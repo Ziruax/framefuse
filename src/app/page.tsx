@@ -147,9 +147,12 @@ export default function Page() {
 
   // ---- Keep refs in sync for the playback loop ----------------------------
   const totalMsRef = useRef(timeline.totalMs);
-  totalMsRef.current = timeline.totalMs;
   const segmentsRef = useRef(timeline.segments);
-  segmentsRef.current = timeline.segments;
+
+  useEffect(() => {
+    totalMsRef.current = timeline.totalMs;
+    segmentsRef.current = timeline.segments;
+  }, [timeline.totalMs, timeline.segments]);
 
   // ---- Playback rAF loop --------------------------------------------------
   useEffect(() => {
@@ -179,7 +182,8 @@ export default function Page() {
 
   // ---- Detect Electron + wire app-menu accelerators -----------------------
   const exportRef = useRef<() => void>(() => {});
-  exportRef.current = async () => {
+
+  const handleExport = useCallback(async () => {
     if (timeline.segments.length === 0) {
       toast.error("Add images first");
       return;
@@ -222,11 +226,17 @@ export default function Page() {
       setExportProgress(null);
       abortRef.current = null;
     }
-  };
+  }, [timeline.segments, timeline.totalMs, items, audioTrack, settings, kenBurns, inElectron]);
+
+  // Keep exportRef in sync so menu accelerators call the latest version
+  useEffect(() => {
+    exportRef.current = handleExport;
+  }, [handleExport]);
 
   useEffect(() => {
     const electron = isElectron();
-    setInElectron(electron);
+    // Defer setState to avoid cascading renders
+    Promise.resolve().then(() => setInElectron(electron));
     if (electron && window.electronAPI) {
       const api = window.electronAPI;
       const offExport = api.onMenu("menu:export", () => exportRef.current());
@@ -379,10 +389,6 @@ export default function Page() {
     },
     [seek],
   );
-
-  const handleExport = useCallback(() => {
-    exportRef.current();
-  }, []);
 
   const handleCancel = useCallback(() => {
     abortRef.current?.abort();
