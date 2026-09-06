@@ -9,12 +9,12 @@
   "scripts": {
     "dev": "next dev -p 3000",
     "clean": "node -e \"const fs=require('fs');['.next','out','dist'].forEach(d=>{try{fs.rmSync(d,{recursive:true,force:true});console.log('Removed '+d)}catch(e){console.log('Could not remove '+d+': '+e.message)}})\"",
-    "build": "npm run clean && next build",
+    "build": "npm run clean && next build --webpack",
     "start": "next start",
     "lint": "eslint .",
     "electron": "electron electron/main.js",
     "electron:dev": "concurrently -k \"npm run dev\" \"wait-on http://localhost:3000 && electron electron/main.js\"",
-    "electron:build": "npm run clean && next build && electron-builder --win dir --publish never"
+    "electron:build": "npm run clean && next build --webpack && electron-builder --win dir --publish never"
   },
   "dependencies": {
     "clsx": "^2.1.1",

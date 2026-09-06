@@ -8,7 +8,7 @@ import {
   useState,
   type ChangeEvent,
 } from "react";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 import { Header, type LastExport } from "@/components/Header";
 import { MediaPanel } from "@/components/MediaPanel";
 import { PreviewPanel } from "@/components/PreviewPanel";
@@ -215,7 +215,7 @@ export default function Page() {
       });
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      if (ac.signal.aborted) toast("Export cancelled");
+      if (ac.signal.aborted) toast.info("Export cancelled");
       else toast.error(msg || "Export failed");
     } finally {
       setIsExporting(false);
