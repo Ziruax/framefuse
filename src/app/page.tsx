@@ -456,12 +456,18 @@ export default function Page() {
       {/* 3-column grid: 300px | 1fr | 320px */}
       <main
         className="grid min-h-0 flex-1 overflow-hidden"
-        style={{ gridTemplateColumns: "300px 1fr 320px" }}
+        style={{
+          gridTemplateColumns: "300px 1fr 320px",
+          backgroundColor: "#0a0a0a",
+        }}
       >
         {/* Left column — Media Panel (300px) */}
         <section
-          className="min-h-0 overflow-hidden border-r"
-          style={{ borderColor: "#27272a" }}
+          className="min-h-0 overflow-y-auto overflow-x-hidden border-r"
+          style={{
+            borderColor: "#27272a",
+            backgroundColor: "#121214",
+          }}
         >
           <MediaPanel
             segments={timeline.segments}
@@ -482,7 +488,10 @@ export default function Page() {
         </section>
 
         {/* Center column — Preview (flex-1) + Timeline (120px) */}
-        <section className="flex min-h-0 flex-col overflow-hidden">
+        <section
+          className="flex min-h-0 flex-col overflow-hidden"
+          style={{ backgroundColor: "#0a0a0a" }}
+        >
           <div className="min-h-0 flex-1 overflow-hidden">
             <PreviewPanel
               segments={timeline.segments}
@@ -510,8 +519,11 @@ export default function Page() {
 
         {/* Right column — Settings Panel (320px) */}
         <section
-          className="min-h-0 overflow-hidden border-l"
-          style={{ borderColor: "#27272a" }}
+          className="min-h-0 overflow-y-auto overflow-x-hidden border-l"
+          style={{
+            borderColor: "#27272a",
+            backgroundColor: "#121214",
+          }}
         >
           <SettingsPanel
             kenBurns={kenBurns}
