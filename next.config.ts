@@ -10,8 +10,10 @@ const nextConfig: NextConfig = {
     ignoreBuildErrors: true,
   },
   reactStrictMode: false,
-  // Allow the preview origin to access dev-server assets.
-  allowedDevOrigins: ["*.space-z.ai", "*.chatglm.cn"],
+  // Fix "ignored package-lock.json in home directory" warning on Windows
+  turbopack: {
+    root: __dirname,
+  },
 };
 
 export default nextConfig;
