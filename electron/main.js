@@ -49,6 +49,7 @@ function createWindow() {
     backgroundColor: "#0a0a0a",
     title: "FrameFuse v4",
     autoHideMenuBar: false,
+    icon: path.join(__dirname, "..", "build", "icon.ico"),
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),

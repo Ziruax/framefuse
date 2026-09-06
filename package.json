@@ -50,11 +50,12 @@
     "files": [
       "out/**/*",
       "electron/**/*",
+      "build/**/*",
       "package.json"
     ],
     "win": {
       "target": "nsis",
-      "icon": "public/logo.svg",
+      "icon": "build/icon.ico",
       "signtoolOptions": null,
       "signAndEditExecutable": false,
       "forceCodeSigning": false

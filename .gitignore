@@ -36,3 +36,4 @@ dev.log
 *.exe
 *.dll
 tool-results/
+build/
