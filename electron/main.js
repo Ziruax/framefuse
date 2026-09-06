@@ -12,21 +12,39 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 const ffmpeg = require("fluent-ffmpeg");
-let ffmpegPath = require("ffmpeg-static");
 
-// On Windows, prefer ffmpeg.exe if it exists alongside the package binary.
-if (process.platform === "win32" && !ffmpegPath.endsWith(".exe")) {
-  const exePath = ffmpegPath + ".exe";
-  try {
-    if (fs.existsSync(exePath)) {
-      ffmpegPath = exePath;
-    }
-  } catch (_) {
-    /* ignore */
+// Resolve FFmpeg binary path — works in both dev and packaged modes
+// The ffmpeg-static npm package provides the binary, but when packaged
+// into an asar, the binary is extracted to app.asar.unpacked/
+let ffmpegPath;
+
+if (app.isPackaged) {
+  // In packaged app, the binary is at:
+  // resources/app.asar.unpacked/node_modules/ffmpeg-static/ffmpeg.exe (Windows)
+  // resources/app.asar.unpacked/node_modules/ffmpeg-static/ffmpeg (Mac/Linux)
+  const exeName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
+  ffmpegPath = path.join(
+    process.resourcesPath,
+    "app.asar.unpacked",
+    "node_modules",
+    "ffmpeg-static",
+    exeName
+  );
+} else {
+  // In dev mode, use ffmpeg-static package directly
+  ffmpegPath = require("ffmpeg-static");
+  // On Windows, prefer ffmpeg.exe if it exists
+  if (process.platform === "win32" && !ffmpegPath.endsWith(".exe")) {
+    const exePath = ffmpegPath + ".exe";
+    try {
+      if (fs.existsSync(exePath)) {
+        ffmpegPath = exePath;
+      }
+    } catch (_) { /* ignore */ }
   }
 }
 
-// Point fluent-ffmpeg at the native binary bundled by ffmpeg-static.
+// Point fluent-ffmpeg at the native binary
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 const isDev = !app.isPackaged;
