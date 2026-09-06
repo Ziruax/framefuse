@@ -83,14 +83,17 @@ function showToast(type: ToastType, message: string, description?: string): void
   }, 4000);
 }
 
-export const toast = {
-  success: (message: string, opts?: { description?: string }): void =>
-    showToast("success", message, opts?.description),
-  error: (message: string, opts?: { description?: string }): void =>
-    showToast("error", message, opts?.description),
-  info: (message: string, opts?: { description?: string }): void =>
-    showToast("info", message, opts?.description),
-  message: (message: string): void => showToast("info", message),
-};
+export const toast = Object.assign(
+  (message: string): void => showToast("info", message),
+  {
+    success: (message: string, opts?: { description?: string }): void =>
+      showToast("success", message, opts?.description),
+    error: (message: string, opts?: { description?: string }): void =>
+      showToast("error", message, opts?.description),
+    info: (message: string, opts?: { description?: string }): void =>
+      showToast("info", message, opts?.description),
+    message: (message: string): void => showToast("info", message),
+  }
+);
 
 export default toast;

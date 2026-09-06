@@ -64,7 +64,8 @@ function createWindow() {
 
   if (isDev) {
     mainWindow.loadURL("http://localhost:3000");
-    mainWindow.webContents.openDevTools({ mode: "detach" });
+    // DevTools disabled by default — uncomment to debug
+    // mainWindow.webContents.openDevTools({ mode: "detach" });
   } else {
     const file = path.join(__dirname, "..", "out", "index.html");
     if (fs.existsSync(file)) {

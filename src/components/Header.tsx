@@ -261,9 +261,9 @@ export function Header({
                 color: "#67e8f9",
               }
             : {
-                borderColor: "#92400e",
-                backgroundColor: "rgba(120, 53, 15, 0.3)",
-                color: "#fcd34d",
+                borderColor: "#27272a",
+                backgroundColor: "#18181b",
+                color: "#71717a",
               }
         }
         title={
@@ -273,7 +273,7 @@ export function Header({
         }
       >
         <Cpu className="size-3" />
-        {inElectron ? "Native FFmpeg" : "Browser Preview"}
+        {inElectron ? "Native FFmpeg" : "Browser"}
       </span>
     </header>
   );
