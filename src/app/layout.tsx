@@ -22,7 +22,13 @@ export default function RootLayout({
   return (
     <html lang="en" className="dark" suppressHydrationWarning>
       <body
-        className="antialiased bg-background text-foreground"
+        className="antialiased"
+        style={{
+          backgroundColor: "#0a0a0a",
+          color: "#e4e4e7",
+          fontFamily:
+            'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
+        }}
         suppressHydrationWarning
       >
         {children}

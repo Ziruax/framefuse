@@ -24,7 +24,10 @@ const DEFAULT_BEAT_TAIL_MS = 5000;
 /** Default duration for a duration-less segment in sequential mode (ms). */
 const DEFAULT_DURATION_MS = 5000;
 
-/** Parse a timecode like "SS", "MM:SS", or "HH:MM:SS" into milliseconds. */
+/**
+ * Parse a timecode like "SS", "MM:SS", or "HH:MM:SS" into milliseconds.
+ * Returns 0 if any component is NaN.
+ */
 export function parseTimecode(tc: string): number {
   const parts = tc.split(":").map((p) => parseInt(p, 10));
   let h = 0,
@@ -44,10 +47,14 @@ export function parseTimecode(tc: string): number {
   return ((h * 60 + m) * 60 + s) * 1000;
 }
 
+// Three recognized filename patterns (checked in this order):
+// 1. Absolute range:  [00:00:00 - 00:00:06] name.jpg
+// 2. Beat-sheet:       001__Beat_1_0s_name.jpg  (start at 0s)
+// 3. Duration:         10s_name.jpg             (sequential 10s clip)
 const RE_ABSOLUTE =
   /\[\s*(\d{1,2}(?::\d{1,2}){0,2})\s*-\s*(\d{1,2}(?::\d{1,2}){0,2})\s*\]/;
-const RE_DURATION = /^(\d+(?:\.\d+)?)s[_\s-]/;
 const RE_BEAT = /_(\d+(?:\.\d+)?)s[_\.]/;
+const RE_DURATION = /^(\d+(?:\.\d+)?)s[_\s-]/;
 
 /**
  * Parse a filename for timing information.
@@ -56,6 +63,7 @@ const RE_BEAT = /_(\d+(?:\.\d+)?)s[_\.]/;
 export function parseFilename(name: string): ParsedName | null {
   const base = name.replace(/\.[^.]+$/, ""); // strip extension
 
+  // 1. Absolute range: [start - end]
   const abs = base.match(RE_ABSOLUTE);
   if (abs) {
     return {
@@ -67,17 +75,7 @@ export function parseFilename(name: string): ParsedName | null {
     };
   }
 
-  const dur = base.match(RE_DURATION);
-  if (dur) {
-    return {
-      kind: "duration",
-      startMs: null,
-      endMs: null,
-      durationMs: Math.round(parseFloat(dur[1]) * 1000),
-      raw: name,
-    };
-  }
-
+  // 2. Beat-sheet: _Ns_ or _Ns.  (e.g. Beat_1_0s → start at 0s)
   const beat = base.match(RE_BEAT);
   if (beat) {
     return {
@@ -85,6 +83,18 @@ export function parseFilename(name: string): ParsedName | null {
       startMs: Math.round(parseFloat(beat[1]) * 1000),
       endMs: null,
       durationMs: null,
+      raw: name,
+    };
+  }
+
+  // 3. Duration: Ns_name or Ns name or Ns-name
+  const dur = base.match(RE_DURATION);
+  if (dur) {
+    return {
+      kind: "duration",
+      startMs: null,
+      endMs: null,
+      durationMs: Math.round(parseFloat(dur[1]) * 1000),
       raw: name,
     };
   }
@@ -125,6 +135,7 @@ export interface TimelineEntry {
  * - Any start-bearing segment (absolute or beat) → absolute mode.
  * - Otherwise (all duration) → sequential mode.
  * - Overlaps resolved "latest start wins" (earlier segment clipped).
+ * - Beat-sheet segments auto-extend to the next beat's start time.
  */
 export function buildTimeline(
   entries: TimelineEntry[],
@@ -139,14 +150,8 @@ export function buildTimeline(
   );
   const durationOnly = entries.filter((e) => e.parsed.kind === "duration");
 
-  // Files that parsed but don't fit the chosen mode are reported as skipped.
-  for (const e of entries) {
-    if (e.parsed.kind === "absolute" || e.parsed.kind === "beat") continue;
-    if (e.parsed.kind === "duration") continue;
-  }
-  // (Unparseable files never reach here — they're filtered before calling.)
-
-  const mode: TimelineMode = startBearing.length > 0 ? "absolute" : "sequential";
+  const mode: TimelineMode =
+    startBearing.length > 0 ? "absolute" : "sequential";
 
   const segments: MediaSegment[] = [];
 
@@ -167,7 +172,10 @@ export function buildTimeline(
         // beat: extend to next beat's start, or default tail.
         const next = sorted[i + 1];
         const nextStart = next ? next.parsed.startMs ?? 0 : null;
-        endMs = nextStart != null ? nextStart : (e.parsed.startMs ?? 0) + DEFAULT_BEAT_TAIL_MS;
+        endMs =
+          nextStart != null
+            ? nextStart
+            : (e.parsed.startMs ?? 0) + DEFAULT_BEAT_TAIL_MS;
       }
       return { e, endMs };
     });
@@ -224,7 +232,8 @@ export function buildTimeline(
     let cursor = 0;
     for (const e of entries) {
       const ov = overrides[e.id];
-      const dur = ov && ov > 0 ? ov : e.parsed.durationMs ?? DEFAULT_DURATION_MS;
+      const dur =
+        ov && ov > 0 ? ov : e.parsed.durationMs ?? DEFAULT_DURATION_MS;
       const startMs = cursor;
       const endMs = cursor + dur;
       const dir = resolveDirection(e.id, kenBurns.direction);

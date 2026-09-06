@@ -68,7 +68,9 @@ export default function Page() {
 
   // ---- Export -------------------------------------------------------------
   const [isExporting, setIsExporting] = useState(false);
-  const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
+  const [exportProgress, setExportProgress] = useState<ExportProgress | null>(
+    null,
+  );
   const [lastExport, setLastExport] = useState<LastExport | null>(null);
   const [inElectron, setInElectron] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
@@ -111,7 +113,10 @@ export default function Page() {
   );
 
   const activeSegment = useMemo(
-    () => (timeline.segments.length ? segmentAtTime(timeline.segments, currentMs) : null),
+    () =>
+      timeline.segments.length
+        ? segmentAtTime(timeline.segments, currentMs)
+        : null,
     [timeline.segments, currentMs],
   );
 
@@ -226,7 +231,15 @@ export default function Page() {
       setExportProgress(null);
       abortRef.current = null;
     }
-  }, [timeline.segments, timeline.totalMs, items, audioTrack, settings, kenBurns, inElectron]);
+  }, [
+    timeline.segments,
+    timeline.totalMs,
+    items,
+    audioTrack,
+    settings,
+    kenBurns,
+    inElectron,
+  ]);
 
   // Keep exportRef in sync so menu accelerators call the latest version
   useEffect(() => {
@@ -278,8 +291,13 @@ export default function Page() {
       const a = document.createElement("audio");
       a.preload = "metadata";
       a.onloadedmetadata = () => {
-        const dur = a.duration && Number.isFinite(a.duration) ? a.duration * 1000 : null;
-        setAudioTrack((p) => (p && p.url === url ? { ...p, durationMs: dur } : p));
+        const dur =
+          a.duration && Number.isFinite(a.duration)
+            ? a.duration * 1000
+            : null;
+        setAudioTrack((p) =>
+          p && p.url === url ? { ...p, durationMs: dur } : p,
+        );
       };
       a.src = url;
       return { fileName: file.name, url, durationMs: null };
@@ -297,7 +315,9 @@ export default function Page() {
           const r = await fetch(`/samples/${name}`);
           if (!r.ok) continue;
           const blob = await r.blob();
-          files.push(new File([blob], name, { type: blob.type || "image/jpeg" }));
+          files.push(
+            new File([blob], name, { type: blob.type || "image/jpeg" }),
+          );
         } catch {
           /* skip individual failures */
         }
@@ -383,7 +403,8 @@ export default function Page() {
       const cur = segmentAtTime(segs, currentMsRef.current);
       const idx = cur ? segs.findIndex((s) => s.id === cur.id) : -1;
       let target: MediaSegment | undefined;
-      if (dir === 1) target = segs[Math.min(segs.length - 1, idx + 1)] ?? segs[0];
+      if (dir === 1)
+        target = segs[Math.min(segs.length - 1, idx + 1)] ?? segs[0];
       else target = segs[Math.max(0, idx - 1)] ?? segs[0];
       if (target) seek(target.startMs);
     },
@@ -417,7 +438,10 @@ export default function Page() {
   };
 
   return (
-    <div className="flex h-screen flex-col overflow-hidden bg-[#0a0a0a] text-zinc-100">
+    <div
+      className="flex h-screen w-screen flex-col overflow-hidden"
+      style={{ backgroundColor: "#0a0a0a", color: "#e4e4e7" }}
+    >
       <Header
         mode={timeline.mode}
         imageCount={timeline.segments.length}
@@ -429,8 +453,16 @@ export default function Page() {
         onCancel={handleCancel}
       />
 
-      <main className="grid min-h-0 flex-1 grid-cols-[280px_minmax(0,1fr)_290px]">
-        <section className="min-h-0 overflow-hidden border-r border-zinc-800">
+      {/* 3-column grid: 300px | 1fr | 320px */}
+      <main
+        className="grid min-h-0 flex-1 overflow-hidden"
+        style={{ gridTemplateColumns: "300px 1fr 320px" }}
+      >
+        {/* Left column — Media Panel (300px) */}
+        <section
+          className="min-h-0 overflow-hidden border-r"
+          style={{ borderColor: "#27272a" }}
+        >
           <MediaPanel
             segments={timeline.segments}
             mode={timeline.mode}
@@ -449,6 +481,7 @@ export default function Page() {
           />
         </section>
 
+        {/* Center column — Preview (flex-1) + Timeline (120px) */}
         <section className="flex min-h-0 flex-col overflow-hidden">
           <div className="min-h-0 flex-1 overflow-hidden">
             <PreviewPanel
@@ -475,7 +508,11 @@ export default function Page() {
           />
         </section>
 
-        <section className="min-h-0 overflow-hidden border-l border-zinc-800">
+        {/* Right column — Settings Panel (320px) */}
+        <section
+          className="min-h-0 overflow-hidden border-l"
+          style={{ borderColor: "#27272a" }}
+        >
           <SettingsPanel
             kenBurns={kenBurns}
             settings={settings}

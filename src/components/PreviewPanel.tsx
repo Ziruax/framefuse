@@ -9,7 +9,6 @@ import type {
 } from "@/lib/merger/types";
 import { drawFrame, previewDimensions } from "@/lib/merger/renderer";
 import { fmtTimecode } from "@/lib/merger/timeline";
-import { cn } from "@/lib/utils";
 
 interface PreviewPanelProps {
   segments: MediaSegment[];
@@ -60,21 +59,37 @@ export function PreviewPanel({
   const pct = totalMs > 0 ? (currentMs / totalMs) * 100 : 0;
 
   return (
-    <div className="flex h-full flex-col bg-[#0c0c0e]">
+    <div
+      className="flex h-full flex-col overflow-hidden"
+      style={{ backgroundColor: "#0c0c0e" }}
+    >
       {/* Canvas stage */}
       <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden p-4">
         {segments.length === 0 ? (
-          <div className="ff-grid-bg flex h-full w-full flex-col items-center justify-center rounded-xl border border-zinc-800 text-center">
-            <ImageOff className="mb-3 size-8 text-zinc-700" />
-            <p className="text-[13px] font-medium text-zinc-400">No images yet</p>
-            <p className="mt-1 text-[11px] text-zinc-600">
+          <div
+            className="ff-grid-bg flex h-full w-full flex-col items-center justify-center rounded-xl border text-center"
+            style={{ borderColor: "#27272a" }}
+          >
+            <ImageOff className="mb-3 size-8" style={{ color: "#3f3f46" }} />
+            <p className="text-[13px] font-medium" style={{ color: "#a1a1aa" }}>
+              No images yet
+            </p>
+            <p className="mt-1 text-[11px]" style={{ color: "#52525b" }}>
               Add images from the left panel to begin
             </p>
           </div>
         ) : (
           <div
-            className="relative rounded-lg border border-zinc-800 bg-black shadow-2xl shadow-black/50"
-            style={{ aspectRatio: `${dims.w} / ${dims.h}`, maxWidth: "100%", maxHeight: "100%", width: dims.w }}
+            className="relative rounded-lg border shadow-2xl"
+            style={{
+              borderColor: "#27272a",
+              backgroundColor: "#000000",
+              boxShadow: "0 25px 50px -12px rgba(0, 0, 0, 0.8)",
+              aspectRatio: `${dims.w} / ${dims.h}`,
+              maxWidth: "100%",
+              maxHeight: "100%",
+              width: dims.w,
+            }}
           >
             <canvas
               ref={canvasRef}
@@ -84,11 +99,17 @@ export function PreviewPanel({
             />
             {/* Segment label overlay */}
             {activeSegment && (
-              <div className="pointer-events-none absolute left-2 top-2 rounded-md bg-black/60 px-2 py-1 backdrop-blur-sm">
-                <div className="max-w-[280px] truncate text-[11px] font-medium text-zinc-200">
+              <div
+                className="pointer-events-none absolute left-2 top-2 rounded-md px-2 py-1 backdrop-blur-sm"
+                style={{ backgroundColor: "rgba(0, 0, 0, 0.6)" }}
+              >
+                <div
+                  className="max-w-[280px] truncate text-[11px] font-medium"
+                  style={{ color: "#e4e4e7" }}
+                >
                   {activeSegment.fileName}
                 </div>
-                <div className="text-[9px] text-zinc-400">
+                <div className="text-[9px]" style={{ color: "#a1a1aa" }}>
                   {fmtTimecode(activeSegment.startMs)} –{" "}
                   {fmtTimecode(activeSegment.endMs)}
                 </div>
@@ -96,7 +117,13 @@ export function PreviewPanel({
             )}
             {/* Direction badge */}
             {activeSegment && kenBurns.enabled && (
-              <div className="pointer-events-none absolute right-2 top-2 rounded bg-black/60 px-1.5 py-0.5 text-[9px] capitalize text-violet-300 backdrop-blur-sm">
+              <div
+                className="pointer-events-none absolute right-2 top-2 rounded px-1.5 py-0.5 text-[9px] capitalize backdrop-blur-sm"
+                style={{
+                  backgroundColor: "rgba(0, 0, 0, 0.6)",
+                  color: "#c4b5fd",
+                }}
+              >
                 ⟶ {activeSegment.direction}
               </div>
             )}
@@ -105,13 +132,20 @@ export function PreviewPanel({
       </div>
 
       {/* Transport */}
-      <div className="border-t border-zinc-800 bg-[#111113] px-4 py-3">
+      <div
+        className="border-t px-4 py-3"
+        style={{
+          borderColor: "#27272a",
+          backgroundColor: "#111113",
+        }}
+      >
         <div className="mb-2 flex items-center gap-2">
           <button
             type="button"
             onClick={() => onStep(-1)}
             disabled={segments.length === 0}
-            className="rounded-md p-1.5 text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-200 disabled:opacity-30"
+            className="rounded-md p-1.5 transition-colors disabled:opacity-30"
+            style={{ color: "#a1a1aa" }}
             title="Previous segment"
           >
             <SkipBack className="size-4" />
@@ -120,10 +154,11 @@ export function PreviewPanel({
             type="button"
             onClick={onTogglePlay}
             disabled={segments.length === 0}
-            className={cn(
-              "flex size-10 items-center justify-center rounded-full text-white shadow-lg transition-all disabled:opacity-30",
-              "bg-violet-600 shadow-violet-900/30 hover:bg-violet-500",
-            )}
+            className="flex size-10 items-center justify-center rounded-full text-white shadow-lg transition-all disabled:opacity-30"
+            style={{
+              backgroundColor: "#7c3aed",
+              boxShadow: "0 4px 12px rgba(124, 58, 237, 0.4)",
+            }}
             title={isPlaying ? "Pause" : "Play"}
           >
             {isPlaying ? (
@@ -136,7 +171,8 @@ export function PreviewPanel({
             type="button"
             onClick={() => onStep(1)}
             disabled={segments.length === 0}
-            className="rounded-md p-1.5 text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-200 disabled:opacity-30"
+            className="rounded-md p-1.5 transition-colors disabled:opacity-30"
+            style={{ color: "#a1a1aa" }}
             title="Next segment"
           >
             <SkipForward className="size-4" />
@@ -144,9 +180,14 @@ export function PreviewPanel({
 
           <div className="ml-2 flex-1" />
 
-          <div className="font-mono text-[12px] tabular-nums text-zinc-300">
-            <span className="text-zinc-100">{fmtTimecode(currentMs)}</span>
-            <span className="text-zinc-600"> / {fmtTimecode(totalMs)}</span>
+          <div className="font-mono text-[12px] tabular-nums">
+            <span style={{ color: "#e4e4e7" }}>
+              {fmtTimecode(currentMs)}
+            </span>
+            <span style={{ color: "#52525b" }}>
+              {" "}
+              / {fmtTimecode(totalMs)}
+            </span>
           </div>
         </div>
 
@@ -162,7 +203,7 @@ export function PreviewPanel({
             disabled={segments.length === 0}
             className="w-full"
             style={{
-              background: `linear-gradient(to right, oklch(0.541 0.281 293) ${pct}%, #3f3f46 ${pct}%)`,
+              background: `linear-gradient(to right, #7c3aed ${pct}%, #3f3f46 ${pct}%)`,
             }}
           />
         </div>

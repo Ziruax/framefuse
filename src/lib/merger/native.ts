@@ -182,7 +182,8 @@ async function exportViaWebCodecs(
     if (encodeError) throw encodeError;
 
     const currentMs = (i / fps) * 1000;
-    const seg = segments.find((s) => currentMs >= s.startMs && currentMs < s.endMs) ||
+    const seg =
+      segments.find((s) => currentMs >= s.startMs && currentMs < s.endMs) ||
       segments[segments.length - 1];
     const img = seg ? imgCache.get(seg.id) : null;
     if (seg) drawFrame(ctx, img ?? null, seg, currentMs, dims.w, dims.h, kenBurns);
@@ -271,7 +272,10 @@ async function exportViaMediaRecorder(
     recorder.onstop = () => {
       const blob = new Blob(chunks, { type: mimeType });
       const url = URL.createObjectURL(blob);
-      triggerDownload(url, `framefuse_${Date.now()}.${mimeType.includes("mp4") ? "mp4" : "webm"}`);
+      triggerDownload(
+        url,
+        `framefuse_${Date.now()}.${mimeType.includes("mp4") ? "mp4" : "webm"}`,
+      );
       setTimeout(() => URL.revokeObjectURL(url), 60000);
       resolve({ path: "(browser download)", size: blob.size });
     };
@@ -279,7 +283,6 @@ async function exportViaMediaRecorder(
 
   recorder.start();
   const start = performance.now();
-  const totalFrames = Math.max(1, Math.round((totalMs / 1000) * fps));
 
   await new Promise<void>((resolve) => {
     const tick = () => {
@@ -289,7 +292,8 @@ async function exportViaMediaRecorder(
         segments.find((s) => currentMs >= s.startMs && currentMs < s.endMs) ||
         segments[segments.length - 1];
       const img = seg ? imgCache.get(seg.id) : null;
-      if (seg) drawFrame(ctx, img ?? null, seg, currentMs, dims.w, dims.h, kenBurns);
+      if (seg)
+        drawFrame(ctx, img ?? null, seg, currentMs, dims.w, dims.h, kenBurns);
 
       onProgress?.({
         progress: Math.min(100, (currentMs / totalMs) * 100),
@@ -306,7 +310,6 @@ async function exportViaMediaRecorder(
   });
 
   recorder.stop();
-  void totalFrames;
   return done;
 }
 
@@ -318,14 +321,17 @@ function pickMime(): string {
     "video/mp4",
   ];
   for (const c of candidates) {
-    if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(c)) {
+    if (
+      typeof MediaRecorder !== "undefined" &&
+      MediaRecorder.isTypeSupported(c)
+    ) {
       return c;
     }
   }
   return "video/webm";
 }
 
-function triggerDownload(url: string, filename: string) {
+function triggerDownload(url: string, filename: string): void {
   const a = document.createElement("a");
   a.href = url;
   a.download = filename;
@@ -339,7 +345,9 @@ function triggerDownload(url: string, filename: string) {
  * - Inside Electron: native FFmpeg (MP4).
  * - In a browser: WebCodecs MP4 (fast), falling back to MediaRecorder WebM.
  */
-export async function exportNative(opts: ExportNativeOptions): Promise<ExportResult> {
+export async function exportNative(
+  opts: ExportNativeOptions,
+): Promise<ExportResult> {
   if (isElectron()) {
     return exportViaFFmpeg(opts);
   }

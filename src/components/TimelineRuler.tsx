@@ -3,7 +3,6 @@
 import { useRef, useCallback, type PointerEvent as ReactPointerEvent } from "react";
 import type { MediaSegment, TimelineMode } from "@/lib/merger/types";
 import { fmtTimecode } from "@/lib/merger/timeline";
-import { cn } from "@/lib/utils";
 
 interface TimelineRulerProps {
   segments: MediaSegment[];
@@ -14,10 +13,10 @@ interface TimelineRulerProps {
   onSeek: (ms: number) => void;
 }
 
-const BAR_COLORS: Record<string, string> = {
-  absolute: "bg-cyan-500/70 hover:bg-cyan-400",
-  beat: "bg-emerald-500/70 hover:bg-emerald-400",
-  duration: "bg-violet-500/70 hover:bg-violet-400",
+const BAR_BG: Record<string, string> = {
+  absolute: "rgba(6, 182, 212, 0.7)",
+  beat: "rgba(16, 185, 129, 0.7)",
+  duration: "rgba(139, 92, 246, 0.7)",
 };
 
 function niceStep(totalMs: number): number {
@@ -45,7 +44,10 @@ export function TimelineRuler({
       const el = trackRef.current;
       if (!el || totalMs <= 0) return 0;
       const rect = el.getBoundingClientRect();
-      const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+      const ratio = Math.max(
+        0,
+        Math.min(1, (clientX - rect.left) / rect.width),
+      );
       return Math.round(ratio * totalMs);
     },
     [totalMs],
@@ -71,39 +73,76 @@ export function TimelineRuler({
   if (ticks[ticks.length - 1] < totalMs) ticks.push(totalMs);
 
   return (
-    <div className="border-t border-zinc-800 bg-[#111113] px-4 py-3">
+    <div
+      className="border-t px-4 py-3"
+      style={{
+        borderColor: "#27272a",
+        backgroundColor: "#111113",
+        height: "120px",
+      }}
+    >
       {/* Header row */}
       <div className="mb-2 flex items-center justify-between">
-        <div className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+        <div
+          className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-wider"
+          style={{ color: "#71717a" }}
+        >
           Timeline
           {mode && (
             <span
-              className={cn(
-                "rounded px-1.5 py-0.5 text-[9px] font-bold",
+              className="rounded px-1.5 py-0.5 text-[9px] font-bold"
+              style={
                 mode === "absolute"
-                  ? "bg-cyan-950/50 text-cyan-300"
-                  : "bg-violet-950/50 text-violet-300",
-              )}
+                  ? {
+                      backgroundColor: "rgba(8, 51, 68, 0.5)",
+                      color: "#67e8f9",
+                    }
+                  : {
+                      backgroundColor: "rgba(76, 29, 149, 0.5)",
+                      color: "#c4b5fd",
+                    }
+              }
             >
               {mode}
             </span>
           )}
         </div>
-        <div className="flex items-center gap-3 text-[9px] text-zinc-600">
+        <div
+          className="flex items-center gap-3 text-[9px]"
+          style={{ color: "#52525b" }}
+        >
           <span className="flex items-center gap-1">
-            <span className="size-2 rounded-sm bg-cyan-500" /> absolute
+            <span
+              className="size-2 rounded-sm"
+              style={{ backgroundColor: "#06b6d4" }}
+            />{" "}
+            absolute
           </span>
           <span className="flex items-center gap-1">
-            <span className="size-2 rounded-sm bg-emerald-500" /> beat
+            <span
+              className="size-2 rounded-sm"
+              style={{ backgroundColor: "#10b981" }}
+            />{" "}
+            beat
           </span>
           <span className="flex items-center gap-1">
-            <span className="size-2 rounded-sm bg-violet-500" /> duration
+            <span
+              className="size-2 rounded-sm"
+              style={{ backgroundColor: "#8b5cf6" }}
+            />{" "}
+            duration
           </span>
         </div>
       </div>
 
       {segments.length === 0 ? (
-        <div className="flex h-14 items-center justify-center rounded-lg border border-dashed border-zinc-800 text-[11px] text-zinc-600">
+        <div
+          className="flex h-14 items-center justify-center rounded-lg border border-dashed text-[11px]"
+          style={{
+            borderColor: "#27272a",
+            color: "#52525b",
+          }}
+        >
           Timeline appears once images are added
         </div>
       ) : (
@@ -113,7 +152,11 @@ export function TimelineRuler({
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerUp}
-          className="relative h-16 w-full cursor-pointer touch-none select-none rounded-lg border border-zinc-800 bg-zinc-950/60"
+          className="relative h-16 w-full cursor-pointer touch-none select-none rounded-lg border"
+          style={{
+            borderColor: "#27272a",
+            backgroundColor: "rgba(9, 9, 11, 0.6)",
+          }}
         >
           {/* Ticks */}
           <div className="absolute inset-0">
@@ -125,8 +168,11 @@ export function TimelineRuler({
                   className="absolute top-0 h-full"
                   style={{ left: `${left}%` }}
                 >
-                  <div className="h-2 w-px bg-zinc-700" />
-                  <span className="mt-0.5 block -translate-x-1/2 text-[8px] tabular-nums text-zinc-600">
+                  <div className="h-2 w-px" style={{ backgroundColor: "#3f3f46" }} />
+                  <span
+                    className="mt-0.5 block -translate-x-1/2 text-[8px] tabular-nums"
+                    style={{ color: "#52525b" }}
+                  >
                     {fmtTimecode(t)}
                   </span>
                 </div>
@@ -136,43 +182,54 @@ export function TimelineRuler({
 
           {/* Segment bars */}
           <div className="absolute bottom-1 left-0 right-0 top-5">
-            {segments.map((seg) => {
+            {segments.map((seg, idx) => {
               const left = totalMs > 0 ? (seg.startMs / totalMs) * 100 : 0;
-              const width = totalMs > 0 ? (seg.durationMs / totalMs) * 100 : 0;
+              const width =
+                totalMs > 0 ? (seg.durationMs / totalMs) * 100 : 0;
               const isActive = seg.id === activeId;
+              const bg = BAR_BG[seg.kind] || BAR_BG.duration;
               return (
                 <div
                   key={seg.id}
-                  className={cn(
-                    "absolute top-0 flex items-center justify-center overflow-hidden rounded-sm border text-[8px] font-medium text-black/80 transition-all",
-                    BAR_COLORS[seg.kind] || BAR_COLORS.duration,
-                    isActive
-                      ? "border-white ring-1 ring-white/60"
-                      : "border-transparent",
-                  )}
-                  style={{ left: `${left}%`, width: `${Math.max(0.5, width)}%`, height: "70%" }}
+                  className="absolute top-0 flex items-center justify-center overflow-hidden rounded-sm border text-[8px] font-medium transition-all"
+                  style={{
+                    left: `${left}%`,
+                    width: `${Math.max(0.5, width)}%`,
+                    height: "70%",
+                    backgroundColor: bg,
+                    borderColor: isActive ? "#ffffff" : "transparent",
+                    boxShadow: isActive
+                      ? "0 0 0 1px rgba(255,255,255,0.6)"
+                      : "none",
+                    color: "rgba(0, 0, 0, 0.8)",
+                  }}
                   title={`${seg.fileName} · ${fmtTimecode(seg.startMs)}–${fmtTimecode(seg.endMs)}`}
                 >
-                  {width > 6 ? idxLabel(segments, seg) : ""}
+                  {width > 6 ? idx + 1 : ""}
                 </div>
               );
             })}
           </div>
 
-          {/* Playhead */}
+          {/* Playhead (vertical white line) */}
           <div
             className="pointer-events-none absolute top-0 z-10 h-full"
             style={{ left: `${playPct}%` }}
           >
-            <div className="absolute -left-1.5 top-0 size-3 rounded-full border-2 border-violet-400 bg-violet-500 shadow" />
-            <div className="absolute left-0 top-0 h-full w-px bg-violet-400" />
+            <div
+              className="absolute -left-1.5 top-0 size-3 rounded-full border-2 shadow"
+              style={{
+                borderColor: "#a78bfa",
+                backgroundColor: "#8b5cf6",
+              }}
+            />
+            <div
+              className="absolute left-0 top-0 h-full w-px"
+              style={{ backgroundColor: "#ffffff" }}
+            />
           </div>
         </div>
       )}
     </div>
   );
-}
-
-function idxLabel(segments: MediaSegment[], seg: MediaSegment): string {
-  return String(segments.findIndex((s) => s.id === seg.id) + 1);
 }

@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import {
   ZoomIn,
   ZoomOut,
@@ -11,6 +12,7 @@ import {
   Sparkles,
   Bug,
   Aperture,
+  ChevronRight,
 } from "lucide-react";
 import type {
   AspectRatio,
@@ -70,20 +72,27 @@ export function SettingsPanel({
   debug,
 }: SettingsPanelProps) {
   return (
-    <div className="flex h-full flex-col overflow-y-auto bg-[#111113]">
+    <div
+      className="flex h-full flex-col overflow-y-auto"
+      style={{ backgroundColor: "#111113" }}
+    >
       {/* Ken Burns */}
-      <Section icon={Sparkles} title="Ken Burns" accent="violet">
+      <Section icon={Sparkles} title="Ken Burns" accentColor="#a78bfa">
         <div className="flex items-center justify-between">
-          <span className="text-[12px] text-zinc-300">Enable motion</span>
+          <span className="text-[12px]" style={{ color: "#d4d4d8" }}>
+            Enable motion
+          </span>
           <button
             type="button"
             role="switch"
             aria-checked={kenBurns.enabled}
-            onClick={() => onKenBurnsChange({ ...kenBurns, enabled: !kenBurns.enabled })}
-            className={cn(
-              "relative h-5 w-9 rounded-full transition-colors",
-              kenBurns.enabled ? "bg-violet-600" : "bg-zinc-700",
-            )}
+            onClick={() =>
+              onKenBurnsChange({ ...kenBurns, enabled: !kenBurns.enabled })
+            }
+            className="relative h-5 w-9 rounded-full transition-colors"
+            style={{
+              backgroundColor: kenBurns.enabled ? "#7c3aed" : "#3f3f46",
+            }}
           >
             <span
               className={cn(
@@ -94,11 +103,21 @@ export function SettingsPanel({
           </button>
         </div>
 
-        <div className={cn("space-y-3", !kenBurns.enabled && "pointer-events-none opacity-40")}>
+        <div
+          className={cn(
+            "space-y-3",
+            !kenBurns.enabled && "pointer-events-none opacity-40",
+          )}
+        >
           <div>
             <div className="mb-1.5 flex items-center justify-between">
-              <span className="text-[11px] text-zinc-400">Intensity</span>
-              <span className="font-mono text-[11px] tabular-nums text-violet-300">
+              <span className="text-[11px]" style={{ color: "#a1a1aa" }}>
+                Intensity
+              </span>
+              <span
+                className="font-mono text-[11px] tabular-nums"
+                style={{ color: "#c4b5fd" }}
+              >
                 {kenBurns.intensity}
               </span>
             </div>
@@ -109,13 +128,19 @@ export function SettingsPanel({
               step={1}
               value={kenBurns.intensity}
               onChange={(e) =>
-                onKenBurnsChange({ ...kenBurns, intensity: Number(e.target.value) })
+                onKenBurnsChange({
+                  ...kenBurns,
+                  intensity: Number(e.target.value),
+                })
               }
               style={{
-                background: `linear-gradient(to right, oklch(0.541 0.281 293) ${kenBurns.intensity}%, #3f3f46 ${kenBurns.intensity}%)`,
+                background: `linear-gradient(to right, #7c3aed ${kenBurns.intensity}%, #3f3f46 ${kenBurns.intensity}%)`,
               }}
             />
-            <div className="mt-1 flex justify-between text-[9px] text-zinc-600">
+            <div
+              className="mt-1 flex justify-between text-[9px]"
+              style={{ color: "#52525b" }}
+            >
               <span>subtle</span>
               <span>
                 zoom {(1.06 + (kenBurns.intensity / 100) * 0.18).toFixed(3)}×
@@ -125,7 +150,9 @@ export function SettingsPanel({
           </div>
 
           <div>
-            <div className="mb-1.5 text-[11px] text-zinc-400">Direction</div>
+            <div className="mb-1.5 text-[11px]" style={{ color: "#a1a1aa" }}>
+              Direction
+            </div>
             <div className="grid grid-cols-4 gap-1.5">
               {DIRECTIONS.map(({ value, label, Icon }) => {
                 const active = kenBurns.direction === value;
@@ -134,13 +161,25 @@ export function SettingsPanel({
                     key={value}
                     type="button"
                     title={label}
-                    onClick={() => onKenBurnsChange({ ...kenBurns, direction: value })}
+                    onClick={() =>
+                      onKenBurnsChange({ ...kenBurns, direction: value })
+                    }
                     className={cn(
                       "flex aspect-square flex-col items-center justify-center gap-0.5 rounded-md border text-[8px] transition-all",
-                      active
-                        ? "border-violet-500 bg-violet-950/50 text-violet-200"
-                        : "border-zinc-800 bg-zinc-900 text-zinc-500 hover:border-zinc-700 hover:text-zinc-300",
                     )}
+                    style={
+                      active
+                        ? {
+                            borderColor: "#7c3aed",
+                            backgroundColor: "rgba(76, 29, 149, 0.5)",
+                            color: "#ddd6fe",
+                          }
+                        : {
+                            borderColor: "#27272a",
+                            backgroundColor: "#18181b",
+                            color: "#71717a",
+                          }
+                    }
                   >
                     <Icon className="size-3.5" />
                     <span className="capitalize">{value}</span>
@@ -153,7 +192,7 @@ export function SettingsPanel({
       </Section>
 
       {/* Video settings */}
-      <Section icon={Aperture} title="Video" accent="cyan">
+      <Section icon={Aperture} title="Video" accentColor="#22d3ee">
         <Field label="Aspect ratio">
           <Segmented
             options={ASPECTS}
@@ -172,27 +211,45 @@ export function SettingsPanel({
         </Field>
         <Field label="Frame rate">
           <div className="flex gap-1.5">
-            {FPS_OPTIONS.map((fps) => (
-              <button
-                key={fps}
-                type="button"
-                onClick={() => onSettingsChange({ ...settings, fps })}
-                className={cn(
-                  "flex-1 rounded-md border py-1.5 text-[11px] font-medium transition-all",
-                  settings.fps === fps
-                    ? "border-cyan-500 bg-cyan-950/50 text-cyan-200"
-                    : "border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-700",
-                )}
-              >
-                {fps} fps
-              </button>
-            ))}
+            {FPS_OPTIONS.map((fps) => {
+              const active = settings.fps === fps;
+              return (
+                <button
+                  key={fps}
+                  type="button"
+                  onClick={() => onSettingsChange({ ...settings, fps })}
+                  className={cn(
+                    "flex-1 rounded-md border py-1.5 text-[11px] font-medium transition-all",
+                  )}
+                  style={
+                    active
+                      ? {
+                          borderColor: "#06b6d4",
+                          backgroundColor: "rgba(8, 51, 68, 0.5)",
+                          color: "#67e8f9",
+                        }
+                      : {
+                          borderColor: "#27272a",
+                          backgroundColor: "#18181b",
+                          color: "#a1a1aa",
+                        }
+                  }
+                >
+                  {fps} fps
+                </button>
+              );
+            })}
           </div>
         </Field>
         <div>
           <div className="mb-1.5 flex items-center justify-between">
-            <span className="text-[11px] text-zinc-400">Bitrate</span>
-            <span className="font-mono text-[11px] tabular-nums text-cyan-300">
+            <span className="text-[11px]" style={{ color: "#a1a1aa" }}>
+              Bitrate
+            </span>
+            <span
+              className="font-mono text-[11px] tabular-nums"
+              style={{ color: "#67e8f9" }}
+            >
               {settings.bitrateMbps} Mbps
             </span>
           </div>
@@ -203,28 +260,36 @@ export function SettingsPanel({
             step={1}
             value={settings.bitrateMbps}
             onChange={(e) =>
-              onSettingsChange({ ...settings, bitrateMbps: Number(e.target.value) })
+              onSettingsChange({
+                ...settings,
+                bitrateMbps: Number(e.target.value),
+              })
             }
             style={{
-              background: `linear-gradient(to right, oklch(0.6 0.18 200) ${((settings.bitrateMbps - 2) / 18) * 100}%, #3f3f46 ${((settings.bitrateMbps - 2) / 18) * 100}%)`,
+              background: `linear-gradient(to right, #06b6d4 ${((settings.bitrateMbps - 2) / 18) * 100}%, #3f3f46 ${((settings.bitrateMbps - 2) / 18) * 100}%)`,
             }}
           />
         </div>
       </Section>
 
       {/* Debug */}
-      <Section icon={Bug} title="Debug" accent="zinc" defaultOpen={false}>
+      <Section
+        icon={Bug}
+        title="Debug"
+        accentColor="#a1a1aa"
+        defaultOpen={false}
+      >
         <dl className="space-y-1.5 text-[11px]">
           <Row label="Images" value={String(debug.imageCount)} />
           <Row
             label="Mode"
             value={debug.mode ?? "—"}
-            valueClass={
+            valueColor={
               debug.mode === "absolute"
-                ? "text-cyan-300"
+                ? "#67e8f9"
                 : debug.mode === "sequential"
-                  ? "text-violet-300"
-                  : "text-zinc-400"
+                  ? "#c4b5fd"
+                  : "#a1a1aa"
             }
           />
           <Row label="Total time" value={fmtTimecode(debug.totalMs)} />
@@ -238,7 +303,7 @@ export function SettingsPanel({
           <Row
             label="Environment"
             value={debug.inElectron ? "Electron" : "Browser"}
-            valueClass={debug.inElectron ? "text-cyan-300" : "text-amber-300"}
+            valueColor={debug.inElectron ? "#67e8f9" : "#fcd34d"}
           />
         </dl>
       </Section>
@@ -249,51 +314,58 @@ export function SettingsPanel({
 function Section({
   icon: Icon,
   title,
-  accent,
+  accentColor,
   defaultOpen = true,
   children,
 }: {
   icon: typeof Sparkles;
   title: string;
-  accent: "violet" | "cyan" | "zinc";
+  accentColor: string;
   defaultOpen?: boolean;
   children: React.ReactNode;
 }) {
-  const accentText =
-    accent === "violet"
-      ? "text-violet-400"
-      : accent === "cyan"
-        ? "text-cyan-400"
-        : "text-zinc-400";
+  const [open, setOpen] = useState(defaultOpen);
   return (
-    <details
-      open={defaultOpen}
-      className="group border-b border-zinc-800 last:border-b-0"
+    <div
+      className="border-b last:border-b-0"
+      style={{ borderColor: "#27272a" }}
     >
-      <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-3 transition-colors hover:bg-zinc-900/40">
-        <Icon className={cn("size-4", accentText)} />
-        <span className="text-[12px] font-semibold tracking-tight text-zinc-200">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full cursor-pointer items-center gap-2 px-4 py-3 transition-colors"
+        style={{ backgroundColor: "transparent" }}
+      >
+        <Icon className="size-4" style={{ color: accentColor }} />
+        <span
+          className="text-[12px] font-semibold tracking-tight"
+          style={{ color: "#e4e4e7" }}
+        >
           {title}
         </span>
-        <span className="ml-auto text-zinc-600 transition-transform group-open:rotate-90">
-          ›
+        <span
+          className="ml-auto transition-transform"
+          style={{
+            transform: open ? "rotate(90deg)" : "rotate(0deg)",
+            color: "#52525b",
+          }}
+        >
+          <ChevronRight className="size-3.5" />
         </span>
-      </summary>
-      <div className="space-y-3 px-4 pb-4 pt-1">{children}</div>
-    </details>
+      </button>
+      {open && (
+        <div className="space-y-3 px-4 pb-4 pt-1">{children}</div>
+      )}
+    </div>
   );
 }
 
-function Field({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div>
-      <div className="mb-1.5 text-[11px] text-zinc-400">{label}</div>
+      <div className="mb-1.5 text-[11px]" style={{ color: "#a1a1aa" }}>
+        {label}
+      </div>
       {children}
     </div>
   );
@@ -310,21 +382,34 @@ function Segmented<T extends string>({
 }) {
   return (
     <div className="flex gap-1.5">
-      {options.map((opt) => (
-        <button
-          key={opt.value}
-          type="button"
-          onClick={() => onChange(opt.value)}
-          className={cn(
-            "flex-1 rounded-md border py-1.5 text-[11px] font-medium transition-all",
-            value === opt.value
-              ? "border-cyan-500 bg-cyan-950/50 text-cyan-200"
-              : "border-zinc-800 bg-zinc-900 text-zinc-400 hover:border-zinc-700",
-          )}
-        >
-          {opt.label}
-        </button>
-      ))}
+      {options.map((opt) => {
+        const active = value === opt.value;
+        return (
+          <button
+            key={opt.value}
+            type="button"
+            onClick={() => onChange(opt.value)}
+            className={cn(
+              "flex-1 rounded-md border py-1.5 text-[11px] font-medium transition-all",
+            )}
+            style={
+              active
+                ? {
+                    borderColor: "#06b6d4",
+                    backgroundColor: "rgba(8, 51, 68, 0.5)",
+                    color: "#67e8f9",
+                  }
+                : {
+                    borderColor: "#27272a",
+                    backgroundColor: "#18181b",
+                    color: "#a1a1aa",
+                  }
+            }
+          >
+            {opt.label}
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -334,24 +419,24 @@ function Row({
   value,
   mono,
   truncate,
-  valueClass,
+  valueColor,
 }: {
   label: string;
   value: string;
   mono?: boolean;
   truncate?: boolean;
-  valueClass?: string;
+  valueColor?: string;
 }) {
   return (
     <div className="flex items-center justify-between gap-2">
-      <dt className="text-zinc-500">{label}</dt>
+      <dt style={{ color: "#71717a" }}>{label}</dt>
       <dd
         className={cn(
-          "text-right text-zinc-300",
+          "text-right",
           mono && "font-mono",
           truncate && "max-w-[160px] truncate",
-          valueClass,
         )}
+        style={{ color: valueColor || "#d4d4d8" }}
         title={value}
       >
         {value}

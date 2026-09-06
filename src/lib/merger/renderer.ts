@@ -67,9 +67,11 @@ export function drawFrame(
   if (!img) return;
 
   const iw =
-    (img as HTMLImageElement).naturalWidth || (img as HTMLCanvasElement).width;
+    (img as HTMLImageElement).naturalWidth ||
+    (img as HTMLCanvasElement).width;
   const ih =
-    (img as HTMLImageElement).naturalHeight || (img as HTMLCanvasElement).height;
+    (img as HTMLImageElement).naturalHeight ||
+    (img as HTMLCanvasElement).height;
   if (!iw || !ih) return;
 
   const dur = Math.max(1, seg.durationMs);

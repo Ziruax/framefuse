@@ -18,10 +18,12 @@ let ffmpegPath = require("ffmpeg-static");
 if (process.platform === "win32" && !ffmpegPath.endsWith(".exe")) {
   const exePath = ffmpegPath + ".exe";
   try {
-    if (require("fs").existsSync(exePath)) {
+    if (fs.existsSync(exePath)) {
       ffmpegPath = exePath;
     }
-  } catch (_) {}
+  } catch (_) {
+    /* ignore */
+  }
 }
 
 // Point fluent-ffmpeg at the native binary bundled by ffmpeg-static.
@@ -42,8 +44,8 @@ function ensureTempDir() {
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 1600,
-    height: 1000,
+    width: 1400,
+    height: 900,
     minWidth: 1100,
     minHeight: 720,
     backgroundColor: "#0a0a0a",
@@ -97,17 +99,20 @@ function buildApplicationMenu() {
         {
           label: "Add Images…",
           accelerator: "CmdOrCtrl+O",
-          click: () => mainWindow && mainWindow.webContents.send("menu:add-images"),
+          click: () =>
+            mainWindow && mainWindow.webContents.send("menu:add-images"),
         },
         {
           label: "Add Audio…",
-          click: () => mainWindow && mainWindow.webContents.send("menu:add-audio"),
+          click: () =>
+            mainWindow && mainWindow.webContents.send("menu:add-audio"),
         },
         { type: "separator" },
         {
           label: "Export MP4…",
           accelerator: "CmdOrCtrl+E",
-          click: () => mainWindow && mainWindow.webContents.send("menu:export"),
+          click: () =>
+            mainWindow && mainWindow.webContents.send("menu:export"),
         },
         { type: "separator" },
         isMac ? { role: "close" } : { role: "quit" },
@@ -163,7 +168,8 @@ function buildApplicationMenu() {
         {
           label: "Filename Naming Guide",
           click: () =>
-            mainWindow && mainWindow.webContents.send("menu:naming-guide"),
+            mainWindow &&
+            mainWindow.webContents.send("menu:naming-guide"),
         },
       ],
     },
@@ -262,7 +268,7 @@ ipcMain.handle("export-native", async (event, opts) => {
 
   segments.forEach((seg, i) => {
     const d = Math.max(1, Math.round((seg.durationMs / 1000) * fps));
-    const dir = enabled ? (seg.direction || globalDir) : "none";
+    const dir = enabled ? seg.direction || globalDir : "none";
 
     // easeInOutSine via ffmpeg cos(): eased = -(cos(PI*t)-1)/2, t = on/(d-1)
     const tExpr = `on/${Math.max(1, d - 1)}`;
@@ -316,7 +322,9 @@ ipcMain.handle("export-native", async (event, opts) => {
   });
 
   // Concat all video labels.
-  filterParts.push(`${labels.join("")}concat=n=${segments.length}:v=1:a=0[vout]`);
+  filterParts.push(
+    `${labels.join("")}concat=n=${segments.length}:v=1:a=0[vout]`,
+  );
   const filterComplex = filterParts.join(";");
 
   const audioIdx = segments.length; // audio is the last input
@@ -327,12 +335,7 @@ ipcMain.handle("export-native", async (event, opts) => {
     segments.forEach((seg) => cmd.input(seg.imagePath));
     if (audioPath) cmd.input(audioPath);
 
-    const outputOptions = [
-      "-filter_complex",
-      filterComplex,
-      "-map",
-      "[vout]",
-    ];
+    const outputOptions = ["-filter_complex", filterComplex, "-map", "[vout]"];
     if (audioPath) {
       outputOptions.push("-map", `${audioIdx}:a`, "-c:a", "aac", "-b:a", "192k");
     }
@@ -350,7 +353,7 @@ ipcMain.handle("export-native", async (event, opts) => {
       "-b:v",
       `${bitrateMbps}M`,
       "-movflags",
-      "+faststart"
+      "+faststart",
     );
     if (audioPath) outputOptions.push("-shortest");
 

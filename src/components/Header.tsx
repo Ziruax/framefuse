@@ -57,22 +57,39 @@ export function Header({
   const pct = exportProgress?.progress ?? 0;
 
   return (
-    <header className="no-select flex h-16 shrink-0 items-center gap-4 border-b border-zinc-800 bg-[#0d0d0d] px-5">
+    <header
+      className="no-select flex h-14 shrink-0 items-center gap-4 border-b px-5"
+      style={{ backgroundColor: "#0d0d0d", borderColor: "#27272a" }}
+    >
       {/* Brand */}
       <div className="flex items-center gap-3">
-        <div className="flex size-9 items-center justify-center rounded-lg bg-gradient-to-br from-violet-600 to-fuchsia-600 shadow-lg shadow-violet-900/30">
-          <Film className="size-5 text-white" />
+        <div
+          className="flex size-9 items-center justify-center rounded-lg shadow-lg"
+          style={{
+            backgroundImage: "linear-gradient(135deg, #7c3aed 0%, #c026d3 100%)",
+            boxShadow: "0 4px 12px rgba(124, 58, 237, 0.3)",
+          }}
+        >
+          <Film className="size-5" style={{ color: "#ffffff" }} />
         </div>
         <div className="leading-tight">
           <div className="flex items-center gap-2">
-            <span className="text-[15px] font-semibold tracking-tight text-zinc-100">
+            <span
+              className="text-[15px] font-semibold tracking-tight"
+              style={{ color: "#e4e4e7" }}
+            >
               FrameFuse
             </span>
-            <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] font-bold text-violet-300">
+            <span
+              className="rounded px-1.5 py-0.5 text-[10px] font-bold"
+              style={{ backgroundColor: "#27272a", color: "#c4b5fd" }}
+            >
               v4
             </span>
           </div>
-          <div className="text-[11px] text-zinc-500">Image Merger · Native FFmpeg</div>
+          <div className="text-[11px]" style={{ color: "#71717a" }}>
+            Image Merger · Native FFmpeg
+          </div>
         </div>
       </div>
 
@@ -80,21 +97,43 @@ export function Header({
       <div className="ml-2 flex items-center gap-2">
         {mode ? (
           <span
-            className={cn(
-              "rounded-md border px-2.5 py-1 text-[11px] font-semibold tracking-wide",
+            className="rounded-md border px-2.5 py-1 text-[11px] font-semibold tracking-wide"
+            style={
               mode === "absolute"
-                ? "border-cyan-700/50 bg-cyan-950/40 text-cyan-300"
-                : "border-violet-700/50 bg-violet-950/40 text-violet-300",
-            )}
+                ? {
+                    borderColor: "#0e7490",
+                    backgroundColor: "rgba(8, 51, 68, 0.5)",
+                    color: "#67e8f9",
+                  }
+                : {
+                    borderColor: "#6d28d9",
+                    backgroundColor: "rgba(76, 29, 149, 0.5)",
+                    color: "#c4b5fd",
+                  }
+            }
           >
             {mode === "absolute" ? "ABSOLUTE" : "SEQUENTIAL"}
           </span>
         ) : (
-          <span className="rounded-md border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-[11px] font-semibold text-zinc-500">
+          <span
+            className="rounded-md border px-2.5 py-1 text-[11px] font-semibold"
+            style={{
+              borderColor: "#27272a",
+              backgroundColor: "#18181b",
+              color: "#71717a",
+            }}
+          >
             NO TIMELINE
           </span>
         )}
-        <span className="flex items-center gap-1 rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1 text-[11px] text-zinc-400">
+        <span
+          className="flex items-center gap-1 rounded-md border px-2 py-1 text-[11px]"
+          style={{
+            borderColor: "#27272a",
+            backgroundColor: "#18181b",
+            color: "#a1a1aa",
+          }}
+        >
           <ImageIcon className="size-3" />
           {imageCount}
         </span>
@@ -105,33 +144,56 @@ export function Header({
       {/* Export progress (when exporting) */}
       {isExporting && (
         <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2 text-[11px] text-zinc-400">
-            <Timer className="size-3.5 animate-pulse text-violet-400" />
-            <span className="font-mono tabular-nums text-zinc-200">
+          <div
+            className="flex items-center gap-2 text-[11px]"
+            style={{ color: "#a1a1aa" }}
+          >
+            <Timer
+              className="size-3.5 animate-pulse"
+              style={{ color: "#a78bfa" }}
+            />
+            <span
+              className="font-mono tabular-nums"
+              style={{ color: "#e4e4e7" }}
+            >
               {pct.toFixed(0)}%
             </span>
             {exportProgress?.fps ? (
-              <span className="text-zinc-500">
+              <span style={{ color: "#71717a" }}>
                 {exportProgress.fps.toFixed(0)} fps
               </span>
             ) : null}
             {exportProgress?.timemark ? (
-              <span className="text-zinc-500">@ {fmtTimecode(parseTimemark(exportProgress.timemark))}</span>
+              <span style={{ color: "#71717a" }}>
+                @ {fmtTimecode(parseTimemark(exportProgress.timemark))}
+              </span>
             ) : null}
             {exportProgress?.eta ? (
-              <span className="text-zinc-500">ETA {exportProgress.eta}s</span>
+              <span style={{ color: "#71717a" }}>ETA {exportProgress.eta}s</span>
             ) : null}
           </div>
-          <div className="h-1.5 w-40 overflow-hidden rounded-full bg-zinc-800">
+          <div
+            className="h-1.5 w-40 overflow-hidden rounded-full"
+            style={{ backgroundColor: "#27272a" }}
+          >
             <div
-              className="h-full rounded-full bg-gradient-to-r from-violet-500 to-fuchsia-500 transition-[width] duration-200"
-              style={{ width: `${pct}%` }}
+              className="h-full rounded-full transition-[width] duration-200"
+              style={{
+                width: `${pct}%`,
+                backgroundImage:
+                  "linear-gradient(to right, #8b5cf6, #d946ef)",
+              }}
             />
           </div>
           <button
             type="button"
             onClick={onCancel}
-            className="flex items-center gap-1.5 rounded-md border border-red-900/60 bg-red-950/50 px-3 py-1.5 text-[12px] font-medium text-red-300 transition-colors hover:bg-red-900/40"
+            className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-[12px] font-medium transition-colors"
+            style={{
+              borderColor: "#7f1d1d",
+              backgroundColor: "rgba(127, 29, 29, 0.4)",
+              color: "#fca5a5",
+            }}
           >
             <X className="size-3.5" /> Cancel
           </button>
@@ -140,12 +202,21 @@ export function Header({
 
       {/* Last export summary */}
       {!isExporting && lastExport && (
-        <div className="flex items-center gap-2 rounded-md border border-zinc-800 bg-zinc-900/60 px-2.5 py-1 text-[11px] text-zinc-400">
-          <Clock className="size-3 text-zinc-500" />
-          <span className="font-medium text-zinc-300">{fmtBytes(lastExport.size)}</span>
-          <span className="text-zinc-600">·</span>
+        <div
+          className="flex items-center gap-2 rounded-md border px-2.5 py-1 text-[11px]"
+          style={{
+            borderColor: "#27272a",
+            backgroundColor: "rgba(24, 24, 27, 0.6)",
+            color: "#a1a1aa",
+          }}
+        >
+          <Clock className="size-3" style={{ color: "#71717a" }} />
+          <span className="font-medium" style={{ color: "#d4d4d8" }}>
+            {fmtBytes(lastExport.size)}
+          </span>
+          <span style={{ color: "#52525b" }}>·</span>
           <span>{lastExport.method}</span>
-          <span className="text-zinc-600">·</span>
+          <span style={{ color: "#52525b" }}>·</span>
           <span>{timeAgo(lastExport.at)}</span>
         </div>
       )}
@@ -157,11 +228,22 @@ export function Header({
           onClick={onExport}
           disabled={imageCount === 0}
           className={cn(
-            "flex items-center gap-2 rounded-md px-4 py-2 text-[13px] font-semibold text-white shadow-lg transition-all",
-            imageCount === 0
-              ? "cursor-not-allowed bg-zinc-800 text-zinc-600 shadow-none"
-              : "bg-violet-600 shadow-violet-900/30 hover:bg-violet-500 hover:shadow-violet-700/40",
+            "flex items-center gap-2 rounded-md px-4 py-2 text-[13px] font-semibold shadow-lg transition-all",
+            imageCount === 0 && "cursor-not-allowed",
           )}
+          style={
+            imageCount === 0
+              ? {
+                  backgroundColor: "#27272a",
+                  color: "#52525b",
+                  boxShadow: "none",
+                }
+              : {
+                  backgroundColor: "#7c3aed",
+                  color: "#ffffff",
+                  boxShadow: "0 4px 12px rgba(124, 58, 237, 0.3)",
+                }
+          }
         >
           <Download className="size-4" />
           Export MP4
@@ -170,12 +252,20 @@ export function Header({
 
       {/* Method badge */}
       <span
-        className={cn(
-          "flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-[11px] font-medium",
+        className="flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-[11px] font-medium"
+        style={
           inElectron
-            ? "border-cyan-800/60 bg-cyan-950/30 text-cyan-300"
-            : "border-amber-800/50 bg-amber-950/30 text-amber-300",
-        )}
+            ? {
+                borderColor: "#0e7490",
+                backgroundColor: "rgba(8, 51, 68, 0.3)",
+                color: "#67e8f9",
+              }
+            : {
+                borderColor: "#92400e",
+                backgroundColor: "rgba(120, 53, 15, 0.3)",
+                color: "#fcd34d",
+              }
+        }
         title={
           inElectron
             ? "Native FFmpeg encoding via fluent-ffmpeg + ffmpeg-static"
