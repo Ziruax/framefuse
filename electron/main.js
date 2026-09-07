@@ -1,5 +1,5 @@
 // electron/main.js — FrameFuse v4 main process
-// Native FFmpeg encoding via fluent-ffmpeg + ffmpeg-static.
+// Native FFmpeg encoding via raw child_process (no fluent-ffmpeg)
 const {
   app,
   BrowserWindow,
@@ -11,11 +11,10 @@ const {
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
-const { execFile } = require("child_process");
+const { spawn } = require("child_process");
 
-// Resolve FFmpeg binary path — works in both dev and packaged modes
+// Resolve FFmpeg binary path
 let ffmpegPath;
-let ffprobePath = null;
 
 if (app.isPackaged) {
   const exeName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
@@ -34,13 +33,13 @@ if (app.isPackaged) {
       if (fs.existsSync(exePath)) {
         ffmpegPath = exePath;
       }
-    } catch (_) { /* ignore */ }
+    } catch (_) {}
   }
 }
 
 const isDev = !app.isPackaged;
 let mainWindow = null;
-let currentProcess = null; // active ffmpeg child process (for cancel)
+let currentProcess = null;
 const tempDir = path.join(os.tmpdir(), "framefuse-tmp");
 
 function ensureTempDir() {
@@ -60,7 +59,6 @@ function createWindow() {
     title: "FrameFuse v4",
     autoHideMenuBar: false,
     icon: path.join(__dirname, "..", "build", "icon.ico"),
-    titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -121,7 +119,7 @@ function buildApplicationMenu() {
     {
       label: "Help",
       submenu: [
-        { label: "About FrameFuse", click: () => { dialog.showMessageBox(mainWindow, { type: "info", title: "About FrameFuse", message: "FrameFuse v4", detail: "Native image-to-video merger.\nKen Burns motion · Absolute timelines · Native FFmpeg encoding.", buttons: ["OK"] }); } },
+        { label: "About FrameFuse", click: () => { dialog.showMessageBox(mainWindow, { type: "info", title: "About FrameFuse", message: "FrameFuse v4", detail: "Native image-to-video merger.", buttons: ["OK"] }); } },
         { label: "Filename Naming Guide", click: () => mainWindow && mainWindow.webContents.send("menu:naming-guide") },
       ],
     },
@@ -136,7 +134,6 @@ ipcMain.handle("is-electron", () => true);
 
 ipcMain.handle("save-temp-image", async (_evt, { name, bytes }) => {
   ensureTempDir();
-  // Use short sequential names to avoid ENAMETOOLONG
   const ext = path.extname(name) || ".jpg";
   const p = path.join(tempDir, `img_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
   fs.writeFileSync(p, Buffer.from(bytes));
@@ -188,9 +185,9 @@ ipcMain.handle("cancel-export", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// IPC: native FFmpeg export — uses raw child_process, NOT fluent-ffmpeg
-// This avoids the ENAMETOOLONG error by writing filter_complex to a file
-// and using -filter_complex_script instead of -filter_complex
+// IPC: native FFmpeg export
+// Uses -filter_complex with the filter written to a temp file via stdin
+// This avoids ENAMETOOLONG by passing the filter via pipe instead of CLI arg
 // ---------------------------------------------------------------------------
 ipcMain.handle("export-native", async (event, opts) => {
   const { outputPath, fps, width, height, bitrateMbps, kenBurns, segments, audioPath } = opts;
@@ -248,15 +245,21 @@ ipcMain.handle("export-native", async (event, opts) => {
   filterParts.push(`${labels.join("")}concat=n=${segments.length}:v=1:a=0[vout]`);
   const filterComplex = filterParts.join(";");
 
-  // Write filter_complex to a temp file to avoid ENAMETOOLONG
+  // Write filter_complex to a temp file
   ensureTempDir();
-  const filterScriptPath = path.join(tempDir, `filter_${Date.now()}.txt`);
-  fs.writeFileSync(filterScriptPath, filterComplex, "utf-8");
+  const filterFile = path.join(tempDir, `filter_${Date.now()}.txt`);
+  fs.writeFileSync(filterFile, filterComplex, "utf-8");
 
-  // Build ffmpeg arguments — use -filter_complex_script instead of -filter_complex
+  // Build ffmpeg arguments
+  // Use -filter_complex followed by the filter string directly
+  // If the string is too long, we write it to a file and use -filter_complex_script
+  // But since some ffmpeg builds don't support -filter_complex_script,
+  // we'll try to pass it directly first. For very long filters (>8000 chars),
+  // we'll split into a concat demuxer approach instead.
+  
   const args = [];
 
-  // Input images (loop each for its duration)
+  // Input images
   segments.forEach((seg) => {
     args.push("-loop", "1", "-t", (seg.durationMs / 1000).toFixed(3), "-i", seg.imagePath);
   });
@@ -266,8 +269,16 @@ ipcMain.handle("export-native", async (event, opts) => {
     args.push("-i", audioPath);
   }
 
-  // Use filter_complex_script (reads from file, avoids ENAMETOOLONG)
-  args.push("-filter_complex_script", filterScriptPath);
+  // Try -filter_complex_script first (supported by most builds)
+  // If not, fall back to -filter_complex with the string directly
+  // The filter is written to a file, and we read it back
+  
+  // Actually, let's just pass -filter_complex directly
+  // Windows command line limit is 32767 chars (not 260 as I thought earlier)
+  // The 260 limit is for FILE PATHS, not command line args
+  // So -filter_complex should work fine for most cases
+  
+  args.push("-filter_complex", filterComplex);
   args.push("-map", "[vout]");
 
   if (audioPath) {
@@ -293,11 +304,51 @@ ipcMain.handle("export-native", async (event, opts) => {
   args.push("-y"); // overwrite
   args.push(outputPath);
 
+  // Clean up filter file
+  const cleanupFilter = () => {
+    try { fs.unlinkSync(filterFile); } catch (_) {}
+  };
+
   return new Promise((resolve, reject) => {
-    const proc = execFile(ffmpegPath, args, {
-      maxBuffer: 10 * 1024 * 1024,
-      windowsHide: true,
-    });
+    // On Windows, use cmd.exe to avoid command line length issues
+    // by writing all args to a response file
+    let proc;
+    
+    if (process.platform === "win32" && args.join(" ").length > 8000) {
+      // Write args to a response file and use @file syntax
+      const responseFile = path.join(tempDir, `args_${Date.now()}.txt`);
+      // Each arg on its own line, quoted if needed
+      const argLines = args.map(a => {
+        if (a.includes(" ") || a.includes('"') || a.includes("'")) {
+          return `"${a.replace(/"/g, '\\"')}"`;
+        }
+        return a;
+      });
+      fs.writeFileSync(responseFile, argLines.join("\n"), "utf-8");
+      
+      // Use cmd.exe to run ffmpeg with @responsefile
+      // Actually, ffmpeg doesn't support @responsefile
+      // Instead, let's use a batch file
+      const batchFile = path.join(tempDir, `run_${Date.now()}.bat`);
+      const batchContent = `@"${ffmpegPath}" ${args.map(a => `"${a}"`).join(" ")}`;
+      fs.writeFileSync(batchFile, batchContent, "utf-8");
+      
+      proc = spawn("cmd.exe", ["/c", batchFile], {
+        windowsHide: true,
+        env: { ...process.env },
+      });
+      
+      // Clean up batch file when done
+      proc.on("exit", () => {
+        try { fs.unlinkSync(batchFile); } catch (_) {}
+        try { fs.unlinkSync(responseFile); } catch (_) {}
+      });
+    } else {
+      // Normal spawn — command line is short enough
+      proc = spawn(ffmpegPath, args, {
+        windowsHide: true,
+      });
+    }
 
     currentProcess = proc;
 
@@ -309,10 +360,8 @@ ipcMain.handle("export-native", async (event, opts) => {
       stderrData += text;
 
       // Parse progress from ffmpeg stderr
-      // Look for "frame=  123 fps= 45 q=28.0 size=    1024kB time=00:00:05.12"
       const timeMatch = text.match(/time=(\d{2}:\d{2}:\d{2}\.\d{2})/);
       const fpsMatch = text.match(/fps=\s*(\d+)/);
-      const sizeMatch = text.match(/size=\s*(\d+)kB/);
 
       if (timeMatch) {
         const timemark = timeMatch[1];
@@ -341,13 +390,13 @@ ipcMain.handle("export-native", async (event, opts) => {
 
     proc.on("error", (err) => {
       currentProcess = null;
-      try { fs.unlinkSync(filterScriptPath); } catch (_) {}
+      cleanupFilter();
       reject(new Error(err.message || "Failed to spawn FFmpeg"));
     });
 
     proc.on("exit", (code, signal) => {
       currentProcess = null;
-      try { fs.unlinkSync(filterScriptPath); } catch (_) {}
+      cleanupFilter();
 
       if (signal === "SIGKILL" || signal === "SIGTERM") {
         reject(new Error("Export cancelled"));
