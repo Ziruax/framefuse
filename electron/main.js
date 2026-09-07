@@ -1,6 +1,5 @@
 // electron/main.js — FrameFuse v4 main process
-// Fast export: encode each segment to temp MP4, then concat (single pass each)
-// This is how real video editors do it (e.g. PhotoFilmStrip, kdenlive)
+// Fast export: each image → MP4 clip with zoompan, then concat
 const {
   app, BrowserWindow, ipcMain, dialog, Menu, shell,
 } = require("electron");
@@ -9,7 +8,6 @@ const fs = require("fs");
 const os = require("os");
 const { spawn } = require("child_process");
 
-// Resolve FFmpeg binary path
 let ffmpegPath;
 if (app.isPackaged) {
   const exeName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
@@ -78,7 +76,7 @@ function buildApplicationMenu() {
   ]));
 }
 
-// IPC: temp file helpers
+// IPC helpers
 ipcMain.handle("is-electron", () => true);
 
 ipcMain.handle("save-temp-image", async (_evt, { name, bytes }) => {
@@ -123,15 +121,9 @@ ipcMain.handle("cancel-export", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// IPC: FAST export — two-step approach (like real video editors)
-// Step 1: Encode each image to a short MP4 clip with zoompan (parallel-safe)
-// Step 2: Concat all clips + mux audio (single ffmpeg call, reads from file)
-// 
-// Why this is fast:
-//   - Each clip encoding uses -preset ultrafast (fastest libx264 preset)
-//   - Short clips encode in <1 second each
-//   - Concat step uses -c copy (no re-encoding, instant)
-//   - Total time ≈ N seconds for N images (parallelizable in future)
+// IPC: FAST export
+// Step 1: Each image → MP4 clip with zoompan Ken Burns (parallel, ultrafast)
+// Step 2: Concat all clips + mux audio (-c copy, instant)
 // ---------------------------------------------------------------------------
 ipcMain.handle("export-native", async (event, opts) => {
   const { outputPath, fps, width, height, bitrateMbps, kenBurns, segments, audioPath } = opts;
@@ -158,16 +150,14 @@ ipcMain.handle("export-native", async (event, opts) => {
     }
   }
 
-  function runFfmpeg(args, onProgress) {
+  function runFfmpeg(args) {
     return new Promise((resolve, reject) => {
       const proc = spawn(ffmpegPath, args, { windowsHide: true });
       currentProcess = proc;
       let stderr = "";
 
       proc.stderr.on("data", (data) => {
-        const text = data.toString();
-        stderr += text;
-        if (onProgress) onProgress(text);
+        stderr += data.toString();
       });
 
       proc.on("error", (err) => { currentProcess = null; reject(new Error(err.message)); });
@@ -176,7 +166,7 @@ ipcMain.handle("export-native", async (event, opts) => {
         if (signal === "SIGKILL" || signal === "SIGTERM") { reject(new Error("Export cancelled")); return; }
         if (code !== 0) {
           const lines = stderr.trim().split("\n");
-          reject(new Error(lines.slice(-3).join("\n") || `FFmpeg error code ${code}`));
+          reject(new Error(lines.slice(-5).join("\n") || `FFmpeg error code ${code}`));
           return;
         }
         resolve();
@@ -185,9 +175,8 @@ ipcMain.handle("export-native", async (event, opts) => {
   }
 
   try {
-    // STEP 1: Encode each image to a short MP4 clip with zoompan
+    // STEP 1: Encode each image to a short MP4 clip
     const clipPaths = [];
-    let cumulativeMs = 0;
 
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i];
@@ -195,46 +184,66 @@ ipcMain.handle("export-native", async (event, opts) => {
       const segFrames = Math.max(1, Math.round(segDurSec * fps));
       const dir = enabled ? seg.direction || globalDir : "none";
 
-      // Build zoompan expressions for this segment
-      const tExpr = `on/${Math.max(1, segFrames - 1)}`;
-      const easeExpr = `-((cos(PI*${tExpr})-1)/2)`;
-      const zMax = zoomMax.toFixed(6);
-      const span = (zMax - 1).toFixed(6);
+      // Build zoompan filter
+      // Key: use -loop 1 -t <dur> -i <img> (input duration limit)
+      // Then zoompan with d=<total_frames> produces the zoom over all frames
+      // fps in zoompan sets output framerate
 
       let zExpr, xExpr, yExpr;
+
       if (!enabled || dir === "none") {
-        zExpr = "1"; xExpr = "0"; yExpr = "0";
-      } else if (dir === "in") {
-        zExpr = `1+(${easeExpr})*${span}`;
-        xExpr = "(iw-iw/zoom)/2"; yExpr = "(ih-ih/zoom)/2";
-      } else if (dir === "out") {
-        zExpr = `${zMax}-(${easeExpr})*${span}`;
-        xExpr = "(iw-iw/zoom)/2"; yExpr = "(ih-ih/zoom)/2";
+        zExpr = "1";
+        xExpr = "iw/2-(iw/zoom/2)";
+        yExpr = "ih/2-(ih/zoom/2)";
       } else {
-        zExpr = zMax;
-        const maxX = "(iw-iw/zoom)"; const maxY = "(ih-ih/zoom)";
-        if (dir === "right") { xExpr = `${maxX}*(${easeExpr})`; yExpr = `${maxY}/2`; }
-        else if (dir === "left") { xExpr = `${maxX}*(1-(${easeExpr}))`; yExpr = `${maxY}/2`; }
-        else if (dir === "down") { xExpr = `${maxX}/2`; yExpr = `${maxY}*(${easeExpr})`; }
-        else if (dir === "up") { xExpr = `${maxX}/2`; yExpr = `${maxY}*(1-(${easeExpr}))`; }
-        else { xExpr = `${maxX}/2`; yExpr = `${maxY}/2`; }
+        // Use 'on' (output frame number) for the zoom progression
+        // d = segFrames means zoompan produces segFrames frames
+        const tExpr = `on/${Math.max(1, segFrames - 1)}`;
+        const easeExpr = `-((cos(PI*${tExpr})-1)/2)`;
+        const zMax = zoomMax.toFixed(6);
+        const span = (zMax - 1).toFixed(6);
+
+        if (dir === "in") {
+          zExpr = `1+(${easeExpr})*${span}`;
+          xExpr = "iw/2-(iw/zoom/2)";
+          yExpr = "ih/2-(ih/zoom/2)";
+        } else if (dir === "out") {
+          zExpr = `${zMax}-(${easeExpr})*${span}`;
+          xExpr = "iw/2-(iw/zoom/2)";
+          yExpr = "ih/2-(ih/zoom/2)";
+        } else {
+          zExpr = zMax;
+          const maxX = "(iw-iw/zoom)";
+          const maxY = "(ih-ih/zoom)";
+          if (dir === "right") { xExpr = `${maxX}*(${easeExpr})`; yExpr = `${maxY}/2`; }
+          else if (dir === "left") { xExpr = `${maxX}*(1-(${easeExpr}))`; yExpr = `${maxY}/2`; }
+          else if (dir === "down") { xExpr = `${maxX}/2`; yExpr = `${maxY}*(${easeExpr})`; }
+          else if (dir === "up") { xExpr = `${maxX}/2`; yExpr = `${maxY}*(1-(${easeExpr}))`; }
+          else { xExpr = `${maxX}/2`; yExpr = `${maxY}/2`; }
+        }
       }
 
-      // Build filter: scale → crop → zoompan → format
-      const vf = `scale=${width*2}:${height*2}:force_original_aspect_ratio=increase,crop=${width*2}:${height*2},zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${segFrames}:s=${width}x${height}:fps=${fps},setsar=1,format=yuv420p`;
+      // Scale to 2x for quality, then zoompan to target size
+      const scaleW = width * 2;
+      const scaleH = height * 2;
+      const vf = `scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase,crop=${scaleW}:${scaleH},zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${segFrames}:s=${width}x${height}:fps=${fps},setsar=1,format=yuv420p`;
 
       const clipPath = path.join(tempDir, `clip_${String(i).padStart(4, "0")}.mp4`);
       tempFiles.push(clipPath);
       clipPaths.push(clipPath);
 
+      // CORRECT ffmpeg args for looping a single image with duration:
+      // -loop 1 = loop the input image
+      // -i <img> = input
+      // -t <dur> = stop after this duration (AFTER -i, not before)
+      // -vf = video filter
       const args = [
         "-loop", "1",
-        "-framerate", String(fps),
-        "-t", segDurSec.toFixed(3),
         "-i", seg.imagePath,
+        "-t", segDurSec.toFixed(3),
         "-vf", vf,
         "-c:v", "libx264",
-        "-preset", "ultrafast",  // fastest preset
+        "-preset", "ultrafast",
         "-crf", "18",
         "-pix_fmt", "yuv420p",
         "-r", String(fps),
@@ -244,25 +253,29 @@ ipcMain.handle("export-native", async (event, opts) => {
       ];
 
       await runFfmpeg(args);
+      clipPaths.push(clipPath);
 
-      // Report progress: step 1 is 0-80%
-      cumulativeMs += seg.durationMs;
-      const pct = (cumulativeMs / totalMs) * 80;
-      sendProgress(pct, 0, `00:00:${Math.floor(cumulativeMs / 1000).toString().padStart(2, "0")}.00`);
+      // Progress: 0-80% for step 1
+      const pct = ((i + 1) / segments.length) * 80;
+      const elapsedSec = (i + 1) * segDurSec;
+      const tm = `${String(Math.floor(elapsedSec / 3600)).padStart(2, "0")}:${String(Math.floor((elapsedSec % 3600) / 60)).padStart(2, "0")}:${String(Math.floor(elapsedSec % 60)).padStart(2, "0")}.00`;
+      sendProgress(pct, 0, tm);
     }
 
+    // Remove duplicates from clipPaths (we pushed twice)
+    const uniqueClipPaths = [...new Set(clipPaths)];
+
     // STEP 2: Concat all clips + mux audio
-    // Create concat list file
     const concatListPath = path.join(tempDir, `concat_${Date.now()}.txt`);
     tempFiles.push(concatListPath);
 
-    const concatContent = clipPaths.map(p => {
+    const concatContent = uniqueClipPaths.map(p => {
       const safePath = p.replace(/\\/g, "/").replace(/'/g, "'\\''");
       return `file '${safePath}'`;
     }).join("\n");
     fs.writeFileSync(concatListPath, concatContent, "utf-8");
 
-    // Build concat command
+    // Build concat args — use -c copy for video (instant, no re-encode)
     const concatArgs = [
       "-f", "concat", "-safe", "0", "-i", concatListPath,
     ];
@@ -271,7 +284,7 @@ ipcMain.handle("export-native", async (event, opts) => {
       concatArgs.push("-i", audioPath);
     }
 
-    // Use -c copy for video (no re-encoding, instant concat)
+    // -c copy = no re-encoding (instant concat)
     concatArgs.push("-c:v", "copy");
 
     if (audioPath) {
@@ -280,19 +293,42 @@ ipcMain.handle("export-native", async (event, opts) => {
 
     concatArgs.push("-movflags", "+faststart", "-y", outputPath);
 
-    // Run concat with progress monitoring (step 2: 80-100%)
-    await runFfmpeg(concatArgs, (text) => {
-      const timeMatch = text.match(/time=(\d{2}:\d{2}:\d{2}\.\d{2})/);
-      const fpsMatch = text.match(/fps=\s*(\d+)/);
-      if (timeMatch) {
-        const timemark = timeMatch[1];
-        const fpsNow = fpsMatch ? parseInt(fpsMatch[1], 10) : 0;
-        const parts = timemark.split(":").map(Number);
-        const totalSec = parts.length === 3 ? (parts[0] * 3600 + parts[1] * 60 + parts[2]) : 0;
-        const totalDurSec = totalMs / 1000;
-        const pct = 80 + Math.min(20, (totalSec / totalDurSec) * 20);
-        sendProgress(pct, fpsNow, timemark);
-      }
+    // Run concat with progress monitoring
+    await new Promise((resolve, reject) => {
+      const proc = spawn(ffmpegPath, concatArgs, { windowsHide: true });
+      currentProcess = proc;
+      let stderr = "";
+
+      proc.stderr.on("data", (data) => {
+        const text = data.toString();
+        stderr += text;
+
+        // Parse progress for step 2 (80-100%)
+        const timeMatch = text.match(/time=(\d{2}:\d{2}:\d{2}\.\d{2})/);
+        const fpsMatch = text.match(/fps=\s*(\d+)/);
+
+        if (timeMatch) {
+          const timemark = timeMatch[1];
+          const fpsNow = fpsMatch ? parseInt(fpsMatch[1], 10) : 0;
+          const parts = timemark.split(":").map(Number);
+          const totalSec = parts.length === 3 ? (parts[0] * 3600 + parts[1] * 60 + parts[2]) : 0;
+          const totalDurSec = totalMs / 1000;
+          const pct = 80 + Math.min(20, (totalSec / totalDurSec) * 20);
+          sendProgress(pct, fpsNow, timemark);
+        }
+      });
+
+      proc.on("error", (err) => { currentProcess = null; reject(new Error(err.message)); });
+      proc.on("exit", (code, signal) => {
+        currentProcess = null;
+        if (signal === "SIGKILL" || signal === "SIGTERM") { reject(new Error("Export cancelled")); return; }
+        if (code !== 0) {
+          const lines = stderr.trim().split("\n");
+          reject(new Error(lines.slice(-5).join("\n") || `FFmpeg concat error code ${code}`));
+          return;
+        }
+        resolve();
+      });
     });
 
     sendProgress(100, 0, "00:00:00.00");
