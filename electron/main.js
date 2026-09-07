@@ -311,6 +311,12 @@ ipcMain.handle("export-native", async (event, opts) => {
     // Add concat at the end
     filterComplex += `${concatInputs}concat=n=${segments.length}:v=1:a=0[outv]`;
 
+    // ─── CLEANUP TRAILING PUNCTUATION ──────────────────────────────
+    // Strip stray semicolons, newlines, and whitespace from the end of the
+    // filter graph string. A trailing ; causes FFmpeg to expect another
+    // filter definition, finding nothing → "No such filter: ''" crash.
+    filterComplex = filterComplex.trim().replace(/;+$/, "").replace(/\n+$/, "");
+
     // ─── FILTER COMPLEX VIA @ FILE EXPANSION ───────────────────────
     // Write filter to temp file, then use @ prefix to tell FFmpeg to read
     // the filter from the file. This bypasses ALL Windows CLI length limits
