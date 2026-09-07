@@ -258,6 +258,12 @@ ipcMain.handle("export-native", async (event, opts) => {
         const position = cs.customPosition || cs.position || "bottom";
         const marginV = cs.positionY || 50;
 
+        // Calculate max chars per line based on video width and font size
+        // Average char width ≈ 0.6 × font size for sans-serif
+        const charWidth = fontSize * 0.6;
+        const maxWidthPx = width * 0.82; // 82% of video width
+        const maxCharsPerLine = Math.floor(maxWidthPx / charWidth);
+
         let yExprCap;
         if (position === "top") yExprCap = `${marginV}`;
         else if (position === "center") yExprCap = `(h-text_h)/2`;
@@ -269,11 +275,28 @@ ipcMain.handle("export-native", async (event, opts) => {
           const cueStartSec = Math.max(0, (cue.startMs - segStartMs) / 1000);
           const cueEndSec = Math.min(segDurSec, (cue.endMs - segStartMs) / 1000);
 
-          const escapedText = cue.text
+          // Wrap text into multiple lines (drawtext doesn't auto-wrap)
+          // Use literal \n for line breaks in drawtext
+          const words = cue.text.split(/\s+/);
+          let lines = [];
+          let currentLine = "";
+          for (const word of words) {
+            const testLine = currentLine ? currentLine + " " + word : word;
+            if (testLine.length > maxCharsPerLine && currentLine) {
+              lines.push(currentLine);
+              currentLine = word;
+            } else {
+              currentLine = testLine;
+            }
+          }
+          if (currentLine) lines.push(currentLine);
+          const wrappedText = lines.join("\\n"); // Literal \n for drawtext
+
+          // Escape special characters for drawtext
+          const escapedText = wrappedText
             .replace(/\\/g, "\\\\")
             .replace(/:/g, "\\:")
-            .replace(/'/g, "\u2019")
-            .replace(/\n/g, " ");
+            .replace(/'/g, "\u2019");
 
           filter += `,drawtext=font='${fontName}':fontsize=${fontSize}:fontcolor=${textColor}:bordercolor=${borderColor}:borderw=${borderWidth}:text='${escapedText}':x=(w-text_w)/2:y=${yExprCap}:enable='between(t,${cueStartSec.toFixed(3)},${cueEndSec.toFixed(3)})'`;
         }
@@ -288,21 +311,24 @@ ipcMain.handle("export-native", async (event, opts) => {
     // Add concat at the end
     filterComplex += `${concatInputs}concat=n=${segments.length}:v=1:a=0[outv]`;
 
-    // ─── FILTER COMPLEX LENGTH CHECK ───────────────────────────────
-    // Windows cmd.exe limit: 8191 chars. Node.js spawn limit: 32767 chars.
-    // If the filter_complex string exceeds 8000 chars, write it to a temp
-    // file and use -filter_complex_script (bypasses all CLI length limits).
-    const FILTER_COMPLEX_THRESHOLD = 8000;
+    // ─── ALWAYS USE -filter_complex_script ─────────────────────────
+    // Writing a small text file takes <1ms and guarantees safety regardless
+    // of timeline length, image path lengths, or total arg string size.
+    // This eliminates all Windows CLI length limit edge cases.
     const filterScriptPath = path.join(tempDir, `filter_${Date.now()}.txt`);
+    fs.writeFileSync(filterScriptPath, filterComplex, "utf-8");
+    args.push("-filter_complex_script", filterScriptPath);
 
-    if (filterComplex.length > FILTER_COMPLEX_THRESHOLD) {
-      // Write filter to file and use -filter_complex_script
-      fs.writeFileSync(filterScriptPath, filterComplex, "utf-8");
-      args.push("-filter_complex_script", filterScriptPath);
-    } else {
-      // Short enough for CLI
-      args.push("-filter_complex", filterComplex);
-    }
+    // Cleanup helper (race-condition safe)
+    const cleanupFilterScript = () => {
+      try {
+        if (filterScriptPath && fs.existsSync(filterScriptPath)) {
+          fs.unlinkSync(filterScriptPath);
+        }
+      } catch (err) {
+        // Non-blocking — file may be locked or already deleted
+      }
+    };
 
     // 4. Map outputs
     args.push("-map", "[outv]");
@@ -409,7 +435,7 @@ ipcMain.handle("export-native", async (event, opts) => {
             retryProc.on("error", (err) => { currentProcess = null; reject(new Error(err.message)); });
             retryProc.on("exit", (code2, signal2) => {
               currentProcess = null;
-              try { if (fs.existsSync(filterScriptPath)) fs.unlinkSync(filterScriptPath); } catch (_) {}
+              cleanupFilterScript();
               if (signal2 === "SIGKILL" || signal2 === "SIGTERM") { reject(new Error("Export cancelled")); return; }
               if (code2 !== 0) {
                 const lines = retryStderr.trim().split("\n");
@@ -424,12 +450,12 @@ ipcMain.handle("export-native", async (event, opts) => {
           }
 
           const lines = stderrData.trim().split("\n");
-          try { if (fs.existsSync(filterScriptPath)) fs.unlinkSync(filterScriptPath); } catch (_) {}
+          cleanupFilterScript();
           reject(new Error(lines.slice(-5).join("\n") || `FFmpeg exited with code ${code}`));
           return;
         }
 
-        try { if (fs.existsSync(filterScriptPath)) fs.unlinkSync(filterScriptPath); } catch (_) {}
+        cleanupFilterScript();
         sendProgress(100, 0, "00:00:00.00");
         try { resolve({ path: outputPath, size: fs.statSync(outputPath).size }); }
         catch { resolve({ path: outputPath, size: 0 }); }
