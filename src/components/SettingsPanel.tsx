@@ -796,6 +796,37 @@ function CaptionsSection({
             <span>2×</span>
           </div>
         </div>
+
+        {/* Balanced text wrapping */}
+        <div className="flex items-center justify-between">
+          <div>
+            <span className="text-[12px]" style={{ color: "#d4d4d8" }}>
+              Balanced wrapping
+            </span>
+            <div className="text-[9px] mt-0.5" style={{ color: "#71717a" }}>
+              Triangle shape: line 1 longer than line 2
+            </div>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={captionSettings.balancedWrap}
+            onClick={() =>
+              set({ balancedWrap: !captionSettings.balancedWrap })
+            }
+            className="relative h-5 w-9 rounded-full transition-colors"
+            style={{
+              backgroundColor: captionSettings.balancedWrap ? "#7c3aed" : "#3f3f46",
+            }}
+          >
+            <span
+              className={cn(
+                "absolute top-0.5 size-4 rounded-full bg-white transition-transform",
+                captionSettings.balancedWrap ? "translate-x-4" : "translate-x-0.5",
+              )}
+            />
+          </button>
+        </div>
       </div>
     </Section>
   );

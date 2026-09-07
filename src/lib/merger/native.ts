@@ -570,7 +570,9 @@ export function drawCaption(
   // Wrap.
   const maxW = Math.max(40, preset.maxWidth * cw);
   const lineHeight = Math.round(fontPx * 1.25);
-  const lines = wrapText(ctx, display, maxW);
+  const lines = caption.balancedWrap
+    ? balancedWrapText(ctx, display, maxW)
+    : wrapText(ctx, display, maxW);
   if (lines.length === 0) return;
 
   const blockH = lines.length * lineHeight;
@@ -682,6 +684,92 @@ function wrapText(
     if (line) out.push(line);
   }
   return out;
+}
+
+/**
+ * Balanced text wrapping — creates a triangle/pyramid shape where
+ * line 1 is longest, line 2 is shorter, line 3 is shortest.
+ * This looks much better typographically than greedy wrapping.
+ */
+function balancedWrapText(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  maxW: number,
+  maxLines: number = 3,
+): string[] {
+  const paragraphs = text.split("\n");
+  const result: string[] = [];
+
+  for (const para of paragraphs) {
+    if (!para) {
+      result.push("");
+      continue;
+    }
+
+    const words = para.split(/\s+/);
+    if (words.length <= 1) {
+      result.push(para);
+      continue;
+    }
+
+    // Check if it all fits on one line
+    const fullWidth = ctx.measureText(para).width;
+    if (fullWidth <= maxW) {
+      result.push(para);
+      continue;
+    }
+
+    let bestSplit: string[] = [para];
+    let bestScore = Infinity;
+
+    // Try 2-line splits
+    for (let i = 1; i < words.length; i++) {
+      const line1 = words.slice(0, i).join(" ");
+      const line2 = words.slice(i).join(" ");
+      const w1 = ctx.measureText(line1).width;
+      const w2 = ctx.measureText(line2).width;
+
+      if (w1 > maxW || w2 > maxW) continue;
+
+      // Prefer triangle (line1 > line2) — give penalty for inverted
+      const triangleBonus = w1 > w2 ? 0 : 50;
+      const score = Math.abs(w1 - w2) + triangleBonus;
+
+      if (score < bestScore) {
+        bestScore = score;
+        bestSplit = [line1, line2];
+      }
+    }
+
+    // Try 3-line splits if text is long enough
+    if (words.length >= 5 && maxLines >= 3) {
+      for (let i = 1; i < words.length - 1; i++) {
+        for (let j = i + 1; j < words.length; j++) {
+          const line1 = words.slice(0, i).join(" ");
+          const line2 = words.slice(i, j).join(" ");
+          const line3 = words.slice(j).join(" ");
+          const w1 = ctx.measureText(line1).width;
+          const w2 = ctx.measureText(line2).width;
+          const w3 = ctx.measureText(line3).width;
+
+          if (w1 > maxW || w2 > maxW || w3 > maxW) continue;
+
+          // Prefer triangle (w1 > w2 > w3)
+          const triangleBonus = (w1 > w2 && w2 > w3) ? 0 : 100;
+          const score = Math.abs(w1 - w2) + Math.abs(w2 - w3) + triangleBonus;
+
+          if (score < bestScore) {
+            bestScore = score;
+            bestSplit = [line1, line2, line3];
+          }
+        }
+      }
+    }
+
+    result.push(...bestSplit);
+  }
+
+  return result;
 }
 
 /** Cross-browser rounded-rect path helper. */

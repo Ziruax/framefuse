@@ -109,6 +109,8 @@ export interface CaptionSettings {
   customPosition: "top" | "center" | "bottom" | null;
   /** Font size multiplier 0.5 - 2.0. */
   fontSizeScale: number;
+  /** Balanced text wrapping (triangle shape: line1 > line2 > line3). Default true. */
+  balancedWrap: boolean;
 }
 
 export function defaultCaptionSettings(): CaptionSettings {
@@ -119,6 +121,7 @@ export function defaultCaptionSettings(): CaptionSettings {
     customColor: null,
     customPosition: null,
     fontSizeScale: 1,
+    balancedWrap: true,
   };
 }
 

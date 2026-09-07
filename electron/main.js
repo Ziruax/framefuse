@@ -262,9 +262,10 @@ ipcMain.handle("export-native", async (event, opts) => {
         "-vf", vf,
         "-c:v", "libx264",
         "-preset", "ultrafast",
-        "-crf", "18",
+        "-crf", "20",
         "-pix_fmt", "yuv420p",
         "-r", String(fps),
+        "-threads", "0",
         "-movflags", "+faststart",
         "-y",
         clipPath,
@@ -306,16 +307,15 @@ ipcMain.handle("export-native", async (event, opts) => {
 
     if (captionsEnabled) {
       // libass subtitles filter — escape backslashes and colons in the SRT path
-      // for Windows compatibility. The filename= parameter is required when the
-      // path contains special characters; force_style applies the preset styling.
       const escapedSrt = captionSettings.srtPath
         .replace(/\\/g, "\\\\")
         .replace(/:/g, "\\:");
       const vf = `subtitles=filename='${escapedSrt}':force_style='${captionStyle}'`;
       concatArgs.push("-vf", vf);
-      // Re-encode the video so the filter is applied.
-      concatArgs.push("-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-pix_fmt", "yuv420p");
+      // Re-encode with veryfast preset (faster than fast, still good quality)
+      concatArgs.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-threads", "0");
     } else {
+      // No captions — instant concat with -c copy (no re-encode)
       concatArgs.push("-c:v", "copy");
     }
 
