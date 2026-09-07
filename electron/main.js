@@ -189,19 +189,39 @@ ipcMain.handle("export-native", async (event, opts) => {
 
   try {
     // STEP 1: Encode each image to a short MP4 clip
+    // Captions are burned in HERE (per-segment) so step 2 can use -c copy (instant)
     const clipPaths = [];
+    let cumulativeMs = 0;
+
+    // Pre-compute caption settings for drawtext
+    let captionConfig = null;
+    if (captionsEnabled) {
+      const cs = captionSettings;
+      const fontName = cs.fontName || "Arial";
+      const fontSize = Math.round((cs.fontSize || 0.05) * height * (cs.fontSizeScale || 1));
+      const textColor = (cs.textColor || "#FFFFFF").replace("#", "0x");
+      const borderColor = (cs.borderColor || "#000000").replace("#", "0x");
+      const borderWidth = cs.borderWidth || 2;
+      const position = cs.customPosition || cs.position || "bottom";
+      const marginV = cs.positionY || 50;
+
+      let yExpr;
+      if (position === "top") yExpr = `${marginV}`;
+      else if (position === "center") yExpr = `(h-text_h)/2`;
+      else yExpr = `h-text_h-${marginV}`;
+
+      captionConfig = { fontName, fontSize, textColor, borderColor, borderWidth, yExpr };
+    }
 
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i];
       const segDurSec = seg.durationMs / 1000;
       const segFrames = Math.max(1, Math.round(segDurSec * fps));
       const dir = enabled ? seg.direction || globalDir : "none";
+      const segStartMs = cumulativeMs;
+      const segEndMs = cumulativeMs + seg.durationMs;
 
       // Build zoompan filter
-      // Key: use -loop 1 -t <dur> -i <img> (input duration limit)
-      // Then zoompan with d=<total_frames> produces the zoom over all frames
-      // fps in zoompan sets output framerate
-
       let zExpr, xExpr, yExpr;
 
       if (!enabled || dir === "none") {
@@ -209,8 +229,6 @@ ipcMain.handle("export-native", async (event, opts) => {
         xExpr = "iw/2-(iw/zoom/2)";
         yExpr = "ih/2-(ih/zoom/2)";
       } else {
-        // Use 'on' (output frame number) for the zoom progression
-        // d = segFrames means zoompan produces segFrames frames
         const tExpr = `on/${Math.max(1, segFrames - 1)}`;
         const easeExpr = `-((cos(PI*${tExpr})-1)/2)`;
         const zMax = zoomMax.toFixed(6);
@@ -218,16 +236,13 @@ ipcMain.handle("export-native", async (event, opts) => {
 
         if (dir === "in") {
           zExpr = `1+(${easeExpr})*${span}`;
-          xExpr = "iw/2-(iw/zoom/2)";
-          yExpr = "ih/2-(ih/zoom/2)";
+          xExpr = "iw/2-(iw/zoom/2)"; yExpr = "ih/2-(ih/zoom/2)";
         } else if (dir === "out") {
           zExpr = `${zMax}-(${easeExpr})*${span}`;
-          xExpr = "iw/2-(iw/zoom/2)";
-          yExpr = "ih/2-(ih/zoom/2)";
+          xExpr = "iw/2-(iw/zoom/2)"; yExpr = "ih/2-(ih/zoom/2)";
         } else {
           zExpr = zMax;
-          const maxX = "(iw-iw/zoom)";
-          const maxY = "(ih-ih/zoom)";
+          const maxX = "(iw-iw/zoom)"; const maxY = "(ih-ih/zoom)";
           if (dir === "right") { xExpr = `${maxX}*(${easeExpr})`; yExpr = `${maxY}/2`; }
           else if (dir === "left") { xExpr = `${maxX}*(1-(${easeExpr}))`; yExpr = `${maxY}/2`; }
           else if (dir === "down") { xExpr = `${maxX}/2`; yExpr = `${maxY}*(${easeExpr})`; }
@@ -236,20 +251,45 @@ ipcMain.handle("export-native", async (event, opts) => {
         }
       }
 
-      // Scale to 2x for quality, then zoompan to target size
+      // Build video filter chain: scale + crop + zoompan + optional drawtext
       const scaleW = width * 2;
       const scaleH = height * 2;
-      const vf = `scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase,crop=${scaleW}:${scaleH},zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${segFrames}:s=${width}x${height}:fps=${fps},setsar=1,format=yuv420p`;
+      let vfParts = [
+        `scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase`,
+        `crop=${scaleW}:${scaleH}`,
+        `zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${segFrames}:s=${width}x${height}:fps=${fps}`,
+        `setsar=1`,
+        `format=yuv420p`,
+      ];
+
+      // Add drawtext filters for captions that overlap this segment
+      if (captionConfig && subtitleCues) {
+        for (const cue of subtitleCues) {
+          if (cue.endMs <= segStartMs || cue.startMs >= segEndMs) continue;
+
+          // Time relative to this clip (starts at 0)
+          const cueStartSec = Math.max(0, (cue.startMs - segStartMs) / 1000);
+          const cueEndSec = Math.min(segDurSec, (cue.endMs - segStartMs) / 1000);
+
+          // Escape text for drawtext
+          const escapedText = cue.text
+            .replace(/\\/g, "\\\\")
+            .replace(/:/g, "\\:")
+            .replace(/'/g, "\u2019")
+            .replace(/\n/g, " ");
+
+          const dt = `drawtext=font='${captionConfig.fontName}':fontsize=${captionConfig.fontSize}:fontcolor=${captionConfig.textColor}:bordercolor=${captionConfig.borderColor}:borderw=${captionConfig.borderWidth}:text='${escapedText}':x=(w-text_w)/2:y=${captionConfig.yExpr}:enable='between(t,${cueStartSec.toFixed(3)},${cueEndSec.toFixed(3)})'`;
+
+          vfParts.push(dt);
+        }
+      }
+
+      const vf = vfParts.join(",");
 
       const clipPath = path.join(tempDir, `clip_${String(i).padStart(4, "0")}.mp4`);
       tempFiles.push(clipPath);
       clipPaths.push(clipPath);
 
-      // CORRECT ffmpeg args for looping a single image with duration:
-      // -loop 1 = loop the input image
-      // -i <img> = input
-      // -t <dur> = stop after this duration (AFTER -i, not before)
-      // -vf = video filter
       const args = [
         "-loop", "1",
         "-i", seg.imagePath,
@@ -267,31 +307,25 @@ ipcMain.handle("export-native", async (event, opts) => {
       ];
 
       await runFfmpeg(args);
-      clipPaths.push(clipPath);
 
-      // Progress: 0-80% for step 1
-      const pct = ((i + 1) / segments.length) * 80;
-      const elapsedSec = (i + 1) * segDurSec;
-      const tm = `${String(Math.floor(elapsedSec / 3600)).padStart(2, "0")}:${String(Math.floor((elapsedSec % 3600) / 60)).padStart(2, "0")}:${String(Math.floor(elapsedSec % 60)).padStart(2, "0")}.00`;
-      sendProgress(pct, 0, tm);
+      // Progress: 0-95% for step 1 (burning captions here so step 2 is instant)
+      const pct = ((i + 1) / segments.length) * 95;
+      sendProgress(pct, 0, `00:00:${String(Math.floor((cumulativeMs + seg.durationMs) / 1000)).padStart(2, "0")}.00`);
+
+      cumulativeMs = segEndMs;
     }
 
-    // Remove duplicates from clipPaths (we pushed twice)
-    const uniqueClipPaths = [...new Set(clipPaths)];
-
     // STEP 2: Concat all clips + mux audio
+    // ALWAYS use -c copy now (captions already burned in step 1)
     const concatListPath = path.join(tempDir, `concat_${Date.now()}.txt`);
     tempFiles.push(concatListPath);
 
-    const concatContent = uniqueClipPaths.map(p => {
+    const concatContent = clipPaths.map(p => {
       const safePath = p.replace(/\\/g, "/").replace(/'/g, "'\\''");
       return `file '${safePath}'`;
     }).join("\n");
     fs.writeFileSync(concatListPath, concatContent, "utf-8");
 
-    // Build concat args — use -c copy for video (instant, no re-encode)
-    // UNLESS captions need to be burned in, in which case we re-encode the
-    // concatenated stream with a subtitles filter.
     const concatArgs = [
       "-f", "concat", "-safe", "0", "-i", concatListPath,
     ];
@@ -300,72 +334,8 @@ ipcMain.handle("export-native", async (event, opts) => {
       concatArgs.push("-i", audioPath);
     }
 
-    if (captionsEnabled) {
-      // Build drawtext filter chain for each subtitle cue
-      // This renders text directly on the video using FFmpeg's drawtext
-      // which is more reliable than the subtitles/ASS filter
-      const cs = captionSettings;
-      const fontName = cs.fontName || "Arial";
-      const fontSize = Math.round((cs.fontSize || 0.05) * height * (cs.fontSizeScale || 1));
-      const textColor = (cs.textColor || "#FFFFFF").replace("#", "0x");
-      const borderColor = (cs.borderColor || "#000000").replace("#", "0x");
-      const borderWidth = cs.borderWidth || 2;
-      const position = cs.customPosition || cs.position || "bottom";
-      const marginV = cs.positionY || 50;
-
-      const drawtextFilters = [];
-      let cumulativeMs = 0;
-
-      for (const seg of segments) {
-        const segStartMs = cumulativeMs;
-        const segEndMs = cumulativeMs + seg.durationMs;
-        const segStartSec = segStartMs / 1000;
-        const segEndSec = segEndMs / 1000;
-
-        // Find cues that overlap this segment
-        for (const cue of subtitleCues) {
-          if (cue.endMs <= segStartMs || cue.startMs >= segEndMs) continue;
-
-          // Calculate start/end times relative to the concatenated video
-          const cueStartSec = Math.max(cue.startMs, segStartMs) / 1000;
-          const cueEndSec = Math.min(cue.endMs, segEndMs) / 1000;
-
-          // Escape text for drawtext: escape colons, single quotes, backslashes
-          const escapedText = cue.text
-            .replace(/\\/g, "\\\\")
-            .replace(/:/g, "\\:")
-            .replace(/'/g, "\u2019")
-            .replace(/\n/g, " ");
-
-          // Position
-          let yExpr;
-          if (position === "top") {
-            yExpr = `${marginV}`;
-          } else if (position === "center") {
-            yExpr = `(h-text_h)/2`;
-          } else {
-            yExpr = `h-text_h-${marginV}`;
-          }
-
-          const filter = `drawtext=fontfile='':font='${fontName}':fontsize=${fontSize}:fontcolor=${textColor}:bordercolor=${borderColor}:borderw=${borderWidth}:text='${escapedText}':start_number=0:x=(w-text_w)/2:y=${yExpr}:enable='between(t,${cueStartSec.toFixed(3)},${cueEndSec.toFixed(3)})'`;
-
-          drawtextFilters.push(filter);
-        }
-
-        cumulativeMs = segEndMs;
-      }
-
-      if (drawtextFilters.length > 0) {
-        const vf = drawtextFilters.join(",");
-        concatArgs.push("-vf", vf);
-        concatArgs.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-threads", "0");
-      } else {
-        concatArgs.push("-c:v", "copy");
-      }
-    } else {
-      // No captions — instant concat with -c copy
-      concatArgs.push("-c:v", "copy");
-    }
+    // ALWAYS -c copy (instant concat — captions already burned in step 1)
+    concatArgs.push("-c:v", "copy");
 
     if (audioPath) {
       concatArgs.push("-c:a", "aac", "-b:a", "192k", "-shortest");
