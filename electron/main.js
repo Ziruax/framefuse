@@ -288,7 +288,21 @@ ipcMain.handle("export-native", async (event, opts) => {
     // Add concat at the end
     filterComplex += `${concatInputs}concat=n=${segments.length}:v=1:a=0[outv]`;
 
-    args.push("-filter_complex", filterComplex);
+    // ─── FILTER COMPLEX LENGTH CHECK ───────────────────────────────
+    // Windows cmd.exe limit: 8191 chars. Node.js spawn limit: 32767 chars.
+    // If the filter_complex string exceeds 8000 chars, write it to a temp
+    // file and use -filter_complex_script (bypasses all CLI length limits).
+    const FILTER_COMPLEX_THRESHOLD = 8000;
+    const filterScriptPath = path.join(tempDir, `filter_${Date.now()}.txt`);
+
+    if (filterComplex.length > FILTER_COMPLEX_THRESHOLD) {
+      // Write filter to file and use -filter_complex_script
+      fs.writeFileSync(filterScriptPath, filterComplex, "utf-8");
+      args.push("-filter_complex_script", filterScriptPath);
+    } else {
+      // Short enough for CLI
+      args.push("-filter_complex", filterComplex);
+    }
 
     // 4. Map outputs
     args.push("-map", "[outv]");
@@ -319,26 +333,12 @@ ipcMain.handle("export-native", async (event, opts) => {
 
     args.push("-movflags", "+faststart", "-y", outputPath);
 
-    // ─── CHECK IF filter_complex IS TOO LONG FOR WINDOWS CLI ───────
-    // Windows limit: 32767 chars. If exceeded, use a batch file.
-    const totalArgsLen = args.join(" ").length;
-    const useBatchFile = process.platform === "win32" && totalArgsLen > 25000;
-
     // ─── RUN FFMPEG ───────────────────────────────────────────────
+    // spawn() bypasses cmd.exe's 8191 char limit (can handle 32767 chars).
+    // For filters > 8000 chars, we use -filter_complex_script (see above).
+    // So we always use spawn() directly — no batch file needed.
     return await new Promise((resolve, reject) => {
-      let proc;
-
-      if (useBatchFile) {
-        // Write batch file for very long commands
-        const batchFile = path.join(tempDir, `run_${Date.now()}.bat`);
-        const quotedArgs = args.map(a => `"${a.replace(/"/g, '\\"')}"`).join(" ");
-        const batchContent = `@"${ffmpegPath}" ${quotedArgs}`;
-        fs.writeFileSync(batchFile, batchContent, "utf-8");
-        proc = spawn("cmd.exe", ["/c", batchFile], { windowsHide: true });
-        proc.on("exit", () => { try { fs.unlinkSync(batchFile); } catch (_) {} });
-      } else {
-        proc = spawn(ffmpegPath, args, { windowsHide: true });
-      }
+      const proc = spawn(ffmpegPath, args, { windowsHide: true });
 
       currentProcess = proc;
       let stderrData = "";
@@ -409,6 +409,7 @@ ipcMain.handle("export-native", async (event, opts) => {
             retryProc.on("error", (err) => { currentProcess = null; reject(new Error(err.message)); });
             retryProc.on("exit", (code2, signal2) => {
               currentProcess = null;
+              try { if (fs.existsSync(filterScriptPath)) fs.unlinkSync(filterScriptPath); } catch (_) {}
               if (signal2 === "SIGKILL" || signal2 === "SIGTERM") { reject(new Error("Export cancelled")); return; }
               if (code2 !== 0) {
                 const lines = retryStderr.trim().split("\n");
@@ -423,10 +424,12 @@ ipcMain.handle("export-native", async (event, opts) => {
           }
 
           const lines = stderrData.trim().split("\n");
+          try { if (fs.existsSync(filterScriptPath)) fs.unlinkSync(filterScriptPath); } catch (_) {}
           reject(new Error(lines.slice(-5).join("\n") || `FFmpeg exited with code ${code}`));
           return;
         }
 
+        try { if (fs.existsSync(filterScriptPath)) fs.unlinkSync(filterScriptPath); } catch (_) {}
         sendProgress(100, 0, "00:00:00.00");
         try { resolve({ path: outputPath, size: fs.statSync(outputPath).size }); }
         catch { resolve({ path: outputPath, size: 0 }); }
