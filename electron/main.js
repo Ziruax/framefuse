@@ -1,5 +1,6 @@
 // electron/main.js — FrameFuse v4 main process
-// Native FFmpeg encoding via raw child_process (no fluent-ffmpeg)
+// Native FFmpeg encoding via raw child_process spawn
+// Uses concat demuxer approach to avoid ENAMETOOLONG on Windows
 const {
   app,
   BrowserWindow,
@@ -175,7 +176,12 @@ ipcMain.handle("choose-output", async () => {
 ipcMain.handle("cancel-export", async () => {
   try {
     if (currentProcess) {
-      currentProcess.kill("SIGKILL");
+      // On Windows, use taskkill to ensure the process tree is killed
+      if (process.platform === "win32") {
+        spawn("taskkill", ["/pid", currentProcess.pid, "/f", "/t"], { windowsHide: true });
+      } else {
+        currentProcess.kill("SIGKILL");
+      }
       currentProcess = null;
     }
     return true;
@@ -186,8 +192,10 @@ ipcMain.handle("cancel-export", async () => {
 
 // ---------------------------------------------------------------------------
 // IPC: native FFmpeg export
-// Uses -filter_complex with the filter written to a temp file via stdin
-// This avoids ENAMETOOLONG by passing the filter via pipe instead of CLI arg
+// Strategy: Two-pass approach
+//   Pass 1: Encode each segment individually (zoompan per image)
+//   Pass 2: Concat all segment videos + mux audio
+// This avoids ENAMETOOLONG because each ffmpeg call has a short filter
 // ---------------------------------------------------------------------------
 ipcMain.handle("export-native", async (event, opts) => {
   const { outputPath, fps, width, height, bitrateMbps, kenBurns, segments, audioPath } = opts;
@@ -200,224 +208,215 @@ ipcMain.handle("export-native", async (event, opts) => {
   const enabled = !!kenBurns?.enabled;
   const globalDir = kenBurns?.direction || "in";
 
-  // Build filter_complex string
-  const filterParts = [];
-  const labels = [];
-
-  segments.forEach((seg, i) => {
-    const d = Math.max(1, Math.round((seg.durationMs / 1000) * fps));
-    const dir = enabled ? seg.direction || globalDir : "none";
-
-    const tExpr = `on/${Math.max(1, d - 1)}`;
-    const easeExpr = `-((cos(PI*${tExpr})-1)/2)`;
-    const zMax = zoomMax.toFixed(6);
-    const span = (zMax - 1).toFixed(6);
-
-    let zExpr, xExpr, yExpr;
-    if (!enabled || dir === "none") {
-      zExpr = "1"; xExpr = "0"; yExpr = "0";
-    } else if (dir === "in") {
-      zExpr = `1+(${easeExpr})*${span}`;
-      xExpr = "(iw-iw/zoom)/2"; yExpr = "(ih-ih/zoom)/2";
-    } else if (dir === "out") {
-      zExpr = `${zMax}-(${easeExpr})*${span}`;
-      xExpr = "(iw-iw/zoom)/2"; yExpr = "(ih-ih/zoom)/2";
-    } else {
-      zExpr = zMax;
-      const maxX = "(iw-iw/zoom)";
-      const maxY = "(ih-ih/zoom)";
-      if (dir === "right") { xExpr = `${maxX}*(${easeExpr})`; yExpr = `${maxY}/2`; }
-      else if (dir === "left") { xExpr = `${maxX}*(1-(${easeExpr}))`; yExpr = `${maxY}/2`; }
-      else if (dir === "down") { xExpr = `${maxX}/2`; yExpr = `${maxY}*(${easeExpr})`; }
-      else if (dir === "up") { xExpr = `${maxX}/2`; yExpr = `${maxY}*(1-(${easeExpr}))`; }
-      else { xExpr = `${maxX}/2`; yExpr = `${maxY}/2`; }
-    }
-
-    const part =
-      `[${i}:v]scale=${width}:${height}:force_original_aspect_ratio=increase,` +
-      `crop=${width}:${height},` +
-      `zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${d}:s=${width}x${height}:fps=${fps},` +
-      `setsar=1,format=yuv420p[v${i}]`;
-    filterParts.push(part);
-    labels.push(`[v${i}]`);
-  });
-
-  filterParts.push(`${labels.join("")}concat=n=${segments.length}:v=1:a=0[vout]`);
-  const filterComplex = filterParts.join(";");
-
-  // Write filter_complex to a temp file
   ensureTempDir();
-  const filterFile = path.join(tempDir, `filter_${Date.now()}.txt`);
-  fs.writeFileSync(filterFile, filterComplex, "utf-8");
+  const tempFiles = []; // track all temp files for cleanup
 
-  // Build ffmpeg arguments
-  // Use -filter_complex followed by the filter string directly
-  // If the string is too long, we write it to a file and use -filter_complex_script
-  // But since some ffmpeg builds don't support -filter_complex_script,
-  // we'll try to pass it directly first. For very long filters (>8000 chars),
-  // we'll split into a concat demuxer approach instead.
-  
-  const args = [];
+  // Helper: run a single ffmpeg command
+  function runFfmpeg(args) {
+    return new Promise((resolve, reject) => {
+      const proc = spawn(ffmpegPath, args, { windowsHide: true });
+      currentProcess = proc;
+      let stderr = "";
 
-  // Input images
-  segments.forEach((seg) => {
-    args.push("-loop", "1", "-t", (seg.durationMs / 1000).toFixed(3), "-i", seg.imagePath);
-  });
+      proc.stderr.on("data", (data) => {
+        stderr += data.toString();
+      });
 
-  // Audio input
-  if (audioPath) {
-    args.push("-i", audioPath);
-  }
+      proc.on("error", (err) => {
+        currentProcess = null;
+        reject(new Error(err.message));
+      });
 
-  // Try -filter_complex_script first (supported by most builds)
-  // If not, fall back to -filter_complex with the string directly
-  // The filter is written to a file, and we read it back
-  
-  // Actually, let's just pass -filter_complex directly
-  // Windows command line limit is 32767 chars (not 260 as I thought earlier)
-  // The 260 limit is for FILE PATHS, not command line args
-  // So -filter_complex should work fine for most cases
-  
-  args.push("-filter_complex", filterComplex);
-  args.push("-map", "[vout]");
-
-  if (audioPath) {
-    args.push("-map", `${segments.length}:a`);
-  }
-
-  // Video encoding
-  args.push(
-    "-c:v", "libx264",
-    "-preset", "fast",
-    "-crf", "20",
-    "-pix_fmt", "yuv420p",
-    "-r", String(fps),
-    "-b:v", `${bitrateMbps}M`,
-  );
-
-  // Audio encoding
-  if (audioPath) {
-    args.push("-c:a", "aac", "-b:a", "192k", "-shortest");
-  }
-
-  args.push("-movflags", "+faststart");
-  args.push("-y"); // overwrite
-  args.push(outputPath);
-
-  // Clean up filter file
-  const cleanupFilter = () => {
-    try { fs.unlinkSync(filterFile); } catch (_) {}
-  };
-
-  return new Promise((resolve, reject) => {
-    // On Windows, use cmd.exe to avoid command line length issues
-    // by writing all args to a response file
-    let proc;
-    
-    if (process.platform === "win32" && args.join(" ").length > 8000) {
-      // Write args to a response file and use @file syntax
-      const responseFile = path.join(tempDir, `args_${Date.now()}.txt`);
-      // Each arg on its own line, quoted if needed
-      const argLines = args.map(a => {
-        if (a.includes(" ") || a.includes('"') || a.includes("'")) {
-          return `"${a.replace(/"/g, '\\"')}"`;
+      proc.on("exit", (code, signal) => {
+        currentProcess = null;
+        if (signal === "SIGKILL" || signal === "SIGTERM") {
+          reject(new Error("Export cancelled"));
+          return;
         }
-        return a;
+        if (code !== 0) {
+          const lines = stderr.trim().split("\n");
+          reject(new Error(lines.slice(-3).join("\n") || `FFmpeg error code ${code}`));
+          return;
+        }
+        resolve();
       });
-      fs.writeFileSync(responseFile, argLines.join("\n"), "utf-8");
-      
-      // Use cmd.exe to run ffmpeg with @responsefile
-      // Actually, ffmpeg doesn't support @responsefile
-      // Instead, let's use a batch file
-      const batchFile = path.join(tempDir, `run_${Date.now()}.bat`);
-      const batchContent = `@"${ffmpegPath}" ${args.map(a => `"${a}"`).join(" ")}`;
-      fs.writeFileSync(batchFile, batchContent, "utf-8");
-      
-      proc = spawn("cmd.exe", ["/c", batchFile], {
-        windowsHide: true,
-        env: { ...process.env },
-      });
-      
-      // Clean up batch file when done
-      proc.on("exit", () => {
-        try { fs.unlinkSync(batchFile); } catch (_) {}
-        try { fs.unlinkSync(responseFile); } catch (_) {}
-      });
-    } else {
-      // Normal spawn — command line is short enough
-      proc = spawn(ffmpegPath, args, {
-        windowsHide: true,
+    });
+  }
+
+  // Helper: send progress
+  function sendProgress(percent, fps, timemark) {
+    if (event.sender && !event.sender.isDestroyed()) {
+      event.sender.send("export-progress", {
+        progress: Math.max(0, Math.min(100, percent)),
+        fps: fps || 0,
+        timemark: timemark || "00:00:00.00",
       });
     }
+  }
 
-    currentProcess = proc;
+  try {
+    // PASS 1: Encode each segment individually
+    const segmentVideos = [];
+    const totalSegments = segments.length;
+    let cumulativeMs = 0;
+    const totalMs = segments.reduce((sum, s) => sum + s.durationMs, 0);
 
-    let stderrData = "";
-    let lastProgress = 0;
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      const segDurSec = seg.durationMs / 1000;
+      const segFrames = Math.max(1, Math.round(segDurSec * fps));
+      const dir = enabled ? seg.direction || globalDir : "none";
 
-    proc.stderr.on("data", (data) => {
-      const text = data.toString();
-      stderrData += text;
+      // Build zoompan filter for this segment
+      const tExpr = `on/${Math.max(1, segFrames - 1)}`;
+      const easeExpr = `-((cos(PI*${tExpr})-1)/2)`;
+      const zMax = zoomMax.toFixed(6);
+      const span = (zMax - 1).toFixed(6);
 
-      // Parse progress from ffmpeg stderr
-      const timeMatch = text.match(/time=(\d{2}:\d{2}:\d{2}\.\d{2})/);
-      const fpsMatch = text.match(/fps=\s*(\d+)/);
+      let zExpr, xExpr, yExpr;
+      if (!enabled || dir === "none") {
+        zExpr = "1"; xExpr = "0"; yExpr = "0";
+      } else if (dir === "in") {
+        zExpr = `1+(${easeExpr})*${span}`;
+        xExpr = "(iw-iw/zoom)/2"; yExpr = "(ih-ih/zoom)/2";
+      } else if (dir === "out") {
+        zExpr = `${zMax}-(${easeExpr})*${span}`;
+        xExpr = "(iw-iw/zoom)/2"; yExpr = "(ih-ih/zoom)/2";
+      } else {
+        zExpr = zMax;
+        const maxX = "(iw-iw/zoom)";
+        const maxY = "(ih-ih/zoom)";
+        if (dir === "right") { xExpr = `${maxX}*(${easeExpr})`; yExpr = `${maxY}/2`; }
+        else if (dir === "left") { xExpr = `${maxX}*(1-(${easeExpr}))`; yExpr = `${maxY}/2`; }
+        else if (dir === "down") { xExpr = `${maxX}/2`; yExpr = `${maxY}*(${easeExpr})`; }
+        else if (dir === "up") { xExpr = `${maxX}/2`; yExpr = `${maxY}*(1-(${easeExpr}))`; }
+        else { xExpr = `${maxX}/2`; yExpr = `${maxY}/2`; }
+      }
 
-      if (timeMatch) {
-        const timemark = timeMatch[1];
-        const fpsNow = fpsMatch ? parseInt(fpsMatch[1], 10) : 0;
+      // Build filter for this single segment (short, no ENAMETOOLONG risk)
+      const filter = `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${segFrames}:s=${width}x${height}:fps=${fps},setsar=1,format=yuv420p`;
 
-        // Parse timemark to seconds
-        const parts = timemark.split(":").map(Number);
-        const totalSec = parts.length === 3 ? (parts[0] * 3600 + parts[1] * 60 + parts[2]) : 0;
+      const segVideoPath = path.join(tempDir, `seg_${String(i).padStart(4, "0")}.mp4`);
+      tempFiles.push(segVideoPath);
 
-        // Calculate total duration from segments
-        const totalDurSec = segments.reduce((sum, s) => sum + s.durationMs, 0) / 1000;
-        const percent = totalDurSec > 0 ? Math.min(100, (totalSec / totalDurSec) * 100) : 0;
+      const args = [
+        "-loop", "1",
+        "-t", segDurSec.toFixed(3),
+        "-i", seg.imagePath,
+        "-vf", filter,
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "20",
+        "-pix_fmt", "yuv420p",
+        "-r", String(fps),
+        "-b:v", `${bitrateMbps}M`,
+        "-movflags", "+faststart",
+        "-y",
+        segVideoPath
+      ];
 
-        if (percent > lastProgress) {
-          lastProgress = percent;
-          if (event.sender && !event.sender.isDestroyed()) {
-            event.sender.send("export-progress", {
-              progress: percent,
-              fps: fpsNow,
-              timemark: timemark,
-            });
-          }
+      await runFfmpeg(args);
+      segmentVideos.push(segVideoPath);
+
+      // Report progress: pass 1 is 0-70%
+      cumulativeMs += seg.durationMs;
+      const pass1Percent = (cumulativeMs / totalMs) * 70;
+      sendProgress(pass1Percent, fps, `00:00:${Math.floor(cumulativeMs / 1000).toString().padStart(2, "0")}.00`);
+    }
+
+    // PASS 2: Concat all segment videos + mux audio
+    // Create concat list file
+    const concatListPath = path.join(tempDir, `concat_${Date.now()}.txt`);
+    const concatContent = segmentVideos.map(v => `file '${v.replace(/'/g, "'\\''")}'`).join("\n");
+    fs.writeFileSync(concatListPath, concatContent, "utf-8");
+    tempFiles.push(concatListPath);
+
+    const concatArgs = [
+      "-f", "concat",
+      "-safe", "0",
+      "-i", concatListPath,
+    ];
+
+    if (audioPath) {
+      concatArgs.push("-i", audioPath);
+    }
+
+    concatArgs.push("-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p", "-r", String(fps));
+
+    if (audioPath) {
+      concatArgs.push("-c:a", "aac", "-b:a", "192k", "-shortest");
+    }
+
+    concatArgs.push("-movflags", "+faststart", "-y", outputPath);
+
+    // Run concat with progress monitoring
+    await new Promise((resolve, reject) => {
+      const proc = spawn(ffmpegPath, concatArgs, { windowsHide: true });
+      currentProcess = proc;
+      let stderr = "";
+
+      proc.stderr.on("data", (data) => {
+        const text = data.toString();
+        stderr += text;
+
+        // Parse progress for pass 2 (70-100%)
+        const timeMatch = text.match(/time=(\d{2}:\d{2}:\d{2}\.\d{2})/);
+        const fpsMatch = text.match(/fps=\s*(\d+)/);
+
+        if (timeMatch) {
+          const timemark = timeMatch[1];
+          const fpsNow = fpsMatch ? parseInt(fpsMatch[1], 10) : 0;
+          const parts = timemark.split(":").map(Number);
+          const totalSec = parts.length === 3 ? (parts[0] * 3600 + parts[1] * 60 + parts[2]) : 0;
+          const totalDurSec = totalMs / 1000;
+          const pass2Percent = 70 + Math.min(30, (totalSec / totalDurSec) * 30);
+          sendProgress(pass2Percent, fpsNow, timemark);
         }
-      }
+      });
+
+      proc.on("error", (err) => {
+        currentProcess = null;
+        reject(new Error(err.message));
+      });
+
+      proc.on("exit", (code, signal) => {
+        currentProcess = null;
+        if (signal === "SIGKILL" || signal === "SIGTERM") {
+          reject(new Error("Export cancelled"));
+          return;
+        }
+        if (code !== 0) {
+          const lines = stderr.trim().split("\n");
+          reject(new Error(lines.slice(-3).join("\n") || `FFmpeg concat error code ${code}`));
+          return;
+        }
+        resolve();
+      });
     });
 
-    proc.on("error", (err) => {
-      currentProcess = null;
-      cleanupFilter();
-      reject(new Error(err.message || "Failed to spawn FFmpeg"));
-    });
+    sendProgress(100, 0, "00:00:00.00");
 
-    proc.on("exit", (code, signal) => {
-      currentProcess = null;
-      cleanupFilter();
+    // Get output file size
+    let size = 0;
+    try {
+      const stats = fs.statSync(outputPath);
+      size = stats.size;
+    } catch (e) {}
 
-      if (signal === "SIGKILL" || signal === "SIGTERM") {
-        reject(new Error("Export cancelled"));
-        return;
-      }
-      if (code !== 0) {
-        // Extract last few lines of stderr for error message
-        const lines = stderrData.trim().split("\n");
-        const lastLines = lines.slice(-5).join("\n");
-        reject(new Error(lastLines || `FFmpeg exited with code ${code}`));
-        return;
-      }
+    // Cleanup temp files
+    for (const f of tempFiles) {
+      try { fs.unlinkSync(f); } catch (_) {}
+    }
 
-      try {
-        const stats = fs.statSync(outputPath);
-        resolve({ path: outputPath, size: stats.size });
-      } catch (e) {
-        resolve({ path: outputPath, size: 0 });
-      }
-    });
-  });
+    return { path: outputPath, size };
+
+  } catch (err) {
+    // Cleanup temp files on error
+    for (const f of tempFiles) {
+      try { fs.unlinkSync(f); } catch (_) {}
+    }
+    throw err;
+  }
 });
 
 // ---------------------------------------------------------------------------

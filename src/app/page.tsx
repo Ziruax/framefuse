@@ -48,6 +48,9 @@ export default function Page() {
   const [audioTrack, setAudioTrack] = useState<AudioTrack | null>(null);
   const [overrides, setOverrides] = useState<Record<string, number>>({});
 
+  // ---- Audio playback (synced with preview) -------------------------------
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
   // ---- Settings -----------------------------------------------------------
   const [kenBurns, setKenBurns] = useState<KenBurnsConfig>({
     enabled: true,
@@ -161,7 +164,20 @@ export default function Page() {
 
   // ---- Playback rAF loop --------------------------------------------------
   useEffect(() => {
-    if (!isPlaying) return;
+    if (!isPlaying) {
+      // Pause audio when not playing
+      if (audioRef.current) {
+        audioRef.current.pause();
+      }
+      return;
+    }
+
+    // Start audio playback synced with timeline
+    if (audioRef.current && audioTrack) {
+      audioRef.current.currentTime = currentMsRef.current / 1000;
+      audioRef.current.play().catch(() => {});
+    }
+
     let raf = 0;
     let last = performance.now();
     const tick = () => {
@@ -175,6 +191,7 @@ export default function Page() {
         currentMsRef.current = m;
         setCurrentMs(m);
         setIsPlaying(false);
+        if (audioRef.current) audioRef.current.pause();
         return;
       }
       currentMsRef.current = m;
@@ -183,7 +200,7 @@ export default function Page() {
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [isPlaying]);
+  }, [isPlaying, audioTrack]);
 
   // ---- Detect Electron + wire app-menu accelerators -----------------------
   const exportRef = useRef<() => void>(() => {});
@@ -383,6 +400,10 @@ export default function Page() {
     const clamped = Math.max(0, Math.min(ms, totalMsRef.current));
     currentMsRef.current = clamped;
     setCurrentMs(clamped);
+    // Sync audio position
+    if (audioRef.current) {
+      audioRef.current.currentTime = clamped / 1000;
+    }
   }, []);
 
   const togglePlay = useCallback(() => {
@@ -570,6 +591,16 @@ export default function Page() {
           e.target.value = "";
         }}
       />
+
+      {/* Hidden audio element for preview playback (synced with timeline) */}
+      {audioTrack && (
+        <audio
+          ref={audioRef}
+          src={audioTrack.url}
+          preload="auto"
+          style={{ display: "none" }}
+        />
+      )}
     </div>
   );
 }
