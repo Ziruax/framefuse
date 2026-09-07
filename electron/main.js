@@ -311,13 +311,13 @@ ipcMain.handle("export-native", async (event, opts) => {
     // Add concat at the end
     filterComplex += `${concatInputs}concat=n=${segments.length}:v=1:a=0[outv]`;
 
-    // ─── ALWAYS USE -filter_complex_script ─────────────────────────
-    // Writing a small text file takes <1ms and guarantees safety regardless
-    // of timeline length, image path lengths, or total arg string size.
-    // This eliminates all Windows CLI length limit edge cases.
+    // ─── FILTER COMPLEX VIA @ FILE EXPANSION ───────────────────────
+    // Write filter to temp file, then use @ prefix to tell FFmpeg to read
+    // the filter from the file. This bypasses ALL Windows CLI length limits
+    // and works with every FFmpeg build (no -filter_complex_script needed).
     const filterScriptPath = path.join(tempDir, `filter_${Date.now()}.txt`);
     fs.writeFileSync(filterScriptPath, filterComplex, "utf-8");
-    args.push("-filter_complex_script", filterScriptPath);
+    args.push("-filter_complex", `@${filterScriptPath}`);
 
     // Cleanup helper (race-condition safe)
     const cleanupFilterScript = () => {
