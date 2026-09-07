@@ -66,7 +66,11 @@
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
+      "createStartMenuShortcut": true,
+      "shortcutName": "FrameFuse",
+      "perMachine": false,
+      "uninstallDisplayName": "FrameFuse v4",
+      "deleteAppDataOnUninstall": false
     },
     "npmRebuild": false
   }
