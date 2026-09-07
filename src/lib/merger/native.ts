@@ -10,6 +10,8 @@ import type {
   MediaSegment,
 } from "./types";
 import { drawFrame, resolveDimensions } from "./renderer";
+import { getCaptionPreset, getFontOption } from "./captionPresets";
+import { cueAt } from "./subtitles";
 
 /** True when running inside the FrameFuse Electron shell. */
 export function isElectron(): boolean {
@@ -20,13 +22,100 @@ function fetchBytes(url: string): Promise<ArrayBuffer> {
   return fetch(url).then((r) => r.arrayBuffer());
 }
 
+/**
+ * Build the FFmpeg force_style string for the active caption settings.
+ * Applies font, color, position, and size overrides on top of the preset.
+ */
+export function buildCaptionFfmpegStyle(opts: {
+  presetId: string;
+  fontId: string;
+  customColor: string | null;
+  customPosition: "top" | "center" | "bottom" | null;
+  fontSizeScale: number;
+  videoHeight: number;
+}): string {
+  const preset = getCaptionPreset(opts.presetId);
+  const font = getFontOption(opts.fontId);
+
+  // Font size: preset.fontSize is a fraction of video height.
+  // ASS FontSize is in points; for libass at the canvas resolution we use
+  // px = fraction * videoHeight * scale.
+  const fontPx = Math.max(
+    8,
+    Math.round(preset.fontSize * opts.videoHeight * (opts.fontSizeScale || 1)),
+  );
+
+  const textColor = opts.customColor || preset.textColor;
+  const position = opts.customPosition || preset.position;
+
+  // Position V (margin from the chosen edge). For "center" we use 0; for
+  // top/bottom we offset by the preset's positionY so captions aren't flush.
+  let marginV = preset.positionY;
+  if (position === "center") marginV = 0;
+
+  // Alignment numpad: 1/2/3 = bottom L/C/R, 4/5/6 = middle L/C/R, 7/8/9 = top L/C/R.
+  const row = position === "top" ? 7 : position === "center" ? 4 : 1;
+  const col =
+    preset.alignment === "left" ? 0 : preset.alignment === "right" ? 2 : 1;
+  const alignment = row + col;
+
+  // Bold / italic.
+  const bold = preset.fontWeight >= 600 ? -1 : 0;
+  const italic = preset.fontStyle === "italic" ? -1 : 0;
+
+  // ASS colors: &HAABBGGRR (alpha inverted vs CSS).
+  const toAss = (hex: string, alpha = 1): string => {
+    const h = hex.replace(/^#/, "");
+    const r = h.slice(0, 2);
+    const g = h.slice(2, 4);
+    const b = h.slice(4, 6);
+    const assAlpha = Math.round((1 - alpha) * 255)
+      .toString(16)
+      .padStart(2, "0")
+      .toUpperCase();
+    return `&H${assAlpha}${b}${g}${r}`.toUpperCase();
+  };
+
+  const parts: string[] = [
+    `FontName=${font.ffmpegName}`,
+    `FontSize=${fontPx}`,
+    `PrimaryColour=${toAss(textColor, 1)}`,
+    `OutlineColour=${toAss(preset.borderColor || "#000000", 1)}`,
+  ];
+  if (preset.bgColor) {
+    parts.push(`BackColour=${toAss(preset.bgColor, preset.bgAlpha)}`);
+  }
+  parts.push(`Bold=${bold}`);
+  parts.push(`Italic=${italic}`);
+  parts.push(`BorderStyle=${preset.bgColor ? 3 : 1}`);
+  parts.push(`Outline=${preset.borderWidth}`);
+  parts.push(
+    `Shadow=${preset.shadow ? Math.max(1, Math.round(preset.shadowBlur)) : 0}`,
+  );
+  parts.push(`Alignment=${alignment}`);
+  parts.push(`MarginL=24`);
+  parts.push(`MarginR=24`);
+  parts.push(`MarginV=${marginV}`);
+
+  return parts.join(",");
+}
+
 // ---------------------------------------------------------------------------
 // Native FFmpeg path (Electron)
 // ---------------------------------------------------------------------------
 async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult> {
   const api = window.electronAPI!;
-  const { segments, imageUrls, audioTrack, settings, kenBurns, onProgress, signal } =
-    opts;
+  const {
+    segments,
+    imageUrls,
+    audioTrack,
+    settings,
+    kenBurns,
+    onProgress,
+    signal,
+    subtitles,
+    captionSettings,
+  } = opts;
 
   const dims = resolveDimensions(settings.aspect, settings.resolution);
 
@@ -57,14 +146,47 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
     });
   }
 
-  // 3. Choose output path.
+  // 3. Persist SRT + build caption style if captions are enabled.
+  let ipcCaptionSettings:
+    | {
+        enabled: boolean;
+        srtPath: string;
+        ffmpegStyle: string;
+      }
+    | undefined = undefined;
+  if (
+    captionSettings?.enabled &&
+    subtitles &&
+    subtitles.cues.length > 0 &&
+    api.saveTempSrt
+  ) {
+    const srtPath = await api.saveTempSrt({
+      name: subtitles.fileName || "subs.srt",
+      text: subtitles.rawText,
+    });
+    const ffmpegStyle = buildCaptionFfmpegStyle({
+      presetId: captionSettings.presetId,
+      fontId: captionSettings.fontId,
+      customColor: captionSettings.customColor,
+      customPosition: captionSettings.customPosition,
+      fontSizeScale: captionSettings.fontSizeScale,
+      videoHeight: dims.h,
+    });
+    ipcCaptionSettings = {
+      enabled: true,
+      srtPath,
+      ffmpegStyle,
+    };
+  }
+
+  // 4. Choose output path.
   const outputPath = await api.chooseOutput();
   if (!outputPath) {
     await api.cleanupTemp();
     throw new Error("Export cancelled");
   }
 
-  // 4. Subscribe to progress.
+  // 5. Subscribe to progress.
   const unsubscribe = api.onExportProgress((d: ExportProgress) => {
     onProgress?.(d);
   });
@@ -87,6 +209,7 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
       kenBurns,
       segments: segPayload,
       audioPath,
+      captionSettings: ipcCaptionSettings,
     });
     return result;
   } finally {
@@ -102,8 +225,17 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
 async function exportViaWebCodecs(
   opts: ExportNativeOptions,
 ): Promise<ExportResult> {
-  const { segments, imageUrls, settings, kenBurns, totalMs, onProgress, signal } =
-    opts;
+  const {
+    segments,
+    imageUrls,
+    settings,
+    kenBurns,
+    totalMs,
+    onProgress,
+    signal,
+    subtitles,
+    captionSettings,
+  } = opts;
 
   const W = typeof window !== "undefined" ? (window as any) : null;
   const VideoEncoderCtor = W?.VideoEncoder;
@@ -170,6 +302,16 @@ async function exportViaWebCodecs(
 
   const frameDurationUs = Math.round(1_000_000 / fps);
 
+  // Precompute caption drawing options once.
+  const drawCaptions =
+    captionSettings?.enabled && subtitles && subtitles.cues.length > 0
+      ? (currentMsLocal: number) => {
+          const cue = cueAt(subtitles.cues, currentMsLocal);
+          if (!cue) return;
+          drawCaption(ctx, cue.text, captionSettings, dims.w, dims.h);
+        }
+      : null;
+
   for (let i = 0; i < totalFrames; i++) {
     if (signal?.aborted) {
       try {
@@ -187,6 +329,7 @@ async function exportViaWebCodecs(
       segments[segments.length - 1];
     const img = seg ? imgCache.get(seg.id) : null;
     if (seg) drawFrame(ctx, img ?? null, seg, currentMs, dims.w, dims.h, kenBurns);
+    if (drawCaptions) drawCaptions(currentMs);
 
     const frame = new VideoFrameCtor(canvas, {
       timestamp: i * frameDurationUs,
@@ -229,8 +372,17 @@ async function exportViaWebCodecs(
 async function exportViaMediaRecorder(
   opts: ExportNativeOptions,
 ): Promise<ExportResult> {
-  const { segments, imageUrls, settings, kenBurns, totalMs, onProgress, signal } =
-    opts;
+  const {
+    segments,
+    imageUrls,
+    settings,
+    kenBurns,
+    totalMs,
+    onProgress,
+    signal,
+    subtitles,
+    captionSettings,
+  } = opts;
 
   const dims = resolveDimensions(settings.aspect, "720p");
   const fps = settings.fps;
@@ -284,6 +436,15 @@ async function exportViaMediaRecorder(
   recorder.start();
   const start = performance.now();
 
+  const drawCaptionsMR =
+    captionSettings?.enabled && subtitles && subtitles.cues.length > 0
+      ? (currentMsLocal: number) => {
+          const cue = cueAt(subtitles.cues, currentMsLocal);
+          if (!cue) return;
+          drawCaption(ctx, cue.text, captionSettings, dims.w, dims.h);
+        }
+      : null;
+
   await new Promise<void>((resolve) => {
     const tick = () => {
       const elapsed = performance.now() - start;
@@ -294,6 +455,7 @@ async function exportViaMediaRecorder(
       const img = seg ? imgCache.get(seg.id) : null;
       if (seg)
         drawFrame(ctx, img ?? null, seg, currentMs, dims.w, dims.h, kenBurns);
+      if (drawCaptionsMR) drawCaptionsMR(currentMs);
 
       onProgress?.({
         progress: Math.min(100, (currentMs / totalMs) * 100),
@@ -338,6 +500,220 @@ function triggerDownload(url: string, filename: string): void {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
+}
+
+// ---------------------------------------------------------------------------
+// Canvas caption drawing — used by both the preview and the WebCodecs /
+// MediaRecorder browser exporters. The Electron FFmpeg path uses libass
+// instead (see buildCaptionFfmpegStyle).
+// ---------------------------------------------------------------------------
+
+interface CanvasCaptionCtx {
+  enabled: boolean;
+  presetId: string;
+  fontId: string;
+  customColor: string | null;
+  customPosition: "top" | "center" | "bottom" | null;
+  fontSizeScale: number;
+}
+
+/**
+ * Draw a caption text onto a 2D canvas context using the active preset.
+ *
+ * Layout strategy:
+ *   1. Apply text-transform (uppercase/lowercase).
+ *   2. Wrap text using measureText to fit maxWidth.
+ *   3. Compute total text block height.
+ *   4. Compute anchor Y based on preset.position + positionY.
+ *   5. If preset.bgColor → draw a rounded rect behind the text.
+ *   6. If preset.borderColor → stroke the text (canvas supports strokeText).
+ *   7. If preset.shadow → enable ctx.shadowBlur/shadowColor before fill.
+ *   8. fillText each wrapped line.
+ */
+export function drawCaption(
+  ctx: CanvasRenderingContext2D,
+  rawText: string,
+  caption: CanvasCaptionCtx,
+  cw: number,
+  ch: number,
+): void {
+  if (!caption?.enabled) return;
+  const text = rawText ?? "";
+  if (!text) return;
+
+  const preset = getCaptionPreset(caption.presetId);
+  const font = getFontOption(caption.fontId);
+  const textColor = caption.customColor || preset.textColor;
+  const position = caption.customPosition || preset.position;
+  const scale = caption.fontSizeScale || 1;
+
+  // Font size: fraction of canvas height.
+  const fontPx = Math.max(8, Math.round(preset.fontSize * ch * scale));
+  const weight = preset.fontWeight;
+  const italic = preset.fontStyle === "italic" ? "italic " : "";
+  ctx.font = `${italic}${weight} ${fontPx}px ${font.stack}`;
+  ctx.textBaseline = "top";
+
+  // Letter spacing (modern canvas API — guarded).
+  try {
+    (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
+      `${preset.letterSpacing}px`;
+  } catch {
+    /* not supported — ignore */
+  }
+
+  // Text transform.
+  let display = text;
+  if (preset.textTransform === "uppercase") display = text.toUpperCase();
+  else if (preset.textTransform === "lowercase") display = text.toLowerCase();
+
+  // Wrap.
+  const maxW = Math.max(40, preset.maxWidth * cw);
+  const lineHeight = Math.round(fontPx * 1.25);
+  const lines = wrapText(ctx, display, maxW);
+  if (lines.length === 0) return;
+
+  const blockH = lines.length * lineHeight;
+  const padding = Math.round((preset.bgPadding / 1080) * ch);
+  const radius = Math.round((preset.bgRadius / 1080) * ch);
+  const maxWidthLine = Math.max(...lines.map((l) => ctx.measureText(l).width));
+
+  // Anchor Y for the text block (top of block).
+  const positionYpx = Math.round((preset.positionY / 1080) * ch);
+  let blockTop: number;
+  if (position === "top") {
+    blockTop = positionYpx;
+  } else if (position === "center") {
+    blockTop = (ch - blockH) / 2 + positionYpx;
+  } else {
+    blockTop = ch - blockH - positionYpx;
+  }
+
+  // Horizontal anchor.
+  const blockLeft = (cw - maxWidthLine) / 2;
+  const blockRight = blockLeft + maxWidthLine;
+
+  // Alignment per-line (left/center/right).
+  const alignLineX = (line: string): number => {
+    const w = ctx.measureText(line).width;
+    if (preset.alignment === "left") return blockLeft;
+    if (preset.alignment === "right") return blockRight - w;
+    return (cw - w) / 2;
+  };
+
+  // Background box.
+  if (preset.bgColor) {
+    const boxX = blockLeft - padding;
+    const boxY = blockTop - padding;
+    const boxW = maxWidthLine + padding * 2;
+    const boxH = blockH + padding * 2;
+    ctx.save();
+    ctx.globalAlpha = preset.bgAlpha;
+    ctx.fillStyle = preset.bgColor;
+    drawRoundedRect(ctx, boxX, boxY, boxW, boxH, radius);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Shadow + border + fill per line.
+  ctx.save();
+  if (preset.shadow) {
+    ctx.shadowColor = preset.shadowColor;
+    ctx.shadowBlur = preset.shadowBlur * (ch / 540);
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 0;
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const x = alignLineX(line);
+    const y = blockTop + i * lineHeight;
+
+    // Border (outline) — drawn first so fillText covers the inner pixels.
+    if (preset.borderColor && preset.borderWidth > 0) {
+      ctx.lineJoin = "round";
+      ctx.strokeStyle = preset.borderColor;
+      ctx.lineWidth = Math.max(
+        1,
+        (preset.borderWidth / 1080) * ch * 2,
+      );
+      ctx.strokeText(line, x, y);
+    }
+
+    ctx.fillStyle = textColor;
+    ctx.fillText(line, x, y);
+  }
+  ctx.restore();
+
+  // Reset letterSpacing to avoid leaking into other draws.
+  try {
+    (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
+      "0px";
+  } catch {
+    /* noop */
+  }
+}
+
+/** Word-wrap text to fit within maxW using the current ctx font. */
+function wrapText(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  maxW: number,
+): string[] {
+  const out: string[] = [];
+  const paragraphs = text.split("\n");
+  for (const para of paragraphs) {
+    if (!para) {
+      out.push("");
+      continue;
+    }
+    const words = para.split(/\s+/);
+    let line = "";
+    for (const word of words) {
+      const candidate = line ? `${line} ${word}` : word;
+      const w = ctx.measureText(candidate).width;
+      if (w > maxW && line) {
+        out.push(line);
+        line = word;
+      } else {
+        line = candidate;
+      }
+    }
+    if (line) out.push(line);
+  }
+  return out;
+}
+
+/** Cross-browser rounded-rect path helper. */
+function drawRoundedRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number,
+): void {
+  const radius = Math.max(0, Math.min(r, Math.min(w, h) / 2));
+  // Prefer the modern roundRect when available.
+  const anyCtx = ctx as CanvasRenderingContext2D & {
+    roundRect?: (x: number, y: number, w: number, h: number, r: number) => void;
+  };
+  if (typeof anyCtx.roundRect === "function") {
+    ctx.beginPath();
+    anyCtx.roundRect(x, y, w, h, radius);
+    return;
+  }
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.lineTo(x + w - radius, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
+  ctx.lineTo(x + w, y + h - radius);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+  ctx.lineTo(x + radius, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
+  ctx.lineTo(x, y + radius);
+  ctx.quadraticCurveTo(x, y, x + radius, y);
+  ctx.closePath();
 }
 
 /**

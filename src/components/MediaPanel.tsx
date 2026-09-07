@@ -16,12 +16,15 @@ import {
   GripVertical,
   ChevronDown,
   ChevronRight,
+  Captions,
+  FileText,
 } from "lucide-react";
 import type {
   MediaSegment,
   TimelineMode,
   AudioTrack,
   OverlapWarning,
+  SubtitleFile,
 } from "@/lib/merger/types";
 import { fmtTimecode } from "@/lib/merger/timeline";
 import { cn } from "@/lib/utils";
@@ -30,13 +33,16 @@ interface MediaPanelProps {
   segments: MediaSegment[];
   mode: TimelineMode | null;
   audioTrack: AudioTrack | null;
+  subtitles: SubtitleFile | null;
   skipped: string[];
   warnings: OverlapWarning[];
   onAddFiles: (files: File[]) => void;
   onLoadSamples: () => void;
   openImagePicker: () => void;
   openAudioPicker: () => void;
+  openSubtitlePicker: () => void;
   onRemoveAudio: () => void;
+  onRemoveSubtitles: () => void;
   onRemove: (id: string) => void;
   onOverride: (id: string, durationMs: number) => void;
   onClearOverride: (id: string) => void;
@@ -60,13 +66,16 @@ export function MediaPanelBase({
   segments,
   mode,
   audioTrack,
+  subtitles,
   skipped,
   warnings,
   onAddFiles,
   onLoadSamples,
   openImagePicker,
   openAudioPicker,
+  openSubtitlePicker,
   onRemoveAudio,
+  onRemoveSubtitles,
   onRemove,
   onOverride,
   onClearOverride,
@@ -131,6 +140,29 @@ export function MediaPanelBase({
           }}
         >
           <Music className="size-3.5" /> Add Audio
+        </button>
+        <button
+          type="button"
+          onClick={openSubtitlePicker}
+          className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-[12px] font-medium transition-colors"
+          style={{
+            borderColor: "#3f3f46",
+            backgroundColor: "#27272a",
+            color: "#e4e4e7",
+          }}
+        >
+          <Captions className="size-3.5" /> Subtitles
+          {subtitles && subtitles.cues.length > 0 && (
+            <span
+              className="ml-0.5 rounded-full px-1.5 py-0.5 text-[9px] font-bold"
+              style={{
+                backgroundColor: "rgba(124, 58, 237, 0.3)",
+                color: "#ddd6fe",
+              }}
+            >
+              {subtitles.cues.length}
+            </span>
+          )}
         </button>
         <div className="flex-1" />
         <span className="text-[11px]" style={{ color: "#71717a" }}>
@@ -429,6 +461,66 @@ export function MediaPanelBase({
                   <Trash2 className="size-3.5" />
                 </button>
               </div>
+            )}
+
+            {/* Subtitles chip */}
+            {subtitles && subtitles.cues.length > 0 && (
+              <div
+                className="flex items-center gap-2.5 rounded-lg border p-2"
+                style={{
+                  borderColor: "#27272a",
+                  backgroundColor: "#18181b",
+                }}
+              >
+                <div
+                  className="flex size-10 shrink-0 items-center justify-center rounded-md"
+                  style={{ backgroundColor: "rgba(76, 29, 149, 0.4)" }}
+                >
+                  <Captions className="size-4" style={{ color: "#c4b5fd" }} />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div
+                    className="truncate text-[11px]"
+                    style={{ color: "#d4d4d8" }}
+                    title={subtitles.fileName}
+                  >
+                    {subtitles.fileName}
+                  </div>
+                  <div className="text-[9px]" style={{ color: "#52525b" }}>
+                    subtitles · {subtitles.cues.length} cue
+                    {subtitles.cues.length === 1 ? "" : "s"}
+                    {subtitles.cues.length > 0
+                      ? ` · ${fmtTimecode(subtitles.cues[subtitles.cues.length - 1].endMs)}`
+                      : ""}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={onRemoveSubtitles}
+                  className="shrink-0 rounded p-1 transition-colors"
+                  style={{ color: "#52525b" }}
+                  title="Remove subtitles"
+                >
+                  <Trash2 className="size-3.5" />
+                </button>
+              </div>
+            )}
+
+            {/* Empty subtitles hint when none loaded */}
+            {!subtitles && (
+              <button
+                type="button"
+                onClick={openSubtitlePicker}
+                className="flex items-center gap-2 rounded-lg border border-dashed p-2 text-[11px] transition-colors"
+                style={{
+                  borderColor: "#27272a",
+                  color: "#71717a",
+                  backgroundColor: "transparent",
+                }}
+              >
+                <FileText className="size-3.5" />
+                <span>Add an .srt subtitle file</span>
+              </button>
             )}
 
             {/* Warnings */}

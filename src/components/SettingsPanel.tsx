@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   ZoomIn,
   ZoomOut,
@@ -13,15 +13,24 @@ import {
   Bug,
   Aperture,
   ChevronRight,
+  Captions,
+  Type,
 } from "lucide-react";
 import type {
   AspectRatio,
+  CaptionSettings,
   KenBurnsConfig,
   KenBurnsDirection,
   Resolution,
+  SubtitleFile,
   VideoSettings,
   TimelineMode,
 } from "@/lib/merger/types";
+import {
+  CAPTION_PRESETS,
+  FONT_OPTIONS,
+  getCaptionPreset,
+} from "@/lib/merger/captionPresets";
 import { fmtTimecode } from "@/lib/merger/timeline";
 import { cn } from "@/lib/utils";
 
@@ -30,6 +39,9 @@ interface SettingsPanelProps {
   settings: VideoSettings;
   onKenBurnsChange: (k: KenBurnsConfig) => void;
   onSettingsChange: (s: VideoSettings) => void;
+  captionSettings: CaptionSettings;
+  onCaptionSettingsChange: (c: CaptionSettings) => void;
+  subtitles: SubtitleFile | null;
   debug: {
     imageCount: number;
     mode: TimelineMode | null;
@@ -69,6 +81,9 @@ export function SettingsPanel({
   settings,
   onKenBurnsChange,
   onSettingsChange,
+  captionSettings,
+  onCaptionSettingsChange,
+  subtitles,
   debug,
 }: SettingsPanelProps) {
   return (
@@ -272,6 +287,13 @@ export function SettingsPanel({
         </div>
       </Section>
 
+      {/* Captions */}
+      <CaptionsSection
+        captionSettings={captionSettings}
+        onCaptionSettingsChange={onCaptionSettingsChange}
+        subtitles={subtitles}
+      />
+
       {/* Debug */}
       <Section
         icon={Bug}
@@ -442,5 +464,339 @@ function Row({
         {value}
       </dd>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Captions section — preset grid, font dropdown, color override, position
+// override, font size scale. Self-contained, calls onCaptionSettingsChange
+// with the next immutable CaptionSettings object.
+// ---------------------------------------------------------------------------
+
+const POSITION_OPTIONS: {
+  value: "top" | "center" | "bottom";
+  label: string;
+}[] = [
+  { value: "top", label: "Top" },
+  { value: "center", label: "Center" },
+  { value: "bottom", label: "Bottom" },
+];
+
+function CaptionsSection({
+  captionSettings,
+  onCaptionSettingsChange,
+  subtitles,
+}: {
+  captionSettings: CaptionSettings;
+  onCaptionSettingsChange: (c: CaptionSettings) => void;
+  subtitles: SubtitleFile | null;
+}) {
+  const set = (patch: Partial<CaptionSettings>) =>
+    onCaptionSettingsChange({ ...captionSettings, ...patch });
+
+  const cueCount = subtitles?.cues.length ?? 0;
+  const lastEnd = cueCount
+    ? fmtTimecode(subtitles!.cues[cueCount - 1].endMs)
+    : "—";
+
+  const selectedPreset = useMemo(
+    () => getCaptionPreset(captionSettings.presetId),
+    [captionSettings.presetId],
+  );
+
+  const hasSubtitles = cueCount > 0;
+  const isEnabled = captionSettings.enabled;
+
+  return (
+    <Section
+      icon={Captions}
+      title="Captions"
+      accentColor="#f0abfc"
+      defaultOpen={false}
+    >
+      {/* Enable toggle + subtitle status */}
+      <div className="flex items-center justify-between">
+        <div className="flex flex-col">
+          <span className="text-[12px]" style={{ color: "#d4d4d8" }}>
+            Burn in captions
+          </span>
+          <span className="text-[10px]" style={{ color: "#71717a" }}>
+            {hasSubtitles
+              ? `${cueCount} cue${cueCount === 1 ? "" : "s"} · ends ${lastEnd}`
+              : "Add an .srt file from the media panel"}
+          </span>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={isEnabled}
+          onClick={() => set({ enabled: !isEnabled })}
+          disabled={!hasSubtitles}
+          className="relative h-5 w-9 rounded-full transition-colors disabled:opacity-40"
+          style={{
+            backgroundColor: isEnabled ? "#7c3aed" : "#3f3f46",
+          }}
+        >
+          <span
+            className={cn(
+              "absolute top-0.5 size-4 rounded-full bg-white transition-transform",
+              isEnabled ? "translate-x-4" : "translate-x-0.5",
+            )}
+          />
+        </button>
+      </div>
+
+      <div
+        className={cn(
+          "space-y-3",
+          !isEnabled && "pointer-events-none opacity-40",
+        )}
+      >
+        {/* Preset grid */}
+        <Field label="Style preset">
+          <div className="grid max-h-56 grid-cols-1 gap-1.5 overflow-y-auto pr-1">
+            {CAPTION_PRESETS.map((p) => {
+              const active = p.id === captionSettings.presetId;
+              const sampleText = "The quick brown fox";
+              const sampleStyle: React.CSSProperties = {
+                color: p.textColor,
+                backgroundColor: p.bgColor ?? "transparent",
+                padding: p.bgColor
+                  ? `${Math.max(2, p.bgPadding / 4)}px ${Math.max(4, p.bgPadding / 3)}px`
+                  : "0",
+                borderRadius: p.bgRadius ? Math.max(2, p.bgRadius / 3) : 0,
+                fontWeight: p.fontWeight,
+                fontStyle: p.fontStyle,
+                fontFamily: p.fontFamily,
+                letterSpacing: p.letterSpacing,
+                textTransform: p.textTransform,
+                textShadow: p.shadow
+                  ? `0 0 ${p.shadowBlur}px ${p.shadowColor}`
+                  : undefined,
+                border: p.borderColor
+                  ? `${Math.max(1, p.borderWidth / 2)}px solid ${p.borderColor}`
+                  : undefined,
+                fontSize: 11,
+                display: "inline-block",
+                opacity: p.bgColor ? p.bgAlpha : 1,
+              };
+              return (
+                <button
+                  key={p.id}
+                  type="button"
+                  onClick={() => set({ presetId: p.id })}
+                  className={cn(
+                    "flex items-center justify-between gap-2 rounded-md border px-2.5 py-2 text-left transition-all",
+                  )}
+                  style={
+                    active
+                      ? {
+                          borderColor: "#7c3aed",
+                          backgroundColor: "rgba(76, 29, 149, 0.35)",
+                        }
+                      : {
+                          borderColor: "#27272a",
+                          backgroundColor: "#18181b",
+                        }
+                  }
+                >
+                  <div className="flex min-w-0 flex-1 items-center gap-2">
+                    <div
+                      className="flex h-6 min-w-[60px] items-center justify-center rounded px-1"
+                      style={{ backgroundColor: "#000000" }}
+                    >
+                      <span style={sampleStyle}>{sampleText}</span>
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div
+                        className="truncate text-[11px] font-semibold"
+                        style={{ color: active ? "#ddd6fe" : "#d4d4d8" }}
+                      >
+                        {p.name}
+                      </div>
+                      <div
+                        className="truncate text-[9px]"
+                        style={{ color: "#71717a" }}
+                      >
+                        {p.description}
+                      </div>
+                    </div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </Field>
+
+        {/* Font selector */}
+        <Field label="Font family">
+          <div className="relative">
+            <select
+              value={captionSettings.fontId}
+              onChange={(e) => set({ fontId: e.target.value })}
+              className="w-full appearance-none rounded-md border px-3 py-2 text-[12px] outline-none"
+              style={{
+                borderColor: "#3f3f46",
+                backgroundColor: "#09090b",
+                color: "#e4e4e7",
+              }}
+            >
+              {FONT_OPTIONS.map((f) => (
+                <option key={f.id} value={f.id}>
+                  {f.name}
+                </option>
+              ))}
+            </select>
+            <Type
+              className="pointer-events-none absolute right-2.5 top-1/2 size-3.5 -translate-y-1/2"
+              style={{ color: "#71717a" }}
+            />
+          </div>
+        </Field>
+
+        {/* Color override */}
+        <Field label="Text color override">
+          <div className="flex items-center gap-2">
+            <label
+              className="relative flex h-8 flex-1 cursor-pointer items-center gap-2 rounded-md border px-2"
+              style={{
+                borderColor: "#3f3f46",
+                backgroundColor: "#18181b",
+              }}
+            >
+              <span
+                className="size-5 shrink-0 rounded border"
+                style={{
+                  backgroundColor: captionSettings.customColor ||
+                    selectedPreset.textColor,
+                  borderColor: "#3f3f46",
+                }}
+              />
+              <span
+                className="flex-1 truncate font-mono text-[11px]"
+                style={{ color: "#d4d4d8" }}
+              >
+                {captionSettings.customColor ||
+                  `${selectedPreset.textColor} (preset)`}
+              </span>
+              <input
+                type="color"
+                value={captionSettings.customColor || selectedPreset.textColor}
+                onChange={(e) => set({ customColor: e.target.value })}
+                className="absolute inset-0 size-full cursor-pointer opacity-0"
+              />
+            </label>
+            {captionSettings.customColor && (
+              <button
+                type="button"
+                onClick={() => set({ customColor: null })}
+                className="rounded-md border px-2 py-1 text-[10px]"
+                style={{
+                  borderColor: "#3f3f46",
+                  backgroundColor: "#18181b",
+                  color: "#a1a1aa",
+                }}
+              >
+                Reset
+              </button>
+            )}
+          </div>
+        </Field>
+
+        {/* Position override */}
+        <Field label="Position override">
+          <div className="flex gap-1.5">
+            {POSITION_OPTIONS.map((opt) => {
+              const active =
+                captionSettings.customPosition === opt.value ||
+                (!captionSettings.customPosition &&
+                  selectedPreset.position === opt.value);
+              const isPresetDefault =
+                !captionSettings.customPosition &&
+                selectedPreset.position === opt.value;
+              return (
+                <button
+                  key={opt.value}
+                  type="button"
+                  onClick={() => set({ customPosition: opt.value })}
+                  className={cn(
+                    "flex-1 rounded-md border py-1.5 text-[11px] font-medium transition-all",
+                  )}
+                  style={
+                    active
+                      ? {
+                          borderColor: "#7c3aed",
+                          backgroundColor: "rgba(76, 29, 149, 0.4)",
+                          color: "#ddd6fe",
+                        }
+                      : {
+                          borderColor: "#27272a",
+                          backgroundColor: "#18181b",
+                          color: "#a1a1aa",
+                        }
+                  }
+                >
+                  {opt.label}
+                  {isPresetDefault && (
+                    <span
+                      className="ml-1 text-[8px] uppercase opacity-70"
+                      title="preset default"
+                    >
+                      ·
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+          {captionSettings.customPosition && (
+            <button
+              type="button"
+              onClick={() => set({ customPosition: null })}
+              className="mt-1.5 text-[10px]"
+              style={{ color: "#71717a" }}
+            >
+              ↩ Reset to preset position ({selectedPreset.position})
+            </button>
+          )}
+        </Field>
+
+        {/* Font size scale */}
+        <div>
+          <div className="mb-1.5 flex items-center justify-between">
+            <span className="text-[11px]" style={{ color: "#a1a1aa" }}>
+              Font size scale
+            </span>
+            <span
+              className="font-mono text-[11px] tabular-nums"
+              style={{ color: "#c4b5fd" }}
+            >
+              {captionSettings.fontSizeScale.toFixed(2)}×
+            </span>
+          </div>
+          <input
+            type="range"
+            min={0.5}
+            max={2}
+            step={0.05}
+            value={captionSettings.fontSizeScale}
+            onChange={(e) =>
+              set({ fontSizeScale: Number(e.target.value) })
+            }
+            style={{
+              background: `linear-gradient(to right, #7c3aed ${((captionSettings.fontSizeScale - 0.5) / 1.5) * 100}%, #3f3f46 ${((captionSettings.fontSizeScale - 0.5) / 1.5) * 100}%)`,
+            }}
+          />
+          <div
+            className="mt-1 flex justify-between text-[9px]"
+            style={{ color: "#52525b" }}
+          >
+            <span>0.5×</span>
+            <span>1×</span>
+            <span>2×</span>
+          </div>
+        </div>
+      </div>
+    </Section>
   );
 }

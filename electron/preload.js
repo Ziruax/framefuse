@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   saveTempImage: (payload) => ipcRenderer.invoke("save-temp-image", payload),
   saveTempAudio: (payload) => ipcRenderer.invoke("save-temp-audio", payload),
+  saveTempSrt: (payload) => ipcRenderer.invoke("save-temp-srt", payload),
 
   chooseOutput: () => ipcRenderer.invoke("choose-output"),
 

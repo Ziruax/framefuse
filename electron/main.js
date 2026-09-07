@@ -95,6 +95,16 @@ ipcMain.handle("save-temp-audio", async (_evt, { name, bytes }) => {
   return p;
 });
 
+ipcMain.handle("save-temp-srt", async (_evt, { name, text }) => {
+  ensureTempDir();
+  const safeName = String(name || "subs.srt").replace(/[\\/:*?"<>|]/g, "_");
+  const ext = path.extname(safeName) || ".srt";
+  const p = path.join(tempDir, `srt_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
+  // Always write SRT as UTF-8 (libass expects UTF-8).
+  fs.writeFileSync(p, String(text || ""), "utf-8");
+  return p;
+});
+
 ipcMain.handle("cleanup-temp", async () => {
   try { if (fs.existsSync(tempDir)) for (const f of fs.readdirSync(tempDir)) try { fs.unlinkSync(path.join(tempDir, f)); } catch (_) {} return true; } catch { return false; }
 });
@@ -126,7 +136,7 @@ ipcMain.handle("cancel-export", async () => {
 // Step 2: Concat all clips + mux audio (-c copy, instant)
 // ---------------------------------------------------------------------------
 ipcMain.handle("export-native", async (event, opts) => {
-  const { outputPath, fps, width, height, bitrateMbps, kenBurns, segments, audioPath } = opts;
+  const { outputPath, fps, width, height, bitrateMbps, kenBurns, segments, audioPath, captionSettings } = opts;
 
   if (!outputPath) throw new Error("No output path");
   if (!segments || segments.length === 0) throw new Error("No segments");
@@ -135,6 +145,14 @@ ipcMain.handle("export-native", async (event, opts) => {
   const zoomMax = 1.06 + (intensity / 100) * 0.18;
   const enabled = !!kenBurns?.enabled;
   const globalDir = kenBurns?.direction || "in";
+
+  // Caption settings: if enabled and an SRT path was provided, burn it in.
+  const captionsEnabled =
+    !!captionSettings &&
+    !!captionSettings.enabled &&
+    typeof captionSettings.srtPath === "string" &&
+    captionSettings.srtPath.length > 0;
+  const captionStyle = captionsEnabled ? (captionSettings.ffmpegStyle || "") : "";
 
   ensureTempDir();
   const tempFiles = [];
@@ -276,6 +294,8 @@ ipcMain.handle("export-native", async (event, opts) => {
     fs.writeFileSync(concatListPath, concatContent, "utf-8");
 
     // Build concat args — use -c copy for video (instant, no re-encode)
+    // UNLESS captions need to be burned in, in which case we re-encode the
+    // concatenated stream with a subtitles filter.
     const concatArgs = [
       "-f", "concat", "-safe", "0", "-i", concatListPath,
     ];
@@ -284,8 +304,20 @@ ipcMain.handle("export-native", async (event, opts) => {
       concatArgs.push("-i", audioPath);
     }
 
-    // -c copy = no re-encoding (instant concat)
-    concatArgs.push("-c:v", "copy");
+    if (captionsEnabled) {
+      // libass subtitles filter — escape backslashes and colons in the SRT path
+      // for Windows compatibility. The filename= parameter is required when the
+      // path contains special characters; force_style applies the preset styling.
+      const escapedSrt = captionSettings.srtPath
+        .replace(/\\/g, "\\\\")
+        .replace(/:/g, "\\:");
+      const vf = `subtitles=filename='${escapedSrt}':force_style='${captionStyle}'`;
+      concatArgs.push("-vf", vf);
+      // Re-encode the video so the filter is applied.
+      concatArgs.push("-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-pix_fmt", "yuv420p");
+    } else {
+      concatArgs.push("-c:v", "copy");
+    }
 
     if (audioPath) {
       concatArgs.push("-c:a", "aac", "-b:a", "192k", "-shortest");

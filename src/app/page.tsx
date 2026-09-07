@@ -22,12 +22,16 @@ import {
   type TimelineEntry,
 } from "@/lib/merger/timeline";
 import { exportNative, isElectron } from "@/lib/merger/native";
-import type {
-  AudioTrack,
-  ExportProgress,
-  KenBurnsConfig,
-  MediaSegment,
-  VideoSettings,
+import { parseSrt, serializeSrt } from "@/lib/merger/subtitles";
+import {
+  defaultCaptionSettings,
+  type AudioTrack,
+  type CaptionSettings,
+  type ExportProgress,
+  type KenBurnsConfig,
+  type MediaSegment,
+  type SubtitleFile,
+  type VideoSettings,
 } from "@/lib/merger/types";
 
 interface MediaItem {
@@ -46,6 +50,7 @@ export default function Page() {
   // ---- Source data --------------------------------------------------------
   const [items, setItems] = useState<MediaItem[]>([]);
   const [audioTrack, setAudioTrack] = useState<AudioTrack | null>(null);
+  const [subtitles, setSubtitles] = useState<SubtitleFile | null>(null);
   const [overrides, setOverrides] = useState<Record<string, number>>({});
 
   // ---- Audio playback (synced with preview) -------------------------------
@@ -63,6 +68,9 @@ export default function Page() {
     bitrateMbps: 8,
     fps: 30,
   });
+  const [captionSettings, setCaptionSettings] = useState<CaptionSettings>(
+    defaultCaptionSettings(),
+  );
 
   // ---- Playback -----------------------------------------------------------
   const [isPlaying, setIsPlaying] = useState(false);
@@ -81,8 +89,13 @@ export default function Page() {
   // ---- File pickers (page-level so the app menu can trigger them) ---------
   const imageInputRef = useRef<HTMLInputElement>(null);
   const audioInputRef = useRef<HTMLInputElement>(null);
+  const subtitleInputRef = useRef<HTMLInputElement>(null);
   const openImagePicker = useCallback(() => imageInputRef.current?.click(), []);
   const openAudioPicker = useCallback(() => audioInputRef.current?.click(), []);
+  const openSubtitlePicker = useCallback(
+    () => subtitleInputRef.current?.click(),
+    [],
+  );
 
   // ---- Loaded HTMLImageElements for canvas drawing ------------------------
   const imagesRef = useRef<Record<string, HTMLImageElement>>({});
@@ -210,6 +223,12 @@ export default function Page() {
       toast.error("Add images first");
       return;
     }
+    // If captions are enabled but no subtitles are loaded, warn (don't abort).
+    if (captionSettings.enabled && (!subtitles || subtitles.cues.length === 0)) {
+      toast.info("Captions enabled but no .srt loaded", {
+        description: "Add a subtitle file from the media panel to burn in captions.",
+      });
+    }
     const ac = new AbortController();
     abortRef.current = ac;
     setIsExporting(true);
@@ -227,6 +246,8 @@ export default function Page() {
         settings,
         kenBurns,
         totalMs: timeline.totalMs,
+        subtitles,
+        captionSettings,
         onProgress: (p) => setExportProgress(p),
         signal: ac.signal,
       });
@@ -255,6 +276,8 @@ export default function Page() {
     audioTrack,
     settings,
     kenBurns,
+    subtitles,
+    captionSettings,
     inElectron,
   ]);
 
@@ -320,6 +343,48 @@ export default function Page() {
       return { fileName: file.name, url, durationMs: null };
     });
     toast.success(`Audio: ${file.name}`);
+  }, []);
+
+  // ---- Subtitle (.srt) loading -------------------------------------------
+  const addSubtitles = useCallback(
+    (file: File) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const rawText = String(reader.result || "");
+        const cues = parseSrt(rawText);
+        if (cues.length === 0) {
+          toast.error("No subtitle cues found", {
+            description:
+              "Make sure the .srt file has standard timecodes (00:00:01,000 --> 00:00:04,000).",
+          });
+          return;
+        }
+        // Re-serialize from parsed cues so the FFmpeg-side SRT is always
+        // well-formed (normalised line endings, 3-digit ms).
+        const normalized = serializeSrt(cues);
+        setSubtitles({
+          fileName: file.name,
+          cues,
+          rawText: normalized,
+        });
+        toast.success(`Loaded ${cues.length} subtitle cue${cues.length === 1 ? "" : "s"}`, {
+          description: file.name,
+        });
+        // Auto-enable captions when subtitles are first added.
+        setCaptionSettings((prev) =>
+          prev.enabled ? prev : { ...prev, enabled: true },
+        );
+      };
+      reader.onerror = () => {
+        toast.error("Failed to read subtitle file");
+      };
+      reader.readAsText(file);
+    },
+    [],
+  );
+
+  const removeSubtitles = useCallback(() => {
+    setSubtitles(null);
   }, []);
 
   const loadSamples = useCallback(async () => {
@@ -494,13 +559,16 @@ export default function Page() {
             segments={timeline.segments}
             mode={timeline.mode}
             audioTrack={audioTrack}
+            subtitles={subtitles}
             skipped={allSkipped}
             warnings={timeline.warnings}
             onAddFiles={addFiles}
             onLoadSamples={loadSamples}
             openImagePicker={openImagePicker}
             openAudioPicker={openAudioPicker}
+            openSubtitlePicker={openSubtitlePicker}
             onRemoveAudio={removeAudio}
+            onRemoveSubtitles={removeSubtitles}
             onRemove={removeItem}
             onOverride={overrideDuration}
             onClearOverride={clearOverride}
@@ -523,6 +591,8 @@ export default function Page() {
               kenBurns={kenBurns}
               aspect={settings.aspect}
               activeSegment={activeSegment}
+              subtitles={subtitles}
+              captionSettings={captionSettings}
               onSeek={seek}
               onTogglePlay={togglePlay}
               onStep={stepSegment}
@@ -551,6 +621,9 @@ export default function Page() {
             settings={settings}
             onKenBurnsChange={setKenBurns}
             onSettingsChange={setSettings}
+            captionSettings={captionSettings}
+            onCaptionSettingsChange={setCaptionSettings}
+            subtitles={subtitles}
             debug={debug}
           />
         </section>
@@ -588,6 +661,23 @@ export default function Page() {
         onChange={(e: ChangeEvent<HTMLInputElement>) => {
           const f = e.target.files?.[0];
           if (f) addAudio(f);
+          e.target.value = "";
+        }}
+      />
+      <input
+        ref={subtitleInputRef}
+        type="file"
+        accept=".srt,text/plain,application/x-subrip"
+        style={{
+          position: "absolute",
+          opacity: 0,
+          width: 1,
+          height: 1,
+          pointerEvents: "none",
+        }}
+        onChange={(e: ChangeEvent<HTMLInputElement>) => {
+          const f = e.target.files?.[0];
+          if (f) addSubtitles(f);
           e.target.value = "";
         }}
       />

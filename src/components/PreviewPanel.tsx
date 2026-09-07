@@ -4,10 +4,14 @@ import { useEffect, useRef } from "react";
 import { Play, Pause, SkipBack, SkipForward, ImageOff } from "lucide-react";
 import type {
   AspectRatio,
+  CaptionSettings,
   KenBurnsConfig,
   MediaSegment,
+  SubtitleFile,
 } from "@/lib/merger/types";
 import { drawFrame, previewDimensions } from "@/lib/merger/renderer";
+import { drawCaption } from "@/lib/merger/native";
+import { cueAt } from "@/lib/merger/subtitles";
 import { fmtTimecode } from "@/lib/merger/timeline";
 
 interface PreviewPanelProps {
@@ -19,6 +23,8 @@ interface PreviewPanelProps {
   kenBurns: KenBurnsConfig;
   aspect: AspectRatio;
   activeSegment: MediaSegment | null;
+  subtitles: SubtitleFile | null;
+  captionSettings: CaptionSettings;
   onSeek: (ms: number) => void;
   onTogglePlay: () => void;
   onStep: (dir: -1 | 1) => void;
@@ -33,6 +39,8 @@ export function PreviewPanel({
   kenBurns,
   aspect,
   activeSegment,
+  subtitles,
+  captionSettings,
   onSeek,
   onTogglePlay,
   onStep,
@@ -54,7 +62,28 @@ export function PreviewPanel({
       ctx.fillStyle = "#0a0a0a";
       ctx.fillRect(0, 0, dims.w, dims.h);
     }
-  }, [currentMs, activeSegment, images, kenBurns, dims.w, dims.h]);
+
+    // Overlay caption if enabled + active cue exists.
+    if (
+      captionSettings?.enabled &&
+      subtitles &&
+      subtitles.cues.length > 0
+    ) {
+      const cue = cueAt(subtitles.cues, currentMs);
+      if (cue) {
+        drawCaption(ctx, cue.text, captionSettings, dims.w, dims.h);
+      }
+    }
+  }, [
+    currentMs,
+    activeSegment,
+    images,
+    kenBurns,
+    dims.w,
+    dims.h,
+    subtitles,
+    captionSettings,
+  ]);
 
   const pct = totalMs > 0 ? (currentMs / totalMs) * 100 : 0;
 

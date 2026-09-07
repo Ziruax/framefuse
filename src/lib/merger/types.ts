@@ -99,6 +99,37 @@ export interface ExportResult {
   size: number;
 }
 
+export interface CaptionSettings {
+  enabled: boolean;
+  presetId: string;
+  fontId: string;
+  /** Override the preset's text color (hex) or null to use the preset. */
+  customColor: string | null;
+  /** Override the preset's position or null to use the preset. */
+  customPosition: "top" | "center" | "bottom" | null;
+  /** Font size multiplier 0.5 - 2.0. */
+  fontSizeScale: number;
+}
+
+export function defaultCaptionSettings(): CaptionSettings {
+  return {
+    enabled: false,
+    presetId: "youtube-clean",
+    fontId: "roboto",
+    customColor: null,
+    customPosition: null,
+    fontSizeScale: 1,
+  };
+}
+
+export interface SubtitleFile {
+  fileName: string;
+  /** Parsed cues (already sorted by start time). */
+  cues: import("./subtitles").SubtitleCue[];
+  /** Original raw text — used when writing the temp .srt for FFmpeg. */
+  rawText: string;
+}
+
 export interface ExportNativeOptions {
   segments: MediaSegment[];
   /** segId -> object URL (or data URL) for the image. */
@@ -107,6 +138,9 @@ export interface ExportNativeOptions {
   settings: VideoSettings;
   kenBurns: KenBurnsConfig;
   totalMs: number;
+  /** Optional subtitle track + caption styling for burn-in. */
+  subtitles?: SubtitleFile | null;
+  captionSettings?: CaptionSettings;
   onProgress?: (p: ExportProgress) => void;
   /** When aborted, the export stops as soon as possible. */
   signal?: AbortSignal;
@@ -120,6 +154,7 @@ declare global {
       exportNative: (opts: unknown) => Promise<ExportResult>;
       saveTempImage: (p: { name: string; bytes: ArrayBuffer }) => Promise<string>;
       saveTempAudio: (p: { name: string; bytes: ArrayBuffer }) => Promise<string>;
+      saveTempSrt: (p: { name: string; text: string }) => Promise<string>;
       chooseOutput: () => Promise<string | null>;
       cleanupTemp: () => Promise<boolean>;
       cancelExport: () => Promise<boolean>;
