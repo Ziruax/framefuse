@@ -136,7 +136,7 @@ ipcMain.handle("cancel-export", async () => {
 // Step 2: Concat all clips + mux audio (-c copy, instant)
 // ---------------------------------------------------------------------------
 ipcMain.handle("export-native", async (event, opts) => {
-  const { outputPath, fps, width, height, bitrateMbps, kenBurns, segments, audioPath, captionSettings } = opts;
+  const { outputPath, fps, width, height, bitrateMbps, kenBurns, segments, audioPath, captionSettings, subtitleCues } = opts;
 
   if (!outputPath) throw new Error("No output path");
   if (!segments || segments.length === 0) throw new Error("No segments");
@@ -146,13 +146,8 @@ ipcMain.handle("export-native", async (event, opts) => {
   const enabled = !!kenBurns?.enabled;
   const globalDir = kenBurns?.direction || "in";
 
-  // Caption settings: if enabled and an SRT path was provided, burn it in.
-  const captionsEnabled =
-    !!captionSettings &&
-    !!captionSettings.enabled &&
-    typeof captionSettings.srtPath === "string" &&
-    captionSettings.srtPath.length > 0;
-  const captionStyle = captionsEnabled ? (captionSettings.ffmpegStyle || "") : "";
+  // Caption settings
+  const captionsEnabled = !!captionSettings?.enabled && subtitleCues && subtitleCues.length > 0;
 
   ensureTempDir();
   const tempFiles = [];
@@ -306,16 +301,69 @@ ipcMain.handle("export-native", async (event, opts) => {
     }
 
     if (captionsEnabled) {
-      // libass subtitles filter — escape backslashes and colons in the SRT path
-      const escapedSrt = captionSettings.srtPath
-        .replace(/\\/g, "\\\\")
-        .replace(/:/g, "\\:");
-      const vf = `subtitles=filename='${escapedSrt}':force_style='${captionStyle}'`;
-      concatArgs.push("-vf", vf);
-      // Re-encode with veryfast preset (faster than fast, still good quality)
-      concatArgs.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-threads", "0");
+      // Build drawtext filter chain for each subtitle cue
+      // This renders text directly on the video using FFmpeg's drawtext
+      // which is more reliable than the subtitles/ASS filter
+      const cs = captionSettings;
+      const fontName = cs.fontName || "Arial";
+      const fontSize = Math.round((cs.fontSize || 0.05) * height * (cs.fontSizeScale || 1));
+      const textColor = (cs.textColor || "#FFFFFF").replace("#", "0x");
+      const borderColor = (cs.borderColor || "#000000").replace("#", "0x");
+      const borderWidth = cs.borderWidth || 2;
+      const position = cs.customPosition || cs.position || "bottom";
+      const marginV = cs.positionY || 50;
+
+      const drawtextFilters = [];
+      let cumulativeMs = 0;
+
+      for (const seg of segments) {
+        const segStartMs = cumulativeMs;
+        const segEndMs = cumulativeMs + seg.durationMs;
+        const segStartSec = segStartMs / 1000;
+        const segEndSec = segEndMs / 1000;
+
+        // Find cues that overlap this segment
+        for (const cue of subtitleCues) {
+          if (cue.endMs <= segStartMs || cue.startMs >= segEndMs) continue;
+
+          // Calculate start/end times relative to the concatenated video
+          const cueStartSec = Math.max(cue.startMs, segStartMs) / 1000;
+          const cueEndSec = Math.min(cue.endMs, segEndMs) / 1000;
+
+          // Escape text for drawtext: escape colons, single quotes, backslashes
+          const escapedText = cue.text
+            .replace(/\\/g, "\\\\")
+            .replace(/:/g, "\\:")
+            .replace(/'/g, "\u2019")
+            .replace(/\n/g, " ");
+
+          // Position
+          let yExpr;
+          if (position === "top") {
+            yExpr = `${marginV}`;
+          } else if (position === "center") {
+            yExpr = `(h-text_h)/2`;
+          } else {
+            yExpr = `h-text_h-${marginV}`;
+          }
+
+          const filter = `drawtext=fontfile='':font='${fontName}':fontsize=${fontSize}:fontcolor=${textColor}:bordercolor=${borderColor}:borderw=${borderWidth}:text='${escapedText}':start_number=0:x=(w-text_w)/2:y=${yExpr}:enable='between(t,${cueStartSec.toFixed(3)},${cueEndSec.toFixed(3)})'`;
+
+          drawtextFilters.push(filter);
+        }
+
+        cumulativeMs = segEndMs;
+      }
+
+      if (drawtextFilters.length > 0) {
+        const vf = drawtextFilters.join(",");
+        concatArgs.push("-vf", vf);
+        concatArgs.push("-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-threads", "0");
+      } else {
+        concatArgs.push("-c:v", "copy");
+      }
     } else {
-      // No captions — instant concat with -c copy (no re-encode)
+      // No captions — instant concat with -c copy
       concatArgs.push("-c:v", "copy");
     }
 

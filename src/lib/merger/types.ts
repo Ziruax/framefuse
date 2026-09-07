@@ -116,10 +116,10 @@ export interface CaptionSettings {
 export function defaultCaptionSettings(): CaptionSettings {
   return {
     enabled: false,
-    presetId: "youtube-clean",
+    presetId: "viral-drift",
     fontId: "roboto",
     customColor: null,
-    customPosition: null,
+    customPosition: "center",
     fontSizeScale: 1,
     balancedWrap: true,
   };

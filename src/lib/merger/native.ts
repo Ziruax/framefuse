@@ -146,37 +146,36 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
     });
   }
 
-  // 3. Persist SRT + build caption style if captions are enabled.
-  let ipcCaptionSettings:
-    | {
-        enabled: boolean;
-        srtPath: string;
-        ffmpegStyle: string;
-      }
-    | undefined = undefined;
+  // 3. Build caption payload if captions are enabled.
+  let ipcCaptionSettings: Record<string, unknown> | undefined = undefined;
+  let ipcSubtitleCues: unknown[] | undefined = undefined;
+
   if (
     captionSettings?.enabled &&
     subtitles &&
-    subtitles.cues.length > 0 &&
-    api.saveTempSrt
+    subtitles.cues.length > 0
   ) {
-    const srtPath = await api.saveTempSrt({
-      name: subtitles.fileName || "subs.srt",
-      text: subtitles.rawText,
-    });
-    const ffmpegStyle = buildCaptionFfmpegStyle({
-      presetId: captionSettings.presetId,
-      fontId: captionSettings.fontId,
-      customColor: captionSettings.customColor,
-      customPosition: captionSettings.customPosition,
-      fontSizeScale: captionSettings.fontSizeScale,
-      videoHeight: dims.h,
-    });
+    const preset = getCaptionPreset(captionSettings.presetId);
+    const font = getFontOption(captionSettings.fontId);
+
     ipcCaptionSettings = {
       enabled: true,
-      srtPath,
-      ffmpegStyle,
+      fontName: font.ffmpegName,
+      fontSize: preset.fontSize,
+      fontSizeScale: captionSettings.fontSizeScale || 1,
+      textColor: captionSettings.customColor || preset.textColor,
+      borderColor: preset.borderColor || "#000000",
+      borderWidth: preset.borderWidth,
+      position: preset.position,
+      positionY: preset.positionY,
+      customPosition: captionSettings.customPosition,
     };
+
+    ipcSubtitleCues = subtitles.cues.map((c) => ({
+      startMs: c.startMs,
+      endMs: c.endMs,
+      text: c.text,
+    }));
   }
 
   // 4. Choose output path.
@@ -210,6 +209,7 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
       segments: segPayload,
       audioPath,
       captionSettings: ipcCaptionSettings,
+      subtitleCues: ipcSubtitleCues,
     });
     return result;
   } finally {
