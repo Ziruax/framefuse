@@ -181,25 +181,82 @@ ipcMain.handle("export-native", async (event, opts) => {
 
   // Pre-compute caption config
   let capConfig = null;
+  let assFilePath = null;
   if (captionsEnabled) {
     const cs = captionSettings;
     const fontName = cs.fontName || "Arial";
     const fontSize = Math.round((cs.fontSize || 0.05) * height * (cs.fontSizeScale || 1));
-    const textColor = (cs.textColor || "#FFFFFF").replace("#", "0x");
-    const borderColor = (cs.borderColor || "#000000").replace("#", "0x");
+    const textColor = (cs.textColor || "#FFFFFF");
+    const borderColor = (cs.borderColor || "#000000");
     const borderWidth = cs.borderWidth || 2;
     const position = cs.customPosition || cs.position || "bottom";
     const marginV = cs.positionY || 50;
-    const charWidth = fontSize * 0.6;
-    const maxWidthPx = width * 0.82;
-    const maxCharsPerLine = Math.floor(maxWidthPx / charWidth);
 
-    let yExprCap;
-    if (position === "top") yExprCap = `${marginV}`;
-    else if (position === "center") yExprCap = `(h-text_h)/2`;
-    else yExprCap = `h-text_h-${marginV}`;
+    // Build ASS subtitle file for this export
+    // ASS supports multi-line text, wrapping, colors, positioning natively
+    const assLines = [];
+    assLines.push("[Script Info]");
+    assLines.push("ScriptType: v4.00+");
+    assLines.push(`PlayResX: ${width}`);
+    assLines.push(`PlayResY: ${height}`);
+    assLines.push("WrapStyle: 0"); // 0 = smart wrapping, even lines
+    assLines.push("ScaledBorderAndShadow: yes");
+    assLines.push("");
+    assLines.push("[V4+ Styles]");
+    assLines.push("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding");
+    
+    // Convert hex #RRGGBB to ASS &HAABBGGRR (alpha inverted)
+    const toAssColor = (hex, alpha = 1) => {
+      const h = hex.replace(/^#/, "");
+      const r = h.slice(0, 2);
+      const g = h.slice(2, 4);
+      const b = h.slice(4, 6);
+      const assAlpha = Math.round((1 - alpha) * 255).toString(16).padStart(2, "0").toUpperCase();
+      return `&H${assAlpha}${b}${g}${r}`.toUpperCase();
+    };
 
-    capConfig = { fontName, fontSize, textColor, borderColor, borderWidth, yExprCap, maxCharsPerLine };
+    // Alignment: 1=bottom-left, 2=bottom-center, 3=bottom-right
+    //            4=middle-left, 5=middle-center, 6=middle-right
+    //            7=top-left, 8=top-center, 9=top-right
+    let alignment = 2; // bottom-center default
+    if (position === "top") alignment = 8;
+    else if (position === "center") alignment = 5;
+    
+    const bold = (cs.fontWeight || 600) >= 600 ? -1 : 0;
+    
+    assLines.push(`Style: Default,${fontName},${fontSize},${toAssColor(textColor)},${toAssColor(textColor)},${toAssColor(borderColor)},${toAssColor("#000000", 0.5)},${bold},0,0,0,100,100,0,0,1,${borderWidth},1,${alignment},40,40,${marginV},1`);
+    assLines.push("");
+    assLines.push("[Events]");
+    assLines.push("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text");
+
+    // Add each cue as an ASS dialogue event
+    let cumulativeCueMs = 0;
+    for (const cue of subtitleCues) {
+      const startSec = cue.startMs / 1000;
+      const endSec = cue.endMs / 1000;
+      
+      // Format time as H:MM:SS.cc
+      const fmtTime = (sec) => {
+        const h = Math.floor(sec / 3600);
+        const m = Math.floor((sec % 3600) / 60);
+        const s = Math.floor(sec % 60);
+        const cs = Math.round((sec % 1) * 100);
+        return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(cs).padStart(2, "0")}`;
+      };
+
+      // ASS uses \N for hard line breaks, \n for soft wraps
+      // Replace newlines in cue text with \N
+      const assText = cue.text.replace(/\n/g, "\\N");
+      
+      assLines.push(`Dialogue: 0,${fmtTime(startSec)},${fmtTime(endSec)},Default,,0,0,0,,${assText}`);
+    }
+
+    // Write ASS file
+    assFilePath = path.join(tempDir, `captions_${Date.now()}.ass`);
+    tempFiles.push(assFilePath);
+    fs.writeFileSync(assFilePath, assLines.join("\n"), "utf-8");
+
+    capConfig = { assFilePath, fontSize, fontName, textColor, borderColor, borderWidth };
   }
 
   function sendProgress(percent, fpsVal, timemark) {
@@ -261,40 +318,14 @@ ipcMain.handle("export-native", async (event, opts) => {
         `format=yuv420p`,
       ];
 
-      // Add drawtext for each caption cue overlapping this segment
-      if (capConfig) {
-        for (const cue of subtitleCues) {
-          if (cue.endMs <= segStartMs || cue.startMs >= segEndMs) continue;
-
-          const cueStartSec = Math.max(0, (cue.startMs - segStartMs) / 1000);
-          const cueEndSec = Math.min(segDurSec, (cue.endMs - segStartMs) / 1000);
-
-          // Wrap text
-          const words = cue.text.split(/\s+/);
-          let lines = [];
-          let currentLine = "";
-          for (const word of words) {
-            const testLine = currentLine ? currentLine + " " + word : word;
-            if (testLine.length > capConfig.maxCharsPerLine && currentLine) {
-              lines.push(currentLine);
-              currentLine = word;
-            } else {
-              currentLine = testLine;
-            }
-          }
-          if (currentLine) lines.push(currentLine);
-          const wrappedText = lines.join("\\n");
-
-          // Escape for drawtext
-          const escapedText = wrappedText
-            .replace(/\\/g, "\\\\")
-            .replace(/:/g, "\\:")
-            .replace(/'/g, "\u2019");
-
-          vfParts.push(
-            `drawtext=font='${capConfig.fontName}':fontsize=${capConfig.fontSize}:fontcolor=${capConfig.textColor}:bordercolor=${capConfig.borderColor}:borderw=${capConfig.borderWidth}:text='${escapedText}':x=(w-text_w)/2:y=${capConfig.yExprCap}:enable='between(t,${cueStartSec.toFixed(3)},${cueEndSec.toFixed(3)})'`
-          );
-        }
+      // Add subtitles filter for captions (ASS supports multi-line, wrapping, positioning)
+      if (capConfig && capConfig.assFilePath) {
+        // Escape the ASS file path for the subtitles filter
+        // Windows paths need backslashes escaped and colons escaped
+        const escapedAssPath = capConfig.assFilePath
+          .replace(/\\/g, "\\\\")
+          .replace(/:/g, "\\:");
+        vfParts.push(`subtitles=filename='${escapedAssPath}'`);
       }
 
       const vf = vfParts.join(",");
