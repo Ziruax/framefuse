@@ -312,29 +312,16 @@ ipcMain.handle("export-native", async (event, opts) => {
     filterComplex += `${concatInputs}concat=n=${segments.length}:v=1:a=0[outv]`;
 
     // ─── CLEANUP TRAILING PUNCTUATION ──────────────────────────────
-    // Strip stray semicolons, newlines, and whitespace from the end of the
-    // filter graph string. A trailing ; causes FFmpeg to expect another
-    // filter definition, finding nothing → "No such filter: ''" crash.
     filterComplex = filterComplex.trim().replace(/;+$/, "").replace(/\n+$/, "");
 
-    // ─── FILTER COMPLEX VIA @ FILE EXPANSION ───────────────────────
-    // Write filter to temp file, then use @ prefix to tell FFmpeg to read
-    // the filter from the file. This bypasses ALL Windows CLI length limits
-    // and works with every FFmpeg build (no -filter_complex_script needed).
-    const filterScriptPath = path.join(tempDir, `filter_${Date.now()}.txt`);
-    fs.writeFileSync(filterScriptPath, filterComplex, "utf-8");
-    args.push("-filter_complex", `@${filterScriptPath}`);
+    // ─── PASS FILTER DIRECTLY ─────────────────────────────────────
+    // Node.js spawn() bypasses cmd.exe and handles up to 32767 chars.
+    // If the total args string exceeds 25000 chars, use a batch file.
+    const filterScriptPath = null; // not used unless batch fallback
+    args.push("-filter_complex", filterComplex);
 
-    // Cleanup helper (race-condition safe)
-    const cleanupFilterScript = () => {
-      try {
-        if (filterScriptPath && fs.existsSync(filterScriptPath)) {
-          fs.unlinkSync(filterScriptPath);
-        }
-      } catch (err) {
-        // Non-blocking — file may be locked or already deleted
-      }
-    };
+    // Cleanup helper (race-condition safe) — no-op since we pass filter directly
+    const cleanupFilterScript = () => {};
 
     // 4. Map outputs
     args.push("-map", "[outv]");
