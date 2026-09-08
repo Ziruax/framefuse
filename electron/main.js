@@ -179,35 +179,45 @@ ipcMain.handle("export-native", async (event, opts) => {
   const totalMs = segments.reduce((sum, s) => sum + s.durationMs, 0);
   const encoder = detectGpuEncoder();
 
-  // Pre-compute caption config
+  // Pre-compute caption config — build ASS file with ALL preset properties
   let capConfig = null;
   let assFilePath = null;
   if (captionsEnabled) {
     const cs = captionSettings;
     const fontName = cs.fontName || "Arial";
     const fontSize = Math.round((cs.fontSize || 0.05) * height * (cs.fontSizeScale || 1));
-    const textColor = (cs.textColor || "#FFFFFF");
-    const borderColor = (cs.borderColor || "#000000");
+    const textColor = cs.textColor || "#FFFFFF";
+    const borderColor = cs.borderColor || "#000000";
     const borderWidth = cs.borderWidth || 2;
     const position = cs.customPosition || cs.position || "bottom";
     const marginV = cs.positionY || 50;
+    const fontWeight = cs.fontWeight || 600;
+    const fontStyle = cs.fontStyle || "normal";
+    const shadow = cs.shadow || false;
+    const shadowColor = cs.shadowColor || "#000000";
+    const shadowBlur = cs.shadowBlur || 3;
+    const bgColor = cs.bgColor || null;
+    const bgAlpha = cs.bgAlpha || 1;
+    const textTransform = cs.textTransform || "none";
+    const letterSpacing = cs.letterSpacing || 0;
+    const alignment = cs.alignment || "center";
 
-    // Build ASS subtitle file for this export
-    // ASS supports multi-line text, wrapping, colors, positioning natively
+    // Build ASS subtitle file with ALL styling from the preset
     const assLines = [];
     assLines.push("[Script Info]");
     assLines.push("ScriptType: v4.00+");
     assLines.push(`PlayResX: ${width}`);
     assLines.push(`PlayResY: ${height}`);
-    assLines.push("WrapStyle: 0"); // 0 = smart wrapping, even lines
+    assLines.push("WrapStyle: 0"); // smart wrapping
     assLines.push("ScaledBorderAndShadow: yes");
     assLines.push("");
+
     assLines.push("[V4+ Styles]");
     assLines.push("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding");
-    
-    // Convert hex #RRGGBB to ASS &HAABBGGRR (alpha inverted)
+
+    // Convert hex #RRGGBB to ASS &HAABBGGRR
     const toAssColor = (hex, alpha = 1) => {
-      const h = hex.replace(/^#/, "");
+      const h = (hex || "#FFFFFF").replace(/^#/, "");
       const r = h.slice(0, 2);
       const g = h.slice(2, 4);
       const b = h.slice(4, 6);
@@ -215,39 +225,56 @@ ipcMain.handle("export-native", async (event, opts) => {
       return `&H${assAlpha}${b}${g}${r}`.toUpperCase();
     };
 
-    // Alignment: 1=bottom-left, 2=bottom-center, 3=bottom-right
-    //            4=middle-left, 5=middle-center, 6=middle-right
-    //            7=top-left, 8=top-center, 9=top-right
-    let alignment = 2; // bottom-center default
-    if (position === "top") alignment = 8;
-    else if (position === "center") alignment = 5;
-    
-    const bold = (cs.fontWeight || 600) >= 600 ? -1 : 0;
-    
-    assLines.push(`Style: Default,${fontName},${fontSize},${toAssColor(textColor)},${toAssColor(textColor)},${toAssColor(borderColor)},${toAssColor("#000000", 0.5)},${bold},0,0,0,100,100,0,0,1,${borderWidth},1,${alignment},40,40,${marginV},1`);
+    // Alignment: 2=bottom-center, 5=middle-center, 8=top-center
+    let assAlignment = 2;
+    if (position === "top") assAlignment = 8;
+    else if (position === "center") assAlignment = 5;
+
+    // Horizontal alignment: left=1/4/7, center=2/5/8, right=3/6/9
+    if (alignment === "left") assAlignment -= 1;
+    else if (alignment === "right") assAlignment += 1;
+
+    const bold = fontWeight >= 600 ? -1 : 0;
+    const italic = fontStyle === "italic" ? -1 : 0;
+
+    // BorderStyle: 1=outline+shadow, 3=opaque background box
+    const borderStyle = bgColor ? 3 : 1;
+    const outline = bgColor ? 0 : borderWidth;
+    const shadowVal = shadow ? Math.max(1, Math.round(shadowBlur)) : 0;
+
+    // BackColour: used for background box (BorderStyle 3) or shadow color (BorderStyle 1)
+    const backColour = bgColor ? toAssColor(bgColor, bgAlpha) : toAssColor(shadow ? shadowColor : "#000000", 0.5);
+
+    // Spacing = letterSpacing in ASS
+    const spacing = letterSpacing || 0;
+
+    assLines.push(`Style: Default,${fontName},${fontSize},${toAssColor(textColor)},${toAssColor(textColor)},${toAssColor(borderColor)},${backColour},${bold},${italic},0,0,100,100,${spacing},0,${borderStyle},${outline},${shadowVal},${assAlignment},40,40,${marginV},1`);
     assLines.push("");
     assLines.push("[Events]");
     assLines.push("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text");
 
-    // Add each cue as an ASS dialogue event
-    let cumulativeCueMs = 0;
+    // Format time as H:MM:SS.cc
+    const fmtTime = (sec) => {
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = Math.floor(sec % 60);
+      const cs = Math.round((sec % 1) * 100);
+      return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(cs).padStart(2, "0")}`;
+    };
+
+    // Add each cue
     for (const cue of subtitleCues) {
       const startSec = cue.startMs / 1000;
       const endSec = cue.endMs / 1000;
-      
-      // Format time as H:MM:SS.cc
-      const fmtTime = (sec) => {
-        const h = Math.floor(sec / 3600);
-        const m = Math.floor((sec % 3600) / 60);
-        const s = Math.floor(sec % 60);
-        const cs = Math.round((sec % 1) * 100);
-        return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(cs).padStart(2, "0")}`;
-      };
 
-      // ASS uses \N for hard line breaks, \n for soft wraps
-      // Replace newlines in cue text with \N
-      const assText = cue.text.replace(/\n/g, "\\N");
-      
+      // Apply text transform
+      let text = cue.text;
+      if (textTransform === "uppercase") text = text.toUpperCase();
+      else if (textTransform === "lowercase") text = text.toLowerCase();
+
+      // Replace newlines with \N for ASS hard line breaks
+      const assText = text.replace(/\n/g, "\\N");
+
       assLines.push(`Dialogue: 0,${fmtTime(startSec)},${fmtTime(endSec)},Default,,0,0,0,,${assText}`);
     }
 
@@ -255,7 +282,7 @@ ipcMain.handle("export-native", async (event, opts) => {
     assFilePath = path.join(tempDir, `captions_${Date.now()}.ass`);
     fs.writeFileSync(assFilePath, assLines.join("\n"), "utf-8");
 
-    capConfig = { assFilePath, fontSize, fontName, textColor, borderColor, borderWidth };
+    capConfig = { assFilePath };
   }
 
   function sendProgress(percent, fpsVal, timemark) {

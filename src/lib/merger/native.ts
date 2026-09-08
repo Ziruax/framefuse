@@ -160,12 +160,30 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
 
     ipcCaptionSettings = {
       enabled: true,
+      // Font
       fontName: font.ffmpegName,
       fontSize: preset.fontSize,
       fontSizeScale: captionSettings.fontSizeScale || 1,
+      fontWeight: preset.fontWeight,
+      fontStyle: preset.fontStyle,
+      // Colors
       textColor: captionSettings.customColor || preset.textColor,
       borderColor: preset.borderColor || "#000000",
       borderWidth: preset.borderWidth,
+      // Background
+      bgColor: preset.bgColor,
+      bgAlpha: preset.bgAlpha,
+      bgPadding: preset.bgPadding,
+      bgRadius: preset.bgRadius,
+      // Shadow
+      shadow: preset.shadow,
+      shadowColor: preset.shadowColor,
+      shadowBlur: preset.shadowBlur,
+      // Text
+      textTransform: preset.textTransform,
+      letterSpacing: preset.letterSpacing,
+      alignment: preset.alignment,
+      // Position
       position: preset.position,
       positionY: preset.positionY,
       customPosition: captionSettings.customPosition,
