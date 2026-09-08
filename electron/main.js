@@ -253,7 +253,6 @@ ipcMain.handle("export-native", async (event, opts) => {
 
     // Write ASS file
     assFilePath = path.join(tempDir, `captions_${Date.now()}.ass`);
-    tempFiles.push(assFilePath);
     fs.writeFileSync(assFilePath, assLines.join("\n"), "utf-8");
 
     capConfig = { assFilePath, fontSize, fontName, textColor, borderColor, borderWidth };
@@ -271,6 +270,7 @@ ipcMain.handle("export-native", async (event, opts) => {
 
   ensureTempDir();
   const tempFiles = [];
+  if (assFilePath) tempFiles.push(assFilePath);
 
   try {
     // ─── STEP 1: Encode each segment ──────────────────────────────
