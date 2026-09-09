@@ -481,9 +481,9 @@ export function MediaPanelBase({
               </div>
             )}
 
-            {/* Whisper-tiny caption generation — always visible so the
+            {/* Whisper-tiny caption generation — ALWAYS visible so the
                 user can find it. Disabled when there's no audio. */}
-            {segments.length > 0 && (
+            {true && (
               <div
                 className="rounded-lg border p-2.5"
                 style={{

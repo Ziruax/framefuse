@@ -514,7 +514,7 @@ function CaptionsSection({
       icon={Captions}
       title="Captions"
       accentColor="#f0abfc"
-      defaultOpen={false}
+      defaultOpen={true}
     >
       {/* Enable toggle + subtitle status */}
       <div className="flex items-center justify-between">
