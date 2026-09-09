@@ -742,9 +742,15 @@ export function drawCaption(
     blockTop = ch - blockH - positionYpx;
   }
 
-  // Horizontal anchor.
-  const blockLeft = (cw - maxWidthLine) / 2;
-  const blockRight = blockLeft + maxWidthLine;
+  // Horizontal anchor — clamp to safe area so captions never get cut
+  // off at the screen edges. If maxWidthLine exceeds the canvas width
+  // (e.g. user picked a wide preset + large font), we shrink the
+  // block to fit with a small margin.
+  const SAFE_MARGIN_PX = Math.round(cw * 0.04); // 4% on each side
+  const maxUsableWidth = cw - SAFE_MARGIN_PX * 2;
+  const effectiveMaxWidth = Math.min(maxWidthLine, maxUsableWidth);
+  const blockLeft = (cw - effectiveMaxWidth) / 2;
+  const blockRight = blockLeft + effectiveMaxWidth;
 
   // Alignment per-line (left/center/right).
   const alignLineX = (line: string): number => {
@@ -963,8 +969,12 @@ function drawWordHighlight(
   else if (position === "center") blockTop = (ch - blockH) / 2 + positionYpx;
   else blockTop = ch - blockH - positionYpx;
 
-  const blockLeft = (cw - maxWidthLine) / 2;
-  const blockRight = blockLeft + maxWidthLine;
+  // Horizontal anchor — clamp to safe area so captions never get cut off.
+  const SAFE_MARGIN_PX = Math.round(cw * 0.04);
+  const maxUsableWidth = cw - SAFE_MARGIN_PX * 2;
+  const effectiveMaxWidth = Math.min(maxWidthLine, maxUsableWidth);
+  const blockLeft = (cw - effectiveMaxWidth) / 2;
+  const blockRight = blockLeft + effectiveMaxWidth;
 
   const alignLineX = (lineStr: string): number => {
     const w = ctx.measureText(lineStr).width;
@@ -977,7 +987,7 @@ function drawWordHighlight(
   if (preset.bgColor) {
     const boxX = blockLeft - padding;
     const boxY = blockTop - padding;
-    const boxW = maxWidthLine + padding * 2;
+    const boxW = effectiveMaxWidth + padding * 2;
     const boxH = blockH + padding * 2;
     ctx.save();
     ctx.globalAlpha = preset.bgAlpha;
@@ -1287,8 +1297,12 @@ function drawWordAnimated(
   else if (position === "center") blockTop = (ch - blockH) / 2 + positionYpx;
   else blockTop = ch - blockH - positionYpx;
 
-  const blockLeft = (cw - maxWidthLine) / 2;
-  const blockRight = blockLeft + maxWidthLine;
+  // Horizontal anchor — clamp to safe area so captions never get cut off.
+  const SAFE_MARGIN_PX = Math.round(cw * 0.04);
+  const maxUsableWidth = cw - SAFE_MARGIN_PX * 2;
+  const effectiveMaxWidth = Math.min(maxWidthLine, maxUsableWidth);
+  const blockLeft = (cw - effectiveMaxWidth) / 2;
+  const blockRight = blockLeft + effectiveMaxWidth;
 
   const alignLineX = (lineStr: string): number => {
     const w = ctx.measureText(lineStr).width;
@@ -1301,7 +1315,7 @@ function drawWordAnimated(
   if (preset.bgColor) {
     const boxX = blockLeft - padding;
     const boxY = blockTop - padding;
-    const boxW = maxWidthLine + padding * 2;
+    const boxW = effectiveMaxWidth + padding * 2;
     const boxH = blockH + padding * 2;
     ctx.save();
     ctx.globalAlpha = preset.bgAlpha;

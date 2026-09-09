@@ -4,6 +4,10 @@ const { contextBridge, ipcRenderer } = require("electron");
 contextBridge.exposeInMainWorld("electronAPI", {
   isElectron: () => ipcRenderer.invoke("is-electron"),
 
+  // Diagnostics — verify FFmpeg is reachable. Returns
+  // { ok, path, version, error }.
+  ffmpegStatus: () => ipcRenderer.invoke("ffmpeg-status"),
+
   exportNative: (opts) => ipcRenderer.invoke("export-native", opts),
 
   saveTempImage: (payload) => ipcRenderer.invoke("save-temp-image", payload),

@@ -9,13 +9,45 @@ const fs = require("fs");
 const os = require("os");
 const { spawn, execSync } = require("child_process");
 
+// Resolve the FFmpeg binary path. On Windows we need ffmpeg.exe, on
+// Linux/macOS we need ffmpeg. When the app is packaged, the binary is
+// bundled via electron-builder's asarUnpack config — but the platform
+// of the bundled binary depends on which OS did the build. To support
+// cross-building (e.g. building the Windows .exe on Linux), we ship
+// BOTH binaries in node_modules/ffmpeg-static/ and pick the right one
+// at runtime based on the host OS.
 let ffmpegPath;
 if (app.isPackaged) {
   const exeName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
-  ffmpegPath = path.join(process.resourcesPath, "app.asar.unpacked", "node_modules", "ffmpeg-static", exeName);
+  const candidates = [
+    path.join(process.resourcesPath, "app.asar.unpacked", "node_modules", "ffmpeg-static", exeName),
+    // Fallback: try without asar.unpacked (in case asarUnpack didn't run).
+    path.join(process.resourcesPath, "app", "node_modules", "ffmpeg-static", exeName),
+    // Fallback: try in extraResources (in case we configured that).
+    path.join(process.resourcesPath, "ffmpeg-static", exeName),
+    // Fallback: try the other extension (in case the platform-specific
+    // binary didn't get bundled — e.g. building Windows on Linux only
+    // ships the Linux binary unless we manually add ffmpeg.exe).
+    path.join(process.resourcesPath, "app.asar.unpacked", "node_modules", "ffmpeg-static",
+      process.platform === "win32" ? "ffmpeg" : "ffmpeg.exe"),
+  ];
+  ffmpegPath = candidates.find((p) => {
+    try { return fs.existsSync(p); } catch { return false; }
+  });
+  if (!ffmpegPath) {
+    // Last-resort: use the npm-resolved path (works in dev, fails in
+    // packaged — but at least we get a clear error).
+    try { ffmpegPath = require("ffmpeg-static"); } catch { ffmpegPath = candidates[0]; }
+  }
 } else {
-  ffmpegPath = require("ffmpeg-static");
-  if (process.platform === "win32" && !ffmpegPath.endsWith(".exe")) {
+  // Dev mode: ffmpeg-static's install.js downloads the host binary.
+  try {
+    ffmpegPath = require("ffmpeg-static");
+  } catch (e) {
+    ffmpegPath = "ffmpeg"; // hope it's on PATH
+  }
+  // On Windows dev, the binary may not have .exe extension.
+  if (process.platform === "win32" && ffmpegPath && !ffmpegPath.endsWith(".exe")) {
     try { if (fs.existsSync(ffmpegPath + ".exe")) ffmpegPath += ".exe"; } catch (_) {}
   }
 }
@@ -86,6 +118,23 @@ function buildApplicationMenu() {
 
 // IPC helpers
 ipcMain.handle("is-electron", () => true);
+
+// Diagnostics — lets the renderer verify ffmpeg is reachable. Returns
+// { ok: boolean, path: string, version: string | null, error: string | null }.
+// The UI surfaces this so users see a clear "FFmpeg not found" message
+// instead of a generic export error.
+ipcMain.handle("ffmpeg-status", async () => {
+  try {
+    if (!ffmpegPath || !fs.existsSync(ffmpegPath)) {
+      return { ok: false, path: ffmpegPath || "(none)", version: null, error: "FFmpeg binary not found at expected path. Try reinstalling FrameFuse." };
+    }
+    const out = execSync(`"${ffmpegPath}" -version`, { encoding: "utf-8", timeout: 10000, windowsHide: true });
+    const firstLine = out.split("\n")[0];
+    return { ok: true, path: ffmpegPath, version: firstLine, error: null };
+  } catch (e) {
+    return { ok: false, path: ffmpegPath || "(none)", version: null, error: e.message };
+  }
+});
 
 ipcMain.handle("save-temp-image", async (_evt, { name, bytes }) => {
   ensureTempDir();

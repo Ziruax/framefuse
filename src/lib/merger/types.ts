@@ -204,6 +204,12 @@ declare global {
   interface Window {
     electronAPI?: {
       isElectron: () => Promise<boolean>;
+      ffmpegStatus: () => Promise<{
+        ok: boolean;
+        path: string;
+        version: string | null;
+        error: string | null;
+      }>;
       exportNative: (opts: unknown) => Promise<ExportResult>;
       saveTempImage: (p: { name: string; bytes: ArrayBuffer }) => Promise<string>;
       saveTempAudio: (p: { name: string; bytes: ArrayBuffer }) => Promise<string>;

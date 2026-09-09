@@ -307,6 +307,24 @@ export default function Page() {
             "Absolute: [00:00:00 - 00:00:06] name.jpg\nBeat: 001__Beat_1_0s_name.jpg\nDuration: 10s_name.jpg",
         }),
       );
+
+      // Verify FFmpeg is reachable on startup so the user sees a clear
+      // error early instead of a generic export failure. This catches
+      // the case where the bundled ffmpeg.exe is missing (e.g. cross-
+      // build from Linux that didn't include the Windows binary).
+      if (api.ffmpegStatus) {
+        api.ffmpegStatus().then((status) => {
+          if (!status.ok) {
+            toast.error("FFmpeg not found", {
+              description:
+                (status.error || "FFmpeg binary is missing") +
+                "\nPath: " + status.path +
+                "\n\nExports will fail until this is fixed. Try reinstalling FrameFuse.",
+            });
+          }
+        }).catch(() => { /* silent — the export will surface the error if needed */ });
+      }
+
       return () => {
         offExport?.();
         offImages?.();
@@ -396,6 +414,8 @@ export default function Page() {
   // ---- Whisper caption generation (word-level timestamps) ----------------
   const [whisperBusy, setWhisperBusy] = useState(false);
   const [whisperProgress, setWhisperProgress] = useState<WhisperProgress | null>(null);
+  // Whisper language: "auto" = auto-detect, or a 2-letter code like "en".
+  const [whisperLanguage, setWhisperLanguage] = useState<string>("auto");
 
   const generateCaptionsFromAudio = useCallback(async () => {
     if (!audioTrack) {
@@ -425,6 +445,7 @@ export default function Page() {
       const result = await transcribeWithWhisper({
         audioFile: file,
         signal: ac.signal,
+        language: whisperLanguage,
         onProgress: (p) => setWhisperProgress(p),
       });
 
@@ -483,7 +504,7 @@ export default function Page() {
       setWhisperBusy(false);
       setWhisperProgress(null);
     }
-  }, [audioTrack, whisperBusy]);
+  }, [audioTrack, whisperBusy, whisperLanguage]);
 
   const loadSamples = useCallback(async () => {
     try {
@@ -674,6 +695,8 @@ export default function Page() {
             onGenerateCaptions={generateCaptionsFromAudio}
             whisperBusy={whisperBusy}
             whisperProgress={whisperProgress}
+            whisperLanguage={whisperLanguage}
+            onWhisperLanguageChange={setWhisperLanguage}
           />
         </section>
 
