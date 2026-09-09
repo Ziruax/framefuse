@@ -24,6 +24,11 @@ import {
 import { exportNative, isElectron } from "@/lib/merger/native";
 import { parseSrt, serializeSrt } from "@/lib/merger/subtitles";
 import {
+  transcribeWithWhisper,
+  isWhisperAvailable,
+  type WhisperProgress,
+} from "@/lib/merger/whisper";
+import {
   defaultCaptionSettings,
   type AudioTrack,
   type CaptionSettings,
@@ -33,6 +38,7 @@ import {
   type SubtitleFile,
   type VideoSettings,
 } from "@/lib/merger/types";
+import { CAPTION_PRESETS } from "@/lib/merger/captionPresets";
 
 interface MediaItem {
   id: string;
@@ -387,6 +393,98 @@ export default function Page() {
     setSubtitles(null);
   }, []);
 
+  // ---- Whisper caption generation (word-level timestamps) ----------------
+  const [whisperBusy, setWhisperBusy] = useState(false);
+  const [whisperProgress, setWhisperProgress] = useState<WhisperProgress | null>(null);
+
+  const generateCaptionsFromAudio = useCallback(async () => {
+    if (!audioTrack) {
+      toast.error("Add an audio track first", {
+        description: "Whisper transcribes your audio into word-by-word captions.",
+      });
+      return;
+    }
+    if (!isWhisperAvailable()) {
+      toast.error("Audio decoding is not supported in this browser");
+      return;
+    }
+    if (whisperBusy) return;
+
+    setWhisperBusy(true);
+    setWhisperProgress({ progress: 0, status: "Starting…" });
+
+    const ac = new AbortController();
+    try {
+      // Fetch the audio File back from the object URL.
+      const resp = await fetch(audioTrack.url);
+      const blob = await resp.blob();
+      const file = new File([blob], audioTrack.fileName, {
+        type: blob.type || "audio/mpeg",
+      });
+
+      const result = await transcribeWithWhisper({
+        audioFile: file,
+        signal: ac.signal,
+        onProgress: (p) => setWhisperProgress(p),
+      });
+
+      if (result.cues.length === 0) {
+        toast.error("No speech detected", {
+          description: "Whisper couldn't transcribe any words from this audio.",
+        });
+        return;
+      }
+
+      const wordCount = result.cues.reduce(
+        (n, c) => n + (c.words?.length ?? 0),
+        0,
+      );
+      setSubtitles({
+        fileName: `${audioTrack.fileName.replace(/\.[^.]+$/, "")}.whisper.srt`,
+        cues: result.cues,
+        rawText: serializeSrt(result.cues),
+      });
+      // Auto-enable captions + switch to word mode + pick a word-aware
+      // preset if the user hasn't already, so the karaoke effect is
+      // immediately visible in the preview.
+      setCaptionSettings((prev) => {
+        const next = { ...prev, enabled: true };
+        if (!prev.wordMode || prev.wordMode === "off") {
+          next.wordMode = "word";
+        }
+        const isWordPreset =
+          prev.presetId.startsWith("word-") ||
+          prev.presetId.startsWith("kinetic-");
+        if (!isWordPreset) {
+          next.presetId = "word-karaoke";
+        }
+        // Default the animation to the preset's preferred animation
+        // (e.g. word-karaoke → pop-in) so the user immediately sees
+        // motion. They can override in the Settings panel.
+        if (!prev.animation || prev.animation === "none") {
+          const preset = CAPTION_PRESETS.find((p) => p.id === next.presetId);
+          if (preset?.animation) next.animation = preset.animation;
+        }
+        return next;
+      });
+      toast.success(
+        `Transcribed ${wordCount} word${wordCount === 1 ? "" : "s"}`,
+        {
+          description: `${result.cues.length} cue${
+            result.cues.length === 1 ? "" : "s"
+          } · word-by-word mode enabled`,
+        },
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("cancelled")) toast.info("Caption generation cancelled");
+      else toast.error("Whisper transcription failed", { description: msg });
+    } finally {
+      setWhisperBusy(false);
+      setWhisperProgress(null);
+    }
+  }, [audioTrack, whisperBusy]);
+
   const loadSamples = useCallback(async () => {
     try {
       const res = await fetch("/samples/manifest.json");
@@ -573,6 +671,9 @@ export default function Page() {
             onOverride={overrideDuration}
             onClearOverride={clearOverride}
             onReorder={reorderItem}
+            onGenerateCaptions={generateCaptionsFromAudio}
+            whisperBusy={whisperBusy}
+            whisperProgress={whisperProgress}
           />
         </section>
 

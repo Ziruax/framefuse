@@ -11,7 +11,14 @@ import type {
 } from "./types";
 import { drawFrame, resolveDimensions } from "./renderer";
 import { getCaptionPreset, getFontOption } from "./captionPresets";
-import { cueAt } from "./subtitles";
+import { cueAt, activeWordIndex, type WordTimestamp } from "./subtitles";
+import {
+  computeWordTransform,
+  assWordAnimationTags,
+  IDENTITY_TRANSFORM,
+  type WordTransform,
+} from "./captionAnimations";
+import type { CaptionAnimation } from "./types";
 
 /** True when running inside the FrameFuse Electron shell. */
 export function isElectron(): boolean {
@@ -120,8 +127,18 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
   const dims = resolveDimensions(settings.aspect, settings.resolution);
 
   // 1. Persist images to temp files.
-  const segPayload: { imagePath: string; direction: string; durationMs: number }[] =
-    [];
+  // Include absolute startMs/endMs so the main process can map SRT cue
+  // timestamps (which are in master-timeline absolute time) onto each
+  // per-segment clip (whose internal clock starts at 0). Without this
+  // mapping, only cues whose original startMs falls within [0, dur] of
+  // every clip would be burned in — i.e. the first caption repeats.
+  const segPayload: {
+    imagePath: string;
+    direction: string;
+    durationMs: number;
+    startMs: number;
+    endMs: number;
+  }[] = [];
   for (const seg of segments) {
     const url = imageUrls[seg.id] || seg.thumbnailUrl;
     const bytes = await fetchBytes(url);
@@ -133,6 +150,8 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
       imagePath,
       direction: seg.direction,
       durationMs: seg.durationMs,
+      startMs: seg.startMs,
+      endMs: seg.endMs,
     });
   }
 
@@ -170,6 +189,7 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
       textColor: captionSettings.customColor || preset.textColor,
       borderColor: preset.borderColor || "#000000",
       borderWidth: preset.borderWidth,
+      highlightColor: preset.highlightColor || null,
       // Background
       bgColor: preset.bgColor,
       bgAlpha: preset.bgAlpha,
@@ -187,12 +207,26 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
       position: preset.position,
       positionY: preset.positionY,
       customPosition: captionSettings.customPosition,
+      // Word-by-word mode (renderer → main process)
+      wordMode: captionSettings.wordMode || "off",
+      // Kinetic typography animation (renderer → main process)
+      animation: captionSettings.animation || "none",
     };
 
+    // Send per-word timestamps so the main process can build ASS \k
+    // karaoke tags / per-word Dialogue lines + \t animation tags. Cues
+    // without word timestamps (plain .srt) just carry text + cue times.
     ipcSubtitleCues = subtitles.cues.map((c) => ({
       startMs: c.startMs,
       endMs: c.endMs,
       text: c.text,
+      words: c.words
+        ? c.words.map((w) => ({
+            text: w.text,
+            startMs: w.startMs,
+            endMs: w.endMs,
+          }))
+        : undefined,
     }));
   }
 
@@ -326,7 +360,15 @@ async function exportViaWebCodecs(
       ? (currentMsLocal: number) => {
           const cue = cueAt(subtitles.cues, currentMsLocal);
           if (!cue) return;
-          drawCaption(ctx, cue.text, captionSettings, dims.w, dims.h);
+          // Pass per-word timestamps + current time + animation so the
+          // word-mode presets and kinetic typography animations render
+          // identically to the preview.
+          const capCtx = {
+            ...captionSettings,
+            words: cue.words,
+            currentMs: currentMsLocal,
+          };
+          drawCaption(ctx, cue.text, capCtx, dims.w, dims.h);
         }
       : null;
 
@@ -459,7 +501,12 @@ async function exportViaMediaRecorder(
       ? (currentMsLocal: number) => {
           const cue = cueAt(subtitles.cues, currentMsLocal);
           if (!cue) return;
-          drawCaption(ctx, cue.text, captionSettings, dims.w, dims.h);
+          const capCtx = {
+            ...captionSettings,
+            words: cue.words,
+            currentMs: currentMsLocal,
+          };
+          drawCaption(ctx, cue.text, capCtx, dims.w, dims.h);
         }
       : null;
 
@@ -533,20 +580,49 @@ interface CanvasCaptionCtx {
   customColor: string | null;
   customPosition: "top" | "center" | "bottom" | null;
   fontSizeScale: number;
+  /** Balanced text wrapping (only used in standard full-text mode). */
+  balancedWrap?: boolean;
+  /**
+   * Word-by-word rendering mode. When "word" or "word-only" is set,
+   * `drawCaption` expects `words` + `currentMs` so it can highlight or
+   * show only the currently-spoken word. Cues without word timestamps
+   * always fall back to full-text rendering.
+   */
+  wordMode?: "off" | "word" | "word-only";
+  /** Per-word timestamps for the current cue (only present when ASR-generated). */
+  words?: WordTimestamp[];
+  /** Master-timeline time (ms) used to find the active word. */
+  currentMs?: number;
+  /** Kinetic typography animation. Drives per-word transforms. */
+  animation?: CaptionAnimation;
 }
 
 /**
  * Draw a caption text onto a 2D canvas context using the active preset.
  *
- * Layout strategy:
+ * Layout strategy (full-text mode):
  *   1. Apply text-transform (uppercase/lowercase).
  *   2. Wrap text using measureText to fit maxWidth.
  *   3. Compute total text block height.
  *   4. Compute anchor Y based on preset.position + positionY.
  *   5. If preset.bgColor → draw a rounded rect behind the text.
- *   6. If preset.borderColor → stroke the text (canvas supports strokeText).
+ *   6. If preset.borderColor → stroke the text.
  *   7. If preset.shadow → enable ctx.shadowBlur/shadowColor before fill.
  *   8. fillText each wrapped line.
+ *
+ * Word-by-word modes (require cue.words[]):
+ *   - "word": all words rendered with `textColor`, the currently-spoken
+ *     word re-rendered on top with `highlightColor` (or scaled+bolder
+ *     when no highlight color is set). Reads as a karaoke highlight.
+ *   - "word-only": only the currently-spoken word is rendered, centered,
+ *     large. Hormozi/attention-grabber style.
+ *
+ * Kinetic typography animations (animation != "none"):
+ *   Each word's transform is computed via computeWordTransform() and
+ *   applied as scale / alpha / offset / clip before rendering. This
+ *   works in all three word modes (off / word / word-only). When the
+ *   cue has no word timestamps, the animation falls back to a whole-
+ *   cue fade/scale using cue.startMs → cue.endMs (best-effort).
  */
 export function drawCaption(
   ctx: CanvasRenderingContext2D,
@@ -565,12 +641,60 @@ export function drawCaption(
   const position = caption.customPosition || preset.position;
   const scale = caption.fontSizeScale || 1;
 
+  // Resolve the active animation: explicit override > preset default.
+  const animation: CaptionAnimation =
+    caption.animation || preset.animation || "none";
+
+  // ── Word-by-word modes short-circuit the standard flow ──
+  const wordMode = caption.wordMode ?? "off";
+  const words = caption.words;
+  const hasWords = words && words.length > 0;
+  if ((wordMode === "word" || wordMode === "word-only") && hasWords) {
+    if (wordMode === "word-only") {
+      drawWordOnly(ctx, text, caption, preset, font, textColor, cw, ch, animation);
+      return;
+    }
+    drawWordHighlight(ctx, text, caption, preset, font, textColor, cw, ch, animation);
+    return;
+  }
+
+  // ── Standard full-text mode (with optional whole-cue animation) ──
+  // If an animation is active and we don't have word timestamps,
+  // apply the animation transform to the whole cue (fade-through /
+  // pop-in / drift) using cue start/end as the time window. This is
+  // a best-effort fallback so animations don't visually break when
+  // a user picks an animation but loads a plain .srt.
+  if (animation !== "none" && hasWords) {
+    drawWordAnimated(ctx, text, caption, preset, font, textColor, cw, ch, animation);
+    return;
+  }
+
   // Font size: fraction of canvas height.
   const fontPx = Math.max(8, Math.round(preset.fontSize * ch * scale));
   const weight = preset.fontWeight;
   const italic = preset.fontStyle === "italic" ? "italic " : "";
   ctx.font = `${italic}${weight} ${fontPx}px ${font.stack}`;
   ctx.textBaseline = "top";
+
+  // Whole-cue animation fallback (no word timestamps).
+  let cueTransform: WordTransform = IDENTITY_TRANSFORM;
+  if (animation !== "none" && !hasWords) {
+    // The cue's window is caption.currentMs-relative — but we don't know
+    // cue.start/end here. Use the words[] absence to fall back to a
+    // simple fade-in over the first 200ms of the cue. We approximate
+    // by passing the cue's start as currentMs - 0 and end as +∞; the
+    // animation will see "sinceStart = 0" and render its initial state.
+    cueTransform = computeWordTransform(
+      animation,
+      0,
+      200,
+      Math.min(200, Math.max(0, caption.currentMs ?? 0)),
+      0,
+      0,
+      0,
+      ch,
+    );
+  }
 
   // Letter spacing (modern canvas API — guarded).
   try {
@@ -628,15 +752,16 @@ export function drawCaption(
     const boxW = maxWidthLine + padding * 2;
     const boxH = blockH + padding * 2;
     ctx.save();
-    ctx.globalAlpha = preset.bgAlpha;
+    ctx.globalAlpha = preset.bgAlpha * cueTransform.alpha;
     ctx.fillStyle = preset.bgColor;
     drawRoundedRect(ctx, boxX, boxY, boxW, boxH, radius);
     ctx.fill();
     ctx.restore();
   }
 
-  // Shadow + border + fill per line.
+  // Shadow + border + fill per line, with whole-cue transform applied.
   ctx.save();
+  ctx.globalAlpha = cueTransform.alpha;
   if (preset.shadow) {
     ctx.shadowColor = preset.shadowColor;
     ctx.shadowBlur = preset.shadowBlur * (ch / 540);
@@ -649,7 +774,6 @@ export function drawCaption(
     const x = alignLineX(line);
     const y = blockTop + i * lineHeight;
 
-    // Border (outline) — drawn first so fillText covers the inner pixels.
     if (preset.borderColor && preset.borderWidth > 0) {
       ctx.lineJoin = "round";
       ctx.strokeStyle = preset.borderColor;
@@ -666,6 +790,542 @@ export function drawCaption(
   ctx.restore();
 
   // Reset letterSpacing to avoid leaking into other draws.
+  try {
+    (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
+      "0px";
+  } catch {
+    /* noop */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Word-by-word rendering helpers — used when captionSettings.wordMode is
+// "word" (full text + highlighted active word) or "word-only" (only the
+// currently-spoken word). Both need per-word timestamps from Whisper.
+// Kinetic typography animations are applied per-word in both modes.
+// ---------------------------------------------------------------------------
+
+function setupWordFont(
+  ctx: CanvasRenderingContext2D,
+  preset: ReturnType<typeof getCaptionPreset>,
+  font: ReturnType<typeof getFontOption>,
+  ch: number,
+  scale: number,
+): { fontPx: number; lineHeight: number } {
+  const fontPx = Math.max(8, Math.round(preset.fontSize * ch * scale));
+  const italic = preset.fontStyle === "italic" ? "italic " : "";
+  ctx.font = `${italic}${preset.fontWeight} ${fontPx}px ${font.stack}`;
+  ctx.textBaseline = "top";
+  try {
+    (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
+      `${preset.letterSpacing}px`;
+  } catch {
+    /* noop */
+  }
+  return { fontPx, lineHeight: Math.round(fontPx * 1.25) };
+}
+
+function applyTransformText(
+  text: string,
+  preset: ReturnType<typeof getCaptionPreset>,
+): string {
+  if (preset.textTransform === "uppercase") return text.toUpperCase();
+  if (preset.textTransform === "lowercase") return text.toLowerCase();
+  return text;
+}
+
+/**
+ * Apply a WordTransform to the canvas state before drawing a word.
+ * Returns a save/restore pair via the caller's ctx.save()/ctx.restore().
+ */
+function applyWordTransform(
+  ctx: CanvasRenderingContext2D,
+  t: WordTransform,
+  wordX: number,
+  wordY: number,
+  wordW: number,
+  wordH: number,
+): void {
+  // Alpha
+  ctx.globalAlpha *= t.alpha;
+  // Translation + scale around the word's center
+  if (t.scale !== 1 || t.offsetX !== 0 || t.offsetY !== 0 || t.rotation !== 0) {
+    const cx = wordX + wordW / 2;
+    const cy = wordY + wordH / 2;
+    ctx.translate(cx + t.offsetX, cy + t.offsetY);
+    ctx.rotate(t.rotation);
+    ctx.scale(t.scale, t.scale);
+    ctx.translate(-cx, -cy);
+  }
+}
+
+/**
+ * Word mode — render the full cue text, then re-render the active word
+ * on top in the preset's highlight color (or scaled+bolder when the
+ * preset doesn't define a highlightColor). Each word gets its kinetic
+ * typography animation transform applied independently.
+ */
+function drawWordHighlight(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  caption: CanvasCaptionCtx,
+  preset: ReturnType<typeof getCaptionPreset>,
+  font: ReturnType<typeof getFontOption>,
+  textColor: string,
+  cw: number,
+  ch: number,
+  animation: CaptionAnimation,
+): void {
+  const scale = caption.fontSizeScale || 1;
+  const position = caption.customPosition || preset.position;
+  const { fontPx, lineHeight } = setupWordFont(ctx, preset, font, ch, scale);
+
+  const words = caption.words!;
+  const currentMs = caption.currentMs ?? 0;
+  const activeIdx = activeWordIndex(words, currentMs);
+
+  const display = applyTransformText(text, preset);
+  const displayWords = display.split(/\s+/).filter(Boolean);
+  if (displayWords.length === 0) return;
+
+  // Wrap (greedy — balanced wrap is less useful for highlight mode).
+  const maxW = Math.max(40, preset.maxWidth * cw);
+  const lines: string[][] = [];
+  let curLine: string[] = [];
+  let curWidth = 0;
+  const spaceW = ctx.measureText(" ").width;
+  for (const w of displayWords) {
+    const wWidth = ctx.measureText(w).width;
+    const candidate = curWidth === 0 ? wWidth : curWidth + spaceW + wWidth;
+    if (candidate > maxW && curLine.length > 0) {
+      lines.push(curLine);
+      curLine = [w];
+      curWidth = wWidth;
+    } else {
+      curLine.push(w);
+      curWidth = candidate;
+    }
+  }
+  if (curLine.length) lines.push(curLine);
+
+  const blockH = lines.length * lineHeight;
+  const padding = Math.round((preset.bgPadding / 1080) * ch);
+  const radius = Math.round((preset.bgRadius / 1080) * ch);
+  const maxWidthLine = Math.max(
+    ...lines.map((l) => ctx.measureText(l.join(" ")).width),
+  );
+
+  const positionYpx = Math.round((preset.positionY / 1080) * ch);
+  let blockTop: number;
+  if (position === "top") blockTop = positionYpx;
+  else if (position === "center") blockTop = (ch - blockH) / 2 + positionYpx;
+  else blockTop = ch - blockH - positionYpx;
+
+  const blockLeft = (cw - maxWidthLine) / 2;
+  const blockRight = blockLeft + maxWidthLine;
+
+  const alignLineX = (lineStr: string): number => {
+    const w = ctx.measureText(lineStr).width;
+    if (preset.alignment === "left") return blockLeft;
+    if (preset.alignment === "right") return blockRight - w;
+    return (cw - w) / 2;
+  };
+
+  // Background box.
+  if (preset.bgColor) {
+    const boxX = blockLeft - padding;
+    const boxY = blockTop - padding;
+    const boxW = maxWidthLine + padding * 2;
+    const boxH = blockH + padding * 2;
+    ctx.save();
+    ctx.globalAlpha = preset.bgAlpha;
+    ctx.fillStyle = preset.bgColor;
+    drawRoundedRect(ctx, boxX, boxY, boxW, boxH, radius);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // First pass — render every line with the base text color, applying
+  // each word's animation transform. We split each visual line into
+  // words and draw them one at a time so we can apply per-word transforms.
+  ctx.save();
+  if (preset.shadow) {
+    ctx.shadowColor = preset.shadowColor;
+    ctx.shadowBlur = preset.shadowBlur * (ch / 540);
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 0;
+  }
+
+  let wordCursor = 0;
+  for (let li = 0; li < lines.length; li++) {
+    const lineWords = lines[li];
+    const lineStr = lineWords.join(" ");
+    const lineX = alignLineX(lineStr);
+    const lineY = blockTop + li * lineHeight;
+
+    // Compute x offsets of each word within the line.
+    let xOffset = 0;
+    for (let k = 0; k < lineWords.length; k++) {
+      const w = lineWords[k];
+      const wordX = lineX + xOffset;
+      const wordW = ctx.measureText(w).width;
+      const wordH = lineHeight;
+      const wordIdx = wordCursor + k;
+      const wordTs = words[wordIdx];
+
+      // Compute the animation transform for this word.
+      let t: WordTransform = IDENTITY_TRANSFORM;
+      if (animation !== "none" && wordTs) {
+        t = computeWordTransform(
+          animation,
+          wordTs.startMs,
+          wordTs.endMs,
+          currentMs,
+          wordIdx,
+          wordX,
+          lineY,
+          ch,
+        );
+      }
+
+      ctx.save();
+      applyWordTransform(ctx, t, wordX, lineY, wordW, wordH);
+      if (preset.borderColor && preset.borderWidth > 0) {
+        ctx.lineJoin = "round";
+        ctx.strokeStyle = preset.borderColor;
+        ctx.lineWidth = Math.max(1, (preset.borderWidth / 1080) * ch * 2);
+        ctx.strokeText(w, wordX, lineY);
+      }
+      ctx.fillStyle = textColor;
+      ctx.fillText(w, wordX, lineY);
+      ctx.restore();
+
+      xOffset += wordW + spaceW;
+    }
+    wordCursor += lineWords.length;
+  }
+
+  // Second pass — re-render only the active word in the highlight color,
+  // so it visually pops above the base text. We apply the animation
+  // transform too (so a "pop-in" highlight also pops).
+  if (activeIdx >= 0 && activeIdx < displayWords.length) {
+    wordCursor = 0;
+    for (let li = 0; li < lines.length; li++) {
+      const lineWords = lines[li];
+      if (activeIdx >= wordCursor && activeIdx < wordCursor + lineWords.length) {
+        const lineStr = lineWords.join(" ");
+        const lineX = alignLineX(lineStr);
+
+        const idxInLine = activeIdx - wordCursor;
+        let xOffset = 0;
+        for (let k = 0; k < idxInLine; k++) {
+          xOffset += ctx.measureText(lineWords[k]).width + spaceW;
+        }
+
+        const activeWord = lineWords[idxInLine];
+        const wordX = lineX + xOffset;
+        const wordY = blockTop + li * lineHeight;
+        const wordW = ctx.measureText(activeWord).width;
+        const wordH = lineHeight;
+        const wordTs = words[activeIdx];
+        const highlightColor = preset.highlightColor || textColor;
+
+        let t: WordTransform = IDENTITY_TRANSFORM;
+        if (animation !== "none" && wordTs) {
+          t = computeWordTransform(
+            animation,
+            wordTs.startMs,
+            wordTs.endMs,
+            currentMs,
+            activeIdx,
+            wordX,
+            wordY,
+            ch,
+          );
+        }
+
+        ctx.save();
+        applyWordTransform(ctx, t, wordX, wordY, wordW, wordH);
+        ctx.fillStyle = highlightColor;
+        if (preset.borderColor && preset.borderWidth > 0) {
+          ctx.lineJoin = "round";
+          ctx.strokeStyle = preset.borderColor;
+          ctx.lineWidth = Math.max(1, (preset.borderWidth / 1080) * ch * 2);
+          ctx.strokeText(activeWord, wordX, wordY);
+        }
+        ctx.fillText(activeWord, wordX, wordY);
+        ctx.restore();
+        break;
+      }
+      wordCursor += lineWords.length;
+    }
+  }
+  ctx.restore();
+
+  try {
+    (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
+      "0px";
+  } catch {
+    /* noop */
+  }
+}
+
+/**
+ * Word-only mode — render ONLY the currently-spoken word, large and
+ * centered. Kinetic typography animation applied to the single word.
+ */
+function drawWordOnly(
+  ctx: CanvasRenderingContext2D,
+  _text: string,
+  caption: CanvasCaptionCtx,
+  preset: ReturnType<typeof getCaptionPreset>,
+  font: ReturnType<typeof getFontOption>,
+  textColor: string,
+  cw: number,
+  ch: number,
+  animation: CaptionAnimation,
+): void {
+  const words = caption.words!;
+  const currentMs = caption.currentMs ?? 0;
+  const activeIdx = activeWordIndex(words, currentMs);
+  if (activeIdx < 0 || activeIdx >= words.length) return;
+
+  const scale = caption.fontSizeScale || 1;
+  const position = caption.customPosition || preset.position;
+  const fontPx = Math.max(
+    8,
+    Math.round(preset.fontSize * ch * scale * 1.15),
+  );
+  const italic = preset.fontStyle === "italic" ? "italic " : "";
+  ctx.font = `${italic}${preset.fontWeight} ${fontPx}px ${font.stack}`;
+  ctx.textBaseline = "top";
+  try {
+    (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
+      `${preset.letterSpacing}px`;
+  } catch {
+    /* noop */
+  }
+
+  const rawWord = words[activeIdx].text;
+  const display = applyTransformText(rawWord, preset);
+  const maxW = Math.max(40, preset.maxWidth * cw);
+  let wordWidth = ctx.measureText(display).width;
+  if (wordWidth > maxW) {
+    const shrink = maxW / wordWidth;
+    const shrunkPx = Math.max(8, Math.round(fontPx * shrink));
+    ctx.font = `${italic}${preset.fontWeight} ${shrunkPx}px ${font.stack}`;
+    wordWidth = ctx.measureText(display).width;
+  }
+  const lineHeight = Math.round(fontPx * 1.25);
+
+  // Compute animation transform for this word.
+  const t: WordTransform =
+    animation !== "none"
+      ? computeWordTransform(
+          animation,
+          words[activeIdx].startMs,
+          words[activeIdx].endMs,
+          currentMs,
+          activeIdx,
+          0,
+          0,
+          ch,
+        )
+      : IDENTITY_TRANSFORM;
+
+  const padding = Math.round((preset.bgPadding / 1080) * ch);
+  const radius = Math.round((preset.bgRadius / 1080) * ch);
+  const positionYpx = Math.round((preset.positionY / 1080) * ch);
+
+  let blockTop: number;
+  if (position === "top") blockTop = positionYpx;
+  else if (position === "center") blockTop = (ch - lineHeight) / 2 + positionYpx;
+  else blockTop = ch - lineHeight - positionYpx;
+
+  const blockLeft = (cw - wordWidth) / 2;
+
+  if (preset.bgColor) {
+    const boxX = blockLeft - padding;
+    const boxY = blockTop - padding;
+    const boxW = wordWidth + padding * 2;
+    const boxH = lineHeight + padding * 2;
+    ctx.save();
+    ctx.globalAlpha = preset.bgAlpha * t.alpha;
+    ctx.fillStyle = preset.bgColor;
+    drawRoundedRect(ctx, boxX, boxY, boxW, boxH, radius);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  ctx.save();
+  if (preset.shadow) {
+    ctx.shadowColor = preset.shadowColor;
+    ctx.shadowBlur = preset.shadowBlur * (ch / 540);
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 0;
+  }
+  applyWordTransform(ctx, t, blockLeft, blockTop, wordWidth, lineHeight);
+  if (preset.borderColor && preset.borderWidth > 0) {
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = preset.borderColor;
+    ctx.lineWidth = Math.max(1, (preset.borderWidth / 1080) * ch * 2);
+    ctx.strokeText(display, blockLeft, blockTop);
+  }
+  ctx.fillStyle = preset.highlightColor || textColor;
+  ctx.fillText(display, blockLeft, blockTop);
+  ctx.restore();
+
+  try {
+    (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
+      "0px";
+  } catch {
+    /* noop */
+  }
+}
+
+/**
+ * Word-animated mode — render the full cue text (like the standard
+ * path), but apply the kinetic typography animation transform to each
+ * word independently. Used when wordMode is "off" but an animation is
+ * active AND the cue has word timestamps. Falls back to the standard
+ * full-text path (with whole-cue animation) when no word timestamps.
+ */
+function drawWordAnimated(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  caption: CanvasCaptionCtx,
+  preset: ReturnType<typeof getCaptionPreset>,
+  font: ReturnType<typeof getFontOption>,
+  textColor: string,
+  cw: number,
+  ch: number,
+  animation: CaptionAnimation,
+): void {
+  const scale = caption.fontSizeScale || 1;
+  const position = caption.customPosition || preset.position;
+  const { fontPx, lineHeight } = setupWordFont(ctx, preset, font, ch, scale);
+
+  const words = caption.words!;
+  const currentMs = caption.currentMs ?? 0;
+
+  const display = applyTransformText(text, preset);
+  const displayWords = display.split(/\s+/).filter(Boolean);
+  if (displayWords.length === 0) return;
+
+  // Wrap (greedy).
+  const maxW = Math.max(40, preset.maxWidth * cw);
+  const lines: string[][] = [];
+  let curLine: string[] = [];
+  let curWidth = 0;
+  const spaceW = ctx.measureText(" ").width;
+  for (const w of displayWords) {
+    const wWidth = ctx.measureText(w).width;
+    const candidate = curWidth === 0 ? wWidth : curWidth + spaceW + wWidth;
+    if (candidate > maxW && curLine.length > 0) {
+      lines.push(curLine);
+      curLine = [w];
+      curWidth = wWidth;
+    } else {
+      curLine.push(w);
+      curWidth = candidate;
+    }
+  }
+  if (curLine.length) lines.push(curLine);
+
+  const blockH = lines.length * lineHeight;
+  const padding = Math.round((preset.bgPadding / 1080) * ch);
+  const radius = Math.round((preset.bgRadius / 1080) * ch);
+  const maxWidthLine = Math.max(
+    ...lines.map((l) => ctx.measureText(l.join(" ")).width),
+  );
+
+  const positionYpx = Math.round((preset.positionY / 1080) * ch);
+  let blockTop: number;
+  if (position === "top") blockTop = positionYpx;
+  else if (position === "center") blockTop = (ch - blockH) / 2 + positionYpx;
+  else blockTop = ch - blockH - positionYpx;
+
+  const blockLeft = (cw - maxWidthLine) / 2;
+  const blockRight = blockLeft + maxWidthLine;
+
+  const alignLineX = (lineStr: string): number => {
+    const w = ctx.measureText(lineStr).width;
+    if (preset.alignment === "left") return blockLeft;
+    if (preset.alignment === "right") return blockRight - w;
+    return (cw - w) / 2;
+  };
+
+  // Background box (no animation — keeps the box stable).
+  if (preset.bgColor) {
+    const boxX = blockLeft - padding;
+    const boxY = blockTop - padding;
+    const boxW = maxWidthLine + padding * 2;
+    const boxH = blockH + padding * 2;
+    ctx.save();
+    ctx.globalAlpha = preset.bgAlpha;
+    ctx.fillStyle = preset.bgColor;
+    drawRoundedRect(ctx, boxX, boxY, boxW, boxH, radius);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Render each word with its animation transform applied.
+  ctx.save();
+  if (preset.shadow) {
+    ctx.shadowColor = preset.shadowColor;
+    ctx.shadowBlur = preset.shadowBlur * (ch / 540);
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 0;
+  }
+
+  let wordCursor = 0;
+  for (let li = 0; li < lines.length; li++) {
+    const lineWords = lines[li];
+    const lineStr = lineWords.join(" ");
+    const lineX = alignLineX(lineStr);
+    const lineY = blockTop + li * lineHeight;
+
+    let xOffset = 0;
+    for (let k = 0; k < lineWords.length; k++) {
+      const w = lineWords[k];
+      const wordX = lineX + xOffset;
+      const wordW = ctx.measureText(w).width;
+      const wordH = lineHeight;
+      const wordIdx = wordCursor + k;
+      const wordTs = words[wordIdx];
+
+      let t: WordTransform = IDENTITY_TRANSFORM;
+      if (animation !== "none" && wordTs) {
+        t = computeWordTransform(
+          animation,
+          wordTs.startMs,
+          wordTs.endMs,
+          currentMs,
+          wordIdx,
+          wordX,
+          lineY,
+          ch,
+        );
+      }
+
+      ctx.save();
+      applyWordTransform(ctx, t, wordX, lineY, wordW, wordH);
+      if (preset.borderColor && preset.borderWidth > 0) {
+        ctx.lineJoin = "round";
+        ctx.strokeStyle = preset.borderColor;
+        ctx.lineWidth = Math.max(1, (preset.borderWidth / 1080) * ch * 2);
+        ctx.strokeText(w, wordX, lineY);
+      }
+      ctx.fillStyle = textColor;
+      ctx.fillText(w, wordX, lineY);
+      ctx.restore();
+
+      xOffset += wordW + spaceW;
+    }
+    wordCursor += lineWords.length;
+  }
+  ctx.restore();
+
   try {
     (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
       "0px";

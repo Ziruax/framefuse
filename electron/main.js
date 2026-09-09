@@ -179,9 +179,16 @@ ipcMain.handle("export-native", async (event, opts) => {
   const totalMs = segments.reduce((sum, s) => sum + s.durationMs, 0);
   const encoder = detectGpuEncoder();
 
-  // Pre-compute caption config — build ASS file with ALL preset properties
-  let capConfig = null;
-  let assFilePath = null;
+  // ─── Caption styling config (computed once, reused per-segment) ───
+  // Each clip needs its cues time-shifted to be relative to that
+  // clip's 0-based clock (clip-time 0 = the segment's absolute startMs
+  // on the master timeline). A single global ASS file with absolute
+  // timestamps would only match cues whose startMs < segDurSec for
+  // every clip — i.e. the first caption(s) get burned in repeated
+  // across every clip. This is the bug we fix here, plus we add
+  // word-by-word (ASS \k karaoke tags / per-word Dialogue lines) and
+  // kinetic typography animation (ASS \t transform tags) support.
+  let capStyle = null;
   if (captionsEnabled) {
     const cs = captionSettings;
     const fontName = cs.fontName || "Arial";
@@ -189,6 +196,7 @@ ipcMain.handle("export-native", async (event, opts) => {
     const textColor = cs.textColor || "#FFFFFF";
     const borderColor = cs.borderColor || "#000000";
     const borderWidth = cs.borderWidth || 2;
+    const highlightColor = cs.highlightColor || null;
     const position = cs.customPosition || cs.position || "bottom";
     const marginV = cs.positionY || 50;
     const fontWeight = cs.fontWeight || 600;
@@ -201,27 +209,19 @@ ipcMain.handle("export-native", async (event, opts) => {
     const textTransform = cs.textTransform || "none";
     const letterSpacing = cs.letterSpacing || 0;
     const alignment = cs.alignment || "center";
+    const wordMode = cs.wordMode || "off";
+    const animation = cs.animation || "none";
 
-    // Build ASS subtitle file with ALL styling from the preset
-    const assLines = [];
-    assLines.push("[Script Info]");
-    assLines.push("ScriptType: v4.00+");
-    assLines.push(`PlayResX: ${width}`);
-    assLines.push(`PlayResY: ${height}`);
-    assLines.push("WrapStyle: 0"); // smart wrapping
-    assLines.push("ScaledBorderAndShadow: yes");
-    assLines.push("");
-
-    assLines.push("[V4+ Styles]");
-    assLines.push("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding");
-
-    // Convert hex #RRGGBB to ASS &HAABBGGRR
+    // Convert hex #RRGGBB to ASS &HAABBGGRR (alpha inverted vs CSS).
     const toAssColor = (hex, alpha = 1) => {
       const h = (hex || "#FFFFFF").replace(/^#/, "");
       const r = h.slice(0, 2);
       const g = h.slice(2, 4);
       const b = h.slice(4, 6);
-      const assAlpha = Math.round((1 - alpha) * 255).toString(16).padStart(2, "0").toUpperCase();
+      const assAlpha = Math.round((1 - alpha) * 255)
+        .toString(16)
+        .padStart(2, "0")
+        .toUpperCase();
       return `&H${assAlpha}${b}${g}${r}`.toUpperCase();
     };
 
@@ -242,47 +242,274 @@ ipcMain.handle("export-native", async (event, opts) => {
     const outline = bgColor ? 0 : borderWidth;
     const shadowVal = shadow ? Math.max(1, Math.round(shadowBlur)) : 0;
 
-    // BackColour: used for background box (BorderStyle 3) or shadow color (BorderStyle 1)
-    const backColour = bgColor ? toAssColor(bgColor, bgAlpha) : toAssColor(shadow ? shadowColor : "#000000", 0.5);
+    // BackColour: background box (BorderStyle 3) or shadow color (BorderStyle 1)
+    const backColour = bgColor
+      ? toAssColor(bgColor, bgAlpha)
+      : toAssColor(shadow ? shadowColor : "#000000", 0.5);
 
     // Spacing = letterSpacing in ASS
     const spacing = letterSpacing || 0;
 
-    assLines.push(`Style: Default,${fontName},${fontSize},${toAssColor(textColor)},${toAssColor(textColor)},${toAssColor(borderColor)},${backColour},${bold},${italic},0,0,100,100,${spacing},0,${borderStyle},${outline},${shadowVal},${assAlignment},40,40,${marginV},1`);
+    capStyle = {
+      fontName,
+      fontSize,
+      textColor,
+      borderColor,
+      highlightColor,
+      alignment: assAlignment,
+      bold,
+      italic,
+      borderStyle,
+      outline,
+      shadowVal,
+      backColour,
+      spacing,
+      marginV,
+      textTransform,
+      wordMode,
+      animation,
+    };
+  }
+
+  // Format time as H:MM:SS.cc (ASS centisecond resolution)
+  function assFmtTime(sec) {
+    const clamped = Math.max(0, sec);
+    const h = Math.floor(clamped / 3600);
+    const m = Math.floor((clamped % 3600) / 60);
+    const s = Math.floor(clamped % 60);
+    const cs = Math.round((clamped % 1) * 100);
+    return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(cs).padStart(2, "0")}`;
+  }
+
+  // Convert hex #RRGGBB to ASS &HAABBGGRR.
+  function toAssLocal(hex, alpha = 1) {
+    const h = (hex || "#FFFFFF").replace(/^#/, "");
+    const r = h.slice(0, 2);
+    const g = h.slice(2, 4);
+    const b = h.slice(4, 6);
+    const assAlpha = Math.round((1 - alpha) * 255)
+      .toString(16)
+      .padStart(2, "0")
+      .toUpperCase();
+    return `&H${assAlpha}${b}${g}${r}`.toUpperCase();
+  }
+
+  // Build ASS \t animation tags for a single word. Mirrors
+  // assWordAnimationTags() in src/lib/merger/captionAnimations.ts so the
+  // burned-in export visually matches the preview.
+  function assAnimTags(animation, wordDurMs, ch) {
+    if (!animation || animation === "none") return "";
+    const chScale = ch / 1080;
+    const tags = [];
+    const POP_IN_MS = 220;
+    const SLIDE_UP_MS = 280;
+    const BOUNCE_IN_MS = 380;
+    const REVEAL_MS = 320;
+    const SHAKE_MS = 280;
+    const TYPEWRITER_MS_PER_CHAR = 45;
+
+    switch (animation) {
+      case "pop-in": {
+        tags.push(`\\fscx40\\fscy40\\alpha&HFF&`);
+        tags.push(`\\t(0,${Math.round(POP_IN_MS * 0.7)},\\fscx115\\fscy115\\alpha&H00&)`);
+        tags.push(`\\t(${Math.round(POP_IN_MS * 0.7)},${POP_IN_MS},\\fscx100\\fscy100)`);
+        break;
+      }
+      case "slide-up": {
+        const dy = Math.round(30 * chScale);
+        tags.push(`\\move(0,${dy},0,0,0,${SLIDE_UP_MS})`);
+        tags.push(`\\fad(${Math.round(SLIDE_UP_MS * 0.6)},0)`);
+        break;
+      }
+      case "bounce-in": {
+        const dy = Math.round(25 * chScale);
+        tags.push(`\\move(0,${-dy},0,0,0,${Math.round(BOUNCE_IN_MS * 0.6)})`);
+        tags.push(`\\move(0,${Math.round(-dy * 0.15)},0,0,${Math.round(BOUNCE_IN_MS * 0.6)},${BOUNCE_IN_MS})`);
+        tags.push(`\\fad(${Math.round(BOUNCE_IN_MS * 0.4)},0)`);
+        break;
+      }
+      case "scale-pulse": {
+        const half = Math.round(wordDurMs / 2);
+        tags.push(`\\t(0,${Math.round(half * 0.5)},\\fscx118\\fscy118)`);
+        tags.push(`\\t(${Math.round(half * 0.5)},${half},\\fscx100\\fscy100)`);
+        tags.push(`\\t(${half},${Math.round(half + (wordDurMs - half) * 0.5)},\\fscx118\\fscy118)`);
+        tags.push(`\\t(${Math.round(half + (wordDurMs - half) * 0.5)},${wordDurMs},\\fscx100\\fscy100)`);
+        break;
+      }
+      case "fade-through": {
+        tags.push(`\\fad(150,150)`);
+        break;
+      }
+      case "typewriter": {
+        tags.push(`\\fad(${TYPEWRITER_MS_PER_CHAR * 6},0)`);
+        break;
+      }
+      case "reveal": {
+        tags.push(`\\clip(0,0,0,${ch})`);
+        tags.push(`\\t(0,${REVEAL_MS},\\clip(0,0,2000,${ch}))`);
+        tags.push(`\\fad(${Math.round(REVEAL_MS * 0.5)},0)`);
+        break;
+      }
+      case "wave": {
+        const amp = Math.round(6 * chScale);
+        const q = Math.round(wordDurMs / 4);
+        tags.push(`\\move(0,0,0,${amp},0,${q})`);
+        tags.push(`\\move(0,${amp},0,${-amp},${q},${q * 2})`);
+        tags.push(`\\move(0,${-amp},0,${amp},${q * 2},${q * 3})`);
+        tags.push(`\\move(0,${amp},0,0,${q * 3},${wordDurMs})`);
+        break;
+      }
+      case "jitter": {
+        const amp = Math.round(4 * chScale);
+        const steps = 8;
+        const stepMs = Math.max(40, Math.round(wordDurMs / steps));
+        for (let i = 0; i < steps; i++) {
+          const t1 = i * stepMs;
+          const t2 = (i + 1) * stepMs;
+          const dx = ((i % 2 === 0 ? 1 : -1) * amp * (i + 1)) / steps;
+          const dy = ((i % 3 === 0 ? 1 : -1) * amp * (i + 1)) / steps;
+          tags.push(`\\t(${t1},${t2},\\move(0,0,${Math.round(dx)},${Math.round(dy)})`);
+        }
+        break;
+      }
+      case "shake": {
+        const amp = Math.round(12 * chScale);
+        const steps = 7;
+        const stepMs = Math.round(SHAKE_MS / steps);
+        for (let i = 0; i < steps; i++) {
+          const t1 = i * stepMs;
+          const t2 = (i + 1) * stepMs;
+          const decay = 1 - i / steps;
+          const dx = ((i % 2 === 0 ? 1 : -1) * amp * decay);
+          tags.push(`\\t(${t1},${t2},\\move(0,0,${Math.round(dx)},0)`);
+        }
+        break;
+      }
+      case "drift": {
+        const dy = Math.round(-8 * chScale);
+        tags.push(`\\move(0,0,0,${dy},0,${wordDurMs})`);
+        break;
+      }
+      default:
+        return "";
+    }
+    return tags.length ? `{${tags.join("")}}` : "";
+  }
+
+  // Build the ASS file for a single segment, with cue times SHIFTED to
+  // be relative to that segment's clip-time (0 .. segDurSec). Only
+  // cues whose absolute [startMs, endMs] overlap the segment's absolute
+  // [startMs, endMs] are included; their times are clamped to [0, dur].
+  //
+  // Word-by-word support:
+  //   - wordMode "off": standard Dialogue line per cue (full text).
+  //   - wordMode "word": single Dialogue line spanning the cue with \k
+  //     karaoke tags. PrimaryColour=highlight, SecondaryColour=text so
+  //     libass highlights the active word.
+  //   - wordMode "word-only": one Dialogue line per word, each showing
+  //     only that single word.
+  //
+  // Kinetic typography animation (animation != "none"):
+  //   Each word gets assAnimTags() prepended (ASS \t / \move / \fad
+  //   transform tags) so the burned-in export matches the canvas
+  //   preview. For "word-only" mode the tags go on each per-word line;
+  //   for "word" mode they go inside each \k block; for "off" mode they
+  //   go at the start of the cue's single Dialogue line.
+  //
+  // Returns the path to the written .ass file, or null if no cues apply.
+  function writeSegmentAss(segIndex, segStartMs, segEndMs, segDurMs) {
+    if (!capStyle) return null;
+
+    const style = capStyle;
+    // For "word" karaoke mode we swap PrimaryColour and SecondaryColour
+    // so libass renders the active word in the highlight color and the
+    // inactive words in the preset's textColor.
+    const primary = style.highlightColor || style.textColor;
+    const secondary = style.textColor;
+
+    const assLines = [];
+    assLines.push("[Script Info]");
+    assLines.push("ScriptType: v4.00+");
+    assLines.push(`PlayResX: ${width}`);
+    assLines.push(`PlayResY: ${height}`);
+    assLines.push("WrapStyle: 0");
+    assLines.push("ScaledBorderAndShadow: yes");
+    assLines.push("");
+    assLines.push("[V4+ Styles]");
+    assLines.push("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding");
+    assLines.push(`Style: Default,${style.fontName},${style.fontSize},${toAssLocal(primary)},${toAssLocal(secondary)},${toAssLocal(style.borderColor)},${style.backColour},${style.bold},${style.italic},0,0,100,100,${style.spacing},0,${style.borderStyle},${style.outline},${style.shadowVal},${style.alignment},40,40,${style.marginV},1`);
     assLines.push("");
     assLines.push("[Events]");
     assLines.push("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text");
 
-    // Format time as H:MM:SS.cc
-    const fmtTime = (sec) => {
-      const h = Math.floor(sec / 3600);
-      const m = Math.floor((sec % 3600) / 60);
-      const s = Math.floor(sec % 60);
-      const cs = Math.round((sec % 1) * 100);
-      return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(cs).padStart(2, "0")}`;
+    // Apply text transform consistently for export parity with preview.
+    const transform = (s) => {
+      if (style.textTransform === "uppercase") return s.toUpperCase();
+      if (style.textTransform === "lowercase") return s.toLowerCase();
+      return s;
     };
 
-    // Add each cue
+    let emitted = 0;
     for (const cue of subtitleCues) {
-      const startSec = cue.startMs / 1000;
-      const endSec = cue.endMs / 1000;
+      // Skip cues that do not overlap this segment's absolute window.
+      if (cue.endMs <= segStartMs || cue.startMs >= segEndMs) continue;
 
-      // Apply text transform
-      let text = cue.text;
-      if (textTransform === "uppercase") text = text.toUpperCase();
-      else if (textTransform === "lowercase") text = text.toLowerCase();
+      const relStartMs = Math.max(0, cue.startMs - segStartMs);
+      const relEndMs = Math.min(segDurMs, cue.endMs - segStartMs);
+      if (relEndMs <= relStartMs) continue;
 
-      // Replace newlines with \N for ASS hard line breaks
+      const hasWords = Array.isArray(cue.words) && cue.words.length > 0;
+
+      // ── Word-only mode: one Dialogue line per word ──
+      if (style.wordMode === "word-only" && hasWords) {
+        for (const w of cue.words) {
+          if (w.endMs <= segStartMs || w.startMs >= segEndMs) continue;
+          const wStart = Math.max(0, w.startMs - segStartMs);
+          const wEnd = Math.min(segDurMs, w.endMs - segStartMs);
+          if (wEnd <= wStart) continue;
+          const wt = transform(w.text || "");
+          if (!wt) continue;
+          const animTags = assAnimTags(style.animation, wEnd - wStart, height);
+          assLines.push(`Dialogue: 0,${assFmtTime(wStart / 1000)},${assFmtTime(wEnd / 1000)},Default,,0,0,0,,${animTags}${wt}`);
+          emitted++;
+        }
+        continue;
+      }
+
+      // ── Word (karaoke highlight) mode: one Dialogue line with \k tags ──
+      if (style.wordMode === "word" && hasWords) {
+        const parts = [];
+        for (const w of cue.words) {
+          if (w.endMs <= segStartMs || w.startMs >= segEndMs) continue;
+          const wStart = Math.max(0, w.startMs - segStartMs);
+          const wEnd = Math.min(segEndMs - segStartMs, w.endMs - segStartMs);
+          const wDurCs = Math.max(1, Math.round((wEnd - wStart) / 10));
+          const wt = transform(w.text || "");
+          if (!wt) continue;
+          const animTags = assAnimTags(style.animation, wEnd - wStart, height);
+          parts.push(`${animTags}{\\k${wDurCs}}${wt}`);
+        }
+        if (parts.length === 0) continue;
+        const karaokeText = parts.join(" ");
+        assLines.push(`Dialogue: 0,${assFmtTime(relStartMs / 1000)},${assFmtTime(relEndMs / 1000)},Default,,0,0,0,,${karaokeText}`);
+        emitted++;
+        continue;
+      }
+
+      // ── Standard mode (off) or no word timestamps: full text line ──
+      const text = transform(cue.text || "");
+      if (!text) continue;
       const assText = text.replace(/\n/g, "\\N");
-
-      assLines.push(`Dialogue: 0,${fmtTime(startSec)},${fmtTime(endSec)},Default,,0,0,0,,${assText}`);
+      const animTags = assAnimTags(style.animation, relEndMs - relStartMs, height);
+      assLines.push(`Dialogue: 0,${assFmtTime(relStartMs / 1000)},${assFmtTime(relEndMs / 1000)},Default,,0,0,0,,${animTags}${assText}`);
+      emitted++;
     }
 
-    // Write ASS file
-    assFilePath = path.join(tempDir, `captions_${Date.now()}.ass`);
-    fs.writeFileSync(assFilePath, assLines.join("\n"), "utf-8");
+    if (emitted === 0) return null;
 
-    capConfig = { assFilePath };
+    const assPath = path.join(tempDir, `captions_${String(segIndex).padStart(4, "0")}_${Date.now()}.ass`);
+    fs.writeFileSync(assPath, assLines.join("\n"), "utf-8");
+    return assPath;
   }
 
   function sendProgress(percent, fpsVal, timemark) {
@@ -297,7 +524,6 @@ ipcMain.handle("export-native", async (event, opts) => {
 
   ensureTempDir();
   const tempFiles = [];
-  if (assFilePath) tempFiles.push(assFilePath);
 
   try {
     // ─── STEP 1: Encode each segment ──────────────────────────────
@@ -309,8 +535,14 @@ ipcMain.handle("export-native", async (event, opts) => {
       const segDurSec = seg.durationMs / 1000;
       const segFrames = Math.max(1, Math.round(segDurSec * fps));
       const dir = enabled ? seg.direction || globalDir : "none";
-      const segStartMs = cumulativeMs;
-      const segEndMs = cumulativeMs + seg.durationMs;
+
+      // Use the segment's absolute master-timeline window when present
+      // (sent by the renderer as seg.startMs / seg.endMs). Fall back to
+      // the cumulative sequential cursor for older callers that don't
+      // send absolute times — in that case cue mapping still works for
+      // contiguous sequential timelines.
+      const segStartMs = (typeof seg.startMs === "number") ? seg.startMs : cumulativeMs;
+      const segEndMs = (typeof seg.endMs === "number") ? seg.endMs : (cumulativeMs + seg.durationMs);
 
       // Build zoompan expressions
       let zExpr, xExpr, yExpr;
@@ -334,7 +566,7 @@ ipcMain.handle("export-native", async (event, opts) => {
         }
       }
 
-      // Build -vf: scale(1.1x) + crop + zoompan + format + drawtext(captions)
+      // Build -vf: scale(1.1x) + crop + zoompan + format + subtitles
       const scaleW = Math.round(width * 1.1);
       const scaleH = Math.round(height * 1.1);
       let vfParts = [
@@ -345,14 +577,19 @@ ipcMain.handle("export-native", async (event, opts) => {
         `format=yuv420p`,
       ];
 
-      // Add subtitles filter for captions (ASS supports multi-line, wrapping, positioning)
-      if (capConfig && capConfig.assFilePath) {
-        // Escape the ASS file path for the subtitles filter
-        // Windows paths need backslashes escaped and colons escaped
-        const escapedAssPath = capConfig.assFilePath
-          .replace(/\\/g, "\\\\")
-          .replace(/:/g, "\\:");
-        vfParts.push(`subtitles=filename='${escapedAssPath}'`);
+      // Add subtitles filter for captions (per-segment ASS file with
+      // cues shifted to be relative to this clip's 0-based timeline,
+      // per-word \k karaoke tags when wordMode is enabled, and per-word
+      // \t animation tags when an animation is enabled).
+      if (captionsEnabled) {
+        const segAssPath = writeSegmentAss(i, segStartMs, segEndMs, seg.durationMs);
+        if (segAssPath) {
+          tempFiles.push(segAssPath);
+          const escapedAssPath = segAssPath
+            .replace(/\\/g, "\\\\")
+            .replace(/:/g, "\\:");
+          vfParts.push(`subtitles=filename='${escapedAssPath}'`);
+        }
       }
 
       const vf = vfParts.join(",");
@@ -380,7 +617,7 @@ ipcMain.handle("export-native", async (event, opts) => {
 
       // Progress: 0-95% for step 1
       const pct = ((i + 1) / segments.length) * 95;
-      cumulativeMs = segEndMs;
+      cumulativeMs += seg.durationMs;
       sendProgress(pct, 0, `00:00:${String(Math.floor(cumulativeMs / 1000)).padStart(2, "0")}.00`);
     }
 

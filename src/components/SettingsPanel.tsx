@@ -19,6 +19,7 @@ import {
 import type {
   AspectRatio,
   CaptionSettings,
+  CaptionAnimation,
   KenBurnsConfig,
   KenBurnsDirection,
   Resolution,
@@ -31,6 +32,7 @@ import {
   FONT_OPTIONS,
   getCaptionPreset,
 } from "@/lib/merger/captionPresets";
+import { ANIMATION_LABELS } from "@/lib/merger/captionAnimations";
 import { fmtTimecode } from "@/lib/merger/timeline";
 import { cn } from "@/lib/utils";
 
@@ -827,6 +829,89 @@ function CaptionsSection({
             />
           </button>
         </div>
+
+        {/* Word-by-word mode */}
+        <Field label="Word-by-word mode">
+          <div
+            className="grid grid-cols-3 gap-1"
+            role="radiogroup"
+            aria-label="Word-by-word mode"
+          >
+            {([
+              { value: "off", label: "Off", hint: "Full text" },
+              { value: "word", label: "Highlight", hint: "Karaoke" },
+              { value: "word-only", label: "Single", hint: "Hormozi" },
+            ] as const).map((opt) => {
+              const active = captionSettings.wordMode === opt.value;
+              return (
+                <button
+                  key={opt.value}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  onClick={() => set({ wordMode: opt.value })}
+                  className={cn(
+                    "rounded-md border px-2 py-1.5 text-[10px] font-medium transition-colors",
+                  )}
+                  style={{
+                    borderColor: active ? "#7c3aed" : "#3f3f46",
+                    backgroundColor: active
+                      ? "rgba(124, 58, 237, 0.25)"
+                      : "transparent",
+                    color: active ? "#ddd6fe" : "#a1a1aa",
+                  }}
+                  title={opt.hint}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+          <div className="text-[9px] mt-1.5 leading-snug" style={{ color: "#71717a" }}>
+            Highlight &amp; Single require word-level timestamps. Click
+            &ldquo;Generate captions&rdquo; in the media panel (uses
+            Whisper-tiny) or load a word-aligned SRT.
+          </div>
+        </Field>
+
+        {/* Kinetic typography animation */}
+        <Field label="Animation">
+          <div
+            className="grid grid-cols-3 gap-1 max-h-44 overflow-y-auto pr-1"
+            role="radiogroup"
+            aria-label="Caption animation"
+          >
+            {ANIMATION_LABELS.map((opt) => {
+              const active = (captionSettings.animation || "none") === opt.value;
+              return (
+                <button
+                  key={opt.value}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  onClick={() => set({ animation: opt.value as CaptionAnimation })}
+                  className={cn(
+                    "rounded-md border px-2 py-1.5 text-[10px] font-medium transition-colors",
+                  )}
+                  style={{
+                    borderColor: active ? "#7c3aed" : "#3f3f46",
+                    backgroundColor: active
+                      ? "rgba(124, 58, 237, 0.25)"
+                      : "transparent",
+                    color: active ? "#ddd6fe" : "#a1a1aa",
+                  }}
+                  title={opt.hint}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
+          <div className="text-[9px] mt-1.5 leading-snug" style={{ color: "#71717a" }}>
+            12 kinetic typography animations tuned for storytelling / retention.
+            Pairs with Whisper-generated captions for per-word motion.
+          </div>
+        </Field>
       </div>
     </Section>
   );

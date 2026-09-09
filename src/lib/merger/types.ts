@@ -111,7 +111,55 @@ export interface CaptionSettings {
   fontSizeScale: number;
   /** Balanced text wrapping (triangle shape: line1 > line2 > line3). Default true. */
   balancedWrap: boolean;
+  /**
+   * Word-by-word rendering mode.
+   * - "off"      : show the full cue text at once (standard subtitle behavior).
+   * - "word"     : show the full cue text, but highlight the currently-spoken word
+   *                (viral karaoke style — requires per-word timestamps from Whisper).
+   * - "word-only": show only the currently-spoken word (Hormozi/attention style).
+   * Default "off". When enabled, cues MUST carry `words[]`; cues without
+   * word timestamps fall back to full-text rendering.
+   */
+  wordMode: "off" | "word" | "word-only";
+  /**
+   * Kinetic typography animation. Per-word when words[] are available,
+   * whole-cue otherwise. Drives the per-word "in" transition plus an
+   * optional active-loop transform (e.g. scale-pulse, wave).
+   */
+  animation: CaptionAnimation;
 }
+
+/**
+ * Kinetic typography animations. Each one is designed for the
+ * storytelling/retention niche — they re-engage the viewer's eye on
+ * every word without being distracting.
+ *
+ *   none         — no animation (static text)
+ *   pop-in       — word scales 0.4 → 1 with overshoot bounce (200ms)
+ *   slide-up     — word slides up 30px → 0 with fade-in (250ms)
+ *   bounce-in    — word drops from -25px → 0 with spring ease (350ms)
+ *   scale-pulse  — active word pulses 1 → 1.18 → 1 (continuous)
+ *   fade-through — word alpha 0 → 1, with next word fading in as prev fades
+ *   typewriter   — characters reveal one-by-one (50ms each)
+ *   reveal       — word clipped-from-left + alpha 0.4 → 1 (300ms)
+ *   wave         — word y-offset oscillates with sine while active
+ *   jitter       — small random shake while active (attention)
+ *   shake        — strong horizontal shake for 250ms on word start
+ *   drift        — word slowly drifts upward by 8px while active
+ */
+export type CaptionAnimation =
+  | "none"
+  | "pop-in"
+  | "slide-up"
+  | "bounce-in"
+  | "scale-pulse"
+  | "fade-through"
+  | "typewriter"
+  | "reveal"
+  | "wave"
+  | "jitter"
+  | "shake"
+  | "drift";
 
 export function defaultCaptionSettings(): CaptionSettings {
   return {
@@ -122,6 +170,8 @@ export function defaultCaptionSettings(): CaptionSettings {
     customPosition: "center",
     fontSizeScale: 1,
     balancedWrap: true,
+    wordMode: "off",
+    animation: "none",
   };
 }
 

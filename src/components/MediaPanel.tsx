@@ -18,6 +18,8 @@ import {
   ChevronRight,
   Captions,
   FileText,
+  Sparkles,
+  Loader2,
 } from "lucide-react";
 import type {
   MediaSegment,
@@ -28,6 +30,7 @@ import type {
 } from "@/lib/merger/types";
 import { fmtTimecode } from "@/lib/merger/timeline";
 import { cn } from "@/lib/utils";
+import type { WhisperProgress } from "@/lib/merger/whisper";
 
 interface MediaPanelProps {
   segments: MediaSegment[];
@@ -47,6 +50,12 @@ interface MediaPanelProps {
   onOverride: (id: string, durationMs: number) => void;
   onClearOverride: (id: string) => void;
   onReorder: (id: string, dir: -1 | 1) => void;
+  /** Whisper-tiny caption generation. Requires an audio track. */
+  onGenerateCaptions: () => void;
+  /** True while Whisper is downloading / transcribing. */
+  whisperBusy: boolean;
+  /** Live progress for the Whisper run (null when idle). */
+  whisperProgress: WhisperProgress | null;
 }
 
 const KIND_STYLES: Record<
@@ -80,6 +89,9 @@ export function MediaPanelBase({
   onOverride,
   onClearOverride,
   onReorder,
+  onGenerateCaptions,
+  whisperBusy,
+  whisperProgress,
 }: MediaPanelProps) {
   const [dragOver, setDragOver] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -460,6 +472,79 @@ export function MediaPanelBase({
                 >
                   <Trash2 className="size-3.5" />
                 </button>
+              </div>
+            )}
+
+            {/* Whisper-tiny caption generation */}
+            {(audioTrack || whisperBusy) && (
+              <div
+                className="rounded-lg border p-2.5"
+                style={{
+                  borderColor: "rgba(124, 58, 237, 0.4)",
+                  backgroundColor: "rgba(76, 29, 149, 0.18)",
+                }}
+              >
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={onGenerateCaptions}
+                    disabled={whisperBusy || !audioTrack}
+                    className={cn(
+                      "flex flex-1 items-center justify-center gap-1.5 rounded-md px-2.5 py-1.5 text-[11px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+                    )}
+                    style={{
+                      backgroundColor: whisperBusy ? "#3f3f46" : "#7c3aed",
+                      color: "#ffffff",
+                    }}
+                    title={
+                      !audioTrack
+                        ? "Add an audio track first"
+                        : whisperBusy
+                          ? "Transcribing…"
+                          : "Generate word-by-word captions with Whisper-tiny (in your browser, no server)"
+                    }
+                  >
+                    {whisperBusy ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <Sparkles className="size-3.5" />
+                    )}
+                    {whisperBusy
+                      ? whisperProgress?.status ?? "Working…"
+                      : "Generate captions (Whisper)"}
+                  </button>
+                </div>
+                {whisperBusy && whisperProgress && (
+                  <div className="mt-2">
+                    <div
+                      className="h-1 w-full overflow-hidden rounded-full"
+                      style={{ backgroundColor: "#3f3f46" }}
+                    >
+                      <div
+                        className="h-full rounded-full transition-all"
+                        style={{
+                          width: `${Math.max(2, Math.min(100, whisperProgress.progress))}%`,
+                          backgroundColor: "#a78bfa",
+                        }}
+                      />
+                    </div>
+                    <div
+                      className="mt-1 text-[9px]"
+                      style={{ color: "#a1a1aa" }}
+                    >
+                      {whisperProgress.status} · {Math.round(whisperProgress.progress)}%
+                    </div>
+                  </div>
+                )}
+                {!whisperBusy && (
+                  <div
+                    className="mt-1.5 text-[9px] leading-snug"
+                    style={{ color: "#a1a1aa" }}
+                  >
+                    Uses openai/whisper-tiny (~75 MB, runs locally in your
+                    browser). First run downloads the model.
+                  </div>
+                )}
               </div>
             )}
 

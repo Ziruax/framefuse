@@ -1,11 +1,28 @@
 // src/lib/merger/subtitles.ts — SRT subtitle parser
 // Parses standard .srt files into an array of SubtitleCue objects.
 
+export interface WordTimestamp {
+  /** Word text (already stripped of punctuation, with original spacing remembered). */
+  text: string;
+  /** Start time of this word, in ms, in the master timeline. */
+  startMs: number;
+  /** End time of this word, in ms, in the master timeline. */
+  endMs: number;
+}
+
 export interface SubtitleCue {
   id: number;
   startMs: number;
   endMs: number;
   text: string;
+  /**
+   * Optional per-word timestamps. Populated when captions are generated
+   * from audio via Whisper-tiny (or any future ASR source that returns
+   * word-level alignment). When absent, the cue is rendered as full text.
+   * Used by the "word" and "word-only" caption modes for viral karaoke,
+   * and by per-word kinetic typography animations.
+   */
+  words?: WordTimestamp[];
 }
 
 /**
@@ -164,4 +181,60 @@ export function serializeSrt(cues: SubtitleCue[]): string {
       return `${i + 1}\n${fmt(c.startMs)} --> ${fmt(c.endMs)}\n${c.text}`;
     })
     .join("\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// Word-level helpers — used by the "word" / "word-only" caption modes and
+// by per-word kinetic typography animations.
+// ---------------------------------------------------------------------------
+
+/**
+ * Find the active word at a given time within a cue, or null.
+ * Returns the index into `words[]` for the word whose [startMs, endMs)
+ * contains tMs. The last word whose startMs <= tMs wins (so a word stays
+ * "active" from its start until the next word begins, even if the word's
+ * own endMs is slightly earlier — this matches natural reading behavior).
+ */
+export function activeWordIndex(
+  words: WordTimestamp[] | undefined,
+  tMs: number,
+): number {
+  if (!words || words.length === 0) return -1;
+  let lo = 0;
+  let hi = words.length - 1;
+  let candidate = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const w = words[mid];
+    if (tMs < w.startMs) {
+      hi = mid - 1;
+    } else {
+      candidate = mid;
+      lo = mid + 1;
+    }
+  }
+  return candidate;
+}
+
+/** True if a cue carries word-level timestamps (Whisper-generated). */
+export function hasWordTimestamps(cue: SubtitleCue): boolean {
+  return !!cue.words && cue.words.length > 0;
+}
+
+/**
+ * Build simple per-word timestamps from a cue by evenly dividing its
+ * duration across the words. Used as a fallback when word-level timing
+ * is unavailable but word-by-word mode is requested. Each word gets
+ * `dur / N` ms.
+ */
+export function synthesizeWordTimestamps(cue: SubtitleCue): WordTimestamp[] {
+  const tokens = cue.text.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return [];
+  const dur = Math.max(1, cue.endMs - cue.startMs);
+  const per = dur / tokens.length;
+  return tokens.map((text, i) => ({
+    text,
+    startMs: cue.startMs + Math.round(per * i),
+    endMs: cue.startMs + Math.round(per * (i + 1)),
+  }));
 }
