@@ -6,7 +6,7 @@ node_modules
 /out/
 
 # production
-/build
+
 /dist/
 
 # misc
@@ -36,5 +36,5 @@ dev.log
 *.exe
 *.dll
 tool-results/
-build/
+# build/ (dist output) — build/icon.ico IS committed
 

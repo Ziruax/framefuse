@@ -63,12 +63,10 @@
       {
         "from": "node_modules/ffmpeg-static",
         "to": "ffmpeg-static",
-        "filter": ["ffmpeg", "ffmpeg.exe", "ffmpeg.LICENSE", "ffmpeg.README"]
+        "filter": ["ffmpeg.exe", "ffmpeg.LICENSE", "ffmpeg.README"]
       }
     ],
-    "asarUnpack": [
-      "node_modules/ffmpeg-static/**/*"
-    ],
+    "asarUnpack": [],
     "win": {
       "target": "nsis",
       "signtoolOptions": null,
