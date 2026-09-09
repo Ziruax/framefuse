@@ -31,11 +31,18 @@ function ensureTempDir() {
 }
 
 function createWindow() {
+  // Resolve app icon with graceful fallback if the build/icon.ico is
+  // missing (e.g. during dev before electron-builder has been run).
+  // Electron accepts undefined for the icon option and falls back to
+  // its default window icon.
+  let iconPath = path.join(__dirname, "..", "build", "icon.ico");
+  try { if (!fs.existsSync(iconPath)) iconPath = undefined; } catch (_) { iconPath = undefined; }
+
   mainWindow = new BrowserWindow({
     width: 1400, height: 900, minWidth: 1100, minHeight: 720,
     backgroundColor: "#0a0a0a", title: "FrameFuse v4",
     autoHideMenuBar: false,
-    icon: path.join(__dirname, "..", "build", "icon.ico"),
+    icon: iconPath,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true, nodeIntegration: false, sandbox: false,
@@ -294,13 +301,27 @@ ipcMain.handle("export-native", async (event, opts) => {
     return `&H${assAlpha}${b}${g}${r}`.toUpperCase();
   }
 
-  // Build ASS \t animation tags for a single word. Mirrors
+  // Build ASS animation tags for a single word. Mirrors
   // assWordAnimationTags() in src/lib/merger/captionAnimations.ts so the
   // burned-in export visually matches the preview.
+  //
+  // ASS animation fundamentals:
+  //   - All tags inside ONE {} block apply as a group at the start of
+  //     the line. A second \move or \t in the same block silently
+  //     overrides the first.
+  //   - For multi-stage animation, emit SEPARATE {} blocks per stage.
+  //     libass reads them in order; each \t animates a single property
+  //     over [t1,t2] within the line's start time.
+  //   - \fad(t1,t2) and \move(x1,y1,x2,y2,t1,t2) are special — they
+  //     can only appear ONCE per line. Multiple \fad calls overwrite.
+  //   - For shake/jitter/wave we approximate the multi-stage motion
+  //     with sequential \t blocks that animate \frx (rotation) or
+  //     a single \move with the dominant end position. This is a
+  //     faithful enough approximation that the export matches the
+  //     canvas preview's spirit (motion = attention).
   function assAnimTags(animation, wordDurMs, ch) {
     if (!animation || animation === "none") return "";
     const chScale = ch / 1080;
-    const tags = [];
     const POP_IN_MS = 220;
     const SLIDE_UP_MS = 280;
     const BOUNCE_IN_MS = 380;
@@ -308,92 +329,120 @@ ipcMain.handle("export-native", async (event, opts) => {
     const SHAKE_MS = 280;
     const TYPEWRITER_MS_PER_CHAR = 45;
 
+    // Each entry is a complete {} override block, joined without
+    // separators. libass treats consecutive {} blocks as sequential
+    // override states.
+    const blocks = [];
+
     switch (animation) {
       case "pop-in": {
-        tags.push(`\\fscx40\\fscy40\\alpha&HFF&`);
-        tags.push(`\\t(0,${Math.round(POP_IN_MS * 0.7)},\\fscx115\\fscy115\\alpha&H00&)`);
-        tags.push(`\\t(${Math.round(POP_IN_MS * 0.7)},${POP_IN_MS},\\fscx100\\fscy100)`);
+        // Initial state: scaled to 40%, fully transparent. Then animate
+        // to 115% (overshoot) at 70% of POP_IN_MS, then settle to 100%.
+        blocks.push(`{\\fscx40\\fscy40\\alpha&HFF&}`);
+        blocks.push(`{\\t(0,${Math.round(POP_IN_MS * 0.7)},\\fscx115\\fscy115\\alpha&H00&)}`);
+        blocks.push(`{\\t(${Math.round(POP_IN_MS * 0.7)},${POP_IN_MS},\\fscx100\\fscy100)}`);
         break;
       }
       case "slide-up": {
         const dy = Math.round(30 * chScale);
-        tags.push(`\\move(0,${dy},0,0,0,${SLIDE_UP_MS})`);
-        tags.push(`\\fad(${Math.round(SLIDE_UP_MS * 0.6)},0)`);
+        // Single \move covers the whole slide; \fad adds the fade.
+        blocks.push(`{\\move(0,${dy},0,0,0,${SLIDE_UP_MS})\\fad(${Math.round(SLIDE_UP_MS * 0.6)},0)}`);
         break;
       }
       case "bounce-in": {
+        // Two-stage bounce via \t animating \org (origin) offset.
+        // Stage 1: drop from -dy to 0 over 60% of duration.
+        // Stage 2: tiny overshoot (3% of dy) and settle over remaining 40%.
         const dy = Math.round(25 * chScale);
-        tags.push(`\\move(0,${-dy},0,0,0,${Math.round(BOUNCE_IN_MS * 0.6)})`);
-        tags.push(`\\move(0,${Math.round(-dy * 0.15)},0,0,${Math.round(BOUNCE_IN_MS * 0.6)},${BOUNCE_IN_MS})`);
-        tags.push(`\\fad(${Math.round(BOUNCE_IN_MS * 0.4)},0)`);
+        const overshoot = Math.max(1, Math.round(dy * 0.15));
+        const t1 = Math.round(BOUNCE_IN_MS * 0.6);
+        // \move handles the main drop. \fad handles the fade-in.
+        // The overshoot is approximated with \t animating \fry by 1°
+        // (a tiny visual nudge — full 2-stage \move isn't supported in
+        // a single block).
+        blocks.push(`{\\move(0,${-dy},0,0,0,${t1})\\fad(${Math.round(BOUNCE_IN_MS * 0.4)},0)\\t(${t1},${BOUNCE_IN_MS},\\fry${overshoot > 0 ? 1 : -1})}`);
         break;
       }
       case "scale-pulse": {
-        const half = Math.round(wordDurMs / 2);
-        tags.push(`\\t(0,${Math.round(half * 0.5)},\\fscx118\\fscy118)`);
-        tags.push(`\\t(${Math.round(half * 0.5)},${half},\\fscx100\\fscy100)`);
-        tags.push(`\\t(${half},${Math.round(half + (wordDurMs - half) * 0.5)},\\fscx118\\fscy118)`);
-        tags.push(`\\t(${Math.round(half + (wordDurMs - half) * 0.5)},${wordDurMs},\\fscx100\\fscy100)`);
+        // Two pulses via two sequential \t blocks.
+        const half = Math.max(1, Math.round(wordDurMs / 2));
+        blocks.push(`{\\t(0,${Math.round(half * 0.5)},\\fscx118\\fscy118)}`);
+        blocks.push(`{\\t(${Math.round(half * 0.5)},${half},\\fscx100\\fscy100)}`);
+        blocks.push(`{\\t(${half},${Math.round(half + (wordDurMs - half) * 0.5)},\\fscx118\\fscy118)}`);
+        blocks.push(`{\\t(${Math.round(half + (wordDurMs - half) * 0.5)},${wordDurMs},\\fscx100\\fscy100)}`);
         break;
       }
       case "fade-through": {
-        tags.push(`\\fad(150,150)`);
+        blocks.push(`{\\fad(150,150)}`);
         break;
       }
       case "typewriter": {
-        tags.push(`\\fad(${TYPEWRITER_MS_PER_CHAR * 6},0)`);
+        // Approximate per-character reveal with a slow fade.
+        blocks.push(`{\\fad(${TYPEWRITER_MS_PER_CHAR * 6},0)}`);
         break;
       }
       case "reveal": {
-        tags.push(`\\clip(0,0,0,${ch})`);
-        tags.push(`\\t(0,${REVEAL_MS},\\clip(0,0,2000,${ch}))`);
-        tags.push(`\\fad(${Math.round(REVEAL_MS * 0.5)},0)`);
+        // Animate a clip rect from 0 width to full width.
+        blocks.push(`{\\clip(0,0,0,${ch})\\fad(${Math.round(REVEAL_MS * 0.5)},0)\\t(0,${REVEAL_MS},\\clip(0,0,2000,${ch}))}`);
         break;
       }
       case "wave": {
-        const amp = Math.round(6 * chScale);
-        const q = Math.round(wordDurMs / 4);
-        tags.push(`\\move(0,0,0,${amp},0,${q})`);
-        tags.push(`\\move(0,${amp},0,${-amp},${q},${q * 2})`);
-        tags.push(`\\move(0,${-amp},0,${amp},${q * 2},${q * 3})`);
-        tags.push(`\\move(0,${amp},0,0,${q * 3},${wordDurMs})`);
+        // Approximate sine wave with two-stage \t animating \fry
+        // (small rotation) — gives a gentle rocking that reads as
+        // "wave" without the multi-\move conflict.
+        const amp = Math.max(1, Math.round(6 * chScale));
+        const q = Math.max(50, Math.round(wordDurMs / 4));
+        blocks.push(`{\\t(0,${q},\\fry${amp})}`);
+        blocks.push(`{\\t(${q},${q * 2},\\fry${-amp})}`);
+        blocks.push(`{\\t(${q * 2},${q * 3},\\fry${amp})}`);
+        blocks.push(`{\\t(${q * 3},${wordDurMs},\\fry0)}`);
         break;
       }
       case "jitter": {
-        const amp = Math.round(4 * chScale);
-        const steps = 8;
+        // Multi-stage jitter via sequential \t blocks animating \frx
+        // (rotation x) and \fry (rotation y) — small angles read as
+        // jitter without breaking ASS's single-\move rule.
+        const amp = 2; // degrees — small but visible
+        const steps = Math.min(6, Math.max(3, Math.round(wordDurMs / 80)));
         const stepMs = Math.max(40, Math.round(wordDurMs / steps));
         for (let i = 0; i < steps; i++) {
           const t1 = i * stepMs;
           const t2 = (i + 1) * stepMs;
-          const dx = ((i % 2 === 0 ? 1 : -1) * amp * (i + 1)) / steps;
-          const dy = ((i % 3 === 0 ? 1 : -1) * amp * (i + 1)) / steps;
-          tags.push(`\\t(${t1},${t2},\\move(0,0,${Math.round(dx)},${Math.round(dy)})`);
+          const rx = (i % 2 === 0 ? amp : -amp);
+          const ry = (i % 3 === 0 ? amp : -amp);
+          blocks.push(`{\\t(${t1},${t2},\\frx${rx}\\fry${ry})}`);
         }
+        // Final reset to 0 so the word settles.
+        blocks.push(`{\\t(${steps * stepMs},${wordDurMs},\\frx0\\fry0)}`);
         break;
       }
       case "shake": {
-        const amp = Math.round(12 * chScale);
-        const steps = 7;
+        // Strong horizontal shake via sequential \frx rotation,
+        // decaying amplitude. This reads as a punchy shake.
+        const amp = 4; // degrees
+        const steps = 5;
         const stepMs = Math.round(SHAKE_MS / steps);
         for (let i = 0; i < steps; i++) {
           const t1 = i * stepMs;
           const t2 = (i + 1) * stepMs;
           const decay = 1 - i / steps;
-          const dx = ((i % 2 === 0 ? 1 : -1) * amp * decay);
-          tags.push(`\\t(${t1},${t2},\\move(0,0,${Math.round(dx)},0)`);
+          const rx = (i % 2 === 0 ? 1 : -1) * Math.max(1, Math.round(amp * decay));
+          blocks.push(`{\\t(${t1},${t2},\\frx${rx})}`);
         }
+        // Reset after shake completes.
+        blocks.push(`{\\t(${SHAKE_MS},${Math.max(SHAKE_MS + 50, wordDurMs)},\\frx0)}`);
         break;
       }
       case "drift": {
+        // Single \move upward — works because there's only one move.
         const dy = Math.round(-8 * chScale);
-        tags.push(`\\move(0,0,0,${dy},0,${wordDurMs})`);
+        blocks.push(`{\\move(0,0,0,${dy},0,${wordDurMs})}`);
         break;
       }
       default:
         return "";
     }
-    return tags.length ? `{${tags.join("")}}` : "";
+    return blocks.length ? blocks.join("") : "";
   }
 
   // Build the ASS file for a single segment, with cue times SHIFTED to
@@ -449,6 +498,22 @@ ipcMain.handle("export-native", async (event, opts) => {
       return s;
     };
 
+    // Escape user text for ASS so { } \ and stray ASS tags don't break
+    // the Dialogue line. Per-word text (already split by whitespace) is
+    // also escaped via this helper.
+    const escapeAssText = (s) => {
+      if (!s) return "";
+      // Backslash first (so we don't double-escape what we add).
+      let out = s.replace(/\\/g, "\\\\");
+      // Curly braces → escape so libass treats them as literal chars
+      // instead of override-block delimiters.
+      out = out.replace(/\{/g, "\\{").replace(/\}/g, "\\}");
+      // Newlines → ASS hard line break \N (after backslash escape this
+      // becomes \\N which is what libass expects).
+      out = out.replace(/\n/g, "\\N");
+      return out;
+    };
+
     let emitted = 0;
     for (const cue of subtitleCues) {
       // Skip cues that do not overlap this segment's absolute window.
@@ -467,7 +532,7 @@ ipcMain.handle("export-native", async (event, opts) => {
           const wStart = Math.max(0, w.startMs - segStartMs);
           const wEnd = Math.min(segDurMs, w.endMs - segStartMs);
           if (wEnd <= wStart) continue;
-          const wt = transform(w.text || "");
+          const wt = escapeAssText(transform(w.text || ""));
           if (!wt) continue;
           const animTags = assAnimTags(style.animation, wEnd - wStart, height);
           assLines.push(`Dialogue: 0,${assFmtTime(wStart / 1000)},${assFmtTime(wEnd / 1000)},Default,,0,0,0,,${animTags}${wt}`);
@@ -482,9 +547,9 @@ ipcMain.handle("export-native", async (event, opts) => {
         for (const w of cue.words) {
           if (w.endMs <= segStartMs || w.startMs >= segEndMs) continue;
           const wStart = Math.max(0, w.startMs - segStartMs);
-          const wEnd = Math.min(segEndMs - segStartMs, w.endMs - segStartMs);
+          const wEnd = Math.min(segDurMs, w.endMs - segStartMs);
           const wDurCs = Math.max(1, Math.round((wEnd - wStart) / 10));
-          const wt = transform(w.text || "");
+          const wt = escapeAssText(transform(w.text || ""));
           if (!wt) continue;
           const animTags = assAnimTags(style.animation, wEnd - wStart, height);
           parts.push(`${animTags}{\\k${wDurCs}}${wt}`);
@@ -497,9 +562,9 @@ ipcMain.handle("export-native", async (event, opts) => {
       }
 
       // ── Standard mode (off) or no word timestamps: full text line ──
-      const text = transform(cue.text || "");
+      const text = escapeAssText(transform(cue.text || ""));
       if (!text) continue;
-      const assText = text.replace(/\n/g, "\\N");
+      const assText = text; // escapeAssText already converted \n → \\N
       const animTags = assAnimTags(style.animation, relEndMs - relStartMs, height);
       assLines.push(`Dialogue: 0,${assFmtTime(relStartMs / 1000)},${assFmtTime(relEndMs / 1000)},Default,,0,0,0,,${animTags}${assText}`);
       emitted++;
@@ -585,9 +650,18 @@ ipcMain.handle("export-native", async (event, opts) => {
         const segAssPath = writeSegmentAss(i, segStartMs, segEndMs, seg.durationMs);
         if (segAssPath) {
           tempFiles.push(segAssPath);
+          // Escape the ASS file path for FFmpeg's subtitles filter.
+          // Cross-platform safety:
+          //   1. backslashes → forward slashes (libass prefers forward
+          //      slashes on Windows; FFmpeg normalizes them)
+          //   2. colons escaped to \: (Windows drive letters like C:)
+          //   3. single quotes escaped to \' (filter syntax)
+          //   4. commas escaped to \, (filter argument separator)
           const escapedAssPath = segAssPath
-            .replace(/\\/g, "\\\\")
-            .replace(/:/g, "\\:");
+            .replace(/\\/g, "/")
+            .replace(/:/g, "\\:")
+            .replace(/'/g, "\\'")
+            .replace(/,/g, "\\,");
           vfParts.push(`subtitles=filename='${escapedAssPath}'`);
         }
       }

@@ -9,12 +9,12 @@
   "scripts": {
     "dev": "next dev -p 3000",
     "clean": "node scripts/clean.js",
-    "build": "npm run clean && next build --webpack",
+    "build": "npm run clean && next build --webpack && node scripts/copy-wasm.js",
     "start": "next start",
     "lint": "eslint .",
     "electron": "electron electron/main.js",
     "electron:dev": "concurrently -k \"npm run dev\" \"wait-on http://localhost:3000 && electron electron/main.js\"",
-    "electron:build": "npm run clean && next build --webpack && electron-builder --win dir --publish never"
+    "electron:build": "npm run clean && next build --webpack && node scripts/copy-wasm.js && electron-builder --win dir --publish never"
   },
   "dependencies": {
     "@xenova/transformers": "^2.17.2",
@@ -53,12 +53,18 @@
       "package.json",
       "node_modules/ffmpeg-static/**/*"
     ],
+    "extraResources": [
+      {
+        "from": "node_modules/@xenova/transformers/dist",
+        "to": "transformers-wasm",
+        "filter": ["**/*.{wasm,mjs}"]
+      }
+    ],
     "asarUnpack": [
       "node_modules/ffmpeg-static/**/*"
     ],
     "win": {
       "target": "nsis",
-      "icon": "build/icon.ico",
       "signtoolOptions": null,
       "signAndEditExecutable": false,
       "forceCodeSigning": false

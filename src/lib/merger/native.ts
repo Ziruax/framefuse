@@ -14,7 +14,6 @@ import { getCaptionPreset, getFontOption } from "./captionPresets";
 import { cueAt, activeWordIndex, type WordTimestamp } from "./subtitles";
 import {
   computeWordTransform,
-  assWordAnimationTags,
   IDENTITY_TRANSFORM,
   type WordTransform,
 } from "./captionAnimations";
