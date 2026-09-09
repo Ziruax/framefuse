@@ -4,6 +4,7 @@
 //   2. MediaRecorder (real-time WebM)
 import { Muxer, ArrayBufferTarget } from "mp4-muxer";
 import type {
+  AudioSettings,
   ExportNativeOptions,
   ExportProgress,
   ExportResult,
@@ -117,6 +118,7 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
     audioTrack,
     settings,
     kenBurns,
+    audio,
     onProgress,
     signal,
     subtitles,
@@ -259,6 +261,7 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
       kenBurns,
       segments: segPayload,
       audioPath,
+      audio,
       captionSettings: ipcCaptionSettings,
       subtitleCues: ipcSubtitleCues,
     });
@@ -586,18 +589,17 @@ interface CanvasCaptionCtx {
   /** Balanced text wrapping (only used in standard full-text mode). */
   balancedWrap?: boolean;
   /**
-   * Word-by-word rendering mode. When "word" or "word-only" is set,
-   * `drawCaption` expects `words` + `currentMs` so it can highlight or
-   * show only the currently-spoken word. Cues without word timestamps
-   * always fall back to full-text rendering.
+   * Word-by-word rendering mode. When "word", "word-only" or "stack" is
+   * set, `drawCaption` expects `words` + `currentMs`. Cues without word
+   * timestamps always fall back to full-text rendering.
    */
-  wordMode?: "off" | "word" | "word-only";
+  wordMode?: "off" | "word" | "word-only" | "stack";
   /** Per-word timestamps for the current cue (only present when ASR-generated). */
   words?: WordTimestamp[];
   /** Master-timeline time (ms) used to find the active word. */
   currentMs?: number;
   /** Kinetic typography animation. Drives per-word transforms. */
-  animation?: CaptionAnimation;
+  animation?: CaptionAnimation | null;
   /** Absolute startMs of the current cue (for whole-cue animation fallback). */
   cueStartMs?: number;
   /** Absolute endMs of the current cue (for whole-cue animation fallback). */
@@ -656,9 +658,16 @@ export function drawCaption(
   const wordMode = caption.wordMode ?? "off";
   const words = caption.words;
   const hasWords = words && words.length > 0;
-  if ((wordMode === "word" || wordMode === "word-only") && hasWords) {
+  if (
+    (wordMode === "word" || wordMode === "word-only" || wordMode === "stack") &&
+    hasWords
+  ) {
     if (wordMode === "word-only") {
       drawWordOnly(ctx, text, caption, preset, font, textColor, cw, ch, animation);
+      return;
+    }
+    if (wordMode === "stack") {
+      drawWordStack(ctx, text, caption, preset, font, textColor, cw, ch, animation);
       return;
     }
     drawWordHighlight(ctx, text, caption, preset, font, textColor, cw, ch, animation);
@@ -888,23 +897,83 @@ function applyWordTransform(
   // Alpha
   ctx.globalAlpha *= t.alpha;
   // Translation + scale around the word's center
-  if (t.scale !== 1 || t.offsetX !== 0 || t.offsetY !== 0 || t.rotation !== 0) {
+  const sx = t.scale * t.scaleX;
+  const sy = t.scale * t.scaleY;
+  if (sx !== 1 || sy !== 1 || t.offsetX !== 0 || t.offsetY !== 0 || t.rotation !== 0) {
     const cx = wordX + wordW / 2;
     const cy = wordY + wordH / 2;
     ctx.translate(cx + t.offsetX, cy + t.offsetY);
     ctx.rotate(t.rotation);
-    ctx.scale(t.scale, t.scale);
+    ctx.scale(sx, sy);
     ctx.translate(-cx, -cy);
   }
   // Clip mask: only show the left `clipLeft` fraction of the word.
-  // Used by typewriter (per-character reveal) and reveal (clip-from-
-  // left) animations. Must match the ASS export's \\clip() tag so the
-  // preview and export render identically.
   if (t.clipLeft < 1) {
     ctx.beginPath();
     ctx.rect(wordX, wordY, wordW * t.clipLeft, wordH);
     ctx.clip();
   }
+}
+
+/**
+ * Draw one styled word with the full v4.1 effect set:
+ *   - optional highlight box (spotlight) behind the word
+ *   - glitch RGB-split copies (red -x, cyan +x) at t.glitchAmount
+ *   - per-word color override (color-cycle)
+ *   - border stroke + shadow from the preset
+ * Assumes ctx.save() was called by the caller; applies its own transform
+ * around the word box.
+ */
+function drawStyledWord(
+  ctx: CanvasRenderingContext2D,
+  word: string,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  t: WordTransform,
+  preset: ReturnType<typeof getCaptionPreset>,
+  baseColor: string,
+  ch: number,
+): void {
+  // Spotlight: colored box pops behind the word (grows with the entry).
+  if (t.highlightBox) {
+    const pad = Math.round((preset.bgPadding / 1080) * ch);
+    const grow = 0.6 + 0.4 * Math.min(1, t.scale);
+    ctx.save();
+    ctx.globalAlpha = t.alpha * 0.95;
+    ctx.fillStyle = preset.highlightColor || "#FDE047";
+    const bw = (w + pad * 2) * grow;
+    const bh = (h + pad * 0.6) * grow;
+    drawRoundedRect(ctx, x + w / 2 - bw / 2, y + h / 2 - bh / 2, bw, bh, Math.round((preset.bgRadius / 1080) * ch));
+    ctx.fill();
+    ctx.restore();
+  }
+
+  applyWordTransform(ctx, t, x, y, w, h);
+
+  // Glitch RGB-split copies (drawn beneath the main text).
+  if (t.glitchAmount > 0.05) {
+    const off = Math.max(1.5, 3 * (ch / 540)) * t.glitchAmount;
+    ctx.save();
+    ctx.globalAlpha = t.glitchAmount * 0.8;
+    ctx.fillStyle = "#FF003C"; // red
+    ctx.fillText(word, x - off, y);
+    ctx.fillStyle = "#00E5FF"; // cyan
+    ctx.fillText(word, x + off, y);
+    ctx.restore();
+  }
+
+  const fillColor = t.colorOverride || baseColor;
+
+  if (preset.borderColor && preset.borderWidth > 0) {
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = preset.borderColor;
+    ctx.lineWidth = Math.max(1, (preset.borderWidth / 1080) * ch * 2);
+    ctx.strokeText(word, x, y);
+  }
+  ctx.fillStyle = fillColor;
+  ctx.fillText(word, x, y);
 }
 
 /**
@@ -1041,15 +1110,7 @@ function drawWordHighlight(
       }
 
       ctx.save();
-      applyWordTransform(ctx, t, wordX, lineY, wordW, wordH);
-      if (preset.borderColor && preset.borderWidth > 0) {
-        ctx.lineJoin = "round";
-        ctx.strokeStyle = preset.borderColor;
-        ctx.lineWidth = Math.max(1, (preset.borderWidth / 1080) * ch * 2);
-        ctx.strokeText(w, wordX, lineY);
-      }
-      ctx.fillStyle = textColor;
-      ctx.fillText(w, wordX, lineY);
+      drawStyledWord(ctx, w, wordX, lineY, wordW, wordH, t, preset, textColor, ch);
       ctx.restore();
 
       xOffset += wordW + spaceW;
@@ -1082,9 +1143,9 @@ function drawWordHighlight(
         const wordTs = words[activeIdx];
         const highlightColor = preset.highlightColor || textColor;
 
-        let t: WordTransform = IDENTITY_TRANSFORM;
+        let tActive: WordTransform = IDENTITY_TRANSFORM;
         if (animation !== "none" && wordTs) {
-          t = computeWordTransform(
+          tActive = computeWordTransform(
             animation,
             wordTs.startMs,
             wordTs.endMs,
@@ -1097,15 +1158,10 @@ function drawWordHighlight(
         }
 
         ctx.save();
-        applyWordTransform(ctx, t, wordX, wordY, wordW, wordH);
-        ctx.fillStyle = highlightColor;
-        if (preset.borderColor && preset.borderWidth > 0) {
-          ctx.lineJoin = "round";
-          ctx.strokeStyle = preset.borderColor;
-          ctx.lineWidth = Math.max(1, (preset.borderWidth / 1080) * ch * 2);
-          ctx.strokeText(activeWord, wordX, wordY);
-        }
-        ctx.fillText(activeWord, wordX, wordY);
+        // color-cycle keeps its palette color on the active word; other
+        // animations promote the active word to the highlight color.
+        const activeColor = tActive.colorOverride || highlightColor;
+        drawStyledWord(ctx, activeWord, wordX, wordY, wordW, wordH, tActive, preset, activeColor, ch);
         ctx.restore();
         break;
       }
@@ -1216,15 +1272,142 @@ function drawWordOnly(
     ctx.shadowOffsetX = 0;
     ctx.shadowOffsetY = 0;
   }
-  applyWordTransform(ctx, t, blockLeft, blockTop, wordWidth, lineHeight);
-  if (preset.borderColor && preset.borderWidth > 0) {
-    ctx.lineJoin = "round";
-    ctx.strokeStyle = preset.borderColor;
-    ctx.lineWidth = Math.max(1, (preset.borderWidth / 1080) * ch * 2);
-    ctx.strokeText(display, blockLeft, blockTop);
+  drawStyledWord(ctx, display, blockLeft, blockTop, wordWidth, lineHeight, t, preset, preset.highlightColor || textColor, ch);
+  ctx.restore();
+
+  try {
+    (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
+      "0px";
+  } catch {
+    /* noop */
   }
-  ctx.fillStyle = preset.highlightColor || textColor;
-  ctx.fillText(display, blockLeft, blockTop);
+}
+
+/**
+ * Stack mode (v4.1) — words stack vertically as they are spoken, like
+ * the viral "quote builder" captions: each new word pops into a growing
+ * centered stack; words already spoken stay dim above; the active word
+ * renders in the highlight color with its animation transform. Words
+ * after the active one are hidden. When the stack exceeds 8 rows the
+ * window slides so the newest words stay visible.
+ */
+function drawWordStack(
+  ctx: CanvasRenderingContext2D,
+  _text: string,
+  caption: CanvasCaptionCtx,
+  preset: ReturnType<typeof getCaptionPreset>,
+  font: ReturnType<typeof getFontOption>,
+  textColor: string,
+  cw: number,
+  ch: number,
+  animation: CaptionAnimation,
+): void {
+  const words = caption.words!;
+  const currentMs = caption.currentMs ?? 0;
+  const activeIdx = activeWordIndex(words, currentMs);
+  if (activeIdx < 0 || activeIdx >= words.length) return;
+
+  const scale = caption.fontSizeScale || 1;
+  const position = caption.customPosition || preset.position;
+  const fontPx = Math.max(8, Math.round(preset.fontSize * ch * scale));
+  const italic = preset.fontStyle === "italic" ? "italic " : "";
+  ctx.font = `${italic}${preset.fontWeight} ${fontPx}px ${font.stack}`;
+  ctx.textBaseline = "top";
+  try {
+    (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
+      `${preset.letterSpacing}px`;
+  } catch {
+    /* noop */
+  }
+
+  const maxW = Math.max(40, preset.maxWidth * cw);
+  const lineHeight = Math.round(fontPx * 1.35);
+
+  // Visible window: show the last ≤ 8 spoken words.
+  const MAX_ROWS = 8;
+  const from = Math.max(0, activeIdx - (MAX_ROWS - 1));
+  const rows: { word: string; idx: number; w: number }[] = [];
+  for (let i = from; i <= activeIdx; i++) {
+    const display = applyTransformText(words[i].text, preset);
+    let wW = ctx.measureText(display).width;
+    if (wW > maxW) wW = maxW; // ultra-wide words are clamped (rare)
+    rows.push({ word: display, idx: i, w: wW });
+  }
+  if (rows.length === 0) return;
+
+  const blockH = rows.length * lineHeight;
+  const padding = Math.round((preset.bgPadding / 1080) * ch);
+  const radius = Math.round((preset.bgRadius / 1080) * ch);
+  const positionYpx = Math.round((preset.positionY / 1080) * ch);
+
+  let blockTop: number;
+  if (position === "top") blockTop = positionYpx;
+  else if (position === "center") blockTop = (ch - blockH) / 2 + positionYpx;
+  else blockTop = ch - blockH - positionYpx;
+
+  ctx.save();
+  if (preset.shadow) {
+    ctx.shadowColor = preset.shadowColor;
+    ctx.shadowBlur = preset.shadowBlur * (ch / 540);
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 0;
+  }
+
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    const isActive = row.idx === activeIdx;
+    const wordX = (cw - row.w) / 2;
+    const wordY = blockTop + r * lineHeight;
+
+    const wordTs = words[row.idx];
+    let t: WordTransform = IDENTITY_TRANSFORM;
+    if (animation !== "none" && wordTs) {
+      t = computeWordTransform(
+        animation,
+        wordTs.startMs,
+        wordTs.endMs,
+        currentMs,
+        row.idx,
+        wordX,
+        wordY,
+        ch,
+      );
+    }
+
+    // Spoken (above) words render dim; the active word gets the full
+    // treatment (highlight color + animation transform).
+    if (!isActive) {
+      t = { ...t, alpha: t.alpha * 0.4 };
+    }
+
+    ctx.save();
+    if (isActive && preset.bgColor) {
+      // The active word carries the preset's background box.
+      const boxX = wordX - padding;
+      const boxY = wordY - Math.round(padding * 0.5);
+      const boxW = row.w + padding * 2;
+      const boxH = lineHeight + Math.round(padding * 0.5);
+      ctx.save();
+      ctx.globalAlpha = preset.bgAlpha * t.alpha;
+      ctx.fillStyle = preset.bgColor;
+      drawRoundedRect(ctx, boxX, boxY, boxW, boxH, radius);
+      ctx.fill();
+      ctx.restore();
+    }
+    drawStyledWord(
+      ctx,
+      row.word,
+      wordX,
+      wordY,
+      row.w,
+      lineHeight,
+      t,
+      preset,
+      isActive ? preset.highlightColor || textColor : t.colorOverride || textColor,
+      ch,
+    );
+    ctx.restore();
+  }
   ctx.restore();
 
   try {
@@ -1365,15 +1548,7 @@ function drawWordAnimated(
       }
 
       ctx.save();
-      applyWordTransform(ctx, t, wordX, lineY, wordW, wordH);
-      if (preset.borderColor && preset.borderWidth > 0) {
-        ctx.lineJoin = "round";
-        ctx.strokeStyle = preset.borderColor;
-        ctx.lineWidth = Math.max(1, (preset.borderWidth / 1080) * ch * 2);
-        ctx.strokeText(w, wordX, lineY);
-      }
-      ctx.fillStyle = textColor;
-      ctx.fillText(w, wordX, lineY);
+      drawStyledWord(ctx, w, wordX, lineY, wordW, wordH, t, preset, textColor, ch);
       ctx.restore();
 
       xOffset += wordW + spaceW;

@@ -112,13 +112,22 @@ function hashString(str: string): number {
   return h >>> 0;
 }
 
-/** Seeded direction resolution for "random". */
+/** Seeded direction resolution for "random" with the v4.1 pool.
+ * When kb.direction is a concrete effect it wins directly. When "random",
+ * the segment deterministically picks from the user's selected pool
+ * (2+ preferred effects) — falling back to all 6 when the pool is empty. */
 export function resolveDirection(
   id: string,
   fallback: KenBurnsDirection,
+  pool?: KenBurnsDirection[],
 ): KenBurnsDirection {
   if (fallback !== "random") return fallback;
-  return DIRECTIONS[hashString(id) % DIRECTIONS.length];
+  const effective =
+    pool && pool.length > 0
+      ? pool.filter((d) => d !== "random")
+      : DIRECTIONS;
+  const list = effective.length > 0 ? effective : DIRECTIONS;
+  return list[hashString(id) % list.length];
 }
 
 export interface TimelineEntry {
@@ -205,7 +214,7 @@ export function buildTimeline(
     for (const we of withEnds) {
       const startMs = we.e.parsed.startMs ?? 0;
       const endMs = Math.max(startMs + 200, we.endMs); // min 200ms
-      const dir = resolveDirection(we.e.id, kenBurns.direction);
+      const dir = resolveDirection(we.e.id, kenBurns.direction, kenBurns.directionPool);
       segments.push({
         id: we.e.id,
         fileName: we.e.fileName,
@@ -236,7 +245,7 @@ export function buildTimeline(
         ov && ov > 0 ? ov : e.parsed.durationMs ?? DEFAULT_DURATION_MS;
       const startMs = cursor;
       const endMs = cursor + dur;
-      const dir = resolveDirection(e.id, kenBurns.direction);
+      const dir = resolveDirection(e.id, kenBurns.direction, kenBurns.directionPool);
       segments.push({
         id: e.id,
         fileName: e.fileName,

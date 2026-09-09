@@ -1,66 +1,103 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import {
-  ZoomIn,
-  ZoomOut,
-  ArrowLeft,
-  ArrowRight,
-  ArrowUp,
-  ArrowDown,
-  Shuffle,
-  Sparkles,
-  Bug,
-  Aperture,
+  ChevronDown,
   ChevronRight,
+  Zap,
+  Film,
   Captions,
-  Type,
+  AudioLines,
+  Bug,
+  Wand2,
+  RotateCcw,
+  FileText,
+  FileDown,
   Loader2,
-  Music,
+  Sparkles,
 } from "lucide-react";
 import type {
-  AspectRatio,
+  AudioSettings,
   CaptionSettings,
-  CaptionAnimation,
   KenBurnsConfig,
-  KenBurnsDirection,
-  Resolution,
   SubtitleFile,
   VideoSettings,
-  TimelineMode,
 } from "@/lib/merger/types";
+import type { KenBurnsDirection } from "@/lib/merger/types";
 import {
-  CAPTION_PRESETS,
   FONT_OPTIONS,
+  presetsByCategory,
   getCaptionPreset,
 } from "@/lib/merger/captionPresets";
 import { ANIMATION_LABELS } from "@/lib/merger/captionAnimations";
-import { fmtTimecode } from "@/lib/merger/timeline";
+import type { WhisperProgress } from "@/lib/merger/whisper";
 import { cn } from "@/lib/utils";
 
+// ---------------------------------------------------------------------------
+// Whisper languages
+// ---------------------------------------------------------------------------
+const WHISPER_LANGUAGES: { value: string; label: string }[] = [
+  { value: "auto", label: "Auto-detect" },
+  { value: "en", label: "English" },
+  { value: "es", label: "Spanish" },
+  { value: "fr", label: "French" },
+  { value: "de", label: "German" },
+  { value: "it", label: "Italian" },
+  { value: "pt", label: "Portuguese" },
+  { value: "nl", label: "Dutch" },
+  { value: "ru", label: "Russian" },
+  { value: "ja", label: "Japanese" },
+  { value: "ko", label: "Korean" },
+  { value: "zh", label: "Chinese" },
+  { value: "ar", label: "Arabic" },
+  { value: "hi", label: "Hindi" },
+  { value: "tr", label: "Turkish" },
+  { value: "pl", label: "Polish" },
+  { value: "vi", label: "Vietnamese" },
+  { value: "th", label: "Thai" },
+  { value: "id", label: "Indonesian" },
+  { value: "uk", label: "Ukrainian" },
+];
+
+// ---------------------------------------------------------------------------
+// Ken Burns effect chips (multi-select pool)
+// ---------------------------------------------------------------------------
+const KB_EFFECTS: { value: KenBurnsDirection; label: string; glyph: string }[] = [
+  { value: "in", label: "Zoom In", glyph: "⤢" },
+  { value: "out", label: "Zoom Out", glyph: "⤡" },
+  { value: "left", label: "Pan Left", glyph: "←" },
+  { value: "right", label: "Pan Right", glyph: "→" },
+  { value: "up", label: "Pan Up", glyph: "↑" },
+  { value: "down", label: "Pan Down", glyph: "↓" },
+];
+
+// ---------------------------------------------------------------------------
+// Panel props
+// ---------------------------------------------------------------------------
 interface SettingsPanelProps {
   kenBurns: KenBurnsConfig;
   settings: VideoSettings;
-  onKenBurnsChange: (k: KenBurnsConfig) => void;
+  audioSettings: AudioSettings;
+  onKenBurnsChange: (kb: KenBurnsConfig) => void;
   onSettingsChange: (s: VideoSettings) => void;
+  onAudioSettingsChange: (a: AudioSettings) => void;
   captionSettings: CaptionSettings;
-  onCaptionSettingsChange: (c: CaptionSettings) => void;
+  onCaptionSettingsChange: (cs: CaptionSettings) => void;
+  /** Applies a preset's signature behavior (wordMode + animation + font). */
+  onApplyPreset: (presetId: string) => void;
+  onExportSrt: () => void;
+  onExportAss: () => void;
+  inElectron: boolean;
   subtitles: SubtitleFile | null;
-  /** Audio track present? (for Whisper button enable state) */
   hasAudio: boolean;
-  /** Generate captions via Whisper */
   onGenerateCaptions: () => void;
-  /** True while Whisper is running */
   whisperBusy: boolean;
-  /** Live progress for Whisper */
-  whisperProgress: import("@/lib/merger/whisper").WhisperProgress | null;
-  /** Whisper language code */
+  whisperProgress: WhisperProgress | null;
   whisperLanguage: string;
-  /** Change Whisper language */
   onWhisperLanguageChange: (lang: string) => void;
   debug: {
     imageCount: number;
-    mode: TimelineMode | null;
+    mode: string | null;
     totalMs: number;
     currentMs: number;
     activeSegment: string | null;
@@ -68,395 +105,95 @@ interface SettingsPanelProps {
   };
 }
 
-const DIRECTIONS: { value: KenBurnsDirection; label: string; Icon: typeof ZoomIn }[] =
-  [
-    { value: "in", label: "Zoom In", Icon: ZoomIn },
-    { value: "out", label: "Zoom Out", Icon: ZoomOut },
-    { value: "left", label: "Pan Left", Icon: ArrowLeft },
-    { value: "right", label: "Pan Right", Icon: ArrowRight },
-    { value: "up", label: "Pan Up", Icon: ArrowUp },
-    { value: "down", label: "Pan Down", Icon: ArrowDown },
-    { value: "random", label: "Random", Icon: Shuffle },
-  ];
-
-const ASPECTS: { value: AspectRatio; label: string }[] = [
-  { value: "16:9", label: "16:9" },
-  { value: "9:16", label: "9:16" },
-  { value: "1:1", label: "1:1" },
-];
-
-const RESOLUTIONS: { value: Resolution; label: string }[] = [
-  { value: "720p", label: "720p" },
-  { value: "1080p", label: "1080p" },
-];
-
-const FPS_OPTIONS: VideoSettings["fps"][] = [24, 30, 60];
-
-export function SettingsPanel({
-  kenBurns,
-  settings,
-  onKenBurnsChange,
-  onSettingsChange,
-  captionSettings,
-  onCaptionSettingsChange,
-  subtitles,
-  hasAudio,
-  onGenerateCaptions,
-  whisperBusy,
-  whisperProgress,
-  whisperLanguage,
-  onWhisperLanguageChange,
-  debug,
-}: SettingsPanelProps) {
-  return (
-    <div
-      className="flex h-full flex-col overflow-y-auto"
-      style={{ backgroundColor: "#111113" }}
-    >
-      {/* Ken Burns */}
-      <Section icon={Sparkles} title="Ken Burns" accentColor="#a78bfa">
-        <div className="flex items-center justify-between">
-          <span className="text-[12px]" style={{ color: "#d4d4d8" }}>
-            Enable motion
-          </span>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={kenBurns.enabled}
-            onClick={() =>
-              onKenBurnsChange({ ...kenBurns, enabled: !kenBurns.enabled })
-            }
-            className="relative h-5 w-9 rounded-full transition-colors"
-            style={{
-              backgroundColor: kenBurns.enabled ? "#7c3aed" : "#3f3f46",
-            }}
-          >
-            <span
-              className={cn(
-                "absolute top-0.5 size-4 rounded-full bg-white transition-transform",
-                kenBurns.enabled ? "translate-x-4" : "translate-x-0.5",
-              )}
-            />
-          </button>
-        </div>
-
-        <div
-          className={cn(
-            "space-y-3",
-            !kenBurns.enabled && "pointer-events-none opacity-40",
-          )}
-        >
-          <div>
-            <div className="mb-1.5 flex items-center justify-between">
-              <span className="text-[11px]" style={{ color: "#a1a1aa" }}>
-                Intensity
-              </span>
-              <span
-                className="font-mono text-[11px] tabular-nums"
-                style={{ color: "#c4b5fd" }}
-              >
-                {kenBurns.intensity}
-              </span>
-            </div>
-            <input
-              type="range"
-              min={0}
-              max={100}
-              step={1}
-              value={kenBurns.intensity}
-              onChange={(e) =>
-                onKenBurnsChange({
-                  ...kenBurns,
-                  intensity: Number(e.target.value),
-                })
-              }
-              style={{
-                background: `linear-gradient(to right, #7c3aed ${kenBurns.intensity}%, #3f3f46 ${kenBurns.intensity}%)`,
-              }}
-            />
-            <div
-              className="mt-1 flex justify-between text-[9px]"
-              style={{ color: "#52525b" }}
-            >
-              <span>subtle</span>
-              <span>
-                zoom {(1.06 + (kenBurns.intensity / 100) * 0.18).toFixed(3)}×
-              </span>
-              <span>strong</span>
-            </div>
-          </div>
-
-          <div>
-            <div className="mb-1.5 text-[11px]" style={{ color: "#a1a1aa" }}>
-              Direction
-            </div>
-            <div className="grid grid-cols-4 gap-1.5">
-              {DIRECTIONS.map(({ value, label, Icon }) => {
-                const active = kenBurns.direction === value;
-                return (
-                  <button
-                    key={value}
-                    type="button"
-                    title={label}
-                    onClick={() =>
-                      onKenBurnsChange({ ...kenBurns, direction: value })
-                    }
-                    className={cn(
-                      "flex aspect-square flex-col items-center justify-center gap-0.5 rounded-md border text-[8px] transition-all",
-                    )}
-                    style={
-                      active
-                        ? {
-                            borderColor: "#7c3aed",
-                            backgroundColor: "rgba(76, 29, 149, 0.5)",
-                            color: "#ddd6fe",
-                          }
-                        : {
-                            borderColor: "#27272a",
-                            backgroundColor: "#18181b",
-                            color: "#71717a",
-                          }
-                    }
-                  >
-                    <Icon className="size-3.5" />
-                    <span className="capitalize">{value}</span>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        </div>
-      </Section>
-
-      {/* Video settings */}
-      <Section icon={Aperture} title="Video" accentColor="#22d3ee">
-        <Field label="Aspect ratio">
-          <Segmented
-            options={ASPECTS}
-            value={settings.aspect}
-            onChange={(aspect) => onSettingsChange({ ...settings, aspect })}
-          />
-        </Field>
-        <Field label="Resolution">
-          <Segmented
-            options={RESOLUTIONS}
-            value={settings.resolution}
-            onChange={(resolution) =>
-              onSettingsChange({ ...settings, resolution })
-            }
-          />
-        </Field>
-        <Field label="Frame rate">
-          <div className="flex gap-1.5">
-            {FPS_OPTIONS.map((fps) => {
-              const active = settings.fps === fps;
-              return (
-                <button
-                  key={fps}
-                  type="button"
-                  onClick={() => onSettingsChange({ ...settings, fps })}
-                  className={cn(
-                    "flex-1 rounded-md border py-1.5 text-[11px] font-medium transition-all",
-                  )}
-                  style={
-                    active
-                      ? {
-                          borderColor: "#06b6d4",
-                          backgroundColor: "rgba(8, 51, 68, 0.5)",
-                          color: "#67e8f9",
-                        }
-                      : {
-                          borderColor: "#27272a",
-                          backgroundColor: "#18181b",
-                          color: "#a1a1aa",
-                        }
-                  }
-                >
-                  {fps} fps
-                </button>
-              );
-            })}
-          </div>
-        </Field>
-        <div>
-          <div className="mb-1.5 flex items-center justify-between">
-            <span className="text-[11px]" style={{ color: "#a1a1aa" }}>
-              Bitrate
-            </span>
-            <span
-              className="font-mono text-[11px] tabular-nums"
-              style={{ color: "#67e8f9" }}
-            >
-              {settings.bitrateMbps} Mbps
-            </span>
-          </div>
-          <input
-            type="range"
-            min={2}
-            max={20}
-            step={1}
-            value={settings.bitrateMbps}
-            onChange={(e) =>
-              onSettingsChange({
-                ...settings,
-                bitrateMbps: Number(e.target.value),
-              })
-            }
-            style={{
-              background: `linear-gradient(to right, #06b6d4 ${((settings.bitrateMbps - 2) / 18) * 100}%, #3f3f46 ${((settings.bitrateMbps - 2) / 18) * 100}%)`,
-            }}
-          />
-        </div>
-      </Section>
-
-      {/* Captions */}
-      <CaptionsSection
-        captionSettings={captionSettings}
-        onCaptionSettingsChange={onCaptionSettingsChange}
-        subtitles={subtitles}
-        hasAudio={hasAudio}
-        onGenerateCaptions={onGenerateCaptions}
-        whisperBusy={whisperBusy}
-        whisperProgress={whisperProgress}
-        whisperLanguage={whisperLanguage}
-        onWhisperLanguageChange={onWhisperLanguageChange}
-      />
-
-      {/* Debug */}
-      <Section
-        icon={Bug}
-        title="Debug"
-        accentColor="#a1a1aa"
-        defaultOpen={false}
-      >
-        <dl className="space-y-1.5 text-[11px]">
-          <Row label="Images" value={String(debug.imageCount)} />
-          <Row
-            label="Mode"
-            value={debug.mode ?? "—"}
-            valueColor={
-              debug.mode === "absolute"
-                ? "#67e8f9"
-                : debug.mode === "sequential"
-                  ? "#c4b5fd"
-                  : "#a1a1aa"
-            }
-          />
-          <Row label="Total time" value={fmtTimecode(debug.totalMs)} />
-          <Row label="Current" value={fmtTimecode(debug.currentMs)} />
-          <Row
-            label="Active segment"
-            value={debug.activeSegment ?? "—"}
-            mono
-            truncate
-          />
-          <Row
-            label="Environment"
-            value={debug.inElectron ? "Electron" : "Browser"}
-            valueColor={debug.inElectron ? "#67e8f9" : "#fcd34d"}
-          />
-        </dl>
-      </Section>
-    </div>
-  );
-}
-
+// ---------------------------------------------------------------------------
+// Section / Field / Segmented / Row helpers
+// ---------------------------------------------------------------------------
 function Section({
-  icon: Icon,
+  icon,
   title,
-  accentColor,
-  defaultOpen = true,
   children,
+  defaultOpen = false,
 }: {
-  icon: typeof Sparkles;
+  icon: React.ReactNode;
   title: string;
-  accentColor: string;
-  defaultOpen?: boolean;
   children: React.ReactNode;
+  defaultOpen?: boolean;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <div
-      className="border-b last:border-b-0"
-      style={{ borderColor: "#27272a" }}
-    >
+    <div className="border-b" style={{ borderColor: "#27272a" }}>
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex w-full cursor-pointer items-center gap-2 px-4 py-3 transition-colors"
-        style={{ backgroundColor: "transparent" }}
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center gap-2 px-4 py-3 text-left transition-colors hover:bg-white/5"
+        aria-expanded={open}
       >
-        <Icon className="size-4" style={{ color: accentColor }} />
-        <span
-          className="text-[12px] font-semibold tracking-tight"
-          style={{ color: "#e4e4e7" }}
-        >
+        {open ? (
+          <ChevronDown size={14} className="shrink-0 text-zinc-500" />
+        ) : (
+          <ChevronRight size={14} className="shrink-0 text-zinc-500" />
+        )}
+        <span className="shrink-0 text-zinc-400">{icon}</span>
+        <span className="flex-1 text-xs font-semibold uppercase tracking-wider text-zinc-300">
           {title}
         </span>
-        <span
-          className="ml-auto transition-transform"
-          style={{
-            transform: open ? "rotate(90deg)" : "rotate(0deg)",
-            color: "#52525b",
-          }}
-        >
-          <ChevronRight className="size-3.5" />
-        </span>
       </button>
-      {open && (
-        <div className="space-y-3 px-4 pb-4 pt-1">{children}</div>
-      )}
+      {open && <div className="px-4 pb-4">{children}</div>}
     </div>
   );
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return (
-    <div>
-      <div className="mb-1.5 text-[11px]" style={{ color: "#a1a1aa" }}>
-        {label}
+    <div className="mb-3">
+      <div className="mb-1.5 flex items-baseline justify-between">
+        <label className="text-xs font-medium text-zinc-300">{label}</label>
       </div>
       {children}
+      {hint && <p className="mt-1 text-[10px] leading-relaxed text-zinc-500">{hint}</p>}
     </div>
   );
 }
 
-function Segmented<T extends string>({
+function Segmented<T extends string | number>({
   options,
   value,
   onChange,
+  size = "md",
 }: {
-  options: { value: T; label: string }[];
+  options: { value: T; label: string; title?: string }[];
   value: T;
   onChange: (v: T) => void;
+  size?: "sm" | "md";
 }) {
   return (
-    <div className="flex gap-1.5">
-      {options.map((opt) => {
-        const active = value === opt.value;
+    <div
+      className="grid gap-1 rounded-md p-1"
+      style={{
+        gridTemplateColumns: `repeat(${options.length}, minmax(0, 1fr))`,
+        backgroundColor: "#18181b",
+      }}
+      role="radiogroup"
+    >
+      {options.map((o) => {
+        const active = o.value === value;
         return (
           <button
-            key={opt.value}
+            key={String(o.value)}
             type="button"
-            onClick={() => onChange(opt.value)}
+            role="radio"
+            aria-checked={active}
+            title={o.title}
+            onClick={() => onChange(o.value)}
             className={cn(
-              "flex-1 rounded-md border py-1.5 text-[11px] font-medium transition-all",
-            )}
-            style={
+              "rounded transition-colors",
+              size === "sm" ? "px-1.5 py-1 text-[10px]" : "px-2 py-1.5 text-xs",
               active
-                ? {
-                    borderColor: "#06b6d4",
-                    backgroundColor: "rgba(8, 51, 68, 0.5)",
-                    color: "#67e8f9",
-                  }
-                : {
-                    borderColor: "#27272a",
-                    backgroundColor: "#18181b",
-                    color: "#a1a1aa",
-                  }
-            }
+                ? "bg-zinc-200 font-semibold text-zinc-900"
+                : "text-zinc-400 hover:bg-white/5 hover:text-zinc-200",
+            )}
           >
-            {opt.label}
+            {o.label}
           </button>
         );
       })}
@@ -464,615 +201,781 @@ function Segmented<T extends string>({
   );
 }
 
-function Row({
+function Row({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="mb-3 flex items-center justify-between gap-3">
+      <span className="text-xs text-zinc-300">{label}</span>
+      {children}
+    </div>
+  );
+}
+
+function Toggle({
+  checked,
+  onChange,
   label,
-  value,
-  mono,
-  truncate,
-  valueColor,
 }: {
+  checked: boolean;
+  onChange: (v: boolean) => void;
   label: string;
-  value: string;
-  mono?: boolean;
-  truncate?: boolean;
-  valueColor?: string;
 }) {
   return (
-    <div className="flex items-center justify-between gap-2">
-      <dt style={{ color: "#71717a" }}>{label}</dt>
-      <dd
+    <div className="flex items-center gap-2">
+      <button
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        aria-label={label}
+        onClick={() => onChange(!checked)}
         className={cn(
-          "text-right",
-          mono && "font-mono",
-          truncate && "max-w-[160px] truncate",
+          "relative h-5 w-9 shrink-0 rounded-full transition-colors",
+          checked ? "bg-emerald-500" : "bg-zinc-700",
         )}
-        style={{ color: valueColor || "#d4d4d8" }}
-        title={value}
       >
-        {value}
-      </dd>
+        <span
+          className={cn(
+            "absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform",
+            checked ? "translate-x-4" : "translate-x-0.5",
+          )}
+        />
+      </button>
+      <span className="text-xs text-zinc-300">{label}</span>
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Captions section — preset grid, font dropdown, color override, position
-// override, font size scale. Self-contained, calls onCaptionSettingsChange
-// with the next immutable CaptionSettings object.
+// Main panel
 // ---------------------------------------------------------------------------
+export function SettingsPanel(props: SettingsPanelProps) {
+  const {
+    kenBurns,
+    settings,
+    audioSettings,
+    onKenBurnsChange,
+    onSettingsChange,
+    onAudioSettingsChange,
+    captionSettings,
+    onCaptionSettingsChange,
+    onApplyPreset,
+    onExportSrt,
+    onExportAss,
+    inElectron,
+    subtitles,
+    hasAudio,
+    onGenerateCaptions,
+    whisperBusy,
+    whisperProgress,
+    whisperLanguage,
+    onWhisperLanguageChange,
+    debug,
+  } = props;
 
-const POSITION_OPTIONS: {
-  value: "top" | "center" | "bottom";
-  label: string;
-}[] = [
-  { value: "top", label: "Top" },
-  { value: "center", label: "Center" },
-  { value: "bottom", label: "Bottom" },
-];
+  const zoomMax = 1.06 + (kenBurns.intensity / 100) * 0.18;
 
-function CaptionsSection({
-  captionSettings,
-  onCaptionSettingsChange,
-  subtitles,
-  hasAudio,
-  onGenerateCaptions,
-  whisperBusy,
-  whisperProgress,
-  whisperLanguage,
-  onWhisperLanguageChange,
-}: {
+  // Ken Burns pool toggle: clicking a chip toggles it in the pool while
+  // staying in "random" mode (2+ selected = random among those). A single
+  // selected chip becomes the fixed direction.
+  const ALL_EFFECTS: KenBurnsDirection[] = ["in", "out", "left", "right", "up", "down"];
+  const togglePoolEffect = (dir: KenBurnsDirection) => {
+    const current = kenBurns.directionPool.length ? kenBurns.directionPool : ALL_EFFECTS;
+    const has = current.includes(dir);
+    const next = has ? current.filter((d) => d !== dir) : [...current, dir];
+    if (next.length === 0) {
+      // Deselecting everything → back to full random.
+      onKenBurnsChange({
+        ...kenBurns,
+        direction: "random",
+        directionPool: ALL_EFFECTS,
+      });
+      return;
+    }
+    if (next.length === 1) {
+      // One effect left → fixed direction.
+      onKenBurnsChange({ ...kenBurns, direction: next[0], directionPool: next });
+      return;
+    }
+    onKenBurnsChange({ ...kenBurns, direction: "random", directionPool: next });
+  };
+
+  const setFullRandom = () => {
+    onKenBurnsChange({
+      ...kenBurns,
+      direction: "random",
+      directionPool: ALL_EFFECTS,
+    });
+  };
+
+  const poolActive = (dir: KenBurnsDirection) => {
+    const pool = kenBurns.directionPool.length ? kenBurns.directionPool : ALL_EFFECTS;
+    return pool.includes(dir);
+  };
+
+  const isRandomMode =
+    kenBurns.direction === "random" ||
+    (kenBurns.directionPool.length > 1 &&
+      kenBurns.directionPool.includes(kenBurns.direction));
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="flex items-center gap-2 border-b px-4 py-3" style={{ borderColor: "#27272a" }}>
+        <Wand2 size={14} className="text-zinc-500" />
+        <span className="text-xs font-semibold uppercase tracking-wider text-zinc-300">
+          Settings
+        </span>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        {/* ─── Ken Burns ─────────────────────────────────────────────── */}
+        <Section icon={<Zap size={13} />} title="Ken Burns Motion" defaultOpen>
+          <div className="mb-3">
+            <Toggle
+              checked={kenBurns.enabled}
+              onChange={(v) => onKenBurnsChange({ ...kenBurns, enabled: v })}
+              label="Enable motion"
+            />
+          </div>
+
+          <Field label="Zoom intensity" hint={`Max zoom ${zoomMax.toFixed(2)}×`}>
+            <input
+              type="range"
+              min={0}
+              max={100}
+              step={5}
+              value={kenBurns.intensity}
+              onChange={(e) =>
+                onKenBurnsChange({ ...kenBurns, intensity: Number(e.target.value) })
+              }
+              disabled={!kenBurns.enabled}
+              className="w-full accent-emerald-500"
+              aria-label="Ken Burns zoom intensity"
+            />
+          </Field>
+
+          <Field
+            label="Effects"
+            hint={
+              isRandomMode
+                ? `Random — picks from ${kenBurns.directionPool.length || 6} selected effect${(kenBurns.directionPool.length || 6) === 1 ? "" : "s"} per image`
+                : `Fixed — every image uses ${kenBurns.direction}`
+            }
+          >
+            <div className="grid grid-cols-3 gap-1">
+              {KB_EFFECTS.map((eff) => {
+                const active = poolActive(eff.value);
+                return (
+                  <button
+                    key={eff.value}
+                    type="button"
+                    aria-pressed={active}
+                    disabled={!kenBurns.enabled}
+                    onClick={() => togglePoolEffect(eff.value)}
+                    className={cn(
+                      "flex items-center gap-1 rounded px-1.5 py-1.5 text-[10px] font-medium transition-colors",
+                      active
+                        ? "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-500/40"
+                        : "bg-zinc-800/60 text-zinc-400 hover:bg-white/5",
+                      !kenBurns.enabled && "opacity-40",
+                    )}
+                  >
+                    <span aria-hidden>{eff.glyph}</span>
+                    {eff.label}
+                  </button>
+                );
+              })}
+            </div>
+            <button
+              type="button"
+              onClick={setFullRandom}
+              disabled={!kenBurns.enabled}
+              className={cn(
+                "mt-1.5 w-full rounded px-2 py-1.5 text-[10px] font-semibold transition-colors",
+                isRandomMode && kenBurns.directionPool.length === 6
+                  ? "bg-emerald-500 text-zinc-900"
+                  : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700",
+              )}
+            >
+              🎲 Random — all effects
+            </button>
+            <p className="mt-1 text-[10px] leading-relaxed text-zinc-500">
+              Select 2+ effects to randomize between only your favorites, or pick one to fix it.
+            </p>
+          </Field>
+        </Section>
+
+        {/* ─── Video ─────────────────────────────────────────────────── */}
+        <Section icon={<Film size={13} />} title="Video">
+          <Field label="Aspect ratio">
+            <Segmented
+              options={[
+                { value: "16:9", label: "16:9" },
+                { value: "9:16", label: "9:16" },
+                { value: "1:1", label: "1:1" },
+              ]}
+              value={settings.aspect}
+              onChange={(v) => onSettingsChange({ ...settings, aspect: v })}
+            />
+          </Field>
+          <Field label="Resolution">
+            <Segmented
+              options={[
+                { value: "720p", label: "720p" },
+                { value: "1080p", label: "1080p" },
+              ]}
+              value={settings.resolution}
+              onChange={(v) => onSettingsChange({ ...settings, resolution: v })}
+            />
+          </Field>
+          <Field label="Frame rate">
+            <Segmented
+              options={[
+                { value: 24, label: "24" },
+                { value: 30, label: "30" },
+                { value: 60, label: "60" },
+              ]}
+              value={settings.fps}
+              onChange={(v) => onSettingsChange({ ...settings, fps: v as 24 | 30 | 60 })}
+            />
+          </Field>
+          <Field label="Bitrate" hint={`${settings.bitrateMbps} Mbps`}>
+            <input
+              type="range"
+              min={2}
+              max={20}
+              step={1}
+              value={settings.bitrateMbps}
+              onChange={(e) =>
+                onSettingsChange({ ...settings, bitrateMbps: Number(e.target.value) })
+              }
+              className="w-full accent-emerald-500"
+              aria-label="Video bitrate"
+            />
+          </Field>
+        </Section>
+
+        {/* ─── Audio ─────────────────────────────────────────────────── */}
+        <Section icon={<AudioLines size={13} />} title="Audio">
+          <Row label="Normalize loudness">
+            <Toggle
+              checked={audioSettings.normalize}
+              onChange={(v) => onAudioSettingsChange({ ...audioSettings, normalize: v })}
+              label=""
+            />
+          </Row>
+          <p className="mb-3 mt-[-8px] text-[10px] leading-relaxed text-zinc-500">
+            Master to −16 LUFS (social-media standard) — evens out quiet/loud recordings.
+          </p>
+          <Field label="Fade in" hint={audioSettings.fadeInMs ? `${(audioSettings.fadeInMs / 1000).toFixed(1)}s` : "off"}>
+            <input
+              type="range"
+              min={0}
+              max={3000}
+              step={100}
+              value={audioSettings.fadeInMs}
+              onChange={(e) =>
+                onAudioSettingsChange({ ...audioSettings, fadeInMs: Number(e.target.value) })
+              }
+              className="w-full accent-emerald-500"
+              aria-label="Audio fade in"
+            />
+          </Field>
+          <Field label="Fade out" hint={audioSettings.fadeOutMs ? `${(audioSettings.fadeOutMs / 1000).toFixed(1)}s` : "off"}>
+            <input
+              type="range"
+              min={0}
+              max={3000}
+              step={100}
+              value={audioSettings.fadeOutMs}
+              onChange={(e) =>
+                onAudioSettingsChange({ ...audioSettings, fadeOutMs: Number(e.target.value) })
+              }
+              className="w-full accent-emerald-500"
+              aria-label="Audio fade out"
+            />
+          </Field>
+        </Section>
+
+        {/* ─── Captions ──────────────────────────────────────────────── */}
+        <CaptionsSection
+          captionSettings={captionSettings}
+          onCaptionSettingsChange={onCaptionSettingsChange}
+          onApplyPreset={onApplyPreset}
+          onExportSrt={onExportSrt}
+          onExportAss={onExportAss}
+          inElectron={inElectron}
+          subtitles={subtitles}
+          hasAudio={hasAudio}
+          onGenerateCaptions={onGenerateCaptions}
+          whisperBusy={whisperBusy}
+          whisperProgress={whisperProgress}
+          whisperLanguage={whisperLanguage}
+          onWhisperLanguageChange={onWhisperLanguageChange}
+        />
+
+        {/* ─── Debug ─────────────────────────────────────────────────── */}
+        <Section icon={<Bug size={13} />} title="Debug">
+          <div className="space-y-1 font-mono text-[10px] text-zinc-500">
+            <div>images: {debug.imageCount}</div>
+            <div>mode: {String(debug.mode)}</div>
+            <div>total: {(debug.totalMs / 1000).toFixed(1)}s</div>
+            <div>playhead: {(debug.currentMs / 1000).toFixed(1)}s</div>
+            <div>active: {debug.activeSegment ?? "—"}</div>
+            <div>env: {debug.inElectron ? "electron" : "browser"}</div>
+          </div>
+        </Section>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Captions section
+// ---------------------------------------------------------------------------
+interface CaptionsSectionProps {
   captionSettings: CaptionSettings;
-  onCaptionSettingsChange: (c: CaptionSettings) => void;
+  onCaptionSettingsChange: (cs: CaptionSettings) => void;
+  onApplyPreset: (presetId: string) => void;
+  onExportSrt: () => void;
+  onExportAss: () => void;
+  inElectron: boolean;
   subtitles: SubtitleFile | null;
   hasAudio: boolean;
   onGenerateCaptions: () => void;
   whisperBusy: boolean;
-  whisperProgress: import("@/lib/merger/whisper").WhisperProgress | null;
+  whisperProgress: WhisperProgress | null;
   whisperLanguage: string;
   onWhisperLanguageChange: (lang: string) => void;
-}) {
+}
+
+function CaptionsSection(props: CaptionsSectionProps) {
+  const {
+    captionSettings,
+    onCaptionSettingsChange,
+    onApplyPreset,
+    onExportSrt,
+    onExportAss,
+    inElectron,
+    subtitles,
+    hasAudio,
+    onGenerateCaptions,
+    whisperBusy,
+    whisperProgress,
+    whisperLanguage,
+    onWhisperLanguageChange,
+  } = props;
+
   const set = (patch: Partial<CaptionSettings>) =>
     onCaptionSettingsChange({ ...captionSettings, ...patch });
 
-  const cueCount = subtitles?.cues.length ?? 0;
-  const lastEnd = cueCount
-    ? fmtTimecode(subtitles!.cues[cueCount - 1].endMs)
-    : "—";
-
-  const selectedPreset = useMemo(
-    () => getCaptionPreset(captionSettings.presetId),
-    [captionSettings.presetId],
-  );
-
-  const hasSubtitles = cueCount > 0;
-  const isEnabled = captionSettings.enabled;
+  const preset = getCaptionPreset(captionSettings.presetId);
+  const hasCues = !!subtitles && subtitles.cues.length > 0;
+  const hasWords = hasCues && subtitles!.cues.some((c) => c.words && c.words.length > 0);
 
   return (
-    <Section
-      icon={Captions}
-      title="Captions"
-      accentColor="#f0abfc"
-      defaultOpen={true}
-    >
-      {/* ── Whisper caption generation ── */}
+    <Section icon={<Captions size={13} />} title="Captions" defaultOpen>
+      {/* ── Whisper generation ── */}
       <div
-        className="rounded-lg border p-2.5 mb-3"
-        style={{
-          borderColor: "rgba(124, 58, 237, 0.4)",
-          backgroundColor: "rgba(76, 29, 149, 0.18)",
-        }}
+        className="mb-4 rounded-lg border p-3"
+        style={{ borderColor: "#27272a", backgroundColor: "#18181b" }}
       >
-        {/* Language selector */}
         <div className="mb-2 flex items-center gap-1.5">
-          <span
-            className="text-[10px] font-medium shrink-0"
-            style={{ color: "#c4b5fd" }}
-          >
-            Lang:
+          <Sparkles size={12} className="text-amber-400" />
+          <span className="text-[11px] font-semibold text-zinc-200">
+            AI Captions (Whisper)
           </span>
+        </div>
+        <div className="mb-2 flex gap-2">
           <select
             value={whisperLanguage}
             onChange={(e) => onWhisperLanguageChange(e.target.value)}
-            disabled={whisperBusy}
-            className="flex-1 rounded-md border px-1.5 py-1 text-[10px] outline-none disabled:opacity-50"
-            style={{
-              borderColor: "#3f3f46",
-              backgroundColor: "#09090b",
-              color: "#e4e4e7",
-            }}
-            title="Select the spoken language. Auto-detect lets Whisper figure it out from the first 30 seconds."
+            className="min-w-0 flex-1 rounded border bg-zinc-900 px-2 py-1.5 text-[11px] text-zinc-200"
+            style={{ borderColor: "#3f3f46" }}
+            aria-label="Whisper language"
           >
-            <option value="auto">Auto-detect</option>
-            <option value="english">English</option>
-            <option value="spanish">Spanish</option>
-            <option value="french">French</option>
-            <option value="german">German</option>
-            <option value="italian">Italian</option>
-            <option value="portuguese">Portuguese</option>
-            <option value="dutch">Dutch</option>
-            <option value="russian">Russian</option>
-            <option value="japanese">Japanese</option>
-            <option value="korean">Korean</option>
-            <option value="chinese">Chinese</option>
-            <option value="arabic">Arabic</option>
-            <option value="hindi">Hindi</option>
-            <option value="turkish">Turkish</option>
-            <option value="polish">Polish</option>
-            <option value="vietnamese">Vietnamese</option>
-            <option value="thai">Thai</option>
-            <option value="indonesian">Indonesian</option>
-            <option value="ukrainian">Ukrainian</option>
-            <option value="greek">Greek</option>
-            <option value="hebrew">Hebrew</option>
-            <option value="czech">Czech</option>
-            <option value="swedish">Swedish</option>
-            <option value="finnish">Finnish</option>
-            <option value="norwegian">Norwegian</option>
-            <option value="danish">Danish</option>
-            <option value="hungarian">Hungarian</option>
-            <option value="romanian">Romanian</option>
-            <option value="urdu">Urdu</option>
-            <option value="bengali">Bengali</option>
-            <option value="tamil">Tamil</option>
-            <option value="swahili">Swahili</option>
+            {WHISPER_LANGUAGES.map((l) => (
+              <option key={l.value} value={l.value}>
+                {l.label}
+              </option>
+            ))}
           </select>
         </div>
-        {/* Generate button */}
         <button
           type="button"
           onClick={onGenerateCaptions}
           disabled={whisperBusy || !hasAudio}
           className={cn(
-            "flex w-full items-center justify-center gap-1.5 rounded-md px-2.5 py-2 text-[11px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+            "flex w-full items-center justify-center gap-2 rounded-md px-3 py-2 text-xs font-semibold transition-colors",
+            whisperBusy || !hasAudio
+              ? "cursor-not-allowed bg-zinc-800 text-zinc-500"
+              : "bg-amber-500 text-zinc-900 hover:bg-amber-400",
           )}
-          style={{
-            backgroundColor: whisperBusy ? "#3f3f46" : "#7c3aed",
-            color: "#ffffff",
-          }}
-          title={
-            !hasAudio
-              ? "Add an audio track first"
-              : whisperBusy
-                ? "Transcribing…"
-                : "Generate word-by-word captions with Whisper-tiny (original, non-quantized)"
-          }
         >
           {whisperBusy ? (
-            <Loader2 className="size-3.5 animate-spin" />
+            <Loader2 size={13} className="animate-spin" />
           ) : (
-            <Music className="size-3.5" />
+            <Sparkles size={13} />
           )}
-          {whisperBusy
-            ? whisperProgress?.status ?? "Working…"
-            : "Generate captions (Whisper)"}
+          {whisperBusy ? "Working…" : "Generate from audio"}
         </button>
-        {/* Progress bar */}
-        {whisperBusy && whisperProgress && (
+        {whisperProgress && (
           <div className="mt-2">
-            <div
-              className="h-1 w-full overflow-hidden rounded-full"
-              style={{ backgroundColor: "#3f3f46" }}
-            >
+            <div className="h-1 w-full overflow-hidden rounded-full bg-zinc-800">
               <div
-                className="h-full rounded-full transition-all"
-                style={{
-                  width: `${Math.max(2, Math.min(100, whisperProgress.progress))}%`,
-                  backgroundColor: "#a78bfa",
-                }}
+                className="h-full bg-amber-500 transition-all"
+                style={{ width: `${whisperProgress.progress}%` }}
               />
             </div>
-            <div className="mt-1 text-[9px]" style={{ color: "#a1a1aa" }}>
-              {whisperProgress.status} · {Math.round(whisperProgress.progress)}%
-            </div>
+            <p className="mt-1 truncate text-[10px] text-zinc-500">
+              {whisperProgress.status}
+            </p>
           </div>
         )}
-        {/* Hint */}
-        {!whisperBusy && (
-          <div className="mt-1.5 text-[9px] leading-snug" style={{ color: "#a1a1aa" }}>
-            {hasAudio
-              ? "Uses openai/whisper-tiny (original, non-quantized). First click downloads ~150MB model from HuggingFace, then cached for offline use."
-              : "Add an audio track in the left panel, then click to generate word-by-word captions."}
-          </div>
-        )}
+        <p className="mt-2 text-[10px] leading-relaxed text-zinc-500">
+          Whisper-tiny runs locally (in-app, ~75 MB download once, then offline). Produces{" "}
+          <span className="text-zinc-300">exact word-by-word timing</span> for karaoke &amp;
+          kinetic captions.
+        </p>
       </div>
 
-      {/* Enable toggle + subtitle status */}
-      <div className="flex items-center justify-between">
-        <div className="flex flex-col">
-          <span className="text-[12px]" style={{ color: "#d4d4d8" }}>
-            Burn in captions
-          </span>
-          <span className="text-[10px]" style={{ color: "#71717a" }}>
-            {hasSubtitles
-              ? `${cueCount} cue${cueCount === 1 ? "" : "s"} · ends ${lastEnd}`
-              : "Add an .srt file from the media panel"}
-          </span>
-        </div>
-        <button
-          type="button"
-          role="switch"
-          aria-checked={isEnabled}
-          onClick={() => set({ enabled: !isEnabled })}
-          disabled={!hasSubtitles}
-          className="relative h-5 w-9 rounded-full transition-colors disabled:opacity-40"
-          style={{
-            backgroundColor: isEnabled ? "#7c3aed" : "#3f3f46",
-          }}
-        >
-          <span
-            className={cn(
-              "absolute top-0.5 size-4 rounded-full bg-white transition-transform",
-              isEnabled ? "translate-x-4" : "translate-x-0.5",
+      {/* ── Burn-in toggle + source status ── */}
+      <div className="mb-3">
+        <Toggle
+          checked={captionSettings.enabled}
+          onChange={(v) => set({ enabled: v })}
+          label="Burn captions into video"
+        />
+      </div>
+      <div className="mb-3 text-[10px] text-zinc-500">
+        {subtitles ? (
+          <>
+            <span className="text-zinc-300">{subtitles.fileName}</span> ·{" "}
+            {subtitles.cues.length} cue{subtitles.cues.length === 1 ? "" : "s"}
+            {hasWords && (
+              <span className="text-emerald-400"> · word timing ✓</span>
             )}
-          />
-        </button>
+          </>
+        ) : (
+          "No subtitle source — generate from audio or drop a .srt file."
+        )}
       </div>
 
-      <div
-        className={cn(
-          "space-y-3",
-          !isEnabled && "pointer-events-none opacity-40",
-        )}
+      {/* ── Preset picker (grouped) ── */}
+      <Field
+        label="Style preset"
+        hint={`${preset.name} — ${preset.description}`}
       >
-        {/* Preset grid */}
-        <Field label="Style preset">
-          <div className="grid max-h-56 grid-cols-1 gap-1.5 overflow-y-auto pr-1">
-            {CAPTION_PRESETS.map((p) => {
-              const active = p.id === captionSettings.presetId;
-              const sampleText = "The quick brown fox";
-              const sampleStyle: React.CSSProperties = {
-                color: p.textColor,
-                backgroundColor: p.bgColor ?? "transparent",
-                padding: p.bgColor
-                  ? `${Math.max(2, p.bgPadding / 4)}px ${Math.max(4, p.bgPadding / 3)}px`
-                  : "0",
-                borderRadius: p.bgRadius ? Math.max(2, p.bgRadius / 3) : 0,
-                fontWeight: p.fontWeight,
-                fontStyle: p.fontStyle,
-                fontFamily: p.fontFamily,
-                letterSpacing: p.letterSpacing,
-                textTransform: p.textTransform,
-                textShadow: p.shadow
-                  ? `0 0 ${p.shadowBlur}px ${p.shadowColor}`
-                  : undefined,
-                border: p.borderColor
-                  ? `${Math.max(1, p.borderWidth / 2)}px solid ${p.borderColor}`
-                  : undefined,
-                fontSize: 11,
-                display: "inline-block",
-                opacity: p.bgColor ? p.bgAlpha : 1,
-              };
-              return (
-                <button
-                  key={p.id}
-                  type="button"
-                  onClick={() => set({ presetId: p.id })}
-                  className={cn(
-                    "flex items-center justify-between gap-2 rounded-md border px-2.5 py-2 text-left transition-all",
-                  )}
-                  style={
-                    active
-                      ? {
-                          borderColor: "#7c3aed",
-                          backgroundColor: "rgba(76, 29, 149, 0.35)",
-                        }
-                      : {
-                          borderColor: "#27272a",
-                          backgroundColor: "#18181b",
-                        }
-                  }
-                >
-                  <div className="flex min-w-0 flex-1 items-center gap-2">
-                    <div
-                      className="flex h-6 min-w-[60px] items-center justify-center rounded px-1"
-                      style={{ backgroundColor: "#000000" }}
-                    >
-                      <span style={sampleStyle}>{sampleText}</span>
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div
-                        className="truncate text-[11px] font-semibold"
-                        style={{ color: active ? "#ddd6fe" : "#d4d4d8" }}
-                      >
-                        {p.name}
-                      </div>
-                      <div
-                        className="truncate text-[9px]"
-                        style={{ color: "#71717a" }}
-                      >
-                        {p.description}
-                      </div>
-                    </div>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        </Field>
-
-        {/* Font selector */}
-        <Field label="Font family">
-          <div className="relative">
-            <select
-              value={captionSettings.fontId}
-              onChange={(e) => set({ fontId: e.target.value })}
-              className="w-full appearance-none rounded-md border px-3 py-2 text-[12px] outline-none"
-              style={{
-                borderColor: "#3f3f46",
-                backgroundColor: "#09090b",
-                color: "#e4e4e7",
-              }}
-            >
-              {FONT_OPTIONS.map((f) => (
-                <option key={f.id} value={f.id}>
-                  {f.name}
-                </option>
-              ))}
-            </select>
-            <Type
-              className="pointer-events-none absolute right-2.5 top-1/2 size-3.5 -translate-y-1/2"
-              style={{ color: "#71717a" }}
-            />
-          </div>
-        </Field>
-
-        {/* Color override */}
-        <Field label="Text color override">
-          <div className="flex items-center gap-2">
-            <label
-              className="relative flex h-8 flex-1 cursor-pointer items-center gap-2 rounded-md border px-2"
-              style={{
-                borderColor: "#3f3f46",
-                backgroundColor: "#18181b",
-              }}
-            >
-              <span
-                className="size-5 shrink-0 rounded border"
-                style={{
-                  backgroundColor: captionSettings.customColor ||
-                    selectedPreset.textColor,
-                  borderColor: "#3f3f46",
-                }}
-              />
-              <span
-                className="flex-1 truncate font-mono text-[11px]"
-                style={{ color: "#d4d4d8" }}
+        <div className="max-h-72 overflow-y-auto rounded-md border" style={{ borderColor: "#27272a" }}>
+          {presetsByCategory().map((cat) => (
+            <div key={cat.category}>
+              <div
+                className="sticky top-0 z-10 bg-[#131316] px-2 py-1 text-[9px] font-bold uppercase tracking-widest text-zinc-500"
+                title={cat.hint}
               >
-                {captionSettings.customColor ||
-                  `${selectedPreset.textColor} (preset)`}
-              </span>
-              <input
-                type="color"
-                value={captionSettings.customColor || selectedPreset.textColor}
-                onChange={(e) => set({ customColor: e.target.value })}
-                className="absolute inset-0 size-full cursor-pointer opacity-0"
-              />
-            </label>
-            {captionSettings.customColor && (
-              <button
-                type="button"
-                onClick={() => set({ customColor: null })}
-                className="rounded-md border px-2 py-1 text-[10px]"
-                style={{
-                  borderColor: "#3f3f46",
-                  backgroundColor: "#18181b",
-                  color: "#a1a1aa",
-                }}
-              >
-                Reset
-              </button>
-            )}
-          </div>
-        </Field>
-
-        {/* Position override */}
-        <Field label="Position override">
-          <div className="flex gap-1.5">
-            {POSITION_OPTIONS.map((opt) => {
-              const active =
-                captionSettings.customPosition === opt.value ||
-                (!captionSettings.customPosition &&
-                  selectedPreset.position === opt.value);
-              const isPresetDefault =
-                !captionSettings.customPosition &&
-                selectedPreset.position === opt.value;
-              return (
-                <button
-                  key={opt.value}
-                  type="button"
-                  onClick={() => set({ customPosition: opt.value })}
-                  className={cn(
-                    "flex-1 rounded-md border py-1.5 text-[11px] font-medium transition-all",
-                  )}
-                  style={
-                    active
-                      ? {
-                          borderColor: "#7c3aed",
-                          backgroundColor: "rgba(76, 29, 149, 0.4)",
-                          color: "#ddd6fe",
-                        }
-                      : {
-                          borderColor: "#27272a",
-                          backgroundColor: "#18181b",
-                          color: "#a1a1aa",
-                        }
-                  }
-                >
-                  {opt.label}
-                  {isPresetDefault && (
+                {cat.label}
+              </div>
+              {cat.presets.map((p) => {
+                const active = p.id === captionSettings.presetId;
+                return (
+                  <button
+                    key={p.id}
+                    type="button"
+                    onClick={() => onApplyPreset(p.id)}
+                    className={cn(
+                      "flex w-full items-center gap-2 px-2 py-1.5 text-left transition-colors",
+                      active ? "bg-emerald-500/15" : "hover:bg-white/5",
+                    )}
+                    aria-pressed={active}
+                  >
+                    {/* Mini live swatch */}
                     <span
-                      className="ml-1 text-[8px] uppercase opacity-70"
-                      title="preset default"
+                      className="flex h-6 shrink-0 items-center justify-center overflow-hidden rounded px-1.5"
+                      style={{
+                        backgroundColor: p.bgColor
+                          ? `${p.bgColor}${Math.round(p.bgAlpha * 255)
+                              .toString(16)
+                              .padStart(2, "0")}`
+                          : "transparent",
+                        border: p.borderColor
+                          ? `1px solid ${p.borderColor}`
+                          : "1px solid transparent",
+                        borderRadius: Math.min(6, p.bgRadius / 2),
+                        color: p.textColor,
+                        fontFamily: p.fontFamily,
+                        fontWeight: p.fontWeight,
+                        fontStyle: p.fontStyle === "italic" ? "italic" : "normal",
+                        fontSize: 9,
+                        letterSpacing: Math.min(2, p.letterSpacing / 2),
+                        textTransform: p.textTransform,
+                        textShadow:
+                          p.shadow && p.shadowBlur > 0
+                            ? `0 0 ${Math.max(2, p.shadowBlur / 2)}px ${p.shadowColor}`
+                            : undefined,
+                        minWidth: 54,
+                      }}
                     >
-                      ·
+                      Quick fox
                     </span>
-                  )}
-                </button>
-              );
-            })}
-          </div>
-          {captionSettings.customPosition && (
-            <button
-              type="button"
-              onClick={() => set({ customPosition: null })}
-              className="mt-1.5 text-[10px]"
-              style={{ color: "#71717a" }}
-            >
-              ↩ Reset to preset position ({selectedPreset.position})
-            </button>
-          )}
-        </Field>
-
-        {/* Font size scale */}
-        <div>
-          <div className="mb-1.5 flex items-center justify-between">
-            <span className="text-[11px]" style={{ color: "#a1a1aa" }}>
-              Font size scale
-            </span>
-            <span
-              className="font-mono text-[11px] tabular-nums"
-              style={{ color: "#c4b5fd" }}
-            >
-              {captionSettings.fontSizeScale.toFixed(2)}×
-            </span>
-          </div>
-          <input
-            type="range"
-            min={0.5}
-            max={2}
-            step={0.05}
-            value={captionSettings.fontSizeScale}
-            onChange={(e) =>
-              set({ fontSizeScale: Number(e.target.value) })
-            }
-            style={{
-              background: `linear-gradient(to right, #7c3aed ${((captionSettings.fontSizeScale - 0.5) / 1.5) * 100}%, #3f3f46 ${((captionSettings.fontSizeScale - 0.5) / 1.5) * 100}%)`,
-            }}
-          />
-          <div
-            className="mt-1 flex justify-between text-[9px]"
-            style={{ color: "#52525b" }}
-          >
-            <span>0.5×</span>
-            <span>1×</span>
-            <span>2×</span>
-          </div>
-        </div>
-
-        {/* Balanced text wrapping */}
-        <div className="flex items-center justify-between">
-          <div>
-            <span className="text-[12px]" style={{ color: "#d4d4d8" }}>
-              Balanced wrapping
-            </span>
-            <div className="text-[9px] mt-0.5" style={{ color: "#71717a" }}>
-              Triangle shape: line 1 longer than line 2
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-[11px] font-medium text-zinc-200">
+                        {p.name}
+                        {p.animation && p.animation !== "none" && (
+                          <span className="ml-1 text-[9px] text-emerald-400">✦</span>
+                        )}
+                      </span>
+                      <span className="block truncate text-[9px] text-zinc-500">
+                        {p.description}
+                      </span>
+                    </span>
+                    {p.highlightColor && (
+                      <span
+                        className="h-2.5 w-2.5 shrink-0 rounded-full"
+                        style={{ backgroundColor: p.highlightColor }}
+                        title="Active-word highlight"
+                      />
+                    )}
+                  </button>
+                );
+              })}
             </div>
-          </div>
+          ))}
+        </div>
+      </Field>
+
+      {/* ── Word mode ── */}
+      <Field
+        label="Word mode"
+        hint={
+          hasWords
+            ? "Word-level timing detected — all modes available."
+            : "Word modes need word timestamps — generate captions from audio first."
+        }
+      >
+        <Segmented
+          size="sm"
+          options={[
+            { value: "off", label: "Full text", title: "Standard subtitle block" },
+            { value: "word", label: "Karaoke", title: "Highlight the spoken word" },
+            { value: "word-only", label: "Single", title: "One word at a time (Hormozi)" },
+            { value: "stack", label: "Stack", title: "Words stack as spoken (quote builder)" },
+          ]}
+          value={captionSettings.wordMode}
+          onChange={(v) => set({ wordMode: v })}
+        />
+      </Field>
+
+      {/* ── Animation ── */}
+      <Field
+        label="Kinetic animation"
+        hint={
+          captionSettings.animation
+            ? "Pinned — preset switches keep your choice"
+            : "Following preset default (pin to override)"
+        }
+      >
+        <div className="max-h-56 overflow-y-auto rounded-md border" style={{ borderColor: "#27272a" }}>
+          {[
+            { id: "classic", label: "Classic" },
+            { id: "viral", label: "Viral pack ✦" },
+          ].map((grp) => (
+            <div key={grp.id}>
+              <div className="sticky top-0 z-10 bg-[#131316] px-2 py-1 text-[9px] font-bold uppercase tracking-widest text-zinc-500">
+                {grp.label}
+              </div>
+              <div className="grid grid-cols-2 gap-1 p-1">
+                {ANIMATION_LABELS.filter((a) => a.group === grp.id).map((a) => {
+                  const active =
+                    (captionSettings.animation || preset.animation || "none") === a.value;
+                  return (
+                    <button
+                      key={a.value}
+                      type="button"
+                      title={a.hint}
+                      onClick={() =>
+                        set({
+                          animation: a.value,
+                          animationPinned: a.value !== "none" ? true : false,
+                        })
+                      }
+                      className={cn(
+                        "rounded px-1.5 py-1.5 text-left text-[10px] font-medium transition-colors",
+                        active
+                          ? "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-500/40"
+                          : "bg-zinc-800/50 text-zinc-400 hover:bg-white/5",
+                      )}
+                      aria-pressed={active}
+                    >
+                      {a.label}
+                      <span className="block truncate text-[8px] font-normal text-zinc-500">
+                        {a.hint}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+        {captionSettings.animation && (
           <button
             type="button"
-            role="switch"
-            aria-checked={captionSettings.balancedWrap}
-            onClick={() =>
-              set({ balancedWrap: !captionSettings.balancedWrap })
-            }
-            className="relative h-5 w-9 rounded-full transition-colors"
-            style={{
-              backgroundColor: captionSettings.balancedWrap ? "#7c3aed" : "#3f3f46",
-            }}
+            onClick={() => set({ animation: null, animationPinned: false })}
+            className="mt-1 flex items-center gap-1 text-[10px] text-zinc-500 hover:text-zinc-300"
           >
-            <span
-              className={cn(
-                "absolute top-0.5 size-4 rounded-full bg-white transition-transform",
-                captionSettings.balancedWrap ? "translate-x-4" : "translate-x-0.5",
-              )}
+            <RotateCcw size={10} /> Follow preset default
+          </button>
+        )}
+      </Field>
+
+      {/* ── Font ── */}
+      <Field label="Font" hint="Windows-safe stacks — preview matches the export.">
+        <select
+          value={captionSettings.fontId}
+          onChange={(e) => set({ fontId: e.target.value })}
+          className="w-full rounded border bg-zinc-900 px-2 py-1.5 text-[11px] text-zinc-200"
+          style={{ borderColor: "#3f3f46" }}
+          aria-label="Caption font"
+        >
+          {FONT_OPTIONS.map((f) => (
+            <option key={f.id} value={f.id}>
+              {f.name}
+            </option>
+          ))}
+        </select>
+      </Field>
+
+      {/* ── Color override ── */}
+      <Field label="Text color" hint="Overrides the preset color.">
+        <div className="flex items-center gap-2">
+          <label className="relative inline-flex h-7 w-10 cursor-pointer items-center justify-center overflow-hidden rounded border" style={{ borderColor: "#3f3f46" }}>
+            <input
+              type="color"
+              value={captionSettings.customColor || preset.textColor}
+              onChange={(e) => set({ customColor: e.target.value })}
+              className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+              aria-label="Custom caption color"
             />
+            <span
+              className="h-4 w-6 rounded-sm"
+              style={{ backgroundColor: captionSettings.customColor || preset.textColor }}
+            />
+          </label>
+          <span className="font-mono text-[10px] text-zinc-400">
+            {captionSettings.customColor || preset.textColor}
+          </span>
+          {captionSettings.customColor && (
+            <button
+              type="button"
+              onClick={() => set({ customColor: null })}
+              className="ml-auto flex items-center gap-1 text-[10px] text-zinc-500 hover:text-zinc-300"
+            >
+              <RotateCcw size={10} /> Preset
+            </button>
+          )}
+        </div>
+      </Field>
+
+      {/* ── Position ── */}
+      <Field label="Position">
+        <div className="flex gap-1">
+          {(["top", "center", "bottom"] as const).map((pos) => {
+            const active =
+              captionSettings.customPosition === pos ||
+              (!captionSettings.customPosition && preset.position === pos);
+            const isPresetDefault =
+              !captionSettings.customPosition && preset.position === pos;
+            return (
+              <button
+                key={pos}
+                type="button"
+                onClick={() =>
+                  set({ customPosition: isPresetDefault ? null : pos })
+                }
+                className={cn(
+                  "flex-1 rounded px-2 py-1.5 text-[10px] font-medium capitalize transition-colors",
+                  active
+                    ? "bg-zinc-200 text-zinc-900"
+                    : "bg-zinc-800/60 text-zinc-400 hover:bg-white/5",
+                )}
+                aria-pressed={active}
+              >
+                {pos}
+                {isPresetDefault && <span className="ml-0.5 text-[8px] text-zinc-500">·</span>}
+              </button>
+            );
+          })}
+        </div>
+        {captionSettings.customPosition && (
+          <button
+            type="button"
+            onClick={() => set({ customPosition: null })}
+            className="mt-1 flex items-center gap-1 text-[10px] text-zinc-500 hover:text-zinc-300"
+          >
+            <RotateCcw size={10} /> Preset position
+          </button>
+        )}
+      </Field>
+
+      {/* ── Size scale ── */}
+      <Field
+        label="Size"
+        hint={`${(captionSettings.fontSizeScale * 100).toFixed(0)}% of preset size`}
+      >
+        <input
+          type="range"
+          min={0.5}
+          max={2}
+          step={0.05}
+          value={captionSettings.fontSizeScale}
+          onChange={(e) => set({ fontSizeScale: Number(e.target.value) })}
+          className="w-full accent-emerald-500"
+          aria-label="Caption font size scale"
+        />
+      </Field>
+
+      {/* ── Balanced wrap ── */}
+      <Row label="Balanced wrapping">
+        <Toggle
+          checked={captionSettings.balancedWrap}
+          onChange={(v) => set({ balancedWrap: v })}
+          label=""
+        />
+      </Row>
+      <p className="mb-3 mt-[-8px] text-[10px] leading-relaxed text-zinc-500">
+        Triangle shape — line 1 longer than line 2 (auto in the export via ASS smart wrap).
+      </p>
+
+      {/* ── Sidecar exports ── */}
+      <Field label="Export caption files">
+        <div className="grid grid-cols-2 gap-1">
+          <button
+            type="button"
+            onClick={onExportSrt}
+            disabled={!hasCues}
+            className={cn(
+              "flex items-center justify-center gap-1 rounded px-2 py-1.5 text-[10px] font-semibold transition-colors",
+              hasCues
+                ? "bg-zinc-800 text-zinc-200 hover:bg-zinc-700"
+                : "cursor-not-allowed bg-zinc-800/50 text-zinc-600",
+            )}
+          >
+            <FileText size={11} /> .srt
+          </button>
+          <button
+            type="button"
+            onClick={onExportAss}
+            disabled={!hasCues}
+            title={inElectron ? "Styled ASS with your kinetic animations" : "Desktop app only"}
+            className={cn(
+              "flex items-center justify-center gap-1 rounded px-2 py-1.5 text-[10px] font-semibold transition-colors",
+              hasCues && inElectron
+                ? "bg-zinc-800 text-zinc-200 hover:bg-zinc-700"
+                : "cursor-not-allowed bg-zinc-800/50 text-zinc-600",
+            )}
+          >
+            <FileDown size={11} /> .ass
           </button>
         </div>
-
-        {/* Word-by-word mode */}
-        <Field label="Word-by-word mode">
-          <div
-            className="grid grid-cols-3 gap-1"
-            role="radiogroup"
-            aria-label="Word-by-word mode"
-          >
-            {([
-              { value: "off", label: "Off", hint: "Full text" },
-              { value: "word", label: "Highlight", hint: "Karaoke" },
-              { value: "word-only", label: "Single", hint: "Hormozi" },
-            ] as const).map((opt) => {
-              const active = captionSettings.wordMode === opt.value;
-              return (
-                <button
-                  key={opt.value}
-                  type="button"
-                  role="radio"
-                  aria-checked={active}
-                  onClick={() => set({ wordMode: opt.value })}
-                  className={cn(
-                    "rounded-md border px-2 py-1.5 text-[10px] font-medium transition-colors",
-                  )}
-                  style={{
-                    borderColor: active ? "#7c3aed" : "#3f3f46",
-                    backgroundColor: active
-                      ? "rgba(124, 58, 237, 0.25)"
-                      : "transparent",
-                    color: active ? "#ddd6fe" : "#a1a1aa",
-                  }}
-                  title={opt.hint}
-                >
-                  {opt.label}
-                </button>
-              );
-            })}
-          </div>
-          <div className="text-[9px] mt-1.5 leading-snug" style={{ color: "#71717a" }}>
-            Highlight &amp; Single require word-level timestamps. Click
-            &ldquo;Generate captions&rdquo; in the media panel (uses
-            Whisper-tiny) or load a word-aligned SRT.
-          </div>
-        </Field>
-
-        {/* Kinetic typography animation */}
-        <Field label="Animation">
-          <div
-            className="grid grid-cols-3 gap-1 max-h-44 overflow-y-auto pr-1"
-            role="radiogroup"
-            aria-label="Caption animation"
-          >
-            {ANIMATION_LABELS.map((opt) => {
-              const active = (captionSettings.animation || "none") === opt.value;
-              return (
-                <button
-                  key={opt.value}
-                  type="button"
-                  role="radio"
-                  aria-checked={active}
-                  onClick={() => set({ animation: opt.value as CaptionAnimation })}
-                  className={cn(
-                    "rounded-md border px-2 py-1.5 text-[10px] font-medium transition-colors",
-                  )}
-                  style={{
-                    borderColor: active ? "#7c3aed" : "#3f3f46",
-                    backgroundColor: active
-                      ? "rgba(124, 58, 237, 0.25)"
-                      : "transparent",
-                    color: active ? "#ddd6fe" : "#a1a1aa",
-                  }}
-                  title={opt.hint}
-                >
-                  {opt.label}
-                </button>
-              );
-            })}
-          </div>
-          <div className="text-[9px] mt-1.5 leading-snug" style={{ color: "#71717a" }}>
-            12 kinetic typography animations tuned for storytelling / retention.
-            Pairs with Whisper-generated captions for per-word motion.
-          </div>
-        </Field>
-      </div>
+      </Field>
     </Section>
   );
 }

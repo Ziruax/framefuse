@@ -20,6 +20,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   cancelExport: () => ipcRenderer.invoke("cancel-export"),
 
+  // v4.1: export the full-timeline ASS subtitle sidecar.
+  exportAssFile: (opts) => ipcRenderer.invoke("export-ass-file", opts),
+
   onExportProgress: (callback) => {
     const handler = (_event, data) => callback(data);
     ipcRenderer.on("export-progress", handler);

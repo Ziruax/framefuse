@@ -29,7 +29,10 @@ import {
   type WhisperProgress,
 } from "@/lib/merger/whisper";
 import {
+  defaultAudioSettings,
   defaultCaptionSettings,
+  defaultKenBurnsConfig,
+  type AudioSettings,
   type AudioTrack,
   type CaptionSettings,
   type ExportProgress,
@@ -38,7 +41,7 @@ import {
   type SubtitleFile,
   type VideoSettings,
 } from "@/lib/merger/types";
-import { CAPTION_PRESETS } from "@/lib/merger/captionPresets";
+import { getCaptionPreset, getFontOption, CAPTION_PRESETS } from "@/lib/merger/captionPresets";
 
 interface MediaItem {
   id: string;
@@ -52,6 +55,28 @@ function genId(): string {
   return `f${Date.now().toString(36)}_${_idCounter.toString(36)}`;
 }
 
+// ---- Settings persistence (production-ready: survive restarts) ----------
+const LS_KEY = "framefuse.settings.v41";
+
+interface PersistedSettings {
+  kenBurns: KenBurnsConfig;
+  settings: VideoSettings;
+  captionSettings: CaptionSettings;
+  audio: AudioSettings;
+  whisperLanguage: string;
+}
+
+function loadPersisted(): Partial<PersistedSettings> {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 export default function Page() {
   // ---- Source data --------------------------------------------------------
   const [items, setItems] = useState<MediaItem[]>([]);
@@ -63,19 +88,23 @@ export default function Page() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
   // ---- Settings -----------------------------------------------------------
-  const [kenBurns, setKenBurns] = useState<KenBurnsConfig>({
-    enabled: true,
-    intensity: 35,
-    direction: "random",
-  });
-  const [settings, setSettings] = useState<VideoSettings>({
-    aspect: "16:9",
-    resolution: "1080p",
-    bitrateMbps: 8,
-    fps: 30,
-  });
+  const persisted = useMemo(() => loadPersisted(), []);
+  const [kenBurns, setKenBurns] = useState<KenBurnsConfig>(
+    persisted.kenBurns ?? defaultKenBurnsConfig(),
+  );
+  const [settings, setSettings] = useState<VideoSettings>(
+    persisted.settings ?? {
+      aspect: "16:9",
+      resolution: "1080p",
+      bitrateMbps: 8,
+      fps: 30,
+    },
+  );
   const [captionSettings, setCaptionSettings] = useState<CaptionSettings>(
-    defaultCaptionSettings(),
+    persisted.captionSettings ?? defaultCaptionSettings(),
+  );
+  const [audioSettings, setAudioSettings] = useState<AudioSettings>(
+    persisted.audio ?? defaultAudioSettings(),
   );
 
   // ---- Playback -----------------------------------------------------------
@@ -251,6 +280,7 @@ export default function Page() {
         audioTrack,
         settings,
         kenBurns,
+        audio: audioSettings,
         totalMs: timeline.totalMs,
         subtitles,
         captionSettings,
@@ -282,6 +312,7 @@ export default function Page() {
     audioTrack,
     settings,
     kenBurns,
+    audioSettings,
     subtitles,
     captionSettings,
     inElectron,
@@ -411,11 +442,135 @@ export default function Page() {
     setSubtitles(null);
   }, []);
 
+  // ---- Caption preset selection — make presets BEHAVE like their names --
+  // Selecting a preset applies its signature wordMode + animation (unless
+  // the user pinned one) + preferred font, so "Hormozi" actually slams
+  // single words and "Karaoke" actually fills word-by-word.
+  const applyCaptionPreset = useCallback((presetId: string) => {
+    const preset = getCaptionPreset(presetId);
+    setCaptionSettings((prev) => {
+      const next: CaptionSettings = {
+        ...prev,
+        presetId: preset.id,
+        // Reset overrides so the preset's design shines through.
+        customColor: null,
+        customPosition: null,
+      };
+      // Apply the preset's preferred font.
+      if (preset.fontId) next.fontId = preset.fontId;
+      // Apply the preset's word mode (its signature behavior).
+      if (preset.wordMode) next.wordMode = preset.wordMode;
+      // Apply the preset's animation unless the user pinned one explicitly.
+      if (prev.animationPinned !== true) {
+        next.animation = preset.animation ?? null;
+      }
+      return next;
+    });
+  }, []);
+
+  // ---- Caption sidecar exports (.srt browser / .ass Electron) ----------
+  const exportSrtSidecar = useCallback(() => {
+    if (!subtitles || subtitles.cues.length === 0) {
+      toast.error("No captions to export", {
+        description: "Generate captions from audio or load a .srt file first.",
+      });
+      return;
+    }
+    const text = serializeSrt(subtitles.cues);
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = (subtitles.fileName || "captions").replace(/\.[^.]+$/, "") + ".srt";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    toast.success(`Exported ${subtitles.cues.length} cues to .srt`);
+  }, [subtitles]);
+
+  const exportAssSidecar = useCallback(async () => {
+    if (!subtitles || subtitles.cues.length === 0) {
+      toast.error("No captions to export", {
+        description: "Generate captions from audio or load a .srt file first.",
+      });
+      return;
+    }
+    const api = window.electronAPI;
+    if (!api?.exportAssFile) {
+      toast.info(".ass export is available in the desktop app");
+      return;
+    }
+    try {
+      const { resolveDimensions } = await import("@/lib/merger/renderer");
+      const dims = resolveDimensions(settings.aspect, settings.resolution);
+      const preset = getCaptionPreset(captionSettings.presetId);
+      const font = getFontOption(captionSettings.fontId);
+      const res = await api.exportAssFile({
+        cues: subtitles.cues.map((c) => ({
+          startMs: c.startMs,
+          endMs: c.endMs,
+          text: c.text,
+          words: c.words,
+        })),
+        captionSettings: {
+          fontName: font.ffmpegName,
+          fontSize: preset.fontSize,
+          fontSizeScale: captionSettings.fontSizeScale,
+          fontWeight: preset.fontWeight,
+          fontStyle: preset.fontStyle,
+          textColor: captionSettings.customColor || preset.textColor,
+          highlightColor: preset.highlightColor || null,
+          borderColor: preset.borderColor,
+          borderWidth: preset.borderWidth,
+          bgColor: preset.bgColor,
+          bgAlpha: preset.bgAlpha,
+          shadow: preset.shadow,
+          shadowColor: preset.shadowColor,
+          shadowBlur: preset.shadowBlur,
+          textTransform: preset.textTransform,
+          letterSpacing: preset.letterSpacing,
+          alignment: preset.alignment,
+          position: preset.position,
+          positionY: preset.positionY,
+          customPosition: captionSettings.customPosition,
+          wordMode: captionSettings.wordMode,
+          animation: captionSettings.animation || preset.animation || "none",
+        },
+        width: dims.w,
+        height: dims.h,
+      });
+      if (res) {
+        toast.success("Exported .ass subtitle file", { description: res.path });
+      }
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : ".ass export failed");
+    }
+  }, [subtitles, captionSettings, settings.aspect, settings.resolution]);
+
   // ---- Whisper caption generation (word-level timestamps) ----------------
   const [whisperBusy, setWhisperBusy] = useState(false);
   const [whisperProgress, setWhisperProgress] = useState<WhisperProgress | null>(null);
   // Whisper language: "auto" = auto-detect, or a 2-letter code like "en".
-  const [whisperLanguage, setWhisperLanguage] = useState<string>("auto");
+  const [whisperLanguage, setWhisperLanguage] = useState<string>(
+    persisted.whisperLanguage ?? "auto",
+  );
+
+  // ---- Persist settings on change ----------------------------------------
+  useEffect(() => {
+    const payload: PersistedSettings = {
+      kenBurns,
+      settings,
+      captionSettings,
+      audio: audioSettings,
+      whisperLanguage,
+    };
+    try {
+      localStorage.setItem(LS_KEY, JSON.stringify(payload));
+    } catch {
+      /* storage full / private mode — non-fatal */
+    }
+  }, [kenBurns, settings, captionSettings, audioSettings, whisperLanguage]);
 
   const generateCaptionsFromAudio = useCallback(async () => {
     if (!audioTrack) {
@@ -489,11 +644,15 @@ export default function Page() {
         return next;
       });
       toast.success(
-        `Transcribed ${wordCount} word${wordCount === 1 ? "" : "s"}`,
+        `Transcribed ${wordCount} word${wordCount === 1 ? "" : "s"}${
+          result.wordLevel ? " (exact word timing)" : ""
+        }`,
         {
           description: `${result.cues.length} cue${
             result.cues.length === 1 ? "" : "s"
-          } · word-by-word mode enabled`,
+          } · ${result.wordLevel ? "word-by-word mode ready" : "estimated word timing"}${
+            result.language ? ` · ${result.language}` : ""
+          }`,
         },
       );
     } catch (err) {
@@ -620,6 +779,41 @@ export default function Page() {
     abortRef.current?.abort();
   }, []);
 
+  // ---- Keyboard shortcuts (production-ready transport) ------------------
+  // Space: play/pause · ←/→: seek ±1s · Shift+←/→: prev/next segment.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      // Don't hijack typing in inputs.
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if (e.key === " " || e.code === "Space") {
+        e.preventDefault();
+        togglePlay();
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        if (e.shiftKey) stepSegment(1);
+        else seek(currentMsRef.current + 1000);
+      } else if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        if (e.shiftKey) stepSegment(-1);
+        else seek(Math.max(0, currentMsRef.current - 1000));
+      } else if (e.key === "Home") {
+        e.preventDefault();
+        seek(0);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [togglePlay, seek, stepSegment]);
+
   // ---- Cleanup object URLs on unmount -------------------------------------
   useEffect(() => {
     return () => {
@@ -682,6 +876,8 @@ export default function Page() {
             skipped={allSkipped}
             warnings={timeline.warnings}
             onAddFiles={addFiles}
+            onAddAudioFile={addAudio}
+            onAddSubtitleFile={addSubtitles}
             onLoadSamples={loadSamples}
             openImagePicker={openImagePicker}
             openAudioPicker={openAudioPicker}
@@ -692,11 +888,6 @@ export default function Page() {
             onOverride={overrideDuration}
             onClearOverride={clearOverride}
             onReorder={reorderItem}
-            onGenerateCaptions={generateCaptionsFromAudio}
-            whisperBusy={whisperBusy}
-            whisperProgress={whisperProgress}
-            whisperLanguage={whisperLanguage}
-            onWhisperLanguageChange={setWhisperLanguage}
           />
         </section>
 
@@ -743,10 +934,16 @@ export default function Page() {
           <SettingsPanel
             kenBurns={kenBurns}
             settings={settings}
+            audioSettings={audioSettings}
             onKenBurnsChange={setKenBurns}
             onSettingsChange={setSettings}
+            onAudioSettingsChange={setAudioSettings}
             captionSettings={captionSettings}
             onCaptionSettingsChange={setCaptionSettings}
+            onApplyPreset={applyCaptionPreset}
+            onExportSrt={exportSrtSidecar}
+            onExportAss={exportAssSidecar}
+            inElectron={inElectron}
             subtitles={subtitles}
             hasAudio={!!audioTrack}
             onGenerateCaptions={generateCaptionsFromAudio}

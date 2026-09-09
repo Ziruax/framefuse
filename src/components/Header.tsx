@@ -268,7 +268,7 @@ export function Header({
         }
         title={
           inElectron
-            ? "Native FFmpeg encoding via fluent-ffmpeg + ffmpeg-static"
+            ? "Native FFmpeg encoding (GPU-accelerated when available) — export matches the preview"
             : "Browser preview mode — WebCodecs/MediaRecorder fallback"
         }
       >

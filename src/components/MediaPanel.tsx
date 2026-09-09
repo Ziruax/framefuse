@@ -18,8 +18,6 @@ import {
   ChevronRight,
   Captions,
   FileText,
-  Sparkles,
-  Loader2,
 } from "lucide-react";
 import type {
   MediaSegment,
@@ -30,7 +28,6 @@ import type {
 } from "@/lib/merger/types";
 import { fmtTimecode } from "@/lib/merger/timeline";
 import { cn } from "@/lib/utils";
-import type { WhisperProgress } from "@/lib/merger/whisper";
 
 interface MediaPanelProps {
   segments: MediaSegment[];
@@ -40,6 +37,9 @@ interface MediaPanelProps {
   skipped: string[];
   warnings: OverlapWarning[];
   onAddFiles: (files: File[]) => void;
+  /** Drag-drop support: audio + .srt files are routed too (v4.1). */
+  onAddAudioFile: (file: File) => void;
+  onAddSubtitleFile: (file: File) => void;
   onLoadSamples: () => void;
   openImagePicker: () => void;
   openAudioPicker: () => void;
@@ -50,13 +50,6 @@ interface MediaPanelProps {
   onOverride: (id: string, durationMs: number) => void;
   onClearOverride: (id: string) => void;
   onReorder: (id: string, dir: -1 | 1) => void;
-  /** Whisper caption generation moved to SettingsPanel — these props
-   * are kept for backwards compatibility but no longer rendered here. */
-  onGenerateCaptions?: () => void;
-  whisperBusy?: boolean;
-  whisperProgress?: WhisperProgress | null;
-  whisperLanguage?: string;
-  onWhisperLanguageChange?: (lang: string) => void;
 }
 
 const KIND_STYLES: Record<
@@ -80,6 +73,8 @@ export function MediaPanelBase({
   skipped,
   warnings,
   onAddFiles,
+  onAddAudioFile,
+  onAddSubtitleFile,
   onLoadSamples,
   openImagePicker,
   openAudioPicker,
@@ -90,20 +85,25 @@ export function MediaPanelBase({
   onOverride,
   onClearOverride,
   onReorder,
-  onGenerateCaptions,
-  whisperBusy,
-  whisperProgress,
-  whisperLanguage,
-  onWhisperLanguageChange,
 }: MediaPanelProps) {
   const [dragOver, setDragOver] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
 
+  // v4.1: drag-drop routes images, audio AND .srt files with feedback.
   const handleFiles = (files: FileList | null) => {
     if (!files) return;
-    const arr = Array.from(files).filter((f) => f.type.startsWith("image/"));
-    if (arr.length) onAddFiles(arr);
+    const all = Array.from(files);
+    const images = all.filter((f) => f.type.startsWith("image/"));
+    const audio = all.filter(
+      (f) => f.type.startsWith("audio/") || /\.(mp3|wav|m4a|ogg|flac|aac|opus)$/i.test(f.name),
+    );
+    const srts = all.filter(
+      (f) => f.type === "application/x-subrip" || /\.srt$/i.test(f.name),
+    );
+    if (images.length) onAddFiles(images);
+    if (audio.length) onAddAudioFile(audio[audio.length - 1]);
+    if (srts.length) onAddSubtitleFile(srts[srts.length - 1]);
   };
 
   const handleDrop = (e: DragEvent<HTMLDivElement>) => {
