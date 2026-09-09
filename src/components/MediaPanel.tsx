@@ -50,16 +50,13 @@ interface MediaPanelProps {
   onOverride: (id: string, durationMs: number) => void;
   onClearOverride: (id: string) => void;
   onReorder: (id: string, dir: -1 | 1) => void;
-  /** Whisper-tiny caption generation. Requires an audio track. */
-  onGenerateCaptions: () => void;
-  /** True while Whisper is downloading / transcribing. */
-  whisperBusy: boolean;
-  /** Live progress for the Whisper run (null when idle). */
-  whisperProgress: WhisperProgress | null;
-  /** Whisper language code: "auto" for auto-detect, or 2-letter ISO 639-1. */
-  whisperLanguage: string;
-  /** Callback to change the Whisper language. */
-  onWhisperLanguageChange: (lang: string) => void;
+  /** Whisper caption generation moved to SettingsPanel — these props
+   * are kept for backwards compatibility but no longer rendered here. */
+  onGenerateCaptions?: () => void;
+  whisperBusy?: boolean;
+  whisperProgress?: WhisperProgress | null;
+  whisperLanguage?: string;
+  onWhisperLanguageChange?: (lang: string) => void;
 }
 
 const KIND_STYLES: Record<
@@ -481,135 +478,8 @@ export function MediaPanelBase({
               </div>
             )}
 
-            {/* Whisper-tiny caption generation — ALWAYS visible so the
-                user can find it. Disabled when there's no audio. */}
-            {true && (
-              <div
-                className="rounded-lg border p-2.5"
-                style={{
-                  borderColor: "rgba(124, 58, 237, 0.4)",
-                  backgroundColor: "rgba(76, 29, 149, 0.18)",
-                }}
-              >
-                {/* Language selector — auto-detect or pick from common languages */}
-                <div className="mb-2 flex items-center gap-1.5">
-                  <span
-                    className="text-[10px] font-medium shrink-0"
-                    style={{ color: "#c4b5fd" }}
-                  >
-                    Lang:
-                  </span>
-                  <select
-                    value={whisperLanguage}
-                    onChange={(e) => onWhisperLanguageChange(e.target.value)}
-                    disabled={whisperBusy}
-                    className="flex-1 rounded-md border px-1.5 py-1 text-[10px] outline-none disabled:opacity-50"
-                    style={{
-                      borderColor: "#3f3f46",
-                      backgroundColor: "#09090b",
-                      color: "#e4e4e7",
-                    }}
-                    title="Select the spoken language. Auto-detect lets Whisper figure it out from the first 30 seconds."
-                  >
-                    <option value="auto">Auto-detect</option>
-                    <option value="english">English</option>
-                    <option value="spanish">Spanish</option>
-                    <option value="french">French</option>
-                    <option value="german">German</option>
-                    <option value="italian">Italian</option>
-                    <option value="portuguese">Portuguese</option>
-                    <option value="dutch">Dutch</option>
-                    <option value="russian">Russian</option>
-                    <option value="japanese">Japanese</option>
-                    <option value="korean">Korean</option>
-                    <option value="chinese">Chinese</option>
-                    <option value="arabic">Arabic</option>
-                    <option value="hindi">Hindi</option>
-                    <option value="turkish">Turkish</option>
-                    <option value="polish">Polish</option>
-                    <option value="vietnamese">Vietnamese</option>
-                    <option value="thai">Thai</option>
-                    <option value="indonesian">Indonesian</option>
-                    <option value="ukrainian">Ukrainian</option>
-                    <option value="greek">Greek</option>
-                    <option value="hebrew">Hebrew</option>
-                    <option value="czech">Czech</option>
-                    <option value="swedish">Swedish</option>
-                    <option value="finnish">Finnish</option>
-                    <option value="norwegian">Norwegian</option>
-                    <option value="danish">Danish</option>
-                    <option value="hungarian">Hungarian</option>
-                    <option value="romanian">Romanian</option>
-                    <option value="urdu">Urdu</option>
-                    <option value="bengali">Bengali</option>
-                    <option value="tamil">Tamil</option>
-                    <option value="swahili">Swahili</option>
-                  </select>
-                </div>
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={onGenerateCaptions}
-                    disabled={whisperBusy || !audioTrack}
-                    className={cn(
-                      "flex flex-1 items-center justify-center gap-1.5 rounded-md px-2.5 py-1.5 text-[11px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50",
-                    )}
-                    style={{
-                      backgroundColor: whisperBusy ? "#3f3f46" : "#7c3aed",
-                      color: "#ffffff",
-                    }}
-                    title={
-                      !audioTrack
-                        ? "Add an audio track first"
-                        : whisperBusy
-                          ? "Transcribing…"
-                          : "Generate word-by-word captions with Whisper-tiny (in your browser, no server)"
-                    }
-                  >
-                    {whisperBusy ? (
-                      <Loader2 className="size-3.5 animate-spin" />
-                    ) : (
-                      <Sparkles className="size-3.5" />
-                    )}
-                    {whisperBusy
-                      ? whisperProgress?.status ?? "Working…"
-                      : "Generate captions (Whisper)"}
-                  </button>
-                </div>
-                {whisperBusy && whisperProgress && (
-                  <div className="mt-2">
-                    <div
-                      className="h-1 w-full overflow-hidden rounded-full"
-                      style={{ backgroundColor: "#3f3f46" }}
-                    >
-                      <div
-                        className="h-full rounded-full transition-all"
-                        style={{
-                          width: `${Math.max(2, Math.min(100, whisperProgress.progress))}%`,
-                          backgroundColor: "#a78bfa",
-                        }}
-                      />
-                    </div>
-                    <div
-                      className="mt-1 text-[9px]"
-                      style={{ color: "#a1a1aa" }}
-                    >
-                      {whisperProgress.status} · {Math.round(whisperProgress.progress)}%
-                    </div>
-                  </div>
-                )}
-                {!whisperBusy && (
-                  <div
-                    className="mt-1.5 text-[9px] leading-snug"
-                    style={{ color: "#a1a1aa" }}
-                  >
-                    {audioTrack
-                      ? "Uses openai/whisper-tiny (~150 MB, runs locally). First click downloads the model from HuggingFace, then it's cached for offline use."
-                      : "Add an audio track first, then click to generate word-by-word captions. First run downloads the model (~150MB), cached for offline use after."}
-                  </div>
-                )}
-              </div>
-            )}
+            {/* Whisper caption generation moved to the right Settings panel
+                (Captions section) so all caption controls are in one place. */}
 
             {/* Subtitles chip */}
             {subtitles && subtitles.cues.length > 0 && (

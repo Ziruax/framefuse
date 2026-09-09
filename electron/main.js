@@ -13,32 +13,27 @@ const { spawn, execSync } = require("child_process");
 // Linux/macOS we need ffmpeg. When the app is packaged, the binary is
 // bundled via electron-builder's extraResources config at:
 //   <resourcesPath>/ffmpeg-static/ffmpeg(.exe)
-// We try multiple candidate paths for backwards compatibility with
-// older build configs.
 let ffmpegPath;
 if (app.isPackaged) {
   const exeName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
+  const altName = process.platform === "win32" ? "ffmpeg" : "ffmpeg.exe";
   const candidates = [
     // PRIMARY: extraResources path (current build config).
     path.join(process.resourcesPath, "ffmpeg-static", exeName),
+    // Fallback: try the other extension.
+    path.join(process.resourcesPath, "ffmpeg-static", altName),
     // Legacy: asar.unpacked path (older build config).
     path.join(process.resourcesPath, "app.asar.unpacked", "node_modules", "ffmpeg-static", exeName),
-    // Fallback: try without asar.unpacked.
+    path.join(process.resourcesPath, "app.asar.unpacked", "node_modules", "ffmpeg-static", altName),
+    // Legacy: app/ path.
     path.join(process.resourcesPath, "app", "node_modules", "ffmpeg-static", exeName),
-    // Fallback: try the other extension (in case the platform-specific
-    // binary didn't get bundled).
-    path.join(process.resourcesPath, "ffmpeg-static",
-      process.platform === "win32" ? "ffmpeg" : "ffmpeg.exe"),
-    path.join(process.resourcesPath, "app.asar.unpacked", "node_modules", "ffmpeg-static",
-      process.platform === "win32" ? "ffmpeg" : "ffmpeg.exe"),
   ];
   ffmpegPath = candidates.find((p) => {
     try { return fs.existsSync(p); } catch { return false; }
   });
   if (!ffmpegPath) {
-    // Last-resort: use the npm-resolved path (works in dev, fails in
-    // packaged — but at least we get a clear error).
-    try { ffmpegPath = require("ffmpeg-static"); } catch { ffmpegPath = candidates[0]; }
+    console.error("FFmpeg not found at any candidate path:", candidates);
+    ffmpegPath = candidates[0]; // Use the first candidate for the error message
   }
 } else {
   // Dev mode: ffmpeg-static's install.js downloads the host binary.
@@ -47,11 +42,11 @@ if (app.isPackaged) {
   } catch (e) {
     ffmpegPath = "ffmpeg"; // hope it's on PATH
   }
-  // On Windows dev, the binary may not have .exe extension.
   if (process.platform === "win32" && ffmpegPath && !ffmpegPath.endsWith(".exe")) {
     try { if (fs.existsSync(ffmpegPath + ".exe")) ffmpegPath += ".exe"; } catch (_) {}
   }
 }
+console.log("FFmpeg path:", ffmpegPath, "exists:", (() => { try { return fs.existsSync(ffmpegPath); } catch { return false; } })());
 
 const isDev = !app.isPackaged;
 let mainWindow = null;
@@ -226,6 +221,12 @@ ipcMain.handle("export-native", async (event, opts) => {
 
   if (!outputPath) throw new Error("No output path");
   if (!segments || segments.length === 0) throw new Error("No segments");
+
+  // Verify FFmpeg exists before attempting export — this gives the user
+  // a clear error message instead of a cryptic ENOENT.
+  if (!ffmpegPath || !fs.existsSync(ffmpegPath)) {
+    throw new Error("FFmpeg not found. The bundled FFmpeg binary is missing or corrupted. Please reinstall FrameFuse. Expected at: " + ffmpegPath);
+  }
 
   const intensity = Math.max(0, Math.min(100, Number(kenBurns?.intensity) || 0));
   const zoomMax = 1.06 + (intensity / 100) * 0.18;

@@ -15,6 +15,8 @@ import {
   ChevronRight,
   Captions,
   Type,
+  Loader2,
+  Music,
 } from "lucide-react";
 import type {
   AspectRatio,
@@ -44,6 +46,18 @@ interface SettingsPanelProps {
   captionSettings: CaptionSettings;
   onCaptionSettingsChange: (c: CaptionSettings) => void;
   subtitles: SubtitleFile | null;
+  /** Audio track present? (for Whisper button enable state) */
+  hasAudio: boolean;
+  /** Generate captions via Whisper */
+  onGenerateCaptions: () => void;
+  /** True while Whisper is running */
+  whisperBusy: boolean;
+  /** Live progress for Whisper */
+  whisperProgress: import("@/lib/merger/whisper").WhisperProgress | null;
+  /** Whisper language code */
+  whisperLanguage: string;
+  /** Change Whisper language */
+  onWhisperLanguageChange: (lang: string) => void;
   debug: {
     imageCount: number;
     mode: TimelineMode | null;
@@ -86,6 +100,12 @@ export function SettingsPanel({
   captionSettings,
   onCaptionSettingsChange,
   subtitles,
+  hasAudio,
+  onGenerateCaptions,
+  whisperBusy,
+  whisperProgress,
+  whisperLanguage,
+  onWhisperLanguageChange,
   debug,
 }: SettingsPanelProps) {
   return (
@@ -294,6 +314,12 @@ export function SettingsPanel({
         captionSettings={captionSettings}
         onCaptionSettingsChange={onCaptionSettingsChange}
         subtitles={subtitles}
+        hasAudio={hasAudio}
+        onGenerateCaptions={onGenerateCaptions}
+        whisperBusy={whisperBusy}
+        whisperProgress={whisperProgress}
+        whisperLanguage={whisperLanguage}
+        onWhisperLanguageChange={onWhisperLanguageChange}
       />
 
       {/* Debug */}
@@ -488,10 +514,22 @@ function CaptionsSection({
   captionSettings,
   onCaptionSettingsChange,
   subtitles,
+  hasAudio,
+  onGenerateCaptions,
+  whisperBusy,
+  whisperProgress,
+  whisperLanguage,
+  onWhisperLanguageChange,
 }: {
   captionSettings: CaptionSettings;
   onCaptionSettingsChange: (c: CaptionSettings) => void;
   subtitles: SubtitleFile | null;
+  hasAudio: boolean;
+  onGenerateCaptions: () => void;
+  whisperBusy: boolean;
+  whisperProgress: import("@/lib/merger/whisper").WhisperProgress | null;
+  whisperLanguage: string;
+  onWhisperLanguageChange: (lang: string) => void;
 }) {
   const set = (patch: Partial<CaptionSettings>) =>
     onCaptionSettingsChange({ ...captionSettings, ...patch });
@@ -516,6 +554,128 @@ function CaptionsSection({
       accentColor="#f0abfc"
       defaultOpen={true}
     >
+      {/* ── Whisper caption generation ── */}
+      <div
+        className="rounded-lg border p-2.5 mb-3"
+        style={{
+          borderColor: "rgba(124, 58, 237, 0.4)",
+          backgroundColor: "rgba(76, 29, 149, 0.18)",
+        }}
+      >
+        {/* Language selector */}
+        <div className="mb-2 flex items-center gap-1.5">
+          <span
+            className="text-[10px] font-medium shrink-0"
+            style={{ color: "#c4b5fd" }}
+          >
+            Lang:
+          </span>
+          <select
+            value={whisperLanguage}
+            onChange={(e) => onWhisperLanguageChange(e.target.value)}
+            disabled={whisperBusy}
+            className="flex-1 rounded-md border px-1.5 py-1 text-[10px] outline-none disabled:opacity-50"
+            style={{
+              borderColor: "#3f3f46",
+              backgroundColor: "#09090b",
+              color: "#e4e4e7",
+            }}
+            title="Select the spoken language. Auto-detect lets Whisper figure it out from the first 30 seconds."
+          >
+            <option value="auto">Auto-detect</option>
+            <option value="english">English</option>
+            <option value="spanish">Spanish</option>
+            <option value="french">French</option>
+            <option value="german">German</option>
+            <option value="italian">Italian</option>
+            <option value="portuguese">Portuguese</option>
+            <option value="dutch">Dutch</option>
+            <option value="russian">Russian</option>
+            <option value="japanese">Japanese</option>
+            <option value="korean">Korean</option>
+            <option value="chinese">Chinese</option>
+            <option value="arabic">Arabic</option>
+            <option value="hindi">Hindi</option>
+            <option value="turkish">Turkish</option>
+            <option value="polish">Polish</option>
+            <option value="vietnamese">Vietnamese</option>
+            <option value="thai">Thai</option>
+            <option value="indonesian">Indonesian</option>
+            <option value="ukrainian">Ukrainian</option>
+            <option value="greek">Greek</option>
+            <option value="hebrew">Hebrew</option>
+            <option value="czech">Czech</option>
+            <option value="swedish">Swedish</option>
+            <option value="finnish">Finnish</option>
+            <option value="norwegian">Norwegian</option>
+            <option value="danish">Danish</option>
+            <option value="hungarian">Hungarian</option>
+            <option value="romanian">Romanian</option>
+            <option value="urdu">Urdu</option>
+            <option value="bengali">Bengali</option>
+            <option value="tamil">Tamil</option>
+            <option value="swahili">Swahili</option>
+          </select>
+        </div>
+        {/* Generate button */}
+        <button
+          type="button"
+          onClick={onGenerateCaptions}
+          disabled={whisperBusy || !hasAudio}
+          className={cn(
+            "flex w-full items-center justify-center gap-1.5 rounded-md px-2.5 py-2 text-[11px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+          )}
+          style={{
+            backgroundColor: whisperBusy ? "#3f3f46" : "#7c3aed",
+            color: "#ffffff",
+          }}
+          title={
+            !hasAudio
+              ? "Add an audio track first"
+              : whisperBusy
+                ? "Transcribing…"
+                : "Generate word-by-word captions with Whisper-tiny (original, non-quantized)"
+          }
+        >
+          {whisperBusy ? (
+            <Loader2 className="size-3.5 animate-spin" />
+          ) : (
+            <Music className="size-3.5" />
+          )}
+          {whisperBusy
+            ? whisperProgress?.status ?? "Working…"
+            : "Generate captions (Whisper)"}
+        </button>
+        {/* Progress bar */}
+        {whisperBusy && whisperProgress && (
+          <div className="mt-2">
+            <div
+              className="h-1 w-full overflow-hidden rounded-full"
+              style={{ backgroundColor: "#3f3f46" }}
+            >
+              <div
+                className="h-full rounded-full transition-all"
+                style={{
+                  width: `${Math.max(2, Math.min(100, whisperProgress.progress))}%`,
+                  backgroundColor: "#a78bfa",
+                }}
+              />
+            </div>
+            <div className="mt-1 text-[9px]" style={{ color: "#a1a1aa" }}>
+              {whisperProgress.status} · {Math.round(whisperProgress.progress)}%
+            </div>
+          </div>
+        )}
+        {/* Hint */}
+        {!whisperBusy && (
+          <div className="mt-1.5 text-[9px] leading-snug" style={{ color: "#a1a1aa" }}>
+            {hasAudio
+              ? "Uses openai/whisper-tiny (original, non-quantized). First click downloads ~150MB model from HuggingFace, then cached for offline use."
+              : "Add an audio track in the left panel, then click to generate word-by-word captions."}
+          </div>
+        )}
+      </div>
+
       {/* Enable toggle + subtitle status */}
       <div className="flex items-center justify-between">
         <div className="flex flex-col">

@@ -748,6 +748,12 @@ export default function Page() {
             captionSettings={captionSettings}
             onCaptionSettingsChange={setCaptionSettings}
             subtitles={subtitles}
+            hasAudio={!!audioTrack}
+            onGenerateCaptions={generateCaptionsFromAudio}
+            whisperBusy={whisperBusy}
+            whisperProgress={whisperProgress}
+            whisperLanguage={whisperLanguage}
+            onWhisperLanguageChange={setWhisperLanguage}
             debug={debug}
           />
         </section>

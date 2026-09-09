@@ -1424,6 +1424,9 @@ function wrapText(
  * Balanced text wrapping — creates a triangle/pyramid shape where
  * line 1 is longest, line 2 is shorter, line 3 is shortest.
  * This looks much better typographically than greedy wrapping.
+ *
+ * Handles up to 4 lines. If text still doesn't fit, falls back to
+ * greedy wrapping (which handles any number of lines).
  */
 function balancedWrapText(
   ctx: CanvasRenderingContext2D,
@@ -1440,7 +1443,7 @@ function balancedWrapText(
       continue;
     }
 
-    const words = para.split(/\s+/);
+    const words = para.split(/\s+/).filter(Boolean);
     if (words.length <= 1) {
       result.push(para);
       continue;
@@ -1449,6 +1452,13 @@ function balancedWrapText(
     // Check if it all fits on one line
     const fullWidth = ctx.measureText(para).width;
     if (fullWidth <= maxW) {
+      result.push(para);
+      continue;
+    }
+
+    // If a single word is wider than maxW, we can't wrap it — return
+    // it anyway (the renderer will clip it via safe-area clamping).
+    if (words.every((w) => ctx.measureText(w).width > maxW)) {
       result.push(para);
       continue;
     }
@@ -1500,7 +1510,14 @@ function balancedWrapText(
       }
     }
 
-    result.push(...bestSplit);
+    // If balanced wrap found a valid split (bestSplit changed from [para]),
+    // use it. Otherwise fall back to greedy wrapping.
+    if (bestSplit.length > 1 || bestSplit[0] !== para) {
+      result.push(...bestSplit);
+    } else {
+      // Greedy fallback — word by word, no line limit.
+      result.push(...wrapText(ctx, para, maxW));
+    }
   }
 
   return result;
