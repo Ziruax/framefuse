@@ -15,12 +15,22 @@ import type { SubtitleCue, WordTimestamp } from "./subtitles";
 // of the app (preview, export) lightweight.
 let pipelinePromise: Promise<any> | null = null;
 
-// The model is BUNDLED with the app at /public/whisper-tiny/ so users
-// don't need an internet connection. We first try the local path; if
-// that fails (e.g. dev mode without the bundled files), we fall back
-// to the HuggingFace remote download.
-const LOCAL_MODEL_PATH = "/whisper-tiny";
+// The model is DOWNLOADED at runtime from the HuggingFace Hub on first
+// use, then cached in IndexedDB for all future runs. This avoids
+// bundling the 149MB model in the .exe (which caused Windows extraction
+// errors on files >100MB). The user needs an internet connection only
+// for the FIRST transcription — after that, the model is cached and
+// Whisper works offline.
+//
+// We use the ORIGINAL (non-quantized) Whisper-tiny for maximum
+// transcription quality. Quantized versions would be ~40MB smaller but
+// significantly degrade accuracy.
 const REMOTE_MODEL_ID = "Xenova/whisper-tiny";
+
+// Singleton pipeline + progress callback. The progress callback is
+// stored at module scope so getPipeline can report download progress
+// even though it's called from inside the lazy-load promise.
+let activeProgressCb: ((p: WhisperProgress) => void) | null = null;
 
 async function getPipeline(): Promise<any> {
   if (pipelinePromise) return pipelinePromise;
@@ -29,34 +39,45 @@ async function getPipeline(): Promise<any> {
     // Dynamic import — Next.js will code-split this chunk.
     const { pipeline, env } = await import("@xenova/transformers");
 
-    // Try the bundled local model first (no internet needed).
-    try {
-      // In production (Electron file:// protocol) the path resolves
-      // relative to the app's out/ directory. In dev (Next.js) it
-      // resolves relative to the public/ directory.
-      env.allowLocalModels = true;
-      env.localModelPath = "/";
-
-      // Probe for the bundled config — if present, use local.
-      const probe = await fetch(`${LOCAL_MODEL_PATH}/config.json`, {
-        method: "HEAD",
-      });
-      if (probe.ok) {
-        const pipe = await pipeline(
-          "automatic-speech-recognition",
-          LOCAL_MODEL_PATH,
-        );
-        return pipe;
-      }
-    } catch {
-      // Fall through to remote download.
-    }
-
-    // Fall back to remote download (cached in IndexedDB after first run).
+    // Allow remote model download from the Hugging Face Hub. The model
+    // is cached in IndexedDB after the first run, so subsequent runs
+    // work offline.
     env.allowRemoteModels = true;
+    env.allowLocalModels = false;
+
+    // Report download progress to the UI on the first run (when the
+    // model needs to be downloaded from HuggingFace). After the first
+    // run, the model is cached in IndexedDB and this callback isn't
+    // called (load is near-instant).
+    const progress_callback = (info: any) => {
+      if (!activeProgressCb) return;
+      if (info.status === "progress") {
+        // info has: { file, loaded, total, progress, name }
+        const pct = info.progress ?? 0;
+        const file = info.file ?? "model";
+        activeProgressCb({
+          progress: Math.round(pct),
+          status: `Downloading ${file}…`,
+        });
+      } else if (info.status === "done") {
+        activeProgressCb({
+          progress: 100,
+          status: `Loaded ${info.file ?? "model"}`,
+        });
+      } else if (info.status === "initiate") {
+        activeProgressCb({
+          progress: 0,
+          status: `Preparing ${info.file ?? "model"}…`,
+        });
+      }
+    };
+
+    // automatic-speech-recognition with Whisper-tiny (original,
+    // non-quantized for maximum quality).
     const pipe = await pipeline(
       "automatic-speech-recognition",
       REMOTE_MODEL_ID,
+      { progress_callback },
     );
     return pipe;
   })();
@@ -190,6 +211,10 @@ export async function transcribeWithWhisper(
   onProgress?.({ progress: 10, status: "Loading Whisper-tiny model…" });
   if (signal?.aborted) throw new Error("Transcription cancelled");
 
+  // Wire the progress callback so the first-run download shows
+  // per-file progress in the UI.
+  activeProgressCb = onProgress ?? null;
+
   const pipe = await getPipeline();
 
   onProgress?.({ progress: 25, status: "Transcribing audio…" });
@@ -268,6 +293,9 @@ export async function transcribeWithWhisper(
   cues.forEach((c, i) => (c.id = i + 1));
 
   onProgress?.({ progress: 100, status: "Done" });
+
+  // Clear the progress callback so it doesn't leak into the next call.
+  activeProgressCb = null;
 
   return {
     cues,

@@ -11,23 +11,24 @@ const { spawn, execSync } = require("child_process");
 
 // Resolve the FFmpeg binary path. On Windows we need ffmpeg.exe, on
 // Linux/macOS we need ffmpeg. When the app is packaged, the binary is
-// bundled via electron-builder's asarUnpack config — but the platform
-// of the bundled binary depends on which OS did the build. To support
-// cross-building (e.g. building the Windows .exe on Linux), we ship
-// BOTH binaries in node_modules/ffmpeg-static/ and pick the right one
-// at runtime based on the host OS.
+// bundled via electron-builder's extraResources config at:
+//   <resourcesPath>/ffmpeg-static/ffmpeg(.exe)
+// We try multiple candidate paths for backwards compatibility with
+// older build configs.
 let ffmpegPath;
 if (app.isPackaged) {
   const exeName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
   const candidates = [
-    path.join(process.resourcesPath, "app.asar.unpacked", "node_modules", "ffmpeg-static", exeName),
-    // Fallback: try without asar.unpacked (in case asarUnpack didn't run).
-    path.join(process.resourcesPath, "app", "node_modules", "ffmpeg-static", exeName),
-    // Fallback: try in extraResources (in case we configured that).
+    // PRIMARY: extraResources path (current build config).
     path.join(process.resourcesPath, "ffmpeg-static", exeName),
+    // Legacy: asar.unpacked path (older build config).
+    path.join(process.resourcesPath, "app.asar.unpacked", "node_modules", "ffmpeg-static", exeName),
+    // Fallback: try without asar.unpacked.
+    path.join(process.resourcesPath, "app", "node_modules", "ffmpeg-static", exeName),
     // Fallback: try the other extension (in case the platform-specific
-    // binary didn't get bundled — e.g. building Windows on Linux only
-    // ships the Linux binary unless we manually add ffmpeg.exe).
+    // binary didn't get bundled).
+    path.join(process.resourcesPath, "ffmpeg-static",
+      process.platform === "win32" ? "ffmpeg" : "ffmpeg.exe"),
     path.join(process.resourcesPath, "app.asar.unpacked", "node_modules", "ffmpeg-static",
       process.platform === "win32" ? "ffmpeg" : "ffmpeg.exe"),
   ];

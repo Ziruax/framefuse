@@ -604,8 +604,8 @@ export function MediaPanelBase({
                     style={{ color: "#a1a1aa" }}
                   >
                     {audioTrack
-                      ? "Uses openai/whisper-tiny (~75 MB, runs locally in your browser). Bundled with the app — no download needed."
-                      : "Add an audio track first, then click to generate word-by-word captions. Uses openai/whisper-tiny (bundled, no download)."}
+                      ? "Uses openai/whisper-tiny (~150 MB, runs locally). First click downloads the model from HuggingFace, then it's cached for offline use."
+                      : "Add an audio track first, then click to generate word-by-word captions. First run downloads the model (~150MB), cached for offline use after."}
                   </div>
                 )}
               </div>

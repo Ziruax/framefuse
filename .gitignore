@@ -38,12 +38,3 @@ dev.log
 tool-results/
 build/
 
-# Whisper model files — downloaded at build time via
-# `node scripts/fetch-whisper-model.js`. Too large for GitHub (114MB
-# decoder exceeds 100MB file limit). Run `npm run fetch:whisper`
-# before building the desktop app.
-public/whisper-tiny/onnx/*.onnx
-public/whisper-tiny/*.json
-public/whisper-tiny/*.txt
-!public/whisper-tiny/.gitkeep
-
