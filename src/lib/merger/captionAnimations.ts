@@ -122,8 +122,12 @@ export function computeWordTransform(
   switch (animation) {
     case "pop-in": {
       // Scale 0.4 → 1 with overshoot bounce over POP_IN_MS.
+      // easeOutBack(0)=0, easeOutBack(1)=1 with overshoot in between.
+      // So scale = 0.4 + easeOutBack(t) * 0.6 gives 0.4 at t=0 and
+      // 1.0 at t=1, matching the ASS export's \fscx40 → \fscx115 → \fscx100.
       const t = clamp01(sinceStart / POP_IN_MS);
-      const scale = 0.4 + (easeOutBack(t) - 0.4) * (1 - 0.4) / (1 - 0);
+      const eased = easeOutBack(t);
+      const scale = 0.4 + eased * 0.6;
       // After the bounce, settle at 1.
       const finalScale = t >= 1 ? 1 : scale;
       return {
@@ -253,6 +257,26 @@ export function computeWordTransform(
  * set to the word's start, so t=0 inside the line is the word's start.
  *
  * `ch` is the ASS PlayResY (typically 1080 or the video height).
+ *
+ * IMPORTANT: This function is the TS-side mirror of assAnimTags() in
+ * electron/main.js. They MUST stay in sync so the canvas preview
+ * (which uses computeWordTransform above) and the burned-in FFmpeg
+ * export (which uses this ASS-tag emitter via main.js) produce
+ * visually-identical output.
+ *
+ * ASS animation fundamentals:
+ *   - All tags inside ONE {} block apply as a group at the start of the
+ *     line. A second \move or \fad in the same block silently overrides
+ *     the first. Multi-stage animations MUST use separate {} blocks.
+ *   - \fad(t1,t2) and \move(x1,y1,x2,y2,t1,t2) can only appear ONCE per
+ *     line — multiple calls silently overwrite.
+ *   - \t(t1,t2,style) animates a single style property over [t1,t2]
+ *     within the line's time. Sequential {} blocks with their own \t
+ *     are read in order by libass.
+ *   - For wave / jitter / shake (multi-point motion), we approximate
+ *     with sequential \t blocks animating \frx/\fry rotation — small
+ *     angles read as the intended motion without breaking ASS's
+ *     single-\move rule.
  */
 export function assWordAnimationTags(
   animation: CaptionAnimation,
@@ -262,115 +286,116 @@ export function assWordAnimationTags(
   if (animation === "none") return "";
 
   const chScale = ch / 1080;
-  const tags: string[] = [];
+  // Each entry is a complete {} override block. Consecutive blocks are
+  // read by libass as sequential override states.
+  const blocks: string[] = [];
 
   switch (animation) {
     case "pop-in": {
-      // Scale 40% → 100% with overshoot via two keyframes (libass \t is
-      // linear interpolation between two states; we approximate the
-      // overshoot by going 40% → 115% over 70% of the time, then
-      // 115% → 100% over the remaining 30%).
-      tags.push(`\\fscx40\\fscy40\\alpha&HFF&`);
-      tags.push(`\\t(0,${Math.round(POP_IN_MS * 0.7)},\\fscx115\\fscy115\\alpha&H00&)`);
-      tags.push(`\\t(${Math.round(POP_IN_MS * 0.7)},${POP_IN_MS},\\fscx100\\fscy100)`);
+      // Initial state: scaled to 40%, fully transparent. Then animate
+      // to 115% (overshoot) at 70% of POP_IN_MS, then settle to 100%.
+      blocks.push(`{\\fscx40\\fscy40\\alpha&HFF&}`);
+      blocks.push(`{\\t(0,${Math.round(POP_IN_MS * 0.7)},\\fscx115\\fscy115\\alpha&H00&)}`);
+      blocks.push(`{\\t(${Math.round(POP_IN_MS * 0.7)},${POP_IN_MS},\\fscx100\\fscy100)}`);
       break;
     }
     case "slide-up": {
       const dy = Math.round(30 * chScale);
-      tags.push(`\\move(0,${dy},0,0,0,${SLIDE_UP_MS})`);
-      tags.push(`\\fad(${Math.round(SLIDE_UP_MS * 0.6)},0)`);
+      // Single \move covers the whole slide; \fad adds the fade.
+      blocks.push(`{\\move(0,${dy},0,0,0,${SLIDE_UP_MS})\\fad(${Math.round(SLIDE_UP_MS * 0.6)},0)}`);
       break;
     }
     case "bounce-in": {
+      // \move handles the main drop. \fad handles the fade-in. The
+      // overshoot is approximated with \t animating \fry by 1° (a
+      // tiny visual nudge — full 2-stage \move isn't supported in a
+      // single block).
       const dy = Math.round(25 * chScale);
-      // Approximate the elastic ease with a two-stage move: drop fast,
-      // bounce up small, settle.
-      tags.push(`\\move(0,${-dy},0,0,0,${Math.round(BOUNCE_IN_MS * 0.6)})`);
-      tags.push(`\\move(0,${Math.round(-dy * 0.15)},0,0,${Math.round(BOUNCE_IN_MS * 0.6)},${BOUNCE_IN_MS})`);
-      tags.push(`\\fad(${Math.round(BOUNCE_IN_MS * 0.4)},0)`);
+      const t1 = Math.round(BOUNCE_IN_MS * 0.6);
+      blocks.push(`{\\move(0,${-dy},0,0,0,${t1})\\fad(${Math.round(BOUNCE_IN_MS * 0.4)},0)\\t(${t1},${BOUNCE_IN_MS},\\fry1)}`);
       break;
     }
     case "scale-pulse": {
-      // Pulse twice across the word's duration. \t can't easily loop, so
-      // we use two sequential pulses.
-      const half = Math.round(wordDurMs / 2);
-      tags.push(`\\t(0,${Math.round(half * 0.5)},\\fscx118\\fscy118)`);
-      tags.push(`\\t(${Math.round(half * 0.5)},${half},\\fscx100\\fscy100)`);
-      tags.push(`\\t(${half},${Math.round(half + (wordDurMs - half) * 0.5)},\\fscx118\\fscy118)`);
-      tags.push(`\\t(${Math.round(half + (wordDurMs - half) * 0.5)},${wordDurMs},\\fscx100\\fscy100)`);
+      // Two pulses via sequential \t blocks.
+      const half = Math.max(1, Math.round(wordDurMs / 2));
+      blocks.push(`{\\t(0,${Math.round(half * 0.5)},\\fscx118\\fscy118)}`);
+      blocks.push(`{\\t(${Math.round(half * 0.5)},${half},\\fscx100\\fscy100)}`);
+      blocks.push(`{\\t(${half},${Math.round(half + (wordDurMs - half) * 0.5)},\\fscx118\\fscy118)}`);
+      blocks.push(`{\\t(${Math.round(half + (wordDurMs - half) * 0.5)},${wordDurMs},\\fscx100\\fscy100)}`);
       break;
     }
     case "fade-through": {
-      tags.push(`\\fad(150,150)`);
+      blocks.push(`{\\fad(150,150)}`);
       break;
     }
     case "typewriter": {
-      // Approximation: alpha 0 → 1 over the first ~300ms. Per-character
-      // reveal in ASS requires \\clip with an animated rect, which is
-      // expensive; we keep it simple with a fade + small x clip move.
-      tags.push(`\\fad(${TYPEWRITER_MS_PER_CHAR * 6},0)`);
+      // Approximate per-character reveal with a slow fade.
+      blocks.push(`{\\fad(${TYPEWRITER_MS_PER_CHAR * 6},0)}`);
       break;
     }
     case "reveal": {
-      // Reveal from left: animate a clip rect from x=0 to full width.
-      // ASS \\clip uses PlayResX/Y coordinates; we use a generous width
-      // so this works at any canvas size. The clip animation needs a
-      // fixed width, so we use 2000 (covers up to 1080p 16:9 + 9:16).
-      tags.push(`\\clip(0,0,0,${ch})`);
-      tags.push(`\\t(0,${REVEAL_MS},\\clip(0,0,2000,${ch}))`);
-      tags.push(`\\fad(${Math.round(REVEAL_MS * 0.5)},0)`);
+      // Animate a clip rect from 0 width to full width.
+      blocks.push(`{\\clip(0,0,0,${ch})\\fad(${Math.round(REVEAL_MS * 0.5)},0)\\t(0,${REVEAL_MS},\\clip(0,0,2000,${ch}))}`);
       break;
     }
     case "wave": {
-      // Two sine cycles over the word's duration. Approximated with 4
-      // \move segments.
-      const amp = Math.round(6 * chScale);
-      const q = Math.round(wordDurMs / 4);
-      tags.push(`\\move(0,0,0,${amp},0,${q})`);
-      tags.push(`\\move(0,${amp},0,${-amp},${q},${q * 2})`);
-      tags.push(`\\move(0,${-amp},0,${amp},${q * 2},${q * 3})`);
-      tags.push(`\\move(0,${amp},0,0,${q * 3},${wordDurMs})`);
+      // Approximate sine wave with sequential \t animating \fry
+      // (small rotation) — gives a gentle rocking that reads as
+      // "wave" without the multi-\move conflict.
+      const amp = Math.max(1, Math.round(6 * chScale));
+      const q = Math.max(50, Math.round(wordDurMs / 4));
+      blocks.push(`{\\t(0,${q},\\fry${amp})}`);
+      blocks.push(`{\\t(${q},${q * 2},\\fry${-amp})}`);
+      blocks.push(`{\\t(${q * 2},${q * 3},\\fry${amp})}`);
+      blocks.push(`{\\t(${q * 3},${wordDurMs},\\fry0)}`);
       break;
     }
     case "jitter": {
-      // 8 jitter steps across the word (every ~80ms for a 640ms word).
-      // We can't randomize in ASS, so use a deterministic pattern.
-      const amp = Math.round(4 * chScale);
-      const steps = 8;
+      // Multi-stage jitter via sequential \t blocks animating \frx
+      // (rotation x) and \fry (rotation y) — small angles read as
+      // jitter without breaking ASS's single-\move rule.
+      const amp = 2; // degrees — small but visible
+      const steps = Math.min(6, Math.max(3, Math.round(wordDurMs / 80)));
       const stepMs = Math.max(40, Math.round(wordDurMs / steps));
       for (let i = 0; i < steps; i++) {
         const t1 = i * stepMs;
         const t2 = (i + 1) * stepMs;
-        const dx = ((i % 2 === 0 ? 1 : -1) * amp * (i + 1)) / steps;
-        const dy = ((i % 3 === 0 ? 1 : -1) * amp * (i + 1)) / steps;
-        tags.push(`\\t(${t1},${t2},\\move(0,0,${Math.round(dx)},${Math.round(dy)})`);
+        const rx = i % 2 === 0 ? amp : -amp;
+        const ry = i % 3 === 0 ? amp : -amp;
+        blocks.push(`{\\t(${t1},${t2},\\frx${rx}\\fry${ry})}`);
       }
+      // Final reset to 0 so the word settles.
+      blocks.push(`{\\t(${steps * stepMs},${wordDurMs},\\frx0\\fry0)}`);
       break;
     }
     case "shake": {
-      // 7 shake steps with decaying amplitude.
-      const amp = Math.round(12 * chScale);
-      const steps = 7;
+      // Strong horizontal shake via sequential \frx rotation,
+      // decaying amplitude. Reads as a punchy shake.
+      const amp = 4; // degrees
+      const steps = 5;
       const stepMs = Math.round(SHAKE_MS / steps);
       for (let i = 0; i < steps; i++) {
         const t1 = i * stepMs;
         const t2 = (i + 1) * stepMs;
         const decay = 1 - i / steps;
-        const dx = ((i % 2 === 0 ? 1 : -1) * amp * decay);
-        tags.push(`\\t(${t1},${t2},\\move(0,0,${Math.round(dx)},0)`);
+        const rx = (i % 2 === 0 ? 1 : -1) * Math.max(1, Math.round(amp * decay));
+        blocks.push(`{\\t(${t1},${t2},\\frx${rx})}`);
       }
+      // Reset after shake completes.
+      blocks.push(`{\\t(${SHAKE_MS},${Math.max(SHAKE_MS + 50, wordDurMs)},\\frx0)}`);
       break;
     }
     case "drift": {
+      // Single \move upward — works because there's only one move.
       const dy = Math.round(-8 * chScale);
-      tags.push(`\\move(0,0,0,${dy},0,${wordDurMs})`);
+      blocks.push(`{\\move(0,0,0,${dy},0,${wordDurMs})}`);
       break;
     }
     default:
       return "";
   }
 
-  return tags.length ? `{${tags.join("")}}` : "";
+  return blocks.length ? blocks.join("") : "";
 }
 
 /** Human-readable labels for the animation selector UI. */

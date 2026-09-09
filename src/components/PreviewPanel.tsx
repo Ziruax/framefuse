@@ -71,14 +71,16 @@ export function PreviewPanel({
     ) {
       const cue = cueAt(subtitles.cues, currentMs);
       if (cue) {
-        // Pass per-word timestamps + current time + animation so the
-        // word-mode presets and kinetic typography animations render
-        // identically to the export. Cues without words[] fall back
-        // to full-text rendering inside drawCaption.
+        // Pass per-word timestamps + current time + cue window +
+        // animation so the word-mode presets and kinetic typography
+        // animations render identically to the export. Cues without
+        // words[] fall back to full-text rendering inside drawCaption.
         const capCtx = {
           ...captionSettings,
           words: cue.words,
           currentMs,
+          cueStartMs: cue.startMs,
+          cueEndMs: cue.endMs,
         };
         drawCaption(ctx, cue.text, capCtx, dims.w, dims.h);
       }

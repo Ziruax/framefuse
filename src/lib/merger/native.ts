@@ -359,13 +359,15 @@ async function exportViaWebCodecs(
       ? (currentMsLocal: number) => {
           const cue = cueAt(subtitles.cues, currentMsLocal);
           if (!cue) return;
-          // Pass per-word timestamps + current time + animation so the
-          // word-mode presets and kinetic typography animations render
-          // identically to the preview.
+          // Pass per-word timestamps + current time + cue window +
+          // animation so the word-mode presets and kinetic typography
+          // animations render identically to the preview.
           const capCtx = {
             ...captionSettings,
             words: cue.words,
             currentMs: currentMsLocal,
+            cueStartMs: cue.startMs,
+            cueEndMs: cue.endMs,
           };
           drawCaption(ctx, cue.text, capCtx, dims.w, dims.h);
         }
@@ -504,6 +506,8 @@ async function exportViaMediaRecorder(
             ...captionSettings,
             words: cue.words,
             currentMs: currentMsLocal,
+            cueStartMs: cue.startMs,
+            cueEndMs: cue.endMs,
           };
           drawCaption(ctx, cue.text, capCtx, dims.w, dims.h);
         }
@@ -594,6 +598,10 @@ interface CanvasCaptionCtx {
   currentMs?: number;
   /** Kinetic typography animation. Drives per-word transforms. */
   animation?: CaptionAnimation;
+  /** Absolute startMs of the current cue (for whole-cue animation fallback). */
+  cueStartMs?: number;
+  /** Absolute endMs of the current cue (for whole-cue animation fallback). */
+  cueEndMs?: number;
 }
 
 /**
@@ -676,18 +684,20 @@ export function drawCaption(
   ctx.textBaseline = "top";
 
   // Whole-cue animation fallback (no word timestamps).
+  // Used when an animation is active but the cue has no per-word
+  // timestamps (e.g. user loaded a plain .srt). We apply the animation
+  // transform to the whole cue using the cue's actual [start, end]
+  // window so the "in" transition plays correctly.
   let cueTransform: WordTransform = IDENTITY_TRANSFORM;
   if (animation !== "none" && !hasWords) {
-    // The cue's window is caption.currentMs-relative — but we don't know
-    // cue.start/end here. Use the words[] absence to fall back to a
-    // simple fade-in over the first 200ms of the cue. We approximate
-    // by passing the cue's start as currentMs - 0 and end as +∞; the
-    // animation will see "sinceStart = 0" and render its initial state.
+    const cueStart = caption.cueStartMs ?? 0;
+    const cueEnd = caption.cueEndMs ?? (cueStart + 200);
+    const current = caption.currentMs ?? cueStart;
     cueTransform = computeWordTransform(
       animation,
-      0,
-      200,
-      Math.min(200, Math.max(0, caption.currentMs ?? 0)),
+      cueStart,
+      cueEnd,
+      current,
       0,
       0,
       0,
@@ -759,6 +769,9 @@ export function drawCaption(
   }
 
   // Shadow + border + fill per line, with whole-cue transform applied.
+  // The transform (scale/offset/clip) is applied around the text block's
+  // center so the animation visibly plays in preview. Without this, only
+  // the alpha would animate and the preview wouldn't match the export.
   ctx.save();
   ctx.globalAlpha = cueTransform.alpha;
   if (preset.shadow) {
@@ -766,6 +779,27 @@ export function drawCaption(
     ctx.shadowBlur = preset.shadowBlur * (ch / 540);
     ctx.shadowOffsetX = 0;
     ctx.shadowOffsetY = 0;
+  }
+  // Apply the whole-cue transform (scale/offset/clip) around the text
+  // block's center. clipLeft is applied via a rect clip over the full
+  // text block width.
+  if (
+    cueTransform.scale !== 1 ||
+    cueTransform.offsetX !== 0 ||
+    cueTransform.offsetY !== 0 ||
+    cueTransform.rotation !== 0
+  ) {
+    const cx = blockLeft + maxWidthLine / 2;
+    const cy = blockTop + blockH / 2;
+    ctx.translate(cx + cueTransform.offsetX, cy + cueTransform.offsetY);
+    ctx.rotate(cueTransform.rotation);
+    ctx.scale(cueTransform.scale, cueTransform.scale);
+    ctx.translate(-cx, -cy);
+  }
+  if (cueTransform.clipLeft < 1) {
+    ctx.beginPath();
+    ctx.rect(blockLeft, blockTop, maxWidthLine * cueTransform.clipLeft, blockH);
+    ctx.clip();
   }
 
   for (let i = 0; i < lines.length; i++) {
@@ -855,6 +889,15 @@ function applyWordTransform(
     ctx.rotate(t.rotation);
     ctx.scale(t.scale, t.scale);
     ctx.translate(-cx, -cy);
+  }
+  // Clip mask: only show the left `clipLeft` fraction of the word.
+  // Used by typewriter (per-character reveal) and reveal (clip-from-
+  // left) animations. Must match the ASS export's \\clip() tag so the
+  // preview and export render identically.
+  if (t.clipLeft < 1) {
+    ctx.beginPath();
+    ctx.rect(wordX, wordY, wordW * t.clipLeft, wordH);
+    ctx.clip();
   }
 }
 
