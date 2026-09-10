@@ -19,7 +19,13 @@ const {
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
-const { spawn, execSync } = require("child_process");
+const { spawn, spawnSync, execSync } = require("child_process");
+
+// v5.0: pure FFmpeg graph/arg builders (CommonJS, zero requires — also
+// imported directly by /home/z/harness/export-graph-harness.js). Holds the
+// transition tables + the v4.9 clip-argv builders (verbatim, moved here)
+// plus the new video / overlay / chroma / SFX / parallel-pool graph math.
+const G = require("./export-graph");
 
 // Resolve the FFmpeg binary path. On Windows we need ffmpeg.exe, on
 // Linux/macOS we need ffmpeg. When the app is packaged, the binary is
@@ -57,7 +63,10 @@ console.log("FFmpeg path:", ffmpegPath, "exists:", (() => { try { return fs.exis
 
 const isDev = !app.isPackaged;
 let mainWindow = null;
-let currentProcess = null;
+// v5.0: ALL live ffmpeg children (step-1 runs a parallel pool now). Cancel
+// kills everything in the set; a leak guard at export end verifies the set
+// is empty so no zombie encoders survive a failed/cancelled export.
+const activeProcs = new Set();
 const tempDir = path.join(os.tmpdir(), "framefuse-tmp");
 
 function ensureTempDir() {
@@ -148,6 +157,18 @@ ipcMain.handle("save-temp-audio", async (_evt, { name, bytes }) => {
   return p;
 });
 
+// v5.0: video sources for the multi-track timeline — same pattern as
+// save-temp-audio (temp dir, unique name, write bytes, return path). The
+// returned path feeds the base-lane video clips AND overlay compositing;
+// cleanup-temp removes it with everything else in the dir.
+ipcMain.handle("save-temp-video", async (_evt, { name, bytes }) => {
+  ensureTempDir();
+  const ext = path.extname(name) || ".mp4";
+  const p = path.join(tempDir, `vid_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
+  fs.writeFileSync(p, Buffer.from(bytes));
+  return p;
+});
+
 ipcMain.handle("cleanup-temp", async () => {
   try { if (fs.existsSync(tempDir)) for (const f of fs.readdirSync(tempDir)) try { fs.unlinkSync(path.join(tempDir, f)); } catch (_) {} return true; } catch { return false; }
 });
@@ -162,13 +183,34 @@ ipcMain.handle("choose-output", async () => {
   return res.filePath;
 });
 
+/** Kill one ffmpeg child (Windows needs taskkill for the whole tree). */
+function killProc(proc) {
+  try {
+    if (!proc || proc.exitCode !== null || proc.signalCode) return;
+    if (process.platform === "win32") {
+      spawn("taskkill", ["/pid", proc.pid, "/f", "/t"], { windowsHide: true });
+    } else {
+      proc.kill("SIGKILL");
+    }
+  } catch (_) { /* already gone */ }
+}
+
+/** Kill every live ffmpeg child (pool + step-2 mux). */
+function killAllProcs() {
+  for (const proc of Array.from(activeProcs)) killProc(proc);
+}
+
+/** Leak guard: an export must never leave ffmpeg children behind. */
+function leakGuard() {
+  if (activeProcs.size > 0) {
+    console.warn(`[framefuse] export ended with ${activeProcs.size} ffmpeg process(es) still alive — killing`);
+    killAllProcs();
+  }
+}
+
 ipcMain.handle("cancel-export", async () => {
   try {
-    if (currentProcess) {
-      if (process.platform === "win32") spawn("taskkill", ["/pid", currentProcess.pid, "/f", "/t"], { windowsHide: true });
-      else currentProcess.kill("SIGKILL");
-      currentProcess = null;
-    }
+    killAllProcs();
     return true;
   } catch { return false; }
 });
@@ -243,11 +285,13 @@ function encoderArgs(encoderName, bitrateMbps, width, height, quality, crf) {
 }
 
 // Helper: run ffmpeg and wait. `totalSec` enables real-time progress via
-// stderr "time=" parsing; `onTime` receives fractional seconds.
+// stderr "time=" parsing; `onTime` receives fractional seconds. Every live
+// child registers itself in `activeProcs` so cancel-export / pool failure /
+// the leak guard can kill the WHOLE set (v4.9 killed a single child).
 function runFfmpeg(args, totalSec, onTime) {
   return new Promise((resolve, reject) => {
     const proc = spawn(ffmpegPath, args, { windowsHide: true });
-    currentProcess = proc;
+    activeProcs.add(proc);
     let stderr = "";
     let stderrTail = "";
     proc.stderr.on("data", (data) => {
@@ -262,9 +306,9 @@ function runFfmpeg(args, totalSec, onTime) {
       stderr += s;
       stderrTail = (stderrTail + s).slice(-4000);
     });
-    proc.on("error", (err) => { currentProcess = null; reject(new Error(err.message)); });
+    proc.on("error", (err) => { activeProcs.delete(proc); reject(new Error(err.message)); });
     proc.on("exit", (code, signal) => {
-      currentProcess = null;
+      activeProcs.delete(proc);
       if (signal === "SIGKILL" || signal === "SIGTERM") { reject(new Error("Export cancelled")); return; }
       if (code !== 0) {
         const lines = stderrTail.trim().split("\n");
@@ -274,6 +318,72 @@ function runFfmpeg(args, totalSec, onTime) {
       resolve();
     });
   });
+}
+
+// ---------------------------------------------------------------------------
+// v5.0 media probing — `ffmpeg -i <path>` stderr parsed once per file
+// (audio-stream detection + effective display dimensions). Cached by path:
+// temp names are unique per export, so the cache is a session-wide memo.
+// ---------------------------------------------------------------------------
+const probeCache = new Map();
+
+function probeMedia(p) {
+  if (typeof p !== "string" || !p) return { hasAudio: false, width: 0, height: 0 };
+  if (probeCache.has(p)) return probeCache.get(p);
+  let info = { hasAudio: false, width: 0, height: 0 };
+  try {
+    const r = spawnSync(ffmpegPath, ["-hide_banner", "-i", p], {
+      encoding: "utf8", timeout: 15000, windowsHide: true,
+    });
+    const stderr = `${(r && r.stderr) || ""}`;
+    const parsed = G.videoProbeParser(stderr);
+    info = { hasAudio: parsed.hasAudio, width: parsed.width, height: parsed.height };
+  } catch (_) { /* unreadable source → treated as silent/unknown dims */ }
+  probeCache.set(p, info);
+  return info;
+}
+
+// ---------------------------------------------------------------------------
+// v5.0 PARALLEL step-1 pool — clips encode in a worker pool of
+// min(4, max(1, cpus − 2)) concurrent ffmpeg children (spawn, not exec).
+// Any failure fails the whole export (with the clip index in the message)
+// and kills all siblings; cancellation surfaces as the v4.9
+// "Export cancelled" error verbatim.
+// ---------------------------------------------------------------------------
+async function runPool(jobs, workerCount, cbs) {
+  let next = 0;
+  let aborted = false;
+  const failures = [];
+  const killSiblings = () => {
+    if (!aborted) {
+      aborted = true;
+      killAllProcs();
+    }
+  };
+  const workers = Array.from({ length: Math.max(1, workerCount) }, () =>
+    (async () => {
+      while (!aborted) {
+        const idx = next;
+        next += 1;
+        if (idx >= jobs.length) return;
+        try {
+          await runFfmpeg(jobs[idx].args, jobs[idx].durSec, (sec) => cbs.onTime(idx, sec));
+          cbs.onDone(idx);
+        } catch (err) {
+          killSiblings();
+          failures.push({ idx, err });
+          return;
+        }
+      }
+    })(),
+  );
+  await Promise.all(workers);
+  if (failures.length > 0) {
+    const { idx, err } = failures[0];
+    if (err && err.message === "Export cancelled") throw err;
+    const seg = jobs[idx] && jobs[idx].segId ? ` (segment "${jobs[idx].segId}")` : "";
+    throw new Error(`Failed to encode clip ${idx + 1} of ${jobs.length}${seg}: ${(err && err.message) || err}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -907,60 +1017,19 @@ ipcMain.handle("export-ass-file", async (event, opts) => {
 
 // ---------------------------------------------------------------------------
 // IPC: TWO-STEP EXPORT
-// Step 1: Encode each image → MP4 clip with zoompan + ASS subtitles burn-in
-//         (+ v4.3 segment transitions: xfade head composites / dip fades)
+// Step 1: Encode each segment → MP4 clip with zoompan + ASS subtitles burn-in
+//         (+ v4.3 segment transitions: xfade head composites / dip fades;
+//          v5.0: VIDEO sources, overlay compositing, chroma key, per-clip
+//          audio tracks, PARALLEL encode pool)
 // Step 2: Concat all clips + mux audio using -f concat -c copy (INSTANT)
+//
+// v5.0 NOTE: the transition tables (XFADE_NAMES / DIP_COLORS / clampTrMs /
+// frozenZoompanExpr) and the full per-clip argv builder live in
+// ./export-graph.js (pure CommonJS — shared with the test harness).
 // ---------------------------------------------------------------------------
 
-/** v4.3 transition style → xfade transition name (offset=0 head composite). */
-const XFADE_NAMES = {
-  dissolve: "fade",
-  "slide-left": "slideleft",
-  "slide-right": "slideright",
-  "wipe-left": "wipeleft",
-  "wipe-right": "wiperight",
-};
-/** v4.3 dip styles → fade filter color. */
-const DIP_COLORS = { "dip-black": "black", "dip-white": "white" };
-/** Max fraction of a segment's duration a transition may occupy (matches
- *  clampTransitionMs in renderer.ts — keep the two in lockstep). */
-const TRANSITION_MAX_FRACTION = 0.45;
-function clampTrMs(ms, segDurMs) {
-  return ms > 0 && segDurMs > 200
-    ? Math.min(ms, Math.floor(segDurMs * TRANSITION_MAX_FRACTION))
-    : 0;
-}
-
-/**
- * Frozen zoompan expressions = the PREVIOUS segment's Ken Burns END state
- * (eased = 1). Used as input A of the xfade head composite so the preview's
- * "prev frame frozen at its end" and the export are pixel-identical.
- */
-function frozenZoompanExpr(dir, zoomMax) {
-  const zBase = 1.1;
-  const zMaxEff = (1.1 * zoomMax).toFixed(6);
-  const maxX = "(iw-iw/zoom)";
-  const maxY = "(ih-ih/zoom)";
-  const center = "iw/2-(iw/zoom/2)";
-  const centerY = "ih/2-(ih/zoom/2)";
-  switch (dir) {
-    case "in":
-      return { z: zMaxEff, x: center, y: centerY };
-    case "right":
-      return { z: zMaxEff, x: maxX, y: `${maxY}/2` };
-    case "left":
-      return { z: zMaxEff, x: "0", y: `${maxY}/2` };
-    case "down":
-      return { z: zMaxEff, x: `${maxX}/2`, y: maxY };
-    case "up":
-      return { z: zMaxEff, x: `${maxX}/2`, y: "0" };
-    default: // "out", "none", disabled
-      return { z: zBase.toFixed(6), x: center, y: centerY };
-  }
-}
-
 ipcMain.handle("export-native", async (event, opts) => {
-  const { outputPath, fps, width, height, bitrateMbps, quality, crf, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark } = opts;
+  const { outputPath, fps, width, height, bitrateMbps, quality, crf, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark, overlays, sfx } = opts;
 
   if (!outputPath) throw new Error("No output path");
   if (!segments || segments.length === 0) throw new Error("No segments");
@@ -971,8 +1040,8 @@ ipcMain.handle("export-native", async (event, opts) => {
 
   // v4.4 watermark: { imagePath, x, y, w, h, opacity } — geometry computed
   // ONCE in the renderer process (watermarkGeometry) so preview + export
-  // can never disagree. The chain below mirrors the canvas exactly:
-  // scale → setsar → rgba → colorchannelmixer=aa (linear alpha) → overlay.
+  // can never disagree. The chain (scale → setsar → rgba →
+  // colorchannelmixer=aa → overlay) lives in export-graph.buildClipArgs.
   const wm =
     watermark && watermark.imagePath && Number(watermark.w) > 0
       ? {
@@ -984,10 +1053,6 @@ ipcMain.handle("export-native", async (event, opts) => {
           opacity: Math.max(0.05, Math.min(1, Number(watermark.opacity) || 1)).toFixed(3),
         }
       : null;
-  const wmChain = (inputIdx) =>
-    `[${inputIdx}:v]scale=${wm.w}:${wm.h}:flags=bilinear,setsar=1,format=rgba,colorchannelmixer=aa=${wm.opacity}[wmx]`;
-  const wmOverlay = (baseLabel, outLabel) =>
-    `${baseLabel}[wmx]overlay=${wm.x}:${wm.y}:eof_action=repeat${outLabel}`;
 
   const intensity = Math.max(0, Math.min(100, Number(kenBurns?.intensity) || 0));
   const zoomMax = 1.06 + (intensity / 100) * 0.18;
@@ -1023,95 +1088,61 @@ ipcMain.handle("export-native", async (event, opts) => {
   }
 
   try {
-    // ─── STEP 1: Encode each segment ──────────────────────────────
-    // v4.3 transition planning (mirrors renderer.ts formulas exactly).
-    // v4.5: per-boundary overrides — the style at the boundary ENTERING
-    // segments[i] is `transition.overrides[segments[i].id] ?? global`.
-    // Kept in lockstep with boundaryStyle() in types.ts (plain JS here).
-    const trGlobal = transition && transition.style ? transition.style : "none";
-    const trOverrides =
-      transition && transition.overrides && typeof transition.overrides === "object"
-        ? transition.overrides
-        : null;
-    const boundaryStyleAt = (seg) =>
-      seg && trOverrides && Object.prototype.hasOwnProperty.call(trOverrides, seg.id)
-        ? trOverrides[seg.id]
-        : trGlobal;
-    const trWanted =
-      transition && Number(transition.durationMs) > 0
-        ? Number(transition.durationMs)
-        : 0;
-    const fadeStartEnd = !!(transition && transition.fadeStartEnd);
+    // ─── v5.0 media resolution: overlays + SFX + audio mode ─────────
+    // Overlays (track ≥ 1) are NOT concat clips — they composite on top of
+    // whichever base clip their window intersects, in track→startMs order
+    // (the preview draw order). SFX items arrive as already-rendered temp
+    // WAVs (native.ts uploads them via saveTempAudio).
+    const overlaySegs = (Array.isArray(overlays) ? overlays : [])
+      .filter((ov) => ov && (ov.imagePath || ov.videoPath))
+      .slice()
+      .sort(
+        (a, b) =>
+          (Number(a.track) || 0) - (Number(b.track) || 0) ||
+          (Number(a.startMs) || 0) - (Number(b.startMs) || 0),
+      );
+    const sfxList = (Array.isArray(sfx) ? sfx : []).filter(
+      (s) => s && typeof s.wavPath === "string" && s.wavPath,
+    );
 
+    // Base-lane validation: a VIDEO segment must carry its temp file.
+    for (let i = 0; i < segments.length; i++) {
+      const s = segments[i];
+      if (s && s.mediaType === "video" && !s.videoPath && !s.imagePath) {
+        throw new Error(`Segment ${i + 1} is a video but has no source file`);
+      }
+    }
+
+    // v5 AUDIO MODE: the new amix graph runs when CLIP audio actually
+    // participates — any BASE video with an audio stream (detected by
+    // probing the temp file's stderr) or any SFX placement. A music-only
+    // v4.9-shaped project keeps the EXACT v4.9 mux path; a project with no
+    // audio at all keeps the video-only concat (both byte-identical).
+    let anyVideoAudio = false;
+    for (const s of segments) {
+      if (s && s.mediaType === "video" && s.videoPath) {
+        if (probeMedia(s.videoPath).hasAudio) { anyVideoAudio = true; break; }
+      }
+    }
+    const anyAudio = sfxList.length > 0 || anyVideoAudio;
+
+    // ─── STEP 1 (build): probes → per-clip argv jobs ───────────────
+    // v4.3 transition planning + zoompan math + all three v4.9 branches
+    // (xfade head / watermark graph / plain -vf) live in
+    // G.buildClipArgs — byte-identical for v4.9-shaped payloads.
+    const jobs = [];
     const clipPaths = [];
     let cumulativeMs = 0;
-    const doneMs = [0]; // master-timeline ms completed before the current clip
+    const encArgs = encoderArgs(encoder.name, bitrateMbps, width, height, quality, crf);
 
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i];
-      const segDurSec = seg.durationMs / 1000;
-      const segFrames = Math.max(2, Math.round(segDurSec * fps));
-      const dir = enabled ? seg.direction || globalDir : "none";
-      const isLast = i === segments.length - 1;
-
-      // Transition windows for THIS clip (identical clamps to the preview).
-      // v4.5: head style resolves per-boundary; the tail dip leads into the
-      // NEXT boundary, so its style/color comes from segments[i+1].
-      const curStyle = i > 0 ? boundaryStyleAt(seg) : "none";
-      const nextStyle = !isLast ? boundaryStyleAt(segments[i + 1]) : "none";
-      const xfadeName = XFADE_NAMES[curStyle] || null;
-      const dipColor = DIP_COLORS[curStyle] || null;
-      const headMs =
-        i > 0 && curStyle !== "none" ? clampTrMs(trWanted, seg.durationMs) : 0;
-      const dipTailMs =
-        DIP_COLORS[nextStyle] && !isLast ? clampTrMs(trWanted, seg.durationMs) : 0;
-      const startFadeMs =
-        i === 0 && fadeStartEnd ? clampTrMs(trWanted, seg.durationMs) : 0;
-      const endFadeMs =
-        isLast && fadeStartEnd ? clampTrMs(trWanted, seg.durationMs) : 0;
-
-      const segStartMs = (typeof seg.startMs === "number") ? seg.startMs : cumulativeMs;
-      const segEndMs = (typeof seg.endMs === "number") ? seg.endMs : (cumulativeMs + seg.durationMs);
-
-      // ── Build zoompan expressions — EXACT canvas parity ──
-      // The pre-scale is 1.1× supersampled cover, so zoompan's z baseline
-      // is 1.1 (= canvas zoom 1.0). Pan modes start CENTERED (x/y = max/2)
-      // and slide to the edge, matching drawFrame()'s centered start.
-      let zExpr, xExpr, yExpr;
-      if (!enabled || dir === "none") {
-        zExpr = "1.1"; xExpr = "iw/2-(iw/zoom/2)"; yExpr = "ih/2-(ih/zoom/2)";
-      } else {
-        const tExpr = `on/${Math.max(1, segFrames - 1)}`;
-        const easeExpr = `-((cos(PI*${tExpr})-1)/2)`; // easeInOutSine (same as canvas)
-        const zBase = 1.1;
-        const zMaxEff = (1.1 * zoomMax).toFixed(6);
-        const spanEff = (1.1 * zoomMax - 1.1).toFixed(6);
-        const maxX = "(iw-iw/zoom)";
-        const maxY = "(ih-ih/zoom)";
-        if (dir === "in") {
-          zExpr = `${zBase.toFixed(6)}+(${easeExpr})*${spanEff}`;
-          xExpr = "iw/2-(iw/zoom/2)"; yExpr = "ih/2-(ih/zoom/2)";
-        } else if (dir === "out") {
-          zExpr = `${zMaxEff}-(${easeExpr})*${spanEff}`;
-          xExpr = "iw/2-(iw/zoom/2)"; yExpr = "ih/2-(ih/zoom/2)";
-        } else {
-          // Pan modes: constant zoom, window slides center → edge.
-          zExpr = zMaxEff;
-          if (dir === "right") { xExpr = `${maxX}/2*(1+(${easeExpr}))`; yExpr = `${maxY}/2`; }
-          else if (dir === "left") { xExpr = `${maxX}/2*(1-(${easeExpr}))`; yExpr = `${maxY}/2`; }
-          else if (dir === "down") { xExpr = `${maxX}/2`; yExpr = `${maxY}/2*(1+(${easeExpr}))`; }
-          else if (dir === "up") { xExpr = `${maxX}/2`; yExpr = `${maxY}/2*(1-(${easeExpr}))`; }
-          else { xExpr = `${maxX}/2`; yExpr = `${maxY}/2`; }
-        }
-      }
-
-      // ── Build -vf / -filter_complex: supersampled cover + zoompan +
-      //    subtitles + v4.3 transitions ──
-      const scaleW = Math.round(width * 1.1);
-      const scaleH = Math.round(height * 1.1);
       const clipPath = path.join(tempDir, `clip_${String(i).padStart(4, "0")}.mp4`);
       tempFiles.push(clipPath);
       clipPaths.push(clipPath);
+
+      const segStartMs = (typeof seg.startMs === "number") ? seg.startMs : cumulativeMs;
+      const segEndMs = (typeof seg.endMs === "number") ? seg.endMs : (cumulativeMs + seg.durationMs);
 
       let assDoc = null;
       if (captionsEnabled || headlinesEnabled) {
@@ -1137,127 +1168,102 @@ ipcMain.handle("export-native", async (event, opts) => {
           })()
         : null;
 
-      // Post-subtitle fades (applied AFTER captions like a real video —
-      // matches the canvas applyGlobalFade pass): dips + start/end fades.
-      // v4.5: the TAIL dip color comes from the NEXT boundary's style
-      // (that's the dip the tail leads into), NOT the current one.
-      const postFades = [];
-      if (dipColor && headMs > 0) {
-        postFades.push(`fade=t=in:st=0:d=${(headMs / 1000).toFixed(3)}:color=${dipColor}`);
-      }
-      if (dipTailMs > 0) {
-        const tailColor = DIP_COLORS[nextStyle] || "black";
-        postFades.push(
-          `fade=t=out:st=${(segDurSec - dipTailMs / 1000).toFixed(3)}:d=${(dipTailMs / 1000).toFixed(3)}:color=${tailColor}`,
-        );
-      }
-      if (startFadeMs > 0) {
-        postFades.push(`fade=t=in:st=0:d=${(startFadeMs / 1000).toFixed(3)}`);
-      }
-      if (endFadeMs > 0) {
-        postFades.push(
-          `fade=t=out:st=${(segDurSec - endFadeMs / 1000).toFixed(3)}:d=${(endFadeMs / 1000).toFixed(3)}`,
-        );
-      }
-
-      let args;
-      const encodeTail = [
-        ...encoderArgs(encoder.name, bitrateMbps, width, height, quality, crf),
-        "-r", String(fps),
-        "-threads", "0",
-        "-y",
-        clipPath,
-      ];
-
-      // v4.4: post-graph chain = [watermark overlay →] subtitles → fades.
-      // Watermark UNDER captions (same z-order as the canvas preview).
-      const post = [assSuffix, ...postFades].filter(Boolean).join(",");
-
-      if (xfadeName && i > 0 && headMs > 0) {
-        // ── v4.3 xfade HEAD composite (dissolve / slide / wipe) ──
-        // [A = prev frozen at its Ken Burns end-state][B = cur] xfade at
-        // offset=0: output = blend(A,B) for the first F seconds, then B
-        // alone — the clip keeps its exact duration (timeline, audio and
-        // caption timing are untouched, concat stays -c copy).
-        const F = (headMs / 1000).toFixed(3);
-        const prevSeg = segments[i - 1];
-        const prevDir = enabled ? prevSeg.direction || globalDir : "none";
-        const frz = frozenZoompanExpr(prevDir, zoomMax);
-        const pre = `scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase:flags=lanczos,crop=${scaleW}:${scaleH}`;
-        const zpCommon = `d=${segFrames}:s=${width}x${height}:fps=${fps}`;
-        const aChain =
-          `[1:v]${pre},zoompan=z='${frz.z}':x='${frz.x}':y='${frz.y}':${zpCommon},setsar=1,format=yuv420p[a]`;
-        const bChain =
-          `[0:v]${pre},zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':${zpCommon},setsar=1,format=yuv420p[b]`;
-        let graph =
-          `${aChain};${bChain};[a][b]xfade=transition=${xfadeName}:duration=${F}:offset=0[vx]`;
-        let label = "[vx]";
-        // Watermark (input index 2 after cur + prev) under the captions.
-        if (wm) {
-          graph += `;${wmChain(2)};${wmOverlay(label, "[vw]")}`;
-          label = "[vw]";
+      // v5 overlay specs for THIS clip window: every overlay whose
+      // [startMs, endMs) intersects [segStartMs, segStartMs + dur). Source
+      // dims prefer the payload (image natural dims shipped by native.ts),
+      // else probed from the file. Geometry mirrors renderer.overlayGeometry.
+      const overlaySpecs = [];
+      for (const ov of overlaySegs) {
+        const win = G.overlayWindow(ov, segStartMs, seg.durationMs);
+        if (!win || win.overlapMs <= 0) continue;
+        const isVid = ov.mediaType === "video" && ov.videoPath;
+        const srcPath = isVid ? ov.videoPath : ov.imagePath;
+        let srcW = Number(ov.sourceWidth) > 0 ? Number(ov.sourceWidth) : 0;
+        let srcH = Number(ov.sourceHeight) > 0 ? Number(ov.sourceHeight) : 0;
+        if (!srcW || !srcH) {
+          const probe = probeMedia(srcPath);
+          srcW = probe.width;
+          srcH = probe.height;
         }
-        if (post) graph += `;${label}${post}[vout]`;
-        const outLabel = post ? "[vout]" : label;
-        args = [
-          "-loop", "1", "-i", seg.imagePath,
-          "-loop", "1", "-i", prevSeg.imagePath,
-          ...(wm ? ["-i", wm.imagePath] : []),
-          "-t", segDurSec.toFixed(3),
-          "-filter_complex", graph,
-          "-map", outLabel,
-          ...encodeTail,
-        ];
-      } else if (wm) {
-        // ── Single input + watermark → filter_complex (v4.4) ──
-        let graph =
-          `[0:v]scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase:flags=lanczos,crop=${scaleW}:${scaleH},` +
-          `zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${segFrames}:s=${width}x${height}:fps=${fps},setsar=1,format=yuv420p[base]`;
-        graph += `;${wmChain(1)};${wmOverlay("[base]", "[vw]")}`;
-        let label = "[vw]";
-        if (post) graph += `;${label}${post}[vout]`;
-        args = [
-          "-loop", "1",
-          "-i", seg.imagePath,
-          "-i", wm.imagePath,
-          "-t", segDurSec.toFixed(3),
-          "-filter_complex", graph,
-          "-map", post ? "[vout]" : label,
-          ...encodeTail,
-        ];
-      } else {
-        // ── Plain single-input path (no watermark) ──
-        const vfParts = [
-          `scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase:flags=lanczos`,
-          `crop=${scaleW}:${scaleH}`,
-          `zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${segFrames}:s=${width}x${height}:fps=${fps}`,
-          `setsar=1`,
-          `format=yuv420p`,
-        ];
-        if (assSuffix) vfParts.push(assSuffix);
-        vfParts.push(...postFades);
-        args = [
-          "-loop", "1",
-          "-i", seg.imagePath,
-          "-t", segDurSec.toFixed(3),
-          "-vf", vfParts.join(","),
-          ...encodeTail,
-        ];
+        const geo = G.overlayGeometryMirror(width, height, srcW, srcH, ov.overlay);
+        if (geo.dw <= 0 || geo.dh <= 0) continue;
+        overlaySpecs.push({
+          inputArgs: isVid
+            ? G.buildOverlayVideoInputArgs({ ssMs: win.ssMs, durMs: win.overlapMs, path: srcPath })
+            : G.buildOverlayImageInputArgs({ durMs: win.overlapMs, path: srcPath }),
+          x: geo.dx,
+          y: geo.dy,
+          dw: geo.dw,
+          dh: geo.dh,
+          chroma: ov.chroma || null,
+          a: win.a,
+          b: win.b,
+        });
       }
 
-      // Real-time progress: clip i covers [doneMs[i], doneMs[i]+dur] of the
-      // master timeline. 95% of the bar is step 1, 5% step 2.
-      const baseFrac = doneMs[0] / Math.max(1, totalMs);
-      const segFrac = seg.durationMs / Math.max(1, totalMs);
-      await runFfmpeg(args, segDurSec, (secInClip) => {
-        const frac = baseFrac + segFrac * Math.min(1, secInClip / Math.max(0.01, segDurSec));
-        sendProgress(frac * 95, (doneMs[0] + secInClip * 1000) / 1000, etaFor(frac));
+      const segHasAudio = !!(
+        seg.mediaType === "video" &&
+        seg.videoPath &&
+        probeMedia(seg.videoPath).hasAudio
+      );
+
+      const built = G.buildClipArgs({
+        i,
+        seg,
+        segments,
+        fps,
+        width,
+        height,
+        kbEnabled: enabled,
+        zoomMax,
+        globalDir,
+        transition,
+        wm,
+        assSuffix,
+        clipPath,
+        encArgs,
+        anyAudio,
+        segHasAudio,
+        overlaySpecs,
       });
 
-      doneMs[0] += seg.durationMs;
+      jobs.push({
+        idx: i,
+        args: built.args,
+        durSec: seg.durationMs / 1000,
+        durationMs: seg.durationMs,
+        segId: seg.id,
+      });
       cumulativeMs += seg.durationMs;
-      sendProgress((doneMs[0] / Math.max(1, totalMs)) * 95, cumulativeMs / 1000, etaFor(doneMs[0] / Math.max(1, totalMs)));
     }
+
+    // ─── STEP 1 (run): PARALLEL encode pool — the v5 PERF core ─────
+    // N = min(4, max(1, os.cpus() − 2)) concurrent ffmpeg children
+    // (child_process.spawn). Per-clip "time=" marks aggregate into the
+    // SAME export-progress channel + payload shape the UI already
+    // consumes, weighted by clip duration on the master timeline.
+    const poolN = Math.min(4, Math.max(1, os.cpus().length - 2));
+    const clipFrac = jobs.map(() => 0);
+    let lastEmit = 0;
+    const emitProgress = (force) => {
+      const now = Date.now();
+      if (!force && now - lastEmit < 100) return; // ≤10 Hz progress IPC
+      lastEmit = now;
+      let doneMs = 0;
+      for (let k = 0; k < jobs.length; k++) doneMs += clipFrac[k] * jobs[k].durationMs;
+      const frac = doneMs / Math.max(1, totalMs);
+      sendProgress(frac * 95, doneMs / 1000, etaFor(frac));
+    };
+    await runPool(jobs, poolN, {
+      onTime: (idx, sec) => {
+        clipFrac[idx] = Math.min(1, sec / Math.max(0.01, jobs[idx].durSec));
+        emitProgress(false);
+      },
+      onDone: (idx) => {
+        clipFrac[idx] = 1;
+        emitProgress(true);
+      },
+    });
 
     // ─── STEP 2: Concat all clips + mux audio (INSTANT: -c copy) ───
     sendProgress(96, totalSec, etaFor(0.96));
@@ -1271,38 +1277,25 @@ ipcMain.handle("export-native", async (event, opts) => {
     }).join("\n");
     fs.writeFileSync(concatListPath, concatContent, "utf-8");
 
-    const concatArgs = [
-      "-f", "concat", "-safe", "0", "-i", concatListPath,
-    ];
-    if (audioPath) concatArgs.push("-i", audioPath);
-
-    // ALWAYS -c copy for video (captions already burned in step 1)
-    concatArgs.push("-c:v", "copy");
-
-    if (audioPath) {
-      // Audio chain: [normalize] → [fade in] → [fade out] → [pad to video length].
-      // apad=whole_dur pads with silence exactly to the video duration so a
-      // short track no longer TRUNCATES the exported video (and never hangs
-      // the muxer the way bare `apad -shortest` can with stream copy).
-      const af = [];
-      if (audio?.normalize) af.push("loudnorm=I=-16:TP=-1.5:LRA=11");
-      if (audio?.fadeInMs > 0) {
-        af.push(`afade=t=in:st=0:d=${(audio.fadeInMs / 1000).toFixed(3)}`);
-      }
-      if (audio?.fadeOutMs > 0) {
-        const start = Math.max(0, totalSec - audio.fadeOutMs / 1000);
-        af.push(`afade=t=out:st=${start.toFixed(3)}:d=${(audio.fadeOutMs / 1000).toFixed(3)}`);
-      }
-      af.push(`apad=whole_dur=${totalSec.toFixed(3)}`);
-      concatArgs.push("-af", af.join(","));
-      concatArgs.push("-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-shortest");
-    }
-
-    concatArgs.push("-movflags", "+faststart", "-y", outputPath);
+    // v5: G.buildConcatArgs keeps the v4.9 mux argv byte-identical for
+    // music-only / no-audio projects and emits the amix graph (clip audio
+    // + music + adelay'd SFX → apad) when the new audio mode is active.
+    const concatArgs = G.buildConcatArgs({
+      concatListPath,
+      audioPath,
+      audio,
+      outputPath,
+      totalSec,
+      sfx: sfxList,
+      newAudioGraph: anyAudio,
+    });
 
     await runFfmpeg(concatArgs, totalSec, (sec) => {
       const frac = 0.96 + 0.04 * Math.min(1, sec / Math.max(0.01, totalSec));
-      sendProgress(frac, sec, etaFor(frac));
+      // v5 fix (pre-existing v4.9 bug): sendProgress takes PERCENT — the old
+      // code passed the 0.96..1.0 fraction, so the bar dipped 96 → ~1 → 100
+      // during the mux. Payload shape (progress/fps/eta/timemark) unchanged.
+      sendProgress(frac * 100, sec, etaFor(frac));
     });
 
     sendProgress(100, totalSec, 0);
@@ -1311,12 +1304,16 @@ ipcMain.handle("export-native", async (event, opts) => {
     for (const f of tempFiles) { try { fs.unlinkSync(f); } catch (_) {} }
 
     let size = 0;
-    try { size = fs.statSync(outputPath).size; } catch (_) {}
+    try { size = fs.statSync(outputPath).size; } catch {}
     return { path: outputPath, size, encoder: encoder.label };
 
   } catch (err) {
     for (const f of tempFiles) { try { fs.unlinkSync(f); } catch (_) {} }
     throw err;
+  } finally {
+    // v5 leak guard: a finished (or failed/cancelled) export must never
+    // leave ffmpeg children behind — kill + warn if any survived.
+    leakGuard();
   }
 });
 

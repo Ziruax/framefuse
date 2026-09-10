@@ -1,8 +1,8 @@
 {
   "name": "framefuse",
-  "version": "4.8.0",
+  "version": "5.0.0",
   "private": true,
-  "description": "FrameFuse v4.8 — Native desktop image-to-video merger with viral kinetic captions, segment transitions, watermark/logo overlay, undo/redo, exact word-by-word timing, GPU-accelerated export, and preview-accurate Ken Burns motion.",
+  "description": "FrameFuse v5.0 — Multi-track video studio: video clips, green-screen chroma key, overlay lane, synthesized SFX, non-blocking Whisper captions, tabbed UI, and GPU-accelerated parallel FFmpeg export.",
   "main": "electron/main.js",
   "author": "FrameFuse",
   "license": "MIT",

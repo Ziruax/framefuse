@@ -116,11 +116,11 @@ export function Header({
                 color: "#ddd6fe",
               }}
             >
-              v4.9
+              v5.0
             </span>
           </div>
           <div className="text-[11px]" style={{ color: "#71717a" }}>
-            Image Merger · Native FFmpeg
+            Multi-Track Video Studio · Native FFmpeg
           </div>
         </div>
       </div>

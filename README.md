@@ -1,8 +1,27 @@
-# FrameFuse v4.9
+# FrameFuse v5.0
 
-Native desktop **image → video** merger with a **filmstrip storyboard timeline** (thumbnails in every segment, double-click to jump), **middle-truncating filename rows**, **click-to-aim Ken Burns motion**, a **grid media library for 100+ image storyboards**, a **live audio waveform timeline**, **beat-synced cutting with a strength dial**, **viral kinetic captions with favorites**, **segment transitions**, **per-boundary transition overrides**, **export quality profiles**, **watermark/logo overlay**, **undo/redo**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
+Native desktop **multi-track video studio** with a **filmstrip storyboard timeline** (thumbnails in every segment, double-click to jump), **middle-truncating filename rows**, **click-to-aim Ken Burns motion**, a **grid media library for 100+ image storyboards**, a **live audio waveform timeline**, **beat-synced cutting with a strength dial**, **viral kinetic captions with favorites**, **segment transitions**, **per-boundary transition overrides**, **export quality profiles**, **watermark/logo overlay**, **undo/redo**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
 
 ## Highlights
+
+### 🛤 Multi-track timeline (new in v5.0)
+Four stacked lanes — **VIDEO** (base filmstrips), **OVERLAY** (draggable chroma-key clips), **AUDIO** (music waveform) and **SFX** (sound-effect pills). Drag clip bodies to move, edges to trim, and vertically past the 24px threshold to switch lanes. One continuous playhead spans every lane.
+
+### 🎬 Video import + chroma key (new in v5.0)
+Drop **MP4/WebM/MOV** files — they join the base track at source length (or the overlay lane with one click). Each clip gets **Trim start**, **Volume**, and a full **green-screen keyer**: auto-detected key color, similarity / blend / spill sliders, and a live keyed preview swatch. WebGL preview matches the FFmpeg `chromakey + despill` export exactly.
+
+### 💥 Synthesized sound effects (new in v5.0)
+A palette of **10 procedurally-synthesized SFX** (whoosh, pop, ding, impact, riser, click, sparkle, boom, swipe, record-scratch) — zero asset files, click to preview, **+ to place at the playhead**, drag pills along the SFX lane, mix with music through the export `amix` graph.
+
+### 🧠 Non-blocking Whisper captions (new in v5.0)
+Caption generation moved into a **persistent Web Worker** — the UI never freezes during model download or transcription. The ~75 MB whisper-tiny model downloads **once** and stays cached in the browser/Electron storage forever.
+
+### ⚡ Parallel FFmpeg export (new in v5.0)
+Step-1 clips encode in a **CPU-sized parallel pool** (up to 4 concurrent encodes, GPU encoder when available), per-clip timemarks aggregate into live progress, and the step-2 mux mixes clip audio + music + SFX with sample-exact `adelay` placement. Overlay compositing, chroma keying and video trimming all ride the same graph.
+
+### 🗂 Tabbed settings (new in v5.0)
+The right panel is now **Media / Captions / Effects / Audio / Export** tabs — same controls, half the scroll, persisted selection, keyboard-navigable (arrow keys, Home/End), with live indicators while Whisper runs.
+
 
 ### 🎞 Filmstrip storyboard timeline (new in v4.9)
 The timeline segments are no longer colored bars — each clip renders its **own thumbnail** under a translucent kind-tint (cyan absolute / emerald beat / violet duration), with a scrimmed **index chip**, a **duration tag** on wide strips, and hover outlines. The active clip pops (ring + violet glow + lift) while inactive strips recede. **Double-click any strip to jump to its first frame** — single click and drag still scrub, so the interaction never fights the playhead. Rich tooltips carry the full filename, range, duration and motion.

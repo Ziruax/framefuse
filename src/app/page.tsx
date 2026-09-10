@@ -22,6 +22,7 @@ import {
   segmentAtTime,
   type TimelineEntry,
 } from "@/lib/merger/timeline";
+import { makeSfxItem, renderSfxBuffer, type SfxItem } from "@/lib/merger/sfx";
 import { exportNative, isElectron } from "@/lib/merger/native";
 import { parseSrt, serializeSrt, serializeVtt, serializeVttWords } from "@/lib/merger/subtitles";
 import {
@@ -47,9 +48,11 @@ import {
   type CaptionSettings,
   type ExportProgress,
   type HeadlineItem,
+  type ItemEdit,
   type KenBurnsConfig,
   type KenBurnsDirection,
   type MediaSegment,
+  type OverlayTransform,
   type SubtitleFile,
   type TransitionSettings,
   type TransitionStyle,
@@ -68,7 +71,29 @@ interface MediaItem {
   id: string;
   file: File;
   url: string;
+  /** v5.0: source media kind — videos join the media list (never audio) and
+   *  become multi-track timeline items with probed durations. */
+  mediaType: "image" | "video";
 }
+
+/** v5.0: is this imported file a VIDEO? (type prefix or extension — import
+ *  routing: videos join the MEDIA list, everything else routes as in v4.9.) */
+function isVideoFile(f: File): boolean {
+  return (
+    (f.type && f.type.startsWith("video/")) ||
+    /\.(mp4|webm|mov|mkv|m4v|avi)$/i.test(f.name)
+  );
+}
+
+/** v5.0: overlay-lane items without an explicit geometry render centered at
+ *  60% output width. page.tsx writes this same default into the item's edit
+ *  whenever it moves to the overlay track, so buildTimeline resolves a real
+ *  OverlayTransform and the FFmpeg overlay composite (which skips null
+ *  transforms) stays in lockstep with the preview. */
+const DEFAULT_OVERLAY_TRANSFORM: OverlayTransform = {
+  scalePercent: 60,
+  position: "center",
+};
 
 let _idCounter = 0;
 function genId(): string {
@@ -77,13 +102,15 @@ function genId(): string {
 }
 
 // ---- Settings persistence (production-ready: survive restarts) ----------
-// v4.9: versioned settings key. The payload is wrapped as { v: 49, data }
-// so future schema changes can branch on version instead of growing the
-// flat v41 blob. The legacy v41 key is read as a fallback and removed on
-// the first successful v49 write (one-shot migration).
-const LS_KEY = "framefuse.settings.v49";
-const LS_LEGACY_KEY = "framefuse.settings.v41";
-const LS_VERSION = 49;
+// v5.0: versioned settings key. The payload is wrapped as { v: 50, data } so
+// future schema changes can branch on version instead of growing a flat
+// blob. Legacy keys (v49 wrapped, v41 flat) are read as a fallback chain and
+// removed on the first successful v50 write (one-shot migration). Only
+// lightweight UI state is persisted — multi-track edits (itemEdits), SFX
+// placements and video durations belong to PROJECT FILES, not localStorage.
+const LS_KEY = "framefuse.settings.v50";
+const LS_LEGACY_KEYS = ["framefuse.settings.v49", "framefuse.settings.v41"];
+const LS_VERSION = 50;
 
 interface PersistedSettings {
   kenBurns: KenBurnsConfig;
@@ -107,15 +134,19 @@ interface PersistedSettings {
 
 function loadPersisted(): Partial<PersistedSettings> {
   try {
-    // v49 first; fall back to the legacy flat v41 blob.
-    const raw =
-      localStorage.getItem(LS_KEY) ?? localStorage.getItem(LS_LEGACY_KEY);
+    // v50 first; fall back to the legacy v49 (wrapped) and v41 (flat) keys.
+    let raw: string | null = null;
+    for (const key of [LS_KEY, ...LS_LEGACY_KEYS]) {
+      raw = localStorage.getItem(key);
+      if (raw) break;
+    }
     if (!raw) return {};
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return {};
-    // Wrapped ({ v, data }) vs legacy (flat object) shapes.
+    // Wrapped ({ v, data }) vs legacy (flat object) shapes — any wrapped
+    // version unwraps to its data; flat v41 blobs are the settings object.
     const data =
-      parsed && typeof parsed.data === "object" && parsed.v === LS_VERSION
+      parsed && typeof parsed.data === "object" && typeof parsed.v === "number"
         ? parsed.data
         : parsed;
     return data as Partial<PersistedSettings>;
@@ -197,6 +228,25 @@ export default function Page() {
   // v4.8: media library view mode (app-level pref, persisted).
   const [mediaView, setMediaView] = useState<"list" | "grid">("list");
 
+  // ---- v5.0 MULTI-TRACK STATE ----------------------------------------------
+  /** Per-item user edits (patch-merged; undefined values DELETE keys, so a
+   *  `{ chroma: undefined }` patch disables the keyer). Feeds buildTimeline
+   *  → resolved seg.track/volume/trimInMs/chroma/overlay/startMs/durationMs. */
+  const [itemEdits, setItemEdits] = useState<Record<string, ItemEdit>>({});
+  /** Probed video source durations (id → ms) — drives video default clip
+   *  lengths + the timeline trim clamps + project round-trips. */
+  const [videoDurations, setVideoDurations] = useState<Record<string, number>>({});
+  /** Probed video source dims (id → {w,h}) — recorded for the export
+   *  payload (native.ts computes image dims itself; video dims are probed by
+   *  the main process, so this map is a page-level record / undecodable flag). */
+  const [videoDims, setVideoDims] = useState<Record<string, { w: number; h: number }>>({});
+  /** Probed video poster thumbnails (id → 96×54 JPEG dataURL) — used as
+   *  segment thumbnailUrl so the media list, filmstrips and overlays show a
+   *  real frame instead of a broken image. */
+  const [videoThumbnails, setVideoThumbnails] = useState<Record<string, string>>({});
+  /** SFX placements on the master timeline (preview-scheduled + exported). */
+  const [sfxItems, setSfxItems] = useState<SfxItem[]>([]);
+
   // Restore persisted settings AFTER mount (client-only, hydration-safe).
   // Reading localStorage in the state initializers made the first client
   // render differ from the prerendered HTML (React #418) whenever settings
@@ -206,7 +256,6 @@ export default function Page() {
    
   useEffect(() => {
     const p = loadPersisted();
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (p.kenBurns) setKenBurns(p.kenBurns);
      
     if (p.settings) setSettings(p.settings);
@@ -277,7 +326,28 @@ export default function Page() {
     items.forEach((it, order) => {
       const parsed = parseFilename(it.file.name);
       if (!parsed) {
-        skipped.push(it.file.name);
+        if (it.mediaType === "video") {
+          // v5.0: videos don't need filename timing — an unparseable name
+          // becomes a duration-kind entry whose length defaults to the
+          // probed source duration (5000ms until the probe lands).
+          ents.push({
+            id: it.id,
+            fileName: it.file.name,
+            file: it.file,
+            parsed: {
+              kind: "duration",
+              startMs: null,
+              endMs: null,
+              durationMs: null,
+              raw: it.file.name,
+            },
+            order,
+            thumbnailUrl: videoThumbnails[it.id] ?? it.url,
+            mediaType: "video",
+          });
+        } else {
+          skipped.push(it.file.name);
+        }
         return;
       }
       ents.push({
@@ -286,15 +356,27 @@ export default function Page() {
         file: it.file,
         parsed,
         order,
-        thumbnailUrl: it.url,
+        thumbnailUrl:
+          it.mediaType === "video"
+            ? videoThumbnails[it.id] ?? it.url
+            : it.url,
+        mediaType: it.mediaType,
       });
     });
     return { entries: ents, skippedUnparseable: skipped };
-  }, [items]);
+  }, [items, videoThumbnails]);
 
   const timeline = useMemo(
-    () => buildTimeline(entries, overrides, kenBurns, motionOverrides),
-    [entries, overrides, kenBurns, motionOverrides],
+    () =>
+      buildTimeline(
+        entries,
+        overrides,
+        kenBurns,
+        motionOverrides,
+        itemEdits,
+        videoDurations,
+      ),
+    [entries, overrides, kenBurns, motionOverrides, itemEdits, videoDurations],
   );
 
   const activeSegment = useMemo(
@@ -304,6 +386,16 @@ export default function Page() {
         : null,
     [timeline.segments, currentMs],
   );
+
+  /** v5.0: object URLs for VIDEO media items (id → url) — PreviewPanel's
+   *  paint sources and the export's video bytes channel. */
+  const videoUrls = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const it of items) {
+      if (it.mediaType === "video") map[it.id] = it.url;
+    }
+    return map;
+  }, [items]);
 
   // ---- Undo / Redo (v4.3) — snapshot history of the editable session ------
   // Object URLs are NEVER revoked mid-session (only on unmount) so a removed
@@ -323,6 +415,10 @@ export default function Page() {
     transition: TransitionSettings;
     watermarkImage: MediaItem | null;
     watermarkSettings: WatermarkSettings;
+    /** v5.0: multi-track edits + SFX placements + probed video durations. */
+    itemEdits: Record<string, ItemEdit>;
+    sfxItems: SfxItem[];
+    videoDurations: Record<string, number>;
   }
 
   const HISTORY_MAX = 80;
@@ -341,8 +437,10 @@ export default function Page() {
   });
 
   // Mirror of all snapshot-able state (synced after every commit — the
-  // history flush reads this POST-mutation value).
+  // history flush reads this POST-mutation value). v5: also mirrors the
+  // playback flag + sfx placements for the scheduling callbacks.
   const stateRef = useRef<HistorySnapshot | null>(null);
+  const isPlayingRef = useRef(false);
   useEffect(() => {
     stateRef.current = {
       items,
@@ -359,7 +457,11 @@ export default function Page() {
       transition: transitionSettings,
       watermarkImage,
       watermarkSettings,
+      itemEdits,
+      sfxItems,
+      videoDurations,
     };
+    isPlayingRef.current = isPlaying;
   });
 
   const snapshotEq = (a: HistorySnapshot, b: HistorySnapshot): boolean => {
@@ -437,6 +539,10 @@ export default function Page() {
     setTransitionSettings(snap.transition);
     setWatermarkImage(snap.watermarkImage);
     setWatermarkSettings(snap.watermarkSettings);
+    // v5.0: restore the multi-track session (edits, SFX, video durations).
+    setItemEdits(snap.itemEdits);
+    setSfxItems(snap.sfxItems);
+    setVideoDurations(snap.videoDurations);
     setIsPlaying(false);
   }, []);
 
@@ -552,6 +658,108 @@ export default function Page() {
     segmentsRef.current = timeline.segments;
   }, [timeline.totalMs, timeline.segments]);
 
+  // ---- v5.0 SFX preview audio ----------------------------------------------
+  // A page-level (lazy) AudioContext + per-sfxId AudioBuffer cache schedules
+  // every placement ahead of the wall clock when playback starts; seek/pause/
+  // stop kills the live sources and (while playing) reschedules from the new
+  // playhead. The master timeline clock stays the single source of truth —
+  // the music <audio> element keeps its existing behavior.
+  const sfxAudioRef = useRef<{
+    ctx: AudioContext | null;
+    buffers: Map<string, AudioBuffer>;
+  }>({ ctx: null, buffers: new Map() });
+  const sfxSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  /** Bumped on every (re)schedule — in-flight async schedules self-abort when
+   *  superseded (scrub bursts, rapid seeks). */
+  const sfxSchedTokenRef = useRef(0);
+
+  const getSfxAudioContext = useCallback((): AudioContext | null => {
+    if (typeof window === "undefined") return null; // SSR guard — silent no-op
+    const w = window as unknown as {
+      AudioContext?: typeof AudioContext;
+      webkitAudioContext?: typeof AudioContext;
+    };
+    const AC = w.AudioContext ?? w.webkitAudioContext;
+    if (!AC) return null;
+    if (!sfxAudioRef.current.ctx) sfxAudioRef.current.ctx = new AC();
+    return sfxAudioRef.current.ctx;
+  }, []);
+
+  const getSfxBuffer = useCallback(async (sfxId: string): Promise<AudioBuffer | null> => {
+    const cached = sfxAudioRef.current.buffers.get(sfxId);
+    if (cached) return cached;
+    const buf = await renderSfxBuffer(sfxId); // null in Node / on failure
+    if (buf) sfxAudioRef.current.buffers.set(sfxId, buf);
+    return buf;
+  }, []);
+
+  const stopSfxSources = useCallback(() => {
+    sfxSchedTokenRef.current += 1; // invalidate in-flight schedules
+    for (const src of sfxSourcesRef.current) {
+      try {
+        src.onended = null;
+        src.stop();
+      } catch {
+        /* already ended */
+      }
+      try {
+        src.disconnect();
+      } catch {
+        /* already disconnected */
+      }
+    }
+    sfxSourcesRef.current.clear();
+  }, []);
+
+  const scheduleSfxFrom = useCallback(
+    async (fromMs: number) => {
+      stopSfxSources();
+      const ctx = getSfxAudioContext();
+      if (!ctx) return; // no Web Audio (SSR/Node) — silent no-op
+      if (ctx.state === "suspended") ctx.resume().catch(() => {});
+      const items = stateRef.current?.sfxItems ?? [];
+      if (items.length === 0) return;
+      const token = sfxSchedTokenRef.current;
+      const baseTime = ctx.currentTime;
+      for (const item of items) {
+        // Loop-boundary rule: never reschedule items that already passed.
+        if (item.startMs < fromMs) continue;
+        const buf = await getSfxBuffer(item.sfxId);
+        if (token !== sfxSchedTokenRef.current) return; // superseded
+        if (!buf) continue; // unrenderable effect — skip silently
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        const gain = ctx.createGain();
+        gain.gain.value = item.volume;
+        src.connect(gain);
+        gain.connect(ctx.destination);
+        try {
+          const delaySec = Math.max(0, (item.startMs - fromMs) / 1000);
+          src.start(baseTime + delaySec);
+          sfxSourcesRef.current.add(src);
+          src.onended = () => {
+            sfxSourcesRef.current.delete(src);
+          };
+        } catch {
+          /* start threw (past time) — skip this placement */
+        }
+      }
+    },
+    [getSfxAudioContext, getSfxBuffer, stopSfxSources],
+  );
+
+  // Reschedule whenever playback starts or the placement list changes while
+  // playing (add/move/volume mid-playback); stop everything when paused.
+  // Runs AFTER the stateRef sync effect above (declaration order) so it always
+  // reads the freshest sfxItems.
+  useEffect(() => {
+    if (!isPlaying) {
+      stopSfxSources();
+      return;
+    }
+    void scheduleSfxFrom(currentMsRef.current);
+  }, [isPlaying, sfxItems, scheduleSfxFrom, stopSfxSources]);
+
   // ---- Playback rAF loop --------------------------------------------------
   useEffect(() => {
     if (!isPlaying) {
@@ -635,6 +843,10 @@ export default function Page() {
         watermark: watermarkImage
           ? { imageUrl: watermarkImage.url, settings: watermarkSettings }
           : null,
+        // v5.0: SFX placements (native.ts renders each unique effect once,
+        // uploads the WAV, and the amix graph adelay's it at startMs). Omitted
+        // when empty so v4.9-shaped projects keep the byte-identical IPC.
+        sfx: sfxItems.length > 0 ? sfxItems : undefined,
         onProgress: (p) => setExportProgress(p),
         signal: ac.signal,
       });
@@ -671,6 +883,7 @@ export default function Page() {
     watermarkImage,
     watermarkSettings,
     inElectron,
+    sfxItems,
   ]);
 
   // Keep exportRef in sync so menu accelerators call the latest version
@@ -722,18 +935,152 @@ export default function Page() {
   }, [openImagePicker, openAudioPicker]);
 
   // ---- Handlers -----------------------------------------------------------
-  const addFiles = useCallback((files: File[]) => {
-    if (!files.length) return;
-    requestHistoryPush();
-    setItems((prev) => {
-      const next = [...prev];
-      for (const f of files) {
-        next.push({ id: genId(), file: f, url: trackUrl(URL.createObjectURL(f)) });
+  /**
+   * v5.0: probe one imported VIDEO for duration, intrinsic dims and a poster
+   * thumbnail. Fully async and failure-tolerant: an undecodable file settles
+   * with the 5000ms fallback duration and no thumbnail (icon tile) — it never
+   * blocks the media list, which renders immediately from the file list.
+   */
+  const probeVideoItem = useCallback(
+    (item: MediaItem, opts?: { onUndecodable?: (name: string) => void }) => {
+      const { id, url } = item;
+      let settled = false;
+      const finish = (
+        durationMs: number | null,
+        dims: { w: number; h: number } | null,
+        thumb: string | null,
+      ) => {
+        if (settled) return;
+        settled = true;
+        if (typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs > 0) {
+          setVideoDurations((prev) =>
+            prev[id] === durationMs ? prev : { ...prev, [id]: durationMs },
+          );
+        }
+        if (dims && dims.w > 0 && dims.h > 0) {
+          setVideoDims((prev) => ({ ...prev, [id]: dims }));
+        } else {
+          opts?.onUndecodable?.(item.file.name);
+        }
+        if (thumb) {
+          setVideoThumbnails((prev) => ({ ...prev, [id]: thumb }));
+        }
+      };
+      if (typeof document === "undefined") {
+        finish(null, null, null);
+        return;
       }
-      return next;
-    });
-    toast.success(`Added ${files.length} image${files.length === 1 ? "" : "s"}`);
-  }, [requestHistoryPush, trackUrl]);
+      const v = document.createElement("video");
+      v.muted = true;
+      v.playsInline = true;
+      v.preload = "metadata";
+      const cleanupEl = () => {
+        v.onloadedmetadata = null;
+        v.onseeked = null;
+        v.onerror = null;
+        try {
+          v.removeAttribute("src");
+          v.load();
+        } catch {
+          /* noop */
+        }
+      };
+      v.onloadedmetadata = () => {
+        const durSec = v.duration && Number.isFinite(v.duration) ? v.duration : 0;
+        const durationMs = durSec > 0 ? Math.round(durSec * 1000) : 5000;
+        const dims = { w: v.videoWidth || 0, h: v.videoHeight || 0 };
+        const grab = () => {
+          try {
+            if (dims.w > 0 && dims.h > 0) {
+              const c = document.createElement("canvas");
+              c.width = 96;
+              c.height = 54;
+              const cx = c.getContext("2d");
+              if (cx) {
+                // Cover-fit the frame into the 96×54 poster.
+                const cover = Math.max(96 / dims.w, 54 / dims.h);
+                const dw = dims.w * cover;
+                const dh = dims.h * cover;
+                cx.drawImage(v, (96 - dw) / 2, (54 - dh) / 2, dw, dh);
+                finish(durationMs, dims, c.toDataURL("image/jpeg", 0.72));
+                return;
+              }
+            }
+            finish(durationMs, dims, null);
+          } catch {
+            finish(durationMs, dims, null);
+          }
+        };
+        // Poster frame at min(1s, dur/2) — bright enough for typical clips.
+        const seekSec = Math.min(1, Math.max(0, durSec / 2));
+        if (seekSec > 0 && dims.w > 0) {
+          v.onseeked = () => {
+            grab();
+            cleanupEl();
+          };
+          v.currentTime = seekSec;
+          window.setTimeout(() => {
+            if (!settled) grab();
+          }, 4000);
+        } else {
+          grab();
+        }
+      };
+      v.onerror = () => {
+        finish(5000, null, null); // undecodable — 5s placeholder + icon tile
+        cleanupEl();
+      };
+      v.src = url;
+      // Global timeout — a stalled decode must never block the list.
+      window.setTimeout(() => {
+        if (!settled) finish(5000, null, null);
+      }, 8000);
+    },
+    [],
+  );
+
+  const addFiles = useCallback(
+    (files: File[]) => {
+      if (!files.length) return;
+      requestHistoryPush();
+      const added: MediaItem[] = files.map((f) => ({
+        id: genId(),
+        file: f,
+        url: trackUrl(URL.createObjectURL(f)),
+        // v5.0 import routing: video files join the MEDIA list (never the
+        // audio channel); everything else routes exactly as in v4.9.
+        mediaType: isVideoFile(f) ? "video" : "image",
+      }));
+      setItems((prev) => [...prev, ...added]);
+      const nVideo = added.filter((a) => a.mediaType === "video").length;
+      const nImage = added.length - nVideo;
+      if (nVideo > 0) {
+        let warned = false;
+        for (const it of added) {
+          if (it.mediaType !== "video") continue;
+          probeVideoItem(it, {
+            onUndecodable: (name) => {
+              if (warned) return;
+              warned = true;
+              toast.error("Couldn't decode a video", {
+                description: `${name} will use a 5s placeholder — try re-encoding it (MP4/H.264 or WebM).`,
+              });
+            },
+          });
+        }
+        toast.success(
+          `Added ${nVideo} video${nVideo === 1 ? "" : "s"}${nImage ? ` + ${nImage} image${nImage === 1 ? "" : "s"}` : ""}`,
+          {
+            description:
+              "Videos join the base track at their source length — move clips to the Overlay lane from the timeline or the media panel.",
+          },
+        );
+      } else {
+        toast.success(`Added ${nImage} image${nImage === 1 ? "" : "s"}`);
+      }
+    },
+    [requestHistoryPush, trackUrl, probeVideoItem],
+  );
 
   // ---- Beat detection (v4.6) ---------------------------------------------
   const [beatInfo, setBeatInfo] = useState<BeatInfo | null>(null);
@@ -953,7 +1300,7 @@ export default function Page() {
         return;
       }
       const url = trackUrl(URL.createObjectURL(file));
-      setWatermarkImage({ id: `wm_${genId()}`, file, url });
+      setWatermarkImage({ id: `wm_${genId()}`, file, url, mediaType: "image" });
       toast.success(`Watermark set — ${file.name}`, {
         description:
           "Position, size and opacity are in the Watermark settings section.",
@@ -1057,8 +1404,10 @@ export default function Page() {
     try {
       localStorage.setItem(LS_KEY, JSON.stringify({ v: LS_VERSION, data: payload }));
       // One-shot legacy cleanup — the data now lives under the versioned key.
-      if (localStorage.getItem(LS_LEGACY_KEY) != null) {
-        localStorage.removeItem(LS_LEGACY_KEY);
+      for (const legacy of LS_LEGACY_KEYS) {
+        if (localStorage.getItem(legacy) != null) {
+          localStorage.removeItem(legacy);
+        }
       }
     } catch {
       /* storage full / private mode — non-fatal */
@@ -1208,6 +1557,22 @@ export default function Page() {
     // override maps never accumulate orphans (undo still restores them —
     // both maps live in the history snapshot).
     setMotionOverrides((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    // v5.0: same pruning for multi-track edits + probed video durations
+    // (both live in the history snapshot, so Ctrl+Z restores them). The
+    // hidden <video> element is dropped by PreviewPanel when the id leaves
+    // the videoUrls map; thumbnails/dims stay as harmless probe caches.
+    setItemEdits((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setVideoDurations((prev) => {
       if (!(id in prev)) return prev;
       const next = { ...prev };
       delete next[id];
@@ -1388,26 +1753,51 @@ export default function Page() {
     setTransitionSettings((prev) => ({ ...prev, overrides: undefined }));
   }, [requestHistoryPush]);
 
-  /** Duplicate a media item right after the original (v4.2). Copies the
-   *  file (same object) with a fresh id so it lands as its own timeline
-   *  segment; duration overrides do NOT carry over (the copy re-parses). */
-  const duplicateItem = useCallback((id: string) => {
-    requestHistoryPush();
-    setItems((prev) => {
-      const idx = prev.findIndex((i) => i.id === id);
-      if (idx < 0) return prev;
-      const src = prev[idx];
-      const copy: MediaItem = {
-        id: genId(),
-        file: src.file,
-        url: trackUrl(URL.createObjectURL(src.file)),
-      };
-      const next = [...prev];
-      next.splice(idx + 1, 0, copy);
-      return next;
-    });
-    toast.success("Duplicated segment");
-  }, [requestHistoryPush, trackUrl]);
+  /**
+   * Duplicate a media item right after the original (v4.2). Copies the
+   * file (same object) with a fresh id so it lands as its own timeline
+   * segment; duration overrides + itemEdits do NOT carry over (the copy
+   * re-parses), but the probed VIDEO metadata (duration/dims/poster) does —
+   * no re-decode needed.
+   */
+  const duplicateItem = useCallback(
+    (id: string) => {
+      requestHistoryPush();
+      const srcId = id;
+      const copyId = genId();
+      setItems((prev) => {
+        const idx = prev.findIndex((i) => i.id === srcId);
+        if (idx < 0) return prev;
+        const src = prev[idx];
+        const copy: MediaItem = {
+          id: copyId,
+          file: src.file,
+          url: trackUrl(URL.createObjectURL(src.file)),
+          mediaType: src.mediaType,
+        };
+        const next = [...prev];
+        next.splice(idx + 1, 0, copy);
+        return next;
+      });
+      // v5.0: carry the probed video metadata over to the copy instantly
+      // (computed outside the updater — deterministic id, idempotent writes).
+      if (videoDurations[srcId] != null) {
+        setVideoDurations((vd) =>
+          vd[srcId] != null ? { ...vd, [copyId]: vd[srcId] } : vd,
+        );
+      }
+      if (videoDims[srcId]) {
+        setVideoDims((dm) => (dm[srcId] ? { ...dm, [copyId]: dm[srcId] } : dm));
+      }
+      if (videoThumbnails[srcId]) {
+        setVideoThumbnails((th) =>
+          th[srcId] ? { ...th, [copyId]: th[srcId] } : th,
+        );
+      }
+      toast.success("Duplicated segment");
+    },
+    [requestHistoryPush, trackUrl, videoDurations, videoDims, videoThumbnails],
+  );
 
   // ---- Headline overlay management (v4.2) ------------------------------
   const addHeadline = useCallback(() => {
@@ -1468,6 +1858,150 @@ export default function Page() {
     });
   }, [requestHistoryPush]);
 
+  // ---- v5.0: multi-track item edits + SFX placements ----------------------
+  /**
+   * Patch-merge one item's edit. Semantics (7-b's contract): undefined field
+   * values DELETE the key (`{ chroma: undefined }` disables the keyer — the
+   * spread keeps the key present-but-undefined, JSON save drops it, timeline
+   * resolves null); finite numbers / objects merge over the prior edit.
+   * Entries that become empty are removed from the map entirely.
+   */
+  const applyItemEdit = useCallback((id: string, patch: Partial<ItemEdit>) => {
+    setItemEdits((prev) => {
+      const base: ItemEdit = { ...(prev[id] ?? {}) };
+      for (const [key, value] of Object.entries(patch) as [
+        keyof ItemEdit,
+        ItemEdit[keyof ItemEdit],
+      ][]) {
+        if (value === undefined) delete base[key];
+        else (base[key] as unknown) = value;
+      }
+      const next = { ...prev };
+      if (Object.keys(base).length === 0) delete next[id];
+      else next[id] = base;
+      return next;
+    });
+  }, []);
+
+  /**
+   * Shared translation logic for item-edit patches (see the doc comment on
+   * handleSetItemEdit / handleTimelineEdit below for the full contract).
+   */
+  const translateItemEdit = useCallback(
+    (id: string, patch: Partial<ItemEdit>): { patch: Partial<ItemEdit>; routedFromBase: boolean } => {
+      const existing = stateRef.current?.itemEdits[id] ?? {};
+      const eff: Partial<ItemEdit> = { ...patch };
+      // (1) base-lane horizontal move → auto-route to the overlay lane.
+      const patchSetsTrack = "track" in patch;
+      const currentTrack = existing.track ?? 0;
+      const routedFromBase =
+        eff.startMs !== undefined && !patchSetsTrack && currentTrack === 0;
+      if (routedFromBase) eff.track = 1;
+      // (2) overlay default geometry when moving to any overlay lane.
+      const finalTrack = (eff.track !== undefined ? eff.track : currentTrack) ?? 0;
+      const finalOverlay =
+        eff.overlay !== undefined ? eff.overlay : existing.overlay;
+      if (finalTrack >= 1 && !finalOverlay) {
+        eff.overlay = DEFAULT_OVERLAY_TRANSFORM;
+      }
+      return { patch: eff, routedFromBase };
+    },
+    [],
+  );
+
+  /** MediaPanel clip-settings channel (sliders → debounced history push).
+   *
+   * Two page-level translations keep the frozen data model honest:
+   * 1. BASE-LANE startMs (7-a's caveat): absolute-mode base clips emit
+   *    `{ startMs }` on horizontal drags, but buildTimeline ignores
+   *    edit.startMs on the base lane (filename timing rules there). Per
+   *    7-a's recommended option, the patch is AUTO-ROUTED to the overlay
+   *    lane (`{ track: 1, startMs }`) so the clip stays where the user
+   *    dropped it — a toast explains the lane change. Sequential mode never
+   *    emits horizontal base moves, so nothing to translate there.
+   * 2. DEFAULT OVERLAY GEOMETRY: items moved to the overlay lane without an
+   *    explicit transform get DEFAULT_OVERLAY_TRANSFORM written into their
+   *    edit — the FFmpeg overlay composite skips null transforms, so
+   *    materializing the same default the preview renders keeps
+   *    preview↔export parity by construction.
+   */
+  const handleSetItemEdit = useCallback(
+    (id: string, patch: Partial<ItemEdit>) => {
+      requestHistoryPush(500);
+      const { patch: eff, routedFromBase } = translateItemEdit(id, patch);
+      applyItemEdit(id, eff);
+      if (routedFromBase) {
+        toast.info("Moved to the Overlay track", {
+          description:
+            "Base clips follow filename timing — a horizontal drag places the clip as an overlay. Drop it back on the Video lane to restore it.",
+        });
+      }
+    },
+    [requestHistoryPush, applyItemEdit, translateItemEdit],
+  );
+
+  /** TimelineRuler drag commits (move / trim / lane switch — discrete pushes
+   *  on pointerup; same translations as handleSetItemEdit). */
+  const handleTimelineEdit = useCallback(
+    (id: string, patch: Partial<ItemEdit>) => {
+      requestHistoryPush();
+      const { patch: eff, routedFromBase } = translateItemEdit(id, patch);
+      applyItemEdit(id, eff);
+      if (routedFromBase) {
+        toast.info("Moved to the Overlay track", {
+          description:
+            "Base clips follow filename timing — a horizontal drag places the clip as an overlay. Drop it back on the Video lane to restore it.",
+        });
+      }
+    },
+    [requestHistoryPush, applyItemEdit, translateItemEdit],
+  );
+
+  /** v5.0: add an SFX placement at the playhead (MediaPanel palette). */
+  const handleAddSfx = useCallback(
+    (sfxId: string) => {
+      requestHistoryPush();
+      const startMs = Math.max(0, Math.min(currentMsRef.current, totalMsRef.current));
+      setSfxItems((prev) => [...prev, makeSfxItem({ sfxId, startMs, volume: 1 })]);
+    },
+    [requestHistoryPush],
+  );
+
+  /** v5.0: move an SFX pill (TimelineRuler drag). */
+  const handleMoveSfx = useCallback(
+    (id: string, startMs: number) => {
+      requestHistoryPush();
+      setSfxItems((prev) =>
+        prev.map((s) =>
+          s.id === id
+            ? { ...s, startMs: Math.max(0, Math.min(startMs, totalMsRef.current)) }
+            : s,
+        ),
+      );
+    },
+    [requestHistoryPush],
+  );
+
+  /** v5.0: patch an SFX placement (volume slider in the media panel). */
+  const handleUpdateSfx = useCallback(
+    (id: string, patch: Partial<SfxItem>) => {
+      requestHistoryPush(500);
+      setSfxItems((prev) =>
+        prev.map((s) => (s.id === id ? { ...s, ...patch } : s)),
+      );
+    },
+    [requestHistoryPush],
+  );
+
+  /** v5.0: remove an SFX placement (pill × / Alt+click / Delete). */
+  const handleRemoveSfx = useCallback(
+    (id: string) => {
+      requestHistoryPush();
+      setSfxItems((prev) => prev.filter((s) => s.id !== id));
+    },
+    [requestHistoryPush],
+  );
+
   const saveProject = useCallback(async () => {
     try {
       if (items.length === 0) {
@@ -1489,7 +2023,12 @@ export default function Page() {
         }
       }
       const project = await buildProjectFile({
-        images: items.map((it) => ({ id: it.id, file: it.file })),
+        // v5.0: entries carry their mediaType so videos round-trip as videos.
+        images: items.map((it) => ({
+          id: it.id,
+          file: it.file,
+          mediaType: it.mediaType,
+        })),
         audio: audioFile,
         subtitles: subtitles
           ? { fileName: subtitles.fileName, cues: subtitles.cues }
@@ -1503,6 +2042,10 @@ export default function Page() {
               settings: watermarkSettings,
             }
           : null,
+        // v5.0: multi-track session — edits, SFX placements, video durations.
+        itemEdits,
+        sfxItems,
+        videoDurations,
         settings: {
           kenBurns,
           video: settings,
@@ -1514,13 +2057,18 @@ export default function Page() {
       });
       const name = downloadProjectFile(project);
       const imgs = project.images.length;
+      const vids = project.images.filter((i) => i.mediaType === "video").length;
       toast.success(`Project saved — ${name}`, {
-        description: `${imgs} image${imgs === 1 ? "" : "s"}${
+        description: `${imgs} media item${imgs === 1 ? "" : "s"}${
+          vids ? ` (${vids} video${vids === 1 ? "" : "s"})` : ""
+        }${
           project.audio ? " + audio" : ""
         }${
           project.subtitles ? " + captions" : ""
         }${
           project.headlines.length ? ` + ${project.headlines.length} headline` : ""
+        }${
+          sfxItems.length ? ` + ${sfxItems.length} SFX` : ""
         } — fully self-contained .json`,
       });
     } catch (e) {
@@ -1541,6 +2089,9 @@ export default function Page() {
     transitionSettings,
     watermarkImage,
     watermarkSettings,
+    itemEdits,
+    sfxItems,
+    videoDurations,
   ]);
 
   const loadProject = useCallback(
@@ -1553,15 +2104,36 @@ export default function Page() {
         // (object URLs are kept alive for exactly this).
         requestHistoryPush(400);
 
-        // Rebuild media items with their SAVED ids (so duration overrides
-        // + Ken Burns direction hashing map 1:1). Old media URLs stay alive
-        // for undo; the unmount cleanup revokes everything.
+        // Rebuild media items with their SAVED ids (so duration overrides,
+        // itemEdits and Ken Burns direction hashing map 1:1). Old media URLs
+        // stay alive for undo; the unmount cleanup revokes everything.
         const restored: MediaItem[] = loaded.imageFiles.map((entry) => ({
           id: entry.id,
           file: entry.file,
           url: trackUrl(URL.createObjectURL(entry.file)),
+          mediaType: entry.mediaType === "video" ? "video" : "image",
         }));
         setItems(restored);
+
+        // v5.0: restore the multi-track session BEFORE the probes land — the
+        // saved videoDurations make the timeline immediately correct, then
+        // fresh probes (below) confirm/refresh durations + dims + posters.
+        setItemEdits(
+          project.itemEdits && typeof project.itemEdits === "object"
+            ? project.itemEdits
+            : {},
+        );
+        setSfxItems(Array.isArray(project.sfxItems) ? project.sfxItems : []);
+        setVideoDurations(
+          project.videoDurations && typeof project.videoDurations === "object"
+            ? project.videoDurations
+            : {},
+        );
+        // Probe restored videos (durations/dims/thumbnails) — async, never
+        // blocks the session; saved durations cover the gap meanwhile.
+        for (const it of restored) {
+          if (it.mediaType === "video") probeVideoItem(it);
+        }
 
         // Audio.
         if (loaded.audioFile) {
@@ -1605,6 +2177,7 @@ export default function Page() {
             id: loaded.watermarkFile.id,
             file: loaded.watermarkFile.file,
             url,
+            mediaType: "image",
           });
         } else {
           setWatermarkImage(null);
@@ -1639,27 +2212,48 @@ export default function Page() {
         setIsPlaying(false);
 
         const imgs = restored.length;
-        toast.success(`Project loaded — ${imgs} image${imgs === 1 ? "" : "s"}`, {
-          description: `${file.name}${
-            loaded.audioSkipped ? " · audio skipped (>25MB)" : ""
+        const vids = restored.filter((r) => r.mediaType === "video").length;
+        toast.success(
+          `Project loaded — ${imgs} media item${imgs === 1 ? "" : "s"}${
+            vids ? ` (${vids} video${vids === 1 ? "" : "s"})` : ""
           }`,
-        });
+          {
+            description: `${file.name}${
+              loaded.audioSkipped ? " · audio skipped (>25MB)" : ""
+            }${
+              loaded.videoSkipped
+                ? " · video skipped (too large to inline at save time)"
+                : ""
+            }${
+              project.sfxItems?.length
+                ? ` · ${project.sfxItems.length} SFX restored`
+                : ""
+            }`,
+          },
+        );
       } catch (e) {
         toast.error(e instanceof Error ? e.message : "Project load failed");
       }
     },
-    [requestHistoryPush, trackUrl, clearWaveform],
+    [requestHistoryPush, trackUrl, clearWaveform, probeVideoItem],
   );
 
-  const seek = useCallback((ms: number) => {
-    const clamped = Math.max(0, Math.min(ms, totalMsRef.current));
-    currentMsRef.current = clamped;
-    setCurrentMs(clamped);
-    // Sync audio position
-    if (audioRef.current) {
-      audioRef.current.currentTime = clamped / 1000;
-    }
-  }, []);
+  const seek = useCallback(
+    (ms: number) => {
+      const clamped = Math.max(0, Math.min(ms, totalMsRef.current));
+      currentMsRef.current = clamped;
+      setCurrentMs(clamped);
+      // Sync audio position
+      if (audioRef.current) {
+        audioRef.current.currentTime = clamped / 1000;
+      }
+      // v5.0: SFX sources stop + reschedule at the new playhead (the async
+      // schedule self-aborts when superseded, so scrub bursts are cheap).
+      if (isPlayingRef.current) void scheduleSfxFrom(clamped);
+      else stopSfxSources();
+    },
+    [scheduleSfxFrom, stopSfxSources],
+  );
 
   const togglePlay = useCallback(() => {
     if (segmentsRef.current.length === 0) return;
@@ -1738,6 +2332,8 @@ export default function Page() {
   // ---- Cleanup object URLs on unmount -------------------------------------
   // URLs are deliberately kept alive during the whole session so undo can
   // restore removed media byte-perfect; this is the single revocation point.
+  // v5.0: live SFX sources are stopped too (the AudioContext + buffer cache
+  // are module-lifetime singletons, harmless to leave running muted-free).
   useEffect(() => {
     const urls = urlsRef.current;
     return () => {
@@ -1749,8 +2345,9 @@ export default function Page() {
         }
       });
       urls.clear();
+      stopSfxSources();
     };
-  }, []);
+  }, [stopSfxSources]);
 
   const allSkipped = useMemo(
     () => [...skippedUnparseable, ...timeline.skipped],
@@ -1895,6 +2492,14 @@ export default function Page() {
               const s = timeline.segments.find((x) => x.id === id);
               if (s) seek(s.startMs);
             }}
+            itemEdits={itemEdits}
+            videoDurations={videoDurations}
+            onSetItemEdit={handleSetItemEdit}
+            sfxItems={sfxItems}
+            onAddSfx={handleAddSfx}
+            onUpdateSfx={handleUpdateSfx}
+            onRemoveSfx={handleRemoveSfx}
+            currentMs={currentMs}
           />
         </section>
 
@@ -1907,6 +2512,7 @@ export default function Page() {
             <PreviewPanel
               segments={timeline.segments}
               images={images}
+              videoUrls={videoUrls}
               totalMs={timeline.totalMs}
               currentMs={currentMs}
               isPlaying={isPlaying}
@@ -1954,6 +2560,11 @@ export default function Page() {
                 });
               }
             }}
+            onEditItem={handleTimelineEdit}
+            sfxItems={sfxItems}
+            onMoveSfx={handleMoveSfx}
+            onRemoveSfx={handleRemoveSfx}
+            videoDurations={videoDurations}
           />
         </section>
 
@@ -2014,7 +2625,7 @@ export default function Page() {
       <input
         ref={imageInputRef}
         type="file"
-        accept="image/*"
+        accept="image/*,video/mp4,video/webm,video/quicktime,video/x-matroska,video/x-msvideo,.mp4,.webm,.mov,.mkv,.m4v,.avi"
         multiple
         style={{
           position: "absolute",

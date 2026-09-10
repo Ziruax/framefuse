@@ -1,4 +1,17 @@
 // src/lib/merger/types.ts — FrameFuse core type system
+//
+// v5.0: multi-track timeline data model. Segments now carry resolved
+// per-item edit metadata (track / volume / trim / chroma / overlay) and a
+// media kind, so video items, overlay lanes and chroma keying flow through
+// the SAME MediaSegment shape everywhere (preview, native export, project
+// files). Type-only imports keep this module dependency-free at runtime.
+
+import type { ChromaKeySettings } from "./chroma";
+import type { SfxItem } from "./sfx";
+
+// Re-export the sibling-lib types so consumers can import the whole data
+// model from one place (type-only — no runtime dependency is created).
+export type { ChromaKeySettings, SfxItem };
 
 export type TimelineMode = "absolute" | "sequential";
 
@@ -76,6 +89,50 @@ export type KenBurnsDirection =
 
 export type SegmentKind = "absolute" | "duration" | "beat";
 
+// ---------------------------------------------------------------------------
+// v5.0 MULTI-TRACK TIMELINE — media kinds + per-item edits
+//
+// One flat map `itemEdits: Record<string, ItemEdit>` (keyed by item id)
+// carries every user edit for an item: placement, duration, lane, trim,
+// volume, chroma key and overlay geometry. buildTimeline resolves each
+// field onto the segment (edit wins over parsed filename over defaults).
+// ---------------------------------------------------------------------------
+
+/** Kind of a source media file. Audio never becomes a MediaSegment (it is
+ *  a separate AudioTrack), but entries/imports are tagged with this union. */
+export type MediaKind = "image" | "video" | "audio";
+
+/** 9-grid overlay anchor — identical shape to WatermarkPosition. */
+export type OverlayPos = WatermarkPosition;
+
+/** Overlay geometry request resolved per item (scale relative to the OUTPUT
+ *  video width, 10–100; 9-grid anchor). renderer.overlayGeometry is the
+ *  single source of truth for the actual pixel rect. */
+export interface OverlayTransform {
+  /** Destination width as a percentage of the video width (10 – 100). */
+  scalePercent: number;
+  position: OverlayPos;
+}
+
+/** Per-item user edits (all optional; absent fields keep their defaults). */
+export interface ItemEdit {
+  /** Absolute start on the master timeline (overlay lane; base lane follows
+   *  the filename timing / sequential stacking). */
+  startMs?: number;
+  durationMs?: number;
+  /** 0 = base lane (default), 1 = first overlay lane, 2+ stack above. */
+  track?: number;
+  /** Video source trim offset (ms into the source, applied before the
+   *  timeline window). */
+  trimInMs?: number;
+  /** Playback volume 0..2, 1 = unity. */
+  volume?: number;
+  /** Chroma key settings — stored RAW here; chroma.ts owns sanitization
+   *  (sanitizeChromaKeySettings) at the UI boundary. */
+  chroma?: ChromaKeySettings;
+  overlay?: OverlayTransform;
+}
+
 /** A resolved media segment placed on the timeline. */
 export interface MediaSegment {
   id: string;
@@ -101,6 +158,22 @@ export interface MediaSegment {
   thumbnailUrl: string;
   /** Index of the source file in the original upload order. */
   order: number;
+  // --- v5.0 resolved edit fields (present on every segment) ---
+  /** Source media kind (audio never lands on a segment). */
+  mediaType: "image" | "video";
+  /** Resolved lane: 0 = base, >= 1 = overlay (drawn on top, track order). */
+  track: number;
+  /** Resolved volume 0..2 (1 = unity; edit wins, default 1). */
+  volume: number;
+  /** Resolved video trim offset (ms into the source; default 0). */
+  trimInMs: number;
+  /** Full source duration for video items when known, else null. */
+  sourceDurationMs: number | null;
+  /** Resolved chroma key settings or null. NOT sanitized in the timeline —
+   *  chroma.ts owns sanitization at the UI boundary. */
+  chroma: ChromaKeySettings | null;
+  /** Resolved overlay geometry request or null (base-lane default). */
+  overlay: OverlayTransform | null;
 }
 
 export interface AudioTrack {
@@ -367,6 +440,8 @@ export interface ExportNativeOptions {
   transition?: TransitionSettings;
   /** Watermark / logo overlay (v4.4). */
   watermark?: WatermarkExportOptions | null;
+  /** v5.0: SFX placements mixed into the export audio chain. */
+  sfx?: SfxItem[];
   onProgress?: (p: ExportProgress) => void;
   /** When aborted, the export stops as soon as possible. */
   signal?: AbortSignal;
@@ -553,6 +628,9 @@ declare global {
       exportNative: (opts: unknown) => Promise<ExportResult>;
       saveTempImage: (p: { name: string; bytes: ArrayBuffer }) => Promise<string>;
       saveTempAudio: (p: { name: string; bytes: ArrayBuffer }) => Promise<string>;
+      /** v5.0: video sources for the multi-track timeline (same shape as
+       *  saveTempAudio — bytes land in a temp file, path comes back). */
+      saveTempVideo: (p: { name: string; bytes: ArrayBuffer }) => Promise<string>;
       saveTempSrt: (p: { name: string; text: string }) => Promise<string>;
       chooseOutput: () => Promise<string | null>;
       cleanupTemp: () => Promise<boolean>;

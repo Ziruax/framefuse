@@ -1,8 +1,17 @@
 // src/lib/merger/renderer.ts — canvas Ken Burns frame renderer + transitions
+//
+// v5.0 additions: overlayGeometry (single source of truth for overlay
+// placement, mirrored in plain JS by electron/main.js), drawVideoFrame
+// (cover-fit video frames, NO Ken Burns) and the transition VIDEO RULE —
+// xfade-family heads are hard cuts whenever either side of a boundary is a
+// video segment (dips remain allowed). isXfadeStyle is exported so the
+// export pipeline mirror can reuse the exact same definition.
 import type {
   AspectRatio,
   KenBurnsConfig,
   MediaSegment,
+  OverlayPos,
+  OverlayTransform,
   Resolution,
   TransitionSettings,
   TransitionStyle,
@@ -197,10 +206,36 @@ export function clampTransitionMs(durationMs: number, segDurMs: number): number 
 }
 
 /**
+ * v5.0: true for the xfade-family styles (dissolve / slide / wipe) — the
+ * ones FFmpeg composites via the `xfade` filter. Dip-to-black/white and the
+ * hard cut are NOT xfade. Exported so the Electron export pipeline (plain
+ * JS mirror) can apply the exact same video-boundary rule.
+ */
+export function isXfadeStyle(style: TransitionStyle): boolean {
+  return TRANSITION_STYLE_INFO[style]?.xfade != null;
+}
+
+/** v5.0: does the boundary entering `segIdx` touch a VIDEO segment on
+ * either side? (Segments without a mediaType — hand-built / legacy — are
+ * treated as images.) */
+function videoAtBoundary(segments: MediaSegment[], segIdx: number): boolean {
+  return (
+    segments[segIdx]?.mediaType === "video" ||
+    segments[segIdx - 1]?.mediaType === "video"
+  );
+}
+
+/**
  * Effective head-transition duration (ms) for segment `segIdx` — the
  * window at the START of the clip where the transition composite plays.
  * 0 when there is no previous segment or the boundary style is "none"
  * (global OR per-boundary override, v4.5).
+ *
+ * v5.0 VIDEO RULE: an xfade-family head (dissolve / slide / wipe) is
+ * forced to a hard cut (0) when EITHER side of the boundary is a VIDEO
+ * segment — xfade needs both inputs as full-frame streams and video clips
+ * carry their own motion. Dip-to-black / dip-to-white heads remain allowed
+ * at video boundaries.
  */
 export function transitionHeadMs(
   segments: MediaSegment[],
@@ -212,6 +247,7 @@ export function transitionHeadMs(
   if (!seg) return 0;
   const style = boundaryStyle(transition, seg.id);
   if (!transition || style === "none") return 0;
+  if (isXfadeStyle(style) && videoAtBoundary(segments, segIdx)) return 0;
   return clampTransitionMs(transition.durationMs, seg.durationMs);
 }
 
@@ -273,6 +309,10 @@ export function computeTransitionFx(
   if (!seg || segIdx <= 0) return none;
   const style = boundaryStyle(transition, seg.id);
   if (style === "none") return none;
+  // v5.0 VIDEO RULE — xfade heads are hard cuts at video boundaries
+  // (redundant with the transitionHeadMs check below, but explicit here so
+  // the rule can never be bypassed by future refactors of headMs).
+  if (isXfadeStyle(style) && videoAtBoundary(segments, segIdx)) return none;
   const headMs = transitionHeadMs(segments, segIdx, transition);
   if (headMs <= 0) return none;
   const local = currentMs - seg.startMs;
@@ -535,4 +575,117 @@ export function drawWatermark(
   ctx.globalAlpha = Math.max(0.05, Math.min(1, settings.opacity / 100));
   ctx.drawImage(img, g.dx, g.dy, g.dw, g.dh);
   ctx.globalAlpha = 1;
+}
+
+// ---------------------------------------------------------------------------
+// v5.0 MULTI-TRACK OVERLAYS — video frames + overlay geometry.
+//
+// Base VIDEO segments and overlay items are drawn WITHOUT Ken Burns: the
+// video's own motion is the content. drawVideoFrame is the cover-fit twin
+// of drawFrame (zoom locked to 1); overlayGeometry is the single source of
+// truth for the overlay rect on a videoW×videoH frame — the canvas preview,
+// and the FFmpeg overlay filter chain (mirrored in plain JS in
+// electron/main.js) both consume these exact numbers so they can never
+// drift. Geometry follows the watermark contract: width percent of the
+// VIDEO width (clamped 10..100), aspect preserved, 2% margin, 9-grid
+// anchor.
+// ---------------------------------------------------------------------------
+
+/** Anything drawImage accepts that exposes intrinsic dimensions — real
+ *  video elements (videoWidth/videoHeight), images (naturalWidth/Height)
+ *  and canvases/bitmaps (width/height) all satisfy this shape. */
+export type VideoFrameSource = CanvasImageSource & {
+  videoWidth?: number;
+  videoHeight?: number;
+  naturalWidth?: number;
+  naturalHeight?: number;
+  width?: number;
+  height?: number;
+};
+
+/**
+ * v5.0: destination rect for an overlay item on a videoW×videoH frame.
+ * dw = videoW·scalePercent/100 (clamped 10–100), dh aspect-preserved
+ * (both rounded to int), margin = 2% of videoW, 9-grid anchor with the
+ * exact col/row logic of watermarkGeometry. Degenerate inputs (any
+ * dimension ≤ 0 / non-finite, or a missing transform) → all zeros so
+ * callers can skip the draw. A non-finite scalePercent degrades to 100
+ * (full width) instead of poisoning the rect with NaN.
+ */
+export function overlayGeometry(
+  videoW: number,
+  videoH: number,
+  srcW: number,
+  srcH: number,
+  t: OverlayTransform,
+): { dx: number; dy: number; dw: number; dh: number } {
+  if (
+    !t ||
+    !Number.isFinite(videoW) ||
+    !Number.isFinite(videoH) ||
+    !Number.isFinite(srcW) ||
+    !Number.isFinite(srcH) ||
+    videoW <= 0 ||
+    videoH <= 0 ||
+    srcW <= 0 ||
+    srcH <= 0
+  ) {
+    return { dx: 0, dy: 0, dw: 0, dh: 0 };
+  }
+  const sp = Number.isFinite(t.scalePercent)
+    ? clamp(t.scalePercent, 10, 100)
+    : 100;
+  const dw = Math.max(1, Math.round((videoW * sp) / 100));
+  const dh = Math.max(1, Math.round((dw * srcH) / srcW)); // aspect preserved
+  const m = Math.round(videoW * 0.02);
+
+  const pos: OverlayPos = t.position;
+  // Horizontal anchor: left column / center column / right column.
+  const col = pos.endsWith("left") ? 0 : pos.endsWith("right") ? 2 : 1;
+  // Vertical anchor: top row / middle row / bottom row.
+  const row = pos.startsWith("top") ? 0 : pos.startsWith("bottom") ? 2 : 1;
+
+  const dx =
+    col === 0 ? m : col === 2 ? Math.round(videoW - dw - m) : Math.round((videoW - dw) / 2);
+  const dy =
+    row === 0 ? m : row === 2 ? Math.round(videoH - dh - m) : Math.round((videoH - dh) / 2);
+
+  return { dx, dy, dw, dh };
+}
+
+/**
+ * v5.0: draw the current frame of a VIDEO source, cover-fit into cw×ch —
+ * the drawFrame twin with zoom locked to 1 and no Ken Burns (video motion
+ * is the content). Black letterbox fill first, identity transform, high
+ * smoothing. Sources without intrinsic dimensions yet (metadata not
+ * loaded) leave the black frame.
+ */
+export function drawVideoFrame(
+  ctx: CanvasRenderingContext2D,
+  source: VideoFrameSource | null | undefined,
+  cw: number,
+  ch: number,
+): void {
+  // Clear + black background (letterbox fallback).
+  ctx.fillStyle = "#000000";
+  ctx.fillRect(0, 0, cw, ch);
+  if (!source) return;
+
+  const sw = source.videoWidth ?? source.naturalWidth ?? source.width;
+  const sh = source.videoHeight ?? source.naturalHeight ?? source.height;
+  const iw = typeof sw === "number" && Number.isFinite(sw) ? sw : 0;
+  const ih = typeof sh === "number" && Number.isFinite(sh) ? sh : 0;
+  if (!iw || !ih) return;
+
+  // object-fit: cover base scale.
+  const cover = Math.max(cw / iw, ch / ih);
+  const dw = iw * cover;
+  const dh = ih * cover;
+  const dx = (cw - dw) / 2;
+  const dy = (ch - dh) / 2;
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(source, dx, dy, dw, dh);
 }

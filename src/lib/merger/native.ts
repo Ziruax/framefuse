@@ -5,11 +5,14 @@
 import { Muxer, ArrayBufferTarget } from "mp4-muxer";
 import type {
   AudioSettings,
+  ChromaKeySettings,
   ExportNativeOptions,
   ExportProgress,
   ExportResult,
   HeadlineItem,
   MediaSegment,
+  OverlayTransform,
+  SfxItem,
   VideoSettings,
 } from "./types";
 import {
@@ -30,6 +33,8 @@ import {
   type WordTransform,
 } from "./captionAnimations";
 import type { CaptionAnimation } from "./types";
+import { renderSfxWav } from "./sfx";
+import { sanitizeChromaKeySettings } from "./chroma";
 
 /** True when running inside the FrameFuse Electron shell. */
 export function isElectron(): boolean {
@@ -48,6 +53,95 @@ function loadImageElement(url: string): Promise<HTMLImageElement | null> {
     img.onerror = () => resolve(null);
     img.src = url;
   });
+}
+
+// ---------------------------------------------------------------------------
+// v5.0 native-export payload shapes (renderer → main process).
+// ALL v5 fields are optional/additive — a v4.9-shaped project (image-only,
+// no overlays, no SFX) produces the same IPC segments as before, so the
+// main-process FFmpeg graph (and its args) stay byte-identical.
+// ---------------------------------------------------------------------------
+
+/** Base-lane segment → one concat clip. */
+interface NativeSegPayload {
+  id: string;
+  /** Image source (image segments; v4.9 always set this). */
+  imagePath?: string;
+  /** Video source (v5 video segments). */
+  videoPath?: string;
+  direction: string;
+  durationMs: number;
+  startMs: number;
+  endMs: number;
+  mediaType?: "image" | "video";
+  track?: number;
+  volume?: number;
+  trimInMs?: number;
+  sourceDurationMs?: number | null;
+  chroma?: ChromaKeySettings | null;
+  overlay?: OverlayTransform | null;
+}
+
+/** Overlay-lane segment (track ≥ 1) → composited per clip, never a clip. */
+interface NativeOverlayPayload {
+  id: string;
+  mediaType: "image" | "video";
+  track: number;
+  startMs: number;
+  endMs: number;
+  durationMs: number;
+  trimInMs: number;
+  volume: number;
+  chroma: ChromaKeySettings | null;
+  overlay: OverlayTransform | null;
+  imagePath?: string;
+  videoPath?: string;
+  /** Source dims when cheaply known (image natural size) — else the main
+   *  process probes with `ffmpeg -i`. */
+  sourceWidth?: number;
+  sourceHeight?: number;
+}
+
+/** SFX placement + its uploaded WAV (rendered once per unique sfxId). */
+interface NativeSfxPayload {
+  id: string;
+  sfxId: string;
+  startMs: number;
+  volume: number;
+  wavPath: string;
+  durationMs: number;
+}
+
+/**
+ * Read the source bytes of a VIDEO segment. Prefers the media URL map
+ * (page.tsx stores video object URLs under the segment id) and falls back
+ * to the original File — thumbnailUrl is deliberately NOT used (video
+ * thumbnails are canvas frames, not the video).
+ */
+async function videoSourceBytes(
+  seg: MediaSegment,
+  imageUrls: Record<string, string>,
+): Promise<ArrayBuffer> {
+  const url = imageUrls[seg.id];
+  if (url) return fetchBytes(url);
+  if (seg.file) return seg.file.arrayBuffer();
+  throw new Error(
+    `Video segment "${seg.fileName || seg.id}" has no readable source (no URL and no File)`,
+  );
+}
+
+/** v5 features the browser fallback exporters cannot render (yet). */
+const DESKTOP_ONLY_EXPORT_MSG =
+  "Video, chroma-key, overlay and SFX export requires the FrameFuse desktop app";
+
+/** Graceful, typed guard for the browser fallback paths. */
+function assertBrowserExportSupport(opts: ExportNativeOptions): void {
+  const hasV5 = (opts.segments || []).some(
+    (s) => s.mediaType === "video" || (s.track ?? 0) >= 1 || s.chroma != null,
+  );
+  if (hasV5 || (opts.sfx != null && opts.sfx.length > 0)) {
+    throw new Error(DESKTOP_ONLY_EXPORT_MSG);
+  }
 }
 
 /**
@@ -200,27 +294,89 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
 
   const dims = resolveDimensions(settings.aspect, settings.resolution);
 
-  // 1. Persist images to temp files.
-  // Include absolute startMs/endMs so the main process can map SRT cue
-  // timestamps (which are in master-timeline absolute time) onto each
-  // per-segment clip (whose internal clock starts at 0). Without this
-  // mapping, only cues whose original startMs falls within [0, dur] of
+  // 1. Persist segment sources to temp files.
+  // v5.0: the multi-track timeline is split here — BASE-lane segments
+  // (track 0) become concat clips exactly as in v4.9 (images via
+  // saveTempImage, videos via saveTempVideo); OVERLAY-lane segments
+  // (track ≥ 1) are uploaded too but shipped in a separate `overlays`
+  // array — the main process composites them per clip instead of
+  // concatenating them. Include absolute startMs/endMs so the main process
+  // can map SRT cue timestamps (which are in master-timeline absolute time)
+  // onto each per-segment clip (whose internal clock starts at 0). Without
+  // this mapping, only cues whose original startMs falls within [0, dur] of
   // every clip would be burned in — i.e. the first caption repeats.
-  const segPayload: {
-    id: string;
-    imagePath: string;
-    direction: string;
-    durationMs: number;
-    startMs: number;
-    endMs: number;
-  }[] = [];
+  const segPayload: NativeSegPayload[] = [];
+  const overlayPayload: NativeOverlayPayload[] = [];
   for (const seg of segments) {
+    const onOverlayLane = (seg.track ?? 0) >= 1;
+    if (seg.mediaType === "video") {
+      const bytes = await videoSourceBytes(seg, imageUrls);
+      const videoPath = await api.saveTempVideo({
+        name: seg.fileName || `seg_${seg.id}.mp4`,
+        bytes,
+      });
+      if (onOverlayLane) {
+        overlayPayload.push({
+          id: seg.id,
+          mediaType: "video",
+          track: seg.track ?? 1,
+          startMs: seg.startMs,
+          endMs: seg.endMs,
+          durationMs: seg.durationMs,
+          trimInMs: seg.trimInMs || 0,
+          volume: seg.volume,
+          chroma: seg.chroma ? sanitizeChromaKeySettings(seg.chroma) : null,
+          overlay: seg.overlay,
+          videoPath,
+        });
+      } else {
+        segPayload.push({
+          id: seg.id,
+          videoPath,
+          direction: seg.direction,
+          durationMs: seg.durationMs,
+          startMs: seg.startMs,
+          endMs: seg.endMs,
+          mediaType: "video",
+          track: 0,
+          volume: seg.volume,
+          trimInMs: seg.trimInMs || 0,
+          sourceDurationMs: seg.sourceDurationMs ?? null,
+          chroma: seg.chroma ? sanitizeChromaKeySettings(seg.chroma) : null,
+          overlay: seg.overlay,
+        });
+      }
+      continue;
+    }
+    // Image flow (v4.9 verbatim for base clips).
     const url = imageUrls[seg.id] || seg.thumbnailUrl;
     const bytes = await fetchBytes(url);
     const imagePath = await api.saveTempImage({
       name: seg.fileName || `seg_${seg.id}.jpg`,
       bytes,
     });
+    if (onOverlayLane) {
+      // Overlay images: ship natural dims when cheaply available so the
+      // main process can skip probing (it still probes as a fallback).
+      const img = await loadImageElement(url);
+      overlayPayload.push({
+        id: seg.id,
+        mediaType: "image",
+        track: seg.track ?? 1,
+        startMs: seg.startMs,
+        endMs: seg.endMs,
+        durationMs: seg.durationMs,
+        trimInMs: seg.trimInMs || 0,
+        volume: seg.volume,
+        chroma: seg.chroma ? sanitizeChromaKeySettings(seg.chroma) : null,
+        overlay: seg.overlay,
+        imagePath,
+        ...(img && img.naturalWidth > 0 && img.naturalHeight > 0
+          ? { sourceWidth: img.naturalWidth, sourceHeight: img.naturalHeight }
+          : {}),
+      });
+      continue;
+    }
     segPayload.push({
       // v4.5: id carries the per-boundary transition override key.
       id: seg.id,
@@ -229,7 +385,58 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
       durationMs: seg.durationMs,
       startMs: seg.startMs,
       endMs: seg.endMs,
+      mediaType: "image",
+      track: 0,
+      volume: seg.volume,
+      trimInMs: seg.trimInMs || 0,
+      sourceDurationMs: seg.sourceDurationMs ?? null,
+      chroma: seg.chroma ? sanitizeChromaKeySettings(seg.chroma) : null,
+      overlay: seg.overlay,
     });
+  }
+
+  // 1.5 v5.0: render + upload SFX WAVs (one render per UNIQUE sfxId per
+  // export run — the cache dedupes repeated placements of the same effect).
+  // Render failures (no OfflineAudioContext, unknown id, synthesis error)
+  // skip that placement with a console warn instead of failing the export.
+  const ipcSfx: NativeSfxPayload[] = [];
+  if (opts.sfx && opts.sfx.length > 0) {
+    const wavCache = new Map<string, { wavPath: string; durationMs: number } | null>();
+    for (const item of opts.sfx) {
+      if (!item || !item.id || !item.sfxId) continue;
+      if (!wavCache.has(item.sfxId)) {
+        let entry: { wavPath: string; durationMs: number } | null = null;
+        try {
+          const rendered = await renderSfxWav(item.sfxId);
+          if (rendered) {
+            const bytes = await rendered.blob.arrayBuffer();
+            const wavPath = await api.saveTempAudio({
+              name: `sfx_${item.sfxId}.wav`,
+              bytes,
+            });
+            entry = { wavPath, durationMs: rendered.durationMs };
+          } else {
+            console.warn(
+              `[framefuse] SFX "${item.sfxId}" could not be rendered (Web Audio unavailable?) — skipping placement ${item.id}`,
+            );
+          }
+        } catch (e) {
+          console.warn(`[framefuse] SFX "${item.sfxId}" render failed — skipping placement ${item.id}`, e);
+        }
+        wavCache.set(item.sfxId, entry);
+      }
+      const cached = wavCache.get(item.sfxId);
+      if (cached) {
+        ipcSfx.push({
+          id: item.id,
+          sfxId: item.sfxId,
+          startMs: item.startMs,
+          volume: item.volume,
+          wavPath: cached.wavPath,
+          durationMs: cached.durationMs,
+        });
+      }
+    }
   }
 
   // 2. Persist audio if present.
@@ -379,6 +586,10 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
           }
         : undefined,
       watermark: ipcWatermark,
+      // v5.0: overlay-lane segments (composited per clip — never clips) and
+      // rendered SFX placements. Omitted entirely for v4.9-shaped projects.
+      overlays: overlayPayload.length > 0 ? overlayPayload : undefined,
+      sfx: ipcSfx.length > 0 ? ipcSfx : undefined,
     });
     return result;
   } finally {
@@ -405,6 +616,10 @@ async function exportViaWebCodecs(
     subtitles,
     captionSettings,
   } = opts;
+
+  // v5.0 media features (video sources / overlay lanes / chroma key / SFX)
+  // are desktop-app only — fail with a clear typed error before any work.
+  assertBrowserExportSupport(opts);
 
   const W = typeof window !== "undefined" ? (window as any) : null;
   const VideoEncoderCtor = W?.VideoEncoder;
@@ -599,6 +814,10 @@ async function exportViaMediaRecorder(
     subtitles,
     captionSettings,
   } = opts;
+
+  // v5.0 media features (video sources / overlay lanes / chroma key / SFX)
+  // are desktop-app only — fail with a clear typed error before any work.
+  assertBrowserExportSupport(opts);
 
   const dims = resolveDimensions(settings.aspect, "720p");
   const fps = settings.fps;
@@ -2150,6 +2369,9 @@ export async function exportNative(
     return await exportViaWebCodecs(opts);
   } catch (err: any) {
     if (err?.message === "Export cancelled") throw err;
+    // v5.0: desktop-only media features — surface the clear error as-is
+    // (do NOT fall through to MediaRecorder, which cannot render them).
+    if (err?.message === DESKTOP_ONLY_EXPORT_MSG) throw err;
     if (err?.message === "NO_WEBCODECS") {
       return exportViaMediaRecorder(opts);
     }

@@ -1,70 +1,42 @@
 // src/lib/merger/whisper.ts — OpenAI Whisper-tiny ASR via Transformers.js
+// (Web Worker edition, v5.0).
+//
 // Pure in-browser transcription (no server, no API key). Produces cues
 // with REAL per-word timestamps using Whisper's cross-attention alignment
 // (`return_timestamps: "word"`) so the viral "word-by-word" caption mode
 // highlights the currently-spoken word exactly when it is spoken, and the
 // kinetic typography animations drive per-word "in" transitions.
 //
-// Model: Xenova/whisper-tiny (~75 MB, downloaded once and cached in
-// IndexedDB by Transformers.js). Multilingual base model — auto-detects
-// the spoken language.
+// ARCHITECTURE (Task 6-b):
+//  - The MAIN thread (this file) decodes the audio to mono 16 kHz PCM
+//    (AudioContext/decodeAudioData are unavailable inside workers), then
+//    TRANSFERS the Float32Array to a persistent Web Worker
+//    (whisper-worker.ts) and relays its progress messages. The UI never
+//    blocks: ALL Transformers.js + onnxruntime WASM inference runs inside
+//    the worker, and the heavy pipeline code is no longer part of the
+//    main-thread bundle at all.
+//  - The WORKER owns the Xenova/whisper-tiny pipeline (built once, kept
+//    warm for the app lifetime), downloads the model ONCE into the
+//    browser's persistent Cache API storage (env.useBrowserCache) and
+//    returns the raw output chunks; the parsing/grouping into display
+//    cues happens here on the main thread (see parseWhisperOutput).
+//  - Model: Xenova/whisper-tiny (~75 MB, downloaded once and cached
+//    persistently). Multilingual base model — auto-detects the spoken
+//    language. Internet is only required for the FIRST transcription.
+//
+// Node-safety: this module is importable in Node/bun with no side effects —
+// the Worker is created lazily inside function calls, and the (type-only)
+// import of whisper-worker.ts is erased at compile time.
 
 import type { SubtitleCue, WordTimestamp } from "./subtitles";
+import type {
+  RawWhisperChunk,
+  WhisperWorkerResponse,
+} from "./whisper-worker";
 
-// Lazy-load Transformers.js so the heavy model code only loads when
-// the user actually clicks "Generate captions".
-let pipelinePromise: Promise<any> | null = null;
-
-// The model is DOWNLOADED at runtime from the HuggingFace Hub on first
-// use, then cached in IndexedDB for all future runs. The user needs an
-// internet connection only for the FIRST transcription.
-const REMOTE_MODEL_ID = "Xenova/whisper-tiny";
-
-// Singleton pipeline + progress callback (module scope so getPipeline
-// can report download progress).
-let activeProgressCb: ((p: WhisperProgress) => void) | null = null;
-
-async function getPipeline(): Promise<any> {
-  if (pipelinePromise) return pipelinePromise;
-
-  pipelinePromise = (async () => {
-    const { pipeline, env } = await import("@xenova/transformers");
-
-    env.allowRemoteModels = true;
-    env.allowLocalModels = false;
-
-    const progress_callback = (info: any) => {
-      if (!activeProgressCb) return;
-      if (info.status === "progress") {
-        const pct = info.progress ?? 0;
-        const file = info.file ?? "model";
-        activeProgressCb({
-          progress: Math.round(pct),
-          status: `Downloading ${file}…`,
-        });
-      } else if (info.status === "done") {
-        activeProgressCb({
-          progress: 100,
-          status: `Loaded ${info.file ?? "model"}`,
-        });
-      } else if (info.status === "initiate") {
-        activeProgressCb({
-          progress: 0,
-          status: `Preparing ${info.file ?? "model"}…`,
-        });
-      }
-    };
-
-    const pipe = await pipeline(
-      "automatic-speech-recognition",
-      REMOTE_MODEL_ID,
-      { progress_callback },
-    );
-    return pipe;
-  })();
-
-  return pipelinePromise;
-}
+// ---------------------------------------------------------------------------
+// Public API (unchanged since v4 — page.tsx imports these exact signatures).
+// ---------------------------------------------------------------------------
 
 export interface WhisperProgress {
   /** 0-100 progress for the entire transcription run. */
@@ -97,6 +69,11 @@ export interface WhisperResult {
   /** True when REAL word-level alignment was produced. */
   wordLevel: boolean;
 }
+
+// ---------------------------------------------------------------------------
+// Audio decoding (main thread only — AudioContext/OfflineAudioContext are
+// not available inside workers).
+// ---------------------------------------------------------------------------
 
 /**
  * Decode an arbitrary audio File into mono 16 kHz Float32Array PCM
@@ -146,21 +123,21 @@ async function decodeAudioToMono16k(
 
 // ---------------------------------------------------------------------------
 // Word-level cue grouping — turns Whisper's per-word chunks into display
-// cues that keep EXACT per-word timings.
+// cues that keep EXACT per-word timings. (Pure, exported for the harness.)
 // ---------------------------------------------------------------------------
 
 const MAX_WORDS_PER_CUE = 7;
 const MAX_CUE_MS = 3500;
 const WORD_GAP_BREAK_MS = 700;
 
-interface RawWord {
+export interface RawWord {
   text: string;
   startMs: number;
   endMs: number;
 }
 
 /** Group raw aligned words into cues (sentence-ish windows). */
-function groupWordsIntoCues(words: RawWord[]): SubtitleCue[] {
+export function groupWordsIntoCues(words: RawWord[]): SubtitleCue[] {
   const cues: SubtitleCue[] = [];
   let current: RawWord[] = [];
 
@@ -209,31 +186,279 @@ function groupWordsIntoCues(words: RawWord[]): SubtitleCue[] {
   return cues;
 }
 
+// ---------------------------------------------------------------------------
+// Raw-output parsing — converts the worker's raw Transformers.js output
+// into SubtitleCue[]. (Pure, exported for the harness.)
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse the raw Whisper output (`{ chunks }` — the exact shape the worker
+ * returns) into display cues.
+ *
+ * wordLevel=true  → each chunk is (usually) one word with exact timing;
+ *                   multiple tokens inside one chunk (CJK / compact scripts)
+ *                   are distributed across the chunk window. (v4.1 behavior.)
+ * wordLevel=false → chunk-level timestamps with even word distribution.
+ *                   (v4 fallback behavior.)
+ */
+export function parseWhisperOutput(
+  output: { chunks?: RawWhisperChunk[] } | null | undefined,
+  wordLevel: boolean,
+): SubtitleCue[] {
+  const rawChunks = output?.chunks;
+  const chunks: RawWhisperChunk[] = Array.isArray(rawChunks)
+    ? rawChunks
+    : [];
+
+  if (wordLevel && chunks.length > 0) {
+    // Word mode: each chunk is (usually) one word with exact timing.
+    const rawWords: RawWord[] = [];
+    let lastEnd = 0;
+    for (const chunk of chunks) {
+      const text = (chunk.text || "").trim();
+      if (!text) continue;
+      const [s, e] = chunk.timestamp;
+      const startMs = s != null ? Math.round(s * 1000) : lastEnd;
+      let endMs =
+        e != null ? Math.round(e * 1000) : startMs + Math.max(200, text.length * 90);
+      if (endMs <= startMs) endMs = startMs + 200;
+      lastEnd = endMs;
+      // A chunk may contain multiple tokens for CJK / compact scripts.
+      const tokens = text.split(/\s+/).filter(Boolean);
+      if (tokens.length <= 1) {
+        rawWords.push({ text, startMs, endMs });
+      } else {
+        // Distribute the chunk window across its tokens.
+        const dur = endMs - startMs;
+        const per = dur / tokens.length;
+        tokens.forEach((t, i) => {
+          rawWords.push({
+            text: t,
+            startMs: startMs + Math.round(per * i),
+            endMs: startMs + Math.round(per * (i + 1)),
+          });
+        });
+      }
+    }
+    return groupWordsIntoCues(rawWords);
+  }
+
+  // Fallback: chunk-level timestamps + even word distribution (v4).
+  const cues: SubtitleCue[] = [];
+  let cueId = 1;
+  for (const chunk of chunks) {
+    if (!chunk.timestamp) continue;
+    const [startSec, endSec] = chunk.timestamp;
+    if (startSec == null || endSec == null) continue;
+    if (endSec <= startSec) continue;
+
+    const startMs = Math.round(startSec * 1000);
+    const endMs = Math.round(endSec * 1000);
+    const text = (chunk.text || "").trim();
+    if (!text) continue;
+
+    const tokens = text.split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) continue;
+
+    const dur = endMs - startMs;
+    const per = dur / tokens.length;
+    const words: WordTimestamp[] = tokens.map((text, i) => ({
+      text,
+      startMs: startMs + Math.round(per * i),
+      endMs: startMs + Math.round(per * (i + 1)),
+    }));
+
+    cues.push({ id: cueId++, startMs, endMs, text, words });
+  }
+  cues.sort((a, b) => a.startMs - b.startMs);
+  cues.forEach((c, i) => (c.id = i + 1));
+  return cues;
+}
+
+// ---------------------------------------------------------------------------
+// Progress curve mapping (pure, exported for the harness).
+//
+// Overall curve: decode 2 % → model download 10–25 % → transcribing 25–80 %
+// → parsing 80–100 %. Worker "model" events carry the raw file-download
+// percent; worker "transcribe" events already carry absolute 25–80 values.
+// ---------------------------------------------------------------------------
+
+/** Clamp a raw percentage into 0–100 (NaN → 0). */
+export function clampPercent(progress: number): number {
+  const p = Number.isFinite(progress) ? progress : 0;
+  return Math.min(100, Math.max(0, Math.round(p)));
+}
+
+/** Map a worker progress event onto the overall transcribeWithWhisper curve. */
+export function mapWorkerProgress(
+  stage: "model" | "transcribe",
+  progress: number,
+): number {
+  const pct = clampPercent(progress);
+  if (stage === "model") {
+    // Model download occupies the 10–25 % band.
+    return Math.round(10 + 15 * (pct / 100));
+  }
+  // Transcription-stage events already carry absolute 25–80 % values.
+  return Math.min(80, Math.max(25, pct));
+}
+
+// ---------------------------------------------------------------------------
+// Persistent worker singleton + run bookkeeping.
+// ---------------------------------------------------------------------------
+
+interface WorkerTranscription {
+  chunks: RawWhisperChunk[] | null;
+  language: string | null;
+  wordLevel: boolean;
+}
+
+interface PendingRun {
+  mode: "transcribe" | "preload";
+  resolve: (result: WorkerTranscription) => void;
+  reject: (error: Error) => void;
+  onProgress?: (p: WhisperProgress) => void;
+}
+
+/** One persistent worker for the whole app lifetime (created lazily). */
+let workerInstance: Worker | null = null;
+
+const pendingRuns = new Map<number, PendingRun>();
+let runCounter = 0;
+
+function getWorker(): Worker {
+  if (typeof window === "undefined") {
+    throw new Error("Whisper is only available in the browser");
+  }
+  if (typeof Worker === "undefined") {
+    throw new Error("Web Workers are not available in this environment");
+  }
+  if (workerInstance) return workerInstance;
+  try {
+    // webpack 5 (next build --webpack) and the Next 16 dev server both
+    // compile this exact pattern into a separately-loadable worker chunk.
+    workerInstance = new Worker(
+      new URL("./whisper-worker.ts", import.meta.url),
+      { type: "module" },
+    );
+  } catch (err) {
+    throw new Error(
+      `Could not start the Whisper worker: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+  workerInstance.addEventListener("message", onWorkerMessage);
+  workerInstance.addEventListener("error", onWorkerError);
+  workerInstance.addEventListener("messageerror", onWorkerMessageError);
+  return workerInstance;
+}
+
+function failAllPending(message: string): void {
+  for (const [runId, run] of pendingRuns) {
+    pendingRuns.delete(runId);
+    run.reject(new Error(message));
+  }
+}
+
+function disposeWorker(): void {
+  if (!workerInstance) return;
+  workerInstance.removeEventListener("message", onWorkerMessage);
+  workerInstance.removeEventListener("error", onWorkerError);
+  workerInstance.removeEventListener("messageerror", onWorkerMessageError);
+  workerInstance.terminate();
+  workerInstance = null;
+}
+
+function onWorkerMessage(event: MessageEvent): void {
+  const data = event.data as WhisperWorkerResponse | null | undefined;
+  if (!data || typeof data !== "object" || typeof data.type !== "string") {
+    return; // unknown message — ignore
+  }
+  if (typeof data.runId !== "number") return;
+  const run = pendingRuns.get(data.runId);
+  if (!run) return; // stale (aborted or already settled) — discard
+
+  switch (data.type) {
+    case "progress": {
+      const progress =
+        run.mode === "transcribe"
+          ? mapWorkerProgress(data.stage, data.progress)
+          : clampPercent(data.progress);
+      run.onProgress?.({ progress, status: data.status });
+      break;
+    }
+    case "result":
+      pendingRuns.delete(data.runId);
+      run.resolve({
+        chunks: data.chunks ?? null,
+        language: data.language ?? null,
+        wordLevel: !!data.wordLevel,
+      });
+      break;
+    case "error":
+      pendingRuns.delete(data.runId);
+      run.reject(new Error(data.message || "Whisper worker failed"));
+      break;
+    default:
+      break; // unknown type — ignore (forward compatible)
+  }
+}
+
+/**
+ * The worker itself failed to load or crashed with an uncaught error: no
+ * result will ever arrive for pending runs, so reject them all (the UI must
+ * never hang) and drop the dead worker so the next call spawns a fresh one
+ * (the model itself is re-read from the persistent cache, not re-downloaded).
+ */
+function onWorkerError(): void {
+  failAllPending("Whisper worker crashed or failed to load");
+  disposeWorker();
+}
+
+/** Structured-clone failure: the protocol only sends plain objects — if
+ * deserialization ever breaks, fail fast instead of hanging forever. */
+function onWorkerMessageError(): void {
+  failAllPending("Whisper worker sent an unreadable message");
+}
+
+// ---------------------------------------------------------------------------
+// Public functions.
+// ---------------------------------------------------------------------------
+
 /**
  * Transcribe the given audio file with Whisper-tiny and return cues
  * with per-word timestamps.
  *
- * v4.1: uses `return_timestamps: "word"` — Whisper's DTW cross-attention
- * alignment — so every word carries its REAL spoken time. Words are then
- * grouped into short display cues (max ~7 words / sentence punctuation /
- * natural pauses) while preserving exact per-word timing.
+ * v5.0: the audio is decoded here (main thread) and the PCM is TRANSFERRED
+ * to the persistent Whisper Web Worker, which runs all inference off the UI
+ * thread (chunk_length_s 30 / stride_length_s 5, word-level timestamps via
+ * `return_timestamps: "word"` with a chunk-level fallback — identical
+ * pipeline options to v4). Raw output chunks come back and are parsed into
+ * display cues (max ~7 words / sentence punctuation / natural pauses) while
+ * preserving exact per-word timing.
  *
- * Fallback: if word-level alignment is unavailable (very old
- * transformers.js or an alignment failure), we fall back to chunk-level
- * timestamps with even word distribution (v4 behavior).
+ * Aborting rejects immediately and marks the run stale (late worker results
+ * are discarded); the worker is NOT terminated so the model stays warm.
  */
 export async function transcribeWithWhisper(
   opts: WhisperOptions,
 ): Promise<WhisperResult> {
   const { audioFile, onProgress, signal } = opts;
 
+  if (typeof window === "undefined") {
+    throw new Error("Whisper transcription is only available in the browser");
+  }
+
   onProgress?.({ progress: 2, status: "Decoding audio…" });
   if (signal?.aborted) throw new Error("Transcription cancelled");
 
   let pcm: Float32Array;
+  let sampleRate = 16000;
   try {
     const decoded = await decodeAudioToMono16k(audioFile);
     pcm = decoded.data;
+    sampleRate = decoded.sampleRate;
   } catch (err) {
     throw new Error(
       `Could not decode audio: ${
@@ -243,157 +468,115 @@ export async function transcribeWithWhisper(
   }
   if (pcm.length === 0) throw new Error("Audio file is empty or silent");
 
+  // Computed BEFORE the transfer — the transfer neuters this buffer.
+  const pcmDurationMs = Math.round((pcm.length / sampleRate) * 1000);
+
   onProgress?.({ progress: 10, status: "Loading Whisper-tiny model…" });
   if (signal?.aborted) throw new Error("Transcription cancelled");
 
-  activeProgressCb = onProgress ?? null;
+  const worker = getWorker();
+  const runId = ++runCounter;
+  const lang = opts.language || "auto";
+
+  const onAbort = () => {
+    const run = pendingRuns.get(runId);
+    if (!run) return;
+    pendingRuns.delete(runId);
+    // Best-effort: lets the worker skip this run if it has not started yet.
+    // A run already mid-inference finishes in the background and its result
+    // is discarded here (stale runId). The worker is NOT terminated.
+    try {
+      worker.postMessage({ type: "cancel", runId });
+    } catch {
+      // Worker already gone — nothing to cancel.
+    }
+    run.reject(new Error("Transcription cancelled"));
+  };
 
   try {
-    const pipe = await getPipeline();
-
-    onProgress?.({ progress: 25, status: "Transcribing audio…" });
-    if (signal?.aborted) throw new Error("Transcription cancelled");
-
-    const lang = opts.language || "auto";
-    const baseOptions: Record<string, unknown> = {
-      chunk_length_s: 30,
-      stride_length_s: 5,
-      task: "transcribe",
-      // Disables conditioning on previous text — prevents the classic
-      // Whisper repetition loop on long/degraded audio.
-      condition_on_previous_text: false,
-    };
-    if (lang !== "auto") baseOptions.language = lang;
-
-    // ── Pass 1: REAL word-level alignment ──
-    let output: any = null;
-    let wordLevel = false;
-    try {
-      output = await pipe(pcm, {
-        ...baseOptions,
-        return_timestamps: "word",
-      });
-      wordLevel = true;
-    } catch {
-      // Word alignment unsupported → chunk-level fallback below.
-      wordLevel = false;
-    }
+    const raw = await new Promise<WorkerTranscription>((resolve, reject) => {
+      pendingRuns.set(runId, { resolve, reject, onProgress, mode: "transcribe" });
+      signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        // Zero-copy: transfer the PCM buffer to the worker.
+        worker.postMessage(
+          { type: "transcribe", runId, pcm, sampleRate, language: lang },
+          [pcm.buffer],
+        );
+      } catch (err) {
+        pendingRuns.delete(runId);
+        reject(
+          new Error(
+            `Could not send audio to the Whisper worker: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          ),
+        );
+      }
+    });
 
     if (signal?.aborted) throw new Error("Transcription cancelled");
-
-    if (!wordLevel) {
-      onProgress?.({
-        progress: 40,
-        status: "Word alignment unavailable — falling back…",
-      });
-      output = await pipe(pcm, {
-        ...baseOptions,
-        return_timestamps: true,
-      });
-    }
 
     onProgress?.({ progress: 80, status: "Aligning word timestamps…" });
 
-    const detectedLang =
-      lang === "auto" ? (output?.language ?? null) : lang;
-
-    // ── Parse output into cues ──
-    const chunks: Array<{
-      text: string;
-      timestamp: [number | null, number | null];
-    }> = output?.chunks ?? [];
-
-    let cues: SubtitleCue[] = [];
-
-    if (wordLevel && chunks.length > 0) {
-      // Word mode: each chunk is (usually) one word with exact timing.
-      const rawWords: RawWord[] = [];
-      let lastEnd = 0;
-      for (const chunk of chunks) {
-        const text = (chunk.text || "").trim();
-        if (!text) continue;
-        const [s, e] = chunk.timestamp;
-        const startMs =
-          s != null ? Math.round(s * 1000) : lastEnd;
-        let endMs =
-          e != null ? Math.round(e * 1000) : startMs + Math.max(200, text.length * 90);
-        if (endMs <= startMs) endMs = startMs + 200;
-        lastEnd = endMs;
-        // A chunk may contain multiple tokens for CJK / compact scripts.
-        const tokens = text.split(/\s+/).filter(Boolean);
-        if (tokens.length <= 1) {
-          rawWords.push({ text, startMs, endMs });
-        } else {
-          // Distribute the chunk window across its tokens.
-          const dur = endMs - startMs;
-          const per = dur / tokens.length;
-          tokens.forEach((t, i) => {
-            rawWords.push({
-              text: t,
-              startMs: startMs + Math.round(per * i),
-              endMs: startMs + Math.round(per * (i + 1)),
-            });
-          });
-        }
-      }
-      cues = groupWordsIntoCues(rawWords);
-    } else {
-      // Fallback: chunk-level timestamps + even word distribution (v4).
-      let cueId = 1;
-      for (const chunk of chunks) {
-        if (!chunk.timestamp) continue;
-        const [startSec, endSec] = chunk.timestamp;
-        if (startSec == null || endSec == null) continue;
-        if (endSec <= startSec) continue;
-
-        const startMs = Math.round(startSec * 1000);
-        const endMs = Math.round(endSec * 1000);
-        const text = (chunk.text || "").trim();
-        if (!text) continue;
-
-        const tokens = text.split(/\s+/).filter(Boolean);
-        if (tokens.length === 0) continue;
-
-        const dur = endMs - startMs;
-        const per = dur / tokens.length;
-        const words: WordTimestamp[] = tokens.map((text, i) => ({
-          text,
-          startMs: startMs + Math.round(per * i),
-          endMs: startMs + Math.round(per * (i + 1)),
-        }));
-
-        cues.push({ id: cueId++, startMs, endMs, text, words });
-      }
-      cues.sort((a, b) => a.startMs - b.startMs);
-      cues.forEach((c, i) => (c.id = i + 1));
-    }
+    const cues = parseWhisperOutput(
+      { chunks: raw.chunks ?? [] },
+      raw.wordLevel,
+    );
+    const detectedLang = raw.language;
 
     onProgress?.({ progress: 100, status: "Done" });
 
     return {
       cues,
       language: detectedLang,
-      durationMs: cues.length
-        ? cues[cues.length - 1].endMs
-        : Math.round((pcm.length / 16000) * 1000),
-      wordLevel,
+      durationMs: cues.length ? cues[cues.length - 1].endMs : pcmDurationMs,
+      wordLevel: raw.wordLevel,
     };
   } finally {
-    // Always clear the progress callback — success OR error.
-    activeProgressCb = null;
+    signal?.removeEventListener("abort", onAbort);
+    pendingRuns.delete(runId);
   }
 }
 
 /**
- * Pre-load the Whisper-tiny model. Call this on app idle to avoid the
- * model-download latency on the first "Generate" click.
+ * Pre-load the Whisper-tiny model into the persistent worker. Call this on
+ * app idle to avoid the model-download latency on the first "Generate" click.
+ * The model is stored in the browser's persistent cache — download once,
+ * reuse forever.
  */
 export async function preloadWhisper(
   onProgress?: (p: WhisperProgress) => void,
 ): Promise<void> {
   onProgress?.({ progress: 0, status: "Loading Whisper-tiny model…" });
-  await getPipeline();
-  onProgress?.({ progress: 100, status: "Ready" });
+  const worker = getWorker(); // throws a clear error outside the browser
+  const runId = ++runCounter;
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      pendingRuns.set(runId, {
+        mode: "preload",
+        resolve: () => resolve(),
+        reject,
+        onProgress,
+      });
+      try {
+        worker.postMessage({ type: "preload", runId });
+      } catch (err) {
+        pendingRuns.delete(runId);
+        reject(
+          new Error(
+            `Could not reach the Whisper worker: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          ),
+        );
+      }
+    });
+    onProgress?.({ progress: 100, status: "Ready" });
+  } finally {
+    pendingRuns.delete(runId);
+  }
 }
 
 /** True if Whisper transcription is available in this environment. */
@@ -401,6 +584,7 @@ export function isWhisperAvailable(): boolean {
   return (
     typeof window !== "undefined" &&
     !!(window as any).AudioContext &&
-    typeof OfflineAudioContext !== "undefined"
+    typeof OfflineAudioContext !== "undefined" &&
+    typeof Worker !== "undefined"
   );
 }

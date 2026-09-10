@@ -12,6 +12,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   saveTempImage: (payload) => ipcRenderer.invoke("save-temp-image", payload),
   saveTempAudio: (payload) => ipcRenderer.invoke("save-temp-audio", payload),
+  // v5.0: video sources for the multi-track timeline (same IPC pattern as
+  // saveTempAudio — bytes land in a temp file, the path comes back).
+  saveTempVideo: (payload) => ipcRenderer.invoke("save-temp-video", payload),
   saveTempSrt: (payload) => ipcRenderer.invoke("save-temp-srt", payload),
 
   chooseOutput: () => ipcRenderer.invoke("choose-output"),

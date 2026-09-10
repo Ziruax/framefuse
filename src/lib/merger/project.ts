@@ -1,46 +1,71 @@
-// src/lib/merger/project.ts — .framefuse.json project save/load (v4.2)
+// src/lib/merger/project.ts — .framefuse.json project save/load (v4.2 → v5.0)
 //
 // A project file is a single JSON document that restores the ENTIRE working
-// session: media (images + audio, inlined as data URLs so the file is fully
-// self-contained), subtitle cues with word timing, headline overlay items,
-// all settings, and per-segment duration overrides.
+// session: media (images / videos / audio, inlined as data URLs so the file
+// is fully self-contained), subtitle cues with word timing, headline overlay
+// items, all settings, per-segment duration overrides and — since v5.0 — the
+// multi-track edit map (itemEdits), SFX placements (sfxItems) and known
+// video source durations (videoDurations). Videos above MAX_VIDEO_MB are
+// not inlined (a metadata-only stub is kept so the loader can flag it via
+// LoadedProject.videoSkipped).
 //
 // Format:
 // {
 //   "app": "framefuse",
-//   "version": 4.2,
+//   "version": 5.0,
 //   "savedAt": 1730000000000,
-//   "images":   [{ "id": "f...", "name": "001__Beat_1_0s_x.jpg", "type": "image/jpeg", "dataUrl": "..." }],
+//   "images":   [{ "id": "f...", "name": "001__Beat_1_0s_x.jpg", "type": "image/jpeg", "dataUrl": "...", "mediaType": "image" | "video"? }],
 //   "audio":    { "name": "voiceover.mp3", "type": "audio/mpeg", "dataUrl": "..." } | null,
 //   "subtitles":{ "fileName": "...", "cues": [...] } | null,
 //   "headlines":[ ... ],
 //   "overrides":{ "f...": 4200 },
-//   "settings": { "kenBurns", "video", "caption", "audio", "whisperLanguage" }
+//   "motionOverrides": { "f...": "left" },
+//   "itemEdits": { "f...": { "track": 1, "startMs": 500, ... } },        // v5.0
+//   "sfxItems": [ { "id": "sfx_...", "sfxId": "whoosh", "startMs": 1200, "volume": 0.8 } ], // v5.0
+//   "videoDurations": { "f...": 18340 },                                   // v5.0
+//   "watermark": { ... } | null,
+//   "settings": { "kenBurns", "video", "caption", "audio", "whisperLanguage", "transition" }
 // }
+//
+// Loading is fully backward compatible: ≤4.9 files (no new fields) load
+// unchanged — every v5 field is optional and sanitized on parse.
 
 import type {
   AudioSettings,
   CaptionSettings,
   HeadlineItem,
+  ItemEdit,
   KenBurnsConfig,
   KenBurnsDirection,
+  MediaKind,
+  OverlayPos,
   TransitionSettings,
   VideoSettings,
   WatermarkSettings,
 } from "./types";
 import { serializeSrt, type SubtitleCue } from "./subtitles";
+import { getSfxDef, type SfxItem } from "./sfx";
 
 export const PROJECT_APP = "framefuse";
-export const PROJECT_VERSION = 4.9;
+export const PROJECT_VERSION = 5.0;
 
 /** Audio above this size (MB, decoded) is skipped to keep project files sane. */
 export const MAX_AUDIO_MB = 25;
+
+/** v5.0: video entries above this size (MB) are skipped from inlining —
+ *  video data URLs are ~1.37× the raw size, so 200MB keeps project files
+ *  under ~280MB while still bundling typical short-form clips. */
+export const MAX_VIDEO_MB = 200;
 
 export interface ProjectImageEntry {
   id: string;
   name: string;
   type: string;
   dataUrl: string;
+  /** v5.0: "video" entries are reconstructed as video media; absent (≤4.9
+   *  files) means "image". An entry with an empty dataUrl + mediaType
+   *  "video" is a too-big-to-inline stub (see MAX_VIDEO_MB). */
+  mediaType?: MediaKind;
 }
 
 export interface ProjectAudioEntry {
@@ -64,6 +89,14 @@ export interface ProjectFile {
   /** v4.8: per-segment Ken Burns direction overrides (id → direction).
    *  Optional for back-compat with ≤4.7 project files. */
   motionOverrides?: Record<string, KenBurnsDirection>;
+  /** v5.0: per-item edit map (id → { startMs, durationMs, track, trimInMs,
+   *  volume, chroma, overlay }) — multi-track timeline state. */
+  itemEdits?: Record<string, ItemEdit>;
+  /** v5.0: SFX placements on the master timeline (sanitized to known
+   *  SFX_LIBRARY ids on load; invalid entries are dropped). */
+  sfxItems?: SfxItem[];
+  /** v5.0: known source durations for video items (id → ms). */
+  videoDurations?: Record<string, number>;
   /** Watermark / logo overlay (v4.4): image + settings. */
   watermark: {
     image: ProjectImageEntry | null;
@@ -81,7 +114,9 @@ export interface ProjectFile {
 }
 
 export interface SaveProjectInput {
-  images: { id: string; file: File }[];
+  /** v5.0: mediaType is optional per entry — the v4.9 call shape
+   *  `images: [{ id, file }]` keeps compiling (defaults to "image"). */
+  images: { id: string; file: File; mediaType?: MediaKind }[];
   audio: File | null;
   subtitles: { fileName: string; cues: SubtitleCue[] } | null;
   headlines: HeadlineItem[];
@@ -90,6 +125,13 @@ export interface SaveProjectInput {
   motionOverrides?: Record<string, KenBurnsDirection>;
   /** Watermark / logo overlay (v4.4). */
   watermark: { image: { id: string; file: File } | null; settings: WatermarkSettings } | null;
+  /** v5.0: multi-track timeline edits. */
+  itemEdits?: Record<string, ItemEdit>;
+  /** v5.0: SFX placements (rendered WAVs are re-synthesized on load —
+   *  effects are procedural, only the placements persist). */
+  sfxItems?: SfxItem[];
+  /** v5.0: known video source durations (id → ms). */
+  videoDurations?: Record<string, number>;
   settings: ProjectFile["settings"];
 }
 
@@ -108,11 +150,28 @@ export async function buildProjectFile(
 ): Promise<ProjectFile> {
   const images: ProjectImageEntry[] = [];
   for (const img of input.images) {
+    const isVideo = img.mediaType === "video";
+    if (isVideo && img.file.size > MAX_VIDEO_MB * 1024 * 1024) {
+      // v5.0: too big to inline — keep a metadata-only stub so the loader
+      // can flag it (LoadedProject.videoSkipped) instead of silently losing
+      // the item from the session inventory.
+      images.push({
+        id: img.id,
+        name: img.file.name,
+        type: img.file.type || "video/mp4",
+        dataUrl: "",
+        mediaType: "video",
+      });
+      continue;
+    }
     images.push({
       id: img.id,
       name: img.file.name,
-      type: img.file.type || "image/jpeg",
+      type: img.file.type || (isVideo ? "video/mp4" : "image/jpeg"),
       dataUrl: await fileToDataUrl(img.file),
+      ...(img.mediaType && img.mediaType !== "image"
+        ? { mediaType: img.mediaType }
+        : {}),
     });
   }
 
@@ -156,6 +215,9 @@ export async function buildProjectFile(
     headlines: input.headlines,
     overrides: input.overrides,
     motionOverrides: sanitizeMotionOverrides(input.motionOverrides),
+    itemEdits: sanitizeItemEdits(input.itemEdits),
+    sfxItems: sanitizeSfxItems(input.sfxItems),
+    videoDurations: sanitizeVideoDurations(input.videoDurations),
     watermark,
     settings: input.settings,
   };
@@ -175,6 +237,102 @@ function sanitizeMotionOverrides(
       out[id] = dir;
       any = true;
     }
+  }
+  return any ? out : undefined;
+}
+
+/**
+ * v5.0: keep only well-typed ItemEdit fields per id (finite numbers, real
+ * objects). chroma passes through RAW — chroma.ts owns sanitization at the
+ * UI boundary. Returns undefined when nothing survives (field omitted).
+ */
+export function sanitizeItemEdits(
+  edits: Record<string, ItemEdit> | undefined | null,
+): Record<string, ItemEdit> | undefined {
+  if (!edits || typeof edits !== "object") return undefined;
+  const out: Record<string, ItemEdit> = {};
+  let any = false;
+  for (const [id, edit] of Object.entries(edits)) {
+    if (!id || !edit || typeof edit !== "object") continue;
+    const clean: ItemEdit = {};
+    if (typeof edit.startMs === "number" && Number.isFinite(edit.startMs)) {
+      clean.startMs = edit.startMs;
+    }
+    if (typeof edit.durationMs === "number" && Number.isFinite(edit.durationMs)) {
+      clean.durationMs = edit.durationMs;
+    }
+    if (typeof edit.track === "number" && Number.isFinite(edit.track)) {
+      clean.track = edit.track;
+    }
+    if (typeof edit.trimInMs === "number" && Number.isFinite(edit.trimInMs)) {
+      clean.trimInMs = edit.trimInMs;
+    }
+    if (typeof edit.volume === "number" && Number.isFinite(edit.volume)) {
+      clean.volume = edit.volume;
+    }
+    if (edit.chroma && typeof edit.chroma === "object") {
+      clean.chroma = edit.chroma;
+    }
+    if (
+      edit.overlay &&
+      typeof edit.overlay === "object" &&
+      typeof edit.overlay.position === "string" &&
+      typeof edit.overlay.scalePercent === "number" &&
+      Number.isFinite(edit.overlay.scalePercent)
+    ) {
+      clean.overlay = {
+        scalePercent: edit.overlay.scalePercent,
+        position: edit.overlay.position as OverlayPos,
+      };
+    }
+    if (Object.keys(clean).length > 0) {
+      out[id] = clean;
+      any = true;
+    }
+  }
+  return any ? out : undefined;
+}
+
+/**
+ * v5.0: drop SFX placements that don't match the sfx.ts shapes — unknown
+ * effect ids, missing/invalid ids, non-finite starts. Surviving items get
+ * volume clamped to 0..1 (makeSfxItem's contract). Returns undefined when
+ * nothing survives (field omitted).
+ */
+export function sanitizeSfxItems(
+  items: SfxItem[] | undefined | null,
+): SfxItem[] | undefined {
+  if (!Array.isArray(items)) return undefined;
+  const out: SfxItem[] = [];
+  for (const it of items) {
+    if (!it || typeof it !== "object") continue;
+    if (typeof it.id !== "string" || !it.id) continue;
+    if (typeof it.sfxId !== "string" || !getSfxDef(it.sfxId)) continue;
+    if (typeof it.startMs !== "number" || !Number.isFinite(it.startMs)) continue;
+    const rawVol =
+      typeof it.volume === "number" && Number.isFinite(it.volume) ? it.volume : 1;
+    out.push({
+      id: it.id,
+      sfxId: it.sfxId,
+      startMs: it.startMs,
+      volume: Math.min(1, Math.max(0, rawVol)),
+    });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+/** v5.0: keep finite, positive source durations only. */
+export function sanitizeVideoDurations(
+  d: Record<string, number> | undefined | null,
+): Record<string, number> | undefined {
+  if (!d || typeof d !== "object") return undefined;
+  const out: Record<string, number> = {};
+  let any = false;
+  for (const [id, ms] of Object.entries(d)) {
+    if (!id) continue;
+    if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) continue;
+    out[id] = ms;
+    any = true;
   }
   return any ? out : undefined;
 }
@@ -201,14 +359,19 @@ export function downloadProjectFile(project: ProjectFile): string {
 
 export interface LoadedProject {
   project: ProjectFile;
-  /** Reconstructed File objects, in the saved order (ids preserved). */
-  imageFiles: { id: string; file: File }[];
+  /** Reconstructed File objects, in the saved order (ids preserved).
+   *  v5.0: entries carry the saved mediaType when it was "video". */
+  imageFiles: { id: string; file: File; mediaType?: MediaKind }[];
   audioFile: File | null;
   /** Watermark image File (v4.4) or null. */
   watermarkFile: { id: string; file: File } | null;
   /** Re-serialized SRT text (for the FFmpeg temp file). */
   srtText: string | null;
   audioSkipped: boolean;
+  /** v5.0: a video entry existed but produced no File — it was too large
+   *  to inline at save time (stub, empty dataUrl) or its data failed to
+   *  reconstruct. The UI should warn the user and re-link the source. */
+  videoSkipped: boolean;
 }
 
 async function dataUrlToFile(
@@ -221,7 +384,9 @@ async function dataUrlToFile(
   return new File([blob], name, { type: type || blob.type });
 }
 
-/** Parse + validate a .framefuse.json file and rebuild its File objects. */
+/** Parse + validate a .framefuse.json file and rebuild its File objects.
+ *  v5.0: sanitizes the new fields (itemEdits / sfxItems / videoDurations)
+ *  onto the returned project; ≤4.9 files without them load unchanged. */
 export async function parseProjectFile(file: File): Promise<LoadedProject> {
   let project: ProjectFile;
   try {
@@ -240,17 +405,31 @@ export async function parseProjectFile(file: File): Promise<LoadedProject> {
   if (!Array.isArray(project.images)) {
     project.images = [];
   }
+  // v5.0: sanitize the new optional fields (idempotent; ≤4.9 files keep
+  // them undefined). Mutating the parsed project means consumers always see
+  // clean data.
+  project.itemEdits = sanitizeItemEdits(project.itemEdits);
+  project.sfxItems = sanitizeSfxItems(project.sfxItems);
+  project.videoDurations = sanitizeVideoDurations(project.videoDurations);
 
-  const imageFiles: { id: string; file: File }[] = [];
+  const imageFiles: { id: string; file: File; mediaType?: MediaKind }[] = [];
+  let videoSkipped = false;
   for (const img of project.images) {
-    if (!img?.dataUrl || !img.name) continue;
+    const isVideo = img?.mediaType === "video";
+    if (!img?.dataUrl || !img.name) {
+      // Metadata-only stub = video skipped at save time (too big to inline).
+      if (isVideo) videoSkipped = true;
+      continue;
+    }
     try {
       imageFiles.push({
         id: img.id || `p${imageFiles.length}`,
         file: await dataUrlToFile(img.dataUrl, img.name, img.type),
+        ...(isVideo ? { mediaType: "video" as MediaKind } : {}),
       });
     } catch {
-      /* skip unreadable entry */
+      // Unreadable entry — flag videos (v5.0), silently skip images (v4.9).
+      if (isVideo) videoSkipped = true;
     }
   }
   if (imageFiles.length === 0) {
@@ -297,5 +476,6 @@ export async function parseProjectFile(file: File): Promise<LoadedProject> {
     watermarkFile,
     srtText: validCues ? serializeSrt(cues) : null,
     audioSkipped: !!project.audio && !audioFile,
+    videoSkipped,
   };
 }

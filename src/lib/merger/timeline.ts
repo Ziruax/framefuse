@@ -1,9 +1,20 @@
 // src/lib/merger/timeline.ts — filename parser + master timeline builder
+//
+// v5.0: multi-track. buildTimeline resolves per-item edits (itemEdits) into
+// every segment: lane (track 0 = base, >= 1 = overlay), media kind, volume,
+// trim, chroma and overlay geometry. The base lane keeps the v4.9 logic
+// byte-for-byte; overlay items are placed absolutely (edit > parsed >
+// default), never overlap-clipped and never emit warnings. Called WITHOUT
+// itemEdits/videoDurations the output is functionally identical to v4.9.
 import type {
   BuildTimelineResult,
+  ChromaKeySettings,
+  ItemEdit,
   KenBurnsConfig,
   KenBurnsDirection,
+  MediaKind,
   MediaSegment,
+  OverlayTransform,
   OverlapWarning,
   ParsedName,
   SegmentKind,
@@ -23,6 +34,11 @@ const DIRECTIONS: KenBurnsDirection[] = [
 const DEFAULT_BEAT_TAIL_MS = 5000;
 /** Default duration for a duration-less segment in sequential mode (ms). */
 const DEFAULT_DURATION_MS = 5000;
+
+/** A finite number wins; undefined/null/NaN falls back. 0 is preserved. */
+function numOr(v: number | undefined | null, fallback: number): number {
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
 
 /**
  * Parse a timecode like "SS", "MM:SS", or "HH:MM:SS" into milliseconds.
@@ -137,6 +153,85 @@ export interface TimelineEntry {
   parsed: ParsedName;
   order: number;
   thumbnailUrl: string;
+  /** v5.0: source media kind (default "image"; "video" items get source-
+   *  based default durations and no Ken Burns / xfade treatment downstream). */
+  mediaType?: MediaKind;
+}
+
+/** v5.0: per-entry edit resolution (one pass, reused by both lanes). */
+interface ResolvedEntry {
+  entry: TimelineEntry;
+  /** Normalized segment media kind — only "video" is special, everything
+   *  else (including "audio"-tagged oddities) lands as "image". */
+  mediaType: "image" | "video";
+  /** Lane: 0 = base, >= 1 = overlay. Anything not >= 1 routes to base. */
+  track: number;
+  volume: number;
+  trimInMs: number;
+  sourceDurationMs: number | null;
+  chroma: ChromaKeySettings | null;
+  overlay: OverlayTransform | null;
+}
+
+function resolveEntry(
+  e: TimelineEntry,
+  itemEdits?: Record<string, ItemEdit>,
+  videoDurations?: Record<string, number>,
+): ResolvedEntry {
+  const edit = itemEdits?.[e.id];
+  const mediaType: "image" | "video" = e.mediaType === "video" ? "video" : "image";
+  const track =
+    typeof edit?.track === "number" && Number.isFinite(edit.track) && edit.track >= 1
+      ? edit.track
+      : 0;
+  const volume = numOr(edit?.volume, 1);
+  const trimInMs = numOr(edit?.trimInMs, 0);
+  const sourceDurationMs: number | null =
+    mediaType === "video" ? numOr(videoDurations?.[e.id], 0) || null : null;
+  return {
+    entry: e,
+    mediaType,
+    track,
+    volume,
+    trimInMs,
+    sourceDurationMs,
+    // Raw passthrough — chroma.ts owns sanitization at the UI boundary.
+    chroma: edit?.chroma ?? null,
+    overlay: edit?.overlay ?? null,
+  };
+}
+
+/** Build a segment object from a resolved entry (shared by both lanes). */
+function makeSegment(
+  r: ResolvedEntry,
+  kind: SegmentKind,
+  startMs: number,
+  endMs: number,
+  direction: KenBurnsDirection,
+): MediaSegment {
+  const e = r.entry;
+  return {
+    id: e.id,
+    fileName: e.fileName,
+    file: e.file,
+    kind,
+    startMs,
+    endMs,
+    durationMs: endMs - startMs,
+    rawStartMs: e.parsed.startMs,
+    rawEndMs: e.parsed.endMs,
+    rawDurationMs: e.parsed.durationMs,
+    direction,
+    thumbnailUrl: e.thumbnailUrl,
+    order: e.order,
+    mediaType: r.mediaType,
+    track: r.track,
+    volume: r.volume,
+    trimInMs: r.trimInMs,
+    sourceDurationMs: r.sourceDurationMs,
+    chroma: r.chroma,
+    overlay: r.overlay,
+  };
 }
 
 /**
@@ -145,6 +240,16 @@ export interface TimelineEntry {
  * - Otherwise (all duration) → sequential mode.
  * - Overlaps resolved "latest start wins" (earlier segment clipped).
  * - Beat-sheet segments auto-extend to the next beat's start time.
+ *
+ * v5.0: `itemEdits` routes items to lanes (track 0 = base, >= 1 = overlay).
+ * Base-lane logic is the v4.9 code, except a VIDEO base item with no explicit
+ * duration defaults to its source length (`videoDurations[id]`, 5000ms when
+ * unknown) in both the beat-tail and sequential paths. Overlay items are
+ * placed absolutely (edit.startMs ?? parsed.startMs ?? 0) with duration
+ * edit.durationMs ?? parsed.durationMs ?? video-source/5000, are NEVER
+ * overlap-clipped, never participate in base overlap resolution, and never
+ * emit warnings. Without itemEdits/videoDurations the output is
+ * functionally identical to v4.9.
  */
 export function buildTimeline(
   entries: TimelineEntry[],
@@ -155,14 +260,27 @@ export function buildTimeline(
    * becomes `seg.direction`, which the preview renderer AND the FFmpeg
    * zoompan both consume — preview↔export parity is inherited for free. */
   motionOverrides?: Record<string, KenBurnsDirection>,
+  /** v5.0: per-item edits (id → { startMs, durationMs, track, trimInMs,
+   *  volume, chroma, overlay }). Absent/empty = pure v4.9 behavior. */
+  itemEdits?: Record<string, ItemEdit>,
+  /** v5.0: known video source durations (id → ms) driving video defaults. */
+  videoDurations?: Record<string, number>,
 ): BuildTimelineResult {
   const warnings: OverlapWarning[] = [];
   const skipped: string[] = [];
 
-  const startBearing = entries.filter(
-    (e) => e.parsed.kind === "absolute" || e.parsed.kind === "beat",
+  // v5.0: resolve edits once, then partition into lanes. Without itemEdits
+  // every entry lands on the base lane → identical to the v4.9 flow.
+  const resolved = entries.map((e) => resolveEntry(e, itemEdits, videoDurations));
+  const baseEntries = resolved.filter((r) => r.track === 0);
+  const overlayEntries = resolved.filter((r) => r.track >= 1);
+
+  const startBearing = baseEntries.filter(
+    (r) => r.entry.parsed.kind === "absolute" || r.entry.parsed.kind === "beat",
   );
-  const durationOnly = entries.filter((e) => e.parsed.kind === "duration");
+  const durationOnly = baseEntries.filter(
+    (r) => r.entry.parsed.kind === "duration",
+  );
 
   const mode: TimelineMode =
     startBearing.length > 0 ? "absolute" : "sequential";
@@ -172,33 +290,37 @@ export function buildTimeline(
   if (mode === "absolute") {
     // Sort by start time, then original order for stability.
     const sorted = [...startBearing].sort((a, b) => {
-      const sa = a.parsed.startMs ?? 0;
-      const sb = b.parsed.startMs ?? 0;
-      return sa - sb || a.order - b.order;
+      const sa = a.entry.parsed.startMs ?? 0;
+      const sb = b.entry.parsed.startMs ?? 0;
+      return sa - sb || a.entry.order - b.entry.order;
     });
 
     // Compute initial ends.
-    const withEnds = sorted.map((e, i) => {
+    const withEnds = sorted.map((r, i) => {
       let endMs: number;
-      if (e.parsed.kind === "absolute" && e.parsed.endMs != null) {
-        endMs = e.parsed.endMs;
+      if (r.entry.parsed.kind === "absolute" && r.entry.parsed.endMs != null) {
+        endMs = r.entry.parsed.endMs;
       } else {
-        // beat: extend to next beat's start, or default tail.
+        // beat: extend to next beat's start, or default tail (v5.0: a VIDEO
+        // beat with no next beat runs for its SOURCE duration, else 5s).
         const next = sorted[i + 1];
-        const nextStart = next ? next.parsed.startMs ?? 0 : null;
+        const nextStart = next ? next.entry.parsed.startMs ?? 0 : null;
         endMs =
           nextStart != null
             ? nextStart
-            : (e.parsed.startMs ?? 0) + DEFAULT_BEAT_TAIL_MS;
+            : (r.entry.parsed.startMs ?? 0) +
+              (r.mediaType === "video"
+                ? r.sourceDurationMs ?? DEFAULT_BEAT_TAIL_MS
+                : DEFAULT_BEAT_TAIL_MS);
       }
-      return { e, endMs };
+      return { r, endMs };
     });
 
     // Apply per-segment duration overrides (end = start + override).
     for (const we of withEnds) {
-      const ov = overrides[we.e.id];
+      const ov = overrides[we.r.entry.id];
       if (ov && ov > 0) {
-        we.endMs = (we.e.parsed.startMs ?? 0) + ov;
+        we.endMs = (we.r.entry.parsed.startMs ?? 0) + ov;
       }
     }
 
@@ -206,92 +328,175 @@ export function buildTimeline(
     for (let i = 1; i < withEnds.length; i++) {
       const prev = withEnds[i - 1];
       const cur = withEnds[i];
-      const curStart = cur.e.parsed.startMs ?? 0;
+      const curStart = cur.r.entry.parsed.startMs ?? 0;
       if (curStart < prev.endMs) {
         warnings.push({
-          message: `Overlap: "${prev.e.fileName}" clipped at ${fmtTimecode(curStart)} (latest start wins)`,
-          segments: [prev.e.id, cur.e.id],
+          message: `Overlap: "${prev.r.entry.fileName}" clipped at ${fmtTimecode(curStart)} (latest start wins)`,
+          segments: [prev.r.entry.id, cur.r.entry.id],
         });
         prev.endMs = curStart;
       }
     }
 
     for (const we of withEnds) {
-      const startMs = we.e.parsed.startMs ?? 0;
+      const startMs = we.r.entry.parsed.startMs ?? 0;
       const endMs = Math.max(startMs + 200, we.endMs); // min 200ms
       const dir =
-        motionOverrides?.[we.e.id] ??
-        resolveDirection(we.e.id, kenBurns.direction, kenBurns.directionPool);
-      segments.push({
-        id: we.e.id,
-        fileName: we.e.fileName,
-        file: we.e.file,
-        kind: we.e.parsed.kind as SegmentKind,
-        startMs,
-        endMs,
-        durationMs: endMs - startMs,
-        rawStartMs: we.e.parsed.startMs,
-        rawEndMs: we.e.parsed.endMs,
-        rawDurationMs: we.e.parsed.durationMs,
-        direction: dir,
-        thumbnailUrl: we.e.thumbnailUrl,
-        order: we.e.order,
-      });
+        motionOverrides?.[we.r.entry.id] ??
+        resolveDirection(we.r.entry.id, kenBurns.direction, kenBurns.directionPool);
+      segments.push(
+        makeSegment(
+          we.r,
+          we.r.entry.parsed.kind as SegmentKind,
+          startMs,
+          endMs,
+          dir,
+        ),
+      );
     }
 
     // Duration-only files can't be placed in absolute mode → skipped.
-    for (const e of durationOnly) {
-      skipped.push(`${e.fileName} (duration pattern not used in absolute mode)`);
+    // v5.0 exception: VIDEOS don't need filename timing — they are appended
+    // after the last base segment (in original order) at their source
+    // duration, matching the "add clip to the end of the edit" semantics of
+    // a real video editor. Images keep the v4.9 skip behavior.
+    const videoTail = durationOnly.filter((r) => r.mediaType === "video");
+    const imageTail = durationOnly.filter((r) => r.mediaType !== "video");
+    if (videoTail.length > 0) {
+      let cursor = segments.reduce((m, s) => Math.max(m, s.endMs), 0);
+      for (const r of videoTail) {
+        const e = r.entry;
+        const ov = overrides[e.id];
+        const dur =
+          ov && ov > 0
+            ? ov
+            : e.parsed.durationMs != null
+              ? e.parsed.durationMs
+              : r.sourceDurationMs ?? DEFAULT_DURATION_MS;
+        const startMs = cursor;
+        const endMs = cursor + Math.max(200, dur);
+        const dir =
+          motionOverrides?.[e.id] ??
+          resolveDirection(e.id, kenBurns.direction, kenBurns.directionPool);
+        segments.push(
+          makeSegment(r, e.parsed.kind as SegmentKind, startMs, endMs, dir),
+        );
+        cursor = endMs;
+      }
+    }
+    for (const r of imageTail) {
+      skipped.push(
+        `${r.entry.fileName} (duration pattern not used in absolute mode)`,
+      );
     }
   } else {
-    // Sequential: stack durations in original order.
+    // Sequential: stack durations in original order. A video without an
+    // explicit duration defaults to its source length (5000ms when unknown).
     let cursor = 0;
-    for (const e of entries) {
+    for (const r of baseEntries) {
+      const e = r.entry;
       const ov = overrides[e.id];
       const dur =
-        ov && ov > 0 ? ov : e.parsed.durationMs ?? DEFAULT_DURATION_MS;
+        ov && ov > 0
+          ? ov
+          : e.parsed.durationMs != null
+            ? e.parsed.durationMs
+            : r.mediaType === "video"
+              ? r.sourceDurationMs ?? DEFAULT_DURATION_MS
+              : DEFAULT_DURATION_MS;
       const startMs = cursor;
       const endMs = cursor + dur;
       const dir =
         motionOverrides?.[e.id] ??
         resolveDirection(e.id, kenBurns.direction, kenBurns.directionPool);
-      segments.push({
-        id: e.id,
-        fileName: e.fileName,
-        file: e.file,
-        kind: e.parsed.kind as SegmentKind,
-        startMs,
-        endMs,
-        durationMs: dur,
-        rawStartMs: e.parsed.startMs,
-        rawEndMs: e.parsed.endMs,
-        rawDurationMs: e.parsed.durationMs,
-        direction: dir,
-        thumbnailUrl: e.thumbnailUrl,
-        order: e.order,
-      });
+      segments.push(
+        makeSegment(r, e.parsed.kind as SegmentKind, startMs, endMs, dir),
+      );
       cursor = endMs;
     }
   }
 
+  // v5.0: overlay lane — placed absolutely, no overlap clipping, no
+  // warnings, no participation in base resolution. Appended after the base
+  // segments, sorted by startMs (then order) for deterministic draw order.
+  if (overlayEntries.length > 0) {
+    const overlaySegs: MediaSegment[] = overlayEntries.map((r) => {
+      const e = r.entry;
+      const edit = itemEdits?.[e.id];
+      const startMs = numOr(edit?.startMs, numOr(e.parsed.startMs, 0));
+      const durationMs = Math.max(
+        0,
+        numOr(
+          edit?.durationMs,
+          numOr(
+            e.parsed.durationMs,
+            r.mediaType === "video"
+              ? r.sourceDurationMs ?? DEFAULT_DURATION_MS
+              : DEFAULT_DURATION_MS,
+          ),
+        ),
+      );
+      const dir =
+        motionOverrides?.[e.id] ??
+        resolveDirection(e.id, kenBurns.direction, kenBurns.directionPool);
+      return makeSegment(
+        r,
+        e.parsed.kind as SegmentKind,
+        startMs,
+        startMs + durationMs,
+        dir,
+      );
+    });
+    overlaySegs.sort((a, b) => a.startMs - b.startMs || a.order - b.order);
+    segments.push(...overlaySegs);
+  }
+
+  // v5.0: total spans ALL lanes (overlays can extend past the base end).
   const totalMs = segments.reduce((m, s) => Math.max(m, s.endMs), 0);
 
   return { segments, mode, totalMs, warnings, skipped };
 }
 
-/** Find the active segment at a given time (ms). */
+/**
+ * Find the active BASE-lane (track 0) segment at a given time (ms).
+ * v5.0: overlay segments are invisible to this lookup — use
+ * overlaySegmentsAt for the overlay stack. Past the end of the base lane the
+ * last base segment is returned (v4.9 semantic, preserved).
+ */
 export function segmentAtTime(
   segments: MediaSegment[],
   tMs: number,
 ): MediaSegment | null {
+  let last: MediaSegment | null = null;
   for (const s of segments) {
+    if ((s.track ?? 0) !== 0) continue; // v5.0: base lane only
+    last = s;
     if (tMs >= s.startMs && tMs < s.endMs) return s;
   }
-  // If past the end, return the last segment.
-  if (segments.length && tMs >= segments[segments.length - 1].endMs) {
-    return segments[segments.length - 1];
+  // If past the end, return the last base segment.
+  if (last && tMs >= last.endMs) {
+    return last;
   }
   return null;
+}
+
+/**
+ * v5.0: overlay-lane segments (track >= 1) active at tMs, in draw order —
+ * sorted by track (lower tracks draw first / get covered), then startMs.
+ * The interval is closed at the start and open at the end, so a segment
+ * whose endMs equals the next one's startMs never double-draws.
+ */
+export function overlaySegmentsAt(
+  segments: MediaSegment[],
+  tMs: number,
+): MediaSegment[] {
+  const hits: MediaSegment[] = [];
+  for (const s of segments) {
+    if ((s.track ?? 0) < 1) continue;
+    if (tMs >= s.startMs && tMs < s.endMs) hits.push(s);
+  }
+  hits.sort((a, b) => a.track - b.track || a.startMs - b.startMs);
+  return hits;
 }
 
 /** Format milliseconds as MM:SS or HH:MM:SS. */

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ChevronDown,
   Zap,
@@ -25,7 +25,10 @@ import {
   X,
   Star,
   Dices,
+  Images,
+  Download,
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import type {
   AudioSettings,
   CaptionSettings,
@@ -47,7 +50,10 @@ import {
   PRESET_CATEGORIES,
   type CaptionPreset,
 } from "@/lib/merger/captionPresets";
-import { HEADLINE_PRESETS, getHeadlinePreset } from "@/lib/merger/headlinePresets";
+import {
+  HEADLINE_PRESETS,
+  getHeadlinePreset,
+} from "@/lib/merger/headlinePresets";
 import { ANIMATION_LABELS } from "@/lib/merger/captionAnimations";
 import type { WhisperProgress } from "@/lib/merger/whisper";
 import { cn } from "@/lib/utils";
@@ -81,14 +87,15 @@ const WHISPER_LANGUAGES: { value: string; label: string }[] = [
 // ---------------------------------------------------------------------------
 // Ken Burns effect chips (multi-select pool)
 // ---------------------------------------------------------------------------
-const KB_EFFECTS: { value: KenBurnsDirection; label: string; glyph: string }[] = [
-  { value: "in", label: "Zoom In", glyph: "⤢" },
-  { value: "out", label: "Zoom Out", glyph: "⤡" },
-  { value: "left", label: "Pan Left", glyph: "←" },
-  { value: "right", label: "Pan Right", glyph: "→" },
-  { value: "up", label: "Pan Up", glyph: "↑" },
-  { value: "down", label: "Pan Down", glyph: "↓" },
-];
+const KB_EFFECTS: { value: KenBurnsDirection; label: string; glyph: string }[] =
+  [
+    { value: "in", label: "Zoom In", glyph: "⤢" },
+    { value: "out", label: "Zoom Out", glyph: "⤡" },
+    { value: "left", label: "Pan Left", glyph: "←" },
+    { value: "right", label: "Pan Right", glyph: "→" },
+    { value: "up", label: "Pan Up", glyph: "↑" },
+    { value: "down", label: "Pan Down", glyph: "↓" },
+  ];
 
 // ---------------------------------------------------------------------------
 // Panel props
@@ -189,14 +196,24 @@ function Section({
   );
 }
 
-function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+function Field({
+  label,
+  hint,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="mb-3">
       <div className="mb-1.5 flex items-baseline justify-between">
         <label className="text-xs font-medium text-zinc-300">{label}</label>
       </div>
       {children}
-      {hint && <p className="mt-1 text-[10px] leading-relaxed text-zinc-500">{hint}</p>}
+      {hint && (
+        <p className="mt-1 text-[10px] leading-relaxed text-zinc-500">{hint}</p>
+      )}
     </div>
   );
 }
@@ -247,7 +264,13 @@ function Segmented<T extends string | number>({
   );
 }
 
-function Row({ label, children }: { label: string; children: React.ReactNode }) {
+function Row({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="mb-3 flex items-center justify-between gap-3">
       <span className="text-xs text-zinc-300">{label}</span>
@@ -291,6 +314,90 @@ function Toggle({
     </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// v5.0 tabs — Media | Captions | Effects | Audio | Export
+// ---------------------------------------------------------------------------
+const SETTINGS_TAB_IDS = [
+  "media",
+  "captions",
+  "effects",
+  "audio",
+  "export",
+] as const;
+
+type SettingsTabId = (typeof SETTINGS_TAB_IDS)[number];
+
+/** Sanitizes the persisted value — anything unknown falls back to "media". */
+function isSettingsTabId(value: unknown): value is SettingsTabId {
+  return (
+    typeof value === "string" &&
+    (SETTINGS_TAB_IDS as readonly string[]).includes(value)
+  );
+}
+
+/** Dedicated small key (sibling of framefuse.settings.v49/v50). */
+const TAB_STORAGE_KEY = "framefuse.settings.tab";
+
+/** Per-tab accent — emerald/amber/fuchsia/cyan/violet, matching each
+ *  section's semantic colors already used across the app. */
+const SETTINGS_TABS: {
+  id: SettingsTabId;
+  label: string;
+  icon: LucideIcon;
+  accent: string;
+  glow: string;
+}[] = [
+  {
+    id: "media",
+    label: "Media",
+    icon: Images,
+    accent: "#34d399",
+    glow: "rgba(52, 211, 153, 0.55)",
+  },
+  {
+    id: "captions",
+    label: "Captions",
+    icon: Captions,
+    accent: "#fbbf24",
+    glow: "rgba(251, 191, 36, 0.55)",
+  },
+  {
+    id: "effects",
+    label: "Effects",
+    icon: Sparkles,
+    accent: "#e879f9",
+    glow: "rgba(232, 121, 249, 0.55)",
+  },
+  {
+    id: "audio",
+    label: "Audio",
+    icon: AudioLines,
+    accent: "#22d3ee",
+    glow: "rgba(34, 211, 238, 0.55)",
+  },
+  {
+    id: "export",
+    label: "Export",
+    icon: Download,
+    accent: "#a78bfa",
+    glow: "rgba(167, 139, 250, 0.55)",
+  },
+];
+
+// Tab-panel mount transition — pure CSS (no animation deps in this app).
+// The class is re-applied each time a panel becomes visible, so every tab
+// switch replays the short fade/slide-in; prefers-reduced-motion kills it.
+const TAB_PANEL_CSS = `
+@keyframes ff-tab-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.ff-tab-panel-in { animation: ff-tab-in 220ms cubic-bezier(0.21, 0.61, 0.35, 1); }
+@media (prefers-reduced-motion: reduce) {
+  .ff-tab-panel-in { animation: none; }
+}
+`;
 
 // ---------------------------------------------------------------------------
 // Main panel
@@ -340,9 +447,18 @@ export function SettingsPanel(props: SettingsPanelProps) {
   // Ken Burns pool toggle: clicking a chip toggles it in the pool while
   // staying in "random" mode (2+ selected = random among those). A single
   // selected chip becomes the fixed direction.
-  const ALL_EFFECTS: KenBurnsDirection[] = ["in", "out", "left", "right", "up", "down"];
+  const ALL_EFFECTS: KenBurnsDirection[] = [
+    "in",
+    "out",
+    "left",
+    "right",
+    "up",
+    "down",
+  ];
   const togglePoolEffect = (dir: KenBurnsDirection) => {
-    const current = kenBurns.directionPool.length ? kenBurns.directionPool : ALL_EFFECTS;
+    const current = kenBurns.directionPool.length
+      ? kenBurns.directionPool
+      : ALL_EFFECTS;
     const has = current.includes(dir);
     const next = has ? current.filter((d) => d !== dir) : [...current, dir];
     if (next.length === 0) {
@@ -356,7 +472,11 @@ export function SettingsPanel(props: SettingsPanelProps) {
     }
     if (next.length === 1) {
       // One effect left → fixed direction.
-      onKenBurnsChange({ ...kenBurns, direction: next[0], directionPool: next });
+      onKenBurnsChange({
+        ...kenBurns,
+        direction: next[0],
+        directionPool: next,
+      });
       return;
     }
     onKenBurnsChange({ ...kenBurns, direction: "random", directionPool: next });
@@ -371,7 +491,9 @@ export function SettingsPanel(props: SettingsPanelProps) {
   };
 
   const poolActive = (dir: KenBurnsDirection) => {
-    const pool = kenBurns.directionPool.length ? kenBurns.directionPool : ALL_EFFECTS;
+    const pool = kenBurns.directionPool.length
+      ? kenBurns.directionPool
+      : ALL_EFFECTS;
     return pool.includes(dir);
   };
 
@@ -380,9 +502,81 @@ export function SettingsPanel(props: SettingsPanelProps) {
     (kenBurns.directionPool.length > 1 &&
       kenBurns.directionPool.includes(kenBurns.direction));
 
+  // ── v5.0 tab state ──
+  const [tab, setTab] = useState<SettingsTabId>("media");
+  const [tabsHydrated, setTabsHydrated] = useState(false);
+  const tabRefs = useRef<Record<SettingsTabId, HTMLButtonElement | null>>({
+    media: null,
+    captions: null,
+    effects: null,
+    audio: null,
+    export: null,
+  });
+  // Whisper auto-switch guard: flip to Captions once per busy→true edge so
+  // the transcription progress is visible. The user can navigate away
+  // freely — we never yank the tab back while a run is in flight.
+  const whisperAutoSwitchedRef = useRef(false);
+
+  useEffect(() => {
+    // Restore the persisted tab after hydration (a lazy useState initializer
+    // would mismatch SSR markup). One-shot sync with the localStorage
+    // "external system" — same pattern as page.tsx's persisted-restore.
+    try {
+      const stored = window.localStorage.getItem(TAB_STORAGE_KEY);
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      if (isSettingsTabId(stored)) setTab(stored);
+    } catch {
+      /* storage unavailable (private mode) — keep the default */
+    }
+    setTabsHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    if (!tabsHydrated) return;
+    try {
+      window.localStorage.setItem(TAB_STORAGE_KEY, tab);
+    } catch {
+      /* ignore write failures */
+    }
+  }, [tab, tabsHydrated]);
+
+  useEffect(() => {
+    if (whisperBusy) {
+      if (!whisperAutoSwitchedRef.current) {
+        whisperAutoSwitchedRef.current = true;
+        setTab("captions");
+      }
+    } else {
+      // Run finished — the next generation may auto-switch again.
+      whisperAutoSwitchedRef.current = false;
+    }
+  }, [whisperBusy]);
+
+  const activeTab = SETTINGS_TABS.find((t) => t.id === tab) ?? SETTINGS_TABS[0];
+  const activeTabIndex = SETTINGS_TABS.indexOf(activeTab);
+
+  // Roving tabindex: Arrow keys cycle, Home/End jump to the ends.
+  const handleTablistKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const idx = activeTabIndex;
+    let next = -1;
+    if (e.key === "ArrowRight") next = (idx + 1) % SETTINGS_TABS.length;
+    else if (e.key === "ArrowLeft")
+      next = (idx - 1 + SETTINGS_TABS.length) % SETTINGS_TABS.length;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = SETTINGS_TABS.length - 1;
+    else return;
+    e.preventDefault();
+    const target = SETTINGS_TABS[next];
+    setTab(target.id);
+    tabRefs.current[target.id]?.focus();
+  };
+
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center gap-2 border-b px-4 py-3" style={{ borderColor: "#27272a" }}>
+      <div
+        className="flex items-center gap-2 border-b px-4 py-3"
+        style={{ borderColor: "#27272a" }}
+      >
         <Wand2 size={14} className="text-zinc-500" />
         <span className="text-xs font-semibold uppercase tracking-wider text-zinc-300">
           Settings
@@ -390,353 +584,566 @@ export function SettingsPanel(props: SettingsPanelProps) {
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {/* ─── Ken Burns ─────────────────────────────────────────────── */}
-        <Section icon={<Zap size={13} />} title="Ken Burns Motion" defaultOpen>
-          <div className="mb-3">
-            <Toggle
-              checked={kenBurns.enabled}
-              onChange={(v) => onKenBurnsChange({ ...kenBurns, enabled: v })}
-              label="Enable motion"
-            />
-          </div>
+        <style dangerouslySetInnerHTML={{ __html: TAB_PANEL_CSS }} />
 
-          <Field label="Zoom intensity" hint={`Max zoom ${zoomMax.toFixed(2)}×`}>
-            <input
-              type="range"
-              min={0}
-              max={100}
-              step={5}
-              value={kenBurns.intensity}
-              onChange={(e) =>
-                onKenBurnsChange({ ...kenBurns, intensity: Number(e.target.value) })
-              }
-              disabled={!kenBurns.enabled}
-              className="w-full accent-emerald-500"
-              aria-label="Ken Burns zoom intensity"
-            />
-          </Field>
-
-          <Field
-            label="Effects"
-            hint={
-              isRandomMode
-                ? `Random — picks from ${kenBurns.directionPool.length || 6} selected effect${(kenBurns.directionPool.length || 6) === 1 ? "" : "s"} per image`
-                : `Fixed — every image uses ${kenBurns.direction}`
-            }
-          >
-            <div className="grid grid-cols-3 gap-1.5">
-              {KB_EFFECTS.map((eff) => {
-                const active = poolActive(eff.value);
-                return (
-                  <button
-                    key={eff.value}
-                    type="button"
-                    aria-pressed={active}
-                    disabled={!kenBurns.enabled}
-                    onClick={() => togglePoolEffect(eff.value)}
+        {/* ── v5.0 tab bar — 5 equal segments, roving tabindex, sliding
+            accent indicator. Sticky so it survives scrolling. ── */}
+        <div
+          role="tablist"
+          aria-label="Settings sections"
+          onKeyDown={handleTablistKeyDown}
+          className="sticky top-0 z-30 grid grid-cols-5 border-b"
+          style={{ borderColor: "#27272a", backgroundColor: "#121214" }}
+        >
+          {SETTINGS_TABS.map((t) => {
+            const active = t.id === tab;
+            return (
+              <button
+                key={t.id}
+                ref={(el) => {
+                  tabRefs.current[t.id] = el;
+                }}
+                id={`ff-settings-tab-${t.id}`}
+                type="button"
+                role="tab"
+                aria-selected={active}
+                aria-controls={`ff-settings-tabpanel-${t.id}`}
+                tabIndex={active ? 0 : -1}
+                onClick={() => setTab(t.id)}
+                className={cn(
+                  "group relative flex flex-col items-center gap-1 px-1 py-2.5 transition-colors duration-150",
+                  active ? "bg-white/[0.04]" : "hover:bg-white/[0.03]",
+                )}
+              >
+                <span className="relative flex items-center">
+                  <t.icon
+                    size={14}
                     className={cn(
-                      "flex items-center gap-1.5 rounded-md px-1.5 py-1.5 text-[10px] font-medium transition-all duration-150 active:scale-[0.96]",
-                      active
-                        ? "bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/35"
-                        : "bg-zinc-800/60 text-zinc-400 hover:bg-white/5 hover:-translate-y-px",
-                      !kenBurns.enabled && "opacity-40",
+                      "transition-colors duration-150",
+                      active ? "" : "text-zinc-500 group-hover:text-zinc-300",
                     )}
-                  >
-                    <span aria-hidden>{eff.glyph}</span>
-                    {eff.label}
-                  </button>
-                );
-              })}
+                    style={active ? { color: t.accent } : undefined}
+                  />
+                  {/* Live dot while Whisper is transcribing. */}
+                  {t.id === "captions" && whisperBusy && (
+                    <span
+                      className="absolute -right-2 -top-1 size-1.5 animate-pulse rounded-full bg-amber-400"
+                      style={{ boxShadow: "0 0 6px rgba(251, 191, 36, 0.9)" }}
+                      aria-hidden
+                    />
+                  )}
+                  {/* Headline count badge. */}
+                  {t.id === "effects" && headlineItems.length > 0 && (
+                    <span
+                      className="absolute -right-2.5 -top-1.5 rounded-full px-1 py-px text-[8px] font-bold leading-none tabular-nums text-amber-300"
+                      style={{ backgroundColor: "rgba(251, 191, 36, 0.2)" }}
+                      aria-hidden
+                    >
+                      {headlineItems.length}
+                    </span>
+                  )}
+                </span>
+                <span
+                  className={cn(
+                    "text-[9px] font-semibold uppercase tracking-widest transition-colors duration-150",
+                    active
+                      ? "text-zinc-200"
+                      : "text-zinc-500 group-hover:text-zinc-400",
+                  )}
+                >
+                  {t.label}
+                </span>
+              </button>
+            );
+          })}
+          {/* Sliding accent indicator under the active tab. */}
+          <span
+            aria-hidden
+            className="pointer-events-none absolute bottom-0 left-0 h-[2px] w-1/5 transition-all duration-200 ease-out"
+            style={{
+              transform: `translateX(${activeTabIndex * 100}%)`,
+              backgroundColor: activeTab.accent,
+              boxShadow: `0 0 8px ${activeTab.glow}`,
+            }}
+          />
+        </div>
+
+        {/* ─── Media tab — Ken Burns motion ──────────────────────────── */}
+        <div
+          id="ff-settings-tabpanel-media"
+          role="tabpanel"
+          aria-labelledby="ff-settings-tab-media"
+          tabIndex={tab === "media" ? 0 : -1}
+          className={cn("pb-2", tab === "media" ? "ff-tab-panel-in" : "hidden")}
+        >
+          {/* ─── Ken Burns ─────────────────────────────────────────────── */}
+          <Section
+            icon={<Zap size={13} />}
+            title="Ken Burns Motion"
+            defaultOpen
+          >
+            <div className="mb-3">
+              <Toggle
+                checked={kenBurns.enabled}
+                onChange={(v) => onKenBurnsChange({ ...kenBurns, enabled: v })}
+                label="Enable motion"
+              />
             </div>
-            <button
-              type="button"
-              onClick={setFullRandom}
-              disabled={!kenBurns.enabled}
-              className={cn(
-                "mt-1.5 flex w-full items-center justify-center gap-1.5 rounded-md border px-2 py-1.5 text-[10px] font-semibold transition-all active:scale-[0.98]",
-                isRandomMode && kenBurns.directionPool.length === 6
-                  ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
-                  : "border-zinc-700 bg-transparent text-zinc-400 hover:border-zinc-600 hover:bg-white/5 hover:text-zinc-200",
-              )}
-              title="Randomize across all six effects"
+
+            <Field
+              label="Zoom intensity"
+              hint={`Max zoom ${zoomMax.toFixed(2)}×`}
             >
-              <Dices className="size-3.5" />
-              Random — all effects
-            </button>
-            <p className="mt-1 text-[10px] leading-relaxed text-zinc-500">
-              Select 2+ effects to randomize between only your favorites, or pick one to fix it.
-            </p>
-          </Field>
-        </Section>
+              <input
+                type="range"
+                min={0}
+                max={100}
+                step={5}
+                value={kenBurns.intensity}
+                onChange={(e) =>
+                  onKenBurnsChange({
+                    ...kenBurns,
+                    intensity: Number(e.target.value),
+                  })
+                }
+                disabled={!kenBurns.enabled}
+                className="w-full accent-emerald-500"
+                aria-label="Ken Burns zoom intensity"
+              />
+            </Field>
 
-        {/* ─── Video ─────────────────────────────────────────────────── */}
-        <Section icon={<Film size={13} />} title="Video">
-          {/* v4.5: one-click encode-quality profiles. */}
-          <Field label="Quality profile" hint="Resolution + fps + encoder tuning bundles">
-            <div className="grid grid-cols-3 gap-1.5">
-              {QUALITY_PROFILES.map((p) => {
-                // undefined quality (persisted v4.4 settings) = "social".
-                const active = (settings.quality || "social") === p.id;
-                return (
-                  <button
-                    key={p.id}
-                    type="button"
-                    onClick={() =>
-                      onSettingsChange({
-                        ...settings,
-                        resolution: p.resolution,
-                        fps: p.fps,
-                        bitrateMbps: p.bitrateMbps,
-                        crf: p.crf,
-                        quality: p.id,
-                      })
-                    }
-                    title={p.hint}
-                    className={cn(
-                      "ff-profile-card group relative flex flex-col gap-1 rounded-lg border p-2 text-left transition-all duration-200",
-                      active ? "ff-profile-active" : "hover:-translate-y-px hover:brightness-110",
-                    )}
-                    style={
-                      active
-                        ? undefined
-                        : { borderColor: "#27272a", backgroundColor: "#141416" }
-                    }
-                  >
-                    <span className="text-[11px] font-bold" style={{ color: active ? "#a7f3d0" : "#d4d4d8" }}>
-                      {p.label}
-                    </span>
-                    <span className="text-[8px] tabular-nums" style={{ color: "#71717a" }}>
-                      {p.resolution} · {p.fps}fps
-                    </span>
-                    {/* speed meter: 3 dots, filled = speed cost */}
-                    <span className="flex items-center gap-0.5" aria-hidden>
-                      {[1, 2, 3].map((d) => (
-                        <span
-                          key={d}
-                          className="h-1 w-2.5 rounded-full transition-colors duration-200"
-                          style={{
-                            backgroundColor:
-                              d <= p.speed
-                                ? active
-                                  ? "#34d399"
-                                  : "#3f3f46"
-                                : "#1f1f22",
-                          }}
-                        />
-                      ))}
-                      <span className="ml-1 text-[7px] uppercase tracking-wide" style={{ color: "#52525b" }}>
-                        {p.speed === 3 ? "fast" : p.speed === 2 ? "balanced" : "slow"}
+            <Field
+              label="Effects"
+              hint={
+                isRandomMode
+                  ? `Random — picks from ${kenBurns.directionPool.length || 6} selected effect${(kenBurns.directionPool.length || 6) === 1 ? "" : "s"} per image`
+                  : `Fixed — every image uses ${kenBurns.direction}`
+              }
+            >
+              <div className="grid grid-cols-3 gap-1.5">
+                {KB_EFFECTS.map((eff) => {
+                  const active = poolActive(eff.value);
+                  return (
+                    <button
+                      key={eff.value}
+                      type="button"
+                      aria-pressed={active}
+                      disabled={!kenBurns.enabled}
+                      onClick={() => togglePoolEffect(eff.value)}
+                      className={cn(
+                        "flex items-center gap-1.5 rounded-md px-1.5 py-1.5 text-[10px] font-medium transition-all duration-150 active:scale-[0.96]",
+                        active
+                          ? "bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/35"
+                          : "bg-zinc-800/60 text-zinc-400 hover:bg-white/5 hover:-translate-y-px",
+                        !kenBurns.enabled && "opacity-40",
+                      )}
+                    >
+                      <span aria-hidden>{eff.glyph}</span>
+                      {eff.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <button
+                type="button"
+                onClick={setFullRandom}
+                disabled={!kenBurns.enabled}
+                className={cn(
+                  "mt-1.5 flex w-full items-center justify-center gap-1.5 rounded-md border px-2 py-1.5 text-[10px] font-semibold transition-all active:scale-[0.98]",
+                  isRandomMode && kenBurns.directionPool.length === 6
+                    ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
+                    : "border-zinc-700 bg-transparent text-zinc-400 hover:border-zinc-600 hover:bg-white/5 hover:text-zinc-200",
+                )}
+                title="Randomize across all six effects"
+              >
+                <Dices className="size-3.5" />
+                Random — all effects
+              </button>
+              <p className="mt-1 text-[10px] leading-relaxed text-zinc-500">
+                Select 2+ effects to randomize between only your favorites, or
+                pick one to fix it.
+              </p>
+            </Field>
+          </Section>
+        </div>
+
+        {/* ─── Export tab — Video + Debug ────────────────────────────── */}
+        <div
+          id="ff-settings-tabpanel-export"
+          role="tabpanel"
+          aria-labelledby="ff-settings-tab-export"
+          tabIndex={tab === "export" ? 0 : -1}
+          className={cn(
+            "pb-2",
+            tab === "export" ? "ff-tab-panel-in" : "hidden",
+          )}
+        >
+          {/* ─── Video ─────────────────────────────────────────────────── */}
+          <Section icon={<Film size={13} />} title="Video" defaultOpen>
+            {/* v4.5: one-click encode-quality profiles. */}
+            <Field
+              label="Quality profile"
+              hint="Resolution + fps + encoder tuning bundles"
+            >
+              <div className="grid grid-cols-3 gap-1.5">
+                {QUALITY_PROFILES.map((p) => {
+                  // undefined quality (persisted v4.4 settings) = "social".
+                  const active = (settings.quality || "social") === p.id;
+                  return (
+                    <button
+                      key={p.id}
+                      type="button"
+                      onClick={() =>
+                        onSettingsChange({
+                          ...settings,
+                          resolution: p.resolution,
+                          fps: p.fps,
+                          bitrateMbps: p.bitrateMbps,
+                          crf: p.crf,
+                          quality: p.id,
+                        })
+                      }
+                      title={p.hint}
+                      className={cn(
+                        "ff-profile-card group relative flex flex-col gap-1 rounded-lg border p-2 text-left transition-all duration-200",
+                        active
+                          ? "ff-profile-active"
+                          : "hover:-translate-y-px hover:brightness-110",
+                      )}
+                      style={
+                        active
+                          ? undefined
+                          : {
+                              borderColor: "#27272a",
+                              backgroundColor: "#141416",
+                            }
+                      }
+                    >
+                      <span
+                        className="text-[11px] font-bold"
+                        style={{ color: active ? "#a7f3d0" : "#d4d4d8" }}
+                      >
+                        {p.label}
                       </span>
-                    </span>
-                  </button>
-                );
-              })}
+                      <span
+                        className="text-[8px] tabular-nums"
+                        style={{ color: "#71717a" }}
+                      >
+                        {p.resolution} · {p.fps}fps
+                      </span>
+                      {/* speed meter: 3 dots, filled = speed cost */}
+                      <span className="flex items-center gap-0.5" aria-hidden>
+                        {[1, 2, 3].map((d) => (
+                          <span
+                            key={d}
+                            className="h-1 w-2.5 rounded-full transition-colors duration-200"
+                            style={{
+                              backgroundColor:
+                                d <= p.speed
+                                  ? active
+                                    ? "#34d399"
+                                    : "#3f3f46"
+                                  : "#1f1f22",
+                            }}
+                          />
+                        ))}
+                        <span
+                          className="ml-1 text-[7px] uppercase tracking-wide"
+                          style={{ color: "#52525b" }}
+                        >
+                          {p.speed === 3
+                            ? "fast"
+                            : p.speed === 2
+                              ? "balanced"
+                              : "slow"}
+                        </span>
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+              {settings.quality === "custom" ? (
+                <p
+                  className="mt-1.5 flex items-center gap-1 text-[9px]"
+                  style={{ color: "#fbbf24" }}
+                >
+                  <Wand2 className="size-2.5" /> Custom — fields below tuned
+                  manually
+                </p>
+              ) : (
+                <p
+                  className="mt-1.5 text-[9px] leading-relaxed"
+                  style={{ color: "#52525b" }}
+                >
+                  {QUALITY_PROFILES.find((p) => p.id === settings.quality)
+                    ?.hint ??
+                    "Pick a profile, then fine-tune below (switches to Custom)."}
+                </p>
+              )}
+            </Field>
+            <Field
+              label="Aspect ratio"
+              hint="16:9 YouTube · 9:16 Shorts/Reels/TikTok · 1:1 square · 4:5 Instagram feed"
+            >
+              <Segmented
+                options={[
+                  { value: "16:9", label: "16:9" },
+                  { value: "9:16", label: "9:16" },
+                  { value: "1:1", label: "1:1" },
+                  { value: "4:5", label: "4:5" },
+                ]}
+                value={settings.aspect}
+                onChange={(v) => onSettingsChange({ ...settings, aspect: v })}
+              />
+            </Field>
+            <Field label="Resolution">
+              <Segmented
+                options={[
+                  { value: "720p", label: "720p" },
+                  { value: "1080p", label: "1080p" },
+                ]}
+                value={settings.resolution}
+                onChange={(v) =>
+                  onSettingsChange({
+                    ...settings,
+                    resolution: v,
+                    quality: "custom",
+                  })
+                }
+              />
+            </Field>
+            <Field label="Frame rate">
+              <Segmented
+                options={[
+                  { value: 24, label: "24" },
+                  { value: 30, label: "30" },
+                  { value: 60, label: "60" },
+                ]}
+                value={settings.fps}
+                onChange={(v) =>
+                  onSettingsChange({
+                    ...settings,
+                    fps: v as 24 | 30 | 60,
+                    quality: "custom",
+                  })
+                }
+              />
+            </Field>
+            <Field label="Bitrate" hint={`${settings.bitrateMbps} Mbps`}>
+              <input
+                type="range"
+                min={2}
+                max={20}
+                step={1}
+                value={settings.bitrateMbps}
+                onChange={(e) =>
+                  onSettingsChange({
+                    ...settings,
+                    bitrateMbps: Number(e.target.value),
+                    quality: "custom",
+                  })
+                }
+                className="w-full accent-emerald-500"
+                aria-label="Video bitrate"
+              />
+            </Field>
+            <Field
+              label="Constant quality (CRF)"
+              hint={
+                settings.quality === "custom"
+                  ? `CRF ${settings.crf ?? 20} · manual`
+                  : `CRF ${QUALITY_PROFILES.find((p) => p.id === settings.quality)?.crf ?? 20} · from profile`
+              }
+            >
+              <input
+                type="range"
+                min={14}
+                max={30}
+                step={1}
+                value={settings.crf ?? 20}
+                onChange={(e) =>
+                  onSettingsChange({
+                    ...settings,
+                    crf: Number(e.target.value),
+                    quality: "custom",
+                  })
+                }
+                className="w-full accent-emerald-500"
+                aria-label="Constant quality factor"
+              />
+              <p className="mt-0.5 text-[9px]" style={{ color: "#52525b" }}>
+                Lower = better quality + larger files. 18–22 is the sweet spot
+                for social uploads.
+              </p>
+            </Field>
+          </Section>
+
+          {/* ─── Debug ─────────────────────────────────────────────────── */}
+          <Section icon={<Bug size={13} />} title="Debug">
+            <div className="space-y-1 font-mono text-[10px] text-zinc-500">
+              <div>images: {debug.imageCount}</div>
+              <div>mode: {String(debug.mode)}</div>
+              <div>total: {(debug.totalMs / 1000).toFixed(1)}s</div>
+              <div>playhead: {(debug.currentMs / 1000).toFixed(1)}s</div>
+              <div>active: {debug.activeSegment ?? "—"}</div>
+              <div>env: {debug.inElectron ? "electron" : "browser"}</div>
             </div>
-            {settings.quality === "custom" ? (
-              <p className="mt-1.5 flex items-center gap-1 text-[9px]" style={{ color: "#fbbf24" }}>
-                <Wand2 className="size-2.5" /> Custom — fields below tuned manually
-              </p>
-            ) : (
-              <p className="mt-1.5 text-[9px] leading-relaxed" style={{ color: "#52525b" }}>
-                {QUALITY_PROFILES.find((p) => p.id === settings.quality)?.hint ??
-                  "Pick a profile, then fine-tune below (switches to Custom)."}
-              </p>
-            )}
-          </Field>
-          <Field label="Aspect ratio" hint="16:9 YouTube · 9:16 Shorts/Reels/TikTok · 1:1 square · 4:5 Instagram feed">
-            <Segmented
-              options={[
-                { value: "16:9", label: "16:9" },
-                { value: "9:16", label: "9:16" },
-                { value: "1:1", label: "1:1" },
-                { value: "4:5", label: "4:5" },
-              ]}
-              value={settings.aspect}
-              onChange={(v) => onSettingsChange({ ...settings, aspect: v })}
-            />
-          </Field>
-          <Field label="Resolution">
-            <Segmented
-              options={[
-                { value: "720p", label: "720p" },
-                { value: "1080p", label: "1080p" },
-              ]}
-              value={settings.resolution}
-              onChange={(v) =>
-                onSettingsChange({
-                  ...settings,
-                  resolution: v,
-                  quality: "custom",
-                })
-              }
-            />
-          </Field>
-          <Field label="Frame rate">
-            <Segmented
-              options={[
-                { value: 24, label: "24" },
-                { value: 30, label: "30" },
-                { value: 60, label: "60" },
-              ]}
-              value={settings.fps}
-              onChange={(v) =>
-                onSettingsChange({
-                  ...settings,
-                  fps: v as 24 | 30 | 60,
-                  quality: "custom",
-                })
-              }
-            />
-          </Field>
-          <Field label="Bitrate" hint={`${settings.bitrateMbps} Mbps`}>
-            <input
-              type="range"
-              min={2}
-              max={20}
-              step={1}
-              value={settings.bitrateMbps}
-              onChange={(e) =>
-                onSettingsChange({
-                  ...settings,
-                  bitrateMbps: Number(e.target.value),
-                  quality: "custom",
-                })
-              }
-              className="w-full accent-emerald-500"
-              aria-label="Video bitrate"
-            />
-          </Field>
-          <Field
-            label="Constant quality (CRF)"
-            hint={
-              settings.quality === "custom"
-                ? `CRF ${settings.crf ?? 20} · manual`
-                : `CRF ${QUALITY_PROFILES.find((p) => p.id === settings.quality)?.crf ?? 20} · from profile`
-            }
+          </Section>
+        </div>
+
+        {/* ─── Effects tab — Transitions + Watermark + Titles ────────── */}
+        <div
+          id="ff-settings-tabpanel-effects"
+          role="tabpanel"
+          aria-labelledby="ff-settings-tab-effects"
+          tabIndex={tab === "effects" ? 0 : -1}
+          className={cn(
+            "pb-2",
+            tab === "effects" ? "ff-tab-panel-in" : "hidden",
+          )}
+        >
+          {/* ─── Transitions (v4.3) ─────────────────────────────────── */}
+          <Section
+            icon={<ArrowLeftRight size={13} />}
+            title="Transitions"
+            defaultOpen
           >
-            <input
-              type="range"
-              min={14}
-              max={30}
-              step={1}
-              value={settings.crf ?? 20}
-              onChange={(e) =>
-                onSettingsChange({
-                  ...settings,
-                  crf: Number(e.target.value),
-                  quality: "custom",
-                })
-              }
-              className="w-full accent-emerald-500"
-              aria-label="Constant quality factor"
+            <TransitionSection
+              transition={transition}
+              onTransitionChange={onTransitionChange}
             />
-            <p className="mt-0.5 text-[9px]" style={{ color: "#52525b" }}>
-              Lower = better quality + larger files. 18–22 is the sweet spot for social uploads.
+          </Section>
+
+          {/* ─── Watermark (v4.4) ─────────────────────────────────── */}
+          <Section
+            icon={<BadgeCheck size={13} />}
+            title="Watermark"
+            defaultOpen
+          >
+            <WatermarkSection
+              image={watermarkImage}
+              settings={watermarkSettings}
+              onFile={onWatermarkFile}
+              onSettingsChange={onWatermarkSettingsChange}
+              openPicker={openWatermarkPicker}
+            />
+          </Section>
+
+          {/* ─── Title overlay (v4.2) ────────────────────────────────── */}
+          <HeadlineSection
+            items={headlineItems}
+            onAdd={onAddHeadline}
+            onUpdate={onUpdateHeadline}
+            onRemove={onRemoveHeadline}
+            totalMs={totalMs}
+          />
+        </div>
+
+        {/* ─── Audio tab — normalize / fades ──────────────────────────── */}
+        <div
+          id="ff-settings-tabpanel-audio"
+          role="tabpanel"
+          aria-labelledby="ff-settings-tab-audio"
+          tabIndex={tab === "audio" ? 0 : -1}
+          className={cn("pb-2", tab === "audio" ? "ff-tab-panel-in" : "hidden")}
+        >
+          <Section icon={<AudioLines size={13} />} title="Audio" defaultOpen>
+            <Row label="Normalize loudness">
+              <Toggle
+                checked={audioSettings.normalize}
+                onChange={(v) =>
+                  onAudioSettingsChange({ ...audioSettings, normalize: v })
+                }
+                label=""
+              />
+            </Row>
+            <p className="mb-3 mt-[-8px] text-[10px] leading-relaxed text-zinc-500">
+              Master to −16 LUFS (social-media standard) — evens out quiet/loud
+              recordings.
             </p>
-          </Field>
-        </Section>
-
-        {/* ─── Transitions (v4.3) ─────────────────────────────────── */}
-        <Section icon={<ArrowLeftRight size={13} />} title="Transitions" defaultOpen>
-          <TransitionSection
-            transition={transition}
-            onTransitionChange={onTransitionChange}
-          />
-        </Section>
-
-        {/* ─── Watermark (v4.4) ─────────────────────────────────── */}
-        <Section icon={<BadgeCheck size={13} />} title="Watermark" defaultOpen>
-          <WatermarkSection
-            image={watermarkImage}
-            settings={watermarkSettings}
-            onFile={onWatermarkFile}
-            onSettingsChange={onWatermarkSettingsChange}
-            openPicker={openWatermarkPicker}
-          />
-        </Section>
-
-        <Section icon={<AudioLines size={13} />} title="Audio">
-          <Row label="Normalize loudness">
-            <Toggle
-              checked={audioSettings.normalize}
-              onChange={(v) => onAudioSettingsChange({ ...audioSettings, normalize: v })}
-              label=""
-            />
-          </Row>
-          <p className="mb-3 mt-[-8px] text-[10px] leading-relaxed text-zinc-500">
-            Master to −16 LUFS (social-media standard) — evens out quiet/loud recordings.
-          </p>
-          <Field label="Fade in" hint={audioSettings.fadeInMs ? `${(audioSettings.fadeInMs / 1000).toFixed(1)}s` : "off"}>
-            <input
-              type="range"
-              min={0}
-              max={3000}
-              step={100}
-              value={audioSettings.fadeInMs}
-              onChange={(e) =>
-                onAudioSettingsChange({ ...audioSettings, fadeInMs: Number(e.target.value) })
+            <Field
+              label="Fade in"
+              hint={
+                audioSettings.fadeInMs
+                  ? `${(audioSettings.fadeInMs / 1000).toFixed(1)}s`
+                  : "off"
               }
-              className="w-full accent-emerald-500"
-              aria-label="Audio fade in"
-            />
-          </Field>
-          <Field label="Fade out" hint={audioSettings.fadeOutMs ? `${(audioSettings.fadeOutMs / 1000).toFixed(1)}s` : "off"}>
-            <input
-              type="range"
-              min={0}
-              max={3000}
-              step={100}
-              value={audioSettings.fadeOutMs}
-              onChange={(e) =>
-                onAudioSettingsChange({ ...audioSettings, fadeOutMs: Number(e.target.value) })
+            >
+              <input
+                type="range"
+                min={0}
+                max={3000}
+                step={100}
+                value={audioSettings.fadeInMs}
+                onChange={(e) =>
+                  onAudioSettingsChange({
+                    ...audioSettings,
+                    fadeInMs: Number(e.target.value),
+                  })
+                }
+                className="w-full accent-emerald-500"
+                aria-label="Audio fade in"
+              />
+            </Field>
+            <Field
+              label="Fade out"
+              hint={
+                audioSettings.fadeOutMs
+                  ? `${(audioSettings.fadeOutMs / 1000).toFixed(1)}s`
+                  : "off"
               }
-              className="w-full accent-emerald-500"
-              aria-label="Audio fade out"
-            />
-          </Field>
-        </Section>
+            >
+              <input
+                type="range"
+                min={0}
+                max={3000}
+                step={100}
+                value={audioSettings.fadeOutMs}
+                onChange={(e) =>
+                  onAudioSettingsChange({
+                    ...audioSettings,
+                    fadeOutMs: Number(e.target.value),
+                  })
+                }
+                className="w-full accent-emerald-500"
+                aria-label="Audio fade out"
+              />
+            </Field>
+          </Section>
+        </div>
 
-        {/* ─── Title overlay (v4.2) ────────────────────────────────── */}
-        <HeadlineSection
-          items={headlineItems}
-          onAdd={onAddHeadline}
-          onUpdate={onUpdateHeadline}
-          onRemove={onRemoveHeadline}
-          totalMs={totalMs}
-        />
-
-        {/* ─── Captions ──────────────────────────────────────────────── */}
-        <CaptionsSection
-          captionSettings={captionSettings}
-          onCaptionSettingsChange={onCaptionSettingsChange}
-          onApplyPreset={onApplyPreset}
-          favoritePresets={favoritePresets}
-          onToggleFavorite={onToggleFavorite}
-          onExportSrt={onExportSrt}
-          onExportAss={onExportAss}
-          onExportVtt={onExportVtt}
-          onExportVttWords={onExportVttWords}
-          inElectron={inElectron}
-          subtitles={subtitles}
-          hasAudio={hasAudio}
-          onGenerateCaptions={onGenerateCaptions}
-          whisperBusy={whisperBusy}
-          whisperProgress={whisperProgress}
-          whisperLanguage={whisperLanguage}
-          onWhisperLanguageChange={onWhisperLanguageChange}
-        />
-
-        {/* ─── Debug ─────────────────────────────────────────────────── */}
-        <Section icon={<Bug size={13} />} title="Debug">
-          <div className="space-y-1 font-mono text-[10px] text-zinc-500">
-            <div>images: {debug.imageCount}</div>
-            <div>mode: {String(debug.mode)}</div>
-            <div>total: {(debug.totalMs / 1000).toFixed(1)}s</div>
-            <div>playhead: {(debug.currentMs / 1000).toFixed(1)}s</div>
-            <div>active: {debug.activeSegment ?? "—"}</div>
-            <div>env: {debug.inElectron ? "electron" : "browser"}</div>
-          </div>
-        </Section>
+        {/* ─── Captions tab — presets, word mode, Whisper, sidecars ──── */}
+        <div
+          id="ff-settings-tabpanel-captions"
+          role="tabpanel"
+          aria-labelledby="ff-settings-tab-captions"
+          tabIndex={tab === "captions" ? 0 : -1}
+          className={cn(
+            "pb-2",
+            tab === "captions" ? "ff-tab-panel-in" : "hidden",
+          )}
+        >
+          {/* ─── Captions ──────────────────────────────────────────────── */}
+          <CaptionsSection
+            captionSettings={captionSettings}
+            onCaptionSettingsChange={onCaptionSettingsChange}
+            onApplyPreset={onApplyPreset}
+            favoritePresets={favoritePresets}
+            onToggleFavorite={onToggleFavorite}
+            onExportSrt={onExportSrt}
+            onExportAss={onExportAss}
+            onExportVtt={onExportVtt}
+            onExportVttWords={onExportVttWords}
+            inElectron={inElectron}
+            subtitles={subtitles}
+            hasAudio={hasAudio}
+            onGenerateCaptions={onGenerateCaptions}
+            whisperBusy={whisperBusy}
+            whisperProgress={whisperProgress}
+            whisperLanguage={whisperLanguage}
+            onWhisperLanguageChange={onWhisperLanguageChange}
+          />
+        </div>
       </div>
     </div>
   );
@@ -808,19 +1215,21 @@ function TransitionSection({
                 onClick={() => onTransitionChange({ ...transition, style })}
                 className={cn(
                   "ff-tx-tile group flex flex-col items-center gap-1 rounded-md p-1.5 transition-all duration-150",
-                  active
-                    ? "ff-tx-tile-active"
-                    : "hover:bg-white/5",
+                  active ? "ff-tx-tile-active" : "hover:bg-white/5",
                 )}
               >
                 <div className="ff-tx-stage">
                   <div className="ff-tx-rect ff-tx-a" />
-                  <div className={cn("ff-tx-rect ff-tx-b", `ff-anim-${style}`)} />
+                  <div
+                    className={cn("ff-tx-rect ff-tx-b", `ff-anim-${style}`)}
+                  />
                   {isDip && (
                     <div
                       className={cn(
                         "ff-tx-veil",
-                        style === "dip-white" ? "ff-tx-veil-white" : "ff-tx-veil-black",
+                        style === "dip-white"
+                          ? "ff-tx-veil-white"
+                          : "ff-tx-veil-black",
                         `ff-anim-veil-${style}`,
                       )}
                     />
@@ -852,7 +1261,10 @@ function TransitionSection({
             step={100}
             value={transition.durationMs}
             onChange={(e) =>
-              onTransitionChange({ ...transition, durationMs: Number(e.target.value) })
+              onTransitionChange({
+                ...transition,
+                durationMs: Number(e.target.value),
+              })
             }
             className="w-full accent-fuchsia-500"
             aria-label="Transition duration"
@@ -863,7 +1275,9 @@ function TransitionSection({
       <Row label="Fade video in / out">
         <Toggle
           checked={transition.fadeStartEnd}
-          onChange={(v) => onTransitionChange({ ...transition, fadeStartEnd: v })}
+          onChange={(v) =>
+            onTransitionChange({ ...transition, fadeStartEnd: v })
+          }
           label=""
         />
       </Row>
@@ -879,9 +1293,15 @@ function TransitionSection({
 // Watermark section (v4.4) — logo overlay with 3×3 position picker
 // ---------------------------------------------------------------------------
 const WM_POSITIONS: WatermarkPosition[] = [
-  "top-left", "top", "top-right",
-  "left", "center", "right",
-  "bottom-left", "bottom", "bottom-right",
+  "top-left",
+  "top",
+  "top-right",
+  "left",
+  "center",
+  "right",
+  "bottom-left",
+  "bottom",
+  "bottom-right",
 ];
 
 function WatermarkSection({
@@ -904,7 +1324,10 @@ function WatermarkSection({
         hint="PNG with transparency works best. Burned into every frame UNDER the captions — export matches the preview exactly."
       >
         {image ? (
-          <div className="flex items-center gap-2.5 rounded-lg border p-2" style={{ borderColor: "#27272a", backgroundColor: "#18181b" }}>
+          <div
+            className="flex items-center gap-2.5 rounded-lg border p-2"
+            style={{ borderColor: "#27272a", backgroundColor: "#18181b" }}
+          >
             <div
               className="flex size-10 shrink-0 items-center justify-center rounded-lg"
               style={{
@@ -912,13 +1335,23 @@ function WatermarkSection({
                 boxShadow: "inset 0 0 0 1px rgba(255,255,255,0.06)",
               }}
             >
-              <img src={image.url} alt="watermark" className="max-h-8 max-w-8 object-contain" draggable={false} />
+              <img
+                src={image.url}
+                alt="watermark"
+                className="max-h-8 max-w-8 object-contain"
+                draggable={false}
+              />
             </div>
             <div className="min-w-0 flex-1">
-              <div className="truncate text-[11px] font-medium text-zinc-200" title={image.fileName}>
+              <div
+                className="truncate text-[11px] font-medium text-zinc-200"
+                title={image.fileName}
+              >
                 {image.fileName}
               </div>
-              <div className="text-[9px] text-zinc-500">branded on every frame</div>
+              <div className="text-[9px] text-zinc-500">
+                branded on every frame
+              </div>
             </div>
             <button
               type="button"
@@ -947,11 +1380,23 @@ function WatermarkSection({
       {image && (
         <>
           <Field label="Position">
-            <div className="grid w-max grid-cols-3 gap-1" role="radiogroup" aria-label="Watermark position">
+            <div
+              className="grid w-max grid-cols-3 gap-1"
+              role="radiogroup"
+              aria-label="Watermark position"
+            >
               {WM_POSITIONS.map((pos) => {
                 const active = settings.position === pos;
-                const row = pos.startsWith("top") ? 0 : pos.startsWith("bottom") ? 2 : 1;
-                const col = pos.endsWith("left") ? 0 : pos.endsWith("right") ? 2 : 1;
+                const row = pos.startsWith("top")
+                  ? 0
+                  : pos.startsWith("bottom")
+                    ? 2
+                    : 1;
+                const col = pos.endsWith("left")
+                  ? 0
+                  : pos.endsWith("right")
+                    ? 2
+                    : 1;
                 return (
                   <button
                     key={pos}
@@ -959,7 +1404,9 @@ function WatermarkSection({
                     role="radio"
                     aria-checked={active}
                     title={pos}
-                    onClick={() => onSettingsChange({ ...settings, position: pos })}
+                    onClick={() =>
+                      onSettingsChange({ ...settings, position: pos })
+                    }
                     className={cn(
                       "ff-wm-cell group flex size-7 items-center justify-center rounded transition-all active:scale-90",
                       active ? "ff-wm-cell-active" : "hover:bg-white/5",
@@ -968,11 +1415,15 @@ function WatermarkSection({
                     <span
                       className={cn(
                         "size-1.5 rounded-sm transition-all",
-                        active ? "ff-wm-dot-active" : "bg-zinc-600 group-hover:bg-zinc-400",
+                        active
+                          ? "ff-wm-dot-active"
+                          : "bg-zinc-600 group-hover:bg-zinc-400",
                       )}
                       style={
                         !active
-                          ? { transform: `translate(${(col - 1) * 5}px, ${(row - 1) * 5}px)` }
+                          ? {
+                              transform: `translate(${(col - 1) * 5}px, ${(row - 1) * 5}px)`,
+                            }
                           : undefined
                       }
                     />
@@ -989,7 +1440,12 @@ function WatermarkSection({
               max={50}
               step={1}
               value={settings.sizePercent}
-              onChange={(e) => onSettingsChange({ ...settings, sizePercent: Number(e.target.value) })}
+              onChange={(e) =>
+                onSettingsChange({
+                  ...settings,
+                  sizePercent: Number(e.target.value),
+                })
+              }
               className="w-full accent-emerald-500"
               aria-label="Watermark size"
             />
@@ -1002,20 +1458,33 @@ function WatermarkSection({
               max={100}
               step={5}
               value={settings.opacity}
-              onChange={(e) => onSettingsChange({ ...settings, opacity: Number(e.target.value) })}
+              onChange={(e) =>
+                onSettingsChange({
+                  ...settings,
+                  opacity: Number(e.target.value),
+                })
+              }
               className="w-full accent-emerald-500"
               aria-label="Watermark opacity"
             />
           </Field>
 
-          <Field label={`Margin — ${settings.marginPercent}%`} hint="Distance from the edges (scales with the video width).">
+          <Field
+            label={`Margin — ${settings.marginPercent}%`}
+            hint="Distance from the edges (scales with the video width)."
+          >
             <input
               type="range"
               min={0}
               max={10}
               step={1}
               value={settings.marginPercent}
-              onChange={(e) => onSettingsChange({ ...settings, marginPercent: Number(e.target.value) })}
+              onChange={(e) =>
+                onSettingsChange({
+                  ...settings,
+                  marginPercent: Number(e.target.value),
+                })
+              }
               className="w-full accent-emerald-500"
               aria-label="Watermark margin"
             />
@@ -1033,7 +1502,8 @@ function HeadlineSection({
   onRemove,
   totalMs,
 }: HeadlineSectionProps) {
-  const clampMs = (v: number) => Math.max(0, Math.min(v, Math.max(totalMs, 60000)));
+  const clampMs = (v: number) =>
+    Math.max(0, Math.min(v, Math.max(totalMs, 60000)));
 
   return (
     // `key` remounts the section when items appear/disappear so the
@@ -1085,7 +1555,10 @@ function HeadlineSection({
               <div className="mb-2 flex items-center gap-2">
                 <span
                   className="rounded px-1.5 py-0.5 text-[9px] font-bold tabular-nums"
-                  style={{ backgroundColor: "rgba(251, 191, 36, 0.15)", color: "#fbbf24" }}
+                  style={{
+                    backgroundColor: "rgba(251, 191, 36, 0.15)",
+                    color: "#fbbf24",
+                  }}
                 >
                   {idx + 1}
                 </span>
@@ -1104,9 +1577,13 @@ function HeadlineSection({
                     color: preset.textColor,
                     fontFamily: preset.fontFamily,
                     fontWeight: preset.fontWeight,
-                    fontStyle: preset.fontStyle === "italic" ? "italic" : "normal",
+                    fontStyle:
+                      preset.fontStyle === "italic" ? "italic" : "normal",
                     letterSpacing: Math.min(1.5, preset.letterSpacing / 2),
-                    textTransform: preset.textTransform === "uppercase" ? "uppercase" : "none",
+                    textTransform:
+                      preset.textTransform === "uppercase"
+                        ? "uppercase"
+                        : "none",
                     textShadow:
                       preset.shadow && preset.shadowBlur > 0
                         ? `0 0 ${Math.max(2, preset.shadowBlur / 2)}px ${
@@ -1152,7 +1629,9 @@ function HeadlineSection({
                     value={(item.startMs / 1000).toFixed(1)}
                     onChange={(e) =>
                       onUpdate(item.id, {
-                        startMs: clampMs(Math.round(parseFloat(e.target.value) * 1000) || 0),
+                        startMs: clampMs(
+                          Math.round(parseFloat(e.target.value) * 1000) || 0,
+                        ),
                       })
                     }
                     className="w-16 rounded border bg-zinc-900 px-1.5 py-1 text-[10px] tabular-nums text-zinc-200 focus:border-violet-500"
@@ -1167,7 +1646,9 @@ function HeadlineSection({
                     value={(item.endMs / 1000).toFixed(1)}
                     onChange={(e) =>
                       onUpdate(item.id, {
-                        endMs: clampMs(Math.round(parseFloat(e.target.value) * 1000) || 0),
+                        endMs: clampMs(
+                          Math.round(parseFloat(e.target.value) * 1000) || 0,
+                        ),
                       })
                     }
                     className="w-16 rounded border bg-zinc-900 px-1.5 py-1 text-[10px] tabular-nums text-zinc-200 focus:border-violet-500"
@@ -1179,7 +1660,9 @@ function HeadlineSection({
                 <span
                   className={cn(
                     "ml-auto rounded px-1.5 py-0.5 text-[9px] tabular-nums",
-                    invalid ? "bg-red-500/20 text-red-300" : "bg-zinc-800 text-zinc-400",
+                    invalid
+                      ? "bg-red-500/20 text-red-300"
+                      : "bg-zinc-800 text-zinc-400",
                   )}
                 >
                   {invalid ? "end ≤ start" : `${dur.toFixed(1)}s`}
@@ -1189,7 +1672,9 @@ function HeadlineSection({
               {/* Preset select */}
               <select
                 value={item.presetId}
-                onChange={(e) => onUpdate(item.id, { presetId: e.target.value })}
+                onChange={(e) =>
+                  onUpdate(item.id, { presetId: e.target.value })
+                }
                 className="mb-2 w-full rounded border bg-zinc-900 px-2 py-1.5 text-[11px] text-zinc-200 focus:border-violet-500"
                 style={{ borderColor: "#3f3f46" }}
                 aria-label={`Headline ${idx + 1} style`}
@@ -1206,8 +1691,16 @@ function HeadlineSection({
                 size="sm"
                 options={[
                   { value: "top", label: "Top", title: "Top of frame" },
-                  { value: "center", label: "Center", title: "Middle of frame" },
-                  { value: "bottom", label: "Bottom", title: "Bottom of frame" },
+                  {
+                    value: "center",
+                    label: "Center",
+                    title: "Middle of frame",
+                  },
+                  {
+                    value: "bottom",
+                    label: "Bottom",
+                    title: "Bottom of frame",
+                  },
                 ]}
                 value={item.position}
                 onChange={(v) => onUpdate(item.id, { position: v })}
@@ -1227,7 +1720,10 @@ function HeadlineSection({
 
               {/* Size */}
               <div className="mt-2">
-                <Field label="Size" hint={`${(item.sizeScale * 100).toFixed(0)}%`}>
+                <Field
+                  label="Size"
+                  hint={`${(item.sizeScale * 100).toFixed(0)}%`}
+                >
                   <input
                     type="range"
                     min={0.5}
@@ -1317,8 +1813,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
   >("all");
   const q = presetQuery.trim().toLowerCase();
   const isFav = (p: CaptionPreset) => favoritePresets.includes(p.id);
-  const showFavGroup =
-    presetCat === "all" && !q && favoritePresets.length > 0;
+  const showFavGroup = presetCat === "all" && !q && favoritePresets.length > 0;
   const matchesQuery = (p: CaptionPreset) =>
     !q ||
     p.name.toLowerCase().includes(q) ||
@@ -1341,20 +1836,24 @@ function CaptionsSection(props: CaptionsSectionProps) {
     .filter((cat) => cat.presets.length > 0);
   // v4.7: favorites pinned to the top when browsing all styles unfiltered.
   const favGroup = showFavGroup
-      ? {
-          category: "favorites",
-          label: "★ Favorites",
-          hint: "Your starred presets",
-          presets: presetsByCategory()
-            .flatMap((c) => c.presets)
-            .filter((p) => favoritePresets.includes(p.id)),
-        }
-      : null;
-  const matchCount = filteredCategories.reduce((n, c) => n + c.presets.length, 0);
+    ? {
+        category: "favorites",
+        label: "★ Favorites",
+        hint: "Your starred presets",
+        presets: presetsByCategory()
+          .flatMap((c) => c.presets)
+          .filter((p) => favoritePresets.includes(p.id)),
+      }
+    : null;
+  const matchCount = filteredCategories.reduce(
+    (n, c) => n + c.presets.length,
+    0,
+  );
 
   const preset = getCaptionPreset(captionSettings.presetId);
   const hasCues = !!subtitles && subtitles.cues.length > 0;
-  const hasWords = hasCues && subtitles!.cues.some((c) => c.words && c.words.length > 0);
+  const hasWords =
+    hasCues && subtitles!.cues.some((c) => c.words && c.words.length > 0);
 
   return (
     <Section icon={<Captions size={13} />} title="Captions" defaultOpen>
@@ -1416,9 +1915,10 @@ function CaptionsSection(props: CaptionsSectionProps) {
           </div>
         )}
         <p className="mt-2 text-[10px] leading-relaxed text-zinc-500">
-          Whisper-tiny runs locally (in-app, ~75 MB download once, then offline). Produces{" "}
-          <span className="text-zinc-300">exact word-by-word timing</span> for karaoke &amp;
-          kinetic captions.
+          Whisper-tiny runs locally (in-app, ~75 MB download once, then
+          offline). Produces{" "}
+          <span className="text-zinc-300">exact word-by-word timing</span> for
+          karaoke &amp; kinetic captions.
         </p>
       </div>
 
@@ -1478,9 +1978,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
           <div className="relative">
             <select
               value={presetCat}
-              onChange={(e) =>
-                setPresetCat(e.target.value as typeof presetCat)
-              }
+              onChange={(e) => setPresetCat(e.target.value as typeof presetCat)}
               className="h-full appearance-none rounded-md border bg-zinc-900 pl-2 pr-6 text-[10px] text-zinc-200"
               style={{ borderColor: "#27272a" }}
               aria-label="Filter presets by category"
@@ -1512,116 +2010,130 @@ function CaptionsSection(props: CaptionsSectionProps) {
             No presets match “{presetQuery.trim()}”
           </div>
         ) : (
-        <div className="max-h-72 overflow-y-auto rounded-md border" style={{ borderColor: "#27272a" }}>
-          {[favGroup, ...filteredCategories]
-            .filter((g): g is NonNullable<typeof g> => !!g)
-            .map((cat) => (
-            <div key={cat.category}>
-              <div
-                className={cn(
-                  "sticky top-0 z-10 bg-[#131316] px-2 py-1 text-[9px] font-bold uppercase tracking-widest",
-                  cat.category === "favorites" ? "text-amber-400/90" : "text-zinc-500",
-                )}
-                title={cat.hint}
-              >
-                {cat.label}
-              </div>
-              {cat.presets.map((p) => {
-                const active = p.id === captionSettings.presetId;
-                const fav = isFav(p);
-                return (
-                  <button
-                    key={p.id}
-                    type="button"
-                    onClick={() => onApplyPreset(p.id)}
+          <div
+            className="max-h-72 overflow-y-auto rounded-md border"
+            style={{ borderColor: "#27272a" }}
+          >
+            {[favGroup, ...filteredCategories]
+              .filter((g): g is NonNullable<typeof g> => !!g)
+              .map((cat) => (
+                <div key={cat.category}>
+                  <div
                     className={cn(
-                      "flex w-full items-center gap-2 px-2 py-1.5 text-left transition-colors",
-                      active ? "bg-emerald-500/15" : "hover:bg-white/5",
+                      "sticky top-0 z-10 bg-[#131316] px-2 py-1 text-[9px] font-bold uppercase tracking-widest",
+                      cat.category === "favorites"
+                        ? "text-amber-400/90"
+                        : "text-zinc-500",
                     )}
-                    aria-pressed={active}
+                    title={cat.hint}
                   >
-                    {/* Mini live swatch */}
-                    <span
-                      className="flex h-6 shrink-0 items-center justify-center overflow-hidden rounded px-1.5"
-                      style={{
-                        backgroundColor: p.bgColor
-                          ? `${p.bgColor}${Math.round(p.bgAlpha * 255)
-                              .toString(16)
-                              .padStart(2, "0")}`
-                          : "transparent",
-                        border: p.borderColor
-                          ? `1px solid ${p.borderColor}`
-                          : "1px solid transparent",
-                        borderRadius: Math.min(6, p.bgRadius / 2),
-                        color: p.textColor,
-                        fontFamily: p.fontFamily,
-                        fontWeight: p.fontWeight,
-                        fontStyle: p.fontStyle === "italic" ? "italic" : "normal",
-                        fontSize: 9,
-                        letterSpacing: Math.min(2, p.letterSpacing / 2),
-                        textTransform: p.textTransform,
-                        textShadow:
-                          p.shadow && p.shadowBlur > 0
-                            ? `0 0 ${Math.max(2, p.shadowBlur / 2)}px ${p.shadowColor}`
-                            : undefined,
-                        minWidth: 54,
-                      }}
-                    >
-                      Quick fox
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-[11px] font-medium text-zinc-200">
-                        {p.name}
-                        {p.animation && p.animation !== "none" && (
-                          <span className="ml-1 text-[9px] text-emerald-400">✦</span>
+                    {cat.label}
+                  </div>
+                  {cat.presets.map((p) => {
+                    const active = p.id === captionSettings.presetId;
+                    const fav = isFav(p);
+                    return (
+                      <button
+                        key={p.id}
+                        type="button"
+                        onClick={() => onApplyPreset(p.id)}
+                        className={cn(
+                          "flex w-full items-center gap-2 px-2 py-1.5 text-left transition-colors",
+                          active ? "bg-emerald-500/15" : "hover:bg-white/5",
                         )}
-                      </span>
-                      <span className="block truncate text-[9px] text-zinc-500">
-                        {p.description}
-                      </span>
-                    </span>
-                    {p.highlightColor && (
-                      <span
-                        className="h-2.5 w-2.5 shrink-0 rounded-full"
-                        style={{ backgroundColor: p.highlightColor }}
-                        title="Active-word highlight"
-                      />
-                    )}
-                    {/* v4.7 favorite star — spans inside the row button keep
+                        aria-pressed={active}
+                      >
+                        {/* Mini live swatch */}
+                        <span
+                          className="flex h-6 shrink-0 items-center justify-center overflow-hidden rounded px-1.5"
+                          style={{
+                            backgroundColor: p.bgColor
+                              ? `${p.bgColor}${Math.round(p.bgAlpha * 255)
+                                  .toString(16)
+                                  .padStart(2, "0")}`
+                              : "transparent",
+                            border: p.borderColor
+                              ? `1px solid ${p.borderColor}`
+                              : "1px solid transparent",
+                            borderRadius: Math.min(6, p.bgRadius / 2),
+                            color: p.textColor,
+                            fontFamily: p.fontFamily,
+                            fontWeight: p.fontWeight,
+                            fontStyle:
+                              p.fontStyle === "italic" ? "italic" : "normal",
+                            fontSize: 9,
+                            letterSpacing: Math.min(2, p.letterSpacing / 2),
+                            textTransform: p.textTransform,
+                            textShadow:
+                              p.shadow && p.shadowBlur > 0
+                                ? `0 0 ${Math.max(2, p.shadowBlur / 2)}px ${p.shadowColor}`
+                                : undefined,
+                            minWidth: 54,
+                          }}
+                        >
+                          Quick fox
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-[11px] font-medium text-zinc-200">
+                            {p.name}
+                            {p.animation && p.animation !== "none" && (
+                              <span className="ml-1 text-[9px] text-emerald-400">
+                                ✦
+                              </span>
+                            )}
+                          </span>
+                          <span className="block truncate text-[9px] text-zinc-500">
+                            {p.description}
+                          </span>
+                        </span>
+                        {p.highlightColor && (
+                          <span
+                            className="h-2.5 w-2.5 shrink-0 rounded-full"
+                            style={{ backgroundColor: p.highlightColor }}
+                            title="Active-word highlight"
+                          />
+                        )}
+                        {/* v4.7 favorite star — spans inside the row button keep
                         HTML valid; role=button + keyboard handling for a11y. */}
-                    <span
-                      role="button"
-                      tabIndex={0}
-                      aria-pressed={fav}
-                      aria-label={fav ? "Remove from favorites" : "Add to favorites"}
-                      title={fav ? "Remove from favorites" : "Star this preset"}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onToggleFavorite(p.id);
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" || e.key === " ") {
-                          e.preventDefault();
-                          e.stopPropagation();
-                          onToggleFavorite(p.id);
-                        }
-                      }}
-                      className={cn(
-                        "shrink-0 rounded p-0.5 transition-all duration-150 hover:scale-125 active:scale-95",
-                        fav ? "text-amber-400" : "text-zinc-600 hover:text-amber-400/70",
-                      )}
-                    >
-                      <Star
-                        className="size-3"
-                        fill={fav ? "currentColor" : "none"}
-                      />
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-          ))}
-        </div>
+                        <span
+                          role="button"
+                          tabIndex={0}
+                          aria-pressed={fav}
+                          aria-label={
+                            fav ? "Remove from favorites" : "Add to favorites"
+                          }
+                          title={
+                            fav ? "Remove from favorites" : "Star this preset"
+                          }
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onToggleFavorite(p.id);
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              onToggleFavorite(p.id);
+                            }
+                          }}
+                          className={cn(
+                            "shrink-0 rounded p-0.5 transition-all duration-150 hover:scale-125 active:scale-95",
+                            fav
+                              ? "text-amber-400"
+                              : "text-zinc-600 hover:text-amber-400/70",
+                          )}
+                        >
+                          <Star
+                            className="size-3"
+                            fill={fav ? "currentColor" : "none"}
+                          />
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              ))}
+          </div>
         )}
       </Field>
 
@@ -1637,10 +2149,26 @@ function CaptionsSection(props: CaptionsSectionProps) {
         <Segmented
           size="sm"
           options={[
-            { value: "off", label: "Full text", title: "Standard subtitle block" },
-            { value: "word", label: "Karaoke", title: "Highlight the spoken word" },
-            { value: "word-only", label: "Single", title: "One word at a time (Hormozi)" },
-            { value: "stack", label: "Stack", title: "Words stack as spoken (quote builder)" },
+            {
+              value: "off",
+              label: "Full text",
+              title: "Standard subtitle block",
+            },
+            {
+              value: "word",
+              label: "Karaoke",
+              title: "Highlight the spoken word",
+            },
+            {
+              value: "word-only",
+              label: "Single",
+              title: "One word at a time (Hormozi)",
+            },
+            {
+              value: "stack",
+              label: "Stack",
+              title: "Words stack as spoken (quote builder)",
+            },
           ]}
           value={captionSettings.wordMode}
           onChange={(v) => set({ wordMode: v })}
@@ -1656,7 +2184,10 @@ function CaptionsSection(props: CaptionsSectionProps) {
             : "Following preset default (pin to override)"
         }
       >
-        <div className="max-h-56 overflow-y-auto rounded-md border" style={{ borderColor: "#27272a" }}>
+        <div
+          className="max-h-56 overflow-y-auto rounded-md border"
+          style={{ borderColor: "#27272a" }}
+        >
           {[
             { id: "classic", label: "Classic" },
             { id: "viral", label: "Viral pack ✦" },
@@ -1668,7 +2199,9 @@ function CaptionsSection(props: CaptionsSectionProps) {
               <div className="grid grid-cols-2 gap-1 p-1">
                 {ANIMATION_LABELS.filter((a) => a.group === grp.id).map((a) => {
                   const active =
-                    (captionSettings.animation || preset.animation || "none") === a.value;
+                    (captionSettings.animation ||
+                      preset.animation ||
+                      "none") === a.value;
                   return (
                     <button
                       key={a.value}
@@ -1711,7 +2244,10 @@ function CaptionsSection(props: CaptionsSectionProps) {
       </Field>
 
       {/* ── Font ── */}
-      <Field label="Font" hint="Windows-safe stacks — preview matches the export.">
+      <Field
+        label="Font"
+        hint="Windows-safe stacks — preview matches the export."
+      >
         <select
           value={captionSettings.fontId}
           onChange={(e) => set({ fontId: e.target.value })}
@@ -1730,7 +2266,10 @@ function CaptionsSection(props: CaptionsSectionProps) {
       {/* ── Color override ── */}
       <Field label="Text color" hint="Overrides the preset color.">
         <div className="flex items-center gap-2">
-          <label className="relative inline-flex h-7 w-10 cursor-pointer items-center justify-center overflow-hidden rounded border" style={{ borderColor: "#3f3f46" }}>
+          <label
+            className="relative inline-flex h-7 w-10 cursor-pointer items-center justify-center overflow-hidden rounded border"
+            style={{ borderColor: "#3f3f46" }}
+          >
             <input
               type="color"
               value={captionSettings.customColor || preset.textColor}
@@ -1740,7 +2279,10 @@ function CaptionsSection(props: CaptionsSectionProps) {
             />
             <span
               className="h-4 w-6 rounded-sm"
-              style={{ backgroundColor: captionSettings.customColor || preset.textColor }}
+              style={{
+                backgroundColor:
+                  captionSettings.customColor || preset.textColor,
+              }}
             />
           </label>
           <span className="font-mono text-[10px] text-zinc-400">
@@ -1783,7 +2325,9 @@ function CaptionsSection(props: CaptionsSectionProps) {
                 aria-pressed={active}
               >
                 {pos}
-                {isPresetDefault && <span className="ml-0.5 text-[8px] text-zinc-500">·</span>}
+                {isPresetDefault && (
+                  <span className="ml-0.5 text-[8px] text-zinc-500">·</span>
+                )}
               </button>
             );
           })}
@@ -1825,7 +2369,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
         />
       </Row>
       <p className="mb-3 mt-[-8px] text-[10px] leading-relaxed text-zinc-500">
-        Triangle shape — line 1 longer than line 2 (auto in the export via ASS smart wrap).
+        Triangle shape — line 1 longer than line 2 (auto in the export via ASS
+        smart wrap).
       </p>
 
       {/* ── Sidecar exports ── */}
@@ -1862,7 +2407,11 @@ function CaptionsSection(props: CaptionsSectionProps) {
             type="button"
             onClick={onExportAss}
             disabled={!hasCues}
-            title={inElectron ? "Styled ASS with your kinetic animations" : "Desktop app only"}
+            title={
+              inElectron
+                ? "Styled ASS with your kinetic animations"
+                : "Desktop app only"
+            }
             className={cn(
               "flex items-center justify-center gap-1 rounded px-2 py-1.5 text-[10px] font-semibold transition-colors",
               hasCues && inElectron
