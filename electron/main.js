@@ -949,7 +949,7 @@ function frozenZoompanExpr(dir, zoomMax) {
 }
 
 ipcMain.handle("export-native", async (event, opts) => {
-  const { outputPath, fps, width, height, bitrateMbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition } = opts;
+  const { outputPath, fps, width, height, bitrateMbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark } = opts;
 
   if (!outputPath) throw new Error("No output path");
   if (!segments || segments.length === 0) throw new Error("No segments");
@@ -957,6 +957,26 @@ ipcMain.handle("export-native", async (event, opts) => {
   if (!ffmpegPath || !fs.existsSync(ffmpegPath)) {
     throw new Error("FFmpeg not found. The bundled FFmpeg binary is missing or corrupted. Please reinstall FrameFuse. Expected at: " + ffmpegPath);
   }
+
+  // v4.4 watermark: { imagePath, x, y, w, h, opacity } — geometry computed
+  // ONCE in the renderer process (watermarkGeometry) so preview + export
+  // can never disagree. The chain below mirrors the canvas exactly:
+  // scale → setsar → rgba → colorchannelmixer=aa (linear alpha) → overlay.
+  const wm =
+    watermark && watermark.imagePath && Number(watermark.w) > 0
+      ? {
+          imagePath: watermark.imagePath,
+          x: Math.round(Number(watermark.x) || 0),
+          y: Math.round(Number(watermark.y) || 0),
+          w: Math.round(Number(watermark.w)),
+          h: Math.round(Number(watermark.h) || watermark.w),
+          opacity: Math.max(0.05, Math.min(1, Number(watermark.opacity) || 1)).toFixed(3),
+        }
+      : null;
+  const wmChain = (inputIdx) =>
+    `[${inputIdx}:v]scale=${wm.w}:${wm.h}:flags=bilinear,setsar=1,format=rgba,colorchannelmixer=aa=${wm.opacity}[wmx]`;
+  const wmOverlay = (baseLabel, outLabel) =>
+    `${baseLabel}[wmx]overlay=${wm.x}:${wm.y}:eof_action=repeat${outLabel}`;
 
   const intensity = Math.max(0, Math.min(100, Number(kenBurns?.intensity) || 0));
   const zoomMax = 1.06 + (intensity / 100) * 0.18;
@@ -1120,6 +1140,10 @@ ipcMain.handle("export-native", async (event, opts) => {
         clipPath,
       ];
 
+      // v4.4: post-graph chain = [watermark overlay →] subtitles → fades.
+      // Watermark UNDER captions (same z-order as the canvas preview).
+      const post = [assSuffix, ...postFades].filter(Boolean).join(",");
+
       if (xfadeName && i > 0 && headMs > 0) {
         // ── v4.3 xfade HEAD composite (dissolve / slide / wipe) ──
         // [A = prev frozen at its Ken Burns end-state][B = cur] xfade at
@@ -1136,21 +1160,44 @@ ipcMain.handle("export-native", async (event, opts) => {
           `[1:v]${pre},zoompan=z='${frz.z}':x='${frz.x}':y='${frz.y}':${zpCommon},setsar=1,format=yuv420p[a]`;
         const bChain =
           `[0:v]${pre},zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':${zpCommon},setsar=1,format=yuv420p[b]`;
-        const post = [assSuffix, ...postFades].filter(Boolean).join(",");
-        const graph =
-          `${aChain};${bChain};[a][b]xfade=transition=${xfadeName}:duration=${F}:offset=0[vx]` +
-          (post ? `;[vx]${post}[vout]` : "");
-        const outLabel = post ? "[vout]" : "[vx]";
+        let graph =
+          `${aChain};${bChain};[a][b]xfade=transition=${xfadeName}:duration=${F}:offset=0[vx]`;
+        let label = "[vx]";
+        // Watermark (input index 2 after cur + prev) under the captions.
+        if (wm) {
+          graph += `;${wmChain(2)};${wmOverlay(label, "[vw]")}`;
+          label = "[vw]";
+        }
+        if (post) graph += `;${label}${post}[vout]`;
+        const outLabel = post ? "[vout]" : label;
         args = [
           "-loop", "1", "-i", seg.imagePath,
           "-loop", "1", "-i", prevSeg.imagePath,
+          ...(wm ? ["-i", wm.imagePath] : []),
           "-t", segDurSec.toFixed(3),
           "-filter_complex", graph,
           "-map", outLabel,
           ...encodeTail,
         ];
+      } else if (wm) {
+        // ── Single input + watermark → filter_complex (v4.4) ──
+        let graph =
+          `[0:v]scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase:flags=lanczos,crop=${scaleW}:${scaleH},` +
+          `zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${segFrames}:s=${width}x${height}:fps=${fps},setsar=1,format=yuv420p[base]`;
+        graph += `;${wmChain(1)};${wmOverlay("[base]", "[vw]")}`;
+        let label = "[vw]";
+        if (post) graph += `;${label}${post}[vout]`;
+        args = [
+          "-loop", "1",
+          "-i", seg.imagePath,
+          "-i", wm.imagePath,
+          "-t", segDurSec.toFixed(3),
+          "-filter_complex", graph,
+          "-map", post ? "[vout]" : label,
+          ...encodeTail,
+        ];
       } else {
-        // ── Single-input path (clip 0, dip styles, or transitions off) ──
+        // ── Plain single-input path (no watermark) ──
         const vfParts = [
           `scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase:flags=lanczos`,
           `crop=${scaleW}:${scaleH}`,

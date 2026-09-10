@@ -301,6 +301,8 @@ export interface ExportNativeOptions {
   audio?: AudioSettings;
   /** Segment transitions (v4.3). */
   transition?: TransitionSettings;
+  /** Watermark / logo overlay (v4.4). */
+  watermark?: WatermarkExportOptions | null;
   onProgress?: (p: ExportProgress) => void;
   /** When aborted, the export stops as soon as possible. */
   signal?: AbortSignal;
@@ -355,6 +357,55 @@ export interface TransitionSettings {
 
 export function defaultTransitionSettings(): TransitionSettings {
   return { style: "none", durationMs: 500, fadeStartEnd: false };
+}
+
+// ---------------------------------------------------------------------------
+// WATERMARK / LOGO OVERLAY (v4.4) — brand every frame.
+//
+// A single image (PNG with transparency works best) overlaid on every frame
+// of the video, under captions. The preview draws it with canvas globalAlpha;
+// the export uses ffmpeg `scale + format=rgba + colorchannelmixer=aa +
+// overlay=eof_action=repeat` — the exact same linear blend (probe-verified).
+// Geometry is computed by ONE shared function (watermarkGeometry in
+// renderer.ts) so the canvas and the FFmpeg overlay x/y/w/h can never drift.
+// ---------------------------------------------------------------------------
+
+export type WatermarkPosition =
+  | "top-left"
+  | "top"
+  | "top-right"
+  | "left"
+  | "center"
+  | "right"
+  | "bottom-left"
+  | "bottom"
+  | "bottom-right";
+
+export interface WatermarkSettings {
+  position: WatermarkPosition;
+  /** Destination width as a percentage of the video width (5 – 50). */
+  sizePercent: number;
+  /** Opacity 10 – 100. */
+  opacity: number;
+  /** Margin as a percentage of the video width (0 – 10), applied to both
+   *  axes (derived from width so it stays proportional on every aspect). */
+  marginPercent: number;
+}
+
+export function defaultWatermarkSettings(): WatermarkSettings {
+  return {
+    position: "bottom-right",
+    sizePercent: 12,
+    opacity: 80,
+    marginPercent: 3,
+  };
+}
+
+/** The watermark payload handed to the export orchestration. */
+export interface WatermarkExportOptions {
+  /** Object URL / data URL of the watermark image. */
+  imageUrl: string;
+  settings: WatermarkSettings;
 }
 
 /** Human labels + hints for the transition styles (UI + a11y). */

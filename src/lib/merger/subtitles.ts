@@ -183,6 +183,34 @@ export function serializeSrt(cues: SubtitleCue[]): string {
     .join("\n\n");
 }
 
+/**
+ * Serialize cues as WebVTT (v4.4) — the caption format for HTML5 <track>
+ * players and most web video players. Same cue bodies as the .srt export,
+ * WebVTT header + dot-separated timestamps.
+ */
+export function serializeVtt(cues: SubtitleCue[]): string {
+  const fmt = (ms: number): string => {
+    const total = Math.max(0, Math.floor(ms));
+    const h = Math.floor(total / 3_600_000);
+    const m = Math.floor((total % 3_600_000) / 60_000);
+    const s = Math.floor((total % 60_000) / 1000);
+    const milli = total % 1000;
+    return (
+      String(h).padStart(2, "0") +
+      ":" +
+      String(m).padStart(2, "0") +
+      ":" +
+      String(s).padStart(2, "0") +
+      "." +
+      String(milli).padStart(3, "0")
+    );
+  };
+  const body = cues
+    .map((c) => `${fmt(c.startMs)} --> ${fmt(c.endMs)}\n${c.text}`)
+    .join("\n\n");
+  return `WEBVTT\n\n${body}\n`;
+}
+
 // ---------------------------------------------------------------------------
 // Word-level helpers — used by the "word" / "word-only" caption modes and
 // by per-word kinetic typography animations.

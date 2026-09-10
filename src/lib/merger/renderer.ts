@@ -459,3 +459,71 @@ export function applyGlobalFade(
   ctx.drawImage(scratch, 0, 0);
   ctx.globalAlpha = 1;
 }
+
+// ---------------------------------------------------------------------------
+// WATERMARK / LOGO OVERLAY (v4.4) — canvas twin of the FFmpeg overlay chain.
+//
+// Export (electron/main.js): the watermark is an extra input per clip:
+//   [wm:v]scale=w:h:flags=bilinear,format=rgba,colorchannelmixer=aa=<op>[wm]
+//   [base][wm]overlay=<x>:<y>:eof_action=repeat
+// applied AFTER zoompan/xfade and BEFORE subtitles — the exact order of the
+// canvas draw calls below. Geometry comes from watermarkGeometry() so the
+// preview and the export can never disagree.
+// ---------------------------------------------------------------------------
+
+import type { WatermarkSettings } from "./types";
+
+/**
+ * Destination rect for the watermark on a videoW×videoH frame.
+ * Shared by the canvas preview, the browser exporters and (via the IPC
+ * payload) the FFmpeg overlay filter — the single source of truth.
+ */
+export function watermarkGeometry(
+  videoW: number,
+  videoH: number,
+  imgW: number,
+  imgH: number,
+  settings: WatermarkSettings,
+): { dx: number; dy: number; dw: number; dh: number } {
+  if (imgW <= 0 || imgH <= 0 || videoW <= 0 || videoH <= 0) {
+    return { dx: 0, dy: 0, dw: 0, dh: 0 };
+  }
+  const dw = Math.max(1, Math.round((videoW * settings.sizePercent) / 100));
+  const dh = Math.max(1, Math.round((dw * imgH) / imgW)); // aspect preserved
+  const m = Math.round((videoW * settings.marginPercent) / 100);
+
+  const pos = settings.position;
+  // Horizontal anchor: left column / center column / right column.
+  const col = pos.endsWith("left") ? 0 : pos.endsWith("right") ? 2 : 1;
+  // Vertical anchor: top row / middle row / bottom row.
+  const row = pos.startsWith("top") ? 0 : pos.startsWith("bottom") ? 2 : 1;
+
+  const dx =
+    col === 0 ? m : col === 2 ? Math.round(videoW - dw - m) : Math.round((videoW - dw) / 2);
+  const dy =
+    row === 0 ? m : row === 2 ? Math.round(videoH - dh - m) : Math.round((videoH - dh) / 2);
+
+  return { dx, dy, dw, dh };
+}
+
+/** Draw the watermark with opacity (mirrors colorchannelmixer=aa). */
+export function drawWatermark(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement | null,
+  videoW: number,
+  videoH: number,
+  settings: WatermarkSettings | null | undefined,
+): void {
+  if (!img || !settings) return;
+  const iw = img.naturalWidth || img.width;
+  const ih = img.naturalHeight || img.height;
+  if (!iw || !ih) return;
+  const g = watermarkGeometry(videoW, videoH, iw, ih, settings);
+  if (g.dw <= 0 || g.dh <= 0) return;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.globalAlpha = Math.max(0.05, Math.min(1, settings.opacity / 100));
+  ctx.drawImage(img, g.dx, g.dy, g.dw, g.dh);
+  ctx.globalAlpha = 1;
+}

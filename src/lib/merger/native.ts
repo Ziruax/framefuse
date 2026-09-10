@@ -16,7 +16,9 @@ import {
   drawFrameWithTransition,
   applyGlobalFade,
   computeGlobalFade,
+  drawWatermark,
   resolveDimensions,
+  watermarkGeometry,
 } from "./renderer";
 import { getCaptionPreset, getFontOption } from "./captionPresets";
 import { getHeadlinePreset, type HeadlinePreset } from "./headlinePresets";
@@ -35,6 +37,50 @@ export function isElectron(): boolean {
 
 function fetchBytes(url: string): Promise<ArrayBuffer> {
   return fetch(url).then((r) => r.arrayBuffer());
+}
+
+/** Load an image for its natural dimensions (export geometry). */
+function loadImageElement(url: string): Promise<HTMLImageElement | null> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => resolve(null);
+    img.src = url;
+  });
+}
+
+/**
+ * v4.4 watermark IPC payload: persists the image to a temp file and
+ * computes the overlay geometry ONCE (watermarkGeometry) so the FFmpeg
+ * overlay x/y/w/h and the canvas preview are identical by construction.
+ */
+async function buildWatermarkIpc(
+  wm: { imageUrl: string; settings: import("./types").WatermarkSettings } | null | undefined,
+  videoW: number,
+  videoH: number,
+  saveTempImage: (p: { name: string; bytes: ArrayBuffer }) => Promise<string>,
+): Promise<{ imagePath: string; x: number; y: number; w: number; h: number; opacity: number } | undefined> {
+  if (!wm?.imageUrl) return undefined;
+  const img = await loadImageElement(wm.imageUrl);
+  if (!img || !img.naturalWidth || !img.naturalHeight) return undefined;
+  const resp = await fetch(wm.imageUrl);
+  const blob = await resp.blob();
+  const bytes = await blob.arrayBuffer();
+  const ext =
+    blob.type.includes("png") ? ".png" :
+    blob.type.includes("webp") ? ".webp" :
+    blob.type.includes("gif") ? ".gif" : ".jpg";
+  const imagePath = await saveTempImage({ name: `watermark${ext}`, bytes });
+  const g = watermarkGeometry(videoW, videoH, img.naturalWidth, img.naturalHeight, wm.settings);
+  if (g.dw <= 0 || g.dh <= 0) return undefined;
+  return {
+    imagePath,
+    x: g.dx,
+    y: g.dy,
+    w: g.dw,
+    h: g.dh,
+    opacity: wm.settings.opacity / 100,
+  };
 }
 
 /**
@@ -255,6 +301,15 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
           }))
       : undefined;
 
+  // 3.6 Watermark overlay payload (v4.4) — geometry computed once here so
+  // the FFmpeg overlay and the canvas preview can never disagree.
+  const ipcWatermark = await buildWatermarkIpc(
+    opts.watermark,
+    dims.w,
+    dims.h,
+    api.saveTempImage,
+  );
+
   // 4. Choose output path.
   const outputPath = await api.chooseOutput();
   if (!outputPath) {
@@ -296,6 +351,7 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
             fadeStartEnd: !!opts.transition.fadeStartEnd,
           }
         : undefined,
+      watermark: ipcWatermark,
     });
     return result;
   } finally {
@@ -418,6 +474,13 @@ async function exportViaWebCodecs(
   scratch.width = dims.w;
   scratch.height = dims.h;
 
+  // v4.4 watermark — drawn UNDER headlines + captions (same as the export).
+  const wmImage =
+    opts.watermark?.imageUrl
+      ? await loadImageElement(opts.watermark.imageUrl)
+      : null;
+  const wmSettings = opts.watermark?.settings ?? null;
+
   for (let i = 0; i < totalFrames; i++) {
     if (signal?.aborted) {
       try {
@@ -441,6 +504,9 @@ async function exportViaWebCodecs(
         ctx, scratch, seg, Math.max(0, segIdx), segments, img ?? null,
         imgCache, currentMs, dims.w, dims.h, kenBurns, transition,
       );
+    }
+    if (wmImage && wmSettings) {
+      drawWatermark(ctx, wmImage, dims.w, dims.h, wmSettings);
     }
     if (headlineItems) drawHeadline(ctx, headlineItems, currentMs, dims.w, dims.h);
     if (drawCaptions) drawCaptions(currentMs);
@@ -585,6 +651,13 @@ async function exportViaMediaRecorder(
   scratchMR.width = dims.w;
   scratchMR.height = dims.h;
 
+  // v4.4 watermark — drawn UNDER headlines + captions (same as the export).
+  const wmImageMR =
+    opts.watermark?.imageUrl
+      ? await loadImageElement(opts.watermark.imageUrl)
+      : null;
+  const wmSettingsMR = opts.watermark?.settings ?? null;
+
   await new Promise<void>((resolve) => {
     const tick = () => {
       const elapsed = performance.now() - start;
@@ -600,6 +673,9 @@ async function exportViaMediaRecorder(
           ctx, scratchMR, seg, Math.max(0, segIdxMR), segments, img ?? null,
           imgCache, currentMs, dims.w, dims.h, kenBurns, transitionMR,
         );
+      }
+      if (wmImageMR && wmSettingsMR) {
+        drawWatermark(ctx, wmImageMR, dims.w, dims.h, wmSettingsMR);
       }
       if (headlineItemsMR)
         drawHeadline(ctx, headlineItemsMR, currentMs, dims.w, dims.h);

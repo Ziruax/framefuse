@@ -9,6 +9,7 @@ import {
   Captions,
   AudioLines,
   ArrowLeftRight,
+  BadgeCheck,
   Bug,
   Wand2,
   RotateCcw,
@@ -20,6 +21,7 @@ import {
   Plus,
   Trash2,
   Clock,
+  Upload,
 } from "lucide-react";
 import type {
   AudioSettings,
@@ -30,6 +32,8 @@ import type {
   TransitionSettings,
   TransitionStyle,
   VideoSettings,
+  WatermarkPosition,
+  WatermarkSettings,
 } from "@/lib/merger/types";
 import { TRANSITION_STYLE_INFO } from "@/lib/merger/types";
 import type { KenBurnsDirection } from "@/lib/merger/types";
@@ -94,6 +98,14 @@ interface SettingsPanelProps {
   /** Segment transitions (v4.3). */
   transition: TransitionSettings;
   onTransitionChange: (t: TransitionSettings) => void;
+  /** Watermark / logo overlay (v4.4). */
+  watermarkImage: { url: string; fileName: string } | null;
+  watermarkSettings: WatermarkSettings;
+  onWatermarkFile: (file: File | null) => void;
+  onWatermarkSettingsChange: (w: WatermarkSettings) => void;
+  openWatermarkPicker: () => void;
+  /** WebVTT sidecar export (v4.4). */
+  onExportVtt: () => void;
   captionSettings: CaptionSettings;
   onCaptionSettingsChange: (cs: CaptionSettings) => void;
   /** Applies a preset's signature behavior (wordMode + animation + font). */
@@ -277,6 +289,12 @@ export function SettingsPanel(props: SettingsPanelProps) {
     onAudioSettingsChange,
     transition,
     onTransitionChange,
+    watermarkImage,
+    watermarkSettings,
+    onWatermarkFile,
+    onWatermarkSettingsChange,
+    openWatermarkPicker,
+    onExportVtt,
     captionSettings,
     onCaptionSettingsChange,
     onApplyPreset,
@@ -489,6 +507,17 @@ export function SettingsPanel(props: SettingsPanelProps) {
           />
         </Section>
 
+        {/* ─── Watermark (v4.4) ─────────────────────────────────── */}
+        <Section icon={<BadgeCheck size={13} />} title="Watermark" defaultOpen>
+          <WatermarkSection
+            image={watermarkImage}
+            settings={watermarkSettings}
+            onFile={onWatermarkFile}
+            onSettingsChange={onWatermarkSettingsChange}
+            openPicker={openWatermarkPicker}
+          />
+        </Section>
+
         <Section icon={<AudioLines size={13} />} title="Audio">
           <Row label="Normalize loudness">
             <Toggle
@@ -546,6 +575,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
           onApplyPreset={onApplyPreset}
           onExportSrt={onExportSrt}
           onExportAss={onExportAss}
+          onExportVtt={onExportVtt}
           inElectron={inElectron}
           subtitles={subtitles}
           hasAudio={hasAudio}
@@ -701,6 +731,157 @@ function TransitionSection({
         Start/end fades ease the whole video (captions included) from and to
         black — a clean opener/outro even with hard cuts.
       </p>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Watermark section (v4.4) — logo overlay with 3×3 position picker
+// ---------------------------------------------------------------------------
+const WM_POSITIONS: WatermarkPosition[] = [
+  "top-left", "top", "top-right",
+  "left", "center", "right",
+  "bottom-left", "bottom", "bottom-right",
+];
+
+function WatermarkSection({
+  image,
+  settings,
+  onFile,
+  onSettingsChange,
+  openPicker,
+}: {
+  image: { url: string; fileName: string } | null;
+  settings: WatermarkSettings;
+  onFile: (file: File | null) => void;
+  onSettingsChange: (w: WatermarkSettings) => void;
+  openPicker: () => void;
+}) {
+  return (
+    <div>
+      <Field
+        label="Logo image"
+        hint="PNG with transparency works best. Burned into every frame UNDER the captions — export matches the preview exactly."
+      >
+        {image ? (
+          <div className="flex items-center gap-2.5 rounded-lg border p-2" style={{ borderColor: "#27272a", backgroundColor: "#18181b" }}>
+            <div
+              className="flex size-10 shrink-0 items-center justify-center rounded-lg"
+              style={{
+                backgroundColor: "#0a0a0a",
+                boxShadow: "inset 0 0 0 1px rgba(255,255,255,0.06)",
+              }}
+            >
+              <img src={image.url} alt="watermark" className="max-h-8 max-w-8 object-contain" draggable={false} />
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-[11px] font-medium text-zinc-200" title={image.fileName}>
+                {image.fileName}
+              </div>
+              <div className="text-[9px] text-zinc-500">branded on every frame</div>
+            </div>
+            <button
+              type="button"
+              onClick={() => onFile(null)}
+              className="shrink-0 rounded p-1 transition-colors hover:bg-red-500/15 hover:text-red-400"
+              style={{ color: "#71717a" }}
+              title="Remove watermark"
+              aria-label="Remove watermark"
+            >
+              <Trash2 className="size-3.5" />
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={openPicker}
+            className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed px-3 py-3 text-[11px] font-semibold transition-all hover:-translate-y-px"
+            style={{ borderColor: "#3f3f46", color: "#a1a1aa" }}
+          >
+            <Upload className="size-3.5" />
+            Upload logo / watermark
+          </button>
+        )}
+      </Field>
+
+      {image && (
+        <>
+          <Field label="Position">
+            <div className="grid w-max grid-cols-3 gap-1" role="radiogroup" aria-label="Watermark position">
+              {WM_POSITIONS.map((pos) => {
+                const active = settings.position === pos;
+                const row = pos.startsWith("top") ? 0 : pos.startsWith("bottom") ? 2 : 1;
+                const col = pos.endsWith("left") ? 0 : pos.endsWith("right") ? 2 : 1;
+                return (
+                  <button
+                    key={pos}
+                    type="button"
+                    role="radio"
+                    aria-checked={active}
+                    title={pos}
+                    onClick={() => onSettingsChange({ ...settings, position: pos })}
+                    className={cn(
+                      "ff-wm-cell group flex size-7 items-center justify-center rounded transition-all active:scale-90",
+                      active ? "ff-wm-cell-active" : "hover:bg-white/5",
+                    )}
+                  >
+                    <span
+                      className={cn(
+                        "size-1.5 rounded-sm transition-all",
+                        active ? "ff-wm-dot-active" : "bg-zinc-600 group-hover:bg-zinc-400",
+                      )}
+                      style={
+                        !active
+                          ? { transform: `translate(${(col - 1) * 5}px, ${(row - 1) * 5}px)` }
+                          : undefined
+                      }
+                    />
+                  </button>
+                );
+              })}
+            </div>
+          </Field>
+
+          <Field label={`Size — ${settings.sizePercent}% of width`}>
+            <input
+              type="range"
+              min={5}
+              max={50}
+              step={1}
+              value={settings.sizePercent}
+              onChange={(e) => onSettingsChange({ ...settings, sizePercent: Number(e.target.value) })}
+              className="w-full accent-emerald-500"
+              aria-label="Watermark size"
+            />
+          </Field>
+
+          <Field label={`Opacity — ${settings.opacity}%`}>
+            <input
+              type="range"
+              min={10}
+              max={100}
+              step={5}
+              value={settings.opacity}
+              onChange={(e) => onSettingsChange({ ...settings, opacity: Number(e.target.value) })}
+              className="w-full accent-emerald-500"
+              aria-label="Watermark opacity"
+            />
+          </Field>
+
+          <Field label={`Margin — ${settings.marginPercent}%`} hint="Distance from the edges (scales with the video width).">
+            <input
+              type="range"
+              min={0}
+              max={10}
+              step={1}
+              value={settings.marginPercent}
+              onChange={(e) => onSettingsChange({ ...settings, marginPercent: Number(e.target.value) })}
+              className="w-full accent-emerald-500"
+              aria-label="Watermark margin"
+            />
+          </Field>
+        </>
+      )}
     </div>
   );
 }
@@ -948,6 +1129,8 @@ interface CaptionsSectionProps {
   onApplyPreset: (presetId: string) => void;
   onExportSrt: () => void;
   onExportAss: () => void;
+  /** WebVTT sidecar (v4.4). */
+  onExportVtt: () => void;
   inElectron: boolean;
   subtitles: SubtitleFile | null;
   hasAudio: boolean;
@@ -965,6 +1148,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
     onApplyPreset,
     onExportSrt,
     onExportAss,
+    onExportVtt,
     inElectron,
     subtitles,
     hasAudio,
@@ -1357,7 +1541,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
 
       {/* ── Sidecar exports ── */}
       <Field label="Export caption files">
-        <div className="grid grid-cols-2 gap-1">
+        <div className="grid grid-cols-3 gap-1">
           <button
             type="button"
             onClick={onExportSrt}
@@ -1370,6 +1554,20 @@ function CaptionsSection(props: CaptionsSectionProps) {
             )}
           >
             <FileText size={11} /> .srt
+          </button>
+          <button
+            type="button"
+            onClick={onExportVtt}
+            disabled={!hasCues}
+            title="WebVTT — for HTML5 <track> and web video players"
+            className={cn(
+              "flex items-center justify-center gap-1 rounded px-2 py-1.5 text-[10px] font-semibold transition-colors",
+              hasCues
+                ? "bg-zinc-800 text-zinc-200 hover:bg-zinc-700"
+                : "cursor-not-allowed bg-zinc-800/50 text-zinc-600",
+            )}
+          >
+            <FileText size={11} /> .vtt
           </button>
           <button
             type="button"

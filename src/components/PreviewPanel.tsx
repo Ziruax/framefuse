@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { Play, Pause, SkipBack, SkipForward, ImageOff, Type, ArrowLeftRight } from "lucide-react";
+import { Play, Pause, SkipBack, SkipForward, ImageOff, Type, ArrowLeftRight, BadgeCheck } from "lucide-react";
 import type {
   AspectRatio,
   CaptionSettings,
@@ -10,12 +10,14 @@ import type {
   MediaSegment,
   SubtitleFile,
   TransitionSettings,
+  WatermarkSettings,
 } from "@/lib/merger/types";
 import {
   computeTransitionFx,
   computeGlobalFade,
   applyGlobalFade,
   drawFrameWithTransition,
+  drawWatermark,
   previewDimensions,
 } from "@/lib/merger/renderer";
 import { drawCaption, drawHeadline } from "@/lib/merger/native";
@@ -37,6 +39,9 @@ interface PreviewPanelProps {
   headlineItems: HeadlineItem[];
   /** Segment transitions (v4.3). */
   transition: TransitionSettings;
+  /** Watermark image element + settings (v4.4). */
+  watermarkImage: HTMLImageElement | null;
+  watermarkSettings: WatermarkSettings | null;
   onSeek: (ms: number) => void;
   onTogglePlay: () => void;
   onStep: (dir: -1 | 1) => void;
@@ -55,6 +60,8 @@ export function PreviewPanel({
   captionSettings,
   headlineItems,
   transition,
+  watermarkImage,
+  watermarkSettings,
   onSeek,
   onTogglePlay,
   onStep,
@@ -87,6 +94,12 @@ export function PreviewPanel({
     } else {
       ctx.fillStyle = "#0a0a0a";
       ctx.fillRect(0, 0, dims.w, dims.h);
+    }
+
+    // Watermark overlay (v4.4) — UNDER headlines + captions, exactly like
+    // the export z-order (overlay filter before subtitles).
+    if (watermarkImage && watermarkSettings) {
+      drawWatermark(ctx, watermarkImage, dims.w, dims.h, watermarkSettings);
     }
 
     // Headline overlay (v4.2) — under captions so center captions sit on top.
@@ -138,6 +151,8 @@ export function PreviewPanel({
     headlineItems,
     segments,
     transition,
+    watermarkImage,
+    watermarkSettings,
   ]);
 
   const pct = totalMs > 0 ? (currentMs / totalMs) * 100 : 0;
@@ -254,6 +269,21 @@ export function PreviewPanel({
               >
                 <ArrowLeftRight className="size-3" />
                 {txLabel}
+              </div>
+            )}
+            {/* Watermark indicator (v4.4) */}
+            {watermarkImage && watermarkSettings && (
+              <div
+                className="pointer-events-none absolute left-2 top-12 flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] backdrop-blur-sm"
+                style={{
+                  backgroundColor: "rgba(0, 0, 0, 0.55)",
+                  color: "#86efac",
+                  border: "1px solid rgba(134, 239, 172, 0.22)",
+                }}
+                title={`Watermark active — ${watermarkSettings.position}, ${watermarkSettings.sizePercent}% width, ${watermarkSettings.opacity}% opacity`}
+              >
+                <BadgeCheck className="size-3" />
+                watermark
               </div>
             )}
             {/* Headline indicator (v4.2) */}

@@ -25,11 +25,12 @@ import type {
   KenBurnsConfig,
   TransitionSettings,
   VideoSettings,
+  WatermarkSettings,
 } from "./types";
 import { serializeSrt, type SubtitleCue } from "./subtitles";
 
 export const PROJECT_APP = "framefuse";
-export const PROJECT_VERSION = 4.3;
+export const PROJECT_VERSION = 4.4;
 
 /** Audio above this size (MB, decoded) is skipped to keep project files sane. */
 export const MAX_AUDIO_MB = 25;
@@ -59,6 +60,11 @@ export interface ProjectFile {
   } | null;
   headlines: HeadlineItem[];
   overrides: Record<string, number>;
+  /** Watermark / logo overlay (v4.4): image + settings. */
+  watermark: {
+    image: ProjectImageEntry | null;
+    settings: WatermarkSettings;
+  } | null;
   settings: {
     kenBurns: KenBurnsConfig;
     video: VideoSettings;
@@ -76,6 +82,8 @@ export interface SaveProjectInput {
   subtitles: { fileName: string; cues: SubtitleCue[] } | null;
   headlines: HeadlineItem[];
   overrides: Record<string, number>;
+  /** Watermark / logo overlay (v4.4). */
+  watermark: { image: { id: string; file: File } | null; settings: WatermarkSettings } | null;
   settings: ProjectFile["settings"];
 }
 
@@ -111,6 +119,22 @@ export async function buildProjectFile(
     };
   }
 
+  let watermark: ProjectFile["watermark"] = null;
+  if (input.watermark) {
+    const wmImg = input.watermark.image;
+    watermark = {
+      image: wmImg
+        ? {
+            id: wmImg.id,
+            name: wmImg.file.name,
+            type: wmImg.file.type || "image/png",
+            dataUrl: await fileToDataUrl(wmImg.file),
+          }
+        : null,
+      settings: input.watermark.settings,
+    };
+  }
+
   return {
     app: PROJECT_APP,
     version: PROJECT_VERSION,
@@ -125,6 +149,7 @@ export async function buildProjectFile(
       : null,
     headlines: input.headlines,
     overrides: input.overrides,
+    watermark,
     settings: input.settings,
   };
 }
@@ -154,6 +179,8 @@ export interface LoadedProject {
   /** Reconstructed File objects, in the saved order (ids preserved). */
   imageFiles: { id: string; file: File }[];
   audioFile: File | null;
+  /** Watermark image File (v4.4) or null. */
+  watermarkFile: { id: string; file: File } | null;
   /** Re-serialized SRT text (for the FFmpeg temp file). */
   srtText: string | null;
   audioSkipped: boolean;
@@ -218,6 +245,23 @@ export async function parseProjectFile(file: File): Promise<LoadedProject> {
     }
   }
 
+  // Watermark image (v4.4).
+  let watermarkFile: { id: string; file: File } | null = null;
+  if (project.watermark?.image?.dataUrl) {
+    try {
+      watermarkFile = {
+        id: project.watermark.image.id || "wm_project",
+        file: await dataUrlToFile(
+          project.watermark.image.dataUrl,
+          project.watermark.image.name,
+          project.watermark.image.type,
+        ),
+      };
+    } catch {
+      watermarkFile = null;
+    }
+  }
+
   const cues = project.subtitles?.cues;
   const validCues = Array.isArray(cues) && cues.length > 0;
 
@@ -225,6 +269,7 @@ export async function parseProjectFile(file: File): Promise<LoadedProject> {
     project,
     imageFiles,
     audioFile,
+    watermarkFile,
     srtText: validCues ? serializeSrt(cues) : null,
     audioSkipped: !!project.audio && !audioFile,
   };

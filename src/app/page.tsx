@@ -22,7 +22,7 @@ import {
   type TimelineEntry,
 } from "@/lib/merger/timeline";
 import { exportNative, isElectron } from "@/lib/merger/native";
-import { parseSrt, serializeSrt } from "@/lib/merger/subtitles";
+import { parseSrt, serializeSrt, serializeVtt } from "@/lib/merger/subtitles";
 import {
   transcribeWithWhisper,
   isWhisperAvailable,
@@ -33,6 +33,7 @@ import {
   defaultCaptionSettings,
   defaultKenBurnsConfig,
   defaultTransitionSettings,
+  defaultWatermarkSettings,
   makeHeadlineItem,
   type AudioSettings,
   type AudioTrack,
@@ -44,6 +45,7 @@ import {
   type SubtitleFile,
   type TransitionSettings,
   type VideoSettings,
+  type WatermarkSettings,
 } from "@/lib/merger/types";
 import { getCaptionPreset, getFontOption, CAPTION_PRESETS } from "@/lib/merger/captionPresets";
 import {
@@ -77,6 +79,8 @@ interface PersistedSettings {
   headlines?: HeadlineItem[];
   /** Segment transitions (v4.3). */
   transition?: TransitionSettings;
+  /** Watermark settings (v4.4). The image itself lives in project files. */
+  watermark?: WatermarkSettings;
 }
 
 function loadPersisted(): Partial<PersistedSettings> {
@@ -130,6 +134,20 @@ export default function Page() {
   const [transitionSettings, setTransitionSettings] =
     useState<TransitionSettings>(defaultTransitionSettings());
 
+  // ---- Watermark / logo overlay (v4.4) ------------------------------------
+  const [watermarkImage, setWatermarkImage] = useState<MediaItem | null>(null);
+  const [watermarkSettings, setWatermarkSettings] =
+    useState<WatermarkSettings>(defaultWatermarkSettings());
+  /** Loaded element for the canvas preview (natural size for geometry). */
+  const [watermarkImgEl, setWatermarkImgEl] = useState<HTMLImageElement | null>(
+    null,
+  );
+  const watermarkInputRef = useRef<HTMLInputElement>(null);
+  const openWatermarkPicker = useCallback(
+    () => watermarkInputRef.current?.click(),
+    [],
+  );
+
   // Whisper language: "auto" = auto-detect, or a 2-letter code like "en".
   const [whisperLanguage, setWhisperLanguage] = useState<string>("auto");
 
@@ -151,6 +169,7 @@ export default function Page() {
      
     if (p.audio) setAudioSettings(p.audio);
     if (p.transition) setTransitionSettings(p.transition);
+    if (p.watermark) setWatermarkSettings(p.watermark);
     if (Array.isArray(p.headlines)) {
        
       setHeadlineItems(
@@ -242,6 +261,8 @@ export default function Page() {
     audioTrack: AudioTrack | null;
     whisperLanguage: string;
     transition: TransitionSettings;
+    watermarkImage: MediaItem | null;
+    watermarkSettings: WatermarkSettings;
   }
 
   const HISTORY_MAX = 80;
@@ -275,6 +296,8 @@ export default function Page() {
       audioTrack,
       whisperLanguage,
       transition: transitionSettings,
+      watermarkImage,
+      watermarkSettings,
     };
   });
 
@@ -350,6 +373,8 @@ export default function Page() {
     setAudioTrack(snap.audioTrack);
     setWhisperLanguage(snap.whisperLanguage);
     setTransitionSettings(snap.transition);
+    setWatermarkImage(snap.watermarkImage);
+    setWatermarkSettings(snap.watermarkSettings);
     setIsPlaying(false);
   }, []);
 
@@ -399,6 +424,32 @@ export default function Page() {
     urlsRef.current.add(url);
     return url;
   }, []);
+
+  // ---- Watermark image element loading (v4.4) -----------------------------
+  useEffect(() => {
+    let cancelled = false;
+    if (!watermarkImage) {
+      // Deferred clear (avoids synchronous setState in the effect body).
+      const t = window.setTimeout(() => {
+        if (!cancelled) setWatermarkImgEl(null);
+      }, 0);
+      return () => {
+        cancelled = true;
+        clearTimeout(t);
+      };
+    }
+    const img = new Image();
+    img.onload = () => {
+      if (!cancelled) setWatermarkImgEl(img);
+    };
+    img.onerror = () => {
+      if (!cancelled) setWatermarkImgEl(null);
+    };
+    img.src = watermarkImage.url;
+    return () => {
+      cancelled = true;
+    };
+  }, [watermarkImage]);
 
   // ---- Load images when items change --------------------------------------
   useEffect(() => {
@@ -519,6 +570,9 @@ export default function Page() {
         captionSettings,
         headlines: headlineItems.length ? headlineItems : null,
         transition: transitionSettings,
+        watermark: watermarkImage
+          ? { imageUrl: watermarkImage.url, settings: watermarkSettings }
+          : null,
         onProgress: (p) => setExportProgress(p),
         signal: ac.signal,
       });
@@ -552,6 +606,8 @@ export default function Page() {
     captionSettings,
     headlineItems,
     transitionSettings,
+    watermarkImage,
+    watermarkSettings,
     inElectron,
   ]);
 
@@ -731,6 +787,60 @@ export default function Page() {
     toast.success(`Exported ${subtitles.cues.length} cues to .srt`);
   }, [subtitles]);
 
+  // ---- WebVTT sidecar export (v4.4) — HTML5 <track> / web players ----
+  const exportVttSidecar = useCallback(() => {
+    if (!subtitles || subtitles.cues.length === 0) {
+      toast.error("No captions to export", {
+        description: "Generate captions from audio or load a .srt file first.",
+      });
+      return;
+    }
+    const text = serializeVtt(subtitles.cues);
+    const blob = new Blob([text], { type: "text/vtt;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download =
+      (subtitles.fileName || "captions").replace(/\.[^.]+$/, "") + ".vtt";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    toast.success(`Exported ${subtitles.cues.length} cues to .vtt`);
+  }, [subtitles]);
+
+  // ---- Watermark management (v4.4) ---------------------------------------
+  const setWatermarkFile = useCallback(
+    (file: File | null) => {
+      requestHistoryPush(200);
+      if (!file) {
+        setWatermarkImage(null);
+        return;
+      }
+      const url = trackUrl(URL.createObjectURL(file));
+      setWatermarkImage({ id: `wm_${genId()}`, file, url });
+      toast.success(`Watermark set — ${file.name}`, {
+        description:
+          "Position, size and opacity are in the Watermark settings section.",
+      });
+    },
+    [requestHistoryPush, trackUrl],
+  );
+
+  const removeWatermarkImage = useCallback(() => {
+    requestHistoryPush();
+    setWatermarkImage(null);
+    toast.info("Watermark removed");
+  }, [requestHistoryPush]);
+
+  const handleWatermarkSettingsChange = useCallback(
+    (v: WatermarkSettings) => {
+      requestHistoryPush(500);
+      setWatermarkSettings(v);
+    },
+    [requestHistoryPush],
+  );
+
   const exportAssSidecar = useCallback(async () => {
     if (!subtitles || subtitles.cues.length === 0) {
       toast.error("No captions to export", {
@@ -804,13 +914,14 @@ export default function Page() {
       whisperLanguage,
       headlines: headlineItems.length ? headlineItems : [],
       transition: transitionSettings,
+      watermark: watermarkSettings,
     };
     try {
       localStorage.setItem(LS_KEY, JSON.stringify(payload));
     } catch {
       /* storage full / private mode — non-fatal */
     }
-  }, [kenBurns, settings, captionSettings, audioSettings, whisperLanguage, headlineItems, transitionSettings]);
+  }, [kenBurns, settings, captionSettings, audioSettings, whisperLanguage, headlineItems, transitionSettings, watermarkSettings]);
 
   const generateCaptionsFromAudio = useCallback(async () => {
     if (!audioTrack) {
@@ -1064,6 +1175,12 @@ export default function Page() {
           : null,
         headlines: headlineItems,
         overrides,
+        watermark: watermarkImage
+          ? {
+              image: { id: watermarkImage.id, file: watermarkImage.file },
+              settings: watermarkSettings,
+            }
+          : null,
         settings: {
           kenBurns,
           video: settings,
@@ -1099,6 +1216,8 @@ export default function Page() {
     audioSettings,
     whisperLanguage,
     transitionSettings,
+    watermarkImage,
+    watermarkSettings,
   ]);
 
   const loadProject = useCallback(
@@ -1153,6 +1272,21 @@ export default function Page() {
         } else {
           setSubtitles(null);
         }
+
+        // Watermark (v4.4).
+        if (loaded.watermarkFile) {
+          const url = trackUrl(URL.createObjectURL(loaded.watermarkFile.file));
+          setWatermarkImage({
+            id: loaded.watermarkFile.id,
+            file: loaded.watermarkFile.file,
+            url,
+          });
+        } else {
+          setWatermarkImage(null);
+        }
+        setWatermarkSettings(
+          project.watermark?.settings || defaultWatermarkSettings(),
+        );
 
         // Settings + headlines + overrides.
         setKenBurns(project.settings.kenBurns);
@@ -1430,6 +1564,8 @@ export default function Page() {
               captionSettings={captionSettings}
               headlineItems={headlineItems}
               transition={transitionSettings}
+              watermarkImage={watermarkImgEl}
+              watermarkSettings={watermarkImage ? watermarkSettings : null}
               onSeek={seek}
               onTogglePlay={togglePlay}
               onStep={stepSegment}
@@ -1464,11 +1600,21 @@ export default function Page() {
             onSettingsChange={handleSettingsChange}
             onAudioSettingsChange={handleAudioSettingsChange}
             onTransitionChange={handleTransitionChange}
+            watermarkImage={
+              watermarkImage
+                ? { url: watermarkImage.url, fileName: watermarkImage.file.name }
+                : null
+            }
+            watermarkSettings={watermarkSettings}
+            onWatermarkFile={setWatermarkFile}
+            onWatermarkSettingsChange={handleWatermarkSettingsChange}
+            openWatermarkPicker={openWatermarkPicker}
             captionSettings={captionSettings}
             onCaptionSettingsChange={handleCaptionSettingsChange}
             onApplyPreset={applyCaptionPreset}
             onExportSrt={exportSrtSidecar}
             onExportAss={exportAssSidecar}
+            onExportVtt={exportVttSidecar}
             inElectron={inElectron}
             subtitles={subtitles}
             hasAudio={!!audioTrack}
@@ -1553,6 +1699,23 @@ export default function Page() {
         onChange={(e: ChangeEvent<HTMLInputElement>) => {
           const f = e.target.files?.[0];
           if (f) loadProject(f);
+          e.target.value = "";
+        }}
+      />
+      <input
+        ref={watermarkInputRef}
+        type="file"
+        accept="image/png,image/jpeg,image/webp,image/gif,.png,.jpg,.jpeg,.webp,.gif"
+        style={{
+          position: "absolute",
+          opacity: 0,
+          width: 1,
+          height: 1,
+          pointerEvents: "none",
+        }}
+        onChange={(e: ChangeEvent<HTMLInputElement>) => {
+          const f = e.target.files?.[0];
+          if (f) setWatermarkFile(f);
           e.target.value = "";
         }}
       />
