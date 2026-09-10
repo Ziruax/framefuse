@@ -138,3 +138,96 @@ summary {
 summary::-webkit-details-marker {
   display: none;
 }
+
+/* ===== v4.2 UI component classes (shared button/panel styling) ===== */
+
+/* Primary action — violet gradient, glow shadow, hover lift. */
+.ff-btn-primary {
+  background-image: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 55%, #6d28d9 100%);
+  color: #ffffff;
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.4),
+    0 4px 14px rgba(124, 58, 237, 0.35);
+  transition: all 160ms ease;
+}
+.ff-btn-primary:hover {
+  filter: brightness(1.12);
+  box-shadow:
+    0 2px 4px rgba(0, 0, 0, 0.4),
+    0 6px 20px rgba(124, 58, 237, 0.5);
+  transform: translateY(-1px);
+}
+.ff-btn-primary:active {
+  transform: translateY(0);
+  filter: brightness(0.96);
+}
+
+/* Ghost/secondary — quiet outline that fills on hover. */
+.ff-btn-ghost {
+  border: 1px solid #3f3f46;
+  background-color: rgba(39, 39, 42, 0.6);
+  color: #d4d4d8;
+  transition: all 150ms ease;
+}
+.ff-btn-ghost:hover {
+  border-color: #7c3aed;
+  background-color: rgba(124, 58, 237, 0.16);
+  color: #ede9fe;
+}
+.ff-btn-ghost:active {
+  transform: translateY(0.5px);
+}
+
+/* Sample button — violet-tinted invite. */
+.ff-btn-sample {
+  border-color: rgba(109, 40, 217, 0.6);
+  background-color: rgba(76, 29, 149, 0.25);
+  color: #c4b5fd;
+}
+.ff-btn-sample:hover {
+  border-color: #7c3aed;
+  background-color: rgba(124, 58, 237, 0.3);
+  color: #ddd6fe;
+  box-shadow: 0 4px 18px rgba(124, 58, 237, 0.25);
+  transform: translateY(-1px);
+}
+
+/* Section heading — quiet, wide-tracked label. */
+.ff-section-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #71717a;
+}
+
+/* Panel section header bar (used in settings) */
+.ff-panel-header {
+  border-bottom: 1px solid #27272a;
+  background: linear-gradient(180deg, rgba(39, 39, 42, 0.5), rgba(24, 24, 27, 0));
+}
+
+/* Beat-tag pulse for timeline segments (attention cue). */
+@keyframes ff-beat-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0); }
+  50% { box-shadow: 0 0 0 4px rgba(52, 211, 153, 0.18); }
+}
+.ff-beat-pulse {
+  animation: ff-beat-pulse 2.4s ease-in-out infinite;
+}
+
+/* Focus-visible ring — consistent, keyboard-friendly. */
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid #7c3aed;
+  outline-offset: 1px;
+}
+
+/* Smooth scroll for scrolling panels */
+.ff-scroll {
+  scroll-behavior: smooth;
+  overscroll-behavior: contain;
+}
+

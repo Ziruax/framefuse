@@ -15,10 +15,15 @@ import {
   FileDown,
   Loader2,
   Sparkles,
+  Type,
+  Plus,
+  Trash2,
+  Clock,
 } from "lucide-react";
 import type {
   AudioSettings,
   CaptionSettings,
+  HeadlineItem,
   KenBurnsConfig,
   SubtitleFile,
   VideoSettings,
@@ -29,6 +34,7 @@ import {
   presetsByCategory,
   getCaptionPreset,
 } from "@/lib/merger/captionPresets";
+import { HEADLINE_PRESETS, getHeadlinePreset } from "@/lib/merger/headlinePresets";
 import { ANIMATION_LABELS } from "@/lib/merger/captionAnimations";
 import type { WhisperProgress } from "@/lib/merger/whisper";
 import { cn } from "@/lib/utils";
@@ -95,6 +101,13 @@ interface SettingsPanelProps {
   whisperProgress: WhisperProgress | null;
   whisperLanguage: string;
   onWhisperLanguageChange: (lang: string) => void;
+  /** Headline overlay items (v4.2). */
+  headlineItems: HeadlineItem[];
+  onAddHeadline: () => void;
+  onUpdateHeadline: (id: string, patch: Partial<HeadlineItem>) => void;
+  onRemoveHeadline: (id: string) => void;
+  /** Master timeline duration (for headline default windows). */
+  totalMs: number;
   debug: {
     imageCount: number;
     mode: string | null;
@@ -268,6 +281,11 @@ export function SettingsPanel(props: SettingsPanelProps) {
     whisperProgress,
     whisperLanguage,
     onWhisperLanguageChange,
+    headlineItems,
+    onAddHeadline,
+    onUpdateHeadline,
+    onRemoveHeadline,
+    totalMs,
     debug,
   } = props;
 
@@ -495,6 +513,15 @@ export function SettingsPanel(props: SettingsPanelProps) {
           </Field>
         </Section>
 
+        {/* ─── Title overlay (v4.2) ────────────────────────────────── */}
+        <HeadlineSection
+          items={headlineItems}
+          onAdd={onAddHeadline}
+          onUpdate={onUpdateHeadline}
+          onRemove={onRemoveHeadline}
+          totalMs={totalMs}
+        />
+
         {/* ─── Captions ──────────────────────────────────────────────── */}
         <CaptionsSection
           captionSettings={captionSettings}
@@ -525,6 +552,263 @@ export function SettingsPanel(props: SettingsPanelProps) {
         </Section>
       </div>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Headline overlay section (v4.2) — viral hook titles
+// ---------------------------------------------------------------------------
+interface HeadlineSectionProps {
+  items: HeadlineItem[];
+  onAdd: () => void;
+  onUpdate: (id: string, patch: Partial<HeadlineItem>) => void;
+  onRemove: (id: string) => void;
+  totalMs: number;
+}
+
+const HEADLINE_ANIMATIONS: {
+  value: HeadlineItem["animation"];
+  label: string;
+  title: string;
+}[] = [
+  { value: "none", label: "None", title: "Static — no entrance" },
+  { value: "fade", label: "Fade", title: "Fade in / out (300ms)" },
+  { value: "slide-up", label: "Slide", title: "Slide up from below (280ms)" },
+  { value: "pop", label: "Pop", title: "Pop 0.6 → 1 with overshoot (260ms)" },
+  { value: "zoom-punch", label: "Punch", title: "Zoom 2.0 → 1 fast (200ms)" },
+];
+
+function HeadlineSection({
+  items,
+  onAdd,
+  onUpdate,
+  onRemove,
+  totalMs,
+}: HeadlineSectionProps) {
+  const clampMs = (v: number) => Math.max(0, Math.min(v, Math.max(totalMs, 60000)));
+
+  return (
+    // `key` remounts the section when items appear/disappear so the
+    // auto-open (items present → expanded) also applies to headlines
+    // restored from localStorage/project files AFTER the first mount.
+    <Section
+      key={items.length > 0 ? "hl-with-items" : "hl-empty"}
+      icon={<Type size={13} />}
+      title="Title Overlay"
+      defaultOpen={items.length > 0}
+    >
+      <p className="mb-3 text-[10px] leading-relaxed text-zinc-500">
+        Big hook titles independent of captions — perfect for the first 3
+        seconds. Burned into the export exactly like the preview.
+      </p>
+
+      {/* Status line */}
+      <div className="mb-3 flex items-center gap-1.5 text-[10px] text-zinc-500">
+        <Clock size={10} />
+        {items.length === 0 ? (
+          <span>No titles — add one to build your hook.</span>
+        ) : (
+          <span>
+            {items.length} title{items.length === 1 ? "" : "s"} ·{" "}
+            {(
+              items.reduce((n, h) => n + (h.endMs - h.startMs), 0) / 1000
+            ).toFixed(1)}
+            s total
+          </span>
+        )}
+      </div>
+
+      {/* Item list */}
+      <div className="mb-3 space-y-2">
+        {items.map((item, idx) => {
+          const preset = getHeadlinePreset(item.presetId);
+          const dur = (item.endMs - item.startMs) / 1000;
+          const invalid = item.endMs <= item.startMs;
+          return (
+            <div
+              key={item.id}
+              className="rounded-lg border p-2.5 transition-colors"
+              style={{
+                borderColor: invalid ? "rgba(185, 28, 28, 0.5)" : "#27272a",
+                backgroundColor: "#18181b",
+              }}
+            >
+              {/* Header row: index + preset name + remove */}
+              <div className="mb-2 flex items-center gap-2">
+                <span
+                  className="rounded px-1.5 py-0.5 text-[9px] font-bold tabular-nums"
+                  style={{ backgroundColor: "rgba(251, 191, 36, 0.15)", color: "#fbbf24" }}
+                >
+                  {idx + 1}
+                </span>
+                {/* Mini live swatch of the preset */}
+                <span
+                  className="flex h-5 min-w-[46px] items-center justify-center overflow-hidden rounded px-1.5 text-[8px]"
+                  style={{
+                    backgroundColor: preset.bgColor
+                      ? `${preset.bgColor}${Math.round(preset.bgAlpha * 255)
+                          .toString(16)
+                          .padStart(2, "0")}`
+                      : "transparent",
+                    border: preset.borderColor
+                      ? `1px solid ${preset.borderColor}`
+                      : "1px solid transparent",
+                    color: preset.textColor,
+                    fontFamily: preset.fontFamily,
+                    fontWeight: preset.fontWeight,
+                    fontStyle: preset.fontStyle === "italic" ? "italic" : "normal",
+                    letterSpacing: Math.min(1.5, preset.letterSpacing / 2),
+                    textTransform: preset.textTransform === "uppercase" ? "uppercase" : "none",
+                    textShadow:
+                      preset.shadow && preset.shadowBlur > 0
+                        ? `0 0 ${Math.max(2, preset.shadowBlur / 2)}px ${
+                            preset.accentColor || preset.shadowColor
+                          }`
+                        : undefined,
+                  }}
+                >
+                  Hook
+                </span>
+                <span className="flex-1 truncate text-[10px] text-zinc-400">
+                  {preset.name}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => onRemove(item.id)}
+                  className="rounded p-1 text-zinc-500 transition-colors hover:bg-red-500/15 hover:text-red-400"
+                  title="Remove title"
+                >
+                  <Trash2 size={12} />
+                </button>
+              </div>
+
+              {/* Text */}
+              <textarea
+                value={item.text}
+                rows={2}
+                onChange={(e) => onUpdate(item.id, { text: e.target.value })}
+                placeholder="YOUR HOOK HERE — keep it under 8 words"
+                className="mb-2 w-full resize-none rounded border bg-zinc-900 px-2 py-1.5 text-[11px] text-zinc-200 placeholder:text-zinc-600 focus:border-violet-500"
+                style={{ borderColor: "#3f3f46" }}
+                aria-label={`Headline ${idx + 1} text`}
+              />
+
+              {/* Timing */}
+              <div className="mb-2 flex items-center gap-1.5">
+                <label className="flex items-center gap-1 text-[10px] text-zinc-500">
+                  <Clock size={10} />
+                  <input
+                    type="number"
+                    min={0}
+                    step={0.1}
+                    value={(item.startMs / 1000).toFixed(1)}
+                    onChange={(e) =>
+                      onUpdate(item.id, {
+                        startMs: clampMs(Math.round(parseFloat(e.target.value) * 1000) || 0),
+                      })
+                    }
+                    className="w-16 rounded border bg-zinc-900 px-1.5 py-1 text-[10px] tabular-nums text-zinc-200 focus:border-violet-500"
+                    style={{ borderColor: "#3f3f46" }}
+                    aria-label="Start time (seconds)"
+                  />
+                  s →
+                  <input
+                    type="number"
+                    min={0}
+                    step={0.1}
+                    value={(item.endMs / 1000).toFixed(1)}
+                    onChange={(e) =>
+                      onUpdate(item.id, {
+                        endMs: clampMs(Math.round(parseFloat(e.target.value) * 1000) || 0),
+                      })
+                    }
+                    className="w-16 rounded border bg-zinc-900 px-1.5 py-1 text-[10px] tabular-nums text-zinc-200 focus:border-violet-500"
+                    style={{ borderColor: "#3f3f46" }}
+                    aria-label="End time (seconds)"
+                  />
+                  s
+                </label>
+                <span
+                  className={cn(
+                    "ml-auto rounded px-1.5 py-0.5 text-[9px] tabular-nums",
+                    invalid ? "bg-red-500/20 text-red-300" : "bg-zinc-800 text-zinc-400",
+                  )}
+                >
+                  {invalid ? "end ≤ start" : `${dur.toFixed(1)}s`}
+                </span>
+              </div>
+
+              {/* Preset select */}
+              <select
+                value={item.presetId}
+                onChange={(e) => onUpdate(item.id, { presetId: e.target.value })}
+                className="mb-2 w-full rounded border bg-zinc-900 px-2 py-1.5 text-[11px] text-zinc-200 focus:border-violet-500"
+                style={{ borderColor: "#3f3f46" }}
+                aria-label={`Headline ${idx + 1} style`}
+              >
+                {HEADLINE_PRESETS.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} — {p.description}
+                  </option>
+                ))}
+              </select>
+
+              {/* Position + animation */}
+              <Segmented
+                size="sm"
+                options={[
+                  { value: "top", label: "Top", title: "Top of frame" },
+                  { value: "center", label: "Center", title: "Middle of frame" },
+                  { value: "bottom", label: "Bottom", title: "Bottom of frame" },
+                ]}
+                value={item.position}
+                onChange={(v) => onUpdate(item.id, { position: v })}
+              />
+              <div className="mt-1.5">
+                <Segmented
+                  size="sm"
+                  options={HEADLINE_ANIMATIONS.map((a) => ({
+                    value: a.value,
+                    label: a.label,
+                    title: a.title,
+                  }))}
+                  value={item.animation}
+                  onChange={(v) => onUpdate(item.id, { animation: v })}
+                />
+              </div>
+
+              {/* Size */}
+              <div className="mt-2">
+                <Field label="Size" hint={`${(item.sizeScale * 100).toFixed(0)}%`}>
+                  <input
+                    type="range"
+                    min={0.5}
+                    max={2}
+                    step={0.05}
+                    value={item.sizeScale}
+                    onChange={(e) =>
+                      onUpdate(item.id, { sizeScale: Number(e.target.value) })
+                    }
+                    className="w-full accent-amber-500"
+                    aria-label={`Headline ${idx + 1} size`}
+                  />
+                </Field>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Add button */}
+      <button
+        type="button"
+        onClick={onAdd}
+        className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed py-2 text-[11px] font-medium transition-all hover:border-amber-500/50 hover:bg-amber-500/5"
+        style={{ borderColor: "#3f3f46", color: "#d4d4d8" }}
+      >
+        <Plus size={13} className="text-amber-400" /> Add title
+      </button>
+    </Section>
   );
 }
 

@@ -1,16 +1,17 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { Play, Pause, SkipBack, SkipForward, ImageOff } from "lucide-react";
+import { Play, Pause, SkipBack, SkipForward, ImageOff, Type } from "lucide-react";
 import type {
   AspectRatio,
   CaptionSettings,
+  HeadlineItem,
   KenBurnsConfig,
   MediaSegment,
   SubtitleFile,
 } from "@/lib/merger/types";
 import { drawFrame, previewDimensions } from "@/lib/merger/renderer";
-import { drawCaption } from "@/lib/merger/native";
+import { drawCaption, drawHeadline } from "@/lib/merger/native";
 import { cueAt } from "@/lib/merger/subtitles";
 import { fmtTimecode } from "@/lib/merger/timeline";
 
@@ -25,6 +26,8 @@ interface PreviewPanelProps {
   activeSegment: MediaSegment | null;
   subtitles: SubtitleFile | null;
   captionSettings: CaptionSettings;
+  /** Headline overlay items (v4.2). */
+  headlineItems: HeadlineItem[];
   onSeek: (ms: number) => void;
   onTogglePlay: () => void;
   onStep: (dir: -1 | 1) => void;
@@ -41,6 +44,7 @@ export function PreviewPanel({
   activeSegment,
   subtitles,
   captionSettings,
+  headlineItems,
   onSeek,
   onTogglePlay,
   onStep,
@@ -63,6 +67,11 @@ export function PreviewPanel({
       ctx.fillRect(0, 0, dims.w, dims.h);
     }
 
+    // Headline overlay (v4.2) — under captions so center captions sit on top.
+    if (headlineItems && headlineItems.length > 0) {
+      drawHeadline(ctx, headlineItems, currentMs, dims.w, dims.h);
+    }
+
     // Overlay caption if enabled + active cue exists.
     if (
       captionSettings?.enabled &&
@@ -73,8 +82,7 @@ export function PreviewPanel({
       if (cue) {
         // Pass per-word timestamps + current time + cue window +
         // animation so the word-mode presets and kinetic typography
-        // animations render identically to the export. Cues without
-        // words[] fall back to full-text rendering inside drawCaption.
+        // animations render identically to the export.
         const capCtx = {
           ...captionSettings,
           words: cue.words,
@@ -94,6 +102,7 @@ export function PreviewPanel({
     dims.h,
     subtitles,
     captionSettings,
+    headlineItems,
   ]);
 
   const pct = totalMs > 0 ? (currentMs / totalMs) * 100 : 0;
@@ -104,10 +113,16 @@ export function PreviewPanel({
       style={{ backgroundColor: "#0c0c0e" }}
     >
       {/* Canvas stage */}
-      <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden p-4">
+      <div
+        className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden p-4"
+        style={{
+          background:
+            "radial-gradient(ellipse at 50% 20%, rgba(124, 58, 237, 0.07) 0%, rgba(12, 12, 14, 0) 65%)",
+        }}
+      >
         {segments.length === 0 ? (
           <div
-            className="ff-grid-bg flex h-full w-full flex-col items-center justify-center rounded-xl border text-center"
+            className="ff-grid-bg flex h-full w-full flex-col items-center justify-center rounded-xl border text-center transition-colors"
             style={{ borderColor: "#27272a" }}
           >
             <ImageOff className="mb-3 size-8" style={{ color: "#3f3f46" }} />
@@ -120,11 +135,12 @@ export function PreviewPanel({
           </div>
         ) : (
           <div
-            className="relative rounded-lg border shadow-2xl"
+            className="relative rounded-lg border shadow-2xl transition-shadow duration-300"
             style={{
               borderColor: "#27272a",
               backgroundColor: "#000000",
-              boxShadow: "0 25px 50px -12px rgba(0, 0, 0, 0.8)",
+              boxShadow:
+                "0 25px 50px -12px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(124, 58, 237, 0.08)",
               aspectRatio: `${dims.w} / ${dims.h}`,
               maxWidth: "100%",
               maxHeight: "100%",
@@ -141,7 +157,10 @@ export function PreviewPanel({
             {activeSegment && (
               <div
                 className="pointer-events-none absolute left-2 top-2 rounded-md px-2 py-1 backdrop-blur-sm"
-                style={{ backgroundColor: "rgba(0, 0, 0, 0.6)" }}
+                style={{
+                  backgroundColor: "rgba(0, 0, 0, 0.6)",
+                  border: "1px solid rgba(255, 255, 255, 0.06)",
+                }}
               >
                 <div
                   className="max-w-[280px] truncate text-[11px] font-medium"
@@ -162,9 +181,28 @@ export function PreviewPanel({
                 style={{
                   backgroundColor: "rgba(0, 0, 0, 0.6)",
                   color: "#c4b5fd",
+                  border: "1px solid rgba(196, 181, 253, 0.15)",
                 }}
               >
                 ⟶ {activeSegment.direction}
+              </div>
+            )}
+            {/* Headline indicator (v4.2) */}
+            {headlineItems.length > 0 && (
+              <div
+                className="pointer-events-none absolute bottom-2 left-2 flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] backdrop-blur-sm"
+                style={{
+                  backgroundColor: "rgba(0, 0, 0, 0.55)",
+                  color: "#fbbf24",
+                  border: "1px solid rgba(251, 191, 36, 0.2)",
+                }}
+                title={`${headlineItems.length} headline overlay item${
+                  headlineItems.length === 1 ? "" : "s"
+                } on the timeline`}
+              >
+                <Type className="size-3" />
+                {headlineItems.length} headline
+                {headlineItems.length === 1 ? "" : "s"}
               </div>
             )}
           </div>
@@ -177,6 +215,7 @@ export function PreviewPanel({
         style={{
           borderColor: "#27272a",
           backgroundColor: "#111113",
+          boxShadow: "0 -8px 24px rgba(0, 0, 0, 0.35)",
         }}
       >
         <div className="mb-2 flex items-center gap-2">
@@ -184,9 +223,9 @@ export function PreviewPanel({
             type="button"
             onClick={() => onStep(-1)}
             disabled={segments.length === 0}
-            className="rounded-md p-1.5 transition-colors disabled:opacity-30"
+            className="rounded-md p-1.5 transition-all hover:bg-white/10 hover:text-zinc-200 disabled:opacity-30"
             style={{ color: "#a1a1aa" }}
-            title="Previous segment"
+            title="Previous segment (Shift+←)"
           >
             <SkipBack className="size-4" />
           </button>
@@ -194,12 +233,12 @@ export function PreviewPanel({
             type="button"
             onClick={onTogglePlay}
             disabled={segments.length === 0}
-            className="flex size-10 items-center justify-center rounded-full text-white shadow-lg transition-all disabled:opacity-30"
+            className="flex size-10 items-center justify-center rounded-full text-white shadow-lg transition-all duration-150 hover:scale-105 active:scale-95 disabled:opacity-30 disabled:hover:scale-100"
             style={{
-              backgroundColor: "#7c3aed",
-              boxShadow: "0 4px 12px rgba(124, 58, 237, 0.4)",
+              background: "linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%)",
+              boxShadow: "0 4px 16px rgba(124, 58, 237, 0.45)",
             }}
-            title={isPlaying ? "Pause" : "Play"}
+            title={isPlaying ? "Pause (Space)" : "Play (Space)"}
           >
             {isPlaying ? (
               <Pause className="size-5" />
@@ -211,16 +250,16 @@ export function PreviewPanel({
             type="button"
             onClick={() => onStep(1)}
             disabled={segments.length === 0}
-            className="rounded-md p-1.5 transition-colors disabled:opacity-30"
+            className="rounded-md p-1.5 transition-all hover:bg-white/10 hover:text-zinc-200 disabled:opacity-30"
             style={{ color: "#a1a1aa" }}
-            title="Next segment"
+            title="Next segment (Shift+→)"
           >
             <SkipForward className="size-4" />
           </button>
 
           <div className="ml-2 flex-1" />
 
-          <div className="font-mono text-[12px] tabular-nums">
+          <div className="rounded-md border border-transparent bg-black/30 px-2 py-0.5 font-mono text-[12px] tabular-nums">
             <span style={{ color: "#e4e4e7" }}>
               {fmtTimecode(currentMs)}
             </span>
@@ -243,8 +282,12 @@ export function PreviewPanel({
             disabled={segments.length === 0}
             className="w-full"
             style={{
-              background: `linear-gradient(to right, #7c3aed ${pct}%, #3f3f46 ${pct}%)`,
+              background: `linear-gradient(to right, #8b5cf6 ${pct}%, #d946ef ${Math.min(
+                100,
+                pct + 8,
+              )}%, #3f3f46 ${Math.min(100, pct + 8)}%)`,
             }}
+            aria-label="Timeline scrubber"
           />
         </div>
       </div>

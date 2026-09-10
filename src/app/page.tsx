@@ -32,16 +32,23 @@ import {
   defaultAudioSettings,
   defaultCaptionSettings,
   defaultKenBurnsConfig,
+  makeHeadlineItem,
   type AudioSettings,
   type AudioTrack,
   type CaptionSettings,
   type ExportProgress,
+  type HeadlineItem,
   type KenBurnsConfig,
   type MediaSegment,
   type SubtitleFile,
   type VideoSettings,
 } from "@/lib/merger/types";
 import { getCaptionPreset, getFontOption, CAPTION_PRESETS } from "@/lib/merger/captionPresets";
+import {
+  buildProjectFile,
+  downloadProjectFile,
+  parseProjectFile,
+} from "@/lib/merger/project";
 
 interface MediaItem {
   id: string;
@@ -64,6 +71,8 @@ interface PersistedSettings {
   captionSettings: CaptionSettings;
   audio: AudioSettings;
   whisperLanguage: string;
+  /** Headline overlay items (persisted so hook titles survive reloads). v4.2 */
+  headlines?: HeadlineItem[];
 }
 
 function loadPersisted(): Partial<PersistedSettings> {
@@ -88,24 +97,62 @@ export default function Page() {
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
   // ---- Settings -----------------------------------------------------------
-  const persisted = useMemo(() => loadPersisted(), []);
+  // v4.2 hydration fix: persisted (localStorage) values are applied in a
+  // mount effect instead of the state initializers. Reading localStorage
+  // during the first render made the client HTML differ from the prerendered
+  // server HTML (React #418) whenever settings had been saved on a previous
+  // run. Defaults render first (matching the static export), then the saved
+  // settings swap in one frame later.
   const [kenBurns, setKenBurns] = useState<KenBurnsConfig>(
-    persisted.kenBurns ?? defaultKenBurnsConfig(),
+    defaultKenBurnsConfig(),
   );
-  const [settings, setSettings] = useState<VideoSettings>(
-    persisted.settings ?? {
-      aspect: "16:9",
-      resolution: "1080p",
-      bitrateMbps: 8,
-      fps: 30,
-    },
-  );
+  const [settings, setSettings] = useState<VideoSettings>({
+    aspect: "16:9",
+    resolution: "1080p",
+    bitrateMbps: 8,
+    fps: 30,
+  });
   const [captionSettings, setCaptionSettings] = useState<CaptionSettings>(
-    persisted.captionSettings ?? defaultCaptionSettings(),
+    defaultCaptionSettings(),
   );
   const [audioSettings, setAudioSettings] = useState<AudioSettings>(
-    persisted.audio ?? defaultAudioSettings(),
+    defaultAudioSettings(),
   );
+
+  // ---- Headline overlay track (v4.2) — viral hook titles ----------------
+  const [headlineItems, setHeadlineItems] = useState<HeadlineItem[]>([]);
+
+  // Whisper language: "auto" = auto-detect, or a 2-letter code like "en".
+  const [whisperLanguage, setWhisperLanguage] = useState<string>("auto");
+
+  // Restore persisted settings AFTER mount (client-only, hydration-safe).
+  // Reading localStorage in the state initializers made the first client
+  // render differ from the prerendered HTML (React #418) whenever settings
+  // were saved on a previous run. Defaults render first, then the saved
+  // settings swap in one frame later — the intentional one-shot sync with
+  // the localStorage "external system".
+   
+  useEffect(() => {
+    const p = loadPersisted();
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (p.kenBurns) setKenBurns(p.kenBurns);
+     
+    if (p.settings) setSettings(p.settings);
+     
+    if (p.captionSettings) setCaptionSettings(p.captionSettings);
+     
+    if (p.audio) setAudioSettings(p.audio);
+    if (Array.isArray(p.headlines)) {
+       
+      setHeadlineItems(
+        p.headlines.filter((h) => h && h.text && h.endMs > h.startMs),
+      );
+    }
+     
+    if (p.whisperLanguage && p.whisperLanguage !== "auto") {
+      setWhisperLanguage(p.whisperLanguage);
+    }
+  }, []);
 
   // ---- Playback -----------------------------------------------------------
   const [isPlaying, setIsPlaying] = useState(false);
@@ -259,7 +306,11 @@ export default function Page() {
       return;
     }
     // If captions are enabled but no subtitles are loaded, warn (don't abort).
-    if (captionSettings.enabled && (!subtitles || subtitles.cues.length === 0)) {
+    if (
+      captionSettings.enabled &&
+      (!subtitles || subtitles.cues.length === 0) &&
+      headlineItems.length === 0
+    ) {
       toast.info("Captions enabled but no .srt loaded", {
         description: "Add a subtitle file from the media panel to burn in captions.",
       });
@@ -284,6 +335,7 @@ export default function Page() {
         totalMs: timeline.totalMs,
         subtitles,
         captionSettings,
+        headlines: headlineItems.length ? headlineItems : null,
         onProgress: (p) => setExportProgress(p),
         signal: ac.signal,
       });
@@ -315,6 +367,7 @@ export default function Page() {
     audioSettings,
     subtitles,
     captionSettings,
+    headlineItems,
     inElectron,
   ]);
 
@@ -551,10 +604,6 @@ export default function Page() {
   // ---- Whisper caption generation (word-level timestamps) ----------------
   const [whisperBusy, setWhisperBusy] = useState(false);
   const [whisperProgress, setWhisperProgress] = useState<WhisperProgress | null>(null);
-  // Whisper language: "auto" = auto-detect, or a 2-letter code like "en".
-  const [whisperLanguage, setWhisperLanguage] = useState<string>(
-    persisted.whisperLanguage ?? "auto",
-  );
 
   // ---- Persist settings on change ----------------------------------------
   useEffect(() => {
@@ -564,13 +613,14 @@ export default function Page() {
       captionSettings,
       audio: audioSettings,
       whisperLanguage,
+      headlines: headlineItems.length ? headlineItems : [],
     };
     try {
       localStorage.setItem(LS_KEY, JSON.stringify(payload));
     } catch {
       /* storage full / private mode — non-fatal */
     }
-  }, [kenBurns, settings, captionSettings, audioSettings, whisperLanguage]);
+  }, [kenBurns, settings, captionSettings, audioSettings, whisperLanguage, headlineItems]);
 
   const generateCaptionsFromAudio = useCallback(async () => {
     if (!audioTrack) {
@@ -739,6 +789,208 @@ export default function Page() {
     });
   }, []);
 
+  /** Duplicate a media item right after the original (v4.2). Copies the
+   *  file (same object) with a fresh id so it lands as its own timeline
+   *  segment; duration overrides do NOT carry over (the copy re-parses). */
+  const duplicateItem = useCallback((id: string) => {
+    setItems((prev) => {
+      const idx = prev.findIndex((i) => i.id === id);
+      if (idx < 0) return prev;
+      const src = prev[idx];
+      const copy: MediaItem = {
+        id: genId(),
+        file: src.file,
+        url: URL.createObjectURL(src.file),
+      };
+      const next = [...prev];
+      next.splice(idx + 1, 0, copy);
+      return next;
+    });
+    toast.success("Duplicated segment");
+  }, []);
+
+  // ---- Headline overlay management (v4.2) ------------------------------
+  const addHeadline = useCallback(() => {
+    setHeadlineItems((prev) => {
+      // New items default to starting right after the last one ends
+      // (or at the playhead when empty) — quick “hook chain” building.
+      const base = prev.length
+        ? Math.min(prev[prev.length - 1].endMs, totalMsRef.current)
+        : Math.min(currentMsRef.current, Math.max(0, totalMsRef.current - 3000));
+      const item = makeHeadlineItem({ startMs: base, endMs: base + 3000 });
+      return [...prev, item];
+    });
+  }, []);
+
+  const updateHeadline = useCallback(
+    (id: string, patch: Partial<HeadlineItem>) => {
+      setHeadlineItems((prev) =>
+        prev.map((h) => (h.id === id ? { ...h, ...patch } : h)),
+      );
+    },
+    [],
+  );
+
+  const removeHeadline = useCallback((id: string) => {
+    setHeadlineItems((prev) => prev.filter((h) => h.id !== id));
+  }, []);
+
+  // ---- Project save / load (.framefuse.json, v4.2) --------------------
+  const projectInputRef = useRef<HTMLInputElement>(null);
+  const openProjectPicker = useCallback(
+    () => projectInputRef.current?.click(),
+    [],
+  );
+
+  const saveProject = useCallback(async () => {
+    try {
+      if (items.length === 0) {
+        toast.error("Nothing to save yet", {
+          description: "Add images first — the project stores your full storyboard.",
+        });
+        return;
+      }
+      let audioFile: File | null = null;
+      if (audioTrack) {
+        try {
+          const resp = await fetch(audioTrack.url);
+          const blob = await resp.blob();
+          audioFile = new File([blob], audioTrack.fileName, {
+            type: blob.type || "audio/mpeg",
+          });
+        } catch {
+          audioFile = null;
+        }
+      }
+      const project = await buildProjectFile({
+        images: items.map((it) => ({ id: it.id, file: it.file })),
+        audio: audioFile,
+        subtitles: subtitles
+          ? { fileName: subtitles.fileName, cues: subtitles.cues }
+          : null,
+        headlines: headlineItems,
+        overrides,
+        settings: {
+          kenBurns,
+          video: settings,
+          caption: captionSettings,
+          audio: audioSettings,
+          whisperLanguage,
+        },
+      });
+      const name = downloadProjectFile(project);
+      const imgs = project.images.length;
+      toast.success(`Project saved — ${name}`, {
+        description: `${imgs} image${imgs === 1 ? "" : "s"}${
+          project.audio ? " + audio" : ""
+        }${
+          project.subtitles ? " + captions" : ""
+        }${
+          project.headlines.length ? ` + ${project.headlines.length} headline` : ""
+        } — fully self-contained .json`,
+      });
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Project save failed");
+    }
+  }, [
+    items,
+    audioTrack,
+    subtitles,
+    headlineItems,
+    overrides,
+    kenBurns,
+    settings,
+    captionSettings,
+    audioSettings,
+    whisperLanguage,
+  ]);
+
+  const loadProject = useCallback(
+    async (file: File) => {
+      try {
+        const loaded = await parseProjectFile(file);
+        const { project } = loaded;
+
+        // Reset current session media.
+        setItems((prev) => {
+          prev.forEach((i) => URL.revokeObjectURL(i.url));
+          return [];
+        });
+        if (audioTrack) URL.revokeObjectURL(audioTrack.url);
+
+        // Rebuild media items with their SAVED ids (so duration overrides
+        // + Ken Burns direction hashing map 1:1).
+        const restored: MediaItem[] = loaded.imageFiles.map((entry) => ({
+          id: entry.id,
+          file: entry.file,
+          url: URL.createObjectURL(entry.file),
+        }));
+        setItems(restored);
+
+        // Audio.
+        if (loaded.audioFile) {
+          const url = URL.createObjectURL(loaded.audioFile);
+          const a = document.createElement("audio");
+          a.preload = "metadata";
+          a.onloadedmetadata = () => {
+            const dur =
+              a.duration && Number.isFinite(a.duration) ? a.duration * 1000 : null;
+            setAudioTrack((p) =>
+              p && p.url === url ? { ...p, durationMs: dur } : p,
+            );
+          };
+          a.src = url;
+          setAudioTrack({
+            fileName: loaded.audioFile.name,
+            url,
+            durationMs: null,
+          });
+        } else {
+          setAudioTrack(null);
+        }
+
+        // Subtitles.
+        if (project.subtitles && loaded.srtText) {
+          setSubtitles({
+            fileName: project.subtitles.fileName,
+            cues: project.subtitles.cues,
+            rawText: loaded.srtText,
+          });
+        } else {
+          setSubtitles(null);
+        }
+
+        // Settings + headlines + overrides.
+        setKenBurns(project.settings.kenBurns);
+        setSettings(project.settings.video);
+        setCaptionSettings(project.settings.caption);
+        setAudioSettings(project.settings.audio);
+        setWhisperLanguage(project.settings.whisperLanguage || "auto");
+        setHeadlineItems(Array.isArray(project.headlines) ? project.headlines : []);
+        setOverrides(
+          project.overrides && typeof project.overrides === "object"
+            ? project.overrides
+            : {},
+        );
+
+        // Rewind + stop.
+        currentMsRef.current = 0;
+        setCurrentMs(0);
+        setIsPlaying(false);
+
+        const imgs = restored.length;
+        toast.success(`Project loaded — ${imgs} image${imgs === 1 ? "" : "s"}`, {
+          description: `${file.name}${
+            loaded.audioSkipped ? " · audio skipped (>25MB)" : ""
+          }`,
+        });
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : "Project load failed");
+      }
+    },
+    [audioTrack],
+  );
+
   const seek = useCallback((ms: number) => {
     const clamped = Math.max(0, Math.min(ms, totalMsRef.current));
     currentMsRef.current = clamped;
@@ -888,6 +1140,10 @@ export default function Page() {
             onOverride={overrideDuration}
             onClearOverride={clearOverride}
             onReorder={reorderItem}
+            onDuplicate={duplicateItem}
+            onSaveProject={saveProject}
+            onOpenProject={openProjectPicker}
+            onLoadProjectFile={loadProject}
           />
         </section>
 
@@ -908,6 +1164,7 @@ export default function Page() {
               activeSegment={activeSegment}
               subtitles={subtitles}
               captionSettings={captionSettings}
+              headlineItems={headlineItems}
               onSeek={seek}
               onTogglePlay={togglePlay}
               onStep={stepSegment}
@@ -951,6 +1208,11 @@ export default function Page() {
             whisperProgress={whisperProgress}
             whisperLanguage={whisperLanguage}
             onWhisperLanguageChange={setWhisperLanguage}
+            headlineItems={headlineItems}
+            onAddHeadline={addHeadline}
+            onUpdateHeadline={updateHeadline}
+            onRemoveHeadline={removeHeadline}
+            totalMs={timeline.totalMs}
             debug={debug}
           />
         </section>
@@ -1005,6 +1267,23 @@ export default function Page() {
         onChange={(e: ChangeEvent<HTMLInputElement>) => {
           const f = e.target.files?.[0];
           if (f) addSubtitles(f);
+          e.target.value = "";
+        }}
+      />
+      <input
+        ref={projectInputRef}
+        type="file"
+        accept=".json,.framefuse.json,application/json"
+        style={{
+          position: "absolute",
+          opacity: 0,
+          width: 1,
+          height: 1,
+          pointerEvents: "none",
+        }}
+        onChange={(e: ChangeEvent<HTMLInputElement>) => {
+          const f = e.target.files?.[0];
+          if (f) loadProject(f);
           e.target.value = "";
         }}
       />

@@ -187,6 +187,10 @@ export interface CaptionSettings {
  *   swing        — pendulum: rot swings ±8° while active
  *   squash       — squash & stretch entry: fscy 40% → 110% → 100%
  *   zoom-words   — fast-cut: word zooms 1.6 → 1 + quick fade (160ms)
+ *   ── v4.2 viral kinetic pack ──
+ *   tracking-in  — letters slide together: spacing 8px → 0 + fade (300ms)
+ *   blur-in      — focus pull: scale 1.18 → 1 + fade-in (260ms)
+ *   heartbeat    — double-beat pulse 1 → 1.14 → 1 → 1.08 → 1 (640ms)
  */
 export type CaptionAnimation =
   | "none"
@@ -210,7 +214,10 @@ export type CaptionAnimation =
   | "spotlight"
   | "swing"
   | "squash"
-  | "zoom-words";
+  | "zoom-words"
+  | "tracking-in"
+  | "blur-in"
+  | "heartbeat";
 
 export function defaultCaptionSettings(): CaptionSettings {
   return {
@@ -234,6 +241,49 @@ export interface SubtitleFile {
   rawText: string;
 }
 
+// ---------------------------------------------------------------------------
+// HEADLINE OVERLAY (v4.2) — viral hook titles independent of captions.
+// A list of timed text items, each styled by a headline preset, drawn on the
+// canvas preview and burned into the export via extra ASS Dialogue lines.
+// ---------------------------------------------------------------------------
+
+/** Entrance animation for headline items. */
+export type HeadlineAnimation = "none" | "fade" | "slide-up" | "pop" | "zoom-punch";
+
+/** Vertical anchor for a headline item. */
+export type HeadlinePosition = "top" | "center" | "bottom";
+
+/** One timed headline/title item on the master timeline. */
+export interface HeadlineItem {
+  id: string;
+  /** The text (supports \n for manual line breaks). */
+  text: string;
+  /** Master-timeline window. */
+  startMs: number;
+  endMs: number;
+  /** Headline preset id (headlinePresets.ts). */
+  presetId: string;
+  position: HeadlinePosition;
+  /** Entrance animation. */
+  animation: HeadlineAnimation;
+  /** Font size multiplier 0.5 - 2.0. */
+  sizeScale: number;
+}
+
+export function makeHeadlineItem(partial: Partial<HeadlineItem> = {}): HeadlineItem {
+  return {
+    id: `hl_${Date.now().toString(36)}_${Math.floor(Math.random() * 1e4).toString(36)}`,
+    text: "YOUR HOOK HERE",
+    startMs: 0,
+    endMs: 3000,
+    presetId: "impact",
+    position: "top",
+    animation: "pop",
+    sizeScale: 1,
+    ...partial,
+  };
+}
+
 export interface ExportNativeOptions {
   segments: MediaSegment[];
   /** segId -> object URL (or data URL) for the image. */
@@ -245,6 +295,8 @@ export interface ExportNativeOptions {
   /** Optional subtitle track + caption styling for burn-in. */
   subtitles?: SubtitleFile | null;
   captionSettings?: CaptionSettings;
+  /** Headline overlay items for burn-in (v4.2). */
+  headlines?: HeadlineItem[] | null;
   /** Audio post-processing (normalize / fades). v4.1 */
   audio?: AudioSettings;
   onProgress?: (p: ExportProgress) => void;
@@ -292,6 +344,8 @@ declare global {
         captionSettings: unknown;
         width: number;
         height: number;
+        /** Optional headline overlay items to include in the sidecar. v4.2 */
+        headlines?: unknown[];
       }) => Promise<{ path: string; size: number } | null>;
     };
   }

@@ -59,6 +59,14 @@ export interface WordTransform {
    * via BorderStyle 3 per-line (word-only/stack) or a bold pop (karaoke).
    */
   highlightBox: boolean;
+  /**
+   * EXTRA letter spacing in px (canvas scale) added to the word while it
+   * animates in (tracking-in). Layout positions are computed from the
+   * base spacing; this only widens the drawn glyphs, so it is applied
+   * exclusively to standalone-word paths (word-only / stack / whole cue)
+   * where no neighbor overlap can occur.
+   */
+  letterSpacing: number;
 }
 
 export const IDENTITY_TRANSFORM: WordTransform = {
@@ -73,6 +81,7 @@ export const IDENTITY_TRANSFORM: WordTransform = {
   colorOverride: null,
   glitchAmount: 0,
   highlightBox: false,
+  letterSpacing: 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -130,6 +139,9 @@ const FLIP_IN_MS = 260;
 const ELASTIC_MS = 450;
 const ZOOM_WORDS_MS = 160;
 const SQUASH_MS = 340;
+const TRACKING_IN_MS = 300;
+const BLUR_IN_MS = 260;
+const HEARTBEAT_MS = 640;
 
 // ---------------------------------------------------------------------------
 // computeWordTransform — the heart of the system. Given an animation id,
@@ -400,6 +412,48 @@ export function computeWordTransform(
         alpha: clamp01(t * 2.2),
       };
     }
+
+    // ── v4.2 viral kinetic pack ──────────────────────────────────
+    case "tracking-in": {
+      // Letters slide together: extra spacing 8px → 0 + fade (300ms).
+      const t = clamp01(sinceStart / TRACKING_IN_MS);
+      const e = easeOutCubic(t);
+      return {
+        ...IDENTITY_TRANSFORM,
+        letterSpacing: (1 - e) * 8 * chScale,
+        alpha: clamp01(t * 2),
+        scale: 0.96 + 0.04 * e,
+      };
+    }
+    case "blur-in": {
+      // Focus pull: scale 1.18 → 1 + fade-in (260ms).
+      const t = clamp01(sinceStart / BLUR_IN_MS);
+      const e = easeOutCubic(t);
+      const scale = 1.18 - 0.18 * e;
+      return {
+        ...IDENTITY_TRANSFORM,
+        scale: t >= 1 ? 1 : Math.max(0.01, scale),
+        alpha: clamp01(t * 1.8),
+      };
+    }
+    case "heartbeat": {
+      // Double-beat pulse: 1 → 1.14 → 1 → 1.08 → 1 over HEARTBEAT_MS.
+      const t = clamp01(sinceStart / HEARTBEAT_MS);
+      let scale = 1;
+      if (t < 0.28) {
+        // First beat (bigger).
+        const k = t / 0.28;
+        scale = 1 + Math.sin(k * Math.PI) * 0.14;
+      } else if (t < 0.5) {
+        // Rest.
+        scale = 1;
+      } else if (t < 0.78) {
+        // Second beat (smaller).
+        const k = (t - 0.5) / 0.28;
+        scale = 1 + Math.sin(k * Math.PI) * 0.08;
+      }
+      return { ...IDENTITY_TRANSFORM, scale };
+    }
     default:
       return IDENTITY_TRANSFORM;
   }
@@ -649,6 +703,40 @@ export function assWordAnimationTags(
       blocks.push(`{\\t(0,${ZOOM_WORDS_MS},\\fscx100\\fscy100\\alpha&H00&)}`);
       break;
     }
+
+    // ── v4.2 viral kinetic pack ──────────────────────────────────
+    case "tracking-in": {
+      if (karaoke) {
+        // \fsp would leak across the line's word layout (libass keeps inline
+        // overrides until the next block resets them) — approximate with a
+        // tight pop instead so the line never jitters.
+        blocks.push(`{\\fscx92\\fscy92\\alpha&HFF&}`);
+        blocks.push(`{\\t(0,${TRACKING_IN_MS},\\fscx100\\fscy100\\alpha&H00&)}`);
+      } else {
+        const sp = Math.max(1, Math.round(8 * chScale));
+        blocks.push(`{\\fsp${sp}\\alpha&HE6&}`);
+        blocks.push(`{\\t(0,${TRACKING_IN_MS},\\fsp0\\alpha&H00&)}`);
+      }
+      break;
+    }
+    case "blur-in": {
+      // Focus pull: 118 → 100 + fade.
+      blocks.push(`{\\fscx118\\fscy118\\alpha&HFF&}`);
+      blocks.push(`{\\t(0,${Math.round(BLUR_IN_MS * 0.7)},\\fscx104\\fscy104\\alpha&H00&)}`);
+      blocks.push(`{\\t(${Math.round(BLUR_IN_MS * 0.7)},${BLUR_IN_MS},\\fscx100\\fscy100)}`);
+      break;
+    }
+    case "heartbeat": {
+      // Double-beat: 100 → 114 → 100 → 108 → 100.
+      const b1 = Math.round(HEARTBEAT_MS * 0.28);
+      const rest = Math.round(HEARTBEAT_MS * 0.5);
+      const b2 = Math.round(HEARTBEAT_MS * 0.78);
+      blocks.push(`{\\t(0,${Math.round(b1 / 2)},\\fscx114\\fscy114)}`);
+      blocks.push(`{\\t(${Math.round(b1 / 2)},${b1},\\fscx100\\fscy100)}`);
+      blocks.push(`{\\t(${rest},${Math.round(rest + (b2 - rest) / 2)},\\fscx108\\fscy108)}`);
+      blocks.push(`{\\t(${Math.round(rest + (b2 - rest) / 2)},${b2},\\fscx100\\fscy100)}`);
+      break;
+    }
     default:
       return "";
   }
@@ -685,4 +773,7 @@ export const ANIMATION_LABELS: {
   { value: "swing", label: "Swing", hint: "Pendulum ±8° while active", group: "viral" },
   { value: "squash", label: "Squash", hint: "Squash & stretch entry", group: "viral" },
   { value: "zoom-words", label: "Zoom-Words", hint: "Fast-cut zoom 1.6 → 1 (160ms)", group: "viral" },
+  { value: "tracking-in", label: "Tracking-In", hint: "Letters slide together 8px → 0", group: "viral" },
+  { value: "blur-in", label: "Blur-In", hint: "Focus pull 1.18 → 1 + fade", group: "viral" },
+  { value: "heartbeat", label: "Heartbeat", hint: "Double-beat pulse 1.14 / 1.08", group: "viral" },
 ];

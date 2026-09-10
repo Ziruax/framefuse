@@ -8,10 +8,12 @@ import type {
   ExportNativeOptions,
   ExportProgress,
   ExportResult,
+  HeadlineItem,
   MediaSegment,
 } from "./types";
 import { drawFrame, resolveDimensions } from "./renderer";
 import { getCaptionPreset, getFontOption } from "./captionPresets";
+import { getHeadlinePreset, type HeadlinePreset } from "./headlinePresets";
 import { cueAt, activeWordIndex, type WordTimestamp } from "./subtitles";
 import {
   computeWordTransform,
@@ -231,6 +233,22 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
     }));
   }
 
+  // 3.5 Headline overlay payload (v4.2) — burned in via extra ASS lines.
+  const ipcHeadlines =
+    opts.headlines && opts.headlines.length > 0
+      ? opts.headlines
+          .filter((h) => h.text && h.endMs > h.startMs)
+          .map((h) => ({
+            text: h.text,
+            startMs: h.startMs,
+            endMs: h.endMs,
+            presetId: h.presetId,
+            position: h.position,
+            animation: h.animation,
+            sizeScale: h.sizeScale || 1,
+          }))
+      : undefined;
+
   // 4. Choose output path.
   const outputPath = await api.chooseOutput();
   if (!outputPath) {
@@ -264,6 +282,7 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
       audio,
       captionSettings: ipcCaptionSettings,
       subtitleCues: ipcSubtitleCues,
+      headlines: ipcHeadlines,
     });
     return result;
   } finally {
@@ -376,6 +395,10 @@ async function exportViaWebCodecs(
         }
       : null;
 
+  // Headline overlay items (v4.2) — drawn under captions.
+  const headlineItems =
+    opts.headlines && opts.headlines.length > 0 ? opts.headlines : null;
+
   for (let i = 0; i < totalFrames; i++) {
     if (signal?.aborted) {
       try {
@@ -393,6 +416,7 @@ async function exportViaWebCodecs(
       segments[segments.length - 1];
     const img = seg ? imgCache.get(seg.id) : null;
     if (seg) drawFrame(ctx, img ?? null, seg, currentMs, dims.w, dims.h, kenBurns);
+    if (headlineItems) drawHeadline(ctx, headlineItems, currentMs, dims.w, dims.h);
     if (drawCaptions) drawCaptions(currentMs);
 
     const frame = new VideoFrameCtor(canvas, {
@@ -516,6 +540,10 @@ async function exportViaMediaRecorder(
         }
       : null;
 
+  // Headline overlay items (v4.2) — drawn under captions.
+  const headlineItemsMR =
+    opts.headlines && opts.headlines.length > 0 ? opts.headlines : null;
+
   await new Promise<void>((resolve) => {
     const tick = () => {
       const elapsed = performance.now() - start;
@@ -526,6 +554,8 @@ async function exportViaMediaRecorder(
       const img = seg ? imgCache.get(seg.id) : null;
       if (seg)
         drawFrame(ctx, img ?? null, seg, currentMs, dims.w, dims.h, kenBurns);
+      if (headlineItemsMR)
+        drawHeadline(ctx, headlineItemsMR, currentMs, dims.w, dims.h);
       if (drawCaptionsMR) drawCaptionsMR(currentMs);
 
       onProgress?.({
@@ -847,6 +877,212 @@ export function drawCaption(
 }
 
 // ---------------------------------------------------------------------------
+// HEADLINE OVERLAY (v4.2) — viral hook titles, independent of captions.
+// Canvas parity twin of the ASS headline Dialogue lines emitted by
+// electron/main.js. Entrance animations match the ASS tags exactly:
+//   fade        → \fad(300,300)
+//   slide-up    → \move(0,dy,0,0,0,280) + \fad(180,0)
+//   pop         → \fscx60 → 112 → 100 (\t) + alpha
+//   zoom-punch  → \fscx200 → 100 (\t) + alpha
+// ---------------------------------------------------------------------------
+
+const HEADLINE_FADE_MS = 300;
+const HEADLINE_SLIDE_MS = 280;
+const HEADLINE_POP_MS = 260;
+const HEADLINE_PUNCH_MS = 200;
+
+interface HeadlineTransform {
+  alpha: number;
+  offsetY: number;
+  scale: number;
+}
+
+function headlineTransform(
+  animation: HeadlineItem["animation"],
+  startMs: number,
+  endMs: number,
+  currentMs: number,
+  ch: number,
+): HeadlineTransform {
+  const chScale = ch / 1080;
+  const since = currentMs - startMs;
+  const remaining = endMs - currentMs;
+  // Universal fade-out tail (matches the ASS \fad(_,300) out phase).
+  const outT = clamp01(remaining / HEADLINE_FADE_MS);
+
+  let alpha = 1;
+  let offsetY = 0;
+  let scale = 1;
+
+  switch (animation) {
+    case "fade": {
+      alpha = clamp01(since / HEADLINE_FADE_MS);
+      break;
+    }
+    case "slide-up": {
+      const t = clamp01(since / HEADLINE_SLIDE_MS);
+      const e = 1 - Math.pow(1 - t, 3); // easeOutCubic
+      offsetY = (1 - e) * 34 * chScale;
+      alpha = clamp01(t * 1.6);
+      break;
+    }
+    case "pop": {
+      const t = clamp01(since / HEADLINE_POP_MS);
+      // easeOutBack overshoot (same c1 as captionAnimations).
+      const c1 = 1.70158;
+      const c3 = c1 + 1;
+      const e = 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);
+      scale = t >= 1 ? 1 : Math.max(0.05, 0.6 + 0.4 * e);
+      alpha = clamp01(t * 2.4);
+      break;
+    }
+    case "zoom-punch": {
+      const t = clamp01(since / HEADLINE_PUNCH_MS);
+      const e = 1 - Math.pow(1 - t, 4); // easeOutQuart
+      scale = t >= 1 ? 1 : Math.max(0.05, 2.0 - 1.0 * e);
+      alpha = clamp01(t * 2.6);
+      break;
+    }
+    default:
+      break;
+  }
+
+  return { alpha: Math.min(alpha, outT), offsetY, scale };
+}
+
+function clamp01(v: number): number {
+  return Math.max(0, Math.min(1, v));
+}
+
+/**
+ * Draw every headline item active at currentMs onto the canvas.
+ * Called by the preview + browser-export render loops after drawFrame()
+ * and BEFORE captions so center-positioned captions layer on top.
+ */
+export function drawHeadline(
+  ctx: CanvasRenderingContext2D,
+  items: HeadlineItem[],
+  currentMs: number,
+  cw: number,
+  ch: number,
+): void {
+  for (const item of items) {
+    if (!item?.text) continue;
+    if (currentMs < item.startMs || currentMs >= item.endMs) continue;
+
+    const preset: HeadlinePreset = getHeadlinePreset(item.presetId);
+    const t = headlineTransform(
+      item.animation,
+      item.startMs,
+      item.endMs,
+      currentMs,
+      ch,
+    );
+
+    const scale = item.sizeScale || 1;
+    const fontPx = Math.max(10, Math.round(preset.fontSize * ch * scale));
+    const italic = preset.fontStyle === "italic" ? "italic " : "";
+    ctx.font = `${italic}${preset.fontWeight} ${fontPx}px ${preset.fontFamily}`;
+    ctx.textBaseline = "top";
+    try {
+      (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
+        `${(preset.letterSpacing / 1080) * ch}px`;
+    } catch {
+      /* not supported — ignore */
+    }
+
+    let display = item.text;
+    if (preset.textTransform === "uppercase") display = display.toUpperCase();
+
+    // Manual line breaks (\n in the text) + auto wrap at maxWidth.
+    const maxW = Math.max(60, preset.maxWidth * cw);
+    const lineHeight = Math.round(fontPx * 1.22);
+    const lines: string[] = [];
+    for (const rawLine of display.split(/\n+/)) {
+      lines.push(...wrapText(ctx, rawLine, maxW));
+    }
+    if (lines.length === 0) continue;
+
+    const blockH = lines.length * lineHeight;
+    const padding = Math.round((preset.bgPadding / 1080) * ch);
+    const radius = Math.round((preset.bgRadius / 1080) * ch);
+    const maxWidthLine = Math.max(...lines.map((l) => ctx.measureText(l).width));
+
+    const positionYpx = Math.round((preset.positionY / 1080) * ch);
+    let blockTop: number;
+    if (item.position === "top") blockTop = positionYpx;
+    else if (item.position === "center") blockTop = (ch - blockH) / 2;
+    else blockTop = ch - blockH - positionYpx;
+
+    const blockLeft = (cw - maxWidthLine) / 2;
+
+    // Entrance transform around the block center.
+    ctx.save();
+    ctx.globalAlpha = t.alpha;
+    if (t.scale !== 1 || t.offsetY !== 0) {
+      const cx = cw / 2;
+      const cy = blockTop + blockH / 2;
+      ctx.translate(cx, cy + t.offsetY);
+      ctx.scale(t.scale, t.scale);
+      ctx.translate(-cx, -cy);
+    }
+
+    // Background / sticker box.
+    if (preset.bgColor) {
+      const boxX = blockLeft - padding;
+      const boxY = blockTop - padding;
+      const boxW = Math.min(cw - 8, maxWidthLine + padding * 2);
+      const boxH = blockH + padding * 2;
+      ctx.save();
+      ctx.globalAlpha = preset.bgAlpha;
+      ctx.fillStyle = preset.bgColor;
+      drawRoundedRect(ctx, boxX, boxY, boxW, boxH, radius);
+      ctx.fill();
+      if (preset.borderColor && preset.borderWidth > 0) {
+        ctx.lineJoin = "round";
+        ctx.strokeStyle = preset.borderColor;
+        ctx.lineWidth = Math.max(1, (preset.borderWidth / 1080) * ch * 2);
+        drawRoundedRect(ctx, boxX, boxY, boxW, boxH, radius);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+
+    // Glow / shadow + outline + fill per line.
+    ctx.save();
+    if (preset.shadow) {
+      ctx.shadowColor = preset.accentColor || preset.shadowColor;
+      ctx.shadowBlur = preset.shadowBlur * (ch / 540);
+      ctx.shadowOffsetX = 0;
+      ctx.shadowOffsetY = 0;
+    }
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const x = (cw - ctx.measureText(line).width) / 2;
+      const y = blockTop + i * lineHeight;
+      if (!preset.bgColor && preset.borderColor && preset.borderWidth > 0) {
+        ctx.lineJoin = "round";
+        ctx.strokeStyle = preset.borderColor;
+        ctx.lineWidth = Math.max(1, (preset.borderWidth / 1080) * ch * 2);
+        ctx.strokeText(line, x, y);
+      }
+      ctx.fillStyle = preset.textColor;
+      ctx.fillText(line, x, y);
+    }
+    ctx.restore();
+    ctx.restore();
+
+    // Reset letterSpacing (leak guard).
+    try {
+      (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
+        "0px";
+    } catch {
+      /* noop */
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Word-by-word rendering helpers — used when captionSettings.wordMode is
 // "word" (full text + highlighted active word) or "word-only" (only the
 // currently-spoken word). Both need per-word timestamps from Whisper.
@@ -912,6 +1148,16 @@ function applyWordTransform(
     ctx.beginPath();
     ctx.rect(wordX, wordY, wordW * t.clipLeft, wordH);
     ctx.clip();
+  }
+  // Extra letter spacing (tracking-in). Canvas state — restored by the
+  // caller's save/restore. Only standalone-word paths emit non-zero values.
+  if (t.letterSpacing !== 0) {
+    try {
+      (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
+        `${t.letterSpacing}px`;
+    } catch {
+      /* not supported — ignore */
+    }
   }
 }
 

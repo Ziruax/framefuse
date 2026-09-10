@@ -18,6 +18,10 @@ import {
   ChevronRight,
   Captions,
   FileText,
+  Copy,
+  Save,
+  FolderOpen,
+  Sparkles,
 } from "lucide-react";
 import type {
   MediaSegment,
@@ -37,9 +41,11 @@ interface MediaPanelProps {
   skipped: string[];
   warnings: OverlapWarning[];
   onAddFiles: (files: File[]) => void;
-  /** Drag-drop support: audio + .srt files are routed too (v4.1). */
+  /** Drag-drop support: audio + .srt + .framefuse.json files are routed too. */
   onAddAudioFile: (file: File) => void;
   onAddSubtitleFile: (file: File) => void;
+  /** Open a dropped .framefuse.json project (v4.2). */
+  onLoadProjectFile: (file: File) => void;
   onLoadSamples: () => void;
   openImagePicker: () => void;
   openAudioPicker: () => void;
@@ -50,6 +56,11 @@ interface MediaPanelProps {
   onOverride: (id: string, durationMs: number) => void;
   onClearOverride: (id: string) => void;
   onReorder: (id: string, dir: -1 | 1) => void;
+  /** Duplicate a segment in place (v4.2). */
+  onDuplicate: (id: string) => void;
+  /** Save the current session as .framefuse.json (v4.2). */
+  onSaveProject: () => void;
+  onOpenProject: () => void;
 }
 
 const KIND_STYLES: Record<
@@ -65,6 +76,10 @@ const KIND_STYLES: Record<
   },
 };
 
+const isProjectFile = (f: File) =>
+  /\.framefuse\.json$/i.test(f.name) ||
+  (f.type === "application/json" && /\.json$/i.test(f.name));
+
 export function MediaPanelBase({
   segments,
   mode,
@@ -75,6 +90,7 @@ export function MediaPanelBase({
   onAddFiles,
   onAddAudioFile,
   onAddSubtitleFile,
+  onLoadProjectFile,
   onLoadSamples,
   openImagePicker,
   openAudioPicker,
@@ -85,15 +101,20 @@ export function MediaPanelBase({
   onOverride,
   onClearOverride,
   onReorder,
+  onDuplicate,
+  onSaveProject,
+  onOpenProject,
 }: MediaPanelProps) {
   const [dragOver, setDragOver] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
 
   // v4.1: drag-drop routes images, audio AND .srt files with feedback.
+  // v4.2: also routes .framefuse.json project files.
   const handleFiles = (files: FileList | null) => {
     if (!files) return;
     const all = Array.from(files);
+    const projects = all.filter(isProjectFile);
     const images = all.filter((f) => f.type.startsWith("image/"));
     const audio = all.filter(
       (f) => f.type.startsWith("audio/") || /\.(mp3|wav|m4a|ogg|flac|aac|opus)$/i.test(f.name),
@@ -101,6 +122,7 @@ export function MediaPanelBase({
     const srts = all.filter(
       (f) => f.type === "application/x-subrip" || /\.srt$/i.test(f.name),
     );
+    if (projects.length) onLoadProjectFile(projects[projects.length - 1]);
     if (images.length) onAddFiles(images);
     if (audio.length) onAddAudioFile(audio[audio.length - 1]);
     if (srts.length) onAddSubtitleFile(srts[srts.length - 1]);
@@ -133,45 +155,36 @@ export function MediaPanelBase({
     >
       {/* Toolbar */}
       <div
-        className="flex items-center gap-2 border-b px-4 py-3"
+        className="flex items-center gap-1.5 border-b px-3 py-2.5"
         style={{ borderColor: "#27272a" }}
       >
         <button
           type="button"
           onClick={openImagePicker}
-          className="flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[12px] font-semibold transition-colors"
-          style={{ backgroundColor: "#7c3aed", color: "#ffffff" }}
+          className="ff-btn-primary flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[12px] font-semibold"
         >
           <Plus className="size-4" /> Add Images
         </button>
         <button
           type="button"
           onClick={openAudioPicker}
-          className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-[12px] font-medium transition-colors"
-          style={{
-            borderColor: "#3f3f46",
-            backgroundColor: "#27272a",
-            color: "#e4e4e7",
-          }}
+          className="ff-btn-ghost flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[12px] font-medium"
+          title="Attach an audio track (voiceover / music)"
         >
-          <Music className="size-3.5" /> Add Audio
+          <Music className="size-3.5" /> Audio
         </button>
         <button
           type="button"
           onClick={openSubtitlePicker}
-          className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-[12px] font-medium transition-colors"
-          style={{
-            borderColor: "#3f3f46",
-            backgroundColor: "#27272a",
-            color: "#e4e4e7",
-          }}
+          className="ff-btn-ghost flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[12px] font-medium"
+          title="Load an .srt subtitle file"
         >
-          <Captions className="size-3.5" /> Subtitles
+          <Captions className="size-3.5" /> Subs
           {subtitles && subtitles.cues.length > 0 && (
             <span
               className="ml-0.5 rounded-full px-1.5 py-0.5 text-[9px] font-bold"
               style={{
-                backgroundColor: "rgba(124, 58, 237, 0.3)",
+                backgroundColor: "rgba(124, 58, 237, 0.35)",
                 color: "#ddd6fe",
               }}
             >
@@ -180,9 +193,23 @@ export function MediaPanelBase({
           )}
         </button>
         <div className="flex-1" />
-        <span className="text-[11px]" style={{ color: "#71717a" }}>
-          {segments.length} segment{segments.length === 1 ? "" : "s"}
-        </span>
+        {/* Project save / open (v4.2) */}
+        <button
+          type="button"
+          onClick={onSaveProject}
+          className="ff-btn-ghost flex items-center gap-1 rounded-md px-2 py-1.5 text-[11px] font-medium"
+          title="Save the full session (media + captions + headlines + settings) as a self-contained .framefuse.json"
+        >
+          <Save className="size-3.5" />
+        </button>
+        <button
+          type="button"
+          onClick={onOpenProject}
+          className="ff-btn-ghost flex items-center gap-1 rounded-md px-2 py-1.5 text-[11px] font-medium"
+          title="Open a saved .framefuse.json project"
+        >
+          <FolderOpen className="size-3.5" />
+        </button>
       </div>
 
       {/* Scrollable content area */}
@@ -197,17 +224,19 @@ export function MediaPanelBase({
               onDragLeave={() => setDragOver(false)}
               onDrop={handleDrop}
               onClick={openImagePicker}
-              className={cn(
-                "ff-grid-bg flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-12 text-center transition-colors",
-              )}
+              className="ff-grid-bg flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-12 text-center transition-all duration-200"
               style={{
                 borderColor: dragOver ? "#7c3aed" : "#3f3f46",
                 backgroundColor: dragOver ? "rgba(124, 58, 237, 0.1)" : "transparent",
+                boxShadow: dragOver ? "0 0 32px rgba(124, 58, 237, 0.25) inset" : "none",
               }}
             >
               <div
-                className="mb-3 flex size-12 items-center justify-center rounded-full"
-                style={{ backgroundColor: "#27272a" }}
+                className="mb-3 flex size-12 items-center justify-center rounded-full transition-transform duration-200"
+                style={{
+                  backgroundColor: dragOver ? "rgba(124, 58, 237, 0.25)" : "#27272a",
+                  transform: dragOver ? "scale(1.08)" : "scale(1)",
+                }}
               >
                 <Upload className="size-5" style={{ color: "#a1a1aa" }} />
               </div>
@@ -218,20 +247,15 @@ export function MediaPanelBase({
                 Drop images or click to browse
               </p>
               <p className="mt-1 text-[11px]" style={{ color: "#71717a" }}>
-                Filenames encode timing — see the guide below
+                Images · audio · .srt · .framefuse.json projects
               </p>
             </div>
             <button
               type="button"
               onClick={onLoadSamples}
-              className="mt-3 w-full rounded-lg border py-2 text-[12px] font-medium transition-colors"
-              style={{
-                borderColor: "#6d28d9",
-                backgroundColor: "rgba(76, 29, 149, 0.3)",
-                color: "#c4b5fd",
-              }}
+              className="ff-btn-sample mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg border py-2 text-[12px] font-medium transition-all duration-200"
             >
-              ✨ Load sample storyboard (9 beats)
+              <Sparkles className="size-3.5" /> Load sample storyboard (9 beats)
             </button>
           </div>
         )}
@@ -248,9 +272,7 @@ export function MediaPanelBase({
               onDragLeave={() => setDragOver(false)}
               onDrop={handleDrop}
               onClick={openImagePicker}
-              className={cn(
-                "mb-2 flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-dashed py-2 text-[11px] transition-colors",
-              )}
+              className="mb-2 flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-dashed py-2 text-[11px] transition-all duration-200"
               style={{
                 borderColor: dragOver ? "#7c3aed" : "#27272a",
                 color: dragOver ? "#c4b5fd" : "#71717a",
@@ -271,36 +293,41 @@ export function MediaPanelBase({
               return (
                 <div
                   key={seg.id}
-                  className="group flex items-center gap-2.5 rounded-lg border p-2 transition-colors"
+                  className="group relative flex items-center gap-2.5 overflow-hidden rounded-lg border p-2 transition-all duration-150 hover:-translate-y-px"
                   style={{
                     borderColor: "#27272a",
                     backgroundColor: "#18181b",
                   }}
                 >
+                  {/* Active-segment left accent (matches the timeline). */}
+                  <span
+                    className="absolute inset-y-0 left-0 w-[3px]"
+                    style={{
+                      backgroundColor: kindStyle.border,
+                      opacity: 0.65,
+                    }}
+                  />
                   {/* Thumbnail (48x48) */}
                   <div
-                    className="relative size-12 shrink-0 overflow-hidden rounded-md"
+                    className="relative size-12 shrink-0 overflow-hidden rounded-lg ring-1 ring-black/40"
                     style={{ backgroundColor: "#000000" }}
                   >
                     <img
                       src={seg.thumbnailUrl}
                       alt={seg.fileName}
-                      className="size-full object-cover"
+                      className="size-full object-cover transition-transform duration-200 group-hover:scale-105"
                       draggable={false}
                     />
                     <span
-                      className="absolute bottom-0 right-0 rounded-tl px-1 text-[9px] font-medium"
-                      style={{
-                        backgroundColor: "rgba(0, 0, 0, 0.7)",
-                        color: "#d4d4d8",
-                      }}
+                      className="absolute bottom-0 right-0 rounded-tl bg-black/75 px-1 text-[9px] font-semibold tabular-nums"
+                      style={{ color: "#e4e4e7" }}
                     >
                       {idx + 1}
                     </span>
                   </div>
 
                   {/* Info */}
-                  <div className="min-w-0 flex-1">
+                  <div className="ml-1 min-w-0 flex-1">
                     <div className="flex items-center gap-1.5">
                       <span
                         className="rounded border px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide"
@@ -325,7 +352,7 @@ export function MediaPanelBase({
                               if (e.key === "Enter") commitEdit();
                               if (e.key === "Escape") setEditingId(null);
                             }}
-                            className="w-14 rounded border px-1 py-0.5 text-[11px] outline-none"
+                            className="w-14 rounded border px-1 py-0.5 text-[11px] outline-none focus:border-violet-500"
                             style={{
                               borderColor: "#3f3f46",
                               backgroundColor: "#09090b",
@@ -338,14 +365,18 @@ export function MediaPanelBase({
                           <button
                             type="button"
                             onClick={commitEdit}
+                            className="rounded p-0.5 transition-colors hover:bg-white/10"
                             style={{ color: "#34d399" }}
+                            title="Apply duration"
                           >
                             <Check className="size-3.5" />
                           </button>
                           <button
                             type="button"
                             onClick={() => setEditingId(null)}
+                            className="rounded p-0.5 transition-colors hover:bg-white/10"
                             style={{ color: "#71717a" }}
+                            title="Cancel"
                           >
                             <X className="size-3.5" />
                           </button>
@@ -354,9 +385,7 @@ export function MediaPanelBase({
                         <button
                           type="button"
                           onClick={() => startEdit(seg)}
-                          className={cn(
-                            "flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-mono tabular-nums transition-colors",
-                          )}
+                          className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-mono tabular-nums transition-colors hover:bg-white/5"
                           style={{
                             backgroundColor: overridden
                               ? "rgba(120, 53, 15, 0.4)"
@@ -375,7 +404,7 @@ export function MediaPanelBase({
                         <button
                           type="button"
                           onClick={() => onClearOverride(seg.id)}
-                          className="text-[9px] transition-colors"
+                          className="text-[9px] transition-colors hover:underline"
                           style={{ color: "#f59e0b" }}
                           title="Reset to parsed duration"
                         >
@@ -384,17 +413,19 @@ export function MediaPanelBase({
                       )}
                     </div>
                     <div
-                      className="mt-0.5 truncate text-[11px]"
-                      style={{ color: "#a1a1aa" }}
+                      className="mt-0.5 truncate text-[11px] font-medium"
+                      style={{ color: "#d4d4d8" }}
                       title={seg.fileName}
                     >
                       {seg.fileName}
                     </div>
                     <div
                       className="mt-0.5 flex items-center gap-2 text-[9px]"
-                      style={{ color: "#52525b" }}
+                      style={{ color: "#71717a" }}
                     >
-                      <span>dur {(seg.durationMs / 1000).toFixed(1)}s</span>
+                      <span className="tabular-nums">
+                        dur {(seg.durationMs / 1000).toFixed(1)}s
+                      </span>
                       <span style={{ color: "#3f3f46" }}>·</span>
                       <span className="capitalize">{seg.direction}</span>
                     </div>
@@ -406,8 +437,8 @@ export function MediaPanelBase({
                       type="button"
                       onClick={() => onReorder(seg.id, -1)}
                       disabled={idx === 0}
-                      className="transition-colors disabled:opacity-30"
-                      style={{ color: "#52525b" }}
+                      className="rounded p-0.5 transition-colors hover:bg-white/10 disabled:opacity-30"
+                      style={{ color: "#71717a" }}
                       title="Move up"
                     >
                       <ArrowUp className="size-3.5" />
@@ -417,22 +448,33 @@ export function MediaPanelBase({
                       type="button"
                       onClick={() => onReorder(seg.id, 1)}
                       disabled={idx === segments.length - 1}
-                      className="transition-colors disabled:opacity-30"
-                      style={{ color: "#52525b" }}
+                      className="rounded p-0.5 transition-colors hover:bg-white/10 disabled:opacity-30"
+                      style={{ color: "#71717a" }}
                       title="Move down"
                     >
                       <ArrowDown className="size-3.5" />
                     </button>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => onRemove(seg.id)}
-                    className="shrink-0 rounded p-1 transition-colors"
-                    style={{ color: "#52525b" }}
-                    title="Remove"
-                  >
-                    <Trash2 className="size-3.5" />
-                  </button>
+                  <div className="flex shrink-0 flex-col items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => onDuplicate(seg.id)}
+                      className="rounded p-1 opacity-40 transition-all hover:bg-violet-500/15 hover:opacity-100 group-hover:opacity-100"
+                      style={{ color: "#c4b5fd" }}
+                      title="Duplicate segment"
+                    >
+                      <Copy className="size-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onRemove(seg.id)}
+                      className="rounded p-1 opacity-40 transition-all hover:bg-red-500/15 hover:text-red-400 group-hover:opacity-100"
+                      style={{ color: "#a1a1aa" }}
+                      title="Remove"
+                    >
+                      <Trash2 className="size-3.5" />
+                    </button>
+                  </div>
                 </div>
               );
             })}
@@ -440,27 +482,30 @@ export function MediaPanelBase({
             {/* Audio track chip */}
             {audioTrack && (
               <div
-                className="flex items-center gap-2.5 rounded-lg border p-2"
+                className="flex items-center gap-2.5 rounded-lg border p-2 transition-colors"
                 style={{
-                  borderColor: "#27272a",
+                  borderColor: "rgba(112, 26, 117, 0.45)",
                   backgroundColor: "#18181b",
                 }}
               >
                 <div
-                  className="flex size-10 shrink-0 items-center justify-center rounded-md"
-                  style={{ backgroundColor: "rgba(112, 26, 117, 0.4)" }}
+                  className="flex size-10 shrink-0 items-center justify-center rounded-lg"
+                  style={{
+                    backgroundColor: "rgba(112, 26, 117, 0.4)",
+                    boxShadow: "0 0 12px rgba(217, 70, 239, 0.15)",
+                  }}
                 >
                   <Music className="size-4" style={{ color: "#f0abfc" }} />
                 </div>
                 <div className="min-w-0 flex-1">
                   <div
-                    className="truncate text-[11px]"
+                    className="truncate text-[11px] font-medium"
                     style={{ color: "#d4d4d8" }}
                     title={audioTrack.fileName}
                   >
                     {audioTrack.fileName}
                   </div>
-                  <div className="text-[9px]" style={{ color: "#52525b" }}>
+                  <div className="text-[9px]" style={{ color: "#71717a" }}>
                     audio track
                     {audioTrack.durationMs
                       ? ` · ${fmtTimecode(audioTrack.durationMs)}`
@@ -470,8 +515,9 @@ export function MediaPanelBase({
                 <button
                   type="button"
                   onClick={onRemoveAudio}
-                  className="shrink-0 rounded p-1 transition-colors"
-                  style={{ color: "#52525b" }}
+                  className="shrink-0 rounded p-1 transition-colors hover:bg-red-500/15"
+                  style={{ color: "#71717a" }}
+                  title="Remove audio"
                 >
                   <Trash2 className="size-3.5" />
                 </button>
@@ -484,27 +530,30 @@ export function MediaPanelBase({
             {/* Subtitles chip */}
             {subtitles && subtitles.cues.length > 0 && (
               <div
-                className="flex items-center gap-2.5 rounded-lg border p-2"
+                className="flex items-center gap-2.5 rounded-lg border p-2 transition-colors"
                 style={{
-                  borderColor: "#27272a",
+                  borderColor: "rgba(76, 29, 149, 0.45)",
                   backgroundColor: "#18181b",
                 }}
               >
                 <div
-                  className="flex size-10 shrink-0 items-center justify-center rounded-md"
-                  style={{ backgroundColor: "rgba(76, 29, 149, 0.4)" }}
+                  className="flex size-10 shrink-0 items-center justify-center rounded-lg"
+                  style={{
+                    backgroundColor: "rgba(76, 29, 149, 0.4)",
+                    boxShadow: "0 0 12px rgba(124, 58, 237, 0.15)",
+                  }}
                 >
                   <Captions className="size-4" style={{ color: "#c4b5fd" }} />
                 </div>
                 <div className="min-w-0 flex-1">
                   <div
-                    className="truncate text-[11px]"
+                    className="truncate text-[11px] font-medium"
                     style={{ color: "#d4d4d8" }}
                     title={subtitles.fileName}
                   >
                     {subtitles.fileName}
                   </div>
-                  <div className="text-[9px]" style={{ color: "#52525b" }}>
+                  <div className="text-[9px]" style={{ color: "#71717a" }}>
                     subtitles · {subtitles.cues.length} cue
                     {subtitles.cues.length === 1 ? "" : "s"}
                     {subtitles.cues.length > 0
@@ -515,8 +564,8 @@ export function MediaPanelBase({
                 <button
                   type="button"
                   onClick={onRemoveSubtitles}
-                  className="shrink-0 rounded p-1 transition-colors"
-                  style={{ color: "#52525b" }}
+                  className="shrink-0 rounded p-1 transition-colors hover:bg-red-500/15"
+                  style={{ color: "#71717a" }}
                   title="Remove subtitles"
                 >
                   <Trash2 className="size-3.5" />
@@ -529,7 +578,7 @@ export function MediaPanelBase({
               <button
                 type="button"
                 onClick={openSubtitlePicker}
-                className="flex items-center gap-2 rounded-lg border border-dashed p-2 text-[11px] transition-colors"
+                className="flex w-full items-center gap-2 rounded-lg border border-dashed p-2 text-[11px] transition-all hover:border-violet-500/50 hover:bg-violet-500/5"
                 style={{
                   borderColor: "#27272a",
                   color: "#71717a",
@@ -631,7 +680,7 @@ function NamingGuide() {
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider transition-colors"
+        className="flex w-full items-center gap-1.5 text-[10px] font-semibold uppercase tracking-[0.12em] transition-colors hover:text-zinc-400"
         style={{ color: "#71717a" }}
       >
         {open ? (

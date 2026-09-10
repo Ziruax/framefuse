@@ -59,15 +59,20 @@ export function Header({
   return (
     <header
       className="no-select flex h-14 shrink-0 items-center gap-4 border-b px-5"
-      style={{ backgroundColor: "#0d0d0d", borderColor: "#27272a" }}
+      style={{
+        borderColor: "#27272a",
+        background:
+          "linear-gradient(180deg, #121215 0%, #0d0d0d 100%)",
+        boxShadow: "0 1px 0 rgba(255,255,255,0.03) inset, 0 8px 24px rgba(0,0,0,0.35)",
+      }}
     >
       {/* Brand */}
       <div className="flex items-center gap-3">
         <div
-          className="flex size-9 items-center justify-center rounded-lg shadow-lg"
+          className="flex size-9 items-center justify-center rounded-lg shadow-lg transition-transform duration-200 hover:scale-105"
           style={{
-            backgroundImage: "linear-gradient(135deg, #7c3aed 0%, #c026d3 100%)",
-            boxShadow: "0 4px 12px rgba(124, 58, 237, 0.3)",
+            backgroundImage: "linear-gradient(135deg, #8b5cf6 0%, #7c3aed 40%, #c026d3 100%)",
+            boxShadow: "0 4px 14px rgba(124, 58, 237, 0.4)",
           }}
         >
           <Film className="size-5" style={{ color: "#ffffff" }} />
@@ -82,9 +87,13 @@ export function Header({
             </span>
             <span
               className="rounded px-1.5 py-0.5 text-[10px] font-bold"
-              style={{ backgroundColor: "#27272a", color: "#c4b5fd" }}
+              style={{
+                background: "linear-gradient(135deg, rgba(124, 58, 237, 0.35), rgba(192, 38, 211, 0.3))",
+                border: "1px solid rgba(139, 92, 246, 0.35)",
+                color: "#ddd6fe",
+              }}
             >
-              v4
+              v4.2
             </span>
           </div>
           <div className="text-[11px]" style={{ color: "#71717a" }}>
@@ -228,22 +237,9 @@ export function Header({
           onClick={onExport}
           disabled={imageCount === 0}
           className={cn(
-            "flex items-center gap-2 rounded-md px-4 py-2 text-[13px] font-semibold shadow-lg transition-all",
-            imageCount === 0 && "cursor-not-allowed",
+            "ff-btn-primary flex items-center gap-2 rounded-md px-4 py-2 text-[13px] font-semibold transition-all",
+            imageCount === 0 && "cursor-not-allowed opacity-50 grayscale",
           )}
-          style={
-            imageCount === 0
-              ? {
-                  backgroundColor: "#27272a",
-                  color: "#52525b",
-                  boxShadow: "none",
-                }
-              : {
-                  backgroundColor: "#7c3aed",
-                  color: "#ffffff",
-                  boxShadow: "0 4px 12px rgba(124, 58, 237, 0.3)",
-                }
-          }
         >
           <Download className="size-4" />
           Export MP4

@@ -274,7 +274,7 @@ const ANIM = {
   POP_IN_MS: 220, SLIDE_UP_MS: 280, BOUNCE_IN_MS: 380, REVEAL_MS: 320,
   SHAKE_MS: 280, TYPEWRITER_MS_PER_CHAR: 45, SLAM_MS: 180, GLITCH_MS: 220,
   SPIN_IN_MS: 300, FLIP_IN_MS: 260, ELASTIC_MS: 450, ZOOM_WORDS_MS: 160,
-  SQUASH_MS: 340,
+  SQUASH_MS: 340, TRACKING_IN_MS: 300, BLUR_IN_MS: 260, HEARTBEAT_MS: 640,
 };
 
 const COLOR_CYCLE_PALETTE = ["#FDE047", "#22D3EE", "#F472B6", "#A3E635"];
@@ -489,6 +489,35 @@ function assAnimTags(animation, wordDurMs, ch, karaoke, wordIndex, highlightColo
       blocks.push(`{\\t(0,${ANIM.ZOOM_WORDS_MS},\\fscx100\\fscy100\\alpha&H00&)}`);
       break;
     }
+    case "tracking-in": {
+      if (karaoke) {
+        // \fsp would leak across the line's word layout — approximate with
+        // a tight pop (mirrors captionAnimations.ts).
+        blocks.push(`{\\fscx92\\fscy92\\alpha&HFF&}`);
+        blocks.push(`{\\t(0,${ANIM.TRACKING_IN_MS},\\fscx100\\fscy100\\alpha&H00&)}`);
+      } else {
+        const sp = Math.max(1, Math.round(8 * chScale));
+        blocks.push(`{\\fsp${sp}\\alpha&HE6&}`);
+        blocks.push(`{\\t(0,${ANIM.TRACKING_IN_MS},\\fsp0\\alpha&H00&)}`);
+      }
+      break;
+    }
+    case "blur-in": {
+      blocks.push(`{\\fscx118\\fscy118\\alpha&HFF&}`);
+      blocks.push(`{\\t(0,${Math.round(ANIM.BLUR_IN_MS * 0.7)},\\fscx104\\fscy104\\alpha&H00&)}`);
+      blocks.push(`{\\t(${Math.round(ANIM.BLUR_IN_MS * 0.7)},${ANIM.BLUR_IN_MS},\\fscx100\\fscy100)}`);
+      break;
+    }
+    case "heartbeat": {
+      const b1 = Math.round(ANIM.HEARTBEAT_MS * 0.28);
+      const rest = Math.round(ANIM.HEARTBEAT_MS * 0.5);
+      const b2 = Math.round(ANIM.HEARTBEAT_MS * 0.78);
+      blocks.push(`{\\t(0,${Math.round(b1 / 2)},\\fscx114\\fscy114)}`);
+      blocks.push(`{\\t(${Math.round(b1 / 2)},${b1},\\fscx100\\fscy100)}`);
+      blocks.push(`{\\t(${rest},${Math.round(rest + (b2 - rest) / 2)},\\fscx108\\fscy108)}`);
+      blocks.push(`{\\t(${Math.round(rest + (b2 - rest) / 2)},${b2},\\fscx100\\fscy100)}`);
+      break;
+    }
     default:
       return "";
   }
@@ -517,12 +546,134 @@ function escapeAssText(s) {
     .replace(/\n/g, "\\N");
 }
 
+// ---------------------------------------------------------------------------
+// HEADLINE PRESETS — mirror of src/lib/merger/headlinePresets.ts so the
+// exported ASS headline styles match the canvas preview exactly.
+// ---------------------------------------------------------------------------
+
+const HEADLINE_PRESETS = {
+  impact: {
+    ffmpegName: "Impact", fontSize: 0.085, fontWeight: 900, italic: false,
+    textColor: "#FFFFFF", accentColor: null, bgColor: null, bgAlpha: 1,
+    borderColor: "#000000", borderWidth: 6, shadow: true,
+    shadowColor: "#000000", shadowBlur: 12, textTransform: "uppercase",
+    letterSpacing: 2, positionY: 90, maxWidth: 0.86,
+  },
+  neon: {
+    ffmpegName: "Segoe UI", fontSize: 0.062, fontWeight: 800, italic: false,
+    textColor: "#67E8F9", accentColor: "#E879F9", bgColor: null, bgAlpha: 1,
+    borderColor: "#0E7490", borderWidth: 2, shadow: true,
+    shadowColor: "#D946EF", shadowBlur: 22, textTransform: "uppercase",
+    letterSpacing: 4, positionY: 100, maxWidth: 0.84,
+  },
+  sticker: {
+    ffmpegName: "Segoe UI", fontSize: 0.056, fontWeight: 900, italic: false,
+    textColor: "#1C1917", accentColor: "#F59E0B", bgColor: "#FBBF24", bgAlpha: 1,
+    borderColor: "#78350F", borderWidth: 3, shadow: true,
+    shadowColor: "#000000", shadowBlur: 10, textTransform: "uppercase",
+    letterSpacing: 1, positionY: 96, maxWidth: 0.8,
+  },
+  serif: {
+    ffmpegName: "Georgia", fontSize: 0.055, fontWeight: 400, italic: true,
+    textColor: "#F5F5F4", accentColor: null, bgColor: null, bgAlpha: 1,
+    borderColor: null, borderWidth: 0, shadow: true,
+    shadowColor: "#000000", shadowBlur: 8, textTransform: "none",
+    letterSpacing: 1, positionY: 110, maxWidth: 0.82,
+  },
+  banner: {
+    ffmpegName: "Segoe UI", fontSize: 0.05, fontWeight: 700, italic: false,
+    textColor: "#FFFFFF", accentColor: "#34D399", bgColor: "#0F0F12", bgAlpha: 0.72,
+    borderColor: null, borderWidth: 0, shadow: true,
+    shadowColor: "#000000", shadowBlur: 8, textTransform: "none",
+    letterSpacing: 2, positionY: 100, maxWidth: 0.86,
+  },
+};
+
+function getHeadlinePreset(id) {
+  return HEADLINE_PRESETS[id] || HEADLINE_PRESETS.impact;
+}
+
+/**
+ * Entrance tags for one headline item — mirror of headlineTransform() in
+ * native.ts so the burn-in matches the preview.
+ */
+function headlineAnimTags(animation, ch) {
+  const chScale = ch / 1080;
+  switch (animation) {
+    case "fade":
+      return `{\\fad(300,300)}`;
+    case "slide-up": {
+      const dy = Math.max(2, Math.round(34 * chScale));
+      return `{\\move(0,${dy},0,0,0,280)\\fad(180,0)}`;
+    }
+    case "pop":
+      return `{\\fscx60\\fscy60\\alpha&HFF&\\t(0,182,\\fscx112\\fscy112\\alpha&H00&)\\t(182,260,\\fscx100\\fscy100)}${""}\\fad(0,300)`;
+    case "zoom-punch":
+      return `{\\fscx200\\fscy200\\alpha&HFF&\\t(0,200,\\fscx100\\fscy100\\alpha&H00&)\\fad(0,300)}`;
+    default:
+      return `{\\fad(0,300)}`;
+  }
+}
+
+/**
+ * Build the Headline styles + Dialogue lines (clipped to the segment
+ * window, times relative to the window start). Returns
+ * { styleLines, eventLines } — the caller places the styles inside
+ * [V4+ Styles] and the events inside [Events]. Layer 1 so headlines
+ * render above caption lines.
+ */
+function buildHeadlineEvents(headlines, width, height, winStart, winEnd, clampDur) {
+  const styleLines = [];
+  const eventLines = [];
+  const hScale = height / 1080;
+
+  for (const item of headlines) {
+    if (!item || !item.text) continue;
+    if (item.endMs <= winStart || item.startMs >= winEnd) continue;
+    const relStart = Math.max(0, item.startMs - winStart);
+    const relEnd = Math.min(clampDur, item.endMs - winStart);
+    if (relEnd <= relStart) continue;
+
+    const p = getHeadlinePreset(item.presetId);
+    const sizeScale = item.sizeScale || 1;
+    const fontSize = Math.max(10, Math.round(p.fontSize * height * sizeScale));
+    const positionY = Math.round(p.positionY * hScale);
+    const bold = p.fontWeight >= 600 ? -1 : 0;
+    const italic = p.italic ? -1 : 0;
+    // Alignment: 8=top-center, 5=middle-center, 2=bottom-center.
+    const alignment = item.position === "top" ? 8 : item.position === "center" ? 5 : 2;
+    const borderStyle = p.bgColor ? 3 : 1;
+    const outline = p.bgColor ? 0 : Math.max(0, Math.round(p.borderWidth));
+    const shadowVal = p.shadow ? Math.max(1, Math.round(p.shadowBlur / 2)) : 0;
+    const backColour = p.bgColor
+      ? hexToAssColor(p.bgColor, p.bgAlpha)
+      : hexToAssColor(p.accentColor || p.shadowColor || "#000000", 0.55);
+    const marginLR = Math.round((width * (1 - p.maxWidth)) / 2);
+    const spacing = Math.round((p.letterSpacing || 0) * hScale * 10) / 10;
+
+    styleLines.push(
+      `Style: Headline,${p.ffmpegName},${fontSize},${hexToAssColor(p.textColor)},${hexToAssColor(p.textColor)},${hexToAssColor(p.borderColor || p.textColor)},${backColour},${bold},${italic},0,0,100,100,${spacing},0,${borderStyle},${outline},${shadowVal},${alignment},${marginLR},${marginLR},${positionY},1`,
+    );
+
+    let text = String(item.text);
+    if (p.textTransform === "uppercase") text = text.toUpperCase();
+    const tags = headlineAnimTags(item.animation, height);
+    eventLines.push(
+      `Dialogue: 1,${assFmtTime(relStart / 1000)},${assFmtTime(relEnd / 1000)},Headline,,0,0,0,,${tags}${escapeAssText(text)}`,
+    );
+  }
+  return { styleLines, eventLines, count: eventLines.length };
+}
+
 /**
  * Build the full ASS document for a set of cues on the master timeline,
  * with cue times SHIFTED to be relative to [segStartMs, segEndMs] and
  * clamped to [0, segDurMs]. When segStartMs/segEndMs are omitted the
  * cues are emitted with their absolute (master timeline) times — used
  * for the .ass sidecar export.
+ *
+ * Headlines (v4.2): when `headlines` is a non-empty array, a Headline
+ * style + one Dialogue per item are appended (Layer 1, above captions).
  *
  * Word modes:
  *   - "off": one Dialogue per cue (full text).
@@ -533,32 +684,33 @@ function escapeAssText(s) {
  *     [start, next word's start), shows words 0..i stacked with \N,
  *     previous words dim, active word highlighted + animated.
  */
-function buildAssDocument(cues, cs, width, height, segStartMs, segEndMs, segDurMs) {
-  if (!cs) return null;
+function buildAssDocument(cues, cs, headlines, width, height, segStartMs, segEndMs, segDurMs) {
+  const hasHeadlines = Array.isArray(headlines) && headlines.some((h) => h && h.text);
+  if (!cs && !hasHeadlines) return null;
 
-  const fontName = cs.fontName || "Arial";
-  const fontSize = Math.round((cs.fontSize || 0.05) * height * (cs.fontSizeScale || 1));
-  const textColor = cs.textColor || "#FFFFFF";
-  const highlightColor = cs.highlightColor || null;
-  const wordMode = cs.wordMode || "off";
-  const animation = cs.animation || "none";
+  const fontName = (cs && cs.fontName) || "Arial";
+  const fontSize = Math.round(((cs && cs.fontSize) || 0.05) * height * ((cs && cs.fontSizeScale) || 1));
+  const textColor = (cs && cs.textColor) || "#FFFFFF";
+  const highlightColor = (cs && cs.highlightColor) || null;
+  const wordMode = (cs && cs.wordMode) || "off";
+  const animation = (cs && cs.animation) || "none";
   const karaoke = wordMode === "word";
 
-  const position = cs.customPosition || cs.position || "bottom";
-  const marginV = cs.positionY != null ? cs.positionY : 50;
-  const fontWeight = cs.fontWeight || 600;
+  const position = (cs && (cs.customPosition || cs.position)) || "bottom";
+  const marginV = cs && cs.positionY != null ? cs.positionY : 50;
+  const fontWeight = (cs && cs.fontWeight) || 600;
   const bold = fontWeight >= 600 ? -1 : 0;
-  const italic = (cs.fontStyle || "normal") === "italic" ? -1 : 0;
-  const bgColor = cs.bgColor || null;
-  const bgAlpha = cs.bgAlpha != null ? cs.bgAlpha : 1;
-  const borderColor = cs.borderColor || "#000000";
-  const borderWidth = cs.borderWidth != null ? cs.borderWidth : 2;
-  const shadow = !!cs.shadow;
-  const shadowColor = cs.shadowColor || "#000000";
-  const shadowBlur = cs.shadowBlur != null ? cs.shadowBlur : 3;
-  const textTransform = cs.textTransform || "none";
-  const spacing = cs.letterSpacing || 0;
-  const alignment = cs.alignment || "center";
+  const italic = ((cs && cs.fontStyle) || "normal") === "italic" ? -1 : 0;
+  const bgColor = (cs && cs.bgColor) || null;
+  const bgAlpha = cs && cs.bgAlpha != null ? cs.bgAlpha : 1;
+  const borderColor = (cs && cs.borderColor) || "#000000";
+  const borderWidth = cs && cs.borderWidth != null ? cs.borderWidth : 2;
+  const shadow = !!(cs && cs.shadow);
+  const shadowColor = (cs && cs.shadowColor) || "#000000";
+  const shadowBlur = cs && cs.shadowBlur != null ? cs.shadowBlur : 3;
+  const textTransform = (cs && cs.textTransform) || "none";
+  const spacing = (cs && cs.letterSpacing) || 0;
+  const alignment = (cs && cs.alignment) || "center";
 
   // Alignment: 2=bottom-center, 5=middle-center, 8=top-center
   let assAlignment = position === "top" ? 8 : position === "center" ? 5 : 2;
@@ -592,17 +744,33 @@ function buildAssDocument(cues, cs, width, height, segStartMs, segEndMs, segDurM
   assLines.push("");
   assLines.push("[V4+ Styles]");
   assLines.push("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding");
-  assLines.push(`Style: Default,${fontName},${fontSize},${hexToAssColor(primary)},${hexToAssColor(secondary)},${hexToAssColor(borderColor)},${backColour},${bold},${italic},0,0,100,100,${spacing},0,${borderStyle},${outline},${shadowVal},${assAlignment},40,40,${marginV},1`);
-  assLines.push("");
-  assLines.push("[Events]");
-  assLines.push("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text");
 
   const useSegmentWindow = typeof segStartMs === "number" && typeof segDurMs === "number";
   const winStart = useSegmentWindow ? segStartMs : 0;
   const winEnd = useSegmentWindow ? segEndMs : Infinity;
   const clampDur = useSegmentWindow ? segDurMs : Infinity;
 
-  let emitted = 0;
+  // ── Headline overlay styles + events (v4.2, Layer 1) ──
+  const headline = hasHeadlines
+    ? buildHeadlineEvents(headlines, width, height, winStart, winEnd, clampDur)
+    : { styleLines: [], eventLines: [], count: 0 };
+
+  // [V4+ Styles] — Default (captions) + Headline styles.
+  if (cs) {
+    assLines.push(`Style: Default,${fontName},${fontSize},${hexToAssColor(primary)},${hexToAssColor(secondary)},${hexToAssColor(borderColor)},${backColour},${bold},${italic},0,0,100,100,${spacing},0,${borderStyle},${outline},${shadowVal},${assAlignment},40,40,${marginV},1`);
+  }
+  assLines.push(...headline.styleLines);
+  assLines.push("");
+  assLines.push("[Events]");
+  assLines.push("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text");
+  assLines.push(...headline.eventLines);
+
+  let emitted = headline.count;
+
+  if (!cs || !Array.isArray(cues) || cues.length === 0) {
+    return emitted > 0 ? assLines.join("\n") : null;
+  }
+
   for (const cue of cues) {
     if (cue.endMs <= winStart || cue.startMs >= winEnd) continue;
 
@@ -706,9 +874,10 @@ function buildAssDocument(cues, cs, width, height, segStartMs, segEndMs, segDurM
 // ---------------------------------------------------------------------------
 ipcMain.handle("export-ass-file", async (event, opts) => {
   try {
-    const { cues, captionSettings, width, height } = opts;
-    if (!cues || cues.length === 0) return null;
-    const doc = buildAssDocument(cues, captionSettings, width, height, null, null, null);
+    const { cues, captionSettings, headlines, width, height } = opts;
+    const hasHl = Array.isArray(headlines) && headlines.length > 0;
+    if ((!cues || cues.length === 0) && !hasHl) return null;
+    const doc = buildAssDocument(cues || [], captionSettings, headlines, width, height, null, null, null);
     if (!doc) return null;
 
     const res = await dialog.showSaveDialog(mainWindow, {
@@ -731,7 +900,7 @@ ipcMain.handle("export-ass-file", async (event, opts) => {
 // Step 2: Concat all clips + mux audio using -f concat -c copy (INSTANT)
 // ---------------------------------------------------------------------------
 ipcMain.handle("export-native", async (event, opts) => {
-  const { outputPath, fps, width, height, bitrateMbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues } = opts;
+  const { outputPath, fps, width, height, bitrateMbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines } = opts;
 
   if (!outputPath) throw new Error("No output path");
   if (!segments || segments.length === 0) throw new Error("No segments");
@@ -746,6 +915,7 @@ ipcMain.handle("export-native", async (event, opts) => {
   const globalDir = kenBurns?.direction || "in";
 
   const captionsEnabled = !!captionSettings?.enabled && subtitleCues && subtitleCues.length > 0;
+  const headlinesEnabled = Array.isArray(headlines) && headlines.some((h) => h && h.text && h.endMs > h.startMs);
   const totalMs = segments.reduce((sum, s) => Math.max(sum, s.endMs ?? (s.startMs ?? 0) + s.durationMs), 0) || segments.reduce((sum, s) => sum + s.durationMs, 0);
   const totalSec = totalMs / 1000;
   const encoder = detectGpuEncoder();
@@ -830,8 +1000,13 @@ ipcMain.handle("export-native", async (event, opts) => {
         `format=yuv420p`,
       ];
 
-      if (captionsEnabled) {
-        const doc = buildAssDocument(subtitleCues, captionSettings, width, height, segStartMs, segEndMs, seg.durationMs);
+      if (captionsEnabled || headlinesEnabled) {
+        const doc = buildAssDocument(
+          captionsEnabled ? subtitleCues : [],
+          captionsEnabled ? captionSettings : null,
+          headlinesEnabled ? headlines : null,
+          width, height, segStartMs, segEndMs, seg.durationMs,
+        );
         if (doc) {
           const assPath = path.join(tempDir, `captions_${String(i).padStart(4, "0")}_${Date.now()}.ass`);
           fs.writeFileSync(assPath, doc, "utf-8");
@@ -946,3 +1121,9 @@ app.whenReady().then(() => {
 });
 
 app.on("window-all-closed", () => { if (process.platform !== "darwin") app.quit(); });
+
+// Test hook — exposes the ASS builder to the dev verification harness.
+// Harmless in production: nothing requires the Electron main entry.
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { buildAssDocument, assAnimTags, buildHeadlineEvents };
+}

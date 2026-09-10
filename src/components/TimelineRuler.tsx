@@ -3,6 +3,7 @@
 import { useRef, useCallback, type PointerEvent as ReactPointerEvent } from "react";
 import type { MediaSegment, TimelineMode } from "@/lib/merger/types";
 import { fmtTimecode } from "@/lib/merger/timeline";
+import { cn } from "@/lib/utils";
 
 interface TimelineRulerProps {
   segments: MediaSegment[];
@@ -13,10 +14,22 @@ interface TimelineRulerProps {
   onSeek: (ms: number) => void;
 }
 
-const BAR_BG: Record<string, string> = {
-  absolute: "rgba(6, 182, 212, 0.7)",
-  beat: "rgba(16, 185, 129, 0.7)",
-  duration: "rgba(139, 92, 246, 0.7)",
+const BAR_BG: Record<string, { top: string; bottom: string; base: string }> = {
+  absolute: {
+    top: "rgba(34, 211, 238, 0.85)",
+    bottom: "rgba(8, 145, 178, 0.75)",
+    base: "rgba(6, 182, 212, 0.7)",
+  },
+  beat: {
+    top: "rgba(52, 211, 153, 0.85)",
+    bottom: "rgba(5, 150, 105, 0.75)",
+    base: "rgba(16, 185, 129, 0.7)",
+  },
+  duration: {
+    top: "rgba(167, 139, 250, 0.85)",
+    bottom: "rgba(109, 40, 217, 0.75)",
+    base: "rgba(139, 92, 246, 0.7)",
+  },
 };
 
 function niceStep(totalMs: number): number {
@@ -180,28 +193,31 @@ export function TimelineRuler({
             })}
           </div>
 
-          {/* Segment bars */}
+          {/* Segment bars — gradient tracks, active glows, beats pulse */}
           <div className="absolute bottom-1 left-0 right-0 top-5">
             {segments.map((seg, idx) => {
               const left = totalMs > 0 ? (seg.startMs / totalMs) * 100 : 0;
               const width =
                 totalMs > 0 ? (seg.durationMs / totalMs) * 100 : 0;
               const isActive = seg.id === activeId;
-              const bg = BAR_BG[seg.kind] || BAR_BG.duration;
+              const colors = BAR_BG[seg.kind] || BAR_BG.duration;
               return (
                 <div
                   key={seg.id}
-                  className="absolute top-0 flex items-center justify-center overflow-hidden rounded-sm border text-[8px] font-medium transition-all"
+                  className={cn(
+                    "absolute top-0 flex items-center justify-center overflow-hidden rounded-[3px] text-[8px] font-semibold tabular-nums transition-all duration-150",
+                    seg.kind === "beat" && !isActive && "ff-beat-pulse",
+                    isActive && "scale-[1.02]",
+                  )}
                   style={{
                     left: `${left}%`,
                     width: `${Math.max(0.5, width)}%`,
                     height: "70%",
-                    backgroundColor: bg,
-                    borderColor: isActive ? "#ffffff" : "transparent",
+                    backgroundImage: `linear-gradient(180deg, ${colors.top} 0%, ${colors.bottom} 100%)`,
                     boxShadow: isActive
-                      ? "0 0 0 1px rgba(255,255,255,0.6)"
-                      : "none",
-                    color: "rgba(0, 0, 0, 0.8)",
+                      ? "0 0 0 1.5px rgba(255,255,255,0.75), 0 0 14px rgba(255,255,255,0.25)"
+                      : "inset 0 -1px 0 rgba(0,0,0,0.25)",
+                    color: "rgba(9, 9, 11, 0.85)",
                   }}
                   title={`${seg.fileName} · ${fmtTimecode(seg.startMs)}–${fmtTimecode(seg.endMs)}`}
                 >
@@ -211,21 +227,25 @@ export function TimelineRuler({
             })}
           </div>
 
-          {/* Playhead (vertical white line) */}
+          {/* Playhead (violet line + glowing dot) */}
           <div
             className="pointer-events-none absolute top-0 z-10 h-full"
             style={{ left: `${playPct}%` }}
           >
             <div
-              className="absolute -left-1.5 top-0 size-3 rounded-full border-2 shadow"
+              className="absolute -left-1.5 top-0 size-3 rounded-full border-2"
               style={{
-                borderColor: "#a78bfa",
+                borderColor: "#ffffff",
                 backgroundColor: "#8b5cf6",
+                boxShadow: "0 0 10px rgba(139, 92, 246, 0.8)",
               }}
             />
             <div
               className="absolute left-0 top-0 h-full w-px"
-              style={{ backgroundColor: "#ffffff" }}
+              style={{
+                backgroundColor: "#c4b5fd",
+                boxShadow: "0 0 6px rgba(139, 92, 246, 0.6)",
+              }}
             />
           </div>
         </div>

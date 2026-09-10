@@ -1,8 +1,20 @@
-# FrameFuse v4.1
+# FrameFuse v4.2
 
 Native desktop **image → video** merger with **viral kinetic captions**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
 
 ## Highlights
+
+### 🪝 Title overlay track (new in v4.2)
+Big hook titles independent of captions — timed text items with 5 viral presets (**Bold Impact, Neon Hook, Sticker, Elegant Serif, Clean Banner**), top/center/bottom placement, 4 entrance animations (Fade / Slide / Pop / Zoom-Punch) and a live size control. Burned into the export with the same preview-parity guarantee as captions, and exported even when captions are off.
+
+### 💾 Project files (new in v4.2)
+**Save / open `.framefuse.json`** — one self-contained file carrying your images, audio, subtitle cues (with word timing), headline track, duration overrides and every setting. Drop it back onto the app (or use ⌂ Open project) to restore the exact session.
+
+### 🛠 Editor upgrades (new in v4.2)
+- **Duplicate segment** — one click, perfect for beat repetition
+- **3 new kinetic animations**: **Tracking-In** (letters slide together), **Blur-In** (focus pull), **Heartbeat** (double-beat pulse) — 24 total, all ASS-parity
+- Refreshed UI: gradient buttons, depth shadows, glowing playhead, pulsing beat tracks, hover-lift media cards
+- Hydration-safe settings persistence (React #418 fixed)
 
 ### 🎬 Captions that behave like their names
 42 presets across Viral / Kinetic / Social / YouTube / Streaming / Documentary / Corporate / News / Film — every viral preset ships with its signature behavior:
@@ -19,8 +31,8 @@ Native desktop **image → video** merger with **viral kinetic captions**, exact
 | **Word Stack** | Words build a growing centered tower |
 | **Rapid Zoom** | Fast-cut 1.6× → 1 machine-gun pacing |
 
-### ✨ 21 kinetic typography animations
-Pop-In · Slide-Up · Bounce-In · Scale-Pulse · Fade-Through · Typewriter · Reveal · Wave · Jitter · Shake · Drift · **Slam · Glitch · Spin-In · Flip-In · Elastic · Color-Cycle · Spotlight · Swing · Squash · Zoom-Words** — all rendered identically in the canvas preview and the burned-in ASS export (karaoke-safe tags included).
+### ✨ 24 kinetic typography animations
+Pop-In · Slide-Up · Bounce-In · Scale-Pulse · Fade-Through · Typewriter · Reveal · Wave · Jitter · Shake · Drift · **Slam · Glitch · Spin-In · Flip-In · Elastic · Color-Cycle · Spotlight · Swing · Squash · Zoom-Words · Tracking-In · Blur-In · Heartbeat** — all rendered identically in the canvas preview and the burned-in ASS export (karaoke-safe tags included).
 
 ### 🎙️ Whisper word-by-word timing
 Whisper-tiny runs **fully locally** (no API keys, ~75 MB download once, then offline) with `return_timestamps: "word"` **DTW alignment** — every word carries its exact spoken timestamp. Anti-repetition setting for long audio. Automatic sentence-aware cue grouping.
@@ -35,9 +47,10 @@ Whisper-tiny runs **fully locally** (no API keys, ~75 MB download once, then off
 
 ### 🎛️ Production tooling
 - **Ken Burns multi-select** — randomize between your 2+ favorite effects or fix one
+- **Headline overlay track** + **project save/open** (see above)
 - Settings persist across restarts
 - Keyboard shortcuts: `Space` play/pause, `←/→` ±1s, `Shift+←/→` segment step, `Home` restart
-- Drag & drop images, audio **and** `.srt` files
+- Drag & drop images, audio, `.srt` **and** `.framefuse.json` project files
 - Absolute / beat / duration filename timelines
 
 ## Install (Windows)
