@@ -209,35 +209,45 @@ export function planBeatSnap(
   segments: MinimalSegment[],
   beatMs: number[],
   minMs = 800,
+  /** v4.7 strength dial: boundaries land on every Nth beat (1=beat, 4=bar). */
+  stride = 1,
 ): Record<string, number> {
   const out: Record<string, number> = {};
   if (!segments.length || beatMs.length < 2) return out;
 
+  // v4.7: decimate to every Nth beat (strength dial). Keeps beat 0 so the
+  // first boundary still lands on the pulse. With too few beats at this
+  // stride, the grid-quantization path below still works on the stride grid.
+  const grid =
+    stride > 1 ? beatMs.filter((_, i) => i % stride === 0) : beatMs;
+  if (grid.length < 2) return out;
+
   const n = segments.length;
   const ibis: number[] = [];
-  for (let i = 1; i < beatMs.length; i++) {
-    const d = beatMs[i] - beatMs[i - 1];
-    if (d >= 250 && d <= 2000) ibis.push(d);
+  for (let i = 1; i < grid.length; i++) {
+    const d = grid[i] - grid[i - 1];
+    // Upper bound scales with stride — a 2-bar grid at 60 BPM is 8 s.
+    if (d >= 250 && d <= 2000 * Math.max(1, stride)) ibis.push(d);
   }
   if (!ibis.length) return out;
   const G = median(ibis);
   const minUnits = Math.max(1, Math.ceil(minMs / G));
 
-  if (beatMs.length - 1 >= n * minUnits) {
+  if (grid.length - 1 >= n * minUnits) {
     // ---- Tempo-tracking walk over the real beat list ----
     // Entry condition guarantees every segment can span ≥ minUnits beats,
     // so the uniform walk below never starves; the LAST segment absorbs
     // the remainder.
-    const beatsPerSeg = Math.max(minUnits, Math.round((beatMs.length - 1) / n));
+    const beatsPerSeg = Math.max(minUnits, Math.round((grid.length - 1) / n));
     let cursor = 0;
     for (let i = 0; i < n; i++) {
       const endBeat =
         i === n - 1
-          ? beatMs.length - 1
-          : Math.min(cursor + beatsPerSeg, beatMs.length - 1);
+          ? grid.length - 1
+          : Math.min(cursor + beatsPerSeg, grid.length - 1);
       if (endBeat <= cursor) break; // safety: ran out of beats
-      out[segments[i].id] = beatMs[endBeat] - beatMs[cursor];
-      if (endBeat >= beatMs.length - 1) break;
+      out[segments[i].id] = grid[endBeat] - grid[cursor];
+      if (endBeat >= grid.length - 1) break;
       cursor = endBeat;
     }
     return out;

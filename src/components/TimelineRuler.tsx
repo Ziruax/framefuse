@@ -1,7 +1,12 @@
 "use client";
 
-import { useRef, useCallback, type PointerEvent as ReactPointerEvent } from "react";
-import { Type } from "lucide-react";
+import {
+  useRef,
+  useCallback,
+  useEffect,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
+import { Type, AudioLines } from "lucide-react";
 import type {
   HeadlineItem,
   MediaSegment,
@@ -10,6 +15,7 @@ import type {
 } from "@/lib/merger/types";
 import { boundaryStyle } from "@/lib/merger/types";
 import { fmtTimecode } from "@/lib/merger/timeline";
+import type { WaveformData } from "@/lib/merger/waveform";
 import { cn } from "@/lib/utils";
 
 interface TimelineRulerProps {
@@ -24,24 +30,25 @@ interface TimelineRulerProps {
   transition: TransitionSettings;
   /** Detected beat times (v4.6) → cyan tick rail + live pulse. */
   beats: number[] | null;
+  /** Audio waveform (v4.7) → mirrored peak strip between ruler and bars. */
+  waveform: WaveformData | null;
   onSeek: (ms: number) => void;
 }
 
-const BAR_BG: Record<string, { top: string; bottom: string; base: string }> = {
+// v4.7: desaturated bar gradients (VLM feedback — the neon green fatigued;
+// bright color is now reserved for playhead + active segment).
+const BAR_BG: Record<string, { top: string; bottom: string }> = {
   absolute: {
-    top: "rgba(34, 211, 238, 0.85)",
-    bottom: "rgba(8, 145, 178, 0.75)",
-    base: "rgba(6, 182, 212, 0.7)",
+    top: "rgba(34, 211, 238, 0.62)",
+    bottom: "rgba(8, 145, 178, 0.55)",
   },
   beat: {
-    top: "rgba(52, 211, 153, 0.85)",
-    bottom: "rgba(5, 150, 105, 0.75)",
-    base: "rgba(16, 185, 129, 0.7)",
+    top: "rgba(16, 185, 129, 0.58)",
+    bottom: "rgba(6, 95, 70, 0.52)",
   },
   duration: {
-    top: "rgba(167, 139, 250, 0.85)",
-    bottom: "rgba(109, 40, 217, 0.75)",
-    base: "rgba(139, 92, 246, 0.7)",
+    top: "rgba(139, 92, 246, 0.58)",
+    bottom: "rgba(91, 33, 182, 0.52)",
   },
 };
 
@@ -54,6 +61,143 @@ function niceStep(totalMs: number): number {
   return 600 * 1000;
 }
 
+/** Legend dot — v4.7: larger + ringed so colors read on any background. */
+function LegendDot({ color, gradient }: { color?: string; gradient?: string }) {
+  return (
+    <span
+      className="size-2.5 shrink-0 rounded-[3px] ring-1 ring-inset"
+      style={{
+        backgroundColor: color,
+        backgroundImage: gradient,
+        // @ts-expect-error CSS custom prop for the ring tint
+        "--tw-ring-color": "rgba(255,255,255,0.18)",
+        boxShadow: "0 1px 2px rgba(0,0,0,0.5)",
+      }}
+    />
+  );
+}
+
+/**
+ * Waveform strip (v4.7) — canvas-rendered mirrored peaks.
+ * Static pass (dim bars) is cached in an offscreen canvas keyed by
+ * waveform+width; per-frame work is one blit + bright bars up to the
+ * playhead — safe to redraw at 30–60 fps during playback.
+ */
+function WaveformStrip({
+  data,
+  totalMs,
+  currentMs,
+}: {
+  data: WaveformData;
+  totalMs: number;
+  currentMs: number;
+}) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const cacheRef = useRef<{ key: string; off: HTMLCanvasElement | null }>({
+    key: "",
+    off: null,
+  });
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const parent = canvas.parentElement;
+    if (!parent) return;
+
+    const draw = () => {
+      const cssW = parent.clientWidth;
+      const cssH = parent.clientHeight;
+      if (cssW <= 0 || cssH <= 0) return;
+      const dpr = Math.min(2, window.devicePixelRatio || 1);
+      canvas.width = Math.round(cssW * dpr);
+      canvas.height = Math.round(cssH * dpr);
+      canvas.style.width = `${cssW}px`;
+      canvas.style.height = `${cssH}px`;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      // Clear first — drawImage composites, so without this the dim blit
+      // would accumulate alpha over previous frames and bars could never
+      // dim back down after a seek.
+      ctx.clearRect(0, 0, cssW, cssH);
+
+      // Audio occupies this fraction of track width (audio may be shorter
+      // or longer than the timeline; clamped, tail truncated).
+      const frac = totalMs > 0 ? Math.min(1, data.durationMs / totalMs) : 1;
+      const waveW = Math.max(8, cssW * frac);
+      const mid = cssH / 2;
+      const maxBar = cssH / 2 - 1;
+
+      // Static pass → offscreen cache (peaks don't change with the playhead).
+      // Key includes the decode id — two tracks with identical bucket count
+      // and duration must never share a stale bitmap.
+      const key = `${data.id}:${waveW.toFixed(1)}:${cssH}:${dpr}`;
+      let off = cacheRef.current.key === key ? cacheRef.current.off : null;
+      if (!off) {
+        off = document.createElement("canvas");
+        off.width = canvas.width;
+        off.height = canvas.height;
+        const octx = off.getContext("2d");
+        if (octx) {
+          octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          // Full-brightness bars — the blit below applies the dim alpha.
+          octx.fillStyle = "#67e8f9";
+          const n = data.peaks.length;
+          const barW = waveW / n;
+          for (let i = 0; i < n; i++) {
+            const h = Math.max(1, data.peaks[i] * maxBar);
+            const x = i * barW;
+            octx.fillRect(x, mid - h, Math.max(0.8, barW - 0.5), h * 2);
+          }
+        }
+        cacheRef.current = { key, off };
+      }
+
+      // Blit the dim pass with a unipolar alpha tint.
+      ctx.globalAlpha = 0.42;
+      ctx.drawImage(off, 0, 0, cssW, cssH);
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = "rgba(103, 232, 249, 0.55)";
+
+      // Bright pass: bars up to the playhead. Progress is AUDIO-relative
+      // (wave maps 0..durationMs → 0..waveW); when the video outlives the
+      // audio the whole wave ends up bright, when audio outlives the
+      // timeline the tail stays dim.
+      const audioProg =
+        data.durationMs > 0
+          ? Math.max(0, Math.min(1, currentMs / data.durationMs))
+          : 0;
+      const n = data.peaks.length;
+      const barW = waveW / n;
+      const cutoffIdx = Math.floor(audioProg * n);
+      for (let i = 0; i < cutoffIdx; i++) {
+        const h = Math.max(1, data.peaks[i] * maxBar);
+        const x = i * barW;
+        ctx.fillRect(x, mid - h, Math.max(0.8, barW - 0.5), h * 2);
+      }
+
+      // Hairline baseline.
+      ctx.globalAlpha = 0.25;
+      ctx.fillRect(0, mid - 0.5, waveW, 1);
+      ctx.globalAlpha = 1;
+    };
+
+    draw();
+    const ro = new ResizeObserver(draw);
+    ro.observe(parent);
+    return () => ro.disconnect();
+  }, [data, totalMs, currentMs]);
+
+  return (
+    <div
+      className="pointer-events-none absolute left-1.5 right-1.5 top-[16px] h-[26px]"
+      title="Audio waveform — bright bars show playback progress"
+    >
+      <canvas ref={canvasRef} className="block size-full" />
+    </div>
+  );
+}
+
 export function TimelineRuler({
   segments,
   totalMs,
@@ -63,6 +207,7 @@ export function TimelineRuler({
   headlines,
   transition,
   beats,
+  waveform,
   onSeek,
 }: TimelineRulerProps) {
   const trackRef = useRef<HTMLDivElement>(null);
@@ -116,10 +261,15 @@ export function TimelineRuler({
     let bestMs = 0;
     for (const b of beats) {
       const d = Math.abs(b - currentMs);
-      if (d < best) { best = d; bestMs = b; }
+      if (d < best) {
+        best = d;
+        bestMs = b;
+      }
     }
     return best <= 140 ? bestMs : null;
   })();
+
+  const hasWave = !!waveform && totalMs > 0;
 
   return (
     <div
@@ -127,15 +277,13 @@ export function TimelineRuler({
       style={{
         borderColor: "#27272a",
         backgroundColor: "#111113",
-        height: "120px",
+        height: hasWave ? "140px" : "120px",
+        transition: "height 200ms ease",
       }}
     >
       {/* Header row */}
       <div className="mb-2 flex items-center justify-between">
-        <div
-          className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-wider"
-          style={{ color: "#71717a" }}
-        >
+        <div className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
           Timeline
           {mode && (
             <span
@@ -156,59 +304,35 @@ export function TimelineRuler({
             </span>
           )}
         </div>
-        <div
-          className="flex items-center gap-3 text-[9px]"
-          style={{ color: "#52525b" }}
-        >
+        <div className="flex items-center gap-3 text-[9px] text-zinc-500">
           <span className="flex items-center gap-1">
-            <span
-              className="size-2 rounded-sm"
-              style={{ backgroundColor: "#06b6d4" }}
-            />{" "}
-            absolute
+            <LegendDot color="#06b6d4" /> absolute
           </span>
           <span className="flex items-center gap-1">
-            <span
-              className="size-2 rounded-sm"
-              style={{ backgroundColor: "#10b981" }}
-            />{" "}
-            beat
+            <LegendDot color="#10b981" /> beat
           </span>
           <span className="flex items-center gap-1">
-            <span
-              className="size-2 rounded-sm"
-              style={{ backgroundColor: "#8b5cf6" }}
-            />{" "}
-            duration
+            <LegendDot color="#8b5cf6" /> duration
           </span>
           {txActive && (
             <span className="flex items-center gap-1">
-              <span
-                className="size-2 rounded-sm"
-                style={{
-                  backgroundImage:
-                    "linear-gradient(135deg, #8b5cf6, #d946ef)",
-                }}
-              />{" "}
+              <LegendDot gradient="linear-gradient(135deg, #8b5cf6, #d946ef)" />{" "}
               transition
             </span>
           )}
           {headlines.length > 0 && (
             <span className="flex items-center gap-1">
-              <span
-                className="size-2 rounded-sm"
-                style={{ backgroundColor: "#fbbf24" }}
-              />{" "}
-              title
+              <LegendDot color="#fbbf24" /> title
             </span>
           )}
           {beats && beats.length > 0 && (
             <span className="flex items-center gap-1">
-              <span
-                className="size-2 rounded-sm"
-                style={{ backgroundColor: "#22d3ee" }}
-              />{" "}
-              beats
+              <LegendDot color="#22d3ee" /> beats
+            </span>
+          )}
+          {hasWave && (
+            <span className="flex items-center gap-1">
+              <AudioLines className="size-2.5 text-cyan-300" /> audio
             </span>
           )}
         </div>
@@ -217,10 +341,7 @@ export function TimelineRuler({
       {segments.length === 0 ? (
         <div
           className="flex h-14 items-center justify-center rounded-lg border border-dashed text-[11px]"
-          style={{
-            borderColor: "#27272a",
-            color: "#52525b",
-          }}
+          style={{ borderColor: "#27272a", color: "#52525b" }}
         >
           Timeline appears once images are added
         </div>
@@ -231,10 +352,14 @@ export function TimelineRuler({
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerUp}
-          className="relative h-16 w-full cursor-pointer touch-none select-none rounded-lg border"
+          className={cn(
+            "relative w-full cursor-pointer touch-none select-none rounded-lg border",
+            hasWave ? "h-[92px]" : "h-16",
+          )}
           style={{
             borderColor: "#27272a",
             backgroundColor: "rgba(9, 9, 11, 0.6)",
+            transition: "height 200ms ease",
           }}
         >
           {/* Ticks */}
@@ -247,10 +372,13 @@ export function TimelineRuler({
                   className="absolute top-0 h-full"
                   style={{ left: `${left}%` }}
                 >
-                  <div className="h-2 w-px" style={{ backgroundColor: "#3f3f46" }} />
+                  <div
+                    className="h-2 w-px"
+                    style={{ backgroundColor: "#3f3f46" }}
+                  />
                   <span
                     className="mt-0.5 block -translate-x-1/2 text-[8px] tabular-nums"
-                    style={{ color: "#52525b" }}
+                    style={{ color: "#71717a" }}
                   >
                     {fmtTimecode(t)}
                   </span>
@@ -259,8 +387,24 @@ export function TimelineRuler({
             })}
           </div>
 
+          {/* Waveform strip (v4.7) — sits between the ruler numbers and the
+              segment bars; bright cyan bars mark playback progress. */}
+          {hasWave && waveform && (
+            <WaveformStrip
+              data={waveform}
+              totalMs={totalMs}
+              currentMs={currentMs}
+            />
+          )}
+
           {/* Segment bars — gradient tracks, active glows, beats pulse */}
-          <div className="absolute bottom-1 left-0 right-0 top-5">
+          <div
+            className={cn(
+              "absolute bottom-1 left-0 right-0",
+              hasWave ? "top-[46px]" : "top-5",
+            )}
+            style={{ transition: "top 200ms ease" }}
+          >
             {segments.map((seg, idx) => {
               const left = totalMs > 0 ? (seg.startMs / totalMs) * 100 : 0;
               const width =
@@ -281,9 +425,9 @@ export function TimelineRuler({
                     height: "70%",
                     backgroundImage: `linear-gradient(180deg, ${colors.top} 0%, ${colors.bottom} 100%)`,
                     boxShadow: isActive
-                      ? "0 0 0 1.5px rgba(255,255,255,0.75), 0 0 14px rgba(255,255,255,0.25)"
-                      : "inset 0 -1px 0 rgba(0,0,0,0.25)",
-                    color: "rgba(9, 9, 11, 0.92)",
+                      ? "0 0 0 1.5px rgba(255,255,255,0.75), 0 0 14px rgba(255,255,255,0.3)"
+                      : "inset 0 -1px 0 rgba(0,0,0,0.3)",
+                    color: "rgba(24, 24, 27, 0.95)",
                   }}
                   title={`${seg.fileName} · ${fmtTimecode(seg.startMs)}–${fmtTimecode(seg.endMs)}`}
                 >
@@ -297,50 +441,56 @@ export function TimelineRuler({
                 v4.5: per-boundary overrides tint AMBER + show the boundary's
                 own style; only boundaries with an effective style ≠ none
                 are drawn. */}
-            {txActive || txOverridesActive ?
-              segments.map((seg, idx) => {
-                if (idx === 0) return null;
-                const effStyle = boundaryStyle(transition, seg.id);
-                if (effStyle === "none") return null;
-                const pinned =
-                  !!transition.overrides &&
-                  Object.prototype.hasOwnProperty.call(transition.overrides, seg.id);
-                const durMs = Math.min(
-                  transition.durationMs,
-                  Math.floor(seg.durationMs * 0.45),
-                );
-                if (durMs <= 0 || seg.durationMs <= 200) return null;
-                const left = totalMs > 0 ? (seg.startMs / totalMs) * 100 : 0;
-                const width = totalMs > 0 ? (durMs / totalMs) * 100 : 0;
-                const inPlay =
-                  currentMs >= seg.startMs && currentMs < seg.startMs + durMs;
-                return (
-                  <div
-                    key={`tx-${seg.id}`}
-                    className={cn(
-                      "absolute bottom-0 rounded-[2px] transition-all duration-200",
-                      inPlay && "ff-tx-zone-live",
-                    )}
-                    style={{
-                      left: `${left}%`,
-                      width: `${Math.max(0.4, width)}%`,
-                      height: "30%",
-                      backgroundImage: pinned
-                        ? "repeating-linear-gradient(135deg, rgba(251, 191, 36, 0.6) 0 3px, rgba(245, 158, 11, 0.28) 3px 6px)"
-                        : "repeating-linear-gradient(135deg, rgba(217, 70, 239, 0.55) 0 3px, rgba(139, 92, 246, 0.25) 3px 6px)",
-                      boxShadow: inPlay
-                        ? pinned
-                          ? "0 0 8px rgba(251, 191, 36, 0.55)"
-                          : "0 0 8px rgba(217, 70, 239, 0.55)"
-                        : "none",
-                      border: pinned
-                        ? "1px solid rgba(251, 191, 36, 0.4)"
-                        : "1px solid rgba(217, 70, 239, 0.35)",
-                    }}
-                    title={`${effStyle}${pinned ? " (custom)" : ""} transition · ${fmtTimecode(seg.startMs)}+${(durMs / 1000).toFixed(1)}s`}
-                  />
-                );
-              }) : null}
+            {txActive || txOverridesActive
+              ? segments.map((seg, idx) => {
+                  if (idx === 0) return null;
+                  const effStyle = boundaryStyle(transition, seg.id);
+                  if (effStyle === "none") return null;
+                  const pinned =
+                    !!transition.overrides &&
+                    Object.prototype.hasOwnProperty.call(
+                      transition.overrides,
+                      seg.id,
+                    );
+                  const durMs = Math.min(
+                    transition.durationMs,
+                    Math.floor(seg.durationMs * 0.45),
+                  );
+                  if (durMs <= 0 || seg.durationMs <= 200) return null;
+                  const left =
+                    totalMs > 0 ? (seg.startMs / totalMs) * 100 : 0;
+                  const width = totalMs > 0 ? (durMs / totalMs) * 100 : 0;
+                  const inPlay =
+                    currentMs >= seg.startMs &&
+                    currentMs < seg.startMs + durMs;
+                  return (
+                    <div
+                      key={`tx-${seg.id}`}
+                      className={cn(
+                        "absolute bottom-0 rounded-[2px] transition-all duration-200",
+                        inPlay && "ff-tx-zone-live",
+                      )}
+                      style={{
+                        left: `${left}%`,
+                        width: `${Math.max(0.4, width)}%`,
+                        height: "30%",
+                        backgroundImage: pinned
+                          ? "repeating-linear-gradient(135deg, rgba(251, 191, 36, 0.6) 0 3px, rgba(245, 158, 11, 0.28) 3px 6px)"
+                          : "repeating-linear-gradient(135deg, rgba(217, 70, 239, 0.55) 0 3px, rgba(139, 92, 246, 0.25) 3px 6px)",
+                        boxShadow: inPlay
+                          ? pinned
+                            ? "0 0 8px rgba(251, 191, 36, 0.55)"
+                            : "0 0 8px rgba(217, 70, 239, 0.55)"
+                          : "none",
+                        border: pinned
+                          ? "1px solid rgba(251, 191, 36, 0.4)"
+                          : "1px solid rgba(217, 70, 239, 0.35)",
+                      }}
+                      title={`${effStyle}${pinned ? " (custom)" : ""} transition · ${fmtTimecode(seg.startMs)}+${(durMs / 1000).toFixed(1)}s`}
+                    />
+                  );
+                })
+              : null}
           </div>
 
           {/* Headline marker chips (v4.3) — amber bars on the top edge,
@@ -376,7 +526,7 @@ export function TimelineRuler({
                     ? "0 0 8px rgba(251, 191, 36, 0.7)"
                     : "0 1px 2px rgba(0,0,0,0.4)",
                 }}
-                title={`Title: “${h.text}” · ${fmtTimecode(h.startMs)}–${fmtTimecode(h.endMs)} (click to jump)`}
+                title={`Title: "${h.text}" · ${fmtTimecode(h.startMs)}–${fmtTimecode(h.endMs)} (click to jump)`}
               >
                 {width > 5 ? (
                   <span className="pointer-events-none flex items-center gap-0.5 truncate">
@@ -397,7 +547,8 @@ export function TimelineRuler({
               {beats.map((b, i) => {
                 if (b > totalMs) return null;
                 const left = (b / totalMs) * 100;
-                const live = beatNearest != null && Math.abs(b - beatNearest) < 1;
+                const live =
+                  beatNearest != null && Math.abs(b - beatNearest) < 1;
                 return (
                   <div
                     key={`beat-${i}`}
@@ -408,8 +559,12 @@ export function TimelineRuler({
                     style={{
                       left: `${left}%`,
                       height: live ? "6px" : "4px",
-                      backgroundColor: live ? "#67e8f9" : "rgba(34, 211, 238, 0.55)",
-                      boxShadow: live ? "0 0 6px rgba(103, 232, 249, 0.9)" : "none",
+                      backgroundColor: live
+                        ? "#67e8f9"
+                        : "rgba(34, 211, 238, 0.55)",
+                      boxShadow: live
+                        ? "0 0 6px rgba(103, 232, 249, 0.9)"
+                        : "none",
                     }}
                   />
                 );
@@ -417,7 +572,8 @@ export function TimelineRuler({
             </div>
           )}
 
-          {/* Playhead (violet line + glowing dot + grab cap) */}
+          {/* Playhead (violet line + glowing dot + grab cap) — v4.7: dark
+              drop shadow keeps it readable over bars and waveform. */}
           <div
             className="pointer-events-none absolute top-0 z-10 h-full"
             style={{ left: `${playPct}%` }}
@@ -427,7 +583,8 @@ export function TimelineRuler({
             <div
               className="absolute -left-2 -top-[4px] h-[5px] w-4 rounded-full"
               style={{
-                backgroundImage: "linear-gradient(90deg, #8b5cf6, #d946ef, #8b5cf6)",
+                backgroundImage:
+                  "linear-gradient(90deg, #8b5cf6, #d946ef, #8b5cf6)",
                 boxShadow: "0 0 8px rgba(217, 70, 239, 0.75)",
               }}
             />
@@ -436,14 +593,16 @@ export function TimelineRuler({
               style={{
                 borderColor: "#ffffff",
                 backgroundColor: "#8b5cf6",
-                boxShadow: "0 0 10px rgba(139, 92, 246, 0.8)",
+                boxShadow:
+                  "0 0 10px rgba(139, 92, 246, 0.8), 0 1px 3px rgba(0,0,0,0.6)",
               }}
             />
             <div
               className="absolute left-0 top-0 h-full w-px"
               style={{
                 backgroundColor: "#c4b5fd",
-                boxShadow: "0 0 6px rgba(139, 92, 246, 0.6)",
+                boxShadow:
+                  "0 0 6px rgba(139, 92, 246, 0.6), 1px 0 3px rgba(0,0,0,0.65), -1px 0 3px rgba(0,0,0,0.65)",
               }}
             />
           </div>

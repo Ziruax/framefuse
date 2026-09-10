@@ -85,6 +85,9 @@ interface MediaPanelProps {
   onDetectBeats: () => void;
   onSnapToBeats: () => void;
   onFitToAudio: () => void;
+  /** v4.7 strength dial: boundaries land on every Nth beat (1/2/4/8). */
+  beatStride: number;
+  onBeatStrideChange: (n: number) => void;
 }
 
 const KIND_STYLES: Record<
@@ -137,6 +140,8 @@ export function MediaPanelBase({
   onDetectBeats,
   onSnapToBeats,
   onFitToAudio,
+  beatStride,
+  onBeatStrideChange,
 }: MediaPanelProps) {
   const [dragOver, setDragOver] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -808,7 +813,66 @@ export function MediaPanelBase({
                 </div>
 
                 {mode !== "absolute" ? (
-                  <div className="mt-2 grid grid-cols-3 gap-1.5">
+                  <>
+                    {/* v4.7 strength dial — how often cuts land: every beat,
+                        every 2nd, a bar, or two bars. Applies to Snap cuts. */}
+                    {beatInfo && beatInfo.beatMs.length >= 2 && (
+                      <div className="mt-2 flex items-center gap-1.5">
+                        <span
+                          className="text-[9px] font-medium"
+                          style={{ color: "#67e8f9" }}
+                          title="How frequently cuts land — a bar assumes 4/4 time"
+                        >
+                          Cut every
+                        </span>
+                        <div
+                          className="flex flex-1 items-center rounded-md border p-0.5"
+                          style={{
+                            borderColor: "rgba(34, 211, 238, 0.25)",
+                            backgroundColor: "rgba(9, 9, 11, 0.5)",
+                          }}
+                          role="radiogroup"
+                          aria-label="Beat snap strength"
+                        >
+                          {[
+                            { v: 1, label: "Beat", title: "Every beat — fastest cuts" },
+                            { v: 2, label: "2", title: "Every 2nd beat — half-time" },
+                            { v: 4, label: "Bar", title: "Every 4th beat — one bar (4/4)" },
+                            { v: 8, label: "2 bars", title: "Every 8th beat — two bars (4/4)" },
+                          ].map((opt) => {
+                            const active = beatStride === opt.v;
+                            return (
+                              <button
+                                key={opt.v}
+                                type="button"
+                                role="radio"
+                                aria-checked={active}
+                                title={opt.title}
+                                onClick={() => onBeatStrideChange(opt.v)}
+                                className={cn(
+                                  "flex-1 rounded px-1 py-1 text-[9px] font-semibold tabular-nums transition-all",
+                                  active
+                                    ? "hover:brightness-110"
+                                    : "text-zinc-500 hover:text-zinc-300",
+                                )}
+                                style={
+                                  active
+                                    ? {
+                                        backgroundColor: "rgba(34, 211, 238, 0.2)",
+                                        color: "#a5f3fc",
+                                        boxShadow: "inset 0 0 0 1px rgba(34, 211, 238, 0.35)",
+                                      }
+                                    : undefined
+                                }
+                              >
+                                {opt.label}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                    <div className="mt-2 grid grid-cols-3 gap-1.5">
                     <button
                       type="button"
                       onClick={onDetectBeats}
@@ -867,7 +931,8 @@ export function MediaPanelBase({
                     >
                       <Timer className="size-3" /> Fit audio
                     </button>
-                  </div>
+                    </div>
+                  </>
                 ) : (
                   <div
                     className="mt-2 flex items-center gap-1.5 rounded-md px-2 py-1.5 text-[9px]"

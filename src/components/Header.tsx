@@ -109,14 +109,14 @@ export function Header({
               FrameFuse
             </span>
             <span
-              className="rounded px-1.5 py-0.5 text-[10px] font-bold"
+              className="whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-bold"
               style={{
                 background: "linear-gradient(135deg, rgba(124, 58, 237, 0.35), rgba(192, 38, 211, 0.3))",
                 border: "1px solid rgba(139, 92, 246, 0.35)",
                 color: "#ddd6fe",
               }}
             >
-              v4.6
+              v4.7
             </span>
           </div>
           <div className="text-[11px]" style={{ color: "#71717a" }}>
@@ -313,6 +313,7 @@ export function Header({
           disabled={imageCount === 0}
           className={cn(
             "ff-btn-primary flex items-center gap-2 rounded-md px-4 py-2 text-[13px] font-semibold transition-all",
+            "active:scale-[0.97] active:brightness-90",
             imageCount === 0 && "cursor-not-allowed opacity-50 grayscale",
           )}
         >

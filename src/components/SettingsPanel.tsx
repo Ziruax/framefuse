@@ -24,6 +24,7 @@ import {
   Upload,
   Search,
   X,
+  Star,
 } from "lucide-react";
 import type {
   AudioSettings,
@@ -116,6 +117,9 @@ interface SettingsPanelProps {
   onCaptionSettingsChange: (cs: CaptionSettings) => void;
   /** Applies a preset's signature behavior (wordMode + animation + font). */
   onApplyPreset: (presetId: string) => void;
+  /** v4.7: starred preset ids (Favorites group + filter). */
+  favoritePresets: string[];
+  onToggleFavorite: (presetId: string) => void;
   onExportSrt: () => void;
   onExportAss: () => void;
   inElectron: boolean;
@@ -266,10 +270,10 @@ function Toggle({
         aria-label={label}
         onClick={() => onChange(!checked)}
         className={cn(
-          "relative h-5 w-9 shrink-0 rounded-full transition-all duration-200 active:scale-95",
+          "relative h-5 w-9 shrink-0 rounded-full border transition-all duration-200 active:scale-95",
           checked
-            ? "bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.4)]"
-            : "bg-zinc-700 hover:bg-zinc-600",
+            ? "border-emerald-400/60 bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.4)]"
+            : "border-zinc-600 bg-zinc-800 hover:bg-zinc-700",
         )}
       >
         <span
@@ -307,6 +311,8 @@ export function SettingsPanel(props: SettingsPanelProps) {
     captionSettings,
     onCaptionSettingsChange,
     onApplyPreset,
+    favoritePresets,
+    onToggleFavorite,
     onExportSrt,
     onExportAss,
     inElectron,
@@ -443,11 +449,12 @@ export function SettingsPanel(props: SettingsPanelProps) {
               onClick={setFullRandom}
               disabled={!kenBurns.enabled}
               className={cn(
-                "mt-1.5 w-full rounded px-2 py-1.5 text-[10px] font-semibold transition-colors",
+                "mt-1.5 w-full rounded-md border px-2 py-1.5 text-[10px] font-semibold transition-all active:scale-[0.98]",
                 isRandomMode && kenBurns.directionPool.length === 6
-                  ? "bg-emerald-500 text-zinc-900"
-                  : "bg-zinc-800 text-zinc-300 hover:bg-zinc-700",
+                  ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-300"
+                  : "border-zinc-700 bg-transparent text-zinc-400 hover:border-zinc-600 hover:bg-white/5 hover:text-zinc-200",
               )}
+              title="Randomize across all six effects"
             >
               🎲 Random — all effects
             </button>
@@ -698,6 +705,8 @@ export function SettingsPanel(props: SettingsPanelProps) {
           captionSettings={captionSettings}
           onCaptionSettingsChange={onCaptionSettingsChange}
           onApplyPreset={onApplyPreset}
+          favoritePresets={favoritePresets}
+          onToggleFavorite={onToggleFavorite}
           onExportSrt={onExportSrt}
           onExportAss={onExportAss}
           onExportVtt={onExportVtt}
@@ -1253,6 +1262,9 @@ interface CaptionsSectionProps {
   captionSettings: CaptionSettings;
   onCaptionSettingsChange: (cs: CaptionSettings) => void;
   onApplyPreset: (presetId: string) => void;
+  /** v4.7: starred preset ids (Favorites group + filter). */
+  favoritePresets: string[];
+  onToggleFavorite: (presetId: string) => void;
   onExportSrt: () => void;
   onExportAss: () => void;
   /** WebVTT sidecar (v4.4). */
@@ -1274,6 +1286,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
     captionSettings,
     onCaptionSettingsChange,
     onApplyPreset,
+    favoritePresets,
+    onToggleFavorite,
     onExportSrt,
     onExportAss,
     onExportVtt,
@@ -1291,26 +1305,46 @@ function CaptionsSection(props: CaptionsSectionProps) {
   const set = (patch: Partial<CaptionSettings>) =>
     onCaptionSettingsChange({ ...captionSettings, ...patch });
 
-  // v4.6: preset search + category filter (42 presets need discoverability).
+  /** v4.6: preset search + category filter (42 presets need discoverability). */
   const [presetQuery, setPresetQuery] = useState("");
-  const [presetCat, setPresetCat] = useState<"all" | CaptionPreset["category"]>("all");
+  const [presetCat, setPresetCat] = useState<
+    "all" | "favorites" | CaptionPreset["category"]
+  >("all");
   const q = presetQuery.trim().toLowerCase();
+  const isFav = (p: CaptionPreset) => favoritePresets.includes(p.id);
+  const showFavGroup =
+    presetCat === "all" && !q && favoritePresets.length > 0;
+  const matchesQuery = (p: CaptionPreset) =>
+    !q ||
+    p.name.toLowerCase().includes(q) ||
+    p.description.toLowerCase().includes(q) ||
+    p.id.toLowerCase().includes(q) ||
+    (p.animation ?? "").toLowerCase().includes(q) ||
+    (p.wordMode ?? "").includes(q);
   const filteredCategories = presetsByCategory()
     .map((cat) => ({
       ...cat,
       presets: cat.presets.filter((p) => {
+        if (presetCat === "favorites") return isFav(p) && matchesQuery(p);
+        // When the favorites group is pinned on top, skip the duplicate
+        // copy in the preset's home category.
+        if (showFavGroup && isFav(p)) return false;
         if (presetCat !== "all" && p.category !== presetCat) return false;
-        if (!q) return true;
-        return (
-          p.name.toLowerCase().includes(q) ||
-          p.description.toLowerCase().includes(q) ||
-          p.id.toLowerCase().includes(q) ||
-          (p.animation ?? "").toLowerCase().includes(q) ||
-          (p.wordMode ?? "").includes(q)
-        );
+        return matchesQuery(p);
       }),
     }))
     .filter((cat) => cat.presets.length > 0);
+  // v4.7: favorites pinned to the top when browsing all styles unfiltered.
+  const favGroup = showFavGroup
+      ? {
+          category: "favorites",
+          label: "★ Favorites",
+          hint: "Your starred presets",
+          presets: presetsByCategory()
+            .flatMap((c) => c.presets)
+            .filter((p) => favoritePresets.includes(p.id)),
+        }
+      : null;
   const matchCount = filteredCategories.reduce((n, c) => n + c.presets.length, 0);
 
   const preset = getCaptionPreset(captionSettings.presetId);
@@ -1439,13 +1473,20 @@ function CaptionsSection(props: CaptionsSectionProps) {
           <div className="relative">
             <select
               value={presetCat}
-              onChange={(e) => setPresetCat(e.target.value as typeof presetCat)}
+              onChange={(e) =>
+                setPresetCat(e.target.value as typeof presetCat)
+              }
               className="h-full appearance-none rounded-md border bg-zinc-900 pl-2 pr-6 text-[10px] text-zinc-200"
               style={{ borderColor: "#27272a" }}
               aria-label="Filter presets by category"
               title="Filter by category"
             >
               <option value="all">All styles</option>
+              {favoritePresets.length > 0 && (
+                <option value="favorites">
+                  ★ Favorites ({favoritePresets.length})
+                </option>
+              )}
               {PRESET_CATEGORIES.map((c) => (
                 <option key={c.id} value={c.id}>
                   {c.label}
@@ -1467,16 +1508,22 @@ function CaptionsSection(props: CaptionsSectionProps) {
           </div>
         ) : (
         <div className="max-h-72 overflow-y-auto rounded-md border" style={{ borderColor: "#27272a" }}>
-          {filteredCategories.map((cat) => (
+          {[favGroup, ...filteredCategories]
+            .filter((g): g is NonNullable<typeof g> => !!g)
+            .map((cat) => (
             <div key={cat.category}>
               <div
-                className="sticky top-0 z-10 bg-[#131316] px-2 py-1 text-[9px] font-bold uppercase tracking-widest text-zinc-500"
+                className={cn(
+                  "sticky top-0 z-10 bg-[#131316] px-2 py-1 text-[9px] font-bold uppercase tracking-widest",
+                  cat.category === "favorites" ? "text-amber-400/90" : "text-zinc-500",
+                )}
                 title={cat.hint}
               >
                 {cat.label}
               </div>
               {cat.presets.map((p) => {
                 const active = p.id === captionSettings.presetId;
+                const fav = isFav(p);
                 return (
                   <button
                     key={p.id}
@@ -1535,6 +1582,35 @@ function CaptionsSection(props: CaptionsSectionProps) {
                         title="Active-word highlight"
                       />
                     )}
+                    {/* v4.7 favorite star — spans inside the row button keep
+                        HTML valid; role=button + keyboard handling for a11y. */}
+                    <span
+                      role="button"
+                      tabIndex={0}
+                      aria-pressed={fav}
+                      aria-label={fav ? "Remove from favorites" : "Add to favorites"}
+                      title={fav ? "Remove from favorites" : "Star this preset"}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onToggleFavorite(p.id);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          onToggleFavorite(p.id);
+                        }
+                      }}
+                      className={cn(
+                        "shrink-0 rounded p-0.5 transition-all duration-150 hover:scale-125 active:scale-95",
+                        fav ? "text-amber-400" : "text-zinc-600 hover:text-amber-400/70",
+                      )}
+                    >
+                      <Star
+                        className="size-3"
+                        fill={fav ? "currentColor" : "none"}
+                      />
+                    </span>
                   </button>
                 );
               })}

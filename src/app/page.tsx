@@ -61,6 +61,7 @@ import {
   downloadProjectFile,
   parseProjectFile,
 } from "@/lib/merger/project";
+import { decodeAudioPeaks, type WaveformData } from "@/lib/merger/waveform";
 
 interface MediaItem {
   id: string;
@@ -89,6 +90,10 @@ interface PersistedSettings {
   transition?: TransitionSettings;
   /** Watermark settings (v4.4). The image itself lives in project files. */
   watermark?: WatermarkSettings;
+  /** v4.7: beat-snap strength (boundaries land on every Nth beat). */
+  beatStride?: number;
+  /** v4.7: starred caption preset ids. */
+  favoritePresets?: string[];
 }
 
 function loadPersisted(): Partial<PersistedSettings> {
@@ -162,6 +167,12 @@ export default function Page() {
   // Whisper language: "auto" = auto-detect, or a 2-letter code like "en".
   const [whisperLanguage, setWhisperLanguage] = useState<string>("auto");
 
+  // v4.7: beat-snap strength — boundaries land on every Nth beat (1/2/4/8).
+  // Declared above the restore effect (it references the setter).
+  const [beatStride, setBeatStride] = useState<1 | 2 | 4 | 8>(1);
+  // v4.7: starred caption presets (app-level preference, not project data).
+  const [favoritePresets, setFavoritePresets] = useState<string[]>([]);
+
   // Restore persisted settings AFTER mount (client-only, hydration-safe).
   // Reading localStorage in the state initializers made the first client
   // render differ from the prerendered HTML (React #418) whenever settings
@@ -190,6 +201,15 @@ export default function Page() {
      
     if (p.whisperLanguage && p.whisperLanguage !== "auto") {
       setWhisperLanguage(p.whisperLanguage);
+    }
+    // v4.7 prefs: beat-snap strength + starred presets.
+    if (p.beatStride === 1 || p.beatStride === 2 || p.beatStride === 4 || p.beatStride === 8) {
+      setBeatStride(p.beatStride);
+    }
+    if (Array.isArray(p.favoritePresets)) {
+      setFavoritePresets(
+        p.favoritePresets.filter((id) => typeof id === "string"),
+      );
     }
   }, []);
 
@@ -687,6 +707,8 @@ export default function Page() {
   // ---- Beat detection (v4.6) ---------------------------------------------
   const [beatInfo, setBeatInfo] = useState<BeatInfo | null>(null);
   const [beatBusy, setBeatBusy] = useState(false);
+  // v4.7: waveform peaks for the timeline strip (decoded per audio track).
+  const [waveform, setWaveform] = useState<WaveformData | null>(null);
   // Beat data is DERIVED from the audio — invalidated on every track swap
   // (add/remove) rather than via an effect, per lint rule
   // react-hooks/set-state-in-effect.
@@ -694,10 +716,12 @@ export default function Page() {
     setBeatInfo(null);
     setBeatBusy(false);
   }, []);
+  const clearWaveform = useCallback(() => setWaveform(null), []);
 
   const addAudio = useCallback((file: File) => {
     requestHistoryPush();
     clearBeatInfo();
+    clearWaveform();
     setAudioTrack(() => {
       // The previous track's URL stays alive (undo-safe); unmount revokes.
       const url = trackUrl(URL.createObjectURL(file));
@@ -716,7 +740,31 @@ export default function Page() {
       return { fileName: file.name, url, durationMs: null };
     });
     toast.success(`Audio: ${file.name}`);
-  }, [requestHistoryPush, trackUrl, clearBeatInfo]);
+  }, [requestHistoryPush, trackUrl, clearBeatInfo, clearWaveform]);
+
+  // v4.7: decode waveform peaks whenever a new audio track lands (async —
+  // state is set in the promise continuation, not synchronously in the
+  // effect body). Undecodable audio simply keeps the strip hidden; the
+  // in-flight decode is cancelled when the track changes again.
+  const audioUrl = audioTrack?.url ?? null;
+  useEffect(() => {
+    if (!audioUrl) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await fetch(audioUrl);
+        const blob = await resp.blob();
+        if (cancelled) return;
+        const data = await decodeAudioPeaks(blob);
+        if (!cancelled) setWaveform(data);
+      } catch {
+        /* undecodable → no strip (same contract as beat detection) */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [audioUrl]);
 
   // ---- Subtitle (.srt) loading -------------------------------------------
   const addSubtitles = useCallback(
@@ -971,13 +1019,15 @@ export default function Page() {
       headlines: headlineItems.length ? headlineItems : [],
       transition: transitionSettings,
       watermark: watermarkSettings,
+      beatStride,
+      favoritePresets,
     };
     try {
       localStorage.setItem(LS_KEY, JSON.stringify(payload));
     } catch {
       /* storage full / private mode — non-fatal */
     }
-  }, [kenBurns, settings, captionSettings, audioSettings, whisperLanguage, headlineItems, transitionSettings, watermarkSettings]);
+  }, [kenBurns, settings, captionSettings, audioSettings, whisperLanguage, headlineItems, transitionSettings, watermarkSettings, beatStride, favoritePresets]);
 
   const generateCaptionsFromAudio = useCallback(async () => {
     if (!audioTrack) {
@@ -1104,8 +1154,9 @@ export default function Page() {
   const removeAudio = useCallback(() => {
     requestHistoryPush();
     clearBeatInfo();
+    clearWaveform();
     setAudioTrack(null);
-  }, [requestHistoryPush, clearBeatInfo]);
+  }, [requestHistoryPush, clearBeatInfo, clearWaveform]);
 
   const removeItem = useCallback((id: string) => {
     requestHistoryPush();
@@ -1178,19 +1229,35 @@ export default function Page() {
     const plan = planBeatSnap(
       timeline.segments.map((s) => ({ id: s.id, durationMs: s.durationMs })),
       beatInfo.beatMs,
+      800,
+      beatStride,
     );
     if (!Object.keys(plan).length) {
       toast.error("Not enough beats to snap", {
-        description: "Try a longer/punchier audio track.",
+        description: "Try a longer/punchier audio track, or a finer cut rate (Beat / 2).",
       });
       return;
     }
     requestHistoryPush();
     setOverrides((prev) => ({ ...prev, ...plan }));
-    toast.success("Cuts snapped to beats", {
-      description: "Undo (Ctrl+Z) restores the previous durations.",
-    });
-  }, [beatInfo, timeline.segments, timeline.mode, requestHistoryPush]);
+    toast.success(
+      beatStride === 1
+        ? "Cuts snapped to beats"
+        : `Cuts snapped to every ${beatStride}th beat`,
+      {
+        description: "Undo (Ctrl+Z) restores the previous durations.",
+      },
+    );
+  }, [beatInfo, timeline.segments, timeline.mode, requestHistoryPush, beatStride]);
+
+  // ---- Preset favorites (v4.7) --------------------------------------------
+  const toggleFavoritePreset = useCallback((presetId: string) => {
+    setFavoritePresets((prev) =>
+      prev.includes(presetId)
+        ? prev.filter((id) => id !== presetId)
+        : [...prev, presetId],
+    );
+  }, []);
 
   const handleFitToAudio = useCallback(() => {
     if (!audioTrack || !audioTrack.durationMs || !timeline.segments.length) return;
@@ -1419,6 +1486,7 @@ export default function Page() {
         // Audio.
         if (loaded.audioFile) {
           const url = trackUrl(URL.createObjectURL(loaded.audioFile));
+          clearWaveform();
           const a = document.createElement("audio");
           a.preload = "metadata";
           a.onloadedmetadata = () => {
@@ -1436,6 +1504,7 @@ export default function Page() {
           });
         } else {
           setAudioTrack(null);
+          clearWaveform();
         }
 
         // Subtitles.
@@ -1493,7 +1562,7 @@ export default function Page() {
         toast.error(e instanceof Error ? e.message : "Project load failed");
       }
     },
-    [requestHistoryPush, trackUrl],
+    [requestHistoryPush, trackUrl, clearWaveform],
   );
 
   const seek = useCallback((ms: number) => {
@@ -1728,6 +1797,8 @@ export default function Page() {
             onDetectBeats={handleDetectBeats}
             onSnapToBeats={handleSnapToBeats}
             onFitToAudio={handleFitToAudio}
+            beatStride={beatStride}
+            onBeatStrideChange={(n) => setBeatStride(n as 1 | 2 | 4 | 8)}
           />
         </section>
 
@@ -1766,6 +1837,7 @@ export default function Page() {
             headlines={headlineItems}
             transition={transitionSettings}
             beats={beatInfo?.beatMs ?? null}
+            waveform={waveform}
             onSeek={seek}
           />
         </section>
@@ -1799,6 +1871,8 @@ export default function Page() {
             captionSettings={captionSettings}
             onCaptionSettingsChange={handleCaptionSettingsChange}
             onApplyPreset={applyCaptionPreset}
+            favoritePresets={favoritePresets}
+            onToggleFavorite={toggleFavoritePreset}
             onExportSrt={exportSrtSidecar}
             onExportAss={exportAssSidecar}
             onExportVtt={exportVttSidecar}

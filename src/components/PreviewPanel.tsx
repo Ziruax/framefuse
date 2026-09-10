@@ -334,9 +334,10 @@ export function PreviewPanel({
             type="button"
             onClick={() => onStep(-1)}
             disabled={segments.length === 0}
-            className="rounded-md p-1.5 transition-all hover:bg-white/10 hover:text-zinc-200 disabled:opacity-30"
+            className="flex size-8 items-center justify-center rounded-lg transition-all hover:bg-white/10 hover:text-zinc-200 active:scale-90 disabled:opacity-30"
             style={{ color: "#a1a1aa" }}
             title="Previous segment (Shift+←)"
+            aria-label="Previous segment"
           >
             <SkipBack className="size-4" />
           </button>
@@ -361,9 +362,10 @@ export function PreviewPanel({
             type="button"
             onClick={() => onStep(1)}
             disabled={segments.length === 0}
-            className="rounded-md p-1.5 transition-all hover:bg-white/10 hover:text-zinc-200 disabled:opacity-30"
+            className="flex size-8 items-center justify-center rounded-lg transition-all hover:bg-white/10 hover:text-zinc-200 active:scale-90 disabled:opacity-30"
             style={{ color: "#a1a1aa" }}
             title="Next segment (Shift+→)"
+            aria-label="Next segment"
           >
             <SkipForward className="size-4" />
           </button>
@@ -374,9 +376,11 @@ export function PreviewPanel({
             <span style={{ color: "#e4e4e7" }}>
               {fmtTimecode(currentMs)}
             </span>
-            <span style={{ color: "#52525b" }}>
-              {" "}
-              / {fmtTimecode(totalMs)}
+            <span className="mx-0.5" style={{ color: "#52525b" }}>
+              /
+            </span>
+            <span style={{ color: "#a1a1aa" }}>
+              {fmtTimecode(totalMs)}
             </span>
           </div>
         </div>
