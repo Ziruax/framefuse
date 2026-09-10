@@ -213,21 +213,32 @@ function detectGpuEncoder() {
   return detectedEncoder;
 }
 
-/** Build encoder args for a quality-first, speed-optimized encode. */
-function encoderArgs(encoderName, bitrateMbps, width, height) {
+/** Build encoder args for a quality-first, speed-optimized encode.
+ * v4.5: the `quality` profile ("draft" | "social" | "cinema" | "custom")
+ * drives CRF/cq + the encoder speed preset; `crf` is the explicit target
+ * used when quality === "custom". "social" keeps the exact v4.4 behavior. */
+const QUALITY_ENCODER = {
+  draft:  { crf: 27, x264: "veryfast", nvencPreset: "p1", nvencCq: 27, qsvQ: 27, amfI: 26, amfP: 28 },
+  social: { crf: 20, x264: "veryfast", nvencPreset: "p4", nvencCq: 23, qsvQ: 23, amfI: 22, amfP: 24 },
+  cinema: { crf: 17, x264: "medium",   nvencPreset: "p6", nvencCq: 19, qsvQ: 19, amfI: 19, amfP: 21 },
+};
+
+function encoderArgs(encoderName, bitrateMbps, width, height, quality, crf) {
+  const q = QUALITY_ENCODER[quality] || QUALITY_ENCODER.social;
+  const crfVal = quality === "custom" ? Math.max(14, Math.min(30, Number(crf) || 20)) : q.crf;
   switch (encoderName) {
     case "h264_nvenc":
       // Constant-quality mode: visually lossless-to-high quality, no wasted bits.
-      return ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq", "-rc", "vbr", "-cq", "23", "-b:v", "0", "-maxrate", `${Math.round((bitrateMbps || 8) * 1.5)}M`, "-bufsize", `${Math.round((bitrateMbps || 8) * 3)}M`, "-pix_fmt", "yuv420p"];
+      return ["-c:v", "h264_nvenc", "-preset", q.nvencPreset, "-tune", "hq", "-rc", "vbr", "-cq", String(quality === "custom" ? crfVal : q.nvencCq), "-b:v", "0", "-maxrate", `${Math.round((bitrateMbps || 8) * 1.5)}M`, "-bufsize", `${Math.round((bitrateMbps || 8) * 3)}M`, "-pix_fmt", "yuv420p"];
     case "h264_qsv":
-      return ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "23", "-look_ahead", "0", "-pix_fmt", "yuv420p"];
+      return ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", String(quality === "custom" ? crfVal : q.qsvQ), "-look_ahead", "0", "-pix_fmt", "yuv420p"];
     case "h264_amf":
-      return ["-c:v", "h264_amf", "-quality", "balanced", "-rc", "vbr_peak", "-qp_i", "22", "-qp_p", "24", "-b:v", `${bitrateMbps || 8}M`, "-pix_fmt", "yuv420p"];
+      return ["-c:v", "h264_amf", "-quality", quality === "cinema" ? "quality" : "balanced", "-rc", "vbr_peak", "-qp_i", String(quality === "custom" ? crfVal : q.amfI), "-qp_p", String((quality === "custom" ? crfVal : q.amfP) + 2), "-b:v", `${bitrateMbps || 8}M`, "-pix_fmt", "yuv420p"];
     default:
-      // libx264: "veryfast" is ~2× the speed of ultrafast at MUCH better
-      // quality per bit. Still-image-heavy content compresses well, so
-      // files stay small.
-      return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"];
+      // libx264: profile preset balances speed vs compression efficiency.
+      // "social"/"draft" = veryfast (2× ultrafast at much better quality per
+      // bit); "cinema" = medium for the maximum-quality master.
+      return ["-c:v", "libx264", "-preset", quality === "cinema" ? q.x264 : "veryfast", "-crf", String(crfVal), "-pix_fmt", "yuv420p"];
   }
 }
 
@@ -949,7 +960,7 @@ function frozenZoompanExpr(dir, zoomMax) {
 }
 
 ipcMain.handle("export-native", async (event, opts) => {
-  const { outputPath, fps, width, height, bitrateMbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark } = opts;
+  const { outputPath, fps, width, height, bitrateMbps, quality, crf, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark } = opts;
 
   if (!outputPath) throw new Error("No output path");
   if (!segments || segments.length === 0) throw new Error("No segments");
@@ -1014,14 +1025,23 @@ ipcMain.handle("export-native", async (event, opts) => {
   try {
     // ─── STEP 1: Encode each segment ──────────────────────────────
     // v4.3 transition planning (mirrors renderer.ts formulas exactly).
-    const trStyle = transition && transition.style ? transition.style : "none";
+    // v4.5: per-boundary overrides — the style at the boundary ENTERING
+    // segments[i] is `transition.overrides[segments[i].id] ?? global`.
+    // Kept in lockstep with boundaryStyle() in types.ts (plain JS here).
+    const trGlobal = transition && transition.style ? transition.style : "none";
+    const trOverrides =
+      transition && transition.overrides && typeof transition.overrides === "object"
+        ? transition.overrides
+        : null;
+    const boundaryStyleAt = (seg) =>
+      seg && trOverrides && Object.prototype.hasOwnProperty.call(trOverrides, seg.id)
+        ? trOverrides[seg.id]
+        : trGlobal;
     const trWanted =
       transition && Number(transition.durationMs) > 0
         ? Number(transition.durationMs)
         : 0;
     const fadeStartEnd = !!(transition && transition.fadeStartEnd);
-    const xfadeName = XFADE_NAMES[trStyle] || null;
-    const dipColor = DIP_COLORS[trStyle] || null;
 
     const clipPaths = [];
     let cumulativeMs = 0;
@@ -1035,10 +1055,16 @@ ipcMain.handle("export-native", async (event, opts) => {
       const isLast = i === segments.length - 1;
 
       // Transition windows for THIS clip (identical clamps to the preview).
+      // v4.5: head style resolves per-boundary; the tail dip leads into the
+      // NEXT boundary, so its style/color comes from segments[i+1].
+      const curStyle = i > 0 ? boundaryStyleAt(seg) : "none";
+      const nextStyle = !isLast ? boundaryStyleAt(segments[i + 1]) : "none";
+      const xfadeName = XFADE_NAMES[curStyle] || null;
+      const dipColor = DIP_COLORS[curStyle] || null;
       const headMs =
-        i > 0 && trStyle !== "none" ? clampTrMs(trWanted, seg.durationMs) : 0;
+        i > 0 && curStyle !== "none" ? clampTrMs(trWanted, seg.durationMs) : 0;
       const dipTailMs =
-        dipColor && !isLast ? clampTrMs(trWanted, seg.durationMs) : 0;
+        DIP_COLORS[nextStyle] && !isLast ? clampTrMs(trWanted, seg.durationMs) : 0;
       const startFadeMs =
         i === 0 && fadeStartEnd ? clampTrMs(trWanted, seg.durationMs) : 0;
       const endFadeMs =
@@ -1113,13 +1139,16 @@ ipcMain.handle("export-native", async (event, opts) => {
 
       // Post-subtitle fades (applied AFTER captions like a real video —
       // matches the canvas applyGlobalFade pass): dips + start/end fades.
+      // v4.5: the TAIL dip color comes from the NEXT boundary's style
+      // (that's the dip the tail leads into), NOT the current one.
       const postFades = [];
       if (dipColor && headMs > 0) {
         postFades.push(`fade=t=in:st=0:d=${(headMs / 1000).toFixed(3)}:color=${dipColor}`);
       }
       if (dipTailMs > 0) {
+        const tailColor = DIP_COLORS[nextStyle] || "black";
         postFades.push(
-          `fade=t=out:st=${(segDurSec - dipTailMs / 1000).toFixed(3)}:d=${(dipTailMs / 1000).toFixed(3)}:color=${dipColor}`,
+          `fade=t=out:st=${(segDurSec - dipTailMs / 1000).toFixed(3)}:d=${(dipTailMs / 1000).toFixed(3)}:color=${tailColor}`,
         );
       }
       if (startFadeMs > 0) {
@@ -1133,7 +1162,7 @@ ipcMain.handle("export-native", async (event, opts) => {
 
       let args;
       const encodeTail = [
-        ...encoderArgs(encoder.name, bitrateMbps, width, height),
+        ...encoderArgs(encoder.name, bitrateMbps, width, height, quality, crf),
         "-r", String(fps),
         "-threads", "0",
         "-y",

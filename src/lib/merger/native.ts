@@ -10,6 +10,7 @@ import type {
   ExportResult,
   HeadlineItem,
   MediaSegment,
+  VideoSettings,
 } from "./types";
 import {
   drawFrame,
@@ -164,6 +165,24 @@ export function buildCaptionFfmpegStyle(opts: {
 // ---------------------------------------------------------------------------
 // Native FFmpeg path (Electron)
 // ---------------------------------------------------------------------------
+
+/**
+ * Browser-fallback bitrate (bits/sec) with the v4.5 quality profile applied.
+ * The FFmpeg path uses CRF/cq (per-profile); the browser encoders can't, so
+ * profiles scale the bitrate instead: draft ≈ 55%, social 100%, cinema 160%.
+ */
+function browserQualityBitrate(settings: VideoSettings): number {
+  const base = (settings.bitrateMbps || 8) * 1_000_000;
+  switch (settings.quality) {
+    case "draft":
+      return Math.round(base * 0.55);
+    case "cinema":
+      return Math.round(base * 1.6);
+    default:
+      return base;
+  }
+}
+
 async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult> {
   const api = window.electronAPI!;
   const {
@@ -188,6 +207,7 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
   // mapping, only cues whose original startMs falls within [0, dur] of
   // every clip would be burned in — i.e. the first caption repeats.
   const segPayload: {
+    id: string;
     imagePath: string;
     direction: string;
     durationMs: number;
@@ -202,6 +222,8 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
       bytes,
     });
     segPayload.push({
+      // v4.5: id carries the per-boundary transition override key.
+      id: seg.id,
       imagePath,
       direction: seg.direction,
       durationMs: seg.durationMs,
@@ -337,6 +359,9 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
       width: dims.w,
       height: dims.h,
       bitrateMbps: settings.bitrateMbps,
+      // v4.5 encode-quality profile ("social" keeps v4.4 behavior).
+      quality: settings.quality || "social",
+      crf: typeof settings.crf === "number" ? settings.crf : 20,
       kenBurns,
       segments: segPayload,
       audioPath,
@@ -349,6 +374,8 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
             style: opts.transition.style,
             durationMs: opts.transition.durationMs,
             fadeStartEnd: !!opts.transition.fadeStartEnd,
+            // v4.5 per-boundary style overrides (segId -> TransitionStyle).
+            overrides: opts.transition.overrides || undefined,
           }
         : undefined,
       watermark: ipcWatermark,
@@ -420,7 +447,7 @@ async function exportViaWebCodecs(
     fastStart: "in-memory",
   });
 
-  const bitrate = Math.round(settings.bitrateMbps * 1_000_000);
+  const bitrate = Math.round(browserQualityBitrate(settings));
   // Pick an H.264 codec string appropriate for the resolution.
   const codec =
     dims.w * dims.h <= 1280 * 720 ? "avc1.42E01E" : "avc1.4D4028";
@@ -602,7 +629,7 @@ async function exportViaMediaRecorder(
   const mimeType = pickMime();
   const recorder = new MediaRecorder(stream, {
     mimeType,
-    videoBitsPerSecond: settings.bitrateMbps * 1_000_000,
+    videoBitsPerSecond: browserQualityBitrate(settings),
   });
   const chunks: BlobPart[] = [];
   recorder.ondataavailable = (e) => {

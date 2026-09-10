@@ -420,3 +420,35 @@ textarea:focus-visible {
   background: #34d399;
   box-shadow: 0 0 6px rgba(52, 211, 153, 0.7);
 }
+
+/* ===== v4.5 — Quality profile cards ===== */
+.ff-profile-card {
+  cursor: pointer;
+}
+.ff-profile-active {
+  border-color: rgba(52, 211, 153, 0.55) !important;
+  background: linear-gradient(160deg, rgba(16, 185, 129, 0.16), rgba(6, 78, 59, 0.28)) !important;
+  box-shadow:
+    0 0 14px rgba(52, 211, 153, 0.22),
+    inset 0 1px 0 rgba(167, 243, 208, 0.18);
+}
+.ff-profile-card:not(.ff-profile-active):hover {
+  border-color: rgba(139, 92, 246, 0.45) !important;
+}
+
+/* ===== v4.5 — Boundary style picker popover ===== */
+.ff-pop {
+  border-color: #27272a;
+  background: #101012;
+  animation: ff-pop-in 140ms ease-out;
+}
+@keyframes ff-pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}

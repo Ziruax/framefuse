@@ -35,7 +35,7 @@ import type {
   WatermarkPosition,
   WatermarkSettings,
 } from "@/lib/merger/types";
-import { TRANSITION_STYLE_INFO } from "@/lib/merger/types";
+import { TRANSITION_STYLE_INFO, QUALITY_PROFILES } from "@/lib/merger/types";
 import type { KenBurnsDirection } from "@/lib/merger/types";
 import {
   FONT_OPTIONS,
@@ -450,6 +450,78 @@ export function SettingsPanel(props: SettingsPanelProps) {
 
         {/* ─── Video ─────────────────────────────────────────────────── */}
         <Section icon={<Film size={13} />} title="Video">
+          {/* v4.5: one-click encode-quality profiles. */}
+          <Field label="Quality profile" hint="Resolution + fps + encoder tuning bundles">
+            <div className="grid grid-cols-3 gap-1.5">
+              {QUALITY_PROFILES.map((p) => {
+                // undefined quality (persisted v4.4 settings) = "social".
+                const active = (settings.quality || "social") === p.id;
+                return (
+                  <button
+                    key={p.id}
+                    type="button"
+                    onClick={() =>
+                      onSettingsChange({
+                        ...settings,
+                        resolution: p.resolution,
+                        fps: p.fps,
+                        bitrateMbps: p.bitrateMbps,
+                        crf: p.crf,
+                        quality: p.id,
+                      })
+                    }
+                    title={p.hint}
+                    className={cn(
+                      "ff-profile-card group relative flex flex-col gap-1 rounded-lg border p-2 text-left transition-all duration-200",
+                      active ? "ff-profile-active" : "hover:-translate-y-px hover:brightness-110",
+                    )}
+                    style={
+                      active
+                        ? undefined
+                        : { borderColor: "#27272a", backgroundColor: "#141416" }
+                    }
+                  >
+                    <span className="text-[11px] font-bold" style={{ color: active ? "#a7f3d0" : "#d4d4d8" }}>
+                      {p.label}
+                    </span>
+                    <span className="text-[8px] tabular-nums" style={{ color: "#71717a" }}>
+                      {p.resolution} · {p.fps}fps
+                    </span>
+                    {/* speed meter: 3 dots, filled = speed cost */}
+                    <span className="flex items-center gap-0.5" aria-hidden>
+                      {[1, 2, 3].map((d) => (
+                        <span
+                          key={d}
+                          className="h-1 w-2.5 rounded-full transition-colors duration-200"
+                          style={{
+                            backgroundColor:
+                              d <= p.speed
+                                ? active
+                                  ? "#34d399"
+                                  : "#3f3f46"
+                                : "#1f1f22",
+                          }}
+                        />
+                      ))}
+                      <span className="ml-1 text-[7px] uppercase tracking-wide" style={{ color: "#52525b" }}>
+                        {p.speed === 3 ? "fast" : p.speed === 2 ? "balanced" : "slow"}
+                      </span>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            {settings.quality === "custom" ? (
+              <p className="mt-1.5 flex items-center gap-1 text-[9px]" style={{ color: "#fbbf24" }}>
+                <Wand2 className="size-2.5" /> Custom — fields below tuned manually
+              </p>
+            ) : (
+              <p className="mt-1.5 text-[9px] leading-relaxed" style={{ color: "#52525b" }}>
+                {QUALITY_PROFILES.find((p) => p.id === settings.quality)?.hint ??
+                  "Pick a profile, then fine-tune below (switches to Custom)."}
+              </p>
+            )}
+          </Field>
           <Field label="Aspect ratio" hint="16:9 YouTube · 9:16 Shorts/Reels/TikTok · 1:1 square · 4:5 Instagram feed">
             <Segmented
               options={[
@@ -469,7 +541,13 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 { value: "1080p", label: "1080p" },
               ]}
               value={settings.resolution}
-              onChange={(v) => onSettingsChange({ ...settings, resolution: v })}
+              onChange={(v) =>
+                onSettingsChange({
+                  ...settings,
+                  resolution: v,
+                  quality: "custom",
+                })
+              }
             />
           </Field>
           <Field label="Frame rate">
@@ -480,7 +558,13 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 { value: 60, label: "60" },
               ]}
               value={settings.fps}
-              onChange={(v) => onSettingsChange({ ...settings, fps: v as 24 | 30 | 60 })}
+              onChange={(v) =>
+                onSettingsChange({
+                  ...settings,
+                  fps: v as 24 | 30 | 60,
+                  quality: "custom",
+                })
+              }
             />
           </Field>
           <Field label="Bitrate" hint={`${settings.bitrateMbps} Mbps`}>
@@ -491,11 +575,43 @@ export function SettingsPanel(props: SettingsPanelProps) {
               step={1}
               value={settings.bitrateMbps}
               onChange={(e) =>
-                onSettingsChange({ ...settings, bitrateMbps: Number(e.target.value) })
+                onSettingsChange({
+                  ...settings,
+                  bitrateMbps: Number(e.target.value),
+                  quality: "custom",
+                })
               }
               className="w-full accent-emerald-500"
               aria-label="Video bitrate"
             />
+          </Field>
+          <Field
+            label="Constant quality (CRF)"
+            hint={
+              settings.quality === "custom"
+                ? `CRF ${settings.crf ?? 20} · manual`
+                : `CRF ${QUALITY_PROFILES.find((p) => p.id === settings.quality)?.crf ?? 20} · from profile`
+            }
+          >
+            <input
+              type="range"
+              min={14}
+              max={30}
+              step={1}
+              value={settings.crf ?? 20}
+              onChange={(e) =>
+                onSettingsChange({
+                  ...settings,
+                  crf: Number(e.target.value),
+                  quality: "custom",
+                })
+              }
+              className="w-full accent-emerald-500"
+              aria-label="Constant quality factor"
+            />
+            <p className="mt-0.5 text-[9px]" style={{ color: "#52525b" }}>
+              Lower = better quality + larger files. 18–22 is the sweet spot for social uploads.
+            </p>
           </Field>
         </Section>
 

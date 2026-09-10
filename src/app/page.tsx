@@ -44,6 +44,7 @@ import {
   type MediaSegment,
   type SubtitleFile,
   type TransitionSettings,
+  type TransitionStyle,
   type VideoSettings,
   type WatermarkSettings,
 } from "@/lib/merger/types";
@@ -119,6 +120,9 @@ export default function Page() {
     resolution: "1080p",
     bitrateMbps: 8,
     fps: 30,
+    // v4.5 encode-quality profile — "social" = the v4.4 defaults exactly.
+    quality: "social",
+    crf: 20,
   });
   const [captionSettings, setCaptionSettings] = useState<CaptionSettings>(
     defaultCaptionSettings(),
@@ -1090,6 +1094,47 @@ export default function Page() {
     });
   }, [requestHistoryPush]);
 
+  /** v4.5 drag-reorder: move an item to an absolute index (drop target). */
+  const moveItemTo = useCallback((id: string, targetIdx: number) => {
+    requestHistoryPush();
+    setItems((prev) => {
+      const idx = prev.findIndex((i) => i.id === id);
+      if (idx < 0 || targetIdx < 0 || targetIdx >= prev.length || targetIdx === idx) {
+        return prev;
+      }
+      const next = [...prev];
+      const [moved] = next.splice(idx, 1);
+      next.splice(targetIdx, 0, moved);
+      return next;
+    });
+  }, [requestHistoryPush]);
+
+  /**
+   * v4.5 per-boundary transition override. `style === null` removes the
+   * override (boundary follows the global style again); a style (including
+   * "none" = explicit hard cut) pins the boundary.
+   */
+  const handleBoundaryStyle = useCallback(
+    (segId: string, style: TransitionStyle | null) => {
+      requestHistoryPush();
+      setTransitionSettings((prev) => {
+        const overrides = { ...(prev.overrides || {}) };
+        if (style == null) delete overrides[segId];
+        else overrides[segId] = style;
+        // Drop the map entirely when empty — keeps settings/project files clean.
+        const hasAny = Object.keys(overrides).length > 0;
+        return { ...prev, overrides: hasAny ? overrides : undefined };
+      });
+    },
+    [requestHistoryPush],
+  );
+
+  /** v4.5: clear every per-boundary override in one shot. */
+  const clearBoundaryOverrides = useCallback(() => {
+    requestHistoryPush();
+    setTransitionSettings((prev) => ({ ...prev, overrides: undefined }));
+  }, [requestHistoryPush]);
+
   /** Duplicate a media item right after the original (v4.2). Copies the
    *  file (same object) with a fresh id so it lands as its own timeline
    *  segment; duration overrides do NOT carry over (the copy re-parses). */
@@ -1499,6 +1544,8 @@ export default function Page() {
         canRedo={historyState.canRedo}
         onUndo={undo}
         onRedo={redo}
+        settings={settings}
+        totalMs={timeline.totalMs}
       />
 
       {/* 3-column grid: 300px | 1fr | 320px */}
@@ -1538,7 +1585,10 @@ export default function Page() {
             onOverride={overrideDuration}
             onClearOverride={clearOverride}
             onReorder={reorderItem}
+            onMoveTo={moveItemTo}
             onDuplicate={duplicateItem}
+            onBoundaryStyle={handleBoundaryStyle}
+            onClearBoundaryOverrides={clearBoundaryOverrides}
             onSaveProject={saveProject}
             onOpenProject={openProjectPicker}
             onLoadProjectFile={loadProject}

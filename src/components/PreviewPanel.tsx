@@ -24,6 +24,16 @@ import { drawCaption, drawHeadline } from "@/lib/merger/native";
 import { cueAt } from "@/lib/merger/subtitles";
 import { fmtTimecode } from "@/lib/merger/timeline";
 
+/** v4.5: middle-ellipsis — keeps the timestamp head AND the descriptive
+ *  tail of filename-encoded storyboards readable in the narrow label. */
+function middleEllipsis(name: string, max = 42): string {
+  if (name.length <= max) return name;
+  const keep = max - 1; // room for the ellipsis char
+  const head = Math.ceil(keep * 0.55);
+  const tail = Math.floor(keep * 0.45);
+  return `${name.slice(0, head)}…${name.slice(name.length - tail)}`;
+}
+
 interface PreviewPanelProps {
   segments: MediaSegment[];
   images: Record<string, HTMLImageElement>;
@@ -222,7 +232,8 @@ export function PreviewPanel({
               height={dims.h}
               className="block size-full rounded-lg"
             />
-            {/* Segment label overlay */}
+            {/* Segment label overlay (v4.5: middle-ellipsis so BOTH the
+                timestamp prefix and the descriptive tail stay readable). */}
             {activeSegment && (
               <div
                 className="pointer-events-none absolute left-2 top-2 rounded-md px-2 py-1 backdrop-blur-sm"
@@ -234,8 +245,9 @@ export function PreviewPanel({
                 <div
                   className="max-w-[280px] truncate text-[11px] font-medium"
                   style={{ color: "#e4e4e7" }}
+                  title={activeSegment.fileName}
                 >
-                  {activeSegment.fileName}
+                  {middleEllipsis(activeSegment.fileName, 42)}
                 </div>
                 <div className="text-[9px]" style={{ color: "#a1a1aa" }}>
                   {fmtTimecode(activeSegment.startMs)} –{" "}

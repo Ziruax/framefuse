@@ -6,6 +6,65 @@ export type AspectRatio = "16:9" | "9:16" | "1:1" | "4:5";
 
 export type Resolution = "720p" | "1080p";
 
+// ---------------------------------------------------------------------------
+// EXPORT QUALITY PROFILES (v4.5) — one-click encode bundles.
+// Each profile sets resolution + fps + bitrate + CRF together; tweaking any
+// individual field afterwards flips `quality` to "custom" (encoder then uses
+// the explicit `crf` value). "social" mirrors v4.4's defaults exactly, so
+// old projects/settings keep their behavior.
+// ---------------------------------------------------------------------------
+
+export type ExportQuality = "draft" | "social" | "cinema" | "custom";
+
+export interface QualityProfile {
+  id: Exclude<ExportQuality, "custom">;
+  label: string;
+  resolution: Resolution;
+  fps: 24 | 30 | 60;
+  bitrateMbps: number;
+  crf: number;
+  /** 1 = slow/best, 3 = fast/rough — drives the speed meter dots. */
+  speed: 1 | 2 | 3;
+  hint: string;
+}
+
+export const QUALITY_PROFILES: QualityProfile[] = [
+  {
+    id: "draft",
+    label: "Draft",
+    resolution: "720p",
+    fps: 30,
+    bitrateMbps: 4,
+    crf: 27,
+    speed: 3,
+    hint: "Fastest rough cut — check the edit before committing to a full render.",
+  },
+  {
+    id: "social",
+    label: "Social",
+    resolution: "1080p",
+    fps: 30,
+    bitrateMbps: 8,
+    crf: 20,
+    speed: 2,
+    hint: "The sweet spot for Shorts / Reels / TikTok — sharp at upload bitrates.",
+  },
+  {
+    id: "cinema",
+    label: "Cinema",
+    resolution: "1080p",
+    fps: 60,
+    bitrateMbps: 14,
+    crf: 17,
+    speed: 1,
+    hint: "Maximum-quality 60fps master — for archival or re-editing later.",
+  },
+];
+
+export function qualityProfile(id: ExportQuality): QualityProfile | null {
+  return QUALITY_PROFILES.find((p) => p.id === id) ?? null;
+}
+
 export type KenBurnsDirection =
   | "in"
   | "out"
@@ -87,6 +146,11 @@ export interface VideoSettings {
   resolution: Resolution;
   bitrateMbps: number;
   fps: 24 | 30 | 60;
+  /** Encode quality profile (v4.5). "custom" = user tuned the fields below. */
+  quality?: ExportQuality;
+  /** Constant-quality target (CRF / cq / QP). Used when quality="custom",
+   * otherwise the profile's value wins. 18 – 28, lower = better. */
+  crf?: number;
 }
 
 /** Result of parsing a single filename. */
@@ -353,6 +417,30 @@ export interface TransitionSettings {
   /** Fade the whole video in from black at the start and out to black at the
    *  end (applied after captions, like a real video opener/outro). */
   fadeStartEnd: boolean;
+  /**
+   * Per-boundary style overrides (v4.5). Keyed by the id of the segment the
+   * transition ENTERS. A value of "none" = explicit hard cut at that
+   * boundary even when a global style is active; an absent key = follow the
+   * global `style`. Everything (preview canvas, WebCodecs/MediaRecorder and
+   * the FFmpeg xfade/fade graphs) resolves through boundaryStyle().
+   */
+  overrides?: Record<string, TransitionStyle>;
+}
+
+/**
+ * Effective transition style at the boundary ENTERING the segment with the
+ * given id — override wins over the global style. THE single resolution
+ * point shared by the canvas preview, browser exports and (mirrored, since
+ * main.js is plain JS) the FFmpeg graph builder.
+ */
+export function boundaryStyle(
+  transition: TransitionSettings | null | undefined,
+  segId: string | undefined | null,
+): TransitionStyle {
+  if (!transition) return "none";
+  if (segId == null) return transition.style;
+  const ov = transition.overrides ? transition.overrides[segId] : undefined;
+  return ov ?? transition.style;
 }
 
 export function defaultTransitionSettings(): TransitionSettings {

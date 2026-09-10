@@ -7,7 +7,7 @@ import type {
   TransitionSettings,
   TransitionStyle,
 } from "./types";
-import { TRANSITION_STYLE_INFO } from "./types";
+import { TRANSITION_STYLE_INFO, boundaryStyle } from "./types";
 
 /** easeInOutSine: -(cos(PI*t) - 1) / 2 */
 export function easeInOutSine(t: number): number {
@@ -199,32 +199,38 @@ export function clampTransitionMs(durationMs: number, segDurMs: number): number 
 /**
  * Effective head-transition duration (ms) for segment `segIdx` — the
  * window at the START of the clip where the transition composite plays.
- * 0 when there is no previous segment or transitions are off.
+ * 0 when there is no previous segment or the boundary style is "none"
+ * (global OR per-boundary override, v4.5).
  */
 export function transitionHeadMs(
   segments: MediaSegment[],
   segIdx: number,
   transition: TransitionSettings | null | undefined,
 ): number {
-  if (!transition || transition.style === "none" || segIdx <= 0) return 0;
+  if (segIdx <= 0) return 0;
   const seg = segments[segIdx];
   if (!seg) return 0;
+  const style = boundaryStyle(transition, seg.id);
+  if (!transition || style === "none") return 0;
   return clampTransitionMs(transition.durationMs, seg.durationMs);
 }
 
 /**
  * Effective TAIL dip duration (ms) for segment `segIdx` — dips darken the
- * tail of the PREVIOUS clip, so this is non-zero only for dip styles on
- * segments that are not the last one.
+ * tail of the PREVIOUS clip, so the style that matters here is the one at
+ * the boundary INTO the NEXT segment (v4.5 per-boundary aware). Non-zero
+ * only for dip styles on segments that are not the last one.
  */
 export function transitionTailMs(
   segments: MediaSegment[],
   segIdx: number,
   transition: TransitionSettings | null | undefined,
 ): number {
-  if (!transition || transition.style === "none") return 0;
-  const info = TRANSITION_STYLE_INFO[transition.style];
-  if (!info.dipColor) return 0; // only dips touch the tail
+  if (!transition) return 0;
+  const next = segments[segIdx + 1];
+  if (!next) return 0;
+  const nextStyle = boundaryStyle(transition, next.id);
+  if (!TRANSITION_STYLE_INFO[nextStyle].dipColor) return 0; // only dips touch the tail
   if (segIdx >= segments.length - 1) return 0;
   const seg = segments[segIdx];
   if (!seg) return 0;
@@ -262,15 +268,16 @@ export function computeTransitionFx(
   transition: TransitionSettings | null | undefined,
 ): TransitionFx {
   const none: TransitionFx = { kind: "none", p: 0, style: null, dipColor: null, headMs: 0 };
-  if (!transition || transition.style === "none") return none;
+  if (!transition) return none;
   const seg = segments[segIdx];
   if (!seg || segIdx <= 0) return none;
+  const style = boundaryStyle(transition, seg.id);
+  if (style === "none") return none;
   const headMs = transitionHeadMs(segments, segIdx, transition);
   if (headMs <= 0) return none;
   const local = currentMs - seg.startMs;
   if (local < 0 || local >= headMs) return none;
   const p = Math.min(1, Math.max(0, local / headMs));
-  const style = transition.style;
   if (style === "dissolve") {
     return { kind: "dissolve", p, style, dipColor: null, headMs };
   }
@@ -322,14 +329,16 @@ export function computeGlobalFade(
     }
   }
 
-  // Dip tails (dip styles, all but the last clip).
+  // Dip tails (dip styles, all but the last clip) — colored by the style at
+  // the boundary into the NEXT segment (v4.5 per-boundary aware).
   const tailMs = transitionTailMs(segments, segIdx, transition);
   if (tailMs > 0) {
     const intoTail = currentMs - (seg.endMs - tailMs);
     if (intoTail >= 0) {
       const p = Math.min(1, intoTail / tailMs); // 0 → 1 as we approach the end
+      const nextStyle = boundaryStyle(transition, segments[segIdx + 1]?.id);
       const color =
-        transition.style === "dip-white" ? "white" : "black";
+        nextStyle === "dip-white" ? "white" : "black";
       return { alpha: 1 - p, color };
     }
   }

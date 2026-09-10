@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useState, type DragEvent } from "react";
+import { memo, useRef, useState, type DragEvent } from "react";
 import {
   Plus,
   Upload,
@@ -23,6 +23,7 @@ import {
   FolderOpen,
   Sparkles,
   ArrowLeftRight,
+  RotateCcw,
 } from "lucide-react";
 import type {
   MediaSegment,
@@ -31,8 +32,9 @@ import type {
   OverlapWarning,
   SubtitleFile,
   TransitionSettings,
+  TransitionStyle,
 } from "@/lib/merger/types";
-import { TRANSITION_STYLE_INFO } from "@/lib/merger/types";
+import { TRANSITION_STYLE_INFO, boundaryStyle } from "@/lib/merger/types";
 import { fmtTimecode } from "@/lib/merger/timeline";
 import { cn } from "@/lib/utils";
 
@@ -59,8 +61,14 @@ interface MediaPanelProps {
   onOverride: (id: string, durationMs: number) => void;
   onClearOverride: (id: string) => void;
   onReorder: (id: string, dir: -1 | 1) => void;
+  /** v4.5 drag-reorder: move an item to an absolute index. */
+  onMoveTo: (id: string, targetIdx: number) => void;
   /** Duplicate a segment in place (v4.2). */
   onDuplicate: (id: string) => void;
+  /** v4.5 per-boundary transition override (null = follow global). */
+  onBoundaryStyle: (segId: string, style: TransitionStyle | null) => void;
+  /** v4.5: reset ALL per-boundary overrides. */
+  onClearBoundaryOverrides: () => void;
   /** Save the current session as .framefuse.json (v4.2). */
   onSaveProject: () => void;
   onOpenProject: () => void;
@@ -106,7 +114,10 @@ export function MediaPanelBase({
   onOverride,
   onClearOverride,
   onReorder,
+  onMoveTo,
   onDuplicate,
+  onBoundaryStyle,
+  onClearBoundaryOverrides,
   onSaveProject,
   onOpenProject,
   transition,
@@ -114,6 +125,14 @@ export function MediaPanelBase({
   const [dragOver, setDragOver] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
+  // v4.5: per-boundary transition popover + card drag-reorder state.
+  // `draggedIdRef` is the SYNCHRONOUS source of truth (state stays for
+  // styling) — dragstart→drop can commit in the same tick when drags are
+  // programmatic/fast, and React state hasn't committed yet at drop time.
+  const [openBoundary, setOpenBoundary] = useState<string | null>(null);
+  const [draggedId, setDraggedId] = useState<string | null>(null);
+  const [dropTargetIdx, setDropTargetIdx] = useState<number | null>(null);
+  const draggedIdRef = useRef<string | null>(null);
 
   // v4.1: drag-drop routes images, audio AND .srt files with feedback.
   // v4.2: also routes .framefuse.json project files.
@@ -272,6 +291,8 @@ export function MediaPanelBase({
             {/* Dropzone (compact) when segments exist */}
             <div
               onDragOver={(e) => {
+                // v4.5: card drags (reorder) must not light up the file zone.
+                if (!e.dataTransfer.types.includes("Files")) return;
                 e.preventDefault();
                 setDragOver(true);
               }}
@@ -290,39 +311,204 @@ export function MediaPanelBase({
               <Plus className="size-3.5" /> Add more images
             </div>
 
+            {/* v4.5: per-boundary override summary + reset-all. */}
+            {transition.overrides && Object.keys(transition.overrides).length > 0 && (
+              <div
+                className="mb-2 flex items-center justify-between rounded-md border px-2 py-1"
+                style={{
+                  borderColor: "rgba(251, 191, 36, 0.25)",
+                  backgroundColor: "rgba(120, 53, 15, 0.14)",
+                }}
+              >
+                <span className="text-[9px] font-medium" style={{ color: "#fbbf24" }}>
+                  ✦ {Object.keys(transition.overrides).length} custom
+                  {" "}
+                  {Object.keys(transition.overrides).length === 1 ? "boundary" : "boundaries"}
+                </span>
+                <button
+                  type="button"
+                  onClick={onClearBoundaryOverrides}
+                  className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[8px] font-semibold transition-colors hover:bg-amber-500/15"
+                  style={{ color: "#fbbf24" }}
+                  title="Reset every boundary back to the global transition"
+                >
+                  <RotateCcw className="size-2.5" /> reset all
+                </button>
+              </div>
+            )}
+
             {segments.map((seg, idx) => {
               const overridden =
                 seg.rawDurationMs != null &&
                 Math.abs(seg.rawDurationMs - seg.durationMs) > 50;
               const kindStyle =
                 KIND_STYLES[seg.kind] || KIND_STYLES.duration;
+              // v4.5: drag-reorder only re-sequences SEQUENTIAL timelines —
+              // absolute/beat projects are ordered by filename timestamps.
+              const dragEnabled = mode !== "absolute";
+              // v4.5 boundary state: effective style + whether it's pinned.
+              const effStyle = boundaryStyle(transition, seg.id);
+              const isPinned =
+                !!transition.overrides &&
+                Object.prototype.hasOwnProperty.call(transition.overrides, seg.id);
+              const boundaryOpen = openBoundary === seg.id;
+              const headDurSec =
+                (Math.min(transition.durationMs, Math.floor(seg.durationMs * 0.45)) / 1000);
               return (
                 <div key={seg.id}>
-                {(idx > 0 && transition && transition.style !== "none") ? (
-                  <div
-                    className="ff-tx-link -my-0.5 flex items-center gap-1.5 pl-6 text-[9px] font-medium capitalize"
-                    style={{ color: "#d8b4fe" }}
-                    title={`${TRANSITION_STYLE_INFO[transition.style].label} transition into this segment · ${(Math.min(transition.durationMs, Math.floor(seg.durationMs * 0.45)) / 1000).toFixed(1)}s`}
-                  >
-                    <span
-                      className="inline-flex size-3.5 items-center justify-center rounded-full"
-                      style={{
-                        backgroundImage:
-                          "linear-gradient(135deg, #8b5cf6, #d946ef)",
-                        boxShadow: "0 0 6px rgba(139, 92, 246, 0.45)",
-                      }}
+                {idx > 0 ? (
+                  <div className="relative -my-0.5">
+                    {/* Click-outside backdrop while the picker is open. */}
+                    {boundaryOpen && (
+                      <div
+                        className="fixed inset-0 z-20"
+                        onClick={() => setOpenBoundary(null)}
+                        aria-hidden
+                      />
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setOpenBoundary(boundaryOpen ? null : seg.id)}
+                      aria-expanded={boundaryOpen}
+                      aria-label={`Transition into segment ${idx + 1}`}
+                      className={cn(
+                        "ff-tx-link relative z-[21] ml-5 flex items-center gap-1.5 rounded-full py-0.5 pl-2 pr-2.5 text-[9px] font-medium capitalize transition-all duration-200",
+                        effStyle === "none" && !isPinned
+                          ? "opacity-40 hover:opacity-100"
+                          : "hover:brightness-110",
+                      )}
+                      style={
+                        isPinned
+                          ? {
+                              color: "#fbbf24",
+                              backgroundColor: "rgba(120, 53, 15, 0.22)",
+                              boxShadow: "inset 0 0 0 1px rgba(251, 191, 36, 0.28)",
+                            }
+                          : effStyle !== "none"
+                            ? { color: "#d8b4fe" }
+                            : { color: "#71717a" }
+                      }
+                      title={`${TRANSITION_STYLE_INFO[effStyle].label} into segment ${idx + 1}${isPinned ? " (custom)" : ""} · ${headDurSec.toFixed(1)}s · click to customize`}
                     >
-                      <ArrowLeftRight className="size-2" style={{ color: "#fff" }} />
-                    </span>
-                    {transition.style.replace("-", " ")}
+                      <span
+                        className="inline-flex size-3.5 items-center justify-center rounded-full transition-transform duration-200 group-hover:scale-110"
+                        style={
+                          effStyle === "none"
+                            ? {
+                                backgroundColor: "#3f3f46",
+                              }
+                            : {
+                                backgroundImage:
+                                  "linear-gradient(135deg, #8b5cf6, #d946ef)",
+                                boxShadow: "0 0 6px rgba(139, 92, 246, 0.45)",
+                              }
+                        }
+                      >
+                        <ArrowLeftRight className="size-2" style={{ color: effStyle === "none" ? "#a1a1aa" : "#fff" }} />
+                      </span>
+                      {isPinned && effStyle === "none" ? "hard cut" : effStyle.replace("-", " ")}
+                      {isPinned && effStyle !== "none" ? " ✦" : ""}
+                      <ChevronDown
+                        className={cn(
+                          "size-2.5 transition-transform duration-200",
+                          boundaryOpen && "rotate-180",
+                        )}
+                        style={{ color: "currentColor" }}
+                      />
+                    </button>
+
+                    {/* v4.5 boundary style picker. */}
+                    {boundaryOpen && (
+                      <div className="ff-pop absolute left-5 top-full z-[22] mt-1 w-56 rounded-lg border p-2 shadow-xl">
+                        <p className="mb-1.5 px-0.5 text-[9px] font-semibold uppercase tracking-wider" style={{ color: "#71717a" }}>
+                          Boundary {idx} → {idx + 1}
+                        </p>
+                        <div className="grid grid-cols-2 gap-1">
+                          {(Object.keys(TRANSITION_STYLE_INFO) as TransitionStyle[]).map((st) => (
+                            <button
+                              key={st}
+                              type="button"
+                              onClick={() => {
+                                onBoundaryStyle(seg.id, st);
+                                setOpenBoundary(null);
+                              }}
+                              className={cn(
+                                "rounded px-1.5 py-1 text-left text-[9px] font-medium transition-all duration-150",
+                                effStyle === st
+                                  ? "bg-violet-500/25 ring-1 ring-violet-400/50"
+                                  : "hover:bg-white/5",
+                              )}
+                              style={{ color: effStyle === st ? "#d8b4fe" : "#a1a1aa" }}
+                              title={TRANSITION_STYLE_INFO[st].hint}
+                            >
+                              {TRANSITION_STYLE_INFO[st].label}
+                            </button>
+                          ))}
+                        </div>
+                        <div className="mt-1.5 flex items-center justify-between border-t pt-1.5" style={{ borderColor: "#27272a" }}>
+                          <span className="text-[8px] tabular-nums" style={{ color: "#52525b" }}>
+                            {headDurSec.toFixed(1)}s · global: {transition.style.replace("-", " ")}
+                          </span>
+                          {isPinned && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                onBoundaryStyle(seg.id, null);
+                                setOpenBoundary(null);
+                              }}
+                              className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[8px] font-semibold transition-colors hover:bg-white/5"
+                              style={{ color: "#fbbf24" }}
+                            >
+                              <RotateCcw className="size-2.5" /> follow global
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 ) : null}
                 <div
                   key={seg.id}
-                  className="group relative flex items-center gap-2.5 overflow-hidden rounded-lg border p-2 transition-all duration-150 hover:-translate-y-px"
+                  draggable={dragEnabled}
+                  onDragStart={(e) => {
+                    if (!dragEnabled) return;
+                    setDraggedId(seg.id);
+                    draggedIdRef.current = seg.id;
+                    e.dataTransfer.effectAllowed = "move";
+                    // Data required for some browsers to start a drag.
+                    e.dataTransfer.setData("text/plain", seg.id);
+                  }}
+                  onDragEnd={() => {
+                    setDraggedId(null);
+                    draggedIdRef.current = null;
+                    setDropTargetIdx(null);
+                  }}
+                  onDragOver={(e) => {
+                    const id = draggedIdRef.current;
+                    if (!id || id === seg.id) return;
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = "move";
+                    setDropTargetIdx(idx);
+                  }}
+                  onDrop={(e) => {
+                    const id = draggedIdRef.current;
+                    if (!id) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onMoveTo(id, idx);
+                    setDraggedId(null);
+                    draggedIdRef.current = null;
+                    setDropTargetIdx(null);
+                  }}
+                  className={cn(
+                    "group relative flex items-center gap-2.5 overflow-hidden rounded-lg border p-2 transition-all duration-150 hover:-translate-y-px",
+                    draggedId === seg.id && "opacity-40",
+                    dropTargetIdx === idx && draggedId && draggedId !== seg.id && "ring-1 ring-violet-400/70",
+                  )}
                   style={{
-                    borderColor: "#27272a",
-                    backgroundColor: "#18181b",
+                    borderColor: dropTargetIdx === idx && draggedId ? "#8b5cf6" : "#27272a",
+                    backgroundColor: draggedId === seg.id ? "#0f0f11" : "#18181b",
+                    cursor: draggedId ? "grabbing" : undefined,
                   }}
                 >
                   {/* Active-segment left accent (matches the timeline). */}
@@ -462,21 +648,41 @@ export function MediaPanelBase({
                     <button
                       type="button"
                       onClick={() => onReorder(seg.id, -1)}
-                      disabled={idx === 0}
+                      disabled={idx === 0 || !dragEnabled}
                       className="rounded p-0.5 transition-colors hover:bg-white/10 disabled:opacity-30"
                       style={{ color: "#71717a" }}
-                      title="Move up"
+                      title={
+                        dragEnabled
+                          ? "Move up"
+                          : "Order locked — sequenced by filename timestamps"
+                      }
                     >
                       <ArrowUp className="size-3.5" />
                     </button>
-                    <GripVertical className="size-3" style={{ color: "#3f3f46" }} />
+                    <span
+                      title={
+                        dragEnabled
+                          ? "Drag to reorder"
+                          : "Order locked — beat/absolute timelines are sequenced by filename timestamps"
+                      }
+                      className="flex items-center"
+                    >
+                      <GripVertical
+                        className="size-3"
+                        style={{ color: dragEnabled ? "#3f3f46" : "#27272a" }}
+                      />
+                    </span>
                     <button
                       type="button"
                       onClick={() => onReorder(seg.id, 1)}
-                      disabled={idx === segments.length - 1}
+                      disabled={idx === segments.length - 1 || !dragEnabled}
                       className="rounded p-0.5 transition-colors hover:bg-white/10 disabled:opacity-30"
                       style={{ color: "#71717a" }}
-                      title="Move down"
+                      title={
+                        dragEnabled
+                          ? "Move down"
+                          : "Order locked — sequenced by filename timestamps"
+                      }
                     >
                       <ArrowDown className="size-3.5" />
                     </button>

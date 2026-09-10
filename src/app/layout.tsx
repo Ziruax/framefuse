@@ -2,7 +2,7 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "FrameFuse v4.4 — Image Merger",
+  title: "FrameFuse v4.5 — Image Merger",
   description:
     "Native desktop tool that fuses images into MP4 video with Ken Burns motion, absolute timelines, and native FFmpeg encoding.",
   applicationName: "FrameFuse",

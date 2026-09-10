@@ -1,7 +1,7 @@
 "use client";
 
-import { Film, Download, X, Cpu, Clock, ImageIcon, Timer, Undo2, Redo2 } from "lucide-react";
-import type { TimelineMode, ExportProgress } from "@/lib/merger/types";
+import { Film, Download, X, Cpu, Clock, ImageIcon, Timer, Undo2, Redo2, Gauge } from "lucide-react";
+import type { TimelineMode, ExportProgress, VideoSettings } from "@/lib/merger/types";
 import { fmtBytes, fmtTimecode } from "@/lib/merger/timeline";
 import { cn } from "@/lib/utils";
 
@@ -26,6 +26,9 @@ interface HeaderProps {
   canRedo: boolean;
   onUndo: () => void;
   onRedo: () => void;
+  /** v4.5: export summary (settings + timeline length) for the estimate chip. */
+  settings?: VideoSettings;
+  totalMs?: number;
 }
 
 function timeAgo(at: number): string {
@@ -62,8 +65,19 @@ export function Header({
   canRedo,
   onUndo,
   onRedo,
+  settings,
+  totalMs = 0,
 }: HeaderProps) {
   const pct = exportProgress?.progress ?? 0;
+  // v4.5 export estimate: bitrate × duration / 8 → MB cap (CRF encodes
+  // usually come out smaller; NVENC maxrate caps near this).
+  const estMb = settings ? (settings.bitrateMbps * (totalMs / 1000)) / 8 : 0;
+  const estLabel =
+    estMb >= 1024 ? `${(estMb / 1024).toFixed(1)} GB` : `${Math.max(1, Math.round(estMb))} MB`;
+  const qualityLabel =
+    settings?.quality && settings.quality !== "custom"
+      ? settings.quality.charAt(0).toUpperCase() + settings.quality.slice(1)
+      : "Custom";
 
   return (
     <header
@@ -102,7 +116,7 @@ export function Header({
                 color: "#ddd6fe",
               }}
             >
-              v4.4
+              v4.5
             </span>
           </div>
           <div className="text-[11px]" style={{ color: "#71717a" }}>
@@ -271,6 +285,23 @@ export function Header({
           <span>{lastExport.method}</span>
           <span style={{ color: "#52525b" }}>·</span>
           <span>{timeAgo(lastExport.at)}</span>
+        </div>
+      )}
+
+      {/* v4.5: live export estimate — what the Export button will produce. */}
+      {!isExporting && imageCount > 0 && totalMs > 0 && settings && (
+        <div
+          className="hidden shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border px-2.5 py-1 text-[10px] font-medium tabular-nums md:flex"
+          style={{
+            borderColor: "rgba(52, 211, 153, 0.25)",
+            backgroundColor: "rgba(6, 78, 59, 0.14)",
+            color: "#6ee7b7",
+          }}
+          title={`${qualityLabel} profile · ${settings.resolution} · ${settings.fps}fps · CRF ${settings.crf ?? 20} — the size is a bitrate cap; CRF encodes usually land smaller`}
+        >
+          <Gauge className="size-3" />
+          {settings.resolution} · {settings.fps}fps · {(totalMs / 1000).toFixed(0)}s
+          <span style={{ color: "#34d399" }}>≲{estLabel}</span>
         </div>
       )}
 

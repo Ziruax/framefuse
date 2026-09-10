@@ -8,6 +8,7 @@ import type {
   TimelineMode,
   TransitionSettings,
 } from "@/lib/merger/types";
+import { boundaryStyle } from "@/lib/merger/types";
 import { fmtTimecode } from "@/lib/merger/timeline";
 import { cn } from "@/lib/utils";
 
@@ -98,6 +99,12 @@ export function TimelineRuler({
   if (ticks[ticks.length - 1] < totalMs) ticks.push(totalMs);
 
   const txActive = transition && transition.style !== "none";
+  // v4.5: boundaries can also be active purely via overrides even when the
+  // global style is "none" — the zone strip then only shows the pinned ones.
+  const txOverridesActive =
+    !txActive &&
+    !!transition.overrides &&
+    Object.keys(transition.overrides).length > 0;
 
   return (
     <div
@@ -252,7 +259,7 @@ export function TimelineRuler({
                     boxShadow: isActive
                       ? "0 0 0 1.5px rgba(255,255,255,0.75), 0 0 14px rgba(255,255,255,0.25)"
                       : "inset 0 -1px 0 rgba(0,0,0,0.25)",
-                    color: "rgba(9, 9, 11, 0.85)",
+                    color: "rgba(9, 9, 11, 0.92)",
                   }}
                   title={`${seg.fileName} · ${fmtTimecode(seg.startMs)}–${fmtTimecode(seg.endMs)}`}
                 >
@@ -262,10 +269,18 @@ export function TimelineRuler({
             })}
 
             {/* Transition zones (v4.3) — the head window of every segment
-                after the first, drawn as a diagonal-hatch gradient strip. */}
-            {txActive &&
+                after the first, drawn as a diagonal-hatch gradient strip.
+                v4.5: per-boundary overrides tint AMBER + show the boundary's
+                own style; only boundaries with an effective style ≠ none
+                are drawn. */}
+            {txActive || txOverridesActive ?
               segments.map((seg, idx) => {
                 if (idx === 0) return null;
+                const effStyle = boundaryStyle(transition, seg.id);
+                if (effStyle === "none") return null;
+                const pinned =
+                  !!transition.overrides &&
+                  Object.prototype.hasOwnProperty.call(transition.overrides, seg.id);
                 const durMs = Math.min(
                   transition.durationMs,
                   Math.floor(seg.durationMs * 0.45),
@@ -286,17 +301,22 @@ export function TimelineRuler({
                       left: `${left}%`,
                       width: `${Math.max(0.4, width)}%`,
                       height: "30%",
-                      backgroundImage:
-                        "repeating-linear-gradient(135deg, rgba(217, 70, 239, 0.55) 0 3px, rgba(139, 92, 246, 0.25) 3px 6px)",
+                      backgroundImage: pinned
+                        ? "repeating-linear-gradient(135deg, rgba(251, 191, 36, 0.6) 0 3px, rgba(245, 158, 11, 0.28) 3px 6px)"
+                        : "repeating-linear-gradient(135deg, rgba(217, 70, 239, 0.55) 0 3px, rgba(139, 92, 246, 0.25) 3px 6px)",
                       boxShadow: inPlay
-                        ? "0 0 8px rgba(217, 70, 239, 0.55)"
+                        ? pinned
+                          ? "0 0 8px rgba(251, 191, 36, 0.55)"
+                          : "0 0 8px rgba(217, 70, 239, 0.55)"
                         : "none",
-                      border: "1px solid rgba(217, 70, 239, 0.35)",
+                      border: pinned
+                        ? "1px solid rgba(251, 191, 36, 0.4)"
+                        : "1px solid rgba(217, 70, 239, 0.35)",
                     }}
-                    title={`${transition.style} transition · ${fmtTimecode(seg.startMs)}+${(durMs / 1000).toFixed(1)}s`}
+                    title={`${effStyle}${pinned ? " (custom)" : ""} transition · ${fmtTimecode(seg.startMs)}+${(durMs / 1000).toFixed(1)}s`}
                   />
                 );
-              })}
+              }) : null}
           </div>
 
           {/* Headline marker chips (v4.3) — amber bars on the top edge,
