@@ -1,16 +1,28 @@
-# FrameFuse v4.6
+# FrameFuse v4.7
 
-Native desktop **image → video** merger with **beat-synced cutting**, **viral kinetic captions**, **segment transitions**, **per-boundary transition overrides**, **export quality profiles**, **watermark/logo overlay**, **undo/redo**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
+Native desktop **image → video** merger with a **live audio waveform timeline**, **beat-synced cutting with a strength dial**, **viral kinetic captions with favorites**, **segment transitions**, **per-boundary transition overrides**, **export quality profiles**, **watermark/logo overlay**, **undo/redo**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
 
 ## Highlights
 
-### 🥁 Beat-synced editing (new in v4.6)
+### 🌊 Audio waveform timeline (new in v4.7)
+Drop any track and the timeline renders its **full peak waveform** between the ruler and the segment bars — bright cyan bars mark playback progress in real time (audio-relative, pixel-exact at any scrub position), dim bars show what's coming. Mirrored bars use sqrt perceptual shaping so quiet passages stay visible, and the static pass is cached offscreen keyed by decode identity for 60fps-safe redraws.
+
+### 🎚 Beat-snap strength dial (new in v4.7)
+Choose how often cuts land: every **Beat**, every **2** beats, a **Bar** (4/4), or **2 bars**. Fast cuts for energetic tracks, cinematic pacing for slow ones — the strided walk still follows tempo drift and stays export-parity (duration overrides only). Persisted across sessions.
+
+### ⭐ Caption preset favorites (new in v4.7)
+Star any of the 42 presets — favorites pin to a **★ group at the top** of the picker (deduplicated from their home categories), get their own filter option, and persist across restarts.
+
+### 🎨 Visual polish pass (new in v4.7)
+VLM-reviewed UI refresh (6.5 → 8.5/10): desaturated timeline bars with bright color reserved for the playhead, playhead drop-shadow readability over bars and waveform, ringed legend dots, secondary-styled Random button, clearer toggle off-states, 44px transport hit targets, timecode separator hierarchy, and tactile press feedback on Export.
+
+### 🥁 Beat-synced editing (v4.6)
 Drop a music track and hit **Detect beats** — a local onset-envelope DSP (no network, no wasm download) estimates the **BPM** and every beat. **Snap cuts** retimes all boundaries onto the pulse (tempo-tracking walk over the real beat list, or median-grid quantization when the music is slower than your cut rate), and **Fit video to audio** scales the whole timeline to end with the song. Beat ticks render on the ruler (the beat under the playhead pulses live), every snap/fit is undoable, and because it only produces duration overrides the FFmpeg export stays in exact parity automatically.
 
-### 🔍 Caption preset search (new in v4.6)
+### 🔍 Caption preset search (v4.6)
 42 presets now have a **search box** (name, description, animation, word-mode) + a **category filter** — find "Hormozi", "karaoke" or "glitch" in one keystroke instead of scrolling nine groups.
 
-### 🎤 Karaoke WebVTT (new in v4.6)
+### 🎤 Karaoke WebVTT (v4.6)
 `words .vtt` export emits **word-level timing via WebVTT intra-cue timestamps** — supporting players highlight each word as it's spoken, straight from the Whisper alignment.
 
 ### ⚡ Export quality profiles (new in v4.5)
