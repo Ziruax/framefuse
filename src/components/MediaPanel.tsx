@@ -22,6 +22,7 @@ import {
   Save,
   FolderOpen,
   Sparkles,
+  ArrowLeftRight,
 } from "lucide-react";
 import type {
   MediaSegment,
@@ -29,7 +30,9 @@ import type {
   AudioTrack,
   OverlapWarning,
   SubtitleFile,
+  TransitionSettings,
 } from "@/lib/merger/types";
+import { TRANSITION_STYLE_INFO } from "@/lib/merger/types";
 import { fmtTimecode } from "@/lib/merger/timeline";
 import { cn } from "@/lib/utils";
 
@@ -61,6 +64,8 @@ interface MediaPanelProps {
   /** Save the current session as .framefuse.json (v4.2). */
   onSaveProject: () => void;
   onOpenProject: () => void;
+  /** Segment transitions (v4.3) — boundary link indicators. */
+  transition: TransitionSettings;
 }
 
 const KIND_STYLES: Record<
@@ -104,6 +109,7 @@ export function MediaPanelBase({
   onDuplicate,
   onSaveProject,
   onOpenProject,
+  transition,
 }: MediaPanelProps) {
   const [dragOver, setDragOver] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -291,6 +297,26 @@ export function MediaPanelBase({
               const kindStyle =
                 KIND_STYLES[seg.kind] || KIND_STYLES.duration;
               return (
+                <div key={seg.id}>
+                {(idx > 0 && transition && transition.style !== "none") ? (
+                  <div
+                    className="ff-tx-link -my-0.5 flex items-center gap-1.5 pl-6 text-[9px] font-medium capitalize"
+                    style={{ color: "#d8b4fe" }}
+                    title={`${TRANSITION_STYLE_INFO[transition.style].label} transition into this segment · ${(Math.min(transition.durationMs, Math.floor(seg.durationMs * 0.45)) / 1000).toFixed(1)}s`}
+                  >
+                    <span
+                      className="inline-flex size-3.5 items-center justify-center rounded-full"
+                      style={{
+                        backgroundImage:
+                          "linear-gradient(135deg, #8b5cf6, #d946ef)",
+                        boxShadow: "0 0 6px rgba(139, 92, 246, 0.45)",
+                      }}
+                    >
+                      <ArrowLeftRight className="size-2" style={{ color: "#fff" }} />
+                    </span>
+                    {transition.style.replace("-", " ")}
+                  </div>
+                ) : null}
                 <div
                   key={seg.id}
                   className="group relative flex items-center gap-2.5 overflow-hidden rounded-lg border p-2 transition-all duration-150 hover:-translate-y-px"
@@ -475,6 +501,7 @@ export function MediaPanelBase({
                       <Trash2 className="size-3.5" />
                     </button>
                   </div>
+                </div>
                 </div>
               );
             })}

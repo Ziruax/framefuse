@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { Play, Pause, SkipBack, SkipForward, ImageOff, Type } from "lucide-react";
+import { Play, Pause, SkipBack, SkipForward, ImageOff, Type, ArrowLeftRight } from "lucide-react";
 import type {
   AspectRatio,
   CaptionSettings,
@@ -9,8 +9,15 @@ import type {
   KenBurnsConfig,
   MediaSegment,
   SubtitleFile,
+  TransitionSettings,
 } from "@/lib/merger/types";
-import { drawFrame, previewDimensions } from "@/lib/merger/renderer";
+import {
+  computeTransitionFx,
+  computeGlobalFade,
+  applyGlobalFade,
+  drawFrameWithTransition,
+  previewDimensions,
+} from "@/lib/merger/renderer";
 import { drawCaption, drawHeadline } from "@/lib/merger/native";
 import { cueAt } from "@/lib/merger/subtitles";
 import { fmtTimecode } from "@/lib/merger/timeline";
@@ -28,6 +35,8 @@ interface PreviewPanelProps {
   captionSettings: CaptionSettings;
   /** Headline overlay items (v4.2). */
   headlineItems: HeadlineItem[];
+  /** Segment transitions (v4.3). */
+  transition: TransitionSettings;
   onSeek: (ms: number) => void;
   onTogglePlay: () => void;
   onStep: (dir: -1 | 1) => void;
@@ -45,11 +54,13 @@ export function PreviewPanel({
   subtitles,
   captionSettings,
   headlineItems,
+  transition,
   onSeek,
   onTogglePlay,
   onStep,
 }: PreviewPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const scratchRef = useRef<HTMLCanvasElement | null>(null);
   const dims = previewDimensions(aspect);
 
   // Redraw whenever the playhead or inputs change.
@@ -61,7 +72,18 @@ export function PreviewPanel({
     const seg = activeSegment;
     const img = seg ? images[seg.id] ?? null : null;
     if (seg) {
-      drawFrame(ctx, img, seg, currentMs, dims.w, dims.h, kenBurns);
+      // v4.3: transition head composite (dissolve/slide/wipe/dip) with
+      // EXACT export parity, then captions, then the global fades.
+      if (!scratchRef.current) scratchRef.current = document.createElement("canvas");
+      if (scratchRef.current.width !== dims.w || scratchRef.current.height !== dims.h) {
+        scratchRef.current.width = dims.w;
+        scratchRef.current.height = dims.h;
+      }
+      const segIdx = segments.findIndex((s) => s.id === seg.id);
+      drawFrameWithTransition(
+        ctx, scratchRef.current, seg, Math.max(0, segIdx), segments,
+        img, images, currentMs, dims.w, dims.h, kenBurns, transition,
+      );
     } else {
       ctx.fillStyle = "#0a0a0a";
       ctx.fillRect(0, 0, dims.w, dims.h);
@@ -93,6 +115,17 @@ export function PreviewPanel({
         drawCaption(ctx, cue.text, capCtx, dims.w, dims.h);
       }
     }
+
+    // v4.3: global fades AFTER captions — mirrors fade-after-subtitles
+    // in the FFmpeg export (start/end fades + dip tails).
+    if (seg && scratchRef.current) {
+      const segIdx = Math.max(0, segments.findIndex((s) => s.id === seg.id));
+      applyGlobalFade(
+        ctx,
+        scratchRef.current,
+        computeGlobalFade(segments, segIdx, currentMs, transition),
+      );
+    }
   }, [
     currentMs,
     activeSegment,
@@ -103,9 +136,30 @@ export function PreviewPanel({
     subtitles,
     captionSettings,
     headlineItems,
+    segments,
+    transition,
   ]);
 
   const pct = totalMs > 0 ? (currentMs / totalMs) * 100 : 0;
+
+  // v4.3: is the playhead inside a transition window right now?
+  const activeTxFx = (() => {
+    if (!activeSegment || transition.style === "none") return null;
+    const idx = segments.findIndex((s) => s.id === activeSegment.id);
+    if (idx <= 0) return null;
+    const fx = computeTransitionFx(segments, idx, currentMs, transition);
+    return fx.kind === "none" ? null : fx;
+  })();
+  const txLabel =
+    activeTxFx && activeTxFx.kind !== "none"
+      ? transition.style === "dissolve"
+        ? "dissolve"
+        : transition.style === "dip-black"
+          ? "dip"
+          : transition.style === "dip-white"
+            ? "flash"
+            : transition.style.replace("-", " ")
+      : null;
 
   return (
     <div
@@ -185,6 +239,21 @@ export function PreviewPanel({
                 }}
               >
                 ⟶ {activeSegment.direction}
+              </div>
+            )}
+            {/* Active transition indicator (v4.3) */}
+            {txLabel && (
+              <div
+                className="pointer-events-none absolute bottom-2 right-2 flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-medium capitalize backdrop-blur-sm ff-tx-live"
+                style={{
+                  backgroundColor: "rgba(0, 0, 0, 0.55)",
+                  color: "#f0abfc",
+                  border: "1px solid rgba(240, 171, 252, 0.25)",
+                }}
+                title={`Transition playing — ${(activeTxFx?.p ?? 0).toFixed(2)} progress`}
+              >
+                <ArrowLeftRight className="size-3" />
+                {txLabel}
               </div>
             )}
             {/* Headline indicator (v4.2) */}

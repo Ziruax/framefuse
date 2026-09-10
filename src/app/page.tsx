@@ -32,6 +32,7 @@ import {
   defaultAudioSettings,
   defaultCaptionSettings,
   defaultKenBurnsConfig,
+  defaultTransitionSettings,
   makeHeadlineItem,
   type AudioSettings,
   type AudioTrack,
@@ -41,6 +42,7 @@ import {
   type KenBurnsConfig,
   type MediaSegment,
   type SubtitleFile,
+  type TransitionSettings,
   type VideoSettings,
 } from "@/lib/merger/types";
 import { getCaptionPreset, getFontOption, CAPTION_PRESETS } from "@/lib/merger/captionPresets";
@@ -73,6 +75,8 @@ interface PersistedSettings {
   whisperLanguage: string;
   /** Headline overlay items (persisted so hook titles survive reloads). v4.2 */
   headlines?: HeadlineItem[];
+  /** Segment transitions (v4.3). */
+  transition?: TransitionSettings;
 }
 
 function loadPersisted(): Partial<PersistedSettings> {
@@ -122,6 +126,10 @@ export default function Page() {
   // ---- Headline overlay track (v4.2) — viral hook titles ----------------
   const [headlineItems, setHeadlineItems] = useState<HeadlineItem[]>([]);
 
+  // ---- Segment transitions (v4.3) -----------------------------------------
+  const [transitionSettings, setTransitionSettings] =
+    useState<TransitionSettings>(defaultTransitionSettings());
+
   // Whisper language: "auto" = auto-detect, or a 2-letter code like "en".
   const [whisperLanguage, setWhisperLanguage] = useState<string>("auto");
 
@@ -142,6 +150,7 @@ export default function Page() {
     if (p.captionSettings) setCaptionSettings(p.captionSettings);
      
     if (p.audio) setAudioSettings(p.audio);
+    if (p.transition) setTransitionSettings(p.transition);
     if (Array.isArray(p.headlines)) {
        
       setHeadlineItems(
@@ -217,6 +226,179 @@ export default function Page() {
         : null,
     [timeline.segments, currentMs],
   );
+
+  // ---- Undo / Redo (v4.3) — snapshot history of the editable session ------
+  // Object URLs are NEVER revoked mid-session (only on unmount) so a removed
+  // segment can always be restored byte-perfect by Ctrl+Z.
+  interface HistorySnapshot {
+    items: MediaItem[];
+    overrides: Record<string, number>;
+    subtitles: SubtitleFile | null;
+    headlineItems: HeadlineItem[];
+    captionSettings: CaptionSettings;
+    kenBurns: KenBurnsConfig;
+    settings: VideoSettings;
+    audioSettings: AudioSettings;
+    audioTrack: AudioTrack | null;
+    whisperLanguage: string;
+    transition: TransitionSettings;
+  }
+
+  const HISTORY_MAX = 80;
+  const historyRef = useRef<{
+    stack: HistorySnapshot[];
+    idx: number;
+    baseline: boolean;
+    /** A push is requested and waiting for its debounce window. */
+    pending: boolean;
+    /** Timestamp of the last action — pushes wait for the burst to settle. */
+    lastRequest: number;
+  }>({ stack: [], idx: -1, baseline: false, pending: false, lastRequest: 0 });
+  const [historyState, setHistoryState] = useState({
+    canUndo: false,
+    canRedo: false,
+  });
+
+  // Mirror of all snapshot-able state (synced after every commit — the
+  // history flush reads this POST-mutation value).
+  const stateRef = useRef<HistorySnapshot | null>(null);
+  useEffect(() => {
+    stateRef.current = {
+      items,
+      overrides,
+      subtitles,
+      headlineItems,
+      captionSettings,
+      kenBurns,
+      settings,
+      audioSettings,
+      audioTrack,
+      whisperLanguage,
+      transition: transitionSettings,
+    };
+  });
+
+  const snapshotEq = (a: HistorySnapshot, b: HistorySnapshot): boolean => {
+    try {
+      return JSON.stringify(a) === JSON.stringify(b);
+    } catch {
+      return false;
+    }
+  };
+
+  // POST-STATE history design: every stack entry is a full session state
+  // captured AFTER an action committed. Undo steps to the previous entry,
+  // redo re-applies the next — which is exactly how the removed-segment
+  // case works: [baseline(9), removed(8)] → undo → 9, redo → 8.
+  const pushTimerRef = useRef<number | null>(null);
+
+  const flushHistoryPush = useCallback(() => {
+    const h = historyRef.current;
+    const snap = stateRef.current;
+    if (pushTimerRef.current) {
+      clearTimeout(pushTimerRef.current);
+      pushTimerRef.current = null;
+    }
+    if (!h.pending || !snap || !h.baseline) return;
+    h.pending = false;
+    const top = h.stack[h.idx];
+    if (top && snapshotEq(top, snap)) return; // no-op guard
+    h.stack.length = h.idx + 1; // truncate the redo tail
+    h.stack.push(snap);
+    if (h.stack.length > HISTORY_MAX) h.stack.shift();
+    h.idx = h.stack.length - 1;
+    setHistoryState({ canUndo: h.idx > 0, canRedo: false });
+  }, []);
+
+  /**
+   * Request a history push of the state AFTER the current action settles.
+   * - debounceMs = 0 → discrete action (click): flush ~80ms after the call
+   *   (post-commit, post-stateRef-sync).
+   * - debounceMs > 0 → continuous input (slider/spinner): every change
+   *   restarts the timer; the FINAL settled state is pushed once.
+   */
+  const requestHistoryPush = useCallback(
+    (debounceMs = 0) => {
+      const h = historyRef.current;
+      h.pending = true;
+      h.lastRequest = Date.now();
+      if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
+      const delay = Math.max(80, debounceMs);
+      pushTimerRef.current = window.setTimeout(() => {
+        flushHistoryPush();
+      }, delay);
+    },
+    [flushHistoryPush],
+  );
+
+  const applySnapshot = useCallback((snap: HistorySnapshot) => {
+    // Cancel any in-flight push so restored states are never re-pushed.
+    const h = historyRef.current;
+    h.pending = false;
+    if (pushTimerRef.current) {
+      clearTimeout(pushTimerRef.current);
+      pushTimerRef.current = null;
+    }
+    setItems(snap.items);
+    setOverrides(snap.overrides);
+    setSubtitles(snap.subtitles);
+    setHeadlineItems(snap.headlineItems);
+    setCaptionSettings(snap.captionSettings);
+    setKenBurns(snap.kenBurns);
+    setSettings(snap.settings);
+    setAudioSettings(snap.audioSettings);
+    setAudioTrack(snap.audioTrack);
+    setWhisperLanguage(snap.whisperLanguage);
+    setTransitionSettings(snap.transition);
+    setIsPlaying(false);
+  }, []);
+
+  const undo = useCallback(() => {
+    const h = historyRef.current;
+    if (h.idx <= 0) return;
+    h.idx -= 1;
+    applySnapshot(h.stack[h.idx]);
+    setHistoryState({
+      canUndo: h.idx > 0,
+      canRedo: h.idx < h.stack.length - 1,
+    });
+  }, [applySnapshot]);
+
+  const redo = useCallback(() => {
+    const h = historyRef.current;
+    if (h.idx >= h.stack.length - 1) return;
+    h.idx += 1;
+    applySnapshot(h.stack[h.idx]);
+    setHistoryState({
+      canUndo: h.idx > 0,
+      canRedo: h.idx < h.stack.length - 1,
+    });
+  }, [applySnapshot]);
+
+  // Baseline snapshot after the persisted-restore effect settles.
+  useEffect(() => {
+    const t = setTimeout(() => {
+      const h = historyRef.current;
+      if (!h.baseline) {
+        h.baseline = true;
+        // Directly push the initial state (not via request — no action).
+        const snap = stateRef.current;
+        if (snap) {
+          h.stack = [snap];
+          h.idx = 0;
+        }
+      }
+    }, 100);
+    return () => clearTimeout(t);
+  }, []);
+
+  // Track every object URL ever created so unmount can clean them all up
+  // (they stay alive during the session for undo restores).
+  const urlsRef = useRef<Set<string>>(new Set());
+  const trackUrl = useCallback((url: string) => {
+    urlsRef.current.add(url);
+    return url;
+  }, []);
 
   // ---- Load images when items change --------------------------------------
   useEffect(() => {
@@ -336,6 +518,7 @@ export default function Page() {
         subtitles,
         captionSettings,
         headlines: headlineItems.length ? headlineItems : null,
+        transition: transitionSettings,
         onProgress: (p) => setExportProgress(p),
         signal: ac.signal,
       });
@@ -368,6 +551,7 @@ export default function Page() {
     subtitles,
     captionSettings,
     headlineItems,
+    transitionSettings,
     inElectron,
   ]);
 
@@ -422,20 +606,22 @@ export default function Page() {
   // ---- Handlers -----------------------------------------------------------
   const addFiles = useCallback((files: File[]) => {
     if (!files.length) return;
+    requestHistoryPush();
     setItems((prev) => {
       const next = [...prev];
       for (const f of files) {
-        next.push({ id: genId(), file: f, url: URL.createObjectURL(f) });
+        next.push({ id: genId(), file: f, url: trackUrl(URL.createObjectURL(f)) });
       }
       return next;
     });
     toast.success(`Added ${files.length} image${files.length === 1 ? "" : "s"}`);
-  }, []);
+  }, [requestHistoryPush, trackUrl]);
 
   const addAudio = useCallback((file: File) => {
-    setAudioTrack((prev) => {
-      if (prev) URL.revokeObjectURL(prev.url);
-      const url = URL.createObjectURL(file);
+    requestHistoryPush();
+    setAudioTrack(() => {
+      // The previous track's URL stays alive (undo-safe); unmount revokes.
+      const url = trackUrl(URL.createObjectURL(file));
       const a = document.createElement("audio");
       a.preload = "metadata";
       a.onloadedmetadata = () => {
@@ -451,11 +637,12 @@ export default function Page() {
       return { fileName: file.name, url, durationMs: null };
     });
     toast.success(`Audio: ${file.name}`);
-  }, []);
+  }, [requestHistoryPush, trackUrl]);
 
   // ---- Subtitle (.srt) loading -------------------------------------------
   const addSubtitles = useCallback(
     (file: File) => {
+      requestHistoryPush();
       const reader = new FileReader();
       reader.onload = () => {
         const rawText = String(reader.result || "");
@@ -488,18 +675,20 @@ export default function Page() {
       };
       reader.readAsText(file);
     },
-    [],
+    [requestHistoryPush],
   );
 
   const removeSubtitles = useCallback(() => {
+    requestHistoryPush();
     setSubtitles(null);
-  }, []);
+  }, [requestHistoryPush]);
 
   // ---- Caption preset selection — make presets BEHAVE like their names --
   // Selecting a preset applies its signature wordMode + animation (unless
   // the user pinned one) + preferred font, so "Hormozi" actually slams
   // single words and "Karaoke" actually fills word-by-word.
   const applyCaptionPreset = useCallback((presetId: string) => {
+    requestHistoryPush();
     const preset = getCaptionPreset(presetId);
     setCaptionSettings((prev) => {
       const next: CaptionSettings = {
@@ -519,7 +708,7 @@ export default function Page() {
       }
       return next;
     });
-  }, []);
+  }, [requestHistoryPush]);
 
   // ---- Caption sidecar exports (.srt browser / .ass Electron) ----------
   const exportSrtSidecar = useCallback(() => {
@@ -614,13 +803,14 @@ export default function Page() {
       audio: audioSettings,
       whisperLanguage,
       headlines: headlineItems.length ? headlineItems : [],
+      transition: transitionSettings,
     };
     try {
       localStorage.setItem(LS_KEY, JSON.stringify(payload));
     } catch {
       /* storage full / private mode — non-fatal */
     }
-  }, [kenBurns, settings, captionSettings, audioSettings, whisperLanguage, headlineItems]);
+  }, [kenBurns, settings, captionSettings, audioSettings, whisperLanguage, headlineItems, transitionSettings]);
 
   const generateCaptionsFromAudio = useCallback(async () => {
     if (!audioTrack) {
@@ -665,6 +855,7 @@ export default function Page() {
         (n, c) => n + (c.words?.length ?? 0),
         0,
       );
+      requestHistoryPush(250);
       setSubtitles({
         fileName: `${audioTrack.fileName.replace(/\.[^.]+$/, "")}.whisper.srt`,
         cues: result.cues,
@@ -713,7 +904,7 @@ export default function Page() {
       setWhisperBusy(false);
       setWhisperProgress(null);
     }
-  }, [audioTrack, whisperBusy, whisperLanguage]);
+  }, [audioTrack, whisperBusy, whisperLanguage, requestHistoryPush]);
 
   const loadSamples = useCallback(async () => {
     try {
@@ -744,40 +935,39 @@ export default function Page() {
   }, [addFiles]);
 
   const removeAudio = useCallback(() => {
-    setAudioTrack((prev) => {
-      if (prev) URL.revokeObjectURL(prev.url);
-      return null;
-    });
-  }, []);
+    requestHistoryPush();
+    setAudioTrack(null);
+  }, [requestHistoryPush]);
 
   const removeItem = useCallback((id: string) => {
-    setItems((prev) => {
-      const target = prev.find((i) => i.id === id);
-      if (target) URL.revokeObjectURL(target.url);
-      return prev.filter((i) => i.id !== id);
-    });
+    requestHistoryPush();
+    // The object URL stays alive (undo-safe) — revoked on unmount only.
+    setItems((prev) => prev.filter((i) => i.id !== id));
     setOverrides((prev) => {
       if (!(id in prev)) return prev;
       const next = { ...prev };
       delete next[id];
       return next;
     });
-  }, []);
+  }, [requestHistoryPush]);
 
   const overrideDuration = useCallback((id: string, durationMs: number) => {
+    requestHistoryPush(600);
     setOverrides((prev) => ({ ...prev, [id]: durationMs }));
-  }, []);
+  }, [requestHistoryPush]);
 
   const clearOverride = useCallback((id: string) => {
+    requestHistoryPush();
     setOverrides((prev) => {
       if (!(id in prev)) return prev;
       const next = { ...prev };
       delete next[id];
       return next;
     });
-  }, []);
+  }, [requestHistoryPush]);
 
   const reorderItem = useCallback((id: string, dir: -1 | 1) => {
+    requestHistoryPush();
     setItems((prev) => {
       const idx = prev.findIndex((i) => i.id === id);
       if (idx < 0) return prev;
@@ -787,12 +977,13 @@ export default function Page() {
       [next[idx], next[target]] = [next[target], next[idx]];
       return next;
     });
-  }, []);
+  }, [requestHistoryPush]);
 
   /** Duplicate a media item right after the original (v4.2). Copies the
    *  file (same object) with a fresh id so it lands as its own timeline
    *  segment; duration overrides do NOT carry over (the copy re-parses). */
   const duplicateItem = useCallback((id: string) => {
+    requestHistoryPush();
     setItems((prev) => {
       const idx = prev.findIndex((i) => i.id === id);
       if (idx < 0) return prev;
@@ -800,17 +991,18 @@ export default function Page() {
       const copy: MediaItem = {
         id: genId(),
         file: src.file,
-        url: URL.createObjectURL(src.file),
+        url: trackUrl(URL.createObjectURL(src.file)),
       };
       const next = [...prev];
       next.splice(idx + 1, 0, copy);
       return next;
     });
     toast.success("Duplicated segment");
-  }, []);
+  }, [requestHistoryPush, trackUrl]);
 
   // ---- Headline overlay management (v4.2) ------------------------------
   const addHeadline = useCallback(() => {
+    requestHistoryPush();
     setHeadlineItems((prev) => {
       // New items default to starting right after the last one ends
       // (or at the playhead when empty) — quick “hook chain” building.
@@ -820,20 +1012,22 @@ export default function Page() {
       const item = makeHeadlineItem({ startMs: base, endMs: base + 3000 });
       return [...prev, item];
     });
-  }, []);
+  }, [requestHistoryPush]);
 
   const updateHeadline = useCallback(
     (id: string, patch: Partial<HeadlineItem>) => {
+      requestHistoryPush(600);
       setHeadlineItems((prev) =>
         prev.map((h) => (h.id === id ? { ...h, ...patch } : h)),
       );
     },
-    [],
+    [requestHistoryPush],
   );
 
   const removeHeadline = useCallback((id: string) => {
+    requestHistoryPush();
     setHeadlineItems((prev) => prev.filter((h) => h.id !== id));
-  }, []);
+  }, [requestHistoryPush]);
 
   // ---- Project save / load (.framefuse.json, v4.2) --------------------
   const projectInputRef = useRef<HTMLInputElement>(null);
@@ -876,6 +1070,7 @@ export default function Page() {
           caption: captionSettings,
           audio: audioSettings,
           whisperLanguage,
+          transition: transitionSettings,
         },
       });
       const name = downloadProjectFile(project);
@@ -903,6 +1098,7 @@ export default function Page() {
     captionSettings,
     audioSettings,
     whisperLanguage,
+    transitionSettings,
   ]);
 
   const loadProject = useCallback(
@@ -911,25 +1107,23 @@ export default function Page() {
         const loaded = await parseProjectFile(file);
         const { project } = loaded;
 
-        // Reset current session media.
-        setItems((prev) => {
-          prev.forEach((i) => URL.revokeObjectURL(i.url));
-          return [];
-        });
-        if (audioTrack) URL.revokeObjectURL(audioTrack.url);
+        // Snapshot the PRE-load session so Ctrl+Z restores it fully
+        // (object URLs are kept alive for exactly this).
+        requestHistoryPush(400);
 
         // Rebuild media items with their SAVED ids (so duration overrides
-        // + Ken Burns direction hashing map 1:1).
+        // + Ken Burns direction hashing map 1:1). Old media URLs stay alive
+        // for undo; the unmount cleanup revokes everything.
         const restored: MediaItem[] = loaded.imageFiles.map((entry) => ({
           id: entry.id,
           file: entry.file,
-          url: URL.createObjectURL(entry.file),
+          url: trackUrl(URL.createObjectURL(entry.file)),
         }));
         setItems(restored);
 
         // Audio.
         if (loaded.audioFile) {
-          const url = URL.createObjectURL(loaded.audioFile);
+          const url = trackUrl(URL.createObjectURL(loaded.audioFile));
           const a = document.createElement("audio");
           a.preload = "metadata";
           a.onloadedmetadata = () => {
@@ -972,6 +1166,7 @@ export default function Page() {
             ? project.overrides
             : {},
         );
+        setTransitionSettings(project.settings.transition || defaultTransitionSettings());
 
         // Rewind + stop.
         currentMsRef.current = 0;
@@ -988,7 +1183,7 @@ export default function Page() {
         toast.error(e instanceof Error ? e.message : "Project load failed");
       }
     },
-    [audioTrack],
+    [requestHistoryPush, trackUrl],
   );
 
   const seek = useCallback((ms: number) => {
@@ -1031,8 +1226,9 @@ export default function Page() {
     abortRef.current?.abort();
   }, []);
 
-  // ---- Keyboard shortcuts (production-ready transport) ------------------
-  // Space: play/pause · ←/→: seek ±1s · Shift+←/→: prev/next segment.
+  // ---- Keyboard shortcuts (production-ready transport + undo/redo) -----
+  // Space: play/pause · ←/→: seek ±1s · Shift+←/→: prev/next segment
+  // Ctrl/Cmd+Z: undo · Ctrl/Cmd+Shift+Z / Ctrl+Y: redo.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
@@ -1046,7 +1242,15 @@ export default function Page() {
       ) {
         return;
       }
-      if (e.key === " " || e.code === "Space") {
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && (e.key === "z" || e.key === "Z")) {
+        e.preventDefault();
+        if (e.shiftKey) redo();
+        else undo();
+      } else if (mod && (e.key === "y" || e.key === "Y")) {
+        e.preventDefault();
+        redo();
+      } else if (e.key === " " || e.code === "Space") {
         e.preventDefault();
         togglePlay();
       } else if (e.key === "ArrowRight") {
@@ -1064,19 +1268,74 @@ export default function Page() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, seek, stepSegment]);
+  }, [togglePlay, seek, stepSegment, undo, redo]);
 
   // ---- Cleanup object URLs on unmount -------------------------------------
+  // URLs are deliberately kept alive during the whole session so undo can
+  // restore removed media byte-perfect; this is the single revocation point.
   useEffect(() => {
+    const urls = urlsRef.current;
     return () => {
-      items.forEach((i) => URL.revokeObjectURL(i.url));
-      if (audioTrack) URL.revokeObjectURL(audioTrack.url);
+      urls.forEach((u) => {
+        try {
+          URL.revokeObjectURL(u);
+        } catch {
+          /* already gone */
+        }
+      });
+      urls.clear();
     };
   }, []);
 
   const allSkipped = useMemo(
     () => [...skippedUnparseable, ...timeline.skipped],
     [skippedUnparseable, timeline.skipped],
+  );
+
+  // ---- Settings-change handlers (history-aware wrappers, v4.3) ----------
+  // Continuous inputs (sliders, selects) push one debounced pre-change
+  // snapshot per burst so Ctrl+Z steps back in usable increments.
+  const handleKenBurnsChange = useCallback(
+    (v: KenBurnsConfig) => {
+      requestHistoryPush(500);
+      setKenBurns(v);
+    },
+    [requestHistoryPush],
+  );
+  const handleSettingsChange = useCallback(
+    (v: VideoSettings) => {
+      requestHistoryPush(500);
+      setSettings(v);
+    },
+    [requestHistoryPush],
+  );
+  const handleAudioSettingsChange = useCallback(
+    (v: AudioSettings) => {
+      requestHistoryPush(500);
+      setAudioSettings(v);
+    },
+    [requestHistoryPush],
+  );
+  const handleCaptionSettingsChange = useCallback(
+    (v: CaptionSettings) => {
+      requestHistoryPush(500);
+      setCaptionSettings(v);
+    },
+    [requestHistoryPush],
+  );
+  const handleTransitionChange = useCallback(
+    (v: TransitionSettings) => {
+      requestHistoryPush(500);
+      setTransitionSettings(v);
+    },
+    [requestHistoryPush],
+  );
+  const handleWhisperLanguageChange = useCallback(
+    (lang: string) => {
+      requestHistoryPush();
+      setWhisperLanguage(lang);
+    },
+    [requestHistoryPush],
   );
 
   const debug = {
@@ -1102,6 +1361,10 @@ export default function Page() {
         inElectron={inElectron}
         onExport={handleExport}
         onCancel={handleCancel}
+        canUndo={historyState.canUndo}
+        canRedo={historyState.canRedo}
+        onUndo={undo}
+        onRedo={redo}
       />
 
       {/* 3-column grid: 300px | 1fr | 320px */}
@@ -1127,6 +1390,7 @@ export default function Page() {
             subtitles={subtitles}
             skipped={allSkipped}
             warnings={timeline.warnings}
+            transition={transitionSettings}
             onAddFiles={addFiles}
             onAddAudioFile={addAudio}
             onAddSubtitleFile={addSubtitles}
@@ -1165,6 +1429,7 @@ export default function Page() {
               subtitles={subtitles}
               captionSettings={captionSettings}
               headlineItems={headlineItems}
+              transition={transitionSettings}
               onSeek={seek}
               onTogglePlay={togglePlay}
               onStep={stepSegment}
@@ -1176,6 +1441,8 @@ export default function Page() {
             currentMs={currentMs}
             mode={timeline.mode}
             activeId={activeSegment?.id ?? null}
+            headlines={headlineItems}
+            transition={transitionSettings}
             onSeek={seek}
           />
         </section>
@@ -1192,11 +1459,13 @@ export default function Page() {
             kenBurns={kenBurns}
             settings={settings}
             audioSettings={audioSettings}
-            onKenBurnsChange={setKenBurns}
-            onSettingsChange={setSettings}
-            onAudioSettingsChange={setAudioSettings}
+            transition={transitionSettings}
+            onKenBurnsChange={handleKenBurnsChange}
+            onSettingsChange={handleSettingsChange}
+            onAudioSettingsChange={handleAudioSettingsChange}
+            onTransitionChange={handleTransitionChange}
             captionSettings={captionSettings}
-            onCaptionSettingsChange={setCaptionSettings}
+            onCaptionSettingsChange={handleCaptionSettingsChange}
             onApplyPreset={applyCaptionPreset}
             onExportSrt={exportSrtSidecar}
             onExportAss={exportAssSidecar}
@@ -1207,7 +1476,7 @@ export default function Page() {
             whisperBusy={whisperBusy}
             whisperProgress={whisperProgress}
             whisperLanguage={whisperLanguage}
-            onWhisperLanguageChange={setWhisperLanguage}
+            onWhisperLanguageChange={handleWhisperLanguageChange}
             headlineItems={headlineItems}
             onAddHeadline={addHeadline}
             onUpdateHeadline={updateHeadline}

@@ -1,7 +1,13 @@
 "use client";
 
 import { useRef, useCallback, type PointerEvent as ReactPointerEvent } from "react";
-import type { MediaSegment, TimelineMode } from "@/lib/merger/types";
+import { Type } from "lucide-react";
+import type {
+  HeadlineItem,
+  MediaSegment,
+  TimelineMode,
+  TransitionSettings,
+} from "@/lib/merger/types";
 import { fmtTimecode } from "@/lib/merger/timeline";
 import { cn } from "@/lib/utils";
 
@@ -11,6 +17,10 @@ interface TimelineRulerProps {
   currentMs: number;
   mode: TimelineMode | null;
   activeId: string | null;
+  /** Headline overlay items → clickable marker chips (v4.3). */
+  headlines: HeadlineItem[];
+  /** Segment transitions → boundary zone visualization (v4.3). */
+  transition: TransitionSettings;
   onSeek: (ms: number) => void;
 }
 
@@ -47,6 +57,8 @@ export function TimelineRuler({
   currentMs,
   mode,
   activeId,
+  headlines,
+  transition,
   onSeek,
 }: TimelineRulerProps) {
   const trackRef = useRef<HTMLDivElement>(null);
@@ -84,6 +96,8 @@ export function TimelineRuler({
   const ticks: number[] = [];
   for (let t = 0; t <= totalMs; t += step) ticks.push(t);
   if (ticks[ticks.length - 1] < totalMs) ticks.push(totalMs);
+
+  const txActive = transition && transition.style !== "none";
 
   return (
     <div
@@ -145,6 +159,27 @@ export function TimelineRuler({
             />{" "}
             duration
           </span>
+          {txActive && (
+            <span className="flex items-center gap-1">
+              <span
+                className="size-2 rounded-sm"
+                style={{
+                  backgroundImage:
+                    "linear-gradient(135deg, #8b5cf6, #d946ef)",
+                }}
+              />{" "}
+              transition
+            </span>
+          )}
+          {headlines.length > 0 && (
+            <span className="flex items-center gap-1">
+              <span
+                className="size-2 rounded-sm"
+                style={{ backgroundColor: "#fbbf24" }}
+              />{" "}
+              title
+            </span>
+          )}
         </div>
       </div>
 
@@ -225,7 +260,91 @@ export function TimelineRuler({
                 </div>
               );
             })}
+
+            {/* Transition zones (v4.3) — the head window of every segment
+                after the first, drawn as a diagonal-hatch gradient strip. */}
+            {txActive &&
+              segments.map((seg, idx) => {
+                if (idx === 0) return null;
+                const durMs = Math.min(
+                  transition.durationMs,
+                  Math.floor(seg.durationMs * 0.45),
+                );
+                if (durMs <= 0 || seg.durationMs <= 200) return null;
+                const left = totalMs > 0 ? (seg.startMs / totalMs) * 100 : 0;
+                const width = totalMs > 0 ? (durMs / totalMs) * 100 : 0;
+                const inPlay =
+                  currentMs >= seg.startMs && currentMs < seg.startMs + durMs;
+                return (
+                  <div
+                    key={`tx-${seg.id}`}
+                    className={cn(
+                      "absolute bottom-0 rounded-[2px] transition-all duration-200",
+                      inPlay && "ff-tx-zone-live",
+                    )}
+                    style={{
+                      left: `${left}%`,
+                      width: `${Math.max(0.4, width)}%`,
+                      height: "30%",
+                      backgroundImage:
+                        "repeating-linear-gradient(135deg, rgba(217, 70, 239, 0.55) 0 3px, rgba(139, 92, 246, 0.25) 3px 6px)",
+                      boxShadow: inPlay
+                        ? "0 0 8px rgba(217, 70, 239, 0.55)"
+                        : "none",
+                      border: "1px solid rgba(217, 70, 239, 0.35)",
+                    }}
+                    title={`${transition.style} transition · ${fmtTimecode(seg.startMs)}+${(durMs / 1000).toFixed(1)}s`}
+                  />
+                );
+              })}
           </div>
+
+          {/* Headline marker chips (v4.3) — amber bars on the top edge,
+              click to jump to the headline. */}
+          {headlines.map((h) => {
+            if (totalMs <= 0) return null;
+            const left = (h.startMs / totalMs) * 100;
+            const width = Math.max(
+              0.8,
+              ((h.endMs - h.startMs) / totalMs) * 100,
+            );
+            const inPlay = currentMs >= h.startMs && currentMs < h.endMs;
+            return (
+              <button
+                key={h.id}
+                type="button"
+                onPointerDown={(e) => {
+                  e.stopPropagation();
+                  onSeek(h.startMs + 100);
+                }}
+                className={cn(
+                  "absolute top-0 z-[5] flex h-[10px] items-center justify-start overflow-hidden rounded-sm px-1 text-[7px] font-bold uppercase tracking-wide transition-all duration-150 hover:brightness-125",
+                  inPlay && "ff-hl-live",
+                )}
+                style={{
+                  left: `${Math.max(0, Math.min(98, left))}%`,
+                  width: `${Math.min(99 - Math.max(0, left), Math.max(1, width))}%`,
+                  backgroundImage: inPlay
+                    ? "linear-gradient(90deg, #fbbf24, #f59e0b)"
+                    : "linear-gradient(90deg, rgba(251, 191, 36, 0.75), rgba(245, 158, 11, 0.55))",
+                  color: "#422006",
+                  boxShadow: inPlay
+                    ? "0 0 8px rgba(251, 191, 36, 0.7)"
+                    : "0 1px 2px rgba(0,0,0,0.4)",
+                }}
+                title={`Title: “${h.text}” · ${fmtTimecode(h.startMs)}–${fmtTimecode(h.endMs)} (click to jump)`}
+              >
+                {width > 5 ? (
+                  <span className="pointer-events-none flex items-center gap-0.5 truncate">
+                    <Type className="size-[8px] shrink-0" />
+                    {h.text.replace(/\n/g, " ").slice(0, 30)}
+                  </span>
+                ) : (
+                  <Type className="pointer-events-none size-[8px]" />
+                )}
+              </button>
+            );
+          })}
 
           {/* Playhead (violet line + glowing dot) */}
           <div

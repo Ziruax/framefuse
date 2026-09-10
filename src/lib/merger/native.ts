@@ -11,7 +11,13 @@ import type {
   HeadlineItem,
   MediaSegment,
 } from "./types";
-import { drawFrame, resolveDimensions } from "./renderer";
+import {
+  drawFrame,
+  drawFrameWithTransition,
+  applyGlobalFade,
+  computeGlobalFade,
+  resolveDimensions,
+} from "./renderer";
 import { getCaptionPreset, getFontOption } from "./captionPresets";
 import { getHeadlinePreset, type HeadlinePreset } from "./headlinePresets";
 import { cueAt, activeWordIndex, type WordTimestamp } from "./subtitles";
@@ -283,6 +289,13 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
       captionSettings: ipcCaptionSettings,
       subtitleCues: ipcSubtitleCues,
       headlines: ipcHeadlines,
+      transition: opts.transition
+        ? {
+            style: opts.transition.style,
+            durationMs: opts.transition.durationMs,
+            fadeStartEnd: !!opts.transition.fadeStartEnd,
+          }
+        : undefined,
     });
     return result;
   } finally {
@@ -399,6 +412,12 @@ async function exportViaWebCodecs(
   const headlineItems =
     opts.headlines && opts.headlines.length > 0 ? opts.headlines : null;
 
+  // v4.3 transitions — scratch canvas for the head composite + global fades.
+  const transition = opts.transition ?? null;
+  const scratch = document.createElement("canvas");
+  scratch.width = dims.w;
+  scratch.height = dims.h;
+
   for (let i = 0; i < totalFrames; i++) {
     if (signal?.aborted) {
       try {
@@ -411,13 +430,29 @@ async function exportViaWebCodecs(
     if (encodeError) throw encodeError;
 
     const currentMs = (i / fps) * 1000;
+    const segIdx = segments.findIndex(
+      (s) => currentMs >= s.startMs && currentMs < s.endMs,
+    );
     const seg =
-      segments.find((s) => currentMs >= s.startMs && currentMs < s.endMs) ||
-      segments[segments.length - 1];
+      segIdx >= 0 ? segments[segIdx] : segments[segments.length - 1];
     const img = seg ? imgCache.get(seg.id) : null;
-    if (seg) drawFrame(ctx, img ?? null, seg, currentMs, dims.w, dims.h, kenBurns);
+    if (seg) {
+      drawFrameWithTransition(
+        ctx, scratch, seg, Math.max(0, segIdx), segments, img ?? null,
+        imgCache, currentMs, dims.w, dims.h, kenBurns, transition,
+      );
+    }
     if (headlineItems) drawHeadline(ctx, headlineItems, currentMs, dims.w, dims.h);
     if (drawCaptions) drawCaptions(currentMs);
+    // Global fades AFTER captions (mirrors fade-after-subtitles in FFmpeg).
+    if (seg) {
+      applyGlobalFade(
+        ctx, scratch,
+        computeGlobalFade(
+          segments, Math.max(0, segments.indexOf(seg)), currentMs, transition,
+        ),
+      );
+    }
 
     const frame = new VideoFrameCtor(canvas, {
       timestamp: i * frameDurationUs,
@@ -544,19 +579,40 @@ async function exportViaMediaRecorder(
   const headlineItemsMR =
     opts.headlines && opts.headlines.length > 0 ? opts.headlines : null;
 
+  // v4.3 transitions — scratch canvas for the head composite + global fades.
+  const transitionMR = opts.transition ?? null;
+  const scratchMR = document.createElement("canvas");
+  scratchMR.width = dims.w;
+  scratchMR.height = dims.h;
+
   await new Promise<void>((resolve) => {
     const tick = () => {
       const elapsed = performance.now() - start;
       const currentMs = Math.min(elapsed, totalMs);
+      const segIdxMR = segments.findIndex(
+        (s) => currentMs >= s.startMs && currentMs < s.endMs,
+      );
       const seg =
-        segments.find((s) => currentMs >= s.startMs && currentMs < s.endMs) ||
-        segments[segments.length - 1];
+        segIdxMR >= 0 ? segments[segIdxMR] : segments[segments.length - 1];
       const img = seg ? imgCache.get(seg.id) : null;
-      if (seg)
-        drawFrame(ctx, img ?? null, seg, currentMs, dims.w, dims.h, kenBurns);
+      if (seg) {
+        drawFrameWithTransition(
+          ctx, scratchMR, seg, Math.max(0, segIdxMR), segments, img ?? null,
+          imgCache, currentMs, dims.w, dims.h, kenBurns, transitionMR,
+        );
+      }
       if (headlineItemsMR)
         drawHeadline(ctx, headlineItemsMR, currentMs, dims.w, dims.h);
       if (drawCaptionsMR) drawCaptionsMR(currentMs);
+      // Global fades AFTER captions (mirrors fade-after-subtitles in FFmpeg).
+      if (seg) {
+        applyGlobalFade(
+          ctx, scratchMR,
+          computeGlobalFade(
+            segments, Math.max(0, segments.indexOf(seg)), currentMs, transitionMR,
+          ),
+        );
+      }
 
       onProgress?.({
         progress: Math.min(100, (currentMs / totalMs) * 100),

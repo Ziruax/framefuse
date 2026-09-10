@@ -1,6 +1,6 @@
 "use client";
 
-import { Film, Download, X, Cpu, Clock, ImageIcon, Timer } from "lucide-react";
+import { Film, Download, X, Cpu, Clock, ImageIcon, Timer, Undo2, Redo2 } from "lucide-react";
 import type { TimelineMode, ExportProgress } from "@/lib/merger/types";
 import { fmtBytes, fmtTimecode } from "@/lib/merger/timeline";
 import { cn } from "@/lib/utils";
@@ -21,6 +21,11 @@ interface HeaderProps {
   inElectron: boolean;
   onExport: () => void;
   onCancel: () => void;
+  /** Undo/Redo (v4.3). */
+  canUndo: boolean;
+  canRedo: boolean;
+  onUndo: () => void;
+  onRedo: () => void;
 }
 
 function timeAgo(at: number): string {
@@ -53,6 +58,10 @@ export function Header({
   inElectron,
   onExport,
   onCancel,
+  canUndo,
+  canRedo,
+  onUndo,
+  onRedo,
 }: HeaderProps) {
   const pct = exportProgress?.progress ?? 0;
 
@@ -93,7 +102,7 @@ export function Header({
                 color: "#ddd6fe",
               }}
             >
-              v4.2
+              v4.3
             </span>
           </div>
           <div className="text-[11px]" style={{ color: "#71717a" }}>
@@ -149,6 +158,41 @@ export function Header({
       </div>
 
       <div className="flex-1" />
+
+      {/* Undo / Redo (v4.3) */}
+      <div className="flex items-center gap-1 rounded-lg border p-0.5" style={{ borderColor: "#27272a", backgroundColor: "#131316" }}>
+        <button
+          type="button"
+          onClick={onUndo}
+          disabled={!canUndo}
+          title="Undo (Ctrl+Z)"
+          aria-label="Undo"
+          className={cn(
+            "rounded-md p-1.5 transition-all active:scale-90",
+            canUndo
+              ? "text-zinc-300 hover:bg-white/10 hover:text-white"
+              : "cursor-not-allowed text-zinc-600",
+          )}
+        >
+          <Undo2 className="size-4" />
+        </button>
+        <div className="h-4 w-px" style={{ backgroundColor: "#27272a" }} />
+        <button
+          type="button"
+          onClick={onRedo}
+          disabled={!canRedo}
+          title="Redo (Ctrl+Shift+Z)"
+          aria-label="Redo"
+          className={cn(
+            "rounded-md p-1.5 transition-all active:scale-90",
+            canRedo
+              ? "text-zinc-300 hover:bg-white/10 hover:text-white"
+              : "cursor-not-allowed text-zinc-600",
+          )}
+        >
+          <Redo2 className="size-4" />
+        </button>
+      </div>
 
       {/* Export progress (when exporting) */}
       {isExporting && (
@@ -212,7 +256,7 @@ export function Header({
       {/* Last export summary */}
       {!isExporting && lastExport && (
         <div
-          className="flex items-center gap-2 rounded-md border px-2.5 py-1 text-[11px]"
+          className="flex shrink-0 items-center gap-2 whitespace-nowrap rounded-md border px-2.5 py-1 text-[11px]"
           style={{
             borderColor: "#27272a",
             backgroundColor: "rgba(24, 24, 27, 0.6)",

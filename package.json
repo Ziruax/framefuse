@@ -1,8 +1,8 @@
 {
   "name": "framefuse",
-  "version": "4.2.0",
+  "version": "4.3.0",
   "private": true,
-  "description": "FrameFuse v4.2 — Native desktop image-to-video merger with viral kinetic captions, exact word-by-word timing, GPU-accelerated export, and preview-accurate Ken Burns motion.",
+  "description": "FrameFuse v4.3 — Native desktop image-to-video merger with viral kinetic captions, segment transitions, undo/redo, exact word-by-word timing, GPU-accelerated export, and preview-accurate Ken Burns motion.",
   "main": "electron/main.js",
   "author": "FrameFuse",
   "license": "MIT",
@@ -58,12 +58,18 @@
       {
         "from": "node_modules/@xenova/transformers/dist",
         "to": "transformers-wasm",
-        "filter": ["**/*.{wasm,mjs}"]
+        "filter": [
+          "**/*.{wasm,mjs}"
+        ]
       },
       {
         "from": "node_modules/ffmpeg-static",
         "to": "ffmpeg-static",
-        "filter": ["ffmpeg.exe", "ffmpeg.LICENSE", "ffmpeg.README"]
+        "filter": [
+          "ffmpeg.exe",
+          "ffmpeg.LICENSE",
+          "ffmpeg.README"
+        ]
       }
     ],
     "asarUnpack": [],

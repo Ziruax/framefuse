@@ -8,6 +8,7 @@ import {
   Film,
   Captions,
   AudioLines,
+  ArrowLeftRight,
   Bug,
   Wand2,
   RotateCcw,
@@ -26,8 +27,11 @@ import type {
   HeadlineItem,
   KenBurnsConfig,
   SubtitleFile,
+  TransitionSettings,
+  TransitionStyle,
   VideoSettings,
 } from "@/lib/merger/types";
+import { TRANSITION_STYLE_INFO } from "@/lib/merger/types";
 import type { KenBurnsDirection } from "@/lib/merger/types";
 import {
   FONT_OPTIONS,
@@ -87,6 +91,9 @@ interface SettingsPanelProps {
   onKenBurnsChange: (kb: KenBurnsConfig) => void;
   onSettingsChange: (s: VideoSettings) => void;
   onAudioSettingsChange: (a: AudioSettings) => void;
+  /** Segment transitions (v4.3). */
+  transition: TransitionSettings;
+  onTransitionChange: (t: TransitionSettings) => void;
   captionSettings: CaptionSettings;
   onCaptionSettingsChange: (cs: CaptionSettings) => void;
   /** Applies a preset's signature behavior (wordMode + animation + font). */
@@ -268,6 +275,8 @@ export function SettingsPanel(props: SettingsPanelProps) {
     onKenBurnsChange,
     onSettingsChange,
     onAudioSettingsChange,
+    transition,
+    onTransitionChange,
     captionSettings,
     onCaptionSettingsChange,
     onApplyPreset,
@@ -423,12 +432,13 @@ export function SettingsPanel(props: SettingsPanelProps) {
 
         {/* ─── Video ─────────────────────────────────────────────────── */}
         <Section icon={<Film size={13} />} title="Video">
-          <Field label="Aspect ratio">
+          <Field label="Aspect ratio" hint="16:9 YouTube · 9:16 Shorts/Reels/TikTok · 1:1 square · 4:5 Instagram feed">
             <Segmented
               options={[
                 { value: "16:9", label: "16:9" },
                 { value: "9:16", label: "9:16" },
                 { value: "1:1", label: "1:1" },
+                { value: "4:5", label: "4:5" },
               ]}
               value={settings.aspect}
               onChange={(v) => onSettingsChange({ ...settings, aspect: v })}
@@ -471,7 +481,14 @@ export function SettingsPanel(props: SettingsPanelProps) {
           </Field>
         </Section>
 
-        {/* ─── Audio ─────────────────────────────────────────────────── */}
+        {/* ─── Transitions (v4.3) ─────────────────────────────────── */}
+        <Section icon={<ArrowLeftRight size={13} />} title="Transitions" defaultOpen>
+          <TransitionSection
+            transition={transition}
+            onTransitionChange={onTransitionChange}
+          />
+        </Section>
+
         <Section icon={<AudioLines size={13} />} title="Audio">
           <Row label="Normalize loudness">
             <Toggle
@@ -577,6 +594,116 @@ const HEADLINE_ANIMATIONS: {
   { value: "pop", label: "Pop", title: "Pop 0.6 → 1 with overshoot (260ms)" },
   { value: "zoom-punch", label: "Punch", title: "Zoom 2.0 → 1 fast (200ms)" },
 ];
+
+// ---------------------------------------------------------------------------
+// Transition section (v4.3) — style tiles with LIVE CSS mini-previews
+// ---------------------------------------------------------------------------
+const TX_STYLE_ORDER: TransitionStyle[] = [
+  "none",
+  "dissolve",
+  "dip-black",
+  "dip-white",
+  "slide-left",
+  "slide-right",
+  "wipe-left",
+  "wipe-right",
+];
+
+function TransitionSection({
+  transition,
+  onTransitionChange,
+}: {
+  transition: TransitionSettings;
+  onTransitionChange: (t: TransitionSettings) => void;
+}) {
+  const info = TRANSITION_STYLE_INFO[transition.style];
+  return (
+    <div>
+      <Field
+        label="Style"
+        hint={`${info.hint} ${transition.style === "none" ? "" : "· burned into the export exactly like the preview."}`}
+      >
+        <div className="grid grid-cols-4 gap-1.5">
+          {TX_STYLE_ORDER.map((style) => {
+            const active = transition.style === style;
+            const si = TRANSITION_STYLE_INFO[style];
+            const isDip = style === "dip-black" || style === "dip-white";
+            return (
+              <button
+                key={style}
+                type="button"
+                role="radio"
+                aria-checked={active}
+                title={si.hint}
+                onClick={() => onTransitionChange({ ...transition, style })}
+                className={cn(
+                  "ff-tx-tile group flex flex-col items-center gap-1 rounded-md p-1.5 transition-all duration-150",
+                  active
+                    ? "ff-tx-tile-active"
+                    : "hover:bg-white/5",
+                )}
+              >
+                <div className="ff-tx-stage">
+                  <div className="ff-tx-rect ff-tx-a" />
+                  <div className={cn("ff-tx-rect ff-tx-b", `ff-anim-${style}`)} />
+                  {isDip && (
+                    <div
+                      className={cn(
+                        "ff-tx-veil",
+                        style === "dip-white" ? "ff-tx-veil-white" : "ff-tx-veil-black",
+                        `ff-anim-veil-${style}`,
+                      )}
+                    />
+                  )}
+                </div>
+                <span
+                  className={cn(
+                    "text-[9px] font-medium leading-none",
+                    active ? "text-fuchsia-300" : "text-zinc-400",
+                  )}
+                >
+                  {si.label}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </Field>
+
+      {transition.style !== "none" && (
+        <Field
+          label={`Duration — ${(transition.durationMs / 1000).toFixed(1)}s`}
+          hint="Auto-shortened on very brief segments (max 45% of the segment) so a clip is never all-transition."
+        >
+          <input
+            type="range"
+            min={200}
+            max={1500}
+            step={100}
+            value={transition.durationMs}
+            onChange={(e) =>
+              onTransitionChange({ ...transition, durationMs: Number(e.target.value) })
+            }
+            className="w-full accent-fuchsia-500"
+            aria-label="Transition duration"
+          />
+        </Field>
+      )}
+
+      <Row label="Fade video in / out">
+        <Toggle
+          checked={transition.fadeStartEnd}
+          onChange={(v) => onTransitionChange({ ...transition, fadeStartEnd: v })}
+          label=""
+        />
+      </Row>
+      <p className="mt-1 text-[10px] leading-relaxed text-zinc-500">
+        Start/end fades ease the whole video (captions included) from and to
+        black — a clean opener/outro even with hard cuts.
+      </p>
+    </div>
+  );
+}
 
 function HeadlineSection({
   items,

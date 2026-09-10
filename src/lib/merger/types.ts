@@ -2,7 +2,7 @@
 
 export type TimelineMode = "absolute" | "sequential";
 
-export type AspectRatio = "16:9" | "9:16" | "1:1";
+export type AspectRatio = "16:9" | "9:16" | "1:1" | "4:5";
 
 export type Resolution = "720p" | "1080p";
 
@@ -299,6 +299,8 @@ export interface ExportNativeOptions {
   headlines?: HeadlineItem[] | null;
   /** Audio post-processing (normalize / fades). v4.1 */
   audio?: AudioSettings;
+  /** Segment transitions (v4.3). */
+  transition?: TransitionSettings;
   onProgress?: (p: ExportProgress) => void;
   /** When aborted, the export stops as soon as possible. */
   signal?: AbortSignal;
@@ -317,6 +319,86 @@ export interface AudioSettings {
 export function defaultAudioSettings(): AudioSettings {
   return { normalize: false, fadeInMs: 0, fadeOutMs: 0 };
 }
+
+// ---------------------------------------------------------------------------
+// SEGMENT TRANSITIONS (v4.3) — pro slideshow polish between segments.
+//
+// Architecture: every transition is a per-clip HEAD composite (the first
+// `durationMs` of each clip blends the frozen end-frame of the previous
+// segment with the current segment's animating frames) plus optional tail
+// dips. Because the composite happens INSIDE each clip, the master timeline
+// duration never changes — audio sync, caption timing and the instant
+// `-c copy` concat are all untouched. FFmpeg side: `xfade` with offset=0
+// for dissolve/slide/wipe (verified exactly linear), and the linear `fade`
+// filter for dip-to-black / dip-to-white heads+tails.
+// ---------------------------------------------------------------------------
+
+export type TransitionStyle =
+  | "none"
+  | "dissolve"
+  | "dip-black"
+  | "dip-white"
+  | "slide-left"
+  | "slide-right"
+  | "wipe-left"
+  | "wipe-right";
+
+export interface TransitionSettings {
+  style: TransitionStyle;
+  /** Transition duration in ms (200 – 1500). Clamped per segment to ≤45% of
+   *  the segment duration so a clip is never all-transition. */
+  durationMs: number;
+  /** Fade the whole video in from black at the start and out to black at the
+   *  end (applied after captions, like a real video opener/outro). */
+  fadeStartEnd: boolean;
+}
+
+export function defaultTransitionSettings(): TransitionSettings {
+  return { style: "none", durationMs: 500, fadeStartEnd: false };
+}
+
+/** Human labels + hints for the transition styles (UI + a11y). */
+export const TRANSITION_STYLE_INFO: Record<
+  TransitionStyle,
+  { label: string; hint: string; xfade?: string; dipColor?: "black" | "white" }
+> = {
+  none: { label: "Hard Cut", hint: "No transition — instant cuts between segments." },
+  dissolve: {
+    label: "Dissolve",
+    hint: "Classic crossfade — the previous frame melts into the next.",
+    xfade: "fade",
+  },
+  "dip-black": {
+    label: "Dip Black",
+    hint: "Fades through black at every boundary — cinematic slideshow feel.",
+    dipColor: "black",
+  },
+  "dip-white": {
+    label: "Flash",
+    hint: "Fades through white — punchy, high-energy segment swaps.",
+    dipColor: "white",
+  },
+  "slide-left": {
+    label: "Slide ←",
+    hint: "The next segment slides in from the right.",
+    xfade: "slideleft",
+  },
+  "slide-right": {
+    label: "Slide →",
+    hint: "The next segment slides in from the left.",
+    xfade: "slideright",
+  },
+  "wipe-left": {
+    label: "Wipe ←",
+    hint: "The next segment is wiped in from the right edge.",
+    xfade: "wipeleft",
+  },
+  "wipe-right": {
+    label: "Wipe →",
+    hint: "The next segment is wiped in from the left edge.",
+    xfade: "wiperight",
+  },
+};
 
 // Augment the window with the Electron bridge (optional, only present in app).
 declare global {

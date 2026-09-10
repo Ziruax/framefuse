@@ -23,12 +23,13 @@ import type {
   CaptionSettings,
   HeadlineItem,
   KenBurnsConfig,
+  TransitionSettings,
   VideoSettings,
 } from "./types";
 import { serializeSrt, type SubtitleCue } from "./subtitles";
 
 export const PROJECT_APP = "framefuse";
-export const PROJECT_VERSION = 4.2;
+export const PROJECT_VERSION = 4.3;
 
 /** Audio above this size (MB, decoded) is skipped to keep project files sane. */
 export const MAX_AUDIO_MB = 25;
@@ -64,6 +65,8 @@ export interface ProjectFile {
     caption: CaptionSettings;
     audio: AudioSettings;
     whisperLanguage: string;
+    /** Segment transitions (v4.3; optional for back-compat with 4.2 files). */
+    transition?: TransitionSettings;
   };
 }
 

@@ -897,10 +897,59 @@ ipcMain.handle("export-ass-file", async (event, opts) => {
 // ---------------------------------------------------------------------------
 // IPC: TWO-STEP EXPORT
 // Step 1: Encode each image → MP4 clip with zoompan + ASS subtitles burn-in
+//         (+ v4.3 segment transitions: xfade head composites / dip fades)
 // Step 2: Concat all clips + mux audio using -f concat -c copy (INSTANT)
 // ---------------------------------------------------------------------------
+
+/** v4.3 transition style → xfade transition name (offset=0 head composite). */
+const XFADE_NAMES = {
+  dissolve: "fade",
+  "slide-left": "slideleft",
+  "slide-right": "slideright",
+  "wipe-left": "wipeleft",
+  "wipe-right": "wiperight",
+};
+/** v4.3 dip styles → fade filter color. */
+const DIP_COLORS = { "dip-black": "black", "dip-white": "white" };
+/** Max fraction of a segment's duration a transition may occupy (matches
+ *  clampTransitionMs in renderer.ts — keep the two in lockstep). */
+const TRANSITION_MAX_FRACTION = 0.45;
+function clampTrMs(ms, segDurMs) {
+  return ms > 0 && segDurMs > 200
+    ? Math.min(ms, Math.floor(segDurMs * TRANSITION_MAX_FRACTION))
+    : 0;
+}
+
+/**
+ * Frozen zoompan expressions = the PREVIOUS segment's Ken Burns END state
+ * (eased = 1). Used as input A of the xfade head composite so the preview's
+ * "prev frame frozen at its end" and the export are pixel-identical.
+ */
+function frozenZoompanExpr(dir, zoomMax) {
+  const zBase = 1.1;
+  const zMaxEff = (1.1 * zoomMax).toFixed(6);
+  const maxX = "(iw-iw/zoom)";
+  const maxY = "(ih-ih/zoom)";
+  const center = "iw/2-(iw/zoom/2)";
+  const centerY = "ih/2-(ih/zoom/2)";
+  switch (dir) {
+    case "in":
+      return { z: zMaxEff, x: center, y: centerY };
+    case "right":
+      return { z: zMaxEff, x: maxX, y: `${maxY}/2` };
+    case "left":
+      return { z: zMaxEff, x: "0", y: `${maxY}/2` };
+    case "down":
+      return { z: zMaxEff, x: `${maxX}/2`, y: maxY };
+    case "up":
+      return { z: zMaxEff, x: `${maxX}/2`, y: "0" };
+    default: // "out", "none", disabled
+      return { z: zBase.toFixed(6), x: center, y: centerY };
+  }
+}
+
 ipcMain.handle("export-native", async (event, opts) => {
-  const { outputPath, fps, width, height, bitrateMbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines } = opts;
+  const { outputPath, fps, width, height, bitrateMbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition } = opts;
 
   if (!outputPath) throw new Error("No output path");
   if (!segments || segments.length === 0) throw new Error("No segments");
@@ -944,6 +993,16 @@ ipcMain.handle("export-native", async (event, opts) => {
 
   try {
     // ─── STEP 1: Encode each segment ──────────────────────────────
+    // v4.3 transition planning (mirrors renderer.ts formulas exactly).
+    const trStyle = transition && transition.style ? transition.style : "none";
+    const trWanted =
+      transition && Number(transition.durationMs) > 0
+        ? Number(transition.durationMs)
+        : 0;
+    const fadeStartEnd = !!(transition && transition.fadeStartEnd);
+    const xfadeName = XFADE_NAMES[trStyle] || null;
+    const dipColor = DIP_COLORS[trStyle] || null;
+
     const clipPaths = [];
     let cumulativeMs = 0;
     const doneMs = [0]; // master-timeline ms completed before the current clip
@@ -953,6 +1012,17 @@ ipcMain.handle("export-native", async (event, opts) => {
       const segDurSec = seg.durationMs / 1000;
       const segFrames = Math.max(2, Math.round(segDurSec * fps));
       const dir = enabled ? seg.direction || globalDir : "none";
+      const isLast = i === segments.length - 1;
+
+      // Transition windows for THIS clip (identical clamps to the preview).
+      const headMs =
+        i > 0 && trStyle !== "none" ? clampTrMs(trWanted, seg.durationMs) : 0;
+      const dipTailMs =
+        dipColor && !isLast ? clampTrMs(trWanted, seg.durationMs) : 0;
+      const startFadeMs =
+        i === 0 && fadeStartEnd ? clampTrMs(trWanted, seg.durationMs) : 0;
+      const endFadeMs =
+        isLast && fadeStartEnd ? clampTrMs(trWanted, seg.durationMs) : 0;
 
       const segStartMs = (typeof seg.startMs === "number") ? seg.startMs : cumulativeMs;
       const segEndMs = (typeof seg.endMs === "number") ? seg.endMs : (cumulativeMs + seg.durationMs);
@@ -989,53 +1059,115 @@ ipcMain.handle("export-native", async (event, opts) => {
         }
       }
 
-      // ── Build -vf: 1.1× supersampled cover + zoompan + subtitles ──
+      // ── Build -vf / -filter_complex: supersampled cover + zoompan +
+      //    subtitles + v4.3 transitions ──
       const scaleW = Math.round(width * 1.1);
       const scaleH = Math.round(height * 1.1);
-      const vfParts = [
-        `scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase:flags=lanczos`,
-        `crop=${scaleW}:${scaleH}`,
-        `zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${segFrames}:s=${width}x${height}:fps=${fps}`,
-        `setsar=1`,
-        `format=yuv420p`,
-      ];
+      const clipPath = path.join(tempDir, `clip_${String(i).padStart(4, "0")}.mp4`);
+      tempFiles.push(clipPath);
+      clipPaths.push(clipPath);
 
+      let assDoc = null;
       if (captionsEnabled || headlinesEnabled) {
-        const doc = buildAssDocument(
+        assDoc = buildAssDocument(
           captionsEnabled ? subtitleCues : [],
           captionsEnabled ? captionSettings : null,
           headlinesEnabled ? headlines : null,
           width, height, segStartMs, segEndMs, seg.durationMs,
         );
-        if (doc) {
-          const assPath = path.join(tempDir, `captions_${String(i).padStart(4, "0")}_${Date.now()}.ass`);
-          fs.writeFileSync(assPath, doc, "utf-8");
-          tempFiles.push(assPath);
-          const escapedAssPath = assPath
-            .replace(/\\/g, "/")
-            .replace(/:/g, "\\:")
-            .replace(/'/g, "\\'")
-            .replace(/,/g, "\\,");
-          vfParts.push(`subtitles=filename='${escapedAssPath}'`);
-        }
       }
 
-      const vf = vfParts.join(",");
-      const clipPath = path.join(tempDir, `clip_${String(i).padStart(4, "0")}.mp4`);
-      tempFiles.push(clipPath);
-      clipPaths.push(clipPath);
+      const assSuffix = assDoc
+        ? (() => {
+            const assPath = path.join(tempDir, `captions_${String(i).padStart(4, "0")}_${Date.now()}.ass`);
+            fs.writeFileSync(assPath, assDoc, "utf-8");
+            tempFiles.push(assPath);
+            const escapedAssPath = assPath
+              .replace(/\\/g, "/")
+              .replace(/:/g, "\\:")
+              .replace(/'/g, "\\'")
+              .replace(/,/g, "\\,");
+            return `subtitles=filename='${escapedAssPath}'`;
+          })()
+        : null;
 
-      const args = [
-        "-loop", "1",
-        "-i", seg.imagePath,
-        "-t", segDurSec.toFixed(3),
-        "-vf", vf,
+      // Post-subtitle fades (applied AFTER captions like a real video —
+      // matches the canvas applyGlobalFade pass): dips + start/end fades.
+      const postFades = [];
+      if (dipColor && headMs > 0) {
+        postFades.push(`fade=t=in:st=0:d=${(headMs / 1000).toFixed(3)}:color=${dipColor}`);
+      }
+      if (dipTailMs > 0) {
+        postFades.push(
+          `fade=t=out:st=${(segDurSec - dipTailMs / 1000).toFixed(3)}:d=${(dipTailMs / 1000).toFixed(3)}:color=${dipColor}`,
+        );
+      }
+      if (startFadeMs > 0) {
+        postFades.push(`fade=t=in:st=0:d=${(startFadeMs / 1000).toFixed(3)}`);
+      }
+      if (endFadeMs > 0) {
+        postFades.push(
+          `fade=t=out:st=${(segDurSec - endFadeMs / 1000).toFixed(3)}:d=${(endFadeMs / 1000).toFixed(3)}`,
+        );
+      }
+
+      let args;
+      const encodeTail = [
         ...encoderArgs(encoder.name, bitrateMbps, width, height),
         "-r", String(fps),
         "-threads", "0",
         "-y",
         clipPath,
       ];
+
+      if (xfadeName && i > 0 && headMs > 0) {
+        // ── v4.3 xfade HEAD composite (dissolve / slide / wipe) ──
+        // [A = prev frozen at its Ken Burns end-state][B = cur] xfade at
+        // offset=0: output = blend(A,B) for the first F seconds, then B
+        // alone — the clip keeps its exact duration (timeline, audio and
+        // caption timing are untouched, concat stays -c copy).
+        const F = (headMs / 1000).toFixed(3);
+        const prevSeg = segments[i - 1];
+        const prevDir = enabled ? prevSeg.direction || globalDir : "none";
+        const frz = frozenZoompanExpr(prevDir, zoomMax);
+        const pre = `scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase:flags=lanczos,crop=${scaleW}:${scaleH}`;
+        const zpCommon = `d=${segFrames}:s=${width}x${height}:fps=${fps}`;
+        const aChain =
+          `[1:v]${pre},zoompan=z='${frz.z}':x='${frz.x}':y='${frz.y}':${zpCommon},setsar=1,format=yuv420p[a]`;
+        const bChain =
+          `[0:v]${pre},zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':${zpCommon},setsar=1,format=yuv420p[b]`;
+        const post = [assSuffix, ...postFades].filter(Boolean).join(",");
+        const graph =
+          `${aChain};${bChain};[a][b]xfade=transition=${xfadeName}:duration=${F}:offset=0[vx]` +
+          (post ? `;[vx]${post}[vout]` : "");
+        const outLabel = post ? "[vout]" : "[vx]";
+        args = [
+          "-loop", "1", "-i", seg.imagePath,
+          "-loop", "1", "-i", prevSeg.imagePath,
+          "-t", segDurSec.toFixed(3),
+          "-filter_complex", graph,
+          "-map", outLabel,
+          ...encodeTail,
+        ];
+      } else {
+        // ── Single-input path (clip 0, dip styles, or transitions off) ──
+        const vfParts = [
+          `scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase:flags=lanczos`,
+          `crop=${scaleW}:${scaleH}`,
+          `zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${segFrames}:s=${width}x${height}:fps=${fps}`,
+          `setsar=1`,
+          `format=yuv420p`,
+        ];
+        if (assSuffix) vfParts.push(assSuffix);
+        vfParts.push(...postFades);
+        args = [
+          "-loop", "1",
+          "-i", seg.imagePath,
+          "-t", segDurSec.toFixed(3),
+          "-vf", vfParts.join(","),
+          ...encodeTail,
+        ];
+      }
 
       // Real-time progress: clip i covers [doneMs[i], doneMs[i]+dur] of the
       // master timeline. 95% of the bar is step 1, 5% step 2.
