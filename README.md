@@ -1,10 +1,19 @@
-# FrameFuse v4.4
+# FrameFuse v4.5
 
-Native desktop **image → video** merger with **viral kinetic captions**, **segment transitions**, **watermark/logo overlay**, **undo/redo**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
+Native desktop **image → video** merger with **viral kinetic captions**, **segment transitions**, **per-boundary transition overrides**, **export quality profiles**, **watermark/logo overlay**, **undo/redo**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
 
 ## Highlights
 
-### 🏷 Watermark / logo overlay (new in v4.4)
+### ⚡ Export quality profiles (new in v4.5)
+One-click encode bundles — **Draft** (720p · 30fps · CRF 27, fastest rough cut), **Social** (1080p · 30fps · CRF 20, the upload sweet spot) and **Cinema** (1080p · 60fps · CRF 17 + slower preset, maximum-quality master). Every encoder gets its own tuning (NVENC p1/p4/p6 + cq, QSV, AMF, libx264 preset), fine-tuning any field flips to **Custom** with a live CRF slider, and the header shows a live **size/duration estimate** for the current timeline before you ever hit Export.
+
+### 🔗 Per-boundary transitions (new in v4.5)
+The global style is just the default — click any boundary link between clips to pin its **own** transition (dissolve at 3, flash into the hook, hard cut for the punchline). Pinned boundaries show amber pills + amber timeline hatches, `boundaryStyle()` is the single resolution point shared by the canvas preview, browser exports and the FFmpeg graph builder (36-check harness, real-FFmpeg verified), overrides round-trip through projects/undo/persistence, and **reset all** is one click.
+
+### ✋ Drag to reorder (new in v4.5)
+Drag media cards to re-sequence duration-based timelines; beat/absolute storyboards honestly lock order (filename timestamps rule) with explanatory hints instead of silently doing nothing.
+
+### 🏷 Watermark / logo overlay (v4.4)
 Upload a PNG logo and brand **every frame** — 9-position grid, size (5–50% of width), opacity and margin controls. One shared geometry function drives both the canvas preview and the FFmpeg overlay filter, so the burn-in matches the preview exactly (probe-verified). Watermarks composite correctly during transitions, persist in project files, and are fully undoable.
 
 ### 📄 WebVTT sidecar (new in v4.4)
