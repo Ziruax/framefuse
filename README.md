@@ -1,10 +1,16 @@
-# FrameFuse v4.3
+# FrameFuse v4.4
 
-Native desktop **image → video** merger with **viral kinetic captions**, **segment transitions**, **undo/redo**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
+Native desktop **image → video** merger with **viral kinetic captions**, **segment transitions**, **watermark/logo overlay**, **undo/redo**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
 
 ## Highlights
 
-### 🎞 Segment transitions (new in v4.3)
+### 🏷 Watermark / logo overlay (new in v4.4)
+Upload a PNG logo and brand **every frame** — 9-position grid, size (5–50% of width), opacity and margin controls. One shared geometry function drives both the canvas preview and the FFmpeg overlay filter, so the burn-in matches the preview exactly (probe-verified). Watermarks composite correctly during transitions, persist in project files, and are fully undoable.
+
+### 📄 WebVTT sidecar (new in v4.4)
+`.vtt` joins `.srt` and `.ass` exports for HTML5 `<track>` / web video players.
+
+### 🎞 Segment transitions (v4.3)
 **8 styles** between segments — **Dissolve, Dip-to-Black, Flash (dip-to-white), Slide ←/→, Wipe ←/→** — with a 0.2–1.5s duration slider and an optional **video opener/outro fade**. Every transition is a per-clip head composite (FFmpeg `xfade` at offset 0, blending the previous segment's frozen Ken Burns end-frame), so the timeline duration, audio sync and caption timing are never disturbed — and the burn-in matches the preview exactly (probe-verified against FFmpeg 7.0.2 output, 27/27 parity checks).
 
 ### ↩️ Undo / Redo (new in v4.3)
