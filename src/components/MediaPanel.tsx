@@ -28,6 +28,9 @@ import {
   Scissors,
   Timer,
   Lock,
+  List,
+  LayoutGrid,
+  MoveDiagonal,
 } from "lucide-react";
 import type {
   MediaSegment,
@@ -37,6 +40,7 @@ import type {
   SubtitleFile,
   TransitionSettings,
   TransitionStyle,
+  KenBurnsDirection,
 } from "@/lib/merger/types";
 import { TRANSITION_STYLE_INFO, boundaryStyle } from "@/lib/merger/types";
 import { fmtTimecode } from "@/lib/merger/timeline";
@@ -88,6 +92,19 @@ interface MediaPanelProps {
   /** v4.7 strength dial: boundaries land on every Nth beat (1/2/4/8). */
   beatStride: number;
   onBeatStrideChange: (n: number) => void;
+  /** v4.8: per-segment Ken Burns direction overrides (id → direction). */
+  motionOverrides: Record<string, KenBurnsDirection>;
+  /** Pin one segment's motion (null = clear → back to global/random). */
+  onSetMotion: (segId: string, dir: KenBurnsDirection | null) => void;
+  /** Reset every motion override back to the global setting. */
+  onClearMotionOverrides: () => void;
+  /** v4.8: media library layout (list = rich rows, grid = compact tiles). */
+  mediaView: "list" | "grid";
+  onMediaViewChange: (v: "list" | "grid") => void;
+  /** v4.8: active segment id (grid tiles highlight the playhead segment). */
+  activeId: string | null;
+  /** v4.8: grid tile click → seek the playhead to that segment. */
+  onSelectSegment?: (id: string) => void;
 }
 
 const KIND_STYLES: Record<
@@ -102,6 +119,15 @@ const KIND_STYLES: Record<
     text: "#c4b5fd",
   },
 };
+
+const MOTION_OPTIONS: { value: KenBurnsDirection; label: string; glyph: string }[] = [
+  { value: "in", label: "Zoom In", glyph: "⤢" },
+  { value: "out", label: "Zoom Out", glyph: "⤡" },
+  { value: "left", label: "Pan Left", glyph: "←" },
+  { value: "right", label: "Pan Right", glyph: "→" },
+  { value: "up", label: "Pan Up", glyph: "↑" },
+  { value: "down", label: "Pan Down", glyph: "↓" },
+];
 
 const isProjectFile = (f: File) =>
   /\.framefuse\.json$/i.test(f.name) ||
@@ -142,6 +168,13 @@ export function MediaPanelBase({
   onFitToAudio,
   beatStride,
   onBeatStrideChange,
+  motionOverrides,
+  onSetMotion,
+  onClearMotionOverrides,
+  mediaView,
+  onMediaViewChange,
+  activeId,
+  onSelectSegment,
 }: MediaPanelProps) {
   const [dragOver, setDragOver] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -154,6 +187,8 @@ export function MediaPanelBase({
   const [draggedId, setDraggedId] = useState<string | null>(null);
   const [dropTargetIdx, setDropTargetIdx] = useState<number | null>(null);
   const draggedIdRef = useRef<string | null>(null);
+  // v4.8: per-segment motion popover (mirrors the boundary picker pattern).
+  const [openMotion, setOpenMotion] = useState<string | null>(null);
 
   // v4.1: drag-drop routes images, audio AND .srt files with feedback.
   // v4.2: also routes .framefuse.json project files.
@@ -241,6 +276,42 @@ export function MediaPanelBase({
           )}
         </button>
         <div className="flex-1" />
+        {/* v4.8: library layout toggle — rich rows vs compact tiles. */}
+        <div
+          className="flex items-center rounded-md border p-0.5"
+          style={{ borderColor: "#27272a" }}
+          role="radiogroup"
+          aria-label="Media library view"
+        >
+          <button
+            type="button"
+            onClick={() => onMediaViewChange("list")}
+            aria-pressed={mediaView === "list"}
+            title="List view — details, durations, boundary links"
+            className={cn(
+              "flex items-center justify-center rounded-[4px] p-1.5 transition-all duration-150",
+              mediaView === "list"
+                ? "bg-violet-500/25 text-violet-200 shadow-[inset_0_0_0_1px_rgba(167,139,250,0.4)]"
+                : "text-zinc-500 hover:bg-white/5 hover:text-zinc-300",
+            )}
+          >
+            <List className="size-3.5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => onMediaViewChange("grid")}
+            aria-pressed={mediaView === "grid"}
+            title="Grid view — compact tiles for large storyboards"
+            className={cn(
+              "flex items-center justify-center rounded-[4px] p-1.5 transition-all duration-150",
+              mediaView === "grid"
+                ? "bg-violet-500/25 text-violet-200 shadow-[inset_0_0_0_1px_rgba(167,139,250,0.4)]"
+                : "text-zinc-500 hover:bg-white/5 hover:text-zinc-300",
+            )}
+          >
+            <LayoutGrid className="size-3.5" />
+          </button>
+        </div>
         {/* Project save / open (v4.2) */}
         <button
           type="button"
@@ -322,16 +393,22 @@ export function MediaPanelBase({
               onDragLeave={() => setDragOver(false)}
               onDrop={handleDrop}
               onClick={openImagePicker}
-              className="mb-2 flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-dashed py-2 text-[11px] transition-all duration-200"
+              className="mb-2 flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-dashed py-2.5 text-[11px] font-medium transition-all duration-200 hover:border-violet-500/50 hover:bg-violet-500/5 hover:text-zinc-300"
               style={{
                 borderColor: dragOver ? "#7c3aed" : "#27272a",
-                color: dragOver ? "#c4b5fd" : "#71717a",
+                color: dragOver ? "#c4b5fd" : "#8b8b93",
                 backgroundColor: dragOver
                   ? "rgba(124, 58, 237, 0.1)"
                   : "transparent",
               }}
             >
-              <Plus className="size-3.5" /> Add more images
+              <Plus
+                className={cn(
+                  "size-3.5 transition-transform duration-200",
+                  !dragOver && "group-hover:rotate-90",
+                )}
+              />{" "}
+              Add more images
             </div>
 
             {/* v4.5: per-boundary override summary + reset-all. */}
@@ -360,7 +437,166 @@ export function MediaPanelBase({
               </div>
             )}
 
-            {segments.map((seg, idx) => {
+            {segments.length > 0 && Object.keys(motionOverrides).length > 0 && (
+              <div
+                className="mb-2 flex items-center justify-between rounded-md border px-2 py-1"
+                style={{
+                  borderColor: "rgba(52, 211, 153, 0.22)",
+                  backgroundColor: "rgba(6, 78, 59, 0.12)",
+                }}
+              >
+                <span className="text-[9px] font-medium" style={{ color: "#6ee7b7" }}>
+                  ✦ {Object.keys(motionOverrides).length} custom
+                  {" "}
+                  {Object.keys(motionOverrides).length === 1 ? "motion" : "motions"}
+                </span>
+                <button
+                  type="button"
+                  onClick={onClearMotionOverrides}
+                  className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[8px] font-semibold transition-colors hover:bg-emerald-500/15"
+                  style={{ color: "#6ee7b7" }}
+                  title="Reset every motion back to the global Ken Burns setting"
+                >
+                  <RotateCcw className="size-2.5" /> reset all
+                </button>
+              </div>
+            )}
+
+            {mediaView === "grid" ? (
+              /* v4.8: compact tile grid — built for 100+ image storyboards.
+               * Tiles show index + duration; click seeks; hover reveals
+               * remove; drag-reorder works in sequential mode. */
+              <div className="grid grid-cols-3 gap-1.5">
+                {segments.map((seg, idx) => {
+                  const motionPinned = Object.prototype.hasOwnProperty.call(
+                    motionOverrides,
+                    seg.id,
+                  );
+                  const dragEnabled = mode !== "absolute";
+                  return (
+                    <div
+                      key={seg.id}
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`Segment ${idx + 1} — ${(seg.durationMs / 1000).toFixed(1)}s, ${seg.fileName}`}
+                      draggable={dragEnabled}
+                      onDragStart={(e) => {
+                        if (!dragEnabled) return;
+                        draggedIdRef.current = seg.id;
+                        e.dataTransfer.effectAllowed = "move";
+                        e.dataTransfer.setData("text/plain", seg.id);
+                      }}
+                      onDragEnd={() => {
+                        draggedIdRef.current = null;
+                        setDropTargetIdx(null);
+                      }}
+                      onDragOver={(e) => {
+                        const id = draggedIdRef.current;
+                        if (!id || id === seg.id) return;
+                        e.preventDefault();
+                        e.dataTransfer.dropEffect = "move";
+                        setDropTargetIdx(idx);
+                      }}
+                      onDrop={(e) => {
+                        const id = draggedIdRef.current;
+                        if (!id) return;
+                        e.preventDefault();
+                        e.stopPropagation();
+                        onMoveTo(id, idx);
+                        draggedIdRef.current = null;
+                        setDropTargetIdx(null);
+                      }}
+                      onClick={() => onSelectSegment?.(seg.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          onSelectSegment?.(seg.id);
+                        }
+                      }}
+                      className={cn(
+                        "group/tile relative aspect-square cursor-pointer overflow-hidden rounded-lg border transition-all duration-150 hover:-translate-y-0.5",
+                        activeId === seg.id
+                          ? "border-violet-400/70 shadow-[0_0_0_1px_rgba(167,139,250,0.5),0_4px_16px_rgba(0,0,0,0.4)]"
+                          : "border-[#27272a] hover:border-zinc-600",
+                        dropTargetIdx === idx &&
+                          draggedId &&
+                          draggedId !== seg.id &&
+                          "ring-1 ring-violet-400/70",
+                      )}
+                      style={{ backgroundColor: "#18181b" }}
+                      title={`${seg.fileName}\n${fmtTimecode(seg.startMs)} – ${fmtTimecode(seg.endMs)} · motion ${seg.direction}${motionPinned ? " (custom)" : ""}\nclick to jump`}
+                    >
+                      <img
+                        src={seg.thumbnailUrl}
+                        alt={seg.fileName}
+                        className="pointer-events-none size-full object-cover transition-transform duration-200 group-hover/tile:scale-105"
+                        draggable={false}
+                      />
+                      {/* Scrim + labels */}
+                      <span
+                        className="pointer-events-none absolute inset-x-0 bottom-0 h-1/2"
+                        style={{
+                          background:
+                            "linear-gradient(to top, rgba(0,0,0,0.78), rgba(0,0,0,0))",
+                        }}
+                      />
+                      <span
+                        className="pointer-events-none absolute bottom-1 left-1 rounded bg-black/70 px-1 text-[8px] font-semibold tabular-nums backdrop-blur-sm"
+                        style={{ color: "#e4e4e7" }}
+                      >
+                        {idx + 1}
+                      </span>
+                      <span
+                        className="pointer-events-none absolute bottom-1 right-1 rounded bg-black/70 px-1 text-[8px] tabular-nums backdrop-blur-sm"
+                        style={{ color: "#d4d4d8" }}
+                      >
+                        {(seg.durationMs / 1000).toFixed(1)}s
+                      </span>
+                      {/* Pinned motion indicator */}
+                      {motionPinned && (
+                        <span
+                          className="pointer-events-none absolute left-1 top-1 flex items-center gap-0.5 rounded px-1 py-0.5 text-[7px] font-bold uppercase backdrop-blur-sm"
+                          style={{
+                            backgroundColor: "rgba(6, 78, 59, 0.75)",
+                            color: "#6ee7b7",
+                          }}
+                          title={`Pinned motion: ${motionOverrides[seg.id]}`}
+                        >
+                          <MoveDiagonal className="size-2" />
+                          {motionOverrides[seg.id]}
+                        </span>
+                      )}
+                      {/* Hover actions */}
+                      <span className="absolute right-1 top-1 flex gap-1 opacity-0 transition-opacity duration-150 group-hover/tile:opacity-100">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onRemove(seg.id);
+                          }}
+                          className="flex items-center justify-center rounded bg-black/70 p-1 backdrop-blur-sm transition-colors hover:bg-red-500/40"
+                          style={{ color: "#d4d4d8" }}
+                          title="Remove"
+                        >
+                          <Trash2 className="size-3" />
+                        </button>
+                      </span>
+                    </div>
+                  );
+                })}
+                {/* Add-more tile (grid mode) */}
+                <button
+                  type="button"
+                  onClick={openImagePicker}
+                  className="flex aspect-square items-center justify-center rounded-lg border border-dashed transition-all duration-150 hover:border-violet-500/50 hover:bg-violet-500/5"
+                  style={{ borderColor: "#27272a", color: "#52525b" }}
+                  title="Add more images"
+                >
+                  <Plus className="size-5" />
+                </button>
+              </div>
+            ) : (
+            <>{segments.map((seg, idx) => {
               const overridden =
                 seg.rawDurationMs != null &&
                 Math.abs(seg.rawDurationMs - seg.durationMs) > 50;
@@ -375,6 +611,11 @@ export function MediaPanelBase({
                 !!transition.overrides &&
                 Object.prototype.hasOwnProperty.call(transition.overrides, seg.id);
               const boundaryOpen = openBoundary === seg.id;
+              const motionPinned = Object.prototype.hasOwnProperty.call(
+                motionOverrides,
+                seg.id,
+              );
+              const motionOpen = openMotion === seg.id;
               const headDurSec =
                 (Math.min(transition.durationMs, Math.floor(seg.durationMs * 0.45)) / 1000);
               return (
@@ -524,7 +765,7 @@ export function MediaPanelBase({
                     setDropTargetIdx(null);
                   }}
                   className={cn(
-                    "group relative flex items-center gap-2.5 overflow-hidden rounded-lg border p-2 transition-all duration-150 hover:-translate-y-px",
+                    "group relative flex items-center gap-2.5 rounded-lg border p-2 transition-all duration-150 hover:-translate-y-px",
                     draggedId === seg.id && "opacity-40",
                     dropTargetIdx === idx && draggedId && draggedId !== seg.id && "ring-1 ring-violet-400/70",
                   )}
@@ -536,7 +777,7 @@ export function MediaPanelBase({
                 >
                   {/* Active-segment left accent (matches the timeline). */}
                   <span
-                    className="absolute inset-y-0 left-0 w-[3px]"
+                    className="absolute inset-y-0 left-0 w-[3px] rounded-l-lg"
                     style={{
                       backgroundColor: kindStyle.border,
                       opacity: 0.65,
@@ -655,26 +896,134 @@ export function MediaPanelBase({
                       {seg.fileName}
                     </div>
                     <div
-                      className="mt-0.5 flex items-center gap-2 text-[9px]"
-                      style={{ color: "#a1a1ab" }}
-                      title={`Duration ${(seg.durationMs / 1000).toFixed(1)}s · Ken Burns ${seg.direction}`}
+                      className="relative mt-0.5 flex items-center gap-2 text-[9px]"
+                      style={{ color: "#b1b1b8" }}
+                      title={`Duration ${(seg.durationMs / 1000).toFixed(1)}s · Ken Burns ${seg.direction} — click the motion to customize`}
                     >
                       <span className="tabular-nums">
                         dur {(seg.durationMs / 1000).toFixed(1)}s
                       </span>
                       <span style={{ color: "#52525b" }}>·</span>
-                      <span className="capitalize">{seg.direction}</span>
+                      {/* v4.8: per-segment motion popover — click to pin this
+                          segment's Ken Burns direction (or aim it on the
+                          preview canvas). */}
+                      {motionOpen && (
+                        <div
+                          className="fixed inset-0 z-20"
+                          onClick={() => setOpenMotion(null)}
+                          aria-hidden
+                        />
+                      )}
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setOpenMotion(motionOpen ? null : seg.id)
+                        }
+                        aria-expanded={motionOpen}
+                        aria-label={`Motion for segment ${idx + 1}`}
+                        className={cn(
+                          "relative z-[21] flex items-center gap-1 rounded px-1.5 py-0.5 capitalize transition-all duration-150 hover:bg-white/5",
+                          motionPinned && "font-semibold",
+                        )}
+                        style={{
+                          color: motionPinned ? "#6ee7b7" : undefined,
+                          backgroundColor: motionPinned
+                            ? "rgba(6, 78, 59, 0.45)"
+                            : undefined,
+                        }}
+                        title={
+                          motionPinned
+                            ? `Pinned: ${motionOverrides[seg.id]} — click to change or follow global`
+                            : "Ken Burns motion — click to pin a custom direction"
+                        }
+                      >
+                        {motionPinned && "✦ "}
+                        {seg.direction}
+                        <ChevronDown
+                          className={cn(
+                            "size-2.5 transition-transform duration-200",
+                            motionOpen && "rotate-180",
+                          )}
+                          style={{ color: "currentColor" }}
+                        />
+                      </button>
+                      {motionOpen && (
+                        <div className="ff-pop absolute bottom-full left-0 z-[22] mb-1 w-44 rounded-lg border p-2 shadow-xl">
+                          <p
+                            className="mb-1.5 px-0.5 text-[9px] font-semibold uppercase tracking-wider"
+                            style={{ color: "#71717a" }}
+                          >
+                            Motion · segment {idx + 1}
+                          </p>
+                          <div className="grid grid-cols-2 gap-1">
+                            {MOTION_OPTIONS.map((m) => (
+                              <button
+                                key={m.value}
+                                type="button"
+                                onClick={() => {
+                                  onSetMotion(seg.id, m.value);
+                                  setOpenMotion(null);
+                                }}
+                                className={cn(
+                                  "flex items-center gap-1.5 rounded px-1.5 py-1 text-left text-[9px] font-medium transition-all duration-150",
+                                  motionPinned &&
+                                    motionOverrides[seg.id] === m.value
+                                    ? "bg-emerald-500/25 ring-1 ring-emerald-400/50"
+                                    : "hover:bg-white/5",
+                                )}
+                                style={{
+                                  color:
+                                    motionPinned &&
+                                    motionOverrides[seg.id] === m.value
+                                      ? "#6ee7b7"
+                                      : "#a1a1aa",
+                                }}
+                                title={`${m.label} for this segment only`}
+                              >
+                                <span
+                                  aria-hidden
+                                  className="text-[11px] leading-none"
+                                >
+                                  {m.glyph}
+                                </span>
+                                {m.label}
+                              </button>
+                            ))}
+                          </div>
+                          <div
+                            className="mt-1.5 flex items-center justify-between border-t pt-1.5"
+                            style={{ borderColor: "#27272a" }}
+                          >
+                            <span className="text-[8px]" style={{ color: "#52525b" }}>
+                              tip: aim on the canvas
+                            </span>
+                            {motionPinned && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  onSetMotion(seg.id, null);
+                                  setOpenMotion(null);
+                                }}
+                                className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[8px] font-semibold transition-colors hover:bg-white/5"
+                                style={{ color: "#6ee7b7" }}
+                              >
+                                <RotateCcw className="size-2.5" /> follow global
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   </div>
 
-                  {/* Actions */}
-                  <div className="flex shrink-0 flex-col items-center gap-0.5">
+                  {/* Actions — v4.8: 28px hit targets (VLM: too small/thin). */}
+                  <div className="flex shrink-0 flex-col items-center gap-1">
                     <button
                       type="button"
                       onClick={() => onReorder(seg.id, -1)}
                       disabled={idx === 0 || !dragEnabled}
-                      className="rounded p-0.5 transition-colors hover:bg-white/10 disabled:opacity-30"
-                      style={{ color: "#71717a" }}
+                      className="rounded-md p-1.5 transition-colors hover:bg-white/10 disabled:opacity-30"
+                      style={{ color: "#8a8a93" }}
                       title={
                         dragEnabled
                           ? "Move up"
@@ -700,8 +1049,8 @@ export function MediaPanelBase({
                       type="button"
                       onClick={() => onReorder(seg.id, 1)}
                       disabled={idx === segments.length - 1 || !dragEnabled}
-                      className="rounded p-0.5 transition-colors hover:bg-white/10 disabled:opacity-30"
-                      style={{ color: "#71717a" }}
+                      className="rounded-md p-1.5 transition-colors hover:bg-white/10 disabled:opacity-30"
+                      style={{ color: "#8a8a93" }}
                       title={
                         dragEnabled
                           ? "Move down"
@@ -715,7 +1064,7 @@ export function MediaPanelBase({
                     <button
                       type="button"
                       onClick={() => onDuplicate(seg.id)}
-                      className="rounded p-1 opacity-40 transition-all hover:bg-violet-500/15 hover:opacity-100 group-hover:opacity-100"
+                      className="rounded-md p-1.5 opacity-40 transition-all hover:bg-violet-500/15 hover:opacity-100 group-hover:opacity-100"
                       style={{ color: "#c4b5fd" }}
                       title="Duplicate segment"
                     >
@@ -724,7 +1073,7 @@ export function MediaPanelBase({
                     <button
                       type="button"
                       onClick={() => onRemove(seg.id)}
-                      className="rounded p-1 opacity-40 transition-all hover:bg-red-500/15 hover:text-red-400 group-hover:opacity-100"
+                      className="rounded-md p-1.5 opacity-40 transition-all hover:bg-red-500/15 hover:text-red-400 group-hover:opacity-100"
                       style={{ color: "#a1a1aa" }}
                       title="Remove"
                     >
@@ -734,7 +1083,8 @@ export function MediaPanelBase({
                 </div>
                 </div>
               );
-            })}
+            })}</>
+            )}
 
             {/* Audio track chip */}
             {audioTrack && (

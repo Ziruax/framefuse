@@ -2,6 +2,7 @@
 
 import {
   useRef,
+  useState,
   useCallback,
   useEffect,
   type PointerEvent as ReactPointerEvent,
@@ -141,7 +142,8 @@ function WaveformStrip({
         if (octx) {
           octx.setTransform(dpr, 0, 0, dpr, 0, 0);
           // Full-brightness bars — the blit below applies the dim alpha.
-          octx.fillStyle = "#67e8f9";
+          // v4.8: desaturated sky (VLM: bright cyan strobed).
+          octx.fillStyle = "#7dd3fc";
           const n = data.peaks.length;
           const barW = waveW / n;
           for (let i = 0; i < n; i++) {
@@ -154,10 +156,13 @@ function WaveformStrip({
       }
 
       // Blit the dim pass with a unipolar alpha tint.
-      ctx.globalAlpha = 0.42;
+      // v4.8: 0.30 (was 0.42) + desaturated slate-cyan — VLM flagged the
+      // wave as louder than the clip segments; the audio data should recede
+      // while the bright pass keeps progress contrast.
+      ctx.globalAlpha = 0.3;
       ctx.drawImage(off, 0, 0, cssW, cssH);
       ctx.globalAlpha = 1;
-      ctx.fillStyle = "rgba(103, 232, 249, 0.55)";
+      ctx.fillStyle = "rgba(125, 211, 252, 0.48)";
 
       // Bright pass: bars up to the playhead. Progress is AUDIO-relative
       // (wave maps 0..durationMs → 0..waveW); when the video outlives the
@@ -212,6 +217,13 @@ export function TimelineRuler({
 }: TimelineRulerProps) {
   const trackRef = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
+  // v4.8: mirror of `dragging` for render (refs must not be read during
+  // render — this flips exactly twice per scrub, so rerenders are cheap).
+  const [scrubbing, setScrubbing] = useState(false);
+  // v4.8: hover position for the ghost-time tooltip, stored as a NORMALIZED
+  // ratio (computed in the handler where ref access is legal — the render
+  // path then derives ms arithmetically, no ref reads).
+  const [hoverRatio, setHoverRatio] = useState<number | null>(null);
 
   const xToMs = useCallback(
     (clientX: number) => {
@@ -229,15 +241,27 @@ export function TimelineRuler({
 
   const handlePointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
     dragging.current = true;
+    setScrubbing(true);
     (e.target as HTMLElement).setPointerCapture?.(e.pointerId);
     onSeek(xToMs(e.clientX));
   };
   const handlePointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    // v4.8: ghost tooltip tracks the cursor while NOT scrubbing.
+    if (!dragging.current && e.pointerType === "mouse") {
+      const el = trackRef.current;
+      if (el && el.clientWidth > 0) {
+        const rect = el.getBoundingClientRect();
+        setHoverRatio(
+          Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)),
+        );
+      }
+    }
     if (!dragging.current) return;
     onSeek(xToMs(e.clientX));
   };
   const handlePointerUp = () => {
     dragging.current = false;
+    setScrubbing(false);
   };
 
   const playPct = totalMs > 0 ? Math.min(100, (currentMs / totalMs) * 100) : 0;
@@ -270,6 +294,12 @@ export function TimelineRuler({
   })();
 
   const hasWave = !!waveform && totalMs > 0;
+  // v4.8: hover timecode for the ghost tooltip (null when outside).
+  const hoverMs =
+    hoverRatio != null && totalMs > 0
+      ? Math.round(hoverRatio * totalMs)
+      : null;
+  const hoverPct = hoverRatio != null ? hoverRatio * 100 : 0;
 
   return (
     <div
@@ -352,6 +382,7 @@ export function TimelineRuler({
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerUp}
+          onPointerLeave={() => setHoverRatio(null)}
           className={cn(
             "relative w-full cursor-pointer touch-none select-none rounded-lg border",
             hasWave ? "h-[92px]" : "h-16",
@@ -579,9 +610,10 @@ export function TimelineRuler({
             style={{ left: `${playPct}%` }}
           >
             {/* v4.6: grab cap — a brighter pill above the dot that reads as
-                a draggable handle. */}
+                a draggable handle. v4.8: it now pokes ABOVE the track edge
+                (VLM: needs a clear anchor for precise scrubbing). */}
             <div
-              className="absolute -left-2 -top-[4px] h-[5px] w-4 rounded-full"
+              className="absolute -left-2.5 -top-[7px] h-[6px] w-5 rounded-full"
               style={{
                 backgroundImage:
                   "linear-gradient(90deg, #8b5cf6, #d946ef, #8b5cf6)",
@@ -606,6 +638,38 @@ export function TimelineRuler({
               }}
             />
           </div>
+
+          {/* v4.8: hover ghost — dashed hairline + timecode chip previewing
+              where a click/scrub would land (hidden while dragging: the real
+              playhead is already under the cursor then). */}
+          {hoverMs != null && !scrubbing && (
+            <div
+              className="pointer-events-none absolute top-0 z-10 h-full"
+              style={{ left: `${hoverPct}%` }}
+            >
+              <div
+                className="absolute left-0 top-0 h-full w-px"
+                style={{
+                  backgroundColor: "rgba(228, 228, 231, 0.35)",
+                  backgroundImage:
+                    "linear-gradient(to bottom, rgba(228,228,231,0.55) 40%, transparent 40%)",
+                  backgroundSize: "1px 5px",
+                }}
+              />
+              <div
+                className="absolute -translate-x-1/2 whitespace-nowrap rounded px-1.5 py-0.5 text-[9px] font-semibold tabular-nums backdrop-blur-sm"
+                style={{
+                  top: hasWave ? 48 : 26,
+                  backgroundColor: "rgba(0, 0, 0, 0.78)",
+                  color: "#e4e4e7",
+                  border: "1px solid rgba(228, 228, 231, 0.18)",
+                  boxShadow: "0 2px 8px rgba(0,0,0,0.5)",
+                }}
+              >
+                {fmtTimecode(hoverMs)}
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

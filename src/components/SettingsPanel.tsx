@@ -3,7 +3,6 @@
 import { useState } from "react";
 import {
   ChevronDown,
-  ChevronRight,
   Zap,
   Film,
   Captions,
@@ -167,14 +166,18 @@ function Section({
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-2 px-4 py-3 text-left transition-colors hover:bg-white/5"
+        className="flex w-full items-center gap-2 rounded-none px-4 py-3 text-left transition-colors hover:bg-white/5"
         aria-expanded={open}
       >
-        {open ? (
-          <ChevronDown size={14} className="shrink-0 text-zinc-500" />
-        ) : (
-          <ChevronRight size={14} className="shrink-0 text-zinc-500" />
-        )}
+        {/* v4.8: one rotating chevron (was a two-icon swap) — the motion
+            itself now communicates expanded/collapsed state. */}
+        <ChevronDown
+          size={14}
+          className={cn(
+            "shrink-0 text-zinc-500 transition-transform duration-200",
+            open ? "rotate-0" : "-rotate-90",
+          )}
+        />
         <span className="shrink-0 text-zinc-400">{icon}</span>
         <span className="flex-1 text-xs font-semibold uppercase tracking-wider text-zinc-300">
           {title}
@@ -420,7 +423,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 : `Fixed — every image uses ${kenBurns.direction}`
             }
           >
-            <div className="grid grid-cols-3 gap-1">
+            <div className="grid grid-cols-3 gap-1.5">
               {KB_EFFECTS.map((eff) => {
                 const active = poolActive(eff.value);
                 return (
@@ -433,7 +436,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                     className={cn(
                       "flex items-center gap-1.5 rounded-md px-1.5 py-2 text-[10px] font-medium transition-all duration-150",
                       active
-                        ? "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-500/40"
+                        ? "bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/35"
                         : "bg-zinc-800/60 text-zinc-400 hover:bg-white/5 hover:-translate-y-px",
                       !kenBurns.enabled && "opacity-40",
                     )}

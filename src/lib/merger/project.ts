@@ -23,6 +23,7 @@ import type {
   CaptionSettings,
   HeadlineItem,
   KenBurnsConfig,
+  KenBurnsDirection,
   TransitionSettings,
   VideoSettings,
   WatermarkSettings,
@@ -30,7 +31,7 @@ import type {
 import { serializeSrt, type SubtitleCue } from "./subtitles";
 
 export const PROJECT_APP = "framefuse";
-export const PROJECT_VERSION = 4.7;
+export const PROJECT_VERSION = 4.8;
 
 /** Audio above this size (MB, decoded) is skipped to keep project files sane. */
 export const MAX_AUDIO_MB = 25;
@@ -60,6 +61,9 @@ export interface ProjectFile {
   } | null;
   headlines: HeadlineItem[];
   overrides: Record<string, number>;
+  /** v4.8: per-segment Ken Burns direction overrides (id → direction).
+   *  Optional for back-compat with ≤4.7 project files. */
+  motionOverrides?: Record<string, KenBurnsDirection>;
   /** Watermark / logo overlay (v4.4): image + settings. */
   watermark: {
     image: ProjectImageEntry | null;
@@ -82,6 +86,8 @@ export interface SaveProjectInput {
   subtitles: { fileName: string; cues: SubtitleCue[] } | null;
   headlines: HeadlineItem[];
   overrides: Record<string, number>;
+  /** v4.8: per-segment Ken Burns direction overrides. */
+  motionOverrides?: Record<string, KenBurnsDirection>;
   /** Watermark / logo overlay (v4.4). */
   watermark: { image: { id: string; file: File } | null; settings: WatermarkSettings } | null;
   settings: ProjectFile["settings"];
@@ -149,9 +155,28 @@ export async function buildProjectFile(
       : null,
     headlines: input.headlines,
     overrides: input.overrides,
+    motionOverrides: sanitizeMotionOverrides(input.motionOverrides),
     watermark,
     settings: input.settings,
   };
+}
+
+/** Keep only entries that map to a real concrete direction (never "random",
+ *  never "none" — those are meaningless as pinned overrides). */
+function sanitizeMotionOverrides(
+  mo: Record<string, KenBurnsDirection> | undefined | null,
+): Record<string, KenBurnsDirection> | undefined {
+  if (!mo || typeof mo !== "object") return undefined;
+  const valid: KenBurnsDirection[] = ["in", "out", "left", "right", "up", "down"];
+  const out: Record<string, KenBurnsDirection> = {};
+  let any = false;
+  for (const [id, dir] of Object.entries(mo)) {
+    if (typeof dir === "string" && valid.includes(dir)) {
+      out[id] = dir;
+      any = true;
+    }
+  }
+  return any ? out : undefined;
 }
 
 /** Trigger a browser download of the project as `.framefuse.json`. */

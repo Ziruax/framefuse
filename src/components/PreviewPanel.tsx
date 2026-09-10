@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useRef } from "react";
-import { Play, Pause, SkipBack, SkipForward, ImageOff, Type, ArrowLeftRight, BadgeCheck } from "lucide-react";
+import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
+import { Play, Pause, SkipBack, SkipForward, ImageOff, Type, ArrowLeftRight, BadgeCheck, Crosshair } from "lucide-react";
 import type {
   AspectRatio,
   CaptionSettings,
   HeadlineItem,
   KenBurnsConfig,
+  KenBurnsDirection,
   MediaSegment,
   SubtitleFile,
   TransitionSettings,
@@ -55,7 +56,34 @@ interface PreviewPanelProps {
   onSeek: (ms: number) => void;
   onTogglePlay: () => void;
   onStep: (dir: -1 | 1) => void;
+  /** v4.8: click-to-aim Ken Burns motion — pin the active segment's
+   *  direction from where the user clicks on the canvas. Absent (or motion
+   *  disabled) → the canvas stays a plain preview. */
+  onSetMotion?: (dir: KenBurnsDirection) => void;
 }
+
+/** v4.8: which concrete motion does a click at (nx, ny) ∈ [0,1]² aim at?
+ *  Center zone → zoom in; otherwise the dominant axis wins (the camera
+ *  pans toward the clicked point). Pure + mirrors the card popover. */
+export function aimDirection(
+  nx: number,
+  ny: number,
+  centerRadius = 0.16,
+): KenBurnsDirection {
+  const dx = nx - 0.5;
+  const dy = ny - 0.5;
+  if (Math.hypot(dx, dy * 0.85) < centerRadius) return "in";
+  return Math.abs(dx) >= Math.abs(dy) ? (dx > 0 ? "right" : "left") : ny > 0.5 ? "down" : "up";
+}
+
+const AIM_LABEL: Record<string, string> = {
+  in: "Zoom In",
+  out: "Zoom Out",
+  left: "Pan Left",
+  right: "Pan Right",
+  up: "Pan Up",
+  down: "Pan Down",
+};
 
 export function PreviewPanel({
   segments,
@@ -75,10 +103,16 @@ export function PreviewPanel({
   onSeek,
   onTogglePlay,
   onStep,
+  onSetMotion,
 }: PreviewPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const scratchRef = useRef<HTMLCanvasElement | null>(null);
   const dims = previewDimensions(aspect);
+  // v4.8: hover point for the motion-aiming overlay (normalized coords).
+  const [aim, setAim] = useState<{ nx: number; ny: number } | null>(null);
+  const aimActive =
+    !!onSetMotion && kenBurns.enabled && !!activeSegment && segments.length > 0;
+  const aimedDir = aim ? aimDirection(aim.nx, aim.ny) : null;
 
   // Redraw whenever the playhead or inputs change.
   useEffect(() => {
@@ -224,7 +258,27 @@ export function PreviewPanel({
               maxWidth: "100%",
               maxHeight: "100%",
               width: dims.w,
+              ...(aimActive ? { cursor: "crosshair" } : {}),
             }}
+            onMouseMove={
+              aimActive
+                ? (e: ReactMouseEvent<HTMLDivElement>) => {
+                    const r = e.currentTarget.getBoundingClientRect();
+                    setAim({
+                      nx: Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)),
+                      ny: Math.max(0, Math.min(1, (e.clientY - r.top) / r.height)),
+                    });
+                  }
+                : undefined
+            }
+            onMouseLeave={aimActive ? () => setAim(null) : undefined}
+            onClick={
+              aimActive && aim
+                ? () => {
+                    onSetMotion?.(aimDirection(aim.nx, aim.ny));
+                  }
+                : undefined
+            }
           >
             <canvas
               ref={canvasRef}
@@ -232,6 +286,79 @@ export function PreviewPanel({
               height={dims.h}
               className="block size-full rounded-lg"
             />
+            {/* v4.8: motion-aiming overlay — crosshair follows the cursor,
+                the chip names the direction a click would pin. */}
+            {aimActive && aim && aimedDir && (
+              <div className="pointer-events-none absolute inset-0 overflow-hidden rounded-lg">
+                {/* Crosshair guides */}
+                <span
+                  className="absolute inset-y-0 w-px"
+                  style={{
+                    left: `${aim.nx * 100}%`,
+                    backgroundColor: "rgba(167, 139, 250, 0.4)",
+                    boxShadow: "0 0 8px rgba(167, 139, 250, 0.35)",
+                  }}
+                />
+                <span
+                  className="absolute inset-x-0 h-px"
+                  style={{
+                    top: `${aim.ny * 100}%`,
+                    backgroundColor: "rgba(167, 139, 250, 0.4)",
+                    boxShadow: "0 0 8px rgba(167, 139, 250, 0.35)",
+                  }}
+                />
+                {/* Center bullseye (click = zoom in) + visible center dot
+                    (v4.8 VLM: the center must read on busy video content). */}
+                <span
+                  className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border border-violet-300/40"
+                  style={{
+                    width: "24%",
+                    aspectRatio: "1 / 1",
+                    maxHeight: "34%",
+                    boxShadow:
+                      "inset 0 0 24px rgba(167, 139, 250, 0.18), 0 0 12px rgba(167, 139, 250, 0.12)",
+                  }}
+                />
+                <span
+                  className="absolute left-1/2 top-1/2 size-2 -translate-x-1/2 -translate-y-1/2 rounded-full border-2"
+                  style={{
+                    backgroundColor: "#c4b5fd",
+                    borderColor: "rgba(255, 255, 255, 0.75)",
+                    boxShadow: "0 0 8px rgba(167, 139, 250, 0.9)",
+                  }}
+                />
+                {/* Aim chip near the cursor */}
+                <span
+                  className="absolute flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-semibold backdrop-blur-sm"
+                  style={{
+                    left: `calc(${(aim.nx * 100).toFixed(1)}% + 12px)`,
+                    top: `calc(${(aim.ny * 100).toFixed(1)}% + 12px)`,
+                    backgroundColor: "rgba(0, 0, 0, 0.72)",
+                    color: "#c4b5fd",
+                    border: "1px solid rgba(167, 139, 250, 0.4)",
+                    maxWidth: "45%",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  <Crosshair className="size-3 shrink-0" />
+                  Aim: {AIM_LABEL[aimedDir]}
+                </span>
+              </div>
+            )}
+            {/* v4.8: persistent hint (only while motion aiming is armed) */}
+            {aimActive && !aim && (
+              <div
+                className="pointer-events-none absolute bottom-2 left-1/2 -translate-x-1/2 flex items-center gap-1.5 rounded-md px-2 py-1 text-[9px] backdrop-blur-sm"
+                style={{
+                  backgroundColor: "rgba(0, 0, 0, 0.62)",
+                  color: "#c4b5fd",
+                  border: "1px solid rgba(167, 139, 250, 0.28)",
+                }}
+              >
+                <Crosshair className="size-3" />
+                Click the canvas to aim this segment's motion · center = zoom in
+              </div>
+            )}
             {/* Segment label overlay (v4.5: middle-ellipsis so BOTH the
                 timestamp prefix and the descriptive tail stay readable). */}
             {activeSegment && (
@@ -334,7 +461,7 @@ export function PreviewPanel({
             type="button"
             onClick={() => onStep(-1)}
             disabled={segments.length === 0}
-            className="flex size-8 items-center justify-center rounded-lg transition-all hover:bg-white/10 hover:text-zinc-200 active:scale-90 disabled:opacity-30"
+            className="flex size-8 items-center justify-center rounded-lg transition-all hover:bg-white/10 hover:text-zinc-200 hover:shadow-[0_0_12px_rgba(228,228,231,0.08)] active:scale-90 disabled:opacity-30 disabled:hover:shadow-none"
             style={{ color: "#a1a1aa" }}
             title="Previous segment (Shift+←)"
             aria-label="Previous segment"
@@ -345,7 +472,7 @@ export function PreviewPanel({
             type="button"
             onClick={onTogglePlay}
             disabled={segments.length === 0}
-            className="flex size-10 items-center justify-center rounded-full text-white shadow-lg transition-all duration-150 hover:scale-105 active:scale-95 disabled:opacity-30 disabled:hover:scale-100"
+            className="flex size-10 items-center justify-center rounded-full text-white shadow-lg transition-all duration-150 hover:scale-105 hover:brightness-110 hover:shadow-[0_6px_24px_rgba(124,58,237,0.65)] active:scale-95 disabled:opacity-30 disabled:hover:scale-100 disabled:hover:brightness-100"
             style={{
               background: "linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%)",
               boxShadow: "0 4px 16px rgba(124, 58, 237, 0.45)",
@@ -362,7 +489,7 @@ export function PreviewPanel({
             type="button"
             onClick={() => onStep(1)}
             disabled={segments.length === 0}
-            className="flex size-8 items-center justify-center rounded-lg transition-all hover:bg-white/10 hover:text-zinc-200 active:scale-90 disabled:opacity-30"
+            className="flex size-8 items-center justify-center rounded-lg transition-all hover:bg-white/10 hover:text-zinc-200 hover:shadow-[0_0_12px_rgba(228,228,231,0.08)] active:scale-90 disabled:opacity-30 disabled:hover:shadow-none"
             style={{ color: "#a1a1aa" }}
             title="Next segment (Shift+→)"
             aria-label="Next segment"
@@ -379,7 +506,7 @@ export function PreviewPanel({
             <span className="mx-0.5" style={{ color: "#52525b" }}>
               /
             </span>
-            <span style={{ color: "#a1a1aa" }}>
+            <span style={{ color: "#b5b5bc" }}>
               {fmtTimecode(totalMs)}
             </span>
           </div>

@@ -150,6 +150,11 @@ export function buildTimeline(
   entries: TimelineEntry[],
   overrides: Record<string, number>,
   kenBurns: KenBurnsConfig,
+  /** v4.8: per-segment Ken Burns direction overrides (id → direction).
+   *  Wins over the global/random resolution; a concrete direction here
+   * becomes `seg.direction`, which the preview renderer AND the FFmpeg
+   * zoompan both consume — preview↔export parity is inherited for free. */
+  motionOverrides?: Record<string, KenBurnsDirection>,
 ): BuildTimelineResult {
   const warnings: OverlapWarning[] = [];
   const skipped: string[] = [];
@@ -214,7 +219,9 @@ export function buildTimeline(
     for (const we of withEnds) {
       const startMs = we.e.parsed.startMs ?? 0;
       const endMs = Math.max(startMs + 200, we.endMs); // min 200ms
-      const dir = resolveDirection(we.e.id, kenBurns.direction, kenBurns.directionPool);
+      const dir =
+        motionOverrides?.[we.e.id] ??
+        resolveDirection(we.e.id, kenBurns.direction, kenBurns.directionPool);
       segments.push({
         id: we.e.id,
         fileName: we.e.fileName,
@@ -245,7 +252,9 @@ export function buildTimeline(
         ov && ov > 0 ? ov : e.parsed.durationMs ?? DEFAULT_DURATION_MS;
       const startMs = cursor;
       const endMs = cursor + dur;
-      const dir = resolveDirection(e.id, kenBurns.direction, kenBurns.directionPool);
+      const dir =
+        motionOverrides?.[e.id] ??
+        resolveDirection(e.id, kenBurns.direction, kenBurns.directionPool);
       segments.push({
         id: e.id,
         fileName: e.fileName,

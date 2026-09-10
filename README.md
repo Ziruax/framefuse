@@ -1,10 +1,19 @@
-# FrameFuse v4.7
+# FrameFuse v4.8
 
-Native desktop **image → video** merger with a **live audio waveform timeline**, **beat-synced cutting with a strength dial**, **viral kinetic captions with favorites**, **segment transitions**, **per-boundary transition overrides**, **export quality profiles**, **watermark/logo overlay**, **undo/redo**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
+Native desktop **image → video** merger with **click-to-aim Ken Burns motion**, a **grid media library for 100+ image storyboards**, a **live audio waveform timeline**, **beat-synced cutting with a strength dial**, **viral kinetic captions with favorites**, **segment transitions**, **per-boundary transition overrides**, **export quality profiles**, **watermark/logo overlay**, **undo/redo**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
 
 ## Highlights
 
-### 🌊 Audio waveform timeline (new in v4.7)
+### 🎯 Click-to-aim motion (new in v4.8)
+Hover the preview canvas and a **crosshair + aim chip** appear — click anywhere to pin the active segment's Ken Burns direction (center = zoom in, edges = pan toward the click). Every card's motion label is also a **6-direction popover** with per-segment pinning; overrides flow into the timeline, the project file, undo history, AND the FFmpeg zoompan — one resolution point, exact export parity.
+
+### 🗞 Media library grid view (new in v4.8)
+One toggle flips the library between rich **list rows** and compact **tiles** built for 100+ image storyboards: index + duration badges, active-tile highlight, click-to-jump, hover remove, drag-reorder, and pinned-motion flags. The preference persists.
+
+### 🕶 Timeline hover timecode (new in v4.8)
+Ghost hairline + timecode chip follow the cursor across the ruler and waveform — preview exactly where a click or scrub lands.
+
+### 🌊 Audio waveform timeline (v4.7)
 Drop any track and the timeline renders its **full peak waveform** between the ruler and the segment bars — bright cyan bars mark playback progress in real time (audio-relative, pixel-exact at any scrub position), dim bars show what's coming. Mirrored bars use sqrt perceptual shaping so quiet passages stay visible, and the static pass is cached offscreen keyed by decode identity for 60fps-safe redraws.
 
 ### 🎚 Beat-snap strength dial (new in v4.7)

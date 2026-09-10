@@ -89,6 +89,17 @@ input[type="range"]::-webkit-slider-thumb {
   cursor: pointer;
   border: 2px solid #ffffff;
   box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4);
+  transition: box-shadow 150ms ease, transform 150ms ease;
+}
+
+/* v4.8: thumb grows + glows on hover/drag so the handle reads as grabbable
+   (VLM: default and hover states were visually identical). */
+input[type="range"]:hover::-webkit-slider-thumb,
+input[type="range"]:active::-webkit-slider-thumb {
+  box-shadow:
+    0 0 0 4px rgba(124, 58, 237, 0.35),
+    0 0 10px rgba(139, 92, 246, 0.55);
+  transform: scale(1.18);
 }
 
 input[type="range"]::-moz-range-thumb {
@@ -98,6 +109,15 @@ input[type="range"]::-moz-range-thumb {
   background: #7c3aed;
   cursor: pointer;
   border: 2px solid #ffffff;
+  transition: box-shadow 150ms ease, transform 150ms ease;
+}
+
+input[type="range"]:hover::-moz-range-thumb,
+input[type="range"]:active::-moz-range-thumb {
+  box-shadow:
+    0 0 0 4px rgba(124, 58, 237, 0.35),
+    0 0 10px rgba(139, 92, 246, 0.55);
+  transform: scale(1.18);
 }
 
 /* ===== Selection ===== */

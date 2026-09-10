@@ -48,6 +48,7 @@ import {
   type ExportProgress,
   type HeadlineItem,
   type KenBurnsConfig,
+  type KenBurnsDirection,
   type MediaSegment,
   type SubtitleFile,
   type TransitionSettings,
@@ -94,6 +95,8 @@ interface PersistedSettings {
   beatStride?: number;
   /** v4.7: starred caption preset ids. */
   favoritePresets?: string[];
+  /** v4.8: media library view mode ("list" | "grid") — app-level pref. */
+  mediaView?: "list" | "grid";
 }
 
 function loadPersisted(): Partial<PersistedSettings> {
@@ -172,6 +175,13 @@ export default function Page() {
   const [beatStride, setBeatStride] = useState<1 | 2 | 4 | 8>(1);
   // v4.7: starred caption presets (app-level preference, not project data).
   const [favoritePresets, setFavoritePresets] = useState<string[]>([]);
+  // v4.8: per-segment Ken Burns direction overrides (id → direction).
+  // Project-level data (saved into .framefuse.json), undo-able.
+  const [motionOverrides, setMotionOverrides] = useState<
+    Record<string, KenBurnsDirection>
+  >({});
+  // v4.8: media library view mode (app-level pref, persisted).
+  const [mediaView, setMediaView] = useState<"list" | "grid">("list");
 
   // Restore persisted settings AFTER mount (client-only, hydration-safe).
   // Reading localStorage in the state initializers made the first client
@@ -210,6 +220,10 @@ export default function Page() {
       setFavoritePresets(
         p.favoritePresets.filter((id) => typeof id === "string"),
       );
+    }
+    // v4.8: media library layout preference.
+    if (p.mediaView === "grid" || p.mediaView === "list") {
+      setMediaView(p.mediaView);
     }
   }, []);
 
@@ -265,8 +279,8 @@ export default function Page() {
   }, [items]);
 
   const timeline = useMemo(
-    () => buildTimeline(entries, overrides, kenBurns),
-    [entries, overrides, kenBurns],
+    () => buildTimeline(entries, overrides, kenBurns, motionOverrides),
+    [entries, overrides, kenBurns, motionOverrides],
   );
 
   const activeSegment = useMemo(
@@ -283,6 +297,7 @@ export default function Page() {
   interface HistorySnapshot {
     items: MediaItem[];
     overrides: Record<string, number>;
+    motionOverrides: Record<string, KenBurnsDirection>;
     subtitles: SubtitleFile | null;
     headlineItems: HeadlineItem[];
     captionSettings: CaptionSettings;
@@ -318,6 +333,7 @@ export default function Page() {
     stateRef.current = {
       items,
       overrides,
+      motionOverrides,
       subtitles,
       headlineItems,
       captionSettings,
@@ -395,6 +411,7 @@ export default function Page() {
     }
     setItems(snap.items);
     setOverrides(snap.overrides);
+    setMotionOverrides(snap.motionOverrides);
     setSubtitles(snap.subtitles);
     setHeadlineItems(snap.headlineItems);
     setCaptionSettings(snap.captionSettings);
@@ -1021,13 +1038,14 @@ export default function Page() {
       watermark: watermarkSettings,
       beatStride,
       favoritePresets,
+      mediaView,
     };
     try {
       localStorage.setItem(LS_KEY, JSON.stringify(payload));
     } catch {
       /* storage full / private mode — non-fatal */
     }
-  }, [kenBurns, settings, captionSettings, audioSettings, whisperLanguage, headlineItems, transitionSettings, watermarkSettings, beatStride, favoritePresets]);
+  }, [kenBurns, settings, captionSettings, audioSettings, whisperLanguage, headlineItems, transitionSettings, watermarkSettings, beatStride, favoritePresets, mediaView]);
 
   const generateCaptionsFromAudio = useCallback(async () => {
     if (!audioTrack) {
@@ -1390,6 +1408,29 @@ export default function Page() {
     [],
   );
 
+  // ---- v4.8: per-segment Ken Burns motion override -----------------------
+  /** Pin one segment's motion (null = clear → back to global/random). */
+  const setSegmentMotion = useCallback(
+    (segId: string, dir: KenBurnsDirection | null) => {
+      requestHistoryPush();
+      setMotionOverrides((prev) => {
+        const next = { ...prev };
+        if (dir == null) delete next[segId];
+        else next[segId] = dir;
+        return next;
+      });
+    },
+    [requestHistoryPush],
+  );
+
+  const clearAllMotionOverrides = useCallback(() => {
+    requestHistoryPush();
+    setMotionOverrides({});
+    toast.success("Motion overrides cleared", {
+      description: "Every segment follows the global Ken Burns setting again.",
+    });
+  }, [requestHistoryPush]);
+
   const saveProject = useCallback(async () => {
     try {
       if (items.length === 0) {
@@ -1418,6 +1459,7 @@ export default function Page() {
           : null,
         headlines: headlineItems,
         overrides,
+        motionOverrides,
         watermark: watermarkImage
           ? {
               image: { id: watermarkImage.id, file: watermarkImage.file },
@@ -1453,6 +1495,7 @@ export default function Page() {
     subtitles,
     headlineItems,
     overrides,
+    motionOverrides,
     kenBurns,
     settings,
     captionSettings,
@@ -1543,6 +1586,12 @@ export default function Page() {
         setOverrides(
           project.overrides && typeof project.overrides === "object"
             ? project.overrides
+            : {},
+        );
+        setMotionOverrides(
+          project.motionOverrides &&
+            typeof project.motionOverrides === "object"
+            ? (project.motionOverrides as Record<string, KenBurnsDirection>)
             : {},
         );
         setTransitionSettings(project.settings.transition || defaultTransitionSettings());
@@ -1799,6 +1848,16 @@ export default function Page() {
             onFitToAudio={handleFitToAudio}
             beatStride={beatStride}
             onBeatStrideChange={(n) => setBeatStride(n as 1 | 2 | 4 | 8)}
+            motionOverrides={motionOverrides}
+            onSetMotion={setSegmentMotion}
+            onClearMotionOverrides={clearAllMotionOverrides}
+            mediaView={mediaView}
+            onMediaViewChange={(v) => setMediaView(v)}
+            activeId={activeSegment?.id ?? null}
+            onSelectSegment={(id) => {
+              const s = timeline.segments.find((x) => x.id === id);
+              if (s) seek(s.startMs);
+            }}
           />
         </section>
 
@@ -1826,6 +1885,14 @@ export default function Page() {
               onSeek={seek}
               onTogglePlay={togglePlay}
               onStep={stepSegment}
+              onSetMotion={(dir) => {
+                const seg = activeSegment;
+                if (!seg) return;
+                setSegmentMotion(seg.id, dir);
+                toast.success(`Motion pinned — ${dir}`, {
+                  description: `Segment "${seg.fileName.slice(0, 42)}" now uses ${dir}. Undo (Ctrl+Z) restores it.`,
+                });
+              }}
             />
           </div>
           <TimelineRuler
