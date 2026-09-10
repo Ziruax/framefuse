@@ -211,6 +211,47 @@ export function serializeVtt(cues: SubtitleCue[]): string {
   return `WEBVTT\n\n${body}\n`;
 }
 
+/**
+ * Serialize cues as KARAOKE WebVTT (v4.6) — word-level timing via WebVTT
+ * intra-cue timestamps (cue text timestamps per spec): each word is
+ * followed by a `<00:00:01.200>` marker activating the NEXT word, so
+ * supporting players can highlight word-by-word. Cues without word data
+ * pass through as plain cues.
+ */
+export function serializeVttWords(cues: SubtitleCue[]): string {
+  const fmt = (ms: number): string => {
+    const total = Math.max(0, Math.floor(ms));
+    const h = Math.floor(total / 3_600_000);
+    const m = Math.floor((total % 3_600_000) / 60_000);
+    const s = Math.floor((total % 60_000) / 1000);
+    const milli = total % 1000;
+    return (
+      String(h).padStart(2, "0") +
+      ":" +
+      String(m).padStart(2, "0") +
+      ":" +
+      String(s).padStart(2, "0") +
+      "." +
+      String(milli).padStart(3, "0")
+    );
+  };
+  const blocks: string[] = [];
+  for (const cue of cues) {
+    const words = cue.words ?? [];
+    if (words.length === 0) {
+      blocks.push(`${fmt(cue.startMs)} --> ${fmt(cue.endMs)}\n${cue.text}`);
+      continue;
+    }
+    let text = "";
+    words.forEach((w, i) => {
+      if (i > 0) text += ` <${fmt(w.startMs)}>`;
+      text += w.text;
+    });
+    blocks.push(`${fmt(cue.startMs)} --> ${fmt(cue.endMs)}\n${text}`);
+  }
+  return `WEBVTT\n\n${blocks.join("\n\n")}\n`;
+}
+
 // ---------------------------------------------------------------------------
 // Word-level helpers — used by the "word" / "word-only" caption modes and
 // by per-word kinetic typography animations.

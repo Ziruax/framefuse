@@ -116,7 +116,7 @@ export function Header({
                 color: "#ddd6fe",
               }}
             >
-              v4.5
+              v4.6
             </span>
           </div>
           <div className="text-[11px]" style={{ color: "#71717a" }}>

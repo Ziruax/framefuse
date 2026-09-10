@@ -24,6 +24,10 @@ import {
   Sparkles,
   ArrowLeftRight,
   RotateCcw,
+  Activity,
+  Scissors,
+  Timer,
+  Lock,
 } from "lucide-react";
 import type {
   MediaSegment,
@@ -36,6 +40,7 @@ import type {
 } from "@/lib/merger/types";
 import { TRANSITION_STYLE_INFO, boundaryStyle } from "@/lib/merger/types";
 import { fmtTimecode } from "@/lib/merger/timeline";
+import type { BeatInfo } from "@/lib/merger/beatDetect";
 import { cn } from "@/lib/utils";
 
 interface MediaPanelProps {
@@ -74,6 +79,12 @@ interface MediaPanelProps {
   onOpenProject: () => void;
   /** Segment transitions (v4.3) — boundary link indicators. */
   transition: TransitionSettings;
+  /** Beat detection results (v4.6) — null until detected. */
+  beatInfo: BeatInfo | null;
+  beatBusy: boolean;
+  onDetectBeats: () => void;
+  onSnapToBeats: () => void;
+  onFitToAudio: () => void;
 }
 
 const KIND_STYLES: Record<
@@ -121,6 +132,11 @@ export function MediaPanelBase({
   onSaveProject,
   onOpenProject,
   transition,
+  beatInfo,
+  beatBusy,
+  onDetectBeats,
+  onSnapToBeats,
+  onFitToAudio,
 }: MediaPanelProps) {
   const [dragOver, setDragOver] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -186,7 +202,9 @@ export function MediaPanelBase({
         <button
           type="button"
           onClick={openImagePicker}
-          className="ff-btn-primary flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[12px] font-semibold"
+          className="ff-btn-ghost flex items-center gap-1.5 rounded-md border-emerald-600/50 px-2.5 py-1.5 text-[12px] font-semibold"
+          style={{ color: "#a7f3d0" }}
+          title="Add images (or drop them anywhere on this panel)"
         >
           <Plus className="size-4" /> Add Images
         </button>
@@ -633,12 +651,13 @@ export function MediaPanelBase({
                     </div>
                     <div
                       className="mt-0.5 flex items-center gap-2 text-[9px]"
-                      style={{ color: "#71717a" }}
+                      style={{ color: "#a1a1ab" }}
+                      title={`Duration ${(seg.durationMs / 1000).toFixed(1)}s · Ken Burns ${seg.direction}`}
                     >
                       <span className="tabular-nums">
                         dur {(seg.durationMs / 1000).toFixed(1)}s
                       </span>
-                      <span style={{ color: "#3f3f46" }}>·</span>
+                      <span style={{ color: "#52525b" }}>·</span>
                       <span className="capitalize">{seg.direction}</span>
                     </div>
                   </div>
@@ -738,7 +757,7 @@ export function MediaPanelBase({
                   >
                     {audioTrack.fileName}
                   </div>
-                  <div className="text-[9px]" style={{ color: "#71717a" }}>
+                  <div className="text-[9px]" style={{ color: "#a1a1ab" }}>
                     audio track
                     {audioTrack.durationMs
                       ? ` · ${fmtTimecode(audioTrack.durationMs)}`
@@ -754,6 +773,111 @@ export function MediaPanelBase({
                 >
                   <Trash2 className="size-3.5" />
                 </button>
+              </div>
+            )}
+
+            {/* Beat-sync card (v4.6) — cut on the pulse */}
+            {audioTrack && (
+              <div
+                className="rounded-lg border p-2.5"
+                style={{
+                  borderColor: "rgba(6, 182, 212, 0.35)",
+                  backgroundColor: "rgba(8, 51, 68, 0.18)",
+                }}
+              >
+                <div className="flex items-center gap-2">
+                  <div
+                    className="flex size-6 shrink-0 items-center justify-center rounded-md"
+                    style={{
+                      backgroundColor: "rgba(6, 182, 212, 0.18)",
+                      boxShadow: "0 0 10px rgba(34, 211, 238, 0.12)",
+                    }}
+                  >
+                    <Activity className="size-3.5" style={{ color: "#67e8f9" }} />
+                  </div>
+                  <span className="text-[11px] font-semibold" style={{ color: "#a5f3fc" }}>
+                    Beat sync
+                  </span>
+                  <span className="ml-auto text-[9px] tabular-nums" style={{ color: "#67e8f9" }}>
+                    {beatBusy
+                      ? "listening…"
+                      : beatInfo && beatInfo.beatMs.length >= 2
+                        ? `${beatInfo.bpm ?? "?"} BPM · ${beatInfo.beatMs.length} beats`
+                        : "not detected"}
+                  </span>
+                </div>
+
+                {mode !== "absolute" ? (
+                  <div className="mt-2 grid grid-cols-3 gap-1.5">
+                    <button
+                      type="button"
+                      onClick={onDetectBeats}
+                      disabled={beatBusy}
+                      className={cn(
+                        "flex items-center justify-center gap-1 rounded-md border px-1.5 py-1.5 text-[9px] font-semibold transition-all",
+                        beatBusy
+                          ? "cursor-wait opacity-60"
+                          : "hover:-translate-y-px hover:brightness-125",
+                      )}
+                      style={{
+                        borderColor: "rgba(34, 211, 238, 0.4)",
+                        backgroundColor: "rgba(34, 211, 238, 0.1)",
+                        color: "#a5f3fc",
+                      }}
+                      title="Analyze the audio for beats + tempo (runs locally, ~1s)"
+                    >
+                      <Activity className={cn("size-3", beatBusy && "animate-pulse")} />
+                      {beatBusy ? "…" : "Detect beats"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={onSnapToBeats}
+                      disabled={beatBusy || !beatInfo || beatInfo.beatMs.length < 2}
+                      className={cn(
+                        "flex items-center justify-center gap-1 rounded-md border px-1.5 py-1.5 text-[9px] font-semibold transition-all",
+                        beatBusy || !beatInfo || beatInfo.beatMs.length < 2
+                          ? "cursor-not-allowed opacity-40"
+                          : "hover:-translate-y-px hover:brightness-125",
+                      )}
+                      style={{
+                        borderColor: "rgba(34, 211, 238, 0.4)",
+                        backgroundColor: "rgba(34, 211, 238, 0.1)",
+                        color: "#a5f3fc",
+                      }}
+                      title="Retiming every cut to land exactly on a beat — undo with Ctrl+Z"
+                    >
+                      <Scissors className="size-3" /> Snap cuts
+                    </button>
+                    <button
+                      type="button"
+                      onClick={onFitToAudio}
+                      disabled={beatBusy || !audioTrack.durationMs}
+                      className={cn(
+                        "flex items-center justify-center gap-1 rounded-md border px-1.5 py-1.5 text-[9px] font-semibold transition-all",
+                        beatBusy || !audioTrack.durationMs
+                          ? "cursor-not-allowed opacity-40"
+                          : "hover:-translate-y-px hover:brightness-125",
+                      )}
+                      style={{
+                        borderColor: "rgba(34, 211, 238, 0.4)",
+                        backgroundColor: "rgba(34, 211, 238, 0.1)",
+                        color: "#a5f3fc",
+                      }}
+                      title="Scale segment durations so the video ends with the music"
+                    >
+                      <Timer className="size-3" /> Fit audio
+                    </button>
+                  </div>
+                ) : (
+                  <div
+                    className="mt-2 flex items-center gap-1.5 rounded-md px-2 py-1.5 text-[9px]"
+                    style={{ backgroundColor: "rgba(113, 113, 122, 0.15)", color: "#a1a1aa" }}
+                    title="Timestamped filenames drive absolute timelines"
+                  >
+                    <Lock className="size-3 shrink-0" />
+                    Beat snap needs sequence mode — filename timestamps rule here.
+                  </div>
+                )}
               </div>
             )}
 
@@ -786,7 +910,7 @@ export function MediaPanelBase({
                   >
                     {subtitles.fileName}
                   </div>
-                  <div className="text-[9px]" style={{ color: "#71717a" }}>
+                  <div className="text-[9px]" style={{ color: "#a1a1ab" }}>
                     subtitles · {subtitles.cues.length} cue
                     {subtitles.cues.length === 1 ? "" : "s"}
                     {subtitles.cues.length > 0

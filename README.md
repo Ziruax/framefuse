@@ -1,8 +1,17 @@
-# FrameFuse v4.5
+# FrameFuse v4.6
 
-Native desktop **image → video** merger with **viral kinetic captions**, **segment transitions**, **per-boundary transition overrides**, **export quality profiles**, **watermark/logo overlay**, **undo/redo**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
+Native desktop **image → video** merger with **beat-synced cutting**, **viral kinetic captions**, **segment transitions**, **per-boundary transition overrides**, **export quality profiles**, **watermark/logo overlay**, **undo/redo**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
 
 ## Highlights
+
+### 🥁 Beat-synced editing (new in v4.6)
+Drop a music track and hit **Detect beats** — a local onset-envelope DSP (no network, no wasm download) estimates the **BPM** and every beat. **Snap cuts** retimes all boundaries onto the pulse (tempo-tracking walk over the real beat list, or median-grid quantization when the music is slower than your cut rate), and **Fit video to audio** scales the whole timeline to end with the song. Beat ticks render on the ruler (the beat under the playhead pulses live), every snap/fit is undoable, and because it only produces duration overrides the FFmpeg export stays in exact parity automatically.
+
+### 🔍 Caption preset search (new in v4.6)
+42 presets now have a **search box** (name, description, animation, word-mode) + a **category filter** — find "Hormozi", "karaoke" or "glitch" in one keystroke instead of scrolling nine groups.
+
+### 🎤 Karaoke WebVTT (new in v4.6)
+`words .vtt` export emits **word-level timing via WebVTT intra-cue timestamps** — supporting players highlight each word as it's spoken, straight from the Whisper alignment.
 
 ### ⚡ Export quality profiles (new in v4.5)
 One-click encode bundles — **Draft** (720p · 30fps · CRF 27, fastest rough cut), **Social** (1080p · 30fps · CRF 20, the upload sweet spot) and **Cinema** (1080p · 60fps · CRF 17 + slower preset, maximum-quality master). Every encoder gets its own tuning (NVENC p1/p4/p6 + cq, QSV, AMF, libx264 preset), fine-tuning any field flips to **Custom** with a live CRF slider, and the header shows a live **size/duration estimate** for the current timeline before you ever hit Export.

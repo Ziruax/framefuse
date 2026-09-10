@@ -22,6 +22,8 @@ interface TimelineRulerProps {
   headlines: HeadlineItem[];
   /** Segment transitions → boundary zone visualization (v4.3). */
   transition: TransitionSettings;
+  /** Detected beat times (v4.6) → cyan tick rail + live pulse. */
+  beats: number[] | null;
   onSeek: (ms: number) => void;
 }
 
@@ -60,6 +62,7 @@ export function TimelineRuler({
   activeId,
   headlines,
   transition,
+  beats,
   onSeek,
 }: TimelineRulerProps) {
   const trackRef = useRef<HTMLDivElement>(null);
@@ -105,6 +108,18 @@ export function TimelineRuler({
     !txActive &&
     !!transition.overrides &&
     Object.keys(transition.overrides).length > 0;
+
+  // v4.6 beat rail: the beat closest to the playhead lights up (live pulse).
+  const beatNearest = (() => {
+    if (!beats || beats.length === 0 || totalMs <= 0) return null;
+    let best = Infinity;
+    let bestMs = 0;
+    for (const b of beats) {
+      const d = Math.abs(b - currentMs);
+      if (d < best) { best = d; bestMs = b; }
+    }
+    return best <= 140 ? bestMs : null;
+  })();
 
   return (
     <div
@@ -185,6 +200,15 @@ export function TimelineRuler({
                 style={{ backgroundColor: "#fbbf24" }}
               />{" "}
               title
+            </span>
+          )}
+          {beats && beats.length > 0 && (
+            <span className="flex items-center gap-1">
+              <span
+                className="size-2 rounded-sm"
+                style={{ backgroundColor: "#22d3ee" }}
+              />{" "}
+              beats
             </span>
           )}
         </div>
@@ -366,11 +390,47 @@ export function TimelineRuler({
             );
           })}
 
-          {/* Playhead (violet line + glowing dot) */}
+          {/* Beat rail (v4.6) — cyan ticks at the bottom edge; the beat
+              under the playhead pulses brighter (play-along feel). */}
+          {beats && beats.length > 0 && totalMs > 0 && (
+            <div className="pointer-events-none absolute bottom-[3px] left-0 right-0 h-[5px]">
+              {beats.map((b, i) => {
+                if (b > totalMs) return null;
+                const left = (b / totalMs) * 100;
+                const live = beatNearest != null && Math.abs(b - beatNearest) < 1;
+                return (
+                  <div
+                    key={`beat-${i}`}
+                    className={cn(
+                      "absolute bottom-0 w-px rounded-full transition-all duration-150",
+                      live && "ff-beat-tick-live",
+                    )}
+                    style={{
+                      left: `${left}%`,
+                      height: live ? "6px" : "4px",
+                      backgroundColor: live ? "#67e8f9" : "rgba(34, 211, 238, 0.55)",
+                      boxShadow: live ? "0 0 6px rgba(103, 232, 249, 0.9)" : "none",
+                    }}
+                  />
+                );
+              })}
+            </div>
+          )}
+
+          {/* Playhead (violet line + glowing dot + grab cap) */}
           <div
             className="pointer-events-none absolute top-0 z-10 h-full"
             style={{ left: `${playPct}%` }}
           >
+            {/* v4.6: grab cap — a brighter pill above the dot that reads as
+                a draggable handle. */}
+            <div
+              className="absolute -left-2 -top-[4px] h-[5px] w-4 rounded-full"
+              style={{
+                backgroundImage: "linear-gradient(90deg, #8b5cf6, #d946ef, #8b5cf6)",
+                boxShadow: "0 0 8px rgba(217, 70, 239, 0.75)",
+              }}
+            />
             <div
               className="absolute -left-1.5 top-0 size-3 rounded-full border-2"
               style={{

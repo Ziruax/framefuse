@@ -216,6 +216,15 @@ summary::-webkit-details-marker {
   animation: ff-beat-pulse 2.4s ease-in-out infinite;
 }
 
+/* v4.6 — live beat tick (the beat under the playhead lights up). */
+@keyframes ff-beat-tick-live-pulse {
+  0%, 100% { filter: brightness(1); }
+  50% { filter: brightness(1.6); }
+}
+.ff-beat-tick-live {
+  animation: ff-beat-tick-live-pulse 0.42s ease-in-out infinite;
+}
+
 /* Focus-visible ring — consistent, keyboard-friendly. */
 button:focus-visible,
 input:focus-visible,

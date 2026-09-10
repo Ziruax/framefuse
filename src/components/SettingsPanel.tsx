@@ -22,6 +22,8 @@ import {
   Trash2,
   Clock,
   Upload,
+  Search,
+  X,
 } from "lucide-react";
 import type {
   AudioSettings,
@@ -41,6 +43,8 @@ import {
   FONT_OPTIONS,
   presetsByCategory,
   getCaptionPreset,
+  PRESET_CATEGORIES,
+  type CaptionPreset,
 } from "@/lib/merger/captionPresets";
 import { HEADLINE_PRESETS, getHeadlinePreset } from "@/lib/merger/headlinePresets";
 import { ANIMATION_LABELS } from "@/lib/merger/captionAnimations";
@@ -106,6 +110,8 @@ interface SettingsPanelProps {
   openWatermarkPicker: () => void;
   /** WebVTT sidecar export (v4.4). */
   onExportVtt: () => void;
+  /** Karaoke word-level WebVTT export (v4.6). */
+  onExportVttWords: () => void;
   captionSettings: CaptionSettings;
   onCaptionSettingsChange: (cs: CaptionSettings) => void;
   /** Applies a preset's signature behavior (wordMode + animation + font). */
@@ -252,7 +258,7 @@ function Toggle({
   label: string;
 }) {
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex items-center gap-2.5">
       <button
         type="button"
         role="switch"
@@ -260,18 +266,20 @@ function Toggle({
         aria-label={label}
         onClick={() => onChange(!checked)}
         className={cn(
-          "relative h-5 w-9 shrink-0 rounded-full transition-colors",
-          checked ? "bg-emerald-500" : "bg-zinc-700",
+          "relative h-5 w-9 shrink-0 rounded-full transition-all duration-200 active:scale-95",
+          checked
+            ? "bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.4)]"
+            : "bg-zinc-700 hover:bg-zinc-600",
         )}
       >
         <span
           className={cn(
-            "absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform",
+            "absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform duration-200",
             checked ? "translate-x-4" : "translate-x-0.5",
           )}
         />
       </button>
-      <span className="text-xs text-zinc-300">{label}</span>
+      <span className="text-xs leading-tight text-zinc-300">{label}</span>
     </div>
   );
 }
@@ -295,6 +303,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
     onWatermarkSettingsChange,
     openWatermarkPicker,
     onExportVtt,
+    onExportVttWords,
     captionSettings,
     onCaptionSettingsChange,
     onApplyPreset,
@@ -416,10 +425,10 @@ export function SettingsPanel(props: SettingsPanelProps) {
                     disabled={!kenBurns.enabled}
                     onClick={() => togglePoolEffect(eff.value)}
                     className={cn(
-                      "flex items-center gap-1 rounded px-1.5 py-1.5 text-[10px] font-medium transition-colors",
+                      "flex items-center gap-1.5 rounded-md px-1.5 py-2 text-[10px] font-medium transition-all duration-150",
                       active
                         ? "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-500/40"
-                        : "bg-zinc-800/60 text-zinc-400 hover:bg-white/5",
+                        : "bg-zinc-800/60 text-zinc-400 hover:bg-white/5 hover:-translate-y-px",
                       !kenBurns.enabled && "opacity-40",
                     )}
                   >
@@ -692,6 +701,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
           onExportSrt={onExportSrt}
           onExportAss={onExportAss}
           onExportVtt={onExportVtt}
+          onExportVttWords={onExportVttWords}
           inElectron={inElectron}
           subtitles={subtitles}
           hasAudio={hasAudio}
@@ -1247,6 +1257,8 @@ interface CaptionsSectionProps {
   onExportAss: () => void;
   /** WebVTT sidecar (v4.4). */
   onExportVtt: () => void;
+  /** Karaoke word-level WebVTT (v4.6). */
+  onExportVttWords: () => void;
   inElectron: boolean;
   subtitles: SubtitleFile | null;
   hasAudio: boolean;
@@ -1265,6 +1277,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
     onExportSrt,
     onExportAss,
     onExportVtt,
+    onExportVttWords,
     inElectron,
     subtitles,
     hasAudio,
@@ -1277,6 +1290,28 @@ function CaptionsSection(props: CaptionsSectionProps) {
 
   const set = (patch: Partial<CaptionSettings>) =>
     onCaptionSettingsChange({ ...captionSettings, ...patch });
+
+  // v4.6: preset search + category filter (42 presets need discoverability).
+  const [presetQuery, setPresetQuery] = useState("");
+  const [presetCat, setPresetCat] = useState<"all" | CaptionPreset["category"]>("all");
+  const q = presetQuery.trim().toLowerCase();
+  const filteredCategories = presetsByCategory()
+    .map((cat) => ({
+      ...cat,
+      presets: cat.presets.filter((p) => {
+        if (presetCat !== "all" && p.category !== presetCat) return false;
+        if (!q) return true;
+        return (
+          p.name.toLowerCase().includes(q) ||
+          p.description.toLowerCase().includes(q) ||
+          p.id.toLowerCase().includes(q) ||
+          (p.animation ?? "").toLowerCase().includes(q) ||
+          (p.wordMode ?? "").includes(q)
+        );
+      }),
+    }))
+    .filter((cat) => cat.presets.length > 0);
+  const matchCount = filteredCategories.reduce((n, c) => n + c.presets.length, 0);
 
   const preset = getCaptionPreset(captionSettings.presetId);
   const hasCues = !!subtitles && subtitles.cues.length > 0;
@@ -1370,13 +1405,69 @@ function CaptionsSection(props: CaptionsSectionProps) {
         )}
       </div>
 
-      {/* ── Preset picker (grouped) ── */}
+      {/* ── Preset picker (searchable, filterable, grouped — v4.6) ── */}
       <Field
         label="Style preset"
         hint={`${preset.name} — ${preset.description}`}
       >
+        {/* Search + category chips */}
+        <div className="mb-1.5 flex gap-1">
+          <div className="relative flex-1">
+            <Search
+              size={11}
+              className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-zinc-500"
+            />
+            <input
+              value={presetQuery}
+              onChange={(e) => setPresetQuery(e.target.value)}
+              placeholder="Search 42 presets…"
+              className="w-full rounded-md border bg-zinc-900 py-1 pl-6 pr-2 text-[10px] text-zinc-200 placeholder:text-zinc-600 focus:border-emerald-600/60"
+              style={{ borderColor: "#27272a" }}
+              aria-label="Search caption presets"
+            />
+            {presetQuery && (
+              <button
+                type="button"
+                onClick={() => setPresetQuery("")}
+                className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-zinc-500 hover:text-zinc-200"
+                title="Clear search"
+              >
+                <X size={10} />
+              </button>
+            )}
+          </div>
+          <div className="relative">
+            <select
+              value={presetCat}
+              onChange={(e) => setPresetCat(e.target.value as typeof presetCat)}
+              className="h-full appearance-none rounded-md border bg-zinc-900 pl-2 pr-6 text-[10px] text-zinc-200"
+              style={{ borderColor: "#27272a" }}
+              aria-label="Filter presets by category"
+              title="Filter by category"
+            >
+              <option value="all">All styles</option>
+              {PRESET_CATEGORIES.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.label}
+                </option>
+              ))}
+            </select>
+            <ChevronDown
+              size={10}
+              className="pointer-events-none absolute right-1.5 top-1/2 -translate-y-1/2 text-zinc-500"
+            />
+          </div>
+        </div>
+        {matchCount === 0 ? (
+          <div
+            className="rounded-md border border-dashed px-3 py-4 text-center text-[10px] text-zinc-500"
+            style={{ borderColor: "#27272a" }}
+          >
+            No presets match “{presetQuery.trim()}”
+          </div>
+        ) : (
         <div className="max-h-72 overflow-y-auto rounded-md border" style={{ borderColor: "#27272a" }}>
-          {presetsByCategory().map((cat) => (
+          {filteredCategories.map((cat) => (
             <div key={cat.category}>
               <div
                 className="sticky top-0 z-10 bg-[#131316] px-2 py-1 text-[9px] font-bold uppercase tracking-widest text-zinc-500"
@@ -1450,6 +1541,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
             </div>
           ))}
         </div>
+        )}
       </Field>
 
       {/* ── Word mode ── */}
@@ -1657,7 +1749,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
 
       {/* ── Sidecar exports ── */}
       <Field label="Export caption files">
-        <div className="grid grid-cols-3 gap-1">
+        <div className="grid grid-cols-2 gap-1">
           <button
             type="button"
             onClick={onExportSrt}
@@ -1698,6 +1790,24 @@ function CaptionsSection(props: CaptionsSectionProps) {
             )}
           >
             <FileDown size={11} /> .ass
+          </button>
+          <button
+            type="button"
+            onClick={onExportVttWords}
+            disabled={!hasWords}
+            title={
+              hasWords
+                ? "Karaoke WebVTT — word-level timing for web players"
+                : "Needs word timestamps — generate captions from audio first"
+            }
+            className={cn(
+              "flex items-center justify-center gap-1 rounded px-2 py-1.5 text-[10px] font-semibold transition-colors",
+              hasWords
+                ? "bg-zinc-800 text-zinc-200 hover:bg-zinc-700"
+                : "cursor-not-allowed bg-zinc-800/50 text-zinc-600",
+            )}
+          >
+            <AudioLines size={11} /> words .vtt
           </button>
         </div>
       </Field>

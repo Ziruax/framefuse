@@ -17,12 +17,19 @@ import { SettingsPanel } from "@/components/SettingsPanel";
 import {
   buildTimeline,
   fmtBytes,
+  fmtTimecode,
   parseFilename,
   segmentAtTime,
   type TimelineEntry,
 } from "@/lib/merger/timeline";
 import { exportNative, isElectron } from "@/lib/merger/native";
-import { parseSrt, serializeSrt, serializeVtt } from "@/lib/merger/subtitles";
+import { parseSrt, serializeSrt, serializeVtt, serializeVttWords } from "@/lib/merger/subtitles";
+import {
+  detectBeats as detectBeatsInAudio,
+  planBeatSnap,
+  planFitToAudio,
+  type BeatInfo,
+} from "@/lib/merger/beatDetect";
 import {
   transcribeWithWhisper,
   isWhisperAvailable,
@@ -677,8 +684,20 @@ export default function Page() {
     toast.success(`Added ${files.length} image${files.length === 1 ? "" : "s"}`);
   }, [requestHistoryPush, trackUrl]);
 
+  // ---- Beat detection (v4.6) ---------------------------------------------
+  const [beatInfo, setBeatInfo] = useState<BeatInfo | null>(null);
+  const [beatBusy, setBeatBusy] = useState(false);
+  // Beat data is DERIVED from the audio — invalidated on every track swap
+  // (add/remove) rather than via an effect, per lint rule
+  // react-hooks/set-state-in-effect.
+  const clearBeatInfo = useCallback(() => {
+    setBeatInfo(null);
+    setBeatBusy(false);
+  }, []);
+
   const addAudio = useCallback((file: File) => {
     requestHistoryPush();
+    clearBeatInfo();
     setAudioTrack(() => {
       // The previous track's URL stays alive (undo-safe); unmount revokes.
       const url = trackUrl(URL.createObjectURL(file));
@@ -697,7 +716,7 @@ export default function Page() {
       return { fileName: file.name, url, durationMs: null };
     });
     toast.success(`Audio: ${file.name}`);
-  }, [requestHistoryPush, trackUrl]);
+  }, [requestHistoryPush, trackUrl, clearBeatInfo]);
 
   // ---- Subtitle (.srt) loading -------------------------------------------
   const addSubtitles = useCallback(
@@ -811,6 +830,39 @@ export default function Page() {
     document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 30000);
     toast.success(`Exported ${subtitles.cues.length} cues to .vtt`);
+  }, [subtitles]);
+
+  // ---- Karaoke WebVTT sidecar export (v4.6) — word-level timing ----------
+  const exportVttWordsSidecar = useCallback(() => {
+    if (!subtitles || subtitles.cues.length === 0) {
+      toast.error("No captions to export", {
+        description: "Generate captions from audio or load a .srt file first.",
+      });
+      return;
+    }
+    const wordCount = subtitles.cues.reduce(
+      (n, c) => n + (c.words?.length ?? 0),
+      0,
+    );
+    if (wordCount === 0) {
+      toast.error("No word timing in these captions", {
+        description: "Word-level .vtt needs captions generated from audio (Whisper) — .srt imports carry cue timing only.",
+      });
+      return;
+    }
+    const text = serializeVttWords(subtitles.cues);
+    const blob = new Blob([text], { type: "text/vtt;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download =
+      (subtitles.fileName || "captions").replace(/\.[^.]+$/, "") +
+      ".words.vtt";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    toast.success(`Exported ${wordCount} word timings to .vtt`);
   }, [subtitles]);
 
   // ---- Watermark management (v4.4) ---------------------------------------
@@ -1051,8 +1103,9 @@ export default function Page() {
 
   const removeAudio = useCallback(() => {
     requestHistoryPush();
+    clearBeatInfo();
     setAudioTrack(null);
-  }, [requestHistoryPush]);
+  }, [requestHistoryPush, clearBeatInfo]);
 
   const removeItem = useCallback((id: string) => {
     requestHistoryPush();
@@ -1080,6 +1133,84 @@ export default function Page() {
       return next;
     });
   }, [requestHistoryPush]);
+
+  // ---- Beat-sync actions (v4.6) ------------------------------------------
+
+  const handleDetectBeats = useCallback(async () => {
+    if (!audioTrack || beatBusy) return;
+    setBeatBusy(true);
+    try {
+      const resp = await fetch(audioTrack.url);
+      const blob = await resp.blob();
+      const file = new File([blob], audioTrack.fileName, {
+        type: blob.type || "audio/mpeg",
+      });
+      const info = await detectBeatsInAudio(file);
+      if (info.beatMs.length < 2) {
+        setBeatInfo(info);
+        toast.info("No clear beat found", {
+          description: "The audio may be ambient, speech-only, or very quiet. Beat snapping needs a steady pulse.",
+        });
+        return;
+      }
+      setBeatInfo(info);
+      toast.success(`Detected ${info.beatMs.length} beats${info.bpm ? ` · ${info.bpm} BPM` : ""}`, {
+        description: "Snap cuts to beats now — every boundary lands on the pulse.",
+      });
+    } catch (err) {
+      console.error("beat detect failed", err);
+      toast.error("Beat detection failed", {
+        description: "Could not decode the audio in this browser.",
+      });
+    } finally {
+      setBeatBusy(false);
+    }
+  }, [audioTrack, beatBusy]);
+
+  const handleSnapToBeats = useCallback(() => {
+    if (!beatInfo || !timeline.segments.length) return;
+    if (timeline.mode !== "sequential") {
+      toast.error("Beat snap needs the sequence timeline", {
+        description: "Timestamped filenames drive absolute timelines — rename without _Ns_ patterns to retime freely.",
+      });
+      return;
+    }
+    const plan = planBeatSnap(
+      timeline.segments.map((s) => ({ id: s.id, durationMs: s.durationMs })),
+      beatInfo.beatMs,
+    );
+    if (!Object.keys(plan).length) {
+      toast.error("Not enough beats to snap", {
+        description: "Try a longer/punchier audio track.",
+      });
+      return;
+    }
+    requestHistoryPush();
+    setOverrides((prev) => ({ ...prev, ...plan }));
+    toast.success("Cuts snapped to beats", {
+      description: "Undo (Ctrl+Z) restores the previous durations.",
+    });
+  }, [beatInfo, timeline.segments, timeline.mode, requestHistoryPush]);
+
+  const handleFitToAudio = useCallback(() => {
+    if (!audioTrack || !audioTrack.durationMs || !timeline.segments.length) return;
+    if (timeline.mode !== "sequential") {
+      toast.error("Fit-to-audio needs the sequence timeline", {
+        description: "Timestamped filenames drive absolute timelines.",
+      });
+      return;
+    }
+    const plan = planFitToAudio(
+      timeline.segments.map((s) => ({ id: s.id, durationMs: s.durationMs })),
+      audioTrack.durationMs,
+    );
+    if (!Object.keys(plan).length) return;
+    requestHistoryPush();
+    setOverrides((prev) => ({ ...prev, ...plan }));
+    toast.success("Video fitted to audio", {
+      description: `Timeline now ends with the audio at ${fmtTimecode(audioTrack.durationMs)}.`,
+    });
+  }, [audioTrack, timeline.segments, timeline.mode, requestHistoryPush]);
 
   const reorderItem = useCallback((id: string, dir: -1 | 1) => {
     requestHistoryPush();
@@ -1592,6 +1723,11 @@ export default function Page() {
             onSaveProject={saveProject}
             onOpenProject={openProjectPicker}
             onLoadProjectFile={loadProject}
+            beatInfo={beatInfo}
+            beatBusy={beatBusy}
+            onDetectBeats={handleDetectBeats}
+            onSnapToBeats={handleSnapToBeats}
+            onFitToAudio={handleFitToAudio}
           />
         </section>
 
@@ -1629,6 +1765,7 @@ export default function Page() {
             activeId={activeSegment?.id ?? null}
             headlines={headlineItems}
             transition={transitionSettings}
+            beats={beatInfo?.beatMs ?? null}
             onSeek={seek}
           />
         </section>
@@ -1665,6 +1802,7 @@ export default function Page() {
             onExportSrt={exportSrtSidecar}
             onExportAss={exportAssSidecar}
             onExportVtt={exportVttSidecar}
+            onExportVttWords={exportVttWordsSidecar}
             inElectron={inElectron}
             subtitles={subtitles}
             hasAudio={!!audioTrack}
