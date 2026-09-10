@@ -34,22 +34,26 @@ interface TimelineRulerProps {
   /** Audio waveform (v4.7) → mirrored peak strip between ruler and bars. */
   waveform: WaveformData | null;
   onSeek: (ms: number) => void;
+  /** v4.9: jump to a segment's first frame (filmstrip double-click). */
+  onJumpToSegment?: (id: string) => void;
 }
 
-// v4.7: desaturated bar gradients (VLM feedback — the neon green fatigued;
-// bright color is now reserved for playhead + active segment).
+// v4.9: bar tints — the segment bar is now a FILMSTRIP (thumbnail shows
+// through), so these gradients are translucent kind-tints layered over the
+// image instead of opaque fills. Kind still reads at a glance, but the
+// actual storyboard content is the hero (VLM: "mystery meat" bars).
 const BAR_BG: Record<string, { top: string; bottom: string }> = {
   absolute: {
-    top: "rgba(34, 211, 238, 0.62)",
-    bottom: "rgba(8, 145, 178, 0.55)",
+    top: "rgba(34, 211, 238, 0.30)",
+    bottom: "rgba(8, 145, 178, 0.52)",
   },
   beat: {
-    top: "rgba(16, 185, 129, 0.58)",
-    bottom: "rgba(6, 95, 70, 0.52)",
+    top: "rgba(16, 185, 129, 0.28)",
+    bottom: "rgba(6, 95, 70, 0.50)",
   },
   duration: {
-    top: "rgba(139, 92, 246, 0.58)",
-    bottom: "rgba(91, 33, 182, 0.52)",
+    top: "rgba(139, 92, 246, 0.28)",
+    bottom: "rgba(91, 33, 182, 0.50)",
   },
 };
 
@@ -214,6 +218,7 @@ export function TimelineRuler({
   beats,
   waveform,
   onSeek,
+  onJumpToSegment,
 }: TimelineRulerProps) {
   const trackRef = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
@@ -404,12 +409,12 @@ export function TimelineRuler({
                   style={{ left: `${left}%` }}
                 >
                   <div
-                    className="h-2 w-px"
+                    className="h-1.5 w-px"
                     style={{ backgroundColor: "#3f3f46" }}
                   />
                   <span
-                    className="mt-0.5 block -translate-x-1/2 text-[8px] tabular-nums"
-                    style={{ color: "#71717a" }}
+                    className="mt-0.5 block -translate-x-1/2 text-[8px] font-semibold tabular-nums"
+                    style={{ color: "#7f7f87" }}
                   >
                     {fmtTimecode(t)}
                   </span>
@@ -445,24 +450,64 @@ export function TimelineRuler({
               return (
                 <div
                   key={seg.id}
+                  onDoubleClick={(e) => {
+                    e.stopPropagation();
+                    onSeek(seg.startMs + 5);
+                    onJumpToSegment?.(seg.id);
+                  }}
                   className={cn(
-                    "absolute top-0 flex items-center justify-center overflow-hidden rounded-[3px] text-[8px] font-semibold tabular-nums transition-all duration-150",
+                    "absolute top-0 cursor-pointer overflow-hidden rounded-[4px] text-[8px] font-semibold tabular-nums transition-all duration-150 hover:outline hover:outline-1 hover:outline-white/35",
                     seg.kind === "beat" && !isActive && "ff-beat-pulse",
-                    isActive && "scale-[1.02]",
+                    isActive && "scale-[1.02] z-[1]",
                   )}
                   style={{
                     left: `${left}%`,
                     width: `${Math.max(0.5, width)}%`,
-                    height: "70%",
-                    backgroundImage: `linear-gradient(180deg, ${colors.top} 0%, ${colors.bottom} 100%)`,
+                    height: "100%",
+                    // v4.9 FILMSTRIP: the segment's own thumbnail shows
+                    // through a kind-tint gradient (double background —
+                    // the tint paints on top of the image).
+                    backgroundImage: `linear-gradient(180deg, ${colors.top} 0%, ${colors.bottom} 100%), url(${seg.thumbnailUrl})`,
+                    backgroundSize: "cover",
+                    backgroundPosition: "center",
+                    // Inactive strips recede (dim + desaturate) so the
+                    // active clip pops without extra chrome. v4.9 VLM pass:
+                    // 0.82/0.78 — 0.72 made dark footage vanish into the
+                    // track background.
+                    filter: isActive
+                      ? "saturate(1.15) brightness(1.08)"
+                      : "saturate(0.78) brightness(0.82)",
                     boxShadow: isActive
-                      ? "0 0 0 1.5px rgba(255,255,255,0.75), 0 0 14px rgba(255,255,255,0.3)"
-                      : "inset 0 -1px 0 rgba(0,0,0,0.3)",
-                    color: "rgba(24, 24, 27, 0.95)",
+                      ? "0 0 0 1.5px rgba(255,255,255,0.9), 0 0 14px rgba(167,139,250,0.45), 0 2px 8px rgba(0,0,0,0.55)"
+                      : "inset 0 -1px 0 rgba(0,0,0,0.35), 0 1px 3px rgba(0,0,0,0.4)",
                   }}
-                  title={`${seg.fileName} · ${fmtTimecode(seg.startMs)}–${fmtTimecode(seg.endMs)}`}
+                  title={`${seg.fileName} · ${fmtTimecode(seg.startMs)}–${fmtTimecode(seg.endMs)} · ${(seg.durationMs / 1000).toFixed(1)}s · motion ${seg.direction}\ndouble-click jumps to this clip's first frame`}
                 >
-                  {width > 6 ? idx + 1 : ""}
+                  {/* Index chip — scrimmed so it reads over any footage. */}
+                  {width > 3 ? (
+                    <span
+                      className="absolute left-0 top-0 flex h-[13px] min-w-[13px] items-center justify-center rounded-br-[4px] px-1 text-[8px] font-bold"
+                      style={{
+                        backgroundColor: "rgba(0, 0, 0, 0.75)",
+                        color: "#f4f4f5",
+                        textShadow: "0 1px 1px rgba(0,0,0,0.9)",
+                      }}
+                    >
+                      {idx + 1}
+                    </span>
+                  ) : null}
+                  {/* Duration tag on wide strips. */}
+                  {width > 14 ? (
+                    <span
+                      className="absolute bottom-0.5 right-1 rounded-sm px-1 py-px text-[8px] font-semibold"
+                      style={{
+                        backgroundColor: "rgba(0, 0, 0, 0.62)",
+                        color: "rgba(244, 244, 245, 0.95)",
+                      }}
+                    >
+                      {(seg.durationMs / 1000).toFixed(1)}s
+                    </span>
+                  ) : null}
                 </div>
               );
             })}

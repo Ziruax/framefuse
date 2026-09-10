@@ -24,6 +24,7 @@ import {
   Search,
   X,
   Star,
+  Dices,
 } from "lucide-react";
 import type {
   AudioSettings,
@@ -183,7 +184,7 @@ function Section({
           {title}
         </span>
       </button>
-      {open && <div className="px-4 pb-4">{children}</div>}
+      {open && <div className="px-4 pb-4 pt-1">{children}</div>}
     </div>
   );
 }
@@ -275,7 +276,7 @@ function Toggle({
         className={cn(
           "relative h-5 w-9 shrink-0 rounded-full border transition-all duration-200 active:scale-95",
           checked
-            ? "border-emerald-400/60 bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.4)]"
+            ? "border-violet-400/60 bg-violet-500 shadow-[0_0_10px_rgba(139,92,246,0.4)]"
             : "border-zinc-600 bg-zinc-800 hover:bg-zinc-700",
         )}
       >
@@ -434,7 +435,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                     disabled={!kenBurns.enabled}
                     onClick={() => togglePoolEffect(eff.value)}
                     className={cn(
-                      "flex items-center gap-1.5 rounded-md px-1.5 py-2 text-[10px] font-medium transition-all duration-150",
+                      "flex items-center gap-1.5 rounded-md px-1.5 py-1.5 text-[10px] font-medium transition-all duration-150 active:scale-[0.96]",
                       active
                         ? "bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/35"
                         : "bg-zinc-800/60 text-zinc-400 hover:bg-white/5 hover:-translate-y-px",
@@ -452,14 +453,15 @@ export function SettingsPanel(props: SettingsPanelProps) {
               onClick={setFullRandom}
               disabled={!kenBurns.enabled}
               className={cn(
-                "mt-1.5 w-full rounded-md border px-2 py-1.5 text-[10px] font-semibold transition-all active:scale-[0.98]",
+                "mt-1.5 flex w-full items-center justify-center gap-1.5 rounded-md border px-2 py-1.5 text-[10px] font-semibold transition-all active:scale-[0.98]",
                 isRandomMode && kenBurns.directionPool.length === 6
-                  ? "border-emerald-500/50 bg-emerald-500/15 text-emerald-300"
+                  ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
                   : "border-zinc-700 bg-transparent text-zinc-400 hover:border-zinc-600 hover:bg-white/5 hover:text-zinc-200",
               )}
               title="Randomize across all six effects"
             >
-              🎲 Random — all effects
+              <Dices className="size-3.5" />
+              Random — all effects
             </button>
             <p className="mt-1 text-[10px] leading-relaxed text-zinc-500">
               Select 2+ effects to randomize between only your favorites, or pick one to fix it.

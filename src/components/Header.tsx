@@ -116,7 +116,7 @@ export function Header({
                 color: "#ddd6fe",
               }}
             >
-              v4.8
+              v4.9
             </span>
           </div>
           <div className="text-[11px]" style={{ color: "#71717a" }}>
@@ -133,13 +133,13 @@ export function Header({
             style={
               mode === "absolute"
                 ? {
-                    borderColor: "#0e7490",
-                    backgroundColor: "rgba(8, 51, 68, 0.5)",
+                    borderColor: "rgba(14, 116, 144, 0.55)",
+                    backgroundColor: "rgba(8, 51, 68, 0.35)",
                     color: "#67e8f9",
                   }
                 : {
-                    borderColor: "#6d28d9",
-                    backgroundColor: "rgba(76, 29, 149, 0.5)",
+                    borderColor: "rgba(109, 40, 217, 0.55)",
+                    backgroundColor: "rgba(76, 29, 149, 0.3)",
                     color: "#c4b5fd",
                   }
             }
@@ -322,13 +322,15 @@ export function Header({
         </button>
       )}
 
-      {/* Method badge */}
+      {/* Method badge (v4.9: icon-only — the text duplicated the subtitle
+          and contributed to header "badge soup"; the tooltip carries the
+          full explanation). */}
       <span
-        className="flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-[11px] font-medium"
+        className="flex size-8 items-center justify-center rounded-md border"
         style={
           inElectron
             ? {
-                borderColor: "#0e7490",
+                borderColor: "rgba(14, 116, 144, 0.6)",
                 backgroundColor: "rgba(8, 51, 68, 0.3)",
                 color: "#67e8f9",
               }
@@ -343,9 +345,9 @@ export function Header({
             ? "Native FFmpeg encoding (GPU-accelerated when available) — export matches the preview"
             : "Browser preview mode — WebCodecs/MediaRecorder fallback"
         }
+        aria-label={inElectron ? "Native FFmpeg export" : "Browser export"}
       >
-        <Cpu className="size-3" />
-        {inElectron ? "Native FFmpeg" : "Browser"}
+        <Cpu className="size-4" />
       </span>
     </header>
   );

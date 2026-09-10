@@ -31,7 +31,7 @@ import type {
 import { serializeSrt, type SubtitleCue } from "./subtitles";
 
 export const PROJECT_APP = "framefuse";
-export const PROJECT_VERSION = 4.8;
+export const PROJECT_VERSION = 4.9;
 
 /** Audio above this size (MB, decoded) is skipped to keep project files sane. */
 export const MAX_AUDIO_MB = 25;

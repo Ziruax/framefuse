@@ -24,16 +24,10 @@ import {
 import { drawCaption, drawHeadline } from "@/lib/merger/native";
 import { cueAt } from "@/lib/merger/subtitles";
 import { fmtTimecode } from "@/lib/merger/timeline";
+import { middleEllipsis } from "@/lib/merger/text";
 
-/** v4.5: middle-ellipsis — keeps the timestamp head AND the descriptive
- *  tail of filename-encoded storyboards readable in the narrow label. */
-function middleEllipsis(name: string, max = 42): string {
-  if (name.length <= max) return name;
-  const keep = max - 1; // room for the ellipsis char
-  const head = Math.ceil(keep * 0.55);
-  const tail = Math.floor(keep * 0.45);
-  return `${name.slice(0, head)}…${name.slice(name.length - tail)}`;
-}
+/** v4.5: middle-ellipsis — moved to lib/merger/text.ts in v4.9 (shared
+ *  with the media list rows); re-exported here for local call sites. */
 
 interface PreviewPanelProps {
   segments: MediaSegment[];

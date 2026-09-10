@@ -1,16 +1,25 @@
-# FrameFuse v4.8
+# FrameFuse v4.9
 
-Native desktop **image → video** merger with **click-to-aim Ken Burns motion**, a **grid media library for 100+ image storyboards**, a **live audio waveform timeline**, **beat-synced cutting with a strength dial**, **viral kinetic captions with favorites**, **segment transitions**, **per-boundary transition overrides**, **export quality profiles**, **watermark/logo overlay**, **undo/redo**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
+Native desktop **image → video** merger with a **filmstrip storyboard timeline** (thumbnails in every segment, double-click to jump), **middle-truncating filename rows**, **click-to-aim Ken Burns motion**, a **grid media library for 100+ image storyboards**, a **live audio waveform timeline**, **beat-synced cutting with a strength dial**, **viral kinetic captions with favorites**, **segment transitions**, **per-boundary transition overrides**, **export quality profiles**, **watermark/logo overlay**, **undo/redo**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
 
 ## Highlights
 
-### 🎯 Click-to-aim motion (new in v4.8)
+### 🎞 Filmstrip storyboard timeline (new in v4.9)
+The timeline segments are no longer colored bars — each clip renders its **own thumbnail** under a translucent kind-tint (cyan absolute / emerald beat / violet duration), with a scrimmed **index chip**, a **duration tag** on wide strips, and hover outlines. The active clip pops (ring + violet glow + lift) while inactive strips recede. **Double-click any strip to jump to its first frame** — single click and drag still scrub, so the interaction never fights the playhead. Rich tooltips carry the full filename, range, duration and motion.
+
+### ✂️ Middle-truncating filenames (new in v4.9)
+Storyboard filenames front-load timing metadata and bury the differentiator at the end — so the media rows now **keep the tail visible** (`…OOM_camera.jpg` vs `…OOM_PROTAG.jpg`) while the head ellipsizes responsively. Pure helper in `lib/merger/text.ts` (harness-tested), shared by the preview overlay and the list rows.
+
+### 🧹 Coherence + hygiene pass (new in v4.9)
+VLM-reviewed styling sweep (4 → 8.5/10 on the list view): icon-only header method badge, quieter mode badges, lucide `Dices` Random button at a lighter weight, violet-unified control toggles, tighter effects grid with press feedback, brighter add-more affordance, keyboard focus rings on tiles, brighter ruler ticks. Hygiene: **removing an image now prunes its motion/transition overrides** (orphan-free maps, still fully undoable), and settings persistence moved to a **versioned localStorage key** (`framefuse.settings.v49`, one-shot migration from the legacy v41 blob).
+
+### 🎯 Click-to-aim motion (v4.8)
 Hover the preview canvas and a **crosshair + aim chip** appear — click anywhere to pin the active segment's Ken Burns direction (center = zoom in, edges = pan toward the click). Every card's motion label is also a **6-direction popover** with per-segment pinning; overrides flow into the timeline, the project file, undo history, AND the FFmpeg zoompan — one resolution point, exact export parity.
 
-### 🗞 Media library grid view (new in v4.8)
+### 🗞 Media library grid view (v4.8)
 One toggle flips the library between rich **list rows** and compact **tiles** built for 100+ image storyboards: index + duration badges, active-tile highlight, click-to-jump, hover remove, drag-reorder, and pinned-motion flags. The preference persists.
 
-### 🕶 Timeline hover timecode (new in v4.8)
+### 🕶 Timeline hover timecode (v4.8)
 Ghost hairline + timecode chip follow the cursor across the ruler and waveform — preview exactly where a click or scrub lands.
 
 ### 🌊 Audio waveform timeline (v4.7)

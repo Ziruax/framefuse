@@ -32,6 +32,7 @@ import {
   LayoutGrid,
   MoveDiagonal,
 } from "lucide-react";
+import { splitMiddle } from "@/lib/merger/text";
 import type {
   MediaSegment,
   TimelineMode,
@@ -393,10 +394,10 @@ export function MediaPanelBase({
               onDragLeave={() => setDragOver(false)}
               onDrop={handleDrop}
               onClick={openImagePicker}
-              className="mb-2 flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-dashed py-2.5 text-[11px] font-medium transition-all duration-200 hover:border-violet-500/50 hover:bg-violet-500/5 hover:text-zinc-300"
+              className="mb-2 flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-dashed py-2.5 text-[11px] font-semibold transition-all duration-200 hover:border-violet-500/50 hover:bg-violet-500/5 hover:text-zinc-200 active:scale-[0.98]"
               style={{
-                borderColor: dragOver ? "#7c3aed" : "#27272a",
-                color: dragOver ? "#c4b5fd" : "#8b8b93",
+                borderColor: dragOver ? "#7c3aed" : "#2e2e33",
+                color: dragOver ? "#c4b5fd" : "#a8a8b0",
                 backgroundColor: dragOver
                   ? "rgba(124, 58, 237, 0.1)"
                   : "transparent",
@@ -514,7 +515,8 @@ export function MediaPanelBase({
                         }
                       }}
                       className={cn(
-                        "group/tile relative aspect-square cursor-pointer overflow-hidden rounded-lg border transition-all duration-150 hover:-translate-y-0.5",
+                        "group/tile relative aspect-square cursor-pointer overflow-hidden rounded-lg border outline-none transition-all duration-150 hover:-translate-y-0.5 active:scale-[0.96]",
+                        "focus-visible:ring-2 focus-visible:ring-violet-400/80",
                         activeId === seg.id
                           ? "border-violet-400/70 shadow-[0_0_0_1px_rgba(167,139,250,0.5),0_4px_16px_rgba(0,0,0,0.4)]"
                           : "border-[#27272a] hover:border-zinc-600",
@@ -888,12 +890,30 @@ export function MediaPanelBase({
                         </button>
                       )}
                     </div>
+                    {/* v4.9: middle-truncation — the head (timing metadata)
+                        ellipsizes, the tail (unique suffix + extension)
+                        always stays visible. End-truncation hid exactly the
+                        differentiating half of storyboard filenames. */}
                     <div
-                      className="mt-0.5 truncate text-[11px] font-medium"
+                      className="mt-0.5 flex items-baseline text-[11px] font-medium"
                       style={{ color: "#d4d4d8" }}
                       title={seg.fileName}
                     >
-                      {seg.fileName}
+                      {(() => {
+                        const { head, tail } = splitMiddle(seg.fileName);
+                        return tail ? (
+                          <>
+                            <span className="min-w-0 flex-1 truncate">
+                              {head}
+                            </span>
+                            <span className="shrink-0 whitespace-nowrap">
+                              {tail}
+                            </span>
+                          </>
+                        ) : (
+                          <span className="truncate">{seg.fileName}</span>
+                        );
+                      })()}
                     </div>
                     <div
                       className="relative mt-0.5 flex items-center gap-2 text-[9px]"

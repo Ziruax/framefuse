@@ -77,7 +77,13 @@ function genId(): string {
 }
 
 // ---- Settings persistence (production-ready: survive restarts) ----------
-const LS_KEY = "framefuse.settings.v41";
+// v4.9: versioned settings key. The payload is wrapped as { v: 49, data }
+// so future schema changes can branch on version instead of growing the
+// flat v41 blob. The legacy v41 key is read as a fallback and removed on
+// the first successful v49 write (one-shot migration).
+const LS_KEY = "framefuse.settings.v49";
+const LS_LEGACY_KEY = "framefuse.settings.v41";
+const LS_VERSION = 49;
 
 interface PersistedSettings {
   kenBurns: KenBurnsConfig;
@@ -101,10 +107,18 @@ interface PersistedSettings {
 
 function loadPersisted(): Partial<PersistedSettings> {
   try {
-    const raw = localStorage.getItem(LS_KEY);
+    // v49 first; fall back to the legacy flat v41 blob.
+    const raw =
+      localStorage.getItem(LS_KEY) ?? localStorage.getItem(LS_LEGACY_KEY);
     if (!raw) return {};
     const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : {};
+    if (!parsed || typeof parsed !== "object") return {};
+    // Wrapped ({ v, data }) vs legacy (flat object) shapes.
+    const data =
+      parsed && typeof parsed.data === "object" && parsed.v === LS_VERSION
+        ? parsed.data
+        : parsed;
+    return data as Partial<PersistedSettings>;
   } catch {
     return {};
   }
@@ -1041,7 +1055,11 @@ export default function Page() {
       mediaView,
     };
     try {
-      localStorage.setItem(LS_KEY, JSON.stringify(payload));
+      localStorage.setItem(LS_KEY, JSON.stringify({ v: LS_VERSION, data: payload }));
+      // One-shot legacy cleanup — the data now lives under the versioned key.
+      if (localStorage.getItem(LS_LEGACY_KEY) != null) {
+        localStorage.removeItem(LS_LEGACY_KEY);
+      }
     } catch {
       /* storage full / private mode — non-fatal */
     }
@@ -1185,6 +1203,25 @@ export default function Page() {
       const next = { ...prev };
       delete next[id];
       return next;
+    });
+    // v4.9: prune id-keyed overrides the moment their segment dies, so the
+    // override maps never accumulate orphans (undo still restores them —
+    // both maps live in the history snapshot).
+    setMotionOverrides((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+    setTransitionSettings((prev) => {
+      if (
+        !prev.overrides ||
+        !Object.prototype.hasOwnProperty.call(prev.overrides, id)
+      )
+        return prev;
+      const nextOverrides = { ...prev.overrides };
+      delete nextOverrides[id];
+      return { ...prev, overrides: nextOverrides };
     });
   }, [requestHistoryPush]);
 
@@ -1906,6 +1943,17 @@ export default function Page() {
             beats={beatInfo?.beatMs ?? null}
             waveform={waveform}
             onSeek={seek}
+            onJumpToSegment={(id) => {
+              // v4.9: filmstrip double-click — jump + a light selection cue
+              // (the media card for this clip becomes active via the seek).
+              const s = timeline.segments.find((x) => x.id === id);
+              if (s) {
+                seek(s.startMs + 5);
+                toast.info(`Jumped to clip ${s.order + 1}`, {
+                  description: `${fmtTimecode(s.startMs)} — ${s.fileName.slice(0, 48)}`,
+                });
+              }
+            }}
           />
         </section>
 
