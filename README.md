@@ -1,16 +1,25 @@
-# FrameFuse v4.2
+# FrameFuse v4.3
 
-Native desktop **image → video** merger with **viral kinetic captions**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
+Native desktop **image → video** merger with **viral kinetic captions**, **segment transitions**, **undo/redo**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
 
 ## Highlights
 
-### 🪝 Title overlay track (new in v4.2)
+### 🎞 Segment transitions (new in v4.3)
+**8 styles** between segments — **Dissolve, Dip-to-Black, Flash (dip-to-white), Slide ←/→, Wipe ←/→** — with a 0.2–1.5s duration slider and an optional **video opener/outro fade**. Every transition is a per-clip head composite (FFmpeg `xfade` at offset 0, blending the previous segment's frozen Ken Burns end-frame), so the timeline duration, audio sync and caption timing are never disturbed — and the burn-in matches the preview exactly (probe-verified against FFmpeg 7.0.2 output, 27/27 parity checks).
+
+### ↩️ Undo / Redo (new in v4.3)
+`Ctrl+Z` / `Ctrl+Shift+Z` / `Ctrl+Y` (or the header buttons) step through **80 levels** of session history — segments, durations, captions, headlines, Ken Burns, transitions, every setting. Removed media restores **byte-perfect**.
+
+### 📐 4:5 aspect (new in v4.3)
+Instagram-feed portrait (1080×1350) joins 16:9 / 9:16 / 1:1. The ruler also gains **headline marker chips** (click to jump) and **transition zone hatches** that glow while playing.
+
+### 🪝 Title overlay track (v4.2)
 Big hook titles independent of captions — timed text items with 5 viral presets (**Bold Impact, Neon Hook, Sticker, Elegant Serif, Clean Banner**), top/center/bottom placement, 4 entrance animations (Fade / Slide / Pop / Zoom-Punch) and a live size control. Burned into the export with the same preview-parity guarantee as captions, and exported even when captions are off.
 
-### 💾 Project files (new in v4.2)
-**Save / open `.framefuse.json`** — one self-contained file carrying your images, audio, subtitle cues (with word timing), headline track, duration overrides and every setting. Drop it back onto the app (or use ⌂ Open project) to restore the exact session.
+### 💾 Project files (v4.2)
+**Save / open `.framefuse.json`** — one self-contained file carrying your images, audio, subtitle cues (with word timing), headline track, duration overrides, transitions and every setting. Drop it back onto the app (or use ⌂ Open project) to restore the exact session.
 
-### 🛠 Editor upgrades (new in v4.2)
+### 🛠 Editor upgrades (v4.2)
 - **Duplicate segment** — one click, perfect for beat repetition
 - **3 new kinetic animations**: **Tracking-In** (letters slide together), **Blur-In** (focus pull), **Heartbeat** (double-beat pulse) — 24 total, all ASS-parity
 - Refreshed UI: gradient buttons, depth shadows, glowing playhead, pulsing beat tracks, hover-lift media cards
@@ -47,9 +56,9 @@ Whisper-tiny runs **fully locally** (no API keys, ~75 MB download once, then off
 
 ### 🎛️ Production tooling
 - **Ken Burns multi-select** — randomize between your 2+ favorite effects or fix one
-- **Headline overlay track** + **project save/open** (see above)
+- **Segment transitions** + **headline overlay track** + **project save/open** + **undo/redo** (see above)
 - Settings persist across restarts
-- Keyboard shortcuts: `Space` play/pause, `←/→` ±1s, `Shift+←/→` segment step, `Home` restart
+- Keyboard shortcuts: `Space` play/pause, `←/→` ±1s, `Shift+←/→` segment step, `Home` restart, `Ctrl+Z` / `Ctrl+Shift+Z` undo/redo
 - Drag & drop images, audio, `.srt` **and** `.framefuse.json` project files
 - Absolute / beat / duration filename timelines
 
