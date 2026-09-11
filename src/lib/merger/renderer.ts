@@ -278,7 +278,8 @@ export type TransitionFxKind =
   | "dissolve"
   | "dip-head"
   | "slide"
-  | "wipe";
+  | "wipe"
+  | "circle";
 
 /** Per-frame transition effect descriptor (pure — shared with tests). */
 export interface TransitionFx {
@@ -332,6 +333,9 @@ export function computeTransitionFx(
   }
   if (style === "slide-left" || style === "slide-right" || style === "wipe-left" || style === "wipe-right") {
     return { kind: style.startsWith("slide") ? "slide" : "wipe", p, style, dipColor: null, headMs };
+  }
+  if (style === "circleopen") {
+    return { kind: "circle", p, style, dipColor: null, headMs };
   }
   return none;
 }
@@ -451,7 +455,8 @@ export function drawFrameWithTransition(
     return;
   }
 
-  // slide / wipe: prev frozen BELOW, cur composited on top with offset/clip.
+  // slide / wipe / circle: prev frozen BELOW, cur composited on top with
+  // offset / clip / growing-circle reveal.
   if (prevSeg) {
     drawFrame(ctx, prevImg, prevSeg, prevSeg.endMs, cw, ch, kb);
   } else {
@@ -479,6 +484,15 @@ export function drawFrameWithTransition(
       ctx.beginPath();
       ctx.rect(0, 0, cw * fx.p, ch);
     }
+    ctx.clip();
+    ctx.drawImage(scratch, 0, 0);
+  } else if (fx.kind === "circle") {
+    // circleopen (v5.1): cur reveals through a circle expanding from the
+    // center — the autoeditor painter: radius = (hypot/2)·p reaches the
+    // corners exactly at p = 1, matching ffmpeg xfade circleopen's reveal.
+    const maxR = Math.hypot(cw, ch) / 2;
+    ctx.beginPath();
+    ctx.arc(cw / 2, ch / 2, maxR * fx.p, 0, Math.PI * 2);
     ctx.clip();
     ctx.drawImage(scratch, 0, 0);
   }

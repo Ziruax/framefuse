@@ -270,6 +270,16 @@ export function sanitizeItemEdits(
     if (typeof edit.volume === "number" && Number.isFinite(edit.volume)) {
       clean.volume = edit.volume;
     }
+    // v5.1: per-clip playback speed (0.25..4, finite; 1 is normalized away
+    // so speed-1 edits never bloat project files or the export payload).
+    if (
+      typeof edit.speed === "number" &&
+      Number.isFinite(edit.speed) &&
+      edit.speed > 0 &&
+      edit.speed !== 1
+    ) {
+      clean.speed = Math.min(4, Math.max(0.25, edit.speed));
+    }
     if (edit.chroma && typeof edit.chroma === "object") {
       clean.chroma = edit.chroma;
     }
@@ -386,14 +396,24 @@ async function dataUrlToFile(
 
 /** Parse + validate a .framefuse.json file and rebuild its File objects.
  *  v5.0: sanitizes the new fields (itemEdits / sfxItems / videoDurations)
- *  onto the returned project; ≤4.9 files without them load unchanged. */
+ *  onto the returned project; ≤4.9 files without them load unchanged.
+ *  v5.1: the body is shared with parseProjectDoc so the native open flow
+ *  (electronAPI.openProject() → doc) feeds through the SAME validation. */
 export async function parseProjectFile(file: File): Promise<LoadedProject> {
-  let project: ProjectFile;
+  let doc: unknown;
   try {
-    project = JSON.parse(await file.text());
+    doc = JSON.parse(await file.text());
   } catch {
     throw new Error("Not a valid FrameFuse project file (JSON parse failed)");
   }
+  return parseProjectDoc(doc);
+}
+
+/** v5.1: validate + rehydrate an already-parsed project document (the
+ *  parseProjectFile body minus the JSON step). Native saves hand the doc
+ *  straight back through IPC — this is the single validation path for both. */
+export async function parseProjectDoc(doc: unknown): Promise<LoadedProject> {
+  const project = doc as ProjectFile;
   if (!project || project.app !== PROJECT_APP) {
     throw new Error("This file was not created by FrameFuse");
   }

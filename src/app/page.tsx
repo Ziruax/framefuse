@@ -64,6 +64,8 @@ import {
   buildProjectFile,
   downloadProjectFile,
   parseProjectFile,
+  parseProjectDoc,
+  type ProjectFile,
 } from "@/lib/merger/project";
 import { decodeAudioPeaks, type WaveformData } from "@/lib/merger/waveform";
 
@@ -304,6 +306,10 @@ export default function Page() {
   const [inElectron, setInElectron] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
 
+  // ---- v5.1: native project file identity (null = unsaved session) --------
+  const [currentProjectPath, setCurrentProjectPath] = useState<string | null>(null);
+  const [currentProjectName, setCurrentProjectName] = useState<string | null>(null);
+
   // ---- File pickers (page-level so the app menu can trigger them) ---------
   const imageInputRef = useRef<HTMLInputElement>(null);
   const audioInputRef = useRef<HTMLInputElement>(null);
@@ -386,6 +392,12 @@ export default function Page() {
         : null,
     [timeline.segments, currentMs],
   );
+
+  /** v5.1: number of base-lane boundaries (drives the Random-mix button). */
+  const boundaryCount = useMemo(() => {
+    const baseSegs = timeline.segments.filter((s) => s.track === 0);
+    return baseSegs.length > 1 ? baseSegs.length - 1 : 0;
+  }, [timeline.segments]);
 
   /** v5.0: object URLs for VIDEO media items (id → url) — PreviewPanel's
    *  paint sources and the export's video bytes channel. */
@@ -891,6 +903,13 @@ export default function Page() {
     exportRef.current = handleExport;
   }, [handleExport]);
 
+  // ---- v5.1: native project-file menu handlers (ref-synced so the menu
+  // registrations never re-bind — the exportRef pattern).
+  const saveProjectRef = useRef<() => void>(() => {});
+  const saveProjectAsRef = useRef<() => void>(() => {});
+  const openProjectRef = useRef<() => void>(() => {});
+  const newProjectRef = useRef<() => void>(() => {});
+
   useEffect(() => {
     const electron = isElectron();
     // Defer setState to avoid cascading renders
@@ -906,6 +925,11 @@ export default function Page() {
             "Absolute: [00:00:00 - 00:00:06] name.jpg\nBeat: 001__Beat_1_0s_name.jpg\nDuration: 10s_name.jpg",
         }),
       );
+      // v5.1 native project files (dialog-backed main-process IPC).
+      const offSave = api.onMenu("menu:save-project", () => saveProjectRef.current());
+      const offSaveAs = api.onMenu("menu:save-project-as", () => saveProjectAsRef.current());
+      const offOpen = api.onMenu("menu:open-project", () => openProjectRef.current());
+      const offNew = api.onMenu("menu:new-project", () => newProjectRef.current());
 
       // Verify FFmpeg is reachable on startup so the user sees a clear
       // error early instead of a generic export failure. This catches
@@ -929,6 +953,10 @@ export default function Page() {
         offImages?.();
         offAudio?.();
         offGuide?.();
+        offSave?.();
+        offSaveAs?.();
+        offOpen?.();
+        offNew?.();
       };
     }
     return undefined;
@@ -1799,7 +1827,180 @@ export default function Page() {
     [requestHistoryPush, trackUrl, videoDurations, videoDims, videoThumbnails],
   );
 
-  // ---- Headline overlay management (v4.2) ------------------------------
+  /** v5.1: build an ABSOLUTE-range filename for a split's right half (the
+ *  absolute pattern is checked FIRST by parseFilename, so the clip lands
+ *  exactly at the split point in absolute mode). Any existing range and
+ *  extension are stripped from the base name. */
+function splitRangeName(name: string, startMs: number, endMs: number): string {
+  const dot = name.lastIndexOf(".");
+  const ext = dot > 0 ? name.slice(dot) : "";
+  const base = name
+    .slice(0, dot > 0 ? dot : undefined)
+    .replace(/\[[^\]]*\]\s*/, "")
+    .trim();
+  return `[${fmtTimecode(startMs)} - ${fmtTimecode(endMs)}] ${base || "clip"}${ext}`;
+}
+
+/**
+ * v5.1 SPLIT AT PLAYHEAD — cut the ACTIVE base-track segment in two at the
+ * current playhead (strictly inside, >100ms from both edges). Implemented
+ * entirely with the existing items/overrides/itemEdits model:
+ *  - LEFT: the original item stays; a duration override pins its window to
+ *    (splitAt − start) — honored in BOTH timeline modes.
+ *  - RIGHT: a NEW item (same source File, fresh id, inserted right after):
+ *      · sequential mode keeps the same name (the override pins the
+ *        duration, so the two parts sum to the original);
+ *      · absolute mode renames the File with an absolute range
+ *        `[splitAt − end]` so filename timing places it at the split;
+ *      · video: itemEdits trimInMs = trimIn + leftDur·speed (source time);
+ *        speed/volume edits carry over so both halves play identically.
+ * One requestHistoryPush → ONE undo step (all updates batch in one tick).
+ */
+const splitAtPlayhead = useCallback(() => {
+  const seg = activeSegment; // segmentAtTime → BASE lane only
+  if (!seg) {
+    toast.error("No active clip under the playhead");
+    return;
+  }
+  const splitAt = currentMsRef.current;
+  if (splitAt <= seg.startMs + 100 || splitAt >= seg.endMs - 100) {
+    toast.error("Playhead is too close to the clip edge", {
+      description: "Split needs the playhead more than 0.1s from either edge of the active clip.",
+    });
+    return;
+  }
+  const item = items.find((i) => i.id === seg.id);
+  if (!item) return;
+
+  const speed = seg.speed != null && seg.speed > 0 ? seg.speed : 1;
+  const leftDur = splitAt - seg.startMs;
+  const rightDur = seg.endMs - splitAt;
+  const rightId = genId();
+
+  requestHistoryPush();
+
+  // LEFT: pin the shortened window.
+  // RIGHT: same bytes, fresh id — the shared object URL stays valid (URLs
+  // are only revoked on unmount, by design).
+  setOverrides((prev) => ({ ...prev, [seg.id]: leftDur, [rightId]: rightDur }));
+  setItems((prev) => {
+    const idx = prev.findIndex((i) => i.id === seg.id);
+    if (idx < 0) return prev;
+    const absolute = timeline.mode === "absolute";
+    const name = absolute
+      ? splitRangeName(item.file.name, splitAt, seg.endMs)
+      : item.file.name;
+    const copy: MediaItem = {
+      id: rightId,
+      // File([file]) re-blobs the SAME bytes lazily — no memory copy.
+      file: new File([item.file], name, { type: item.file.type }),
+      url: item.url,
+      mediaType: item.mediaType,
+    };
+    const next = [...prev];
+    // Absolute-mode fix-up: a left half whose placement does NOT come from
+    // filename timing (an untimed video — parseFilename null — or a
+    // duration-kind name) would otherwise re-append at the tail AFTER the
+    // right half — swapping the split order. Renaming it to an absolute
+    // range pins it at its current position. Absolute/beat kinds already
+    // place by filename start, so they keep the user's name.
+    const leftKind = parseFilename(item.file.name)?.kind;
+    if (absolute && leftKind !== "absolute" && leftKind !== "beat") {
+      next[idx] = {
+        ...next[idx],
+        file: new File(
+          [item.file],
+          splitRangeName(item.file.name, seg.startMs, splitAt),
+          { type: item.file.type },
+        ),
+      };
+    }
+    next.splice(idx + 1, 0, copy);
+    return next;
+  });
+  // RIGHT video edit: source window starts after the left half's window.
+  if (item.mediaType === "video") {
+    const rightEdit: ItemEdit = {
+      trimInMs: Math.max(0, Math.round(seg.trimInMs + leftDur * speed)),
+    };
+    if (seg.speed != null && seg.speed !== 1) rightEdit.speed = seg.speed;
+    if (seg.volume != null && seg.volume !== 1) rightEdit.volume = seg.volume;
+    setItemEdits((prev) => ({ ...prev, [rightId]: rightEdit }));
+  }
+  // Carry the probed video metadata (duration/dims/poster) to the right
+  // half instantly — no re-probe (the duplicateItem pattern).
+  if (videoDurations[seg.id] != null) {
+    setVideoDurations((vd) =>
+      vd[seg.id] != null ? { ...vd, [rightId]: vd[seg.id] } : vd,
+    );
+  }
+  if (videoDims[seg.id]) {
+    setVideoDims((dm) => (dm[seg.id] ? { ...dm, [rightId]: dm[seg.id] } : dm));
+  }
+  if (videoThumbnails[seg.id]) {
+    setVideoThumbnails((th) =>
+      th[seg.id] ? { ...th, [rightId]: th[seg.id] } : th,
+    );
+  }
+  toast.success("Clip split at playhead", {
+    description: `Left ${(leftDur / 1000).toFixed(1)}s · right ${(rightDur / 1000).toFixed(1)}s — undo (Ctrl+Z) restores the original clip.`,
+  });
+}, [
+  activeSegment,
+  items,
+  timeline.mode,
+  requestHistoryPush,
+  videoDurations,
+  videoDims,
+  videoThumbnails,
+]);
+
+/**
+ * v5.1 "Random mix" — pin a random transition (from every available style
+ * incl. dips) to ALL base-lane boundaries with no back-to-back repeats, via
+ * the existing per-boundary overrides map. One commit → one undo step.
+ */
+const handleRandomTransitionMix = useCallback(() => {
+  const baseSegs = timeline.segments.filter((s) => s.track === 0);
+  if (baseSegs.length < 2) {
+    toast.error("Need at least two clips", {
+      description: "Transitions live on the boundaries between base-track clips.",
+    });
+    return;
+  }
+  const pool: TransitionStyle[] = [
+    "dissolve",
+    "dip-black",
+    "dip-white",
+    "slide-left",
+    "slide-right",
+    "wipe-left",
+    "wipe-right",
+    "circleopen",
+  ];
+  requestHistoryPush();
+  const overrides: Record<string, TransitionStyle> = {};
+  let prev: TransitionStyle | null = null;
+  for (let i = 1; i < baseSegs.length; i++) {
+    const seg = baseSegs[i];
+    const choices = prev == null ? pool : pool.filter((s) => s !== prev);
+    const pick = choices[Math.floor(Math.random() * choices.length)];
+    overrides[seg.id] = pick;
+    prev = pick;
+  }
+  setTransitionSettings((prevT) => ({ ...prevT, overrides }));
+  toast.success(
+    `Randomized ${baseSegs.length - 1} transition${
+      baseSegs.length === 2 ? "" : "s"
+    }`,
+    {
+      description:
+        "No two neighboring cuts share a style — undo (Ctrl+Z) restores the previous pins.",
+    },
+  );
+}, [timeline.segments, requestHistoryPush]);
+
+// ---- Headline overlay management (v4.2) ------------------------------
   const addHeadline = useCallback(() => {
     requestHistoryPush();
     setHeadlineItems((prev) => {
@@ -1886,9 +2087,20 @@ export default function Page() {
   /**
    * Shared translation logic for item-edit patches (see the doc comment on
    * handleSetItemEdit / handleTimelineEdit below for the full contract).
+   * v5.1 adds (3): the BASE lane pins clip durations through the v4.x
+   * `overrides` map (edit.durationMs only drives the overlay lane), so any
+   * effective duration is mirrored there while the clip sits on the base
+   * lane — timeline trim drags actually stick.
    */
   const translateItemEdit = useCallback(
-    (id: string, patch: Partial<ItemEdit>): { patch: Partial<ItemEdit>; routedFromBase: boolean } => {
+    (
+      id: string,
+      patch: Partial<ItemEdit>,
+    ): {
+      patch: Partial<ItemEdit>;
+      routedFromBase: boolean;
+      baseDurationMs: number | undefined;
+    } => {
       const existing = stateRef.current?.itemEdits[id] ?? {};
       const eff: Partial<ItemEdit> = { ...patch };
       // (1) base-lane horizontal move → auto-route to the overlay lane.
@@ -1904,7 +2116,20 @@ export default function Page() {
       if (finalTrack >= 1 && !finalOverlay) {
         eff.overlay = DEFAULT_OVERLAY_TRANSFORM;
       }
-      return { patch: eff, routedFromBase };
+      // (3) v5.1: mirror the effective duration into the BASE lane's
+      // overrides map. `overrides` is the final TIMELINE duration the base
+      // lane resolves (never speed-divided — see timeline.ts), so trim
+      // drags and panel edits land exactly where the user dropped them.
+      const mergedDur =
+        eff.durationMs !== undefined ? eff.durationMs : existing.durationMs;
+      const baseDurationMs =
+        finalTrack === 0 &&
+        typeof mergedDur === "number" &&
+        Number.isFinite(mergedDur) &&
+        mergedDur > 0
+          ? mergedDur
+          : undefined;
+      return { patch: eff, routedFromBase, baseDurationMs };
     },
     [],
   );
@@ -1928,8 +2153,12 @@ export default function Page() {
   const handleSetItemEdit = useCallback(
     (id: string, patch: Partial<ItemEdit>) => {
       requestHistoryPush(500);
-      const { patch: eff, routedFromBase } = translateItemEdit(id, patch);
+      const { patch: eff, routedFromBase, baseDurationMs } =
+        translateItemEdit(id, patch);
       applyItemEdit(id, eff);
+      if (baseDurationMs != null) {
+        setOverrides((prev) => ({ ...prev, [id]: baseDurationMs }));
+      }
       if (routedFromBase) {
         toast.info("Moved to the Overlay track", {
           description:
@@ -1945,8 +2174,12 @@ export default function Page() {
   const handleTimelineEdit = useCallback(
     (id: string, patch: Partial<ItemEdit>) => {
       requestHistoryPush();
-      const { patch: eff, routedFromBase } = translateItemEdit(id, patch);
+      const { patch: eff, routedFromBase, baseDurationMs } =
+        translateItemEdit(id, patch);
       applyItemEdit(id, eff);
+      if (baseDurationMs != null) {
+        setOverrides((prev) => ({ ...prev, [id]: baseDurationMs }));
+      }
       if (routedFromBase) {
         toast.info("Moved to the Overlay track", {
           description:
@@ -2002,78 +2235,57 @@ export default function Page() {
     [requestHistoryPush],
   );
 
-  const saveProject = useCallback(async () => {
-    try {
-      if (items.length === 0) {
-        toast.error("Nothing to save yet", {
-          description: "Add images first — the project stores your full storyboard.",
+  /**
+   * v5.1: build the self-contained project document — the EXACT v5.0
+   * serialization, shared by the browser download flow and the native
+   * saveProject/saveProjectAs bridges (main.js persists this doc verbatim).
+   */
+  const buildProjectDoc = useCallback(async (): Promise<ProjectFile | null> => {
+    let audioFile: File | null = null;
+    if (audioTrack) {
+      try {
+        const resp = await fetch(audioTrack.url);
+        const blob = await resp.blob();
+        audioFile = new File([blob], audioTrack.fileName, {
+          type: blob.type || "audio/mpeg",
         });
-        return;
+      } catch {
+        audioFile = null;
       }
-      let audioFile: File | null = null;
-      if (audioTrack) {
-        try {
-          const resp = await fetch(audioTrack.url);
-          const blob = await resp.blob();
-          audioFile = new File([blob], audioTrack.fileName, {
-            type: blob.type || "audio/mpeg",
-          });
-        } catch {
-          audioFile = null;
-        }
-      }
-      const project = await buildProjectFile({
-        // v5.0: entries carry their mediaType so videos round-trip as videos.
-        images: items.map((it) => ({
-          id: it.id,
-          file: it.file,
-          mediaType: it.mediaType,
-        })),
-        audio: audioFile,
-        subtitles: subtitles
-          ? { fileName: subtitles.fileName, cues: subtitles.cues }
-          : null,
-        headlines: headlineItems,
-        overrides,
-        motionOverrides,
-        watermark: watermarkImage
-          ? {
-              image: { id: watermarkImage.id, file: watermarkImage.file },
-              settings: watermarkSettings,
-            }
-          : null,
-        // v5.0: multi-track session — edits, SFX placements, video durations.
-        itemEdits,
-        sfxItems,
-        videoDurations,
-        settings: {
-          kenBurns,
-          video: settings,
-          caption: captionSettings,
-          audio: audioSettings,
-          whisperLanguage,
-          transition: transitionSettings,
-        },
-      });
-      const name = downloadProjectFile(project);
-      const imgs = project.images.length;
-      const vids = project.images.filter((i) => i.mediaType === "video").length;
-      toast.success(`Project saved — ${name}`, {
-        description: `${imgs} media item${imgs === 1 ? "" : "s"}${
-          vids ? ` (${vids} video${vids === 1 ? "" : "s"})` : ""
-        }${
-          project.audio ? " + audio" : ""
-        }${
-          project.subtitles ? " + captions" : ""
-        }${
-          project.headlines.length ? ` + ${project.headlines.length} headline` : ""
-        }${
-          sfxItems.length ? ` + ${sfxItems.length} SFX` : ""
-        } — fully self-contained .json`,
-      });
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Project save failed");
     }
+    return await buildProjectFile({
+      // v5.0: entries carry their mediaType so videos round-trip as videos.
+      images: items.map((it) => ({
+        id: it.id,
+        file: it.file,
+        mediaType: it.mediaType,
+      })),
+      audio: audioFile,
+      subtitles: subtitles
+        ? { fileName: subtitles.fileName, cues: subtitles.cues }
+        : null,
+      headlines: headlineItems,
+      overrides,
+      motionOverrides,
+      watermark: watermarkImage
+        ? {
+            image: { id: watermarkImage.id, file: watermarkImage.file },
+            settings: watermarkSettings,
+          }
+        : null,
+      // v5.0: multi-track session — edits, SFX placements, video durations.
+      itemEdits,
+      sfxItems,
+      videoDurations,
+      settings: {
+        kenBurns,
+        video: settings,
+        caption: captionSettings,
+        audio: audioSettings,
+        whisperLanguage,
+        transition: transitionSettings,
+      },
+    });
   }, [
     items,
     audioTrack,
@@ -2094,11 +2306,108 @@ export default function Page() {
     videoDurations,
   ]);
 
+  const saveProject = useCallback(async () => {
+    try {
+      if (items.length === 0) {
+        toast.error("Nothing to save yet", {
+          description: "Add images first — the project stores your full storyboard.",
+        });
+        return;
+      }
+      const project = await buildProjectDoc();
+      if (!project) return;
+
+      // v5.1: native save — direct write once a path is known, save dialog
+      // on the first save. A null result = user cancelled → silent.
+      const api = window.electronAPI;
+      if (api?.saveProject) {
+        const r = await api.saveProject({
+          doc: project,
+          currentPath: currentProjectPath,
+        });
+        if (r) {
+          setCurrentProjectPath(r.path);
+          setCurrentProjectName(r.name);
+          toast.success(`Project saved — ${r.name}`, {
+            description: r.path,
+          });
+        }
+        return;
+      }
+
+      // Browser fallback — EXACTLY the v4.2/v5.0 download flow.
+      const name = downloadProjectFile(project);
+      const imgs = project.images.length;
+      const vids = project.images.filter((i) => i.mediaType === "video").length;
+      toast.success(`Project saved — ${name}`, {
+        description: `${imgs} media item${imgs === 1 ? "" : "s"}${
+          vids ? ` (${vids} video${vids === 1 ? "" : "s"})` : ""
+        }${
+          project.audio ? " + audio" : ""
+        }${
+          project.subtitles ? " + captions" : ""
+        }${
+          project.headlines.length ? ` + ${project.headlines.length} headline` : ""
+        }${
+          sfxItems.length ? ` + ${sfxItems.length} SFX` : ""
+        } — fully self-contained .json`,
+      });
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Project save failed");
+    }
+  }, [items, buildProjectDoc, currentProjectPath, sfxItems]);
+
+  /** v5.1: Save As — always opens the native dialog; browser falls back to
+   *  the download flow (there is no meaningful "as" in a download). */
+  const saveProjectAs = useCallback(async () => {
+    const api = window.electronAPI;
+    if (!api?.saveProjectAs) {
+      await saveProject();
+      return;
+    }
+    try {
+      if (items.length === 0) {
+        toast.error("Nothing to save yet", {
+          description: "Add images first — the project stores your full storyboard.",
+        });
+        return;
+      }
+      const project = await buildProjectDoc();
+      if (!project) return;
+      const r = await api.saveProjectAs({ doc: project });
+      if (r) {
+        setCurrentProjectPath(r.path);
+        setCurrentProjectName(r.name);
+        toast.success(`Project saved — ${r.name}`, {
+          description: r.path,
+        });
+      }
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Project save failed");
+    }
+  }, [items, buildProjectDoc, saveProject]);
+
+  /**
+   * v5.1: loadProject accepts a browser File OR an already-parsed native doc
+   * (electronAPI.openProject hands back { path, name, doc }). Both feed the
+   * SAME parse/validation path — parseProjectFile wraps parseProjectDoc.
+   * Native identity (path/name) is set by the CALLER after this resolves;
+   * loading always clears the previous identity first.
+   */
   const loadProject = useCallback(
-    async (file: File) => {
+    async (source: File | { doc: unknown }, displayName?: string) => {
       try {
-        const loaded = await parseProjectFile(file);
+        const loaded =
+          source instanceof File
+            ? await parseProjectFile(source)
+            : await parseProjectDoc((source as { doc: unknown }).doc);
         const { project } = loaded;
+        const shownName =
+          displayName ?? (source instanceof File ? source.name : "project");
+
+        // v5.1: the loaded session is not yet tied to a file on disk.
+        setCurrentProjectPath(null);
+        setCurrentProjectName(null);
 
         // Snapshot the PRE-load session so Ctrl+Z restores it fully
         // (object URLs are kept alive for exactly this).
@@ -2218,7 +2527,7 @@ export default function Page() {
             vids ? ` (${vids} video${vids === 1 ? "" : "s"})` : ""
           }`,
           {
-            description: `${file.name}${
+            description: `${shownName}${
               loaded.audioSkipped ? " · audio skipped (>25MB)" : ""
             }${
               loaded.videoSkipped
@@ -2237,6 +2546,93 @@ export default function Page() {
     },
     [requestHistoryPush, trackUrl, clearWaveform, probeVideoItem],
   );
+
+  /**
+   * v5.1: open a project — native dialog (with recents) when the bridge is
+   * present, browser file picker otherwise. Feeds the result through the
+   * EXISTING loadProject parse path and adopts the on-disk identity.
+   */
+  const handleOpenProject = useCallback(async () => {
+    const api = window.electronAPI;
+    if (api?.openProject) {
+      try {
+        const r = await api.openProject();
+        if (!r) return; // cancelled — silent
+        await loadProject({ doc: r.doc }, r.name);
+        setCurrentProjectPath(r.path);
+        setCurrentProjectName(r.name);
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : "Project open failed");
+      }
+      return;
+    }
+    openProjectPicker();
+  }, [loadProject, openProjectPicker]);
+
+  /**
+   * v5.1: new project — confirm, then reset the session to the initial-load
+   * state (empty media/captions/headlines/edits/SFX, no project identity).
+   * Settings stay (they are app-level persisted prefs, like the v5.0 load
+   * flow's fallback) and Ctrl+Z restores everything that was cleared.
+   */
+  const newProject = useCallback(() => {
+    const hasSession =
+      items.length > 0 ||
+      audioTrack != null ||
+      subtitles != null ||
+      headlineItems.length > 0 ||
+      sfxItems.length > 0;
+    if (
+      hasSession &&
+      !window.confirm(
+        "Start a new project? Unsaved changes in the current session are cleared (Ctrl+Z can restore them).",
+      )
+    ) {
+      return;
+    }
+    requestHistoryPush();
+    setItems([]);
+    setOverrides({});
+    setMotionOverrides({});
+    setSubtitles(null);
+    setHeadlineItems([]);
+    setAudioTrack(null);
+    setItemEdits({});
+    setSfxItems([]);
+    setVideoDurations({});
+    // v5.1: stale per-item probe caches keyed by the (now removed) ids.
+    setVideoDims({});
+    setVideoThumbnails({});
+    setWatermarkImage(null);
+    clearBeatInfo();
+    clearWaveform();
+    setCurrentProjectPath(null);
+    setCurrentProjectName(null);
+    currentMsRef.current = 0;
+    setCurrentMs(0);
+    setIsPlaying(false);
+    toast.success("New project", {
+      description: "Clean timeline — add media to start editing.",
+    });
+  }, [
+    items.length,
+    audioTrack,
+    subtitles,
+    headlineItems.length,
+    sfxItems.length,
+    requestHistoryPush,
+    clearBeatInfo,
+    clearWaveform,
+  ]);
+
+  // Keep the v5.1 menu-handler refs on the latest closures (the menu
+  // registrations in the Electron effect bind once).
+  useEffect(() => {
+    saveProjectRef.current = () => void saveProject();
+    saveProjectAsRef.current = () => void saveProjectAs();
+    openProjectRef.current = () => void handleOpenProject();
+    newProjectRef.current = newProject;
+  }, [saveProject, saveProjectAs, handleOpenProject, newProject]);
 
   const seek = useCallback(
     (ms: number) => {
@@ -2285,9 +2681,24 @@ export default function Page() {
     abortRef.current?.abort();
   }, []);
 
+  // ---- v5.1 clip tools for the global keyboard handler (ref-synced so the
+  // key listener never re-binds — the exportRef pattern).
+  const removeActiveSegment = useCallback(() => {
+    const seg = activeSegment;
+    if (!seg) return;
+    removeItem(seg.id);
+  }, [activeSegment, removeItem]);
+  const splitAtPlayheadRef = useRef(splitAtPlayhead);
+  const removeActiveRef = useRef(removeActiveSegment);
+  useEffect(() => {
+    splitAtPlayheadRef.current = splitAtPlayhead;
+    removeActiveRef.current = removeActiveSegment;
+  }, [splitAtPlayhead, removeActiveSegment]);
+
   // ---- Keyboard shortcuts (production-ready transport + undo/redo) -----
   // Space: play/pause · ←/→: seek ±1s · Shift+←/→: prev/next segment
-  // Ctrl/Cmd+Z: undo · Ctrl/Cmd+Shift+Z / Ctrl+Y: redo.
+  // Ctrl/Cmd+Z: undo · Ctrl/Cmd+Shift+Z / Ctrl+Y: redo
+  // v5.1: S = split at playhead · Delete/Backspace = remove active clip.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
@@ -2323,6 +2734,17 @@ export default function Page() {
       } else if (e.key === "Home") {
         e.preventDefault();
         seek(0);
+      } else if ((e.key === "s" || e.key === "S") && !mod) {
+        // v5.1: split the active base clip at the playhead (one undo step).
+        e.preventDefault();
+        splitAtPlayheadRef.current();
+      } else if (
+        (e.key === "Delete" || e.key === "Backspace") &&
+        !mod
+      ) {
+        // v5.1: remove the active clip (guarded above against inputs).
+        e.preventDefault();
+        removeActiveRef.current();
       }
     };
     window.addEventListener("keydown", onKey);
@@ -2429,6 +2851,7 @@ export default function Page() {
         onRedo={redo}
         settings={settings}
         totalMs={timeline.totalMs}
+        projectName={currentProjectName}
       />
 
       {/* 3-column grid: 300px | 1fr | 320px */}
@@ -2445,6 +2868,7 @@ export default function Page() {
           style={{
             borderColor: "#27272a",
             backgroundColor: "#121214",
+            boxShadow: "inset 1px 0 0 rgba(255,255,255,0.02)",
           }}
         >
           <MediaPanel
@@ -2473,7 +2897,7 @@ export default function Page() {
             onBoundaryStyle={handleBoundaryStyle}
             onClearBoundaryOverrides={clearBoundaryOverrides}
             onSaveProject={saveProject}
-            onOpenProject={openProjectPicker}
+            onOpenProject={handleOpenProject}
             onLoadProjectFile={loadProject}
             beatInfo={beatInfo}
             beatBusy={beatBusy}
@@ -2565,6 +2989,10 @@ export default function Page() {
             onMoveSfx={handleMoveSfx}
             onRemoveSfx={handleRemoveSfx}
             videoDurations={videoDurations}
+            onSplit={splitAtPlayhead}
+            onDuplicate={duplicateItem}
+            onRemove={removeItem}
+            activeSegment={activeSegment}
           />
         </section>
 
@@ -2574,6 +3002,7 @@ export default function Page() {
           style={{
             borderColor: "#27272a",
             backgroundColor: "#121214",
+            boxShadow: "inset -1px 0 0 rgba(255,255,255,0.02)",
           }}
         >
           <SettingsPanel
@@ -2616,6 +3045,8 @@ export default function Page() {
             onUpdateHeadline={updateHeadline}
             onRemoveHeadline={removeHeadline}
             totalMs={timeline.totalMs}
+            onRandomMix={handleRandomTransitionMix}
+            boundaryCount={boundaryCount}
             debug={debug}
           />
         </section>

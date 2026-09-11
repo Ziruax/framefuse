@@ -1,32 +1,29 @@
-// src/lib/merger/whisper.ts — OpenAI Whisper-tiny ASR via Transformers.js
-// (Web Worker edition, v5.0).
+// src/lib/merger/whisper.ts — OpenAI Whisper-tiny ASR (v5.1 dual-engine).
 //
-// Pure in-browser transcription (no server, no API key). Produces cues
-// with REAL per-word timestamps using Whisper's cross-attention alignment
-// (`return_timestamps: "word"`) so the viral "word-by-word" caption mode
-// highlights the currently-spoken word exactly when it is spoken, and the
-// kinetic typography animations drive per-word "in" transitions.
+// NATIVE PATH (Electron desktop — the default):
+//   The v5.0 renderer Web Worker broke in the PACKAGED app — webpack's
+//   worker chunk loader resolved chunk URLs relative to the worker script
+//   location and duplicated the `_next/static/chunks` prefix
+//   ("…app.asar/out/_next/static/chunks/_next/static/chunks/590caa2a….js"),
+//   so importScripts failed and every transcription errored.
+//   v5.1 moves ALL inference to the main process: audio is decoded with
+//   ffmpeg (native, streamed) and Whisper runs in a utilityProcess with
+//   onnxruntime-node (multi-threaded native CPU — several times faster than
+//   the single-threaded WASM worker). The model downloads ONCE to
+//   <userData>/whisper-models and stays on disk forever.
 //
-// ARCHITECTURE (Task 6-b):
-//  - The MAIN thread (this file) decodes the audio to mono 16 kHz PCM
-//    (AudioContext/decodeAudioData are unavailable inside workers), then
-//    TRANSFERS the Float32Array to a persistent Web Worker
-//    (whisper-worker.ts) and relays its progress messages. The UI never
-//    blocks: ALL Transformers.js + onnxruntime WASM inference runs inside
-//    the worker, and the heavy pipeline code is no longer part of the
-//    main-thread bundle at all.
-//  - The WORKER owns the Xenova/whisper-tiny pipeline (built once, kept
-//    warm for the app lifetime), downloads the model ONCE into the
-//    browser's persistent Cache API storage (env.useBrowserCache) and
-//    returns the raw output chunks; the parsing/grouping into display
-//    cues happens here on the main thread (see parseWhisperOutput).
-//  - Model: Xenova/whisper-tiny (~75 MB, downloaded once and cached
-//    persistently). Multilingual base model — auto-detects the spoken
-//    language. Internet is only required for the FIRST transcription.
+// BROWSER PATH (dev server fallback, unchanged from v5.0):
+//   Pure in-browser transcription via the persistent Web Worker
+//   (whisper-worker.ts) — this main thread decodes the audio to mono 16 kHz
+//   PCM (AudioContext) and TRANSFERS it to the worker.
+//
+// Both paths return cues with REAL per-word timestamps (Whisper's
+// cross-attention alignment, `return_timestamps: "word"`) so the viral
+// "word-by-word" caption mode highlights the currently-spoken word exactly
+// when it is spoken.
 //
 // Node-safety: this module is importable in Node/bun with no side effects —
-// the Worker is created lazily inside function calls, and the (type-only)
-// import of whisper-worker.ts is erased at compile time.
+// every bridge/worker is resolved lazily inside function calls.
 
 import type { SubtitleCue, WordTimestamp } from "./subtitles";
 import type {
@@ -304,7 +301,93 @@ export function mapWorkerProgress(
 }
 
 // ---------------------------------------------------------------------------
-// Persistent worker singleton + run bookkeeping.
+// v5.1 NATIVE branch — Electron desktop: Whisper behind IPC.
+// ---------------------------------------------------------------------------
+
+/** The v5.1 Electron bridge (present only in the packaged/dev app with the
+ *  whisper service wired). Also guards against OLD packaged builds: an app
+ *  whose preload lacks whisperTranscribe falls through to the worker path. */
+function nativeWhisperBridge(): Window["electronAPI"] | null {
+  if (typeof window === "undefined") return null;
+  const api = window.electronAPI;
+  return api && typeof api.whisperTranscribe === "function" ? api : null;
+}
+
+/** Transcribe via the main-process Whisper service (ffmpeg decode +
+ *  utilityProcess inference). The parse/grouping still happens HERE — the
+ *  service returns the RAW chunks (same shape as the web worker). */
+async function transcribeWithWhisperNative(
+  opts: WhisperOptions,
+): Promise<WhisperResult> {
+  const { audioFile, onProgress, signal } = opts;
+  const api = nativeWhisperBridge();
+  if (!api) throw new Error("Native Whisper bridge unavailable");
+
+  onProgress?.({ progress: 2, status: "Decoding audio…" });
+  if (signal?.aborted) throw new Error("Transcription cancelled");
+
+  let bytes: ArrayBuffer;
+  try {
+    bytes = await audioFile.arrayBuffer();
+  } catch (err) {
+    throw new Error(
+      `Could not read audio: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  // Progress events already carry the mapped overall curve (decode 2 →
+  // model 10–25 → transcribe 25–80) — relay them verbatim (clamped).
+  const unsubscribe = api.onWhisperProgress((d) => {
+    if (d && typeof d.progress === "number") {
+      onProgress?.({ progress: clampPercent(d.progress), status: d.status || "" });
+    }
+  });
+
+  const onAbort = () => {
+    // Best-effort: the main process rejects the pending run AND tells the
+    // service to skip it; a late result is discarded as a stale run there.
+    api.whisperCancel().catch(() => {});
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+
+  try {
+    const raw = await api.whisperTranscribe({
+      name: audioFile.name || "audio",
+      bytes,
+      language: opts.language || "auto",
+    });
+    if (signal?.aborted) throw new Error("Transcription cancelled");
+
+    onProgress?.({ progress: 80, status: "Aligning word timestamps…" });
+
+    const rawChunks: RawWhisperChunk[] = Array.isArray(raw?.chunks)
+      ? raw.chunks
+      : [];
+    const cues = parseWhisperOutput({ chunks: rawChunks }, !!raw?.wordLevel);
+
+    onProgress?.({ progress: 100, status: "Done" });
+
+    const durationMs =
+      typeof raw?.durationMs === "number" && raw.durationMs > 0
+        ? raw.durationMs
+        : cues.length
+          ? cues[cues.length - 1].endMs
+          : 0;
+
+    return {
+      cues,
+      language: raw?.language ?? null,
+      durationMs,
+      wordLevel: !!raw?.wordLevel,
+    };
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+    unsubscribe?.();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Persistent worker singleton + run bookkeeping (browser fallback path).
 // ---------------------------------------------------------------------------
 
 interface WorkerTranscription {
@@ -446,6 +529,12 @@ export async function transcribeWithWhisper(
 ): Promise<WhisperResult> {
   const { audioFile, onProgress, signal } = opts;
 
+  // v5.1: the desktop app ALWAYS takes the native service path (ffmpeg
+  // decode + utilityProcess inference) — no renderer worker exists there.
+  if (nativeWhisperBridge()) {
+    return transcribeWithWhisperNative(opts);
+  }
+
   if (typeof window === "undefined") {
     throw new Error("Whisper transcription is only available in the browser");
   }
@@ -548,6 +637,24 @@ export async function transcribeWithWhisper(
 export async function preloadWhisper(
   onProgress?: (p: WhisperProgress) => void,
 ): Promise<void> {
+  // v5.1 native path: warm the service + disk model cache.
+  const api = nativeWhisperBridge();
+  if (api) {
+    onProgress?.({ progress: 0, status: "Loading Whisper-tiny model…" });
+    const unsubscribe = api.onWhisperProgress((d) => {
+      if (d && typeof d.progress === "number") {
+        onProgress?.({ progress: clampPercent(d.progress), status: d.status || "" });
+      }
+    });
+    try {
+      await api.whisperPreload();
+      onProgress?.({ progress: 100, status: "Ready" });
+    } finally {
+      unsubscribe?.();
+    }
+    return;
+  }
+
   onProgress?.({ progress: 0, status: "Loading Whisper-tiny model…" });
   const worker = getWorker(); // throws a clear error outside the browser
   const runId = ++runCounter;
@@ -581,6 +688,7 @@ export async function preloadWhisper(
 
 /** True if Whisper transcription is available in this environment. */
 export function isWhisperAvailable(): boolean {
+  if (nativeWhisperBridge()) return true;
   return (
     typeof window !== "undefined" &&
     !!(window as any).AudioContext &&

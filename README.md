@@ -1,10 +1,22 @@
-# FrameFuse v5.0
+# FrameFuse v5.1
 
 Native desktop **multi-track video studio** with a **filmstrip storyboard timeline** (thumbnails in every segment, double-click to jump), **middle-truncating filename rows**, **click-to-aim Ken Burns motion**, a **grid media library for 100+ image storyboards**, a **live audio waveform timeline**, **beat-synced cutting with a strength dial**, **viral kinetic captions with favorites**, **segment transitions**, **per-boundary transition overrides**, **export quality profiles**, **watermark/logo overlay**, **undo/redo**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
 
 ## Highlights
 
-### 🛤 Multi-track timeline (new in v5.0)
+### 🧠 Native Whisper captions — fixed + 5× faster (new in v5.1)
+Transcription now runs in an Electron **utility process** with **onnxruntime-node** (native, multi-threaded CPU inference) instead of the renderer Web Worker — which also fixes the packaged-app worker path failure that broke every transcription in v5.0. Audio is decoded by **FFmpeg** (streamed, native), and the whisper-tiny model downloads **once** to `<userData>/whisper-models` on disk and stays there forever — offline after the first run.
+
+### ⚡ Non-blocking, GPU-first export (new in v5.1)
+The v5.0 export froze the whole app before the first frame: GPU detection and per-video probes ran as **blocking** `execSync`/`spawnSync` calls (up to 25 s). v5.1 warms the encoder probe at startup, probes all media **in parallel** (async spawn), tries **every** GPU encoder (NVENC → QSV → AMF — a broken driver no longer hides a working GPU), adds **hardware video decode** (`-hwaccel auto`) for base clips, and shows the active encoder in the export tab.
+
+### 🎚 Timeline zoom + split + speed (new in v5.1)
+A true pixel-based timeline: **zoom 4–400 px/s** (buttons, slider, Ctrl+wheel toward the cursor, Fit), adaptive ruler ticks, **Split at playhead** (S key / scissors — one undo step), per-clip **speed 0.25–4×** (preview + `setpts`/`atempo` export), duplicate/delete clip tools, and a **Circle Open** transition + random-mix/apply-all.
+
+### 📁 Native project files (new in v5.1)
+Save/Open/Save-As with **real OS dialogs** (Cmd/Ctrl+S, Cmd/Ctrl+O), a current-project chip in the header, a persisted recents list, and New Project reset — the same self-contained `.framefuse.json` document (media inlined), so projects move between machines.
+
+### 🛤 Multi-track timeline (v5.0)
 Four stacked lanes — **VIDEO** (base filmstrips), **OVERLAY** (draggable chroma-key clips), **AUDIO** (music waveform) and **SFX** (sound-effect pills). Drag clip bodies to move, edges to trim, and vertically past the 24px threshold to switch lanes. One continuous playhead spans every lane.
 
 ### 🎬 Video import + chroma key (new in v5.0)
@@ -12,9 +24,6 @@ Drop **MP4/WebM/MOV** files — they join the base track at source length (or th
 
 ### 💥 Synthesized sound effects (new in v5.0)
 A palette of **10 procedurally-synthesized SFX** (whoosh, pop, ding, impact, riser, click, sparkle, boom, swipe, record-scratch) — zero asset files, click to preview, **+ to place at the playhead**, drag pills along the SFX lane, mix with music through the export `amix` graph.
-
-### 🧠 Non-blocking Whisper captions (new in v5.0)
-Caption generation moved into a **persistent Web Worker** — the UI never freezes during model download or transcription. The ~75 MB whisper-tiny model downloads **once** and stays cached in the browser/Electron storage forever.
 
 ### ⚡ Parallel FFmpeg export (new in v5.0)
 Step-1 clips encode in a **CPU-sized parallel pool** (up to 4 concurrent encodes, GPU encoder when available), per-clip timemarks aggregate into live progress, and the step-2 mux mixes clip audio + music + SFX with sample-exact `adelay` placement. Overlay compositing, chroma keying and video trimming all ride the same graph.

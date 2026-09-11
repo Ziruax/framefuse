@@ -109,6 +109,14 @@ const AIM_LABEL: Record<string, string> = {
   down: "Pan Down",
 };
 
+/** v5.1: MM:SS.d — the transport readout chip precision ("00:12.3"). */
+function fmtTenths(ms: number): string {
+  const s = Math.max(0, ms) / 1000;
+  const m = Math.floor(s / 60);
+  const r = s - m * 60;
+  return `${String(m).padStart(2, "0")}:${r < 10 ? "0" : ""}${r.toFixed(1)}`;
+}
+
 export function PreviewPanel({
   segments,
   images,
@@ -146,6 +154,9 @@ export function PreviewPanel({
   const chromaKeyerRef = useRef<ChromaKeyer | null>(null);
 
   const activeIsVideo = activeSegment?.mediaType === "video";
+  // v5.1: the aiming hint only appears while the pointer is over the canvas —
+  // context-sensitive guidance instead of a permanent fixture (VLM review).
+  const [canvasHover, setCanvasHover] = useState(false);
   const aimActive =
     !!onSetMotion &&
     kenBurns.enabled &&
@@ -235,19 +246,34 @@ export function PreviewPanel({
     const activeOverlays = overlaySegmentsAt(segments, currentMs);
 
     // ---- v5.0: video sync (base + overlays) --------------------------------
-    // Scrub/seek → currentTime = (t − seg.startMs)/1000 + trimIn/1000 and
-    // pause; playing → play() + drift-correct over 120ms; segment exit →
-    // pause. Muted always (audio comes from the music/SFX tracks; the
-    // export handles real clip audio).
+    // Scrub/seek → currentTime = trimIn/1000 + (t − seg.startMs)·speed/1000
+    // and pause; playing → play() at playbackRate=speed + drift-correct over
+    // 120ms; segment exit → pause. Muted always (audio comes from the
+    // music/SFX tracks; the export handles real clip audio).
+    // v5.1: SPEED — source-time mapping is trimIn + local·speed (the export's
+    // setpts twin); the element plays at playbackRate=speed so wall-clock
+    // playback advances source time at the same rate and the 120ms drift
+    // window stays meaningful.
     const syncVideoTo = (el: HTMLVideoElement, vSeg: MediaSegment | null) => {
       if (!vSeg) {
         if (!el.paused) el.pause();
         return;
       }
-      const localMs = currentMs - vSeg.startMs + vSeg.trimInMs;
+      const speed =
+        vSeg.speed != null && Number.isFinite(vSeg.speed) && vSeg.speed > 0
+          ? vSeg.speed
+          : 1;
+      const localMs = vSeg.trimInMs + (currentMs - vSeg.startMs) * speed;
       const targetSec = Math.max(0, localMs) / 1000;
       const dur = Number.isFinite(el.duration) && el.duration > 0 ? el.duration : null;
       const clampedSec = dur != null ? Math.min(targetSec, Math.max(0, dur - 0.05)) : targetSec;
+      if (el.playbackRate !== speed) {
+        try {
+          el.playbackRate = speed;
+        } catch {
+          /* rate out of range — native rate is a fine fallback */
+        }
+      }
       if (!isPlaying) {
         if (!el.paused) el.pause();
         if (el.readyState >= 1 && Math.abs(el.currentTime - clampedSec) > 0.02) {
@@ -483,13 +509,14 @@ export function PreviewPanel({
               borderColor: "#27272a",
               backgroundColor: "#000000",
               boxShadow:
-                "0 25px 50px -12px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(124, 58, 237, 0.08)",
+                "0 25px 50px -12px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(34, 211, 238, 0.08)",
               aspectRatio: `${dims.w} / ${dims.h}`,
               maxWidth: "100%",
               maxHeight: "100%",
               width: dims.w,
               ...(aimActive ? { cursor: "crosshair" } : {}),
             }}
+            onMouseEnter={() => setCanvasHover(true)}
             onMouseMove={
               aimActive
                 ? (e: ReactMouseEvent<HTMLDivElement>) => {
@@ -501,7 +528,10 @@ export function PreviewPanel({
                   }
                 : undefined
             }
-            onMouseLeave={aimActive ? () => setAim(null) : undefined}
+            onMouseLeave={() => {
+              setCanvasHover(false);
+              if (aimActive) setAim(null);
+            }}
             onClick={
               aimActive && aim
                 ? () => {
@@ -575,8 +605,10 @@ export function PreviewPanel({
                 </span>
               </div>
             )}
-            {/* v4.8: persistent hint (only while motion aiming is armed) */}
-            {aimActive && !aim && (
+            {/* v4.8: hover-scoped hint (only while motion aiming is armed
+                AND the pointer is over the canvas — guidance exactly when
+                the click is possible, not a permanent overlay) */}
+            {aimActive && !aim && canvasHover && (
               <div
                 className="pointer-events-none absolute bottom-2 left-1/2 -translate-x-1/2 flex items-center gap-1.5 rounded-md px-2 py-1 text-[9px] backdrop-blur-sm"
                 style={{
@@ -640,10 +672,11 @@ export function PreviewPanel({
                 video
               </div>
             )}
-            {/* Active transition indicator (v4.3) */}
+            {/* Active transition indicator (v4.3) — v5.1: moved to the
+                bottom-center so the aspect chip owns the bottom-right. */}
             {txLabel && (
               <div
-                className="pointer-events-none absolute bottom-2 right-2 flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-medium capitalize backdrop-blur-sm ff-tx-live"
+                className="pointer-events-none absolute bottom-2 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-medium capitalize backdrop-blur-sm ff-tx-live"
                 style={{
                   backgroundColor: "rgba(0, 0, 0, 0.55)",
                   color: "#f0abfc",
@@ -655,6 +688,18 @@ export function PreviewPanel({
                 {txLabel}
               </div>
             )}
+            {/* v5.1 CapCut: aspect label chip — bottom-right of the stage. */}
+            <div
+              className="pointer-events-none absolute bottom-2 right-2 flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[9px] font-semibold uppercase tracking-wide backdrop-blur-sm"
+              style={{
+                backgroundColor: "rgba(0, 0, 0, 0.55)",
+                color: "#a5f3fc",
+                border: "1px solid rgba(103, 232, 249, 0.22)",
+              }}
+              title={`Preview aspect ratio ${aspect} — ${dims.w}×${dims.h} canvas`}
+            >
+              {aspect}
+            </div>
             {/* Watermark indicator (v4.4) */}
             {watermarkImage && watermarkSettings && (
               <div
@@ -701,63 +746,74 @@ export function PreviewPanel({
           boxShadow: "0 -8px 24px rgba(0, 0, 0, 0.35)",
         }}
       >
-        <div className="mb-2 flex items-center gap-2">
+        {/* v5.1 CapCut: centered transport cluster — 28px step buttons,
+            a 36px round cyan play button at the row's visual center, and
+            the timecode chip pinned to the right edge (out of flow) so it
+            never pushes the cluster off-center. */}
+        <div className="relative mb-2 flex items-center justify-center gap-2">
           <button
             type="button"
             onClick={() => onStep(-1)}
             disabled={segments.length === 0}
-            className="flex size-8 items-center justify-center rounded-lg transition-all hover:bg-white/10 hover:text-zinc-200 hover:shadow-[0_0_12px_rgba(228,228,231,0.08)] active:scale-90 disabled:opacity-30 disabled:hover:shadow-none"
+            className="flex size-7 items-center justify-center rounded-lg transition-all hover:bg-white/10 hover:text-zinc-200 hover:shadow-[0_0_12px_rgba(228,228,231,0.08)] active:scale-90 disabled:opacity-30 disabled:hover:shadow-none"
             style={{ color: "#a1a1aa" }}
             title="Previous segment (Shift+←)"
             aria-label="Previous segment"
           >
-            <SkipBack className="size-4" />
+            <SkipBack className="size-3.5" />
           </button>
           <button
             type="button"
             onClick={onTogglePlay}
             disabled={segments.length === 0}
-            className="flex size-10 items-center justify-center rounded-full text-white shadow-lg transition-all duration-150 hover:scale-105 hover:brightness-110 hover:shadow-[0_6px_24px_rgba(124,58,237,0.65)] active:scale-95 disabled:opacity-30 disabled:hover:scale-100 disabled:hover:brightness-100"
+            className="flex size-9 items-center justify-center rounded-full text-white shadow-lg transition-all duration-150 hover:scale-105 hover:brightness-110 hover:shadow-[0_6px_24px_rgba(6,182,212,0.6)] active:scale-95 disabled:opacity-30 disabled:hover:scale-100 disabled:hover:brightness-100"
             style={{
-              background: "linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%)",
-              boxShadow: "0 4px 16px rgba(124, 58, 237, 0.45)",
+              background: "linear-gradient(135deg, #22d3ee 0%, #0891b2 60%, #0e7490 100%)",
+              boxShadow:
+                "0 4px 16px rgba(6, 182, 212, 0.45), inset 0 1px 0 rgba(255,255,255,0.25)",
             }}
             title={isPlaying ? "Pause (Space)" : "Play (Space)"}
+            aria-label={isPlaying ? "Pause playback" : "Play playback"}
           >
             {isPlaying ? (
-              <Pause className="size-5" />
+              <Pause className="size-[18px]" />
             ) : (
-              <Play className="size-5 translate-x-0.5" />
+              <Play className="size-[18px] translate-x-0.5" />
             )}
           </button>
           <button
             type="button"
             onClick={() => onStep(1)}
             disabled={segments.length === 0}
-            className="flex size-8 items-center justify-center rounded-lg transition-all hover:bg-white/10 hover:text-zinc-200 hover:shadow-[0_0_12px_rgba(228,228,231,0.08)] active:scale-90 disabled:opacity-30 disabled:hover:shadow-none"
+            className="flex size-7 items-center justify-center rounded-lg transition-all hover:bg-white/10 hover:text-zinc-200 hover:shadow-[0_0_12px_rgba(228,228,231,0.08)] active:scale-90 disabled:opacity-30 disabled:hover:shadow-none"
             style={{ color: "#a1a1aa" }}
             title="Next segment (Shift+→)"
             aria-label="Next segment"
           >
-            <SkipForward className="size-4" />
+            <SkipForward className="size-3.5" />
           </button>
 
-          <div className="ml-2 flex-1" />
-
-          <div className="rounded-md border border-transparent bg-black/30 px-2 py-0.5 font-mono text-[12px] tabular-nums">
+          {/* Time display — tabular mono chip, pinned right. */}
+          <div
+            className="absolute right-0 top-1/2 -translate-y-1/2 rounded-md border px-2 py-0.5 font-mono text-[11px] tabular-nums"
+            style={{
+              borderColor: "#27272a",
+              backgroundColor: "#18181b",
+            }}
+          >
             <span style={{ color: "#e4e4e7" }}>
-              {fmtTimecode(currentMs)}
+              {fmtTenths(currentMs)}
             </span>
             <span className="mx-0.5" style={{ color: "#52525b" }}>
               /
             </span>
-            <span style={{ color: "#b5b5bc" }}>
-              {fmtTimecode(totalMs)}
+            <span style={{ color: "#8b8b93" }}>
+              {fmtTenths(totalMs)}
             </span>
           </div>
         </div>
 
-        {/* Scrubber */}
+        {/* Scrubber — v5.1: cyan progress fill (matches the playhead). */}
         <div className="group relative flex items-center">
           <input
             type="range"
@@ -769,7 +825,7 @@ export function PreviewPanel({
             disabled={segments.length === 0}
             className="w-full"
             style={{
-              background: `linear-gradient(to right, #8b5cf6 ${pct}%, #d946ef ${Math.min(
+              background: `linear-gradient(to right, #22d3ee ${pct}%, #0891b2 ${Math.min(
                 100,
                 pct + 8,
               )}%, #3f3f46 ${Math.min(100, pct + 8)}%)`,

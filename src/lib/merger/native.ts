@@ -78,6 +78,10 @@ interface NativeSegPayload {
   volume?: number;
   trimInMs?: number;
   sourceDurationMs?: number | null;
+  /** v5.1: playback speed (0.25..4; absent/1 = native rate). Flows into
+   *  the FFmpeg graph as setpts (video) + atempo (audio) — mirrors how
+   *  volume travels: resolved by timeline.ts, consumed by export-graph.js. */
+  speed?: number;
   chroma?: ChromaKeySettings | null;
   overlay?: OverlayTransform | null;
 }
@@ -342,6 +346,11 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
           volume: seg.volume,
           trimInMs: seg.trimInMs || 0,
           sourceDurationMs: seg.sourceDurationMs ?? null,
+          // v5.1: resolved playback speed (speed 1 normalizes away so the
+          // IPC payload stays v5.0-shaped for untouched projects).
+          ...(seg.speed != null && seg.speed !== 1
+            ? { speed: seg.speed }
+            : {}),
           chroma: seg.chroma ? sanitizeChromaKeySettings(seg.chroma) : null,
           overlay: seg.overlay,
         });

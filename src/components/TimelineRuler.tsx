@@ -22,6 +22,7 @@ import {
   useState,
   useCallback,
   useEffect,
+  useLayoutEffect,
   type CSSProperties,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
@@ -30,9 +31,15 @@ import {
   Type,
   AudioLines,
   Clapperboard,
+  Copy,
   Layers,
-  Zap,
+  Scissors,
+  Timer,
+  Trash2,
   X,
+  ZoomIn,
+  ZoomOut,
+  Zap,
   type LucideIcon,
 } from "lucide-react";
 import type {
@@ -42,6 +49,7 @@ import type {
   SfxItem,
   TimelineMode,
   TransitionSettings,
+  TransitionStyle,
 } from "@/lib/merger/types";
 import { boundaryStyle } from "@/lib/merger/types";
 import { fmtTimecode } from "@/lib/merger/timeline";
@@ -76,6 +84,14 @@ interface TimelineRulerProps {
   onRemoveSfx?: (id: string) => void;
   /** v5: video source durations (id → ms) for trim clamping. */
   videoDurations?: Record<string, number>;
+  /** v5.1: split the ACTIVE base clip at the playhead (toolbar / S key). */
+  onSplit?: () => void;
+  /** v5.1: duplicate the active segment (toolbar Copy). */
+  onDuplicate?: (id: string) => void;
+  /** v5.1: remove the active segment (toolbar Trash / Delete key). */
+  onRemove?: (id: string) => void;
+  /** v5.1: the active BASE segment (toolbar enable states + duration chip). */
+  activeSegment?: MediaSegment | null;
 }
 
 // v4.9: bar tints — the segment bar is now a FILMSTRIP (thumbnail shows
@@ -124,8 +140,12 @@ const MAX_DUR_MS = 300000;
 
 const ROW_BORDER = "rgba(39, 39, 42, 0.55)";
 const GUTTER_BORDER = "rgba(39, 39, 42, 0.45)";
-/** Alternating lane banding (overlay + sfx rows; video/audio stay dark). */
-const LANE_BAND_BG = "rgba(24, 24, 27, 0.16)";
+/** v5.1 lane banding: subtle alternating #101012 / #0d0d0f so each lane
+ *  reads as its own track without hard separators; the audio lane goes
+ *  cyan-900/20-tinted while a waveform is loaded. */
+const LANE_BG_A = "#101012";
+const LANE_BG_B = "#0d0d0f";
+const LANE_BG_WAVE = "rgba(22, 78, 99, 0.2)";
 
 function niceStep(totalMs: number): number {
   const totalSec = totalMs / 1000;
@@ -134,6 +154,37 @@ function niceStep(totalMs: number): number {
     if (totalSec / t <= 12) return t * 1000;
   }
   return 600 * 1000;
+}
+
+// ---------------------------------------------------------------------------
+// v5.1 PIXEL ZOOM — the timeline axis is laid out in px, not percentages.
+// ---------------------------------------------------------------------------
+
+/** Zoom range (px per timeline second). */
+const ZOOM_MIN = 4;
+const ZOOM_MAX = 400;
+/** Ruler ticks stay ≥ this many px apart (readable timecodes). */
+const TICK_MIN_PX = 70;
+
+function clampPxPerSec(v: number): number {
+  const n = Number.isFinite(v) ? v : ZOOM_MIN;
+  return Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, n));
+}
+
+/** v5.1 adaptive ruler step: the first step from the ms ladder whose px
+ * spacing is ≥ 70px, so labels never collide at any zoom. */
+function niceStepPx(pxPerSec: number): number {
+  const steps = [100, 250, 500, 1000, 2000, 5000, 10000, 15000, 30000, 60000];
+  for (const s of steps) {
+    if ((s / 1000) * pxPerSec >= TICK_MIN_PX) return s;
+  }
+  return 60000;
+}
+
+/** Pixel layout mode for the shared lane components: when present, every
+ * left/width is computed in px via pxOf() instead of % of the axis. */
+interface TimelinePxLayout {
+  pxOf: (ms: number) => number;
 }
 
 /** Round to the v5 drag snap grid (10 ms). */
@@ -175,6 +226,9 @@ type DragInfo =
       sourceDur: number | null;
       /** Base-lane horizontal moves only apply in absolute mode. */
       allowH: boolean;
+      /** v5.1: resolved playback speed — durationMs is timeline time, trimInMs
+       * is SOURCE time; the trim-l gesture converts between them (× speed). */
+      speed: number;
     }
   | {
       kind: "sfx";
@@ -202,10 +256,15 @@ type DragPreview =
     }
   | { kind: "sfx"; id: string; startMs: number };
 
-/** Max trimmable duration for a clip (video: source window, else 300 s). */
+/** Max trimmable TIMELINE duration for a clip (video: the remaining SOURCE
+ * window divided by speed — v5.1 scaled clamp; else 300 s). */
 function maxDurFor(d: Extract<DragInfo, { kind: "clip" }>): number {
   if (d.mediaType === "video" && d.sourceDur != null && d.sourceDur > 0) {
-    return Math.min(MAX_DUR_MS, Math.max(MIN_DUR_MS, d.sourceDur - d.origTrim));
+    const speed = d.speed > 0 ? d.speed : 1;
+    return Math.min(
+      MAX_DUR_MS,
+      Math.max(MIN_DUR_MS, (d.sourceDur - d.origTrim) / speed),
+    );
   }
   return MAX_DUR_MS;
 }
@@ -217,8 +276,9 @@ function maxDurFor(d: Extract<DragInfo, { kind: "clip" }>): number {
  *  move    : startMs = orig + dx (snapped, clamped [0, totalMs]); vertical
  *            travel >= 24px flips targetTrack (overlay down -> 0, base up -> 1).
  *  trim-l  : slides the window — startMs + durationMs move together, and for
- *            video trimInMs slides with them (same source window, later part).
- *            Constraints: start >= 0, duration in [200, maxDur], trimIn >= 0.
+ *            video trimInMs slides in SOURCE time (delta · speed, v5.1) so the
+ *            same footage keeps playing. Constraints: start >= 0, duration in
+ *            [200, maxDur] (timeline), trimIn >= 0 (source).
  *  trim-r  : durationMs = orig + dx (snapped, clamped [200, maxDur]).
  */
 function computeClipDrag(
@@ -233,6 +293,7 @@ function computeClipDrag(
   targetTrack: number | undefined;
   horizAllowed: boolean;
 } {
+  const speed = d.mediaType === "video" && d.speed > 0 ? d.speed : 1;
   const dx = clientX - d.startX;
   const dy = clientY - d.startY;
   if (d.gesture === "move") {
@@ -258,15 +319,16 @@ function computeClipDrag(
   }
   const maxDur = maxDurFor(d);
   if (d.gesture === "trim-l") {
-    // delta = newStart - origStart. Constraints:
-    //   start >= 0            => delta >= -origStart
-    //   duration <= maxDur    => delta >= origDur - maxDur
-    //   duration >= 200       => delta <= origDur - 200
-    //   video trimIn >= 0     => delta >= -origTrim
+    // delta (TIMELINE ms) moves start+duration together. Constraints:
+    //   start >= 0              => delta >= -origStart
+    //   duration <= maxDur      => delta >= origDur - maxDur
+    //   duration >= 200         => delta <= origDur - 200
+    //   video trimIn >= 0       => delta·speed >= -origTrim (source clamp,
+    //                             v5.1 — the window slides in source time)
     const deltaMin = Math.max(
       -d.origStart,
       d.origDur - maxDur,
-      d.mediaType === "video" ? -d.origTrim : -Infinity,
+      d.mediaType === "video" ? -d.origTrim / speed : -Infinity,
     );
     const deltaMax = d.origDur - MIN_DUR_MS;
     const rawDelta = Math.min(deltaMax, Math.max(deltaMin, dx * d.msPerPx));
@@ -277,7 +339,7 @@ function computeClipDrag(
     return {
       startMs: ns,
       durationMs: d.origDur - delta,
-      trimInMs: d.origTrim + delta,
+      trimInMs: Math.round(d.origTrim + delta * speed),
       targetTrack: undefined,
       horizAllowed: false,
     };
@@ -497,28 +559,42 @@ function WaveformStrip({
   );
 }
 
-/** Ruler ticks + timecode labels (v4.9 markup, shared by both layouts). */
-function TickRow({ ticks, totalMs }: { ticks: number[]; totalMs: number }) {
+/** Ruler ticks + timecode labels (v4.9 markup, shared by both layouts).
+ *  v5.1: `layout` switches positions to px (adaptive step spacing); the
+ *  default keeps the v4.9 %-of-axis placement. */
+function TickRow({
+  ticks,
+  totalMs,
+  layout,
+}: {
+  ticks: number[];
+  totalMs: number;
+  layout?: TimelinePxLayout;
+}) {
   return (
     <div className="absolute inset-0">
       {ticks.map((t) => {
-        const left = totalMs > 0 ? (t / totalMs) * 100 : 0;
+        const left = layout
+          ? layout.pxOf(t)
+          : totalMs > 0
+            ? (t / totalMs) * 100
+            : 0;
         return (
           <div
             key={t}
             className="absolute top-0 h-full"
-            style={{ left: `${left}%` }}
+            style={layout ? { left } : { left: `${left}%` }}
           >
-            <div
-              className="h-1.5 w-px"
-              style={{ backgroundColor: "#3f3f46" }}
-            />
-            <span
-              className="mt-0.5 block -translate-x-1/2 text-[8px] font-semibold tabular-nums"
-              style={{ color: "#7f7f87" }}
-            >
-              {fmtTimecode(t)}
-            </span>
+          <div
+            className="h-1.5 w-px"
+            style={{ backgroundColor: "#52525b" }}
+          />
+          <span
+            className="mt-0.5 block -translate-x-1/2 text-[10px] font-medium leading-none tabular-nums"
+            style={{ color: "#a1a1aa" }}
+          >
+            {fmtTimecode(t)}
+          </span>
           </div>
         );
       })}
@@ -527,41 +603,53 @@ function TickRow({ ticks, totalMs }: { ticks: number[]; totalMs: number }) {
 }
 
 /**
- * Playhead (violet line + glowing dot + grab cap) — v4.7: dark drop shadow
- * keeps it readable over bars and waveform. v5: `leftCss` positions it via
- * calc() so ONE continuous line spans all lanes.
+ * Playhead — v5.1 CapCut look: ONE continuous 2px cyan line spanning all
+ * lanes plus a small glowing triangle grabber at the top (clip-path). Dark
+ * side shadows keep it readable over bars and waveform (v4.7 heritage).
+ * `grab` (optional) hands the ruler's OWN scrub handlers to the triangle:
+ * pressing it seeks and dragging scrubs through the exact same code path —
+ * no new interaction logic, the grabber is simply part of the ruler.
  */
-function Playhead({ leftCss }: { leftCss: CSSProperties }) {
+function Playhead({
+  leftCss,
+  grab,
+}: {
+  leftCss: CSSProperties;
+  /** Partial scrub-handler set — the ruler passes its own scrubHandlers so
+   *  the triangle seeks/scrubs through the existing code path. */
+  grab?: Partial<FilmstripBarDrag>;
+}) {
   return (
     <div
       className="pointer-events-none absolute top-0 z-10 h-full"
       style={leftCss}
     >
-      {/* v4.6: grab cap — a brighter pill above the dot that reads as
-                a draggable handle. v4.8: it now pokes ABOVE the track edge
-                (VLM: needs a clear anchor for precise scrubbing). */}
+      {/* Triangle grabber — 12×9px, centered on the line, poking into the
+                7px scrollport rail above the ruler; glows via the
+                .ff-playhead-grab soft pulse in globals.css. */}
       <div
-        className="absolute -left-2.5 -top-[7px] h-[6px] w-5 rounded-full"
+        {...(grab ?? {})}
+        aria-hidden
+        title={grab ? "Playhead — press and drag to scrub" : undefined}
+        className={cn(
+          "ff-playhead-grab absolute -top-[7px] h-[9px] w-[12px]",
+          grab && "pointer-events-auto cursor-ew-resize touch-none",
+        )}
         style={{
-          backgroundImage: "linear-gradient(90deg, #8b5cf6, #d946ef, #8b5cf6)",
-          boxShadow: "0 0 8px rgba(217, 70, 239, 0.75)",
+          left: -5,
+          clipPath: "polygon(50% 0%, 100% 100%, 0% 100%)",
+          backgroundColor: "#22d3ee",
+          boxShadow:
+            "0 0 8px rgba(34, 211, 238, 0.75), 0 1px 2px rgba(0,0,0,0.6)",
         }}
       />
+      {/* The 2px cyan spine. */}
       <div
-        className="absolute -left-1.5 top-0 size-3 rounded-full border-2"
+        className="absolute left-0 top-0 h-full w-0.5"
         style={{
-          borderColor: "#ffffff",
-          backgroundColor: "#8b5cf6",
+          backgroundColor: "#22d3ee",
           boxShadow:
-            "0 0 10px rgba(139, 92, 246, 0.8), 0 1px 3px rgba(0,0,0,0.6)",
-        }}
-      />
-      <div
-        className="absolute left-0 top-0 h-full w-px"
-        style={{
-          backgroundColor: "#c4b5fd",
-          boxShadow:
-            "0 0 6px rgba(139, 92, 246, 0.6), 1px 0 3px rgba(0,0,0,0.65), -1px 0 3px rgba(0,0,0,0.65)",
+            "0 0 6px rgba(34, 211, 238, 0.65), 1px 0 3px rgba(0,0,0,0.65), -1px 0 3px rgba(0,0,0,0.65)",
         }}
       />
     </div>
@@ -613,25 +701,67 @@ function HoverGhost({
 }
 
 /** Headline marker chips (v4.3) — amber bars on the top edge of the video
- *  lane, click to jump to the headline. Markup verbatim from v4.9. */
+ *  lane, click to jump to the headline. Markup verbatim from v4.9; v5.1
+ *  `layout` positions them in px. */
 function HeadlineChips({
   headlines,
   totalMs,
   currentMs,
   onSeek,
+  layout,
 }: {
   headlines: HeadlineItem[];
   totalMs: number;
   currentMs: number;
   onSeek: (ms: number) => void;
+  layout?: TimelinePxLayout;
 }) {
   return (
     <>
       {headlines.map((h) => {
         if (totalMs <= 0) return null;
+        const inPlay = currentMs >= h.startMs && currentMs < h.endMs;
+        if (layout) {
+          const w = Math.max(2, layout.pxOf(h.endMs) - layout.pxOf(h.startMs));
+          return (
+            <button
+              key={h.id}
+              type="button"
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                onSeek(h.startMs + 100);
+              }}
+              aria-label={`Headline "${h.text}" — jump to ${fmtTimecode(h.startMs)}`}
+              className={cn(
+                "absolute top-0 z-[5] flex h-[10px] items-center justify-start overflow-hidden rounded-sm px-1 text-[7px] font-bold uppercase tracking-wide transition-all duration-150 hover:brightness-125",
+                inPlay && "ff-hl-live",
+              )}
+              style={{
+                left: layout.pxOf(h.startMs),
+                width: w,
+                backgroundImage: inPlay
+                  ? "linear-gradient(90deg, #fbbf24, #f59e0b)"
+                  : "linear-gradient(90deg, rgba(251, 191, 36, 0.75), rgba(245, 158, 11, 0.55))",
+                color: "#422006",
+                boxShadow: inPlay
+                  ? "0 0 8px rgba(251, 191, 36, 0.7)"
+                  : "0 1px 2px rgba(0,0,0,0.4)",
+              }}
+              title={`Title: "${h.text}" · ${fmtTimecode(h.startMs)}–${fmtTimecode(h.endMs)} (click to jump)`}
+            >
+              {w > 5 ? (
+                <span className="pointer-events-none flex items-center gap-0.5 truncate">
+                  <Type className="size-[8px] shrink-0" />
+                  {h.text.replace(/\n/g, " ").slice(0, 30)}
+                </span>
+              ) : (
+                <Type className="pointer-events-none size-[8px]" />
+              )}
+            </button>
+          );
+        }
         const left = (h.startMs / totalMs) * 100;
         const width = Math.max(0.8, ((h.endMs - h.startMs) / totalMs) * 100);
-        const inPlay = currentMs >= h.startMs && currentMs < h.endMs;
         return (
           <button
             key={h.id}
@@ -640,6 +770,7 @@ function HeadlineChips({
               e.stopPropagation();
               onSeek(h.startMs + 100);
             }}
+            aria-label={`Headline "${h.text}" — jump to ${fmtTimecode(h.startMs)}`}
             className={cn(
               "absolute top-0 z-[5] flex h-[10px] items-center justify-start overflow-hidden rounded-sm px-1 text-[7px] font-bold uppercase tracking-wide transition-all duration-150 hover:brightness-125",
               inPlay && "ff-hl-live",
@@ -673,23 +804,26 @@ function HeadlineChips({
 }
 
 /** Beat rail (v4.6) — cyan ticks at the bottom edge of the video lane; the
- *  beat under the playhead pulses brighter (play-along feel). Verbatim. */
+ *  beat under the playhead pulses brighter (play-along feel). Verbatim;
+ *  v5.1 `layout` positions ticks in px. */
 function BeatRail({
   beats,
   totalMs,
   beatNearest,
+  layout,
 }: {
   beats: number[] | null;
   totalMs: number;
   beatNearest: number | null;
+  layout?: TimelinePxLayout;
 }) {
   if (!beats || beats.length === 0 || totalMs <= 0) return null;
   return (
     <div className="pointer-events-none absolute bottom-[3px] left-0 right-0 h-[5px]">
       {beats.map((b, i) => {
         if (b > totalMs) return null;
-        const left = (b / totalMs) * 100;
         const live = beatNearest != null && Math.abs(b - beatNearest) < 1;
+        const left = layout ? layout.pxOf(b) : (b / totalMs) * 100;
         return (
           <div
             key={`beat-${i}`}
@@ -698,7 +832,7 @@ function BeatRail({
               live && "ff-beat-tick-live",
             )}
             style={{
-              left: `${left}%`,
+              ...(layout ? { left } : { left: `${left}%` }),
               height: live ? "6px" : "4px",
               backgroundColor: live ? "#67e8f9" : "rgba(34, 211, 238, 0.55)",
               boxShadow: live ? "0 0 6px rgba(103, 232, 249, 0.9)" : "none",
@@ -724,6 +858,7 @@ function TransitionZones({
   currentMs,
   txActive,
   txOverridesActive,
+  layout,
 }: {
   segs: MediaSegment[];
   transition: TransitionSettings;
@@ -731,6 +866,7 @@ function TransitionZones({
   currentMs: number;
   txActive: boolean;
   txOverridesActive: boolean;
+  layout?: TimelinePxLayout;
 }) {
   if (!txActive && !txOverridesActive) return null;
   return (
@@ -747,10 +883,18 @@ function TransitionZones({
           Math.floor(seg.durationMs * 0.45),
         );
         if (durMs <= 0 || seg.durationMs <= 200) return null;
-        const left = totalMs > 0 ? (seg.startMs / totalMs) * 100 : 0;
-        const width = totalMs > 0 ? (durMs / totalMs) * 100 : 0;
         const inPlay =
           currentMs >= seg.startMs && currentMs < seg.startMs + durMs;
+        const zoneStyle: CSSProperties & { left: number | string; width: number | string } =
+          layout
+            ? {
+                left: layout.pxOf(seg.startMs),
+                width: Math.max(0.4, layout.pxOf(durMs)),
+              }
+            : {
+                left: `${totalMs > 0 ? (seg.startMs / totalMs) * 100 : 0}%`,
+                width: `${totalMs > 0 ? Math.max(0.4, (durMs / totalMs) * 100) : 0}%`,
+              };
         return (
           <div
             key={`tx-${seg.id}`}
@@ -759,8 +903,7 @@ function TransitionZones({
               inPlay && "ff-tx-zone-live",
             )}
             style={{
-              left: `${left}%`,
-              width: `${Math.max(0.4, width)}%`,
+              ...zoneStyle,
               height: "30%",
               backgroundImage: pinned
                 ? "repeating-linear-gradient(135deg, rgba(251, 191, 36, 0.6) 0 3px, rgba(245, 158, 11, 0.28) 3px 6px)"
@@ -775,6 +918,69 @@ function TransitionZones({
                 : "1px solid rgba(217, 70, 239, 0.35)",
             }}
             title={`${effStyle}${pinned ? " (custom)" : ""} transition · ${fmtTimecode(seg.startMs)}+${(durMs / 1000).toFixed(1)}s`}
+          />
+        );
+      })}
+    </>
+  );
+}
+
+/** v5.1 CapCut: transition boundary diamonds — an 8px rotated square
+ *  centered on every boundary between base clips, tinted by that
+ *  boundary's EFFECTIVE style (dip-black dark, dip-white light, any
+ *  xfade-family move violet, none a dim zinc stub). PURE VISUAL layer: it
+ *  mounts inside the axis cell, so presses bubble to the axis's own
+ *  press-to-seek handlers (pressing a diamond jumps to the cut) and the
+ *  title tooltip carries the boundary detail — zero new interaction code. */
+const DIAMOND_LOOK: Record<TransitionStyle, { bg: string; border: string; glow: string }> = {
+  none: { bg: "#27272a", border: "#3f3f46", glow: "none" },
+  "dip-black": { bg: "#18181b", border: "#71717a", glow: "none" },
+  "dip-white": { bg: "#f4f4f5", border: "#a1a1aa", glow: "0 0 6px rgba(244, 244, 245, 0.35)" },
+  dissolve: { bg: "#8b5cf6", border: "rgba(196, 181, 253, 0.9)", glow: "0 0 8px rgba(139, 92, 246, 0.65)" },
+  "slide-left": { bg: "#8b5cf6", border: "rgba(196, 181, 253, 0.9)", glow: "0 0 8px rgba(139, 92, 246, 0.65)" },
+  "slide-right": { bg: "#8b5cf6", border: "rgba(196, 181, 253, 0.9)", glow: "0 0 8px rgba(139, 92, 246, 0.65)" },
+  "wipe-left": { bg: "#8b5cf6", border: "rgba(196, 181, 253, 0.9)", glow: "0 0 8px rgba(139, 92, 246, 0.65)" },
+  "wipe-right": { bg: "#8b5cf6", border: "rgba(196, 181, 253, 0.9)", glow: "0 0 8px rgba(139, 92, 246, 0.65)" },
+  circleopen: { bg: "#8b5cf6", border: "rgba(196, 181, 253, 0.9)", glow: "0 0 8px rgba(139, 92, 246, 0.65)" },
+};
+
+function TransitionDiamonds({
+  segs,
+  transition,
+  layout,
+}: {
+  segs: MediaSegment[];
+  transition: TransitionSettings;
+  layout?: TimelinePxLayout;
+}) {
+  if (segs.length < 2 || layout == null) return null;
+  // Bar-zone geometry: filmstrips live at top 12 / bottom 4 of the 60px
+  // lane → vertical center ≈ 34; the 8px diamond centers on that.
+  return (
+    <>
+      {segs.map((seg, idx) => {
+        if (idx === 0) return null;
+        const style = boundaryStyle(transition, seg.id);
+        const pinned =
+          !!transition.overrides &&
+          Object.prototype.hasOwnProperty.call(transition.overrides, seg.id);
+        const look = DIAMOND_LOOK[style];
+        return (
+          <div
+            key={`dia-${seg.id}`}
+            className="pointer-events-auto absolute z-[4] cursor-pointer"
+            title={`${style === "none" ? "Hard cut" : `${style.replace("-", " ")} transition`}${pinned ? " (custom)" : ""} · boundary at ${fmtTimecode(seg.startMs)} — click to jump to this cut`}
+            style={{
+              left: layout.pxOf(seg.startMs),
+              top: 30,
+              width: 8,
+              height: 8,
+              transform: "translateX(-50%) rotate(45deg)",
+              borderRadius: 1.5,
+              backgroundColor: look.bg,
+              boxShadow: `inset 0 0 0 1px ${look.border}${look.glow !== "none" ? `, ${look.glow}` : ""}`,
+              opacity: style === "none" ? 0.45 : 1,
+            }}
           />
         );
       })}
@@ -806,6 +1012,7 @@ function FilmstripBar({
   previewStartMs,
   previewDurationMs,
   dragging,
+  layout,
 }: {
   seg: MediaSegment;
   idx: number;
@@ -819,11 +1026,22 @@ function FilmstripBar({
   previewStartMs?: number;
   previewDurationMs?: number;
   dragging?: boolean;
+  /** v5.1: pixel layout (zoom) — positions in px instead of %. */
+  layout?: TimelinePxLayout;
 }) {
   const startMs = previewStartMs ?? seg.startMs;
   const durMs = previewDurationMs ?? seg.durationMs;
-  const left = totalMs > 0 ? (startMs / totalMs) * 100 : 0;
-  const width = totalMs > 0 ? (durMs / totalMs) * 100 : 0;
+  const posStyle =
+    layout != null
+      ? {
+          left: layout.pxOf(startMs),
+          width: Math.max(4, layout.pxOf(startMs + durMs) - layout.pxOf(startMs)),
+        }
+      : {
+          left: `${totalMs > 0 ? (startMs / totalMs) * 100 : 0}%`,
+          width: `${totalMs > 0 ? Math.max(0.5, (durMs / totalMs) * 100) : 0}%`,
+        };
+  const widthPxish = layout != null ? posStyle.width : (totalMs > 0 ? (durMs / totalMs) * 100 : 0);
   const colors = BAR_BG[seg.kind] || BAR_BG.duration;
   return (
     <div
@@ -847,43 +1065,39 @@ function FilmstripBar({
           : undefined
       }
       className={cn(
-        "absolute top-0 overflow-hidden rounded-[4px] text-[8px] font-semibold tabular-nums hover:outline hover:outline-1 hover:outline-white/35",
+        // v5.1 CapCut clip card: 6px radius + 1px #27272a hairline + sheen,
+        // with the .ff-clip family in globals.css carrying hover (cyan
+        // hairline + 1px lift), active (2px cyan ring + raise) and drag
+        // states — previously inline filter/box-shadow, now CSS so hover
+        // works. Edge trim zones = .ff-clip::before/::after (visual only).
+        "ff-clip absolute top-0 overflow-hidden rounded-md text-[8px] font-semibold tabular-nums",
         drag
-          ? "cursor-grab touch-none select-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-violet-300/70"
+          ? "cursor-grab touch-none select-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-300/70"
           : "cursor-pointer",
         // Kill the hover transition while dragging so the bar tracks the
         // pointer 1:1 (the v4.9 transition would rubber-band left/width).
-        dragging ? "transition-none" : "transition-all duration-150",
+        dragging ? "ff-clip-drag transition-none" : "transition-all duration-150",
         seg.kind === "beat" && !isActive && "ff-beat-pulse",
-        isActive && "scale-[1.02] z-[1]",
-        dragging && "z-[2] cursor-grabbing",
+        isActive && "ff-clip-active",
+        dragging && "cursor-grabbing",
       )}
       style={{
-        left: `${left}%`,
-        width: `${Math.max(0.5, width)}%`,
+        ...posStyle,
         height: "100%",
         // v4.9 FILMSTRIP: the segment's own thumbnail shows through a
-        // kind-tint gradient (double background — the tint paints on top
-        // of the image).
-        backgroundImage: `linear-gradient(180deg, ${colors.top} 0%, ${colors.bottom} 100%), url(${seg.thumbnailUrl})`,
+        // kind-tint gradient (triple background — v5.1 adds a subtle top
+        // sheen so the card reads as a physical tile; the tint paints over
+        // the image).
+        backgroundImage: `linear-gradient(180deg, rgba(255,255,255,0.10) 0%, rgba(255,255,255,0.02) 35%, rgba(0,0,0,0.22) 100%), linear-gradient(180deg, ${colors.top} 0%, ${colors.bottom} 100%), url(${seg.thumbnailUrl})`,
         backgroundSize: "cover",
         backgroundPosition: "center",
-        // Inactive strips recede (dim + desaturate) so the active clip pops
-        // without extra chrome. v4.9 VLM pass: 0.82/0.78 — 0.72 made dark
-        // footage vanish into the track background.
-        filter: isActive
-          ? "saturate(1.15) brightness(1.08)"
-          : "saturate(0.78) brightness(0.82)",
-        boxShadow: isActive
-          ? "0 0 0 1.5px rgba(255,255,255,0.9), 0 0 14px rgba(167,139,250,0.45), 0 2px 8px rgba(0,0,0,0.55)"
-          : "inset 0 -1px 0 rgba(0,0,0,0.35), 0 1px 3px rgba(0,0,0,0.4)",
       }}
       title={`${seg.fileName} · ${fmtTimecode(seg.startMs)}–${fmtTimecode(seg.endMs)} · ${(seg.durationMs / 1000).toFixed(1)}s · motion ${seg.direction}\ndouble-click jumps to this clip's first frame`}
     >
       {/* Index chip — scrimmed so it reads over any footage. */}
-      {width > 3 ? (
+      {(layout != null ? (widthPxish as number) > 14 : (widthPxish as number) > 3) ? (
         <span
-          className="absolute left-0 top-0 flex h-[13px] min-w-[13px] items-center justify-center rounded-br-[4px] px-1 text-[8px] font-bold"
+          className="absolute left-0 top-0 flex h-[13px] min-w-[13px] items-center justify-center rounded-br-[5px] px-1 text-[8px] font-bold"
           style={{
             backgroundColor: "rgba(0, 0, 0, 0.75)",
             color: "#f4f4f5",
@@ -894,7 +1108,7 @@ function FilmstripBar({
         </span>
       ) : null}
       {/* Duration tag on wide strips. */}
-      {width > 14 ? (
+      {(layout != null ? (widthPxish as number) > 34 : (widthPxish as number) > 14) ? (
         <span
           className="absolute bottom-0.5 right-1 rounded-sm px-1 py-px text-[8px] font-semibold"
           style={{
@@ -913,23 +1127,34 @@ function FilmstripBar({
 // v5 lane chrome
 // ---------------------------------------------------------------------------
 
-/** Left gutter cell: lucide icon + tiny caps label, vertically centered. */
+/** Left gutter cell: lucide icon + tiny caps label, vertically centered.
+ *  v5.1: `sticky` pins the cell to the left edge of the horizontal scroll
+ *  viewport (labels stay visible while the timeline pans) with an opaque
+ *  background so scrolling media never bleeds through. */
 function LaneLabel({
   icon: Icon,
   text,
   accent,
+  sticky,
 }: {
   icon: LucideIcon;
   text: string;
   accent: string;
+  sticky?: boolean;
 }) {
   return (
     <div
-      className="flex h-full w-16 shrink-0 select-none items-center justify-center gap-1 border-r"
-      style={{ borderColor: GUTTER_BORDER }}
+      className={cn(
+        "flex h-full w-16 shrink-0 select-none items-center justify-center gap-1 border-r",
+        sticky && "sticky left-0 z-[7]",
+      )}
+      style={{
+        borderColor: GUTTER_BORDER,
+        ...(sticky ? { backgroundColor: "#0c0c0e" } : {}),
+      }}
     >
       <Icon className="size-3 shrink-0" style={{ color: accent }} aria-hidden />
-      <span className="truncate text-[7px] font-bold uppercase tracking-widest text-zinc-500">
+      <span className="truncate text-[9px] font-bold uppercase tracking-wider text-zinc-500">
         {text}
       </span>
     </div>
@@ -943,6 +1168,14 @@ function EmptyHint({ children }: { children: ReactNode }) {
       {children}
     </div>
   );
+}
+
+/** v5.1: MM:SS.d — sub-second precision for the ruler readout chip. */
+function fmtTcTenths(ms: number): string {
+  const s = Math.max(0, ms) / 1000;
+  const m = Math.floor(s / 60);
+  const r = s - m * 60;
+  return `${String(m).padStart(2, "0")}:${r < 10 ? "0" : ""}${r.toFixed(1)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -966,6 +1199,10 @@ export function TimelineRuler({
   onMoveSfx,
   onRemoveSfx,
   videoDurations,
+  onSplit,
+  onDuplicate,
+  onRemove,
+  activeSegment,
 }: TimelineRulerProps) {
   const trackRef = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
@@ -993,18 +1230,143 @@ export function TimelineRuler({
     videoDurations != null;
   const sfxList = sfxItems ?? [];
 
+  // ------------------------------------------------------------------
+  // v5.1 PIXEL ZOOM state (4..400 px per timeline second).
+  // ------------------------------------------------------------------
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [pxPerSec, setPxPerSec] = useState(60);
+  const [viewportW, setViewportW] = useState(0);
+  /** One-shot "fit" on the first usable layout (spec default). */
+  const didInitialFitRef = useRef(false);
+  /** Zoom anchor set by zoomTo(); applied in the layout effect below so the
+   *  content width re-renders BEFORE scrollLeft is set. */
+  const zoomAnchorRef = useRef<{ viewportX: number; timeMs: number } | null>(null);
+
+  const totalSec = Math.max(0, totalMs) / 1000;
+  const axisW = Math.max(1, totalSec * pxPerSec);
+  const pxOf = useCallback(
+    (ms: number) => (Math.max(0, ms) / 1000) * pxPerSec,
+    [pxPerSec],
+  );
+  const layout: TimelinePxLayout | undefined = isV5
+    ? { pxOf }
+    : undefined;
+
+  const fitPxPerSec = useCallback(
+    () =>
+      clampPxPerSec(
+        (viewportW > GUTTER_W ? viewportW - GUTTER_W : 800) /
+          Math.max(0.001, totalSec),
+      ),
+    [viewportW, totalSec],
+  );
+
+  /** Zoom with an anchor: keep the timeline time under `viewportX` stable
+   *  after the new pxPerSec lands (wheel = cursor, buttons/slider = view
+   *  center). The actual scrollLeft lands in the layout effect. */
+  const zoomTo = useCallback(
+    (next: number, viewportX: number) => {
+      const el = scrollRef.current;
+      const n = clampPxPerSec(next);
+      if (el && pxPerSec > 0) {
+        const contentX = el.scrollLeft + viewportX;
+        const t = Math.max(0, ((contentX - GUTTER_W) / pxPerSec) * 1000);
+        zoomAnchorRef.current = { viewportX, timeMs: t };
+      }
+      setPxPerSec(n);
+    },
+    [pxPerSec],
+  );
+
+  // Viewport width tracker (drives "fit" + the shrink clamp below).
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => {
+      setViewportW((prev) =>
+        el.clientWidth > 0 && el.clientWidth !== prev ? el.clientWidth : prev,
+      );
+    });
+    ro.observe(el);
+    setViewportW((prev) => (el.clientWidth > 0 ? el.clientWidth : prev));
+    return () => ro.disconnect();
+  }, [isV5]);
+
+  // One-shot initial "fit": the default zoom equals the viewport (first
+  // layout with actual media on the timeline).
+  useEffect(() => {
+    if (
+      isV5 &&
+      !didInitialFitRef.current &&
+      viewportW > GUTTER_W &&
+      totalMs > 0
+    ) {
+      didInitialFitRef.current = true;
+      setPxPerSec(fitPxPerSec());
+    }
+  }, [isV5, viewportW, totalMs, fitPxPerSec]);
+
+  // Drastic-change clamp: when the timeline SHRINKS below the viewport
+  // (deleting clips), zoom up so it still fills the lane (never jumps zoom
+  // when the timeline grows — that just scrolls). Capped at ZOOM_MAX.
+  useEffect(() => {
+    if (!isV5 || viewportW <= GUTTER_W || totalMs <= 0) return;
+    if (axisW < viewportW - GUTTER_W && fitPxPerSec() > pxPerSec) {
+      // Lift AFTER paint (rAF): a synchronous setState inside the effect
+      // body trips react-hooks/set-state-in-effect; one frame of the old
+      // zoom after a delete is imperceptible.
+      const fit = fitPxPerSec();
+      const raf = requestAnimationFrame(() => setPxPerSec(fit));
+      return () => cancelAnimationFrame(raf);
+    }
+  }, [isV5, axisW, viewportW, totalMs, fitPxPerSec, pxPerSec]);
+
+  // Apply a pending zoom anchor once the new content width is committed.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    const a = zoomAnchorRef.current;
+    if (!el || !a) return;
+    zoomAnchorRef.current = null;
+    el.scrollLeft = Math.max(
+      0,
+      GUTTER_W + (a.timeMs / 1000) * pxPerSec - a.viewportX,
+    );
+  }, [pxPerSec]);
+
+  // Ctrl/Cmd+wheel zoom (native listener — React wheel handlers are passive
+  // and cannot preventDefault the browser's page pinch-zoom).
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !isV5) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      e.preventDefault();
+      const rect = el.getBoundingClientRect();
+      const viewportX = Math.max(0, e.clientX - rect.left);
+      const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+      zoomTo(pxPerSec * factor, viewportX);
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [isV5, pxPerSec, zoomTo]);
+
   const xToMs = useCallback(
     (clientX: number) => {
       const el = trackRef.current;
       if (!el || totalMs <= 0) return 0;
       const rect = el.getBoundingClientRect();
+      if (isV5) {
+        // v5.1 px layout: ms = (clientX − axis left) / pxPerSec · 1000.
+        const ms = ((clientX - rect.left) / pxPerSec) * 1000;
+        return Math.round(Math.max(0, Math.min(totalMs, ms)));
+      }
       const ratio = Math.max(
         0,
         Math.min(1, (clientX - rect.left) / rect.width),
       );
       return Math.round(ratio * totalMs);
     },
-    [totalMs],
+    [totalMs, isV5, pxPerSec],
   );
 
   const handlePointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
@@ -1038,12 +1400,15 @@ export function TimelineRuler({
   // v5 drag handlers (pointer capture, deadzone, didDrag, commit-on-release)
   // ------------------------------------------------------------------
 
-  /** px->ms scale measured at gesture start from the ticks axis cell. */
+  /** px->ms scale measured at gesture start from the ticks axis cell.
+   *  v5.1 px layout: exactly 1000/pxPerSec (the axis cell IS axisW wide).
+   *  Legacy % layout keeps the measured width. */
   const msPerPxNow = useCallback(() => {
+    if (isV5) return pxPerSec > 0 ? 1000 / pxPerSec : 0;
     const el = trackRef.current;
     const w = el ? el.getBoundingClientRect().width : 0;
     return w > 0 && totalMs > 0 ? totalMs / w : 0;
-  }, [totalMs]);
+  }, [totalMs, isV5, pxPerSec]);
 
   const clipPreviewFor = (id: string) =>
     dragPreview && dragPreview.kind === "clip" && dragPreview.id === id
@@ -1090,6 +1455,14 @@ export function TimelineRuler({
       mediaType: seg.mediaType,
       sourceDur: seg.sourceDurationMs ?? videoDurations?.[seg.id] ?? null,
       allowH: mode === "absolute",
+      // v5.1: resolved playback speed (trim math converts timeline↔source).
+      speed:
+        seg.mediaType === "video" &&
+        seg.speed != null &&
+        Number.isFinite(seg.speed) &&
+        seg.speed > 0
+          ? seg.speed
+          : 1,
     };
   };
 
@@ -1213,7 +1586,13 @@ export function TimelineRuler({
   // ------------------------------------------------------------------
 
   const playPct = totalMs > 0 ? Math.min(100, (currentMs / totalMs) * 100) : 0;
-  const step = niceStep(totalMs);
+  // v5.1: ruler ticks — the px layout uses the adaptive step (labels ≥70px
+  // apart at the current zoom; count-capped so huge zoomed-out timelines
+  // never render thousands of tick divs).
+  let step = layout ? niceStepPx(pxPerSec) : niceStep(totalMs);
+  if (totalMs > 0) {
+    while (totalMs / step > 600) step *= 2;
+  }
   const ticks: number[] = [];
   for (let t = 0; t <= totalMs; t += step) ticks.push(t);
   if (ticks[ticks.length - 1] < totalMs) ticks.push(totalMs);
@@ -1310,6 +1689,47 @@ export function TimelineRuler({
       onJumpToSegment?.(seg.id);
     };
 
+  // ------------------------------------------------------------------
+  // v5.1 toolbar state: split needs the playhead strictly inside the active
+  // clip (>100ms from both edges — the page-level splitAtPlayhead contract);
+  // copy/trash need any active segment.
+  // ------------------------------------------------------------------
+  const hasActive = isV5 && activeSegment != null;
+  const canSplit =
+    isV5 &&
+    activeSegment != null &&
+    onSplit != null &&
+    currentMs > activeSegment.startMs + 100 &&
+    currentMs < activeSegment.endMs - 100;
+
+  /** Small icon button (28px, header undo/redo styling — v5.1: disabled
+   *  reads at 40% opacity, danger hovers red, tooltip + aria-label). */
+  const toolBtn = (
+    icon: ReactNode,
+    label: string,
+    onClick: (() => void) | undefined,
+    disabled: boolean,
+    opts?: { danger?: boolean },
+  ) => (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled || onClick == null}
+      title={label}
+      aria-label={label}
+      className={cn(
+        "flex size-7 items-center justify-center rounded-md transition-all active:scale-90",
+        disabled || onClick == null
+          ? "cursor-not-allowed text-zinc-600 opacity-40"
+          : opts?.danger
+            ? "text-zinc-300 hover:bg-red-500/15 hover:text-red-300"
+            : "text-zinc-300 hover:bg-white/10 hover:text-white",
+      )}
+    >
+      {icon}
+    </button>
+  );
+
   return (
     <div
       className="border-t px-4 py-3"
@@ -1324,7 +1744,7 @@ export function TimelineRuler({
             }),
       }}
     >
-      {/* Header row */}
+      {/* Header row 1: label + mode + active-clip duration chip | legend */}
       <div className="mb-2 flex items-center justify-between">
         <div className="flex items-center gap-2 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
           Timeline
@@ -1344,6 +1764,43 @@ export function TimelineRuler({
               }
             >
               {mode}
+            </span>
+          )}
+          {/* v5.1 CapCut: playhead position readout chip — a cyan mono chip
+              with a tiny playhead tick, 1:1 with the line on the ruler. */}
+          {isV5 && totalMs > 0 && (
+            <span
+              className="flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[9px] font-bold tabular-nums normal-case"
+              style={{
+                backgroundColor: "rgba(8, 51, 68, 0.45)",
+                color: "#67e8f9",
+              }}
+              title="Playhead position — drag the ruler or the playhead grabber to move it"
+            >
+              <span
+                className="h-2 w-0.5 rounded-full"
+                style={{
+                  backgroundColor: "#22d3ee",
+                  boxShadow: "0 0 4px rgba(34, 211, 238, 0.8)",
+                }}
+                aria-hidden
+              />
+              {fmtTcTenths(currentMs)}
+            </span>
+          )}
+          {/* v5.1: 1:1 active-clip duration chip (visible while a segment
+              is selected — playhead inside it). */}
+          {isV5 && activeSegment != null && (
+            <span
+              className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-bold tabular-nums normal-case"
+              style={{ backgroundColor: "rgba(39, 39, 42, 0.55)", color: "#a1a1aa" }}
+              title={`Active clip — ${fmtTimecode(activeSegment.startMs)} to ${fmtTimecode(activeSegment.endMs)} · ${(activeSegment.durationMs / 1000).toFixed(2)}s`}
+            >
+              <Timer className="size-2.5" aria-hidden />
+              {fmtTimecode(activeSegment.durationMs)}
+              <span className="font-medium opacity-70">
+                · {(activeSegment.durationMs / 1000).toFixed(1)}s
+              </span>
             </span>
           )}
         </div>
@@ -1392,6 +1849,96 @@ export function TimelineRuler({
         </div>
       </div>
 
+      {/* v5.1 row 2: clip tools (split / duplicate / delete) + zoom controls —
+          both groups sit in matching #18181b toolbar strips. */}
+      {isV5 && !empty && (
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <div
+            className="flex items-center gap-1 rounded-lg border p-0.5"
+            style={{ borderColor: "#27272a", backgroundColor: "#18181b" }}
+            role="group"
+            aria-label="Clip tools"
+          >
+            {toolBtn(
+              <Scissors className="size-4" />,
+              "Split at playhead (S)",
+              onSplit,
+              !canSplit,
+            )}
+            <div className="h-4 w-px" style={{ backgroundColor: "#27272a" }} />
+            {toolBtn(
+              <Copy className="size-4" />,
+              "Duplicate clip",
+              hasActive && onDuplicate && activeSegment
+                ? () => onDuplicate(activeSegment.id)
+                : undefined,
+              !hasActive,
+            )}
+            {toolBtn(
+              <Trash2 className="size-4" />,
+              "Delete (Del)",
+              hasActive && onRemove && activeSegment
+                ? () => onRemove(activeSegment.id)
+                : undefined,
+              !hasActive,
+              { danger: true },
+            )}
+          </div>
+          {/* v5.1 CapCut: compact zoom strip — 28px icon buttons, an 80px
+              slim slider, and a small text "Fit" button, all in one rounded
+              toolbar strip (matching the clip tools). */}
+          <div
+            className="flex items-center gap-0.5 rounded-lg border p-0.5"
+            style={{ borderColor: "#27272a", backgroundColor: "#18181b" }}
+            role="group"
+            aria-label="Timeline zoom"
+          >
+            <button
+              type="button"
+              onClick={() => zoomTo(pxPerSec / 1.15, viewportW / 2)}
+              title="Zoom out (Ctrl+scroll on the timeline)"
+              aria-label="Zoom out"
+              className="flex size-7 items-center justify-center rounded-md text-zinc-300 transition-all hover:bg-white/10 hover:text-white active:scale-90"
+            >
+              <ZoomOut className="size-3.5" />
+            </button>
+            <input
+              type="range"
+              min={ZOOM_MIN}
+              max={ZOOM_MAX}
+              step={1}
+              value={Math.round(pxPerSec)}
+              onChange={(e) => zoomTo(Number(e.target.value), viewportW / 2)}
+              aria-label="Timeline zoom (pixels per second)"
+              title={`Timeline zoom — ${Math.round(pxPerSec)} px/s (Ctrl+scroll on the timeline)`}
+              className="w-20 accent-cyan-500"
+            />
+            <button
+              type="button"
+              onClick={() => zoomTo(pxPerSec * 1.15, viewportW / 2)}
+              title="Zoom in (Ctrl+scroll on the timeline)"
+              aria-label="Zoom in"
+              className="flex size-7 items-center justify-center rounded-md text-zinc-300 transition-all hover:bg-white/10 hover:text-white active:scale-90"
+            >
+              <ZoomIn className="size-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                const el = scrollRef.current;
+                setPxPerSec(fitPxPerSec());
+                if (el) el.scrollLeft = 0;
+              }}
+              title="Fit timeline to the panel"
+              aria-label="Fit timeline"
+              className="rounded-md px-1.5 py-1 text-[10px] font-semibold text-cyan-300 transition-all hover:bg-cyan-500/15 hover:text-cyan-200 active:scale-95"
+            >
+              Fit
+            </button>
+          </div>
+        </div>
+      )}
+
       {empty ? (
         <div
           className="flex h-14 items-center justify-center rounded-lg border border-dashed text-[11px]"
@@ -1401,34 +1948,51 @@ export function TimelineRuler({
         </div>
       ) : isV5 ? (
         /* ---------------------------------------------------------------
-           v5.0 — 4-LANE EDITOR. Rows: [64px label gutter | time axis].
+           v5.0 — 4-LANE EDITOR. Rows: [64px sticky label gutter | time axis].
+           v5.1 — the axis is PIXEL laid-out (pxPerSec) inside a horizontal
+           scroll container: content width = gutter + totalSec·pxPerSec.
            The playhead / hover ghost / drag tooltip are absolutely
-           positioned on the WRAPPER (calc() left), so each is one
-           continuous element spanning every lane.
+           positioned on the CONTENT wrapper, so each is one continuous
+           element spanning every lane that scrolls with the media.
            --------------------------------------------------------------- */
         <div
-          className="relative flex w-full touch-none select-none flex-col rounded-lg border"
+          className="relative w-full touch-none select-none rounded-lg border"
           style={{
             borderColor: "#27272a",
             backgroundColor: "rgba(9, 9, 11, 0.6)",
           }}
           onPointerLeave={() => setHoverRatio(null)}
         >
+          {/* v5.1: horizontal scroll viewport. The 7px top padding is the
+              rail the playhead grab cap pokes into (it must stay inside the
+              scrollport or overflow-y-hidden would clip it). */}
+          <div
+            ref={scrollRef}
+            className="overflow-x-auto overflow-y-hidden"
+            style={{ paddingTop: 7 }}
+          >
+          <div
+            className="relative flex flex-col"
+            style={{
+              width: Math.max(GUTTER_W + axisW, viewportW || GUTTER_W + axisW),
+            }}
+          >
           {/* Ruler */}
           <div
             className="flex shrink-0 border-b"
             style={{ height: TICKS_H, borderColor: ROW_BORDER }}
           >
             <div
-              className="w-16 shrink-0 border-r"
-              style={{ borderColor: GUTTER_BORDER }}
+              className="sticky left-0 z-[7] w-16 shrink-0 border-r"
+              style={{ borderColor: GUTTER_BORDER, backgroundColor: "#0c0c0e" }}
             />
             <div
               ref={trackRef}
-              className="relative min-w-0 flex-1"
+              className="relative min-w-0 shrink-0 cursor-pointer"
+              style={{ width: axisW }}
               {...scrubHandlers}
             >
-              <TickRow ticks={ticks} totalMs={totalMs} />
+              <TickRow ticks={ticks} totalMs={totalMs} layout={layout} />
             </div>
           </div>
 
@@ -1437,11 +2001,12 @@ export function TimelineRuler({
             role="group"
             aria-label="Video lane"
             className="flex shrink-0 border-b"
-            style={{ height: BASE_H, borderColor: ROW_BORDER }}
+            style={{ height: BASE_H, borderColor: ROW_BORDER, backgroundColor: LANE_BG_A }}
           >
-            <LaneLabel icon={Clapperboard} text="Video" accent="#22d3ee" />
+            <LaneLabel icon={Clapperboard} text="Video" accent="#22d3ee" sticky />
             <div
-              className="relative min-w-0 flex-1 transition-colors hover:bg-white/[0.02]"
+              className="relative min-w-0 shrink-0 transition-colors hover:bg-white/[0.02]"
+              style={{ width: axisW }}
               {...scrubHandlers}
             >
               {baseSegs.length === 0 ? (
@@ -1453,6 +2018,7 @@ export function TimelineRuler({
                     totalMs={totalMs}
                     currentMs={currentMs}
                     onSeek={onSeek}
+                    layout={layout}
                   />
                   <div
                     className="absolute left-0 right-0"
@@ -1483,6 +2049,7 @@ export function TimelineRuler({
                           previewStartMs={preview?.startMs}
                           previewDurationMs={preview?.durationMs}
                           dragging={preview != null}
+                          layout={layout}
                         />
                       );
                     })}
@@ -1493,12 +2060,20 @@ export function TimelineRuler({
                       currentMs={currentMs}
                       txActive={txActive}
                       txOverridesActive={txOverridesActive}
+                      layout={layout}
+                    />
+                    {/* v5.1 CapCut: boundary diamonds above the filmstrips. */}
+                    <TransitionDiamonds
+                      segs={baseSegs}
+                      transition={transition}
+                      layout={layout}
                     />
                   </div>
                   <BeatRail
                     beats={beats}
                     totalMs={totalMs}
                     beatNearest={beatNearest}
+                    layout={layout}
                   />
                 </>
               )}
@@ -1513,12 +2088,13 @@ export function TimelineRuler({
             style={{
               height: overlayLaneH,
               borderColor: ROW_BORDER,
-              backgroundColor: LANE_BAND_BG,
+              backgroundColor: LANE_BG_B,
             }}
           >
-            <LaneLabel icon={Layers} text="Overlay" accent="#a78bfa" />
+            <LaneLabel icon={Layers} text="OVL" accent="#a78bfa" sticky />
             <div
-              className="relative min-w-0 flex-1 transition-colors hover:bg-white/[0.02]"
+              className="relative min-w-0 shrink-0 transition-colors hover:bg-white/[0.02]"
+              style={{ width: axisW }}
               {...scrubHandlers}
             >
               {overlaySegs.length === 0 ? (
@@ -1530,8 +2106,19 @@ export function TimelineRuler({
                   const pv = clipPreviewFor(seg.id);
                   const startMs = pv?.startMs ?? seg.startMs;
                   const durMs = pv?.durationMs ?? seg.durationMs;
-                  const left = totalMs > 0 ? (startMs / totalMs) * 100 : 0;
-                  const width = totalMs > 0 ? (durMs / totalMs) * 100 : 0;
+                  const pos =
+                    layout != null
+                      ? {
+                          left: layout.pxOf(startMs),
+                          width: Math.max(
+                            2,
+                            layout.pxOf(startMs + durMs) - layout.pxOf(startMs),
+                          ),
+                        }
+                      : {
+                          left: `${totalMs > 0 ? (startMs / totalMs) * 100 : 0}%`,
+                          width: `${totalMs > 0 ? Math.max(0.4, (durMs / totalMs) * 100) : 0}%`,
+                        };
                   const isVideo = seg.mediaType === "video";
                   const draggable = !!onEditItem;
                   return (
@@ -1541,15 +2128,20 @@ export function TimelineRuler({
                       tabIndex={draggable ? 0 : undefined}
                       aria-label={`${seg.fileName}, overlay clip, ${fmtTimecode(startMs)} to ${fmtTimecode(startMs + durMs)}`}
                       className={cn(
-                        "absolute flex select-none items-center gap-1 overflow-hidden rounded-[5px] border pl-[2px] pr-2 text-[8px] font-semibold text-zinc-200",
+                        // v5.1 CapCut card: 6px radius, hover lift + cyan
+                        // hairline outline, edge-trim zones (below) glow
+                        // cyan on group hover. Transition killed while
+                        // dragging (the preview must track 1:1).
+                        "group absolute flex select-none items-center gap-1 overflow-hidden rounded-md border pl-[2px] pr-2 text-[8px] font-semibold text-zinc-200",
                         draggable
                           ? "cursor-grab touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-violet-300/70"
                           : "cursor-pointer",
-                        pv != null && "z-[3] cursor-grabbing",
+                        pv != null
+                          ? "z-[3] cursor-grabbing transition-none"
+                          : "transition-all duration-150 hover:-translate-y-px hover:outline hover:outline-1 hover:outline-cyan-500/40",
                       )}
                       style={{
-                        left: `${left}%`,
-                        width: `${Math.max(0.4, width)}%`,
+                        ...pos,
                         minWidth: 16,
                         top: OV_PAD + row * (OV_ROW_H + OV_GAP),
                         height: OV_ROW_H,
@@ -1611,13 +2203,15 @@ export function TimelineRuler({
                       <span className="shrink-0 tabular-nums text-zinc-300/80">
                         {(durMs / 1000).toFixed(1)}s
                       </span>
-                      {/* Trim handles: 4px hit zones, wider on hover. The
-                          shared move/up handlers live on the clip root and
-                          receive the captured edge events via bubbling. */}
+                      {/* Trim handles — v5.1 CapCut: fixed 6px cyan zones that
+                          fade in on clip hover (group-hover). The shared
+                          move/up handlers live on the clip root and receive
+                          the captured edge events via bubbling — interaction
+                          UNCHANGED, visuals only. */}
                       {draggable && (
                         <>
                           <div
-                            className="absolute inset-y-0 left-0 z-[2] w-[4px] cursor-ew-resize touch-none transition-[width] duration-100 hover:w-[8px]"
+                            className="absolute inset-y-0 left-0 z-[2] w-[6px] cursor-ew-resize touch-none bg-cyan-400/25 opacity-0 shadow-[inset_1px_0_0_rgba(34,211,238,0.6)] transition-opacity duration-100 group-hover:opacity-100"
                             title="Drag to trim the start"
                             onPointerDown={(e) =>
                               beginClipDrag(e, seg, "trim-l")
@@ -1625,7 +2219,7 @@ export function TimelineRuler({
                             onLostPointerCapture={handleDragAbort}
                           />
                           <div
-                            className="absolute inset-y-0 right-0 z-[2] w-[4px] cursor-ew-resize touch-none transition-[width] duration-100 hover:w-[8px]"
+                            className="absolute inset-y-0 right-0 z-[2] w-[6px] cursor-ew-resize touch-none bg-cyan-400/25 opacity-0 shadow-[inset_-1px_0_0_rgba(34,211,238,0.6)] transition-opacity duration-100 group-hover:opacity-100"
                             title="Drag to trim the end"
                             onPointerDown={(e) =>
                               beginClipDrag(e, seg, "trim-r")
@@ -1641,16 +2235,22 @@ export function TimelineRuler({
             </div>
           </div>
 
-          {/* LANE 3 — AUDIO (music waveform; visual + click-to-seek only) */}
+          {/* LANE 3 — AUDIO (music waveform; visual + click-to-seek only) —
+              cyan-900/20-tinted while a waveform is loaded (v5.1). */}
           <div
             role="group"
             aria-label="Audio lane"
             className="flex shrink-0 border-b"
-            style={{ height: AUDIO_H, borderColor: ROW_BORDER }}
+            style={{
+              height: AUDIO_H,
+              borderColor: ROW_BORDER,
+              backgroundColor: hasWave ? LANE_BG_WAVE : LANE_BG_A,
+            }}
           >
-            <LaneLabel icon={AudioLines} text="Audio" accent="#67e8f9" />
+            <LaneLabel icon={AudioLines} text="Audio" accent="#67e8f9" sticky />
             <div
-              className="relative min-w-0 flex-1 transition-colors hover:bg-white/[0.02]"
+              className="relative min-w-0 shrink-0 transition-colors hover:bg-white/[0.02]"
+              style={{ width: axisW }}
               {...scrubHandlers}
             >
               {hasWave && waveform ? (
@@ -1673,11 +2273,12 @@ export function TimelineRuler({
             role="group"
             aria-label="Sound effects lane"
             className="flex shrink-0 rounded-b-[7px]"
-            style={{ height: SFX_H, backgroundColor: LANE_BAND_BG }}
+            style={{ height: SFX_H, backgroundColor: LANE_BG_B }}
           >
-            <LaneLabel icon={Zap} text="SFX" accent="#fbbf24" />
+            <LaneLabel icon={Zap} text="SFX" accent="#fbbf24" sticky />
             <div
-              className="relative min-w-0 flex-1 transition-colors hover:bg-white/[0.02]"
+              className="relative min-w-0 shrink-0 transition-colors hover:bg-white/[0.02]"
+              style={{ width: axisW }}
               {...scrubHandlers}
             >
               {sfxList.length === 0 ? (
@@ -1688,11 +2289,23 @@ export function TimelineRuler({
                   const pv = sfxPreviewFor(item.id);
                   const startMs = Math.max(0, pv?.startMs ?? item.startMs);
                   const durMs = def?.defaultDurMs ?? 0;
-                  const left =
-                    totalMs > 0
-                      ? Math.max(0, Math.min(100, (startMs / totalMs) * 100))
-                      : 0;
-                  const width = totalMs > 0 ? (durMs / totalMs) * 100 : 0;
+                  const pos =
+                    layout != null
+                      ? {
+                          left: layout.pxOf(startMs),
+                          width: Math.max(
+                            2,
+                            layout.pxOf(startMs + durMs) - layout.pxOf(startMs),
+                          ),
+                        }
+                      : {
+                          left: `${
+                            totalMs > 0
+                              ? Math.max(0, Math.min(100, (startMs / totalMs) * 100))
+                              : 0
+                          }%`,
+                          width: `${totalMs > 0 ? Math.max(0.2, (durMs / totalMs) * 100) : 0}%`,
+                        };
                   return (
                     <div
                       key={item.id}
@@ -1702,23 +2315,23 @@ export function TimelineRuler({
                       className={cn(
                         "group absolute select-none rounded-full border pl-1.5 pr-2 text-[8px] font-semibold",
                         onMoveSfx
-                          ? "cursor-grab touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-amber-300/70"
+                          ? "cursor-grab touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-violet-300/70"
                           : "cursor-pointer",
                         pv != null && "z-[3] cursor-grabbing",
                       )}
                       style={{
-                        left: `${left}%`,
-                        // Duration-proportional width with a fixed floor.
-                        width: `${Math.max(0.2, width)}%`,
+                        ...pos,
                         minWidth: 28,
                         top: 4,
                         height: 22,
+                        // v5.1 CapCut: violet pills (overlay-lane accent),
+                        // hot-tracked while dragging.
                         backgroundColor:
                           pv != null
-                            ? "rgba(251, 191, 36, 0.30)"
-                            : "rgba(251, 191, 36, 0.15)",
-                        borderColor: "rgba(251, 191, 36, 0.45)",
-                        color: "#fde68a",
+                            ? "rgba(139, 92, 246, 0.34)"
+                            : "rgba(139, 92, 246, 0.16)",
+                        borderColor: "rgba(167, 139, 250, 0.5)",
+                        color: "#ddd6fe",
                         boxShadow:
                           pv != null
                             ? "0 0 0 1.5px rgba(255,255,255,0.55), 0 3px 10px rgba(0,0,0,0.55)"
@@ -1750,14 +2363,10 @@ export function TimelineRuler({
                       }}
                     >
                       <span
-                        className="shrink-0 text-[9px] leading-none"
+                        className="flex shrink-0 items-center"
                         aria-hidden
                       >
-                        {def ? (
-                          def.emoji
-                        ) : (
-                          <Zap className="size-2.5" aria-hidden />
-                        )}
+                        <Zap className="size-2.5" aria-hidden />
                       </span>
                       <span className="min-w-0 flex-1 truncate">
                         {def?.label ?? item.sfxId}
@@ -1801,7 +2410,7 @@ export function TimelineRuler({
               className="pointer-events-none absolute z-[6] rounded-md border border-dashed"
               style={{
                 left: GUTTER_W,
-                right: 0,
+                width: axisW,
                 top: dropTarget.top,
                 height: dropTarget.height,
                 borderColor: dropTarget.borderColor,
@@ -1810,13 +2419,26 @@ export function TimelineRuler({
             />
           )}
 
-          {/* Playhead — ONE continuous line spanning every lane. */}
-          <Playhead leftCss={{ left: axisLeftCss(playPct / 100) }} />
+          {/* Playhead — ONE continuous line spanning every lane, positioned
+              in px on the content wrapper (scrolls with the media). The
+              triangle grabber reuses the ruler's scrub handlers (v5.1). */}
+          <Playhead
+            leftCss={{
+              left: layout
+                ? GUTTER_W + layout.pxOf(currentMs)
+                : axisLeftCss(playPct / 100),
+            }}
+            grab={isV5 ? scrubHandlers : undefined}
+          />
 
           {/* Hover ghost — hidden while scrubbing OR dragging. */}
           {hoverMs != null && !scrubbing && dragPreview == null && (
             <HoverGhost
-              leftCss={{ left: axisLeftCss(hoverRatio ?? 0) }}
+              leftCss={{
+                left: layout
+                  ? GUTTER_W + layout.pxOf(hoverMs)
+                  : axisLeftCss(hoverRatio ?? 0),
+              }}
               top={2}
               label={fmtTimecode(hoverMs)}
             />
@@ -1828,9 +2450,17 @@ export function TimelineRuler({
             <div
               className="pointer-events-none absolute top-0 z-20 -translate-x-1/2"
               style={{
-                left: axisLeftCss(
-                  Math.max(0.02, Math.min(0.98, dragPreview.startMs / totalMs)),
-                ),
+                left: layout
+                  ? GUTTER_W +
+                    layout.pxOf(
+                      Math.max(
+                        totalMs * 0.02,
+                        Math.min(totalMs * 0.98, dragPreview.startMs),
+                      ),
+                    )
+                  : axisLeftCss(
+                      Math.max(0.02, Math.min(0.98, dragPreview.startMs / totalMs)),
+                    ),
               }}
             >
               <div
@@ -1848,6 +2478,8 @@ export function TimelineRuler({
               </div>
             </div>
           )}
+          </div>
+          </div>
         </div>
       ) : (
         /* ---------------------------------------------------------------

@@ -38,3 +38,5 @@ dev.log
 tool-results/
 # build/ (dist output) — build/icon.ico IS committed
 
+dist/
+whisper-service/

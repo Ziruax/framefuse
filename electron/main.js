@@ -14,12 +14,12 @@
 //     color-cycle, spotlight, swing, squash, zoom-words)
 //   - .ass sidecar export IPC
 const {
-  app, BrowserWindow, ipcMain, dialog, Menu, shell,
+  app, BrowserWindow, ipcMain, dialog, Menu, shell, utilityProcess,
 } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
-const { spawn, spawnSync, execSync } = require("child_process");
+const { spawn } = require("child_process");
 
 // v5.0: pure FFmpeg graph/arg builders (CommonJS, zero requires — also
 // imported directly by /home/z/harness/export-graph-harness.js). Holds the
@@ -80,7 +80,7 @@ function createWindow() {
 
   mainWindow = new BrowserWindow({
     width: 1400, height: 900, minWidth: 1100, minHeight: 720,
-    backgroundColor: "#0a0a0a", title: "FrameFuse v4.1",
+    backgroundColor: "#0a0a0a", title: "FrameFuse v5.1",
     autoHideMenuBar: false,
     icon: iconPath,
     webPreferences: {
@@ -107,7 +107,12 @@ function buildApplicationMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate([
     ...(isMac ? [{ role: "appMenu" }] : []),
     { label: "File", submenu: [
-      { label: "Add Images…", accelerator: "CmdOrCtrl+O", click: () => mainWindow && mainWindow.webContents.send("menu:add-images") },
+      { label: "New Project", accelerator: "CmdOrCtrl+Alt+N", click: () => mainWindow && mainWindow.webContents.send("menu:new-project") },
+      { label: "Open Project…", accelerator: "CmdOrCtrl+O", click: () => mainWindow && mainWindow.webContents.send("menu:open-project") },
+      { label: "Save Project", accelerator: "CmdOrCtrl+S", click: () => mainWindow && mainWindow.webContents.send("menu:save-project") },
+      { label: "Save Project As…", accelerator: "CmdOrCtrl+Shift+S", click: () => mainWindow && mainWindow.webContents.send("menu:save-project-as") },
+      { type: "separator" },
+      { label: "Add Media…", click: () => mainWindow && mainWindow.webContents.send("menu:add-images") },
       { label: "Add Audio…", click: () => mainWindow && mainWindow.webContents.send("menu:add-audio") },
       { type: "separator" },
       { label: "Export MP4…", accelerator: "CmdOrCtrl+E", click: () => mainWindow && mainWindow.webContents.send("menu:export") },
@@ -118,7 +123,7 @@ function buildApplicationMenu() {
     { label: "View", submenu: [{ role: "reload" }, { role: "forceReload" }, { role: "toggleDevTools" }, { type: "separator" }, { role: "resetZoom" }, { role: "zoomIn" }, { role: "zoomOut" }, { type: "separator" }, { role: "togglefullscreen" }] },
     { label: "Window", submenu: [{ role: "minimize" }, { role: "zoom" }] },
     { label: "Help", submenu: [
-      { label: "About", click: () => { dialog.showMessageBox(mainWindow, { type: "info", title: "About", message: "FrameFuse v4.1", detail: "Native image-to-video merger with viral kinetic captions.", buttons: ["OK"] }); } },
+      { label: "About", click: () => { dialog.showMessageBox(mainWindow, { type: "info", title: "About", message: "FrameFuse v5.1", detail: "Multi-track video studio — video clips, chroma key, native Whisper captions, GPU-accelerated FFmpeg export.", buttons: ["OK"] }); } },
       { label: "Naming Guide", click: () => mainWindow && mainWindow.webContents.send("menu:naming-guide") },
     ]},
   ]));
@@ -127,18 +132,30 @@ function buildApplicationMenu() {
 // IPC helpers
 ipcMain.handle("is-electron", () => true);
 
-// Diagnostics — lets the renderer verify ffmpeg is reachable.
+// Diagnostics — lets the renderer verify ffmpeg is reachable (v5.1: async —
+// the old execSync blocked the main process up to 10 s on slow disks).
 ipcMain.handle("ffmpeg-status", async () => {
   try {
     if (!ffmpegPath || !fs.existsSync(ffmpegPath)) {
       return { ok: false, path: ffmpegPath || "(none)", version: null, error: "FFmpeg binary not found at expected path. Try reinstalling FrameFuse." };
     }
-    const out = execSync(`"${ffmpegPath}" -version`, { encoding: "utf-8", timeout: 10000, windowsHide: true });
-    const firstLine = out.split("\n")[0];
-    return { ok: true, path: ffmpegPath, version: firstLine, error: null };
+    const r = await ffmpegCapture(["-version"], 10000);
+    const firstLine = r.out.split("\n")[0] || "";
+    return {
+      ok: r.code === 0,
+      path: ffmpegPath,
+      version: firstLine,
+      error: r.code === 0 ? null : "FFmpeg did not respond in time.",
+    };
   } catch (e) {
     return { ok: false, path: ffmpegPath || "(none)", version: null, error: e.message };
   }
+});
+
+// v5.1: encoder badge for the export UI (result of the async GPU probe).
+ipcMain.handle("export-info", async () => {
+  const enc = await detectGpuEncoderAsync();
+  return { encoder: enc.label, encoderName: enc.name };
 });
 
 ipcMain.handle("save-temp-image", async (_evt, { name, bytes }) => {
@@ -183,6 +200,104 @@ ipcMain.handle("choose-output", async () => {
   return res.filePath;
 });
 
+// ---------------------------------------------------------------------------
+// v5.1 NATIVE PROJECT FILES — save/open dialogs + recents (userData).
+// The renderer keeps its self-contained .framefuse.json document (media
+// inlined); these handlers just give it NATIVE file dialogs, a current-path
+// short-circuit for Cmd+S, and a persisted recents list for the menu.
+// ---------------------------------------------------------------------------
+function recentsPath() {
+  return path.join(app.getPath("userData"), "framefuse-recent-projects.json");
+}
+
+function loadRecentProjects() {
+  try {
+    const raw = fs.readFileSync(recentsPath(), "utf-8");
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter((e) => e && typeof e.path === "string" && fs.existsSync(e.path))
+      .slice(0, 8);
+  } catch (_) { return []; }
+}
+
+function saveRecentProjects(list) {
+  try {
+    fs.mkdirSync(path.dirname(recentsPath()), { recursive: true });
+    fs.writeFileSync(recentsPath(), JSON.stringify(list, null, 2), "utf-8");
+  } catch (_) { /* recents are best-effort */ }
+}
+
+function rememberProject(filePath) {
+  const list = loadRecentProjects().filter((e) => e.path !== filePath);
+  list.unshift({
+    path: filePath,
+    name: path.basename(filePath, path.extname(filePath)),
+    savedAt: Date.now(),
+  });
+  saveRecentProjects(list.slice(0, 8));
+}
+
+function defaultProjectName(doc) {
+  try {
+    const name = doc && typeof doc.name === "string" && doc.name ? doc.name : "untitled";
+    return name.replace(/[\\/:*?"<>|]+/g, "_").slice(0, 60);
+  } catch (_) { return "untitled"; }
+}
+
+async function saveProjectDialog(doc, currentPath) {
+  let filePath = currentPath || null;
+  if (!filePath) {
+    const res = await dialog.showSaveDialog(mainWindow, {
+      title: "Save FrameFuse Project",
+      defaultPath: `${defaultProjectName(doc)}.framefuse.json`,
+      filters: [{ name: "FrameFuse Project", extensions: ["framefuse.json", "json"] }],
+    });
+    if (res.canceled || !res.filePath) return null;
+    filePath = res.filePath;
+    if (!/\.json$/i.test(filePath)) filePath += ".framefuse.json";
+  }
+  fs.writeFileSync(filePath, JSON.stringify(doc));
+  rememberProject(filePath);
+  return { path: filePath, name: path.basename(filePath, path.extname(filePath)) };
+}
+
+ipcMain.handle("project:save", async (_e, { doc, currentPath }) => {
+  return saveProjectDialog(doc, currentPath || null);
+});
+
+ipcMain.handle("project:save-as", async (_e, { doc }) => {
+  return saveProjectDialog(doc, null);
+});
+
+ipcMain.handle("project:open", async () => {
+  const res = await dialog.showOpenDialog(mainWindow, {
+    title: "Open FrameFuse Project",
+    properties: ["openFile"],
+    filters: [{ name: "FrameFuse Project", extensions: ["framefuse.json", "json"] }],
+  });
+  if (res.canceled || !res.filePaths || res.filePaths.length === 0) return null;
+  const filePath = res.filePaths[0];
+  try {
+    const raw = fs.readFileSync(filePath, "utf-8");
+    const doc = JSON.parse(raw);
+    if (!doc || doc.app !== "framefuse") {
+      throw new Error("Not a FrameFuse project file");
+    }
+    rememberProject(filePath);
+    return { path: filePath, name: path.basename(filePath, path.extname(filePath)), doc };
+  } catch (err) {
+    throw new Error(`Could not open project: ${err.message}`);
+  }
+});
+
+ipcMain.handle("project:recent", () => loadRecentProjects());
+
+ipcMain.handle("project:remove-recent", (_e, { path: p }) => {
+  saveRecentProjects(loadRecentProjects().filter((e) => e.path !== p));
+  return true;
+});
+
 /** Kill one ffmpeg child (Windows needs taskkill for the whole tree). */
 function killProc(proc) {
   try {
@@ -208,6 +323,44 @@ function leakGuard() {
   }
 }
 
+/** Async ffmpeg stdout/stderr capture — NEVER blocks the main process event
+ *  loop (the v5.0 execSync/spawnSync probes froze the whole app). Resolves
+ *  { code, out } with out = stdout+stderr concatenated; a timeout resolves
+ *  code -1 with whatever was captured. */
+function ffmpegCapture(args, timeoutMs = 12000) {
+  return new Promise((resolve) => {
+    let done = false;
+    let out = "";
+    let proc;
+    try {
+      proc = spawn(ffmpegPath, args, { windowsHide: true });
+    } catch (err) {
+      resolve({ code: -1, out, error: err.message });
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      try { proc.kill("SIGKILL"); } catch (_) {}
+      resolve({ code: -1, out, timeout: true });
+    }, timeoutMs);
+    proc.stdout.on("data", (d) => { out += d.toString(); });
+    proc.stderr.on("data", (d) => { out += d.toString(); });
+    proc.on("error", (err) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve({ code: -1, out, error: err.message });
+    });
+    proc.on("exit", (code) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve({ code, out });
+    });
+  });
+}
+
 ipcMain.handle("cancel-export", async () => {
   try {
     killAllProcs();
@@ -216,43 +369,249 @@ ipcMain.handle("cancel-export", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// v5.1 NATIVE WHISPER SERVICE (utilityProcess).
+//
+// The v5.0 renderer Web Worker broke in the PACKAGED app — webpack's worker
+// chunk loader resolved chunk URLs relative to the worker script location
+// and duplicated the `_next/static/chunks` prefix
+// ("…app.asar/out/_next/static/chunks/_next/static/chunks/590caa2a….js"),
+// so importScripts failed and every transcription errored. The native
+// service fixes this at the root: NO renderer worker at all. Transformers.js
+// + onnxruntime-node run in a utility process (native threads, disk model
+// cache in userData — downloaded once, available forever).
+// ---------------------------------------------------------------------------
+const whisperChild = { proc: null, dead: true };
+const whisperRuns = new Map(); // runId → { resolve, reject, sender }
+let whisperRunSeq = 0;
+
+function whisperCacheDir() {
+  return path.join(app.getPath("userData"), "whisper-models");
+}
+
+function whisperChildEntry() {
+  // Packaged: staged service at <resources>/whisper-service (extraResources,
+  // outside asar so ESM imports + the native onnxruntime binding load).
+  return app.isPackaged
+    ? path.join(process.resourcesPath, "whisper-service", "whisper-child.js")
+    : path.join(__dirname, "whisper-child.js");
+}
+
+function getWhisperChild() {
+  if (whisperChild.proc && !whisperChild.dead) return whisperChild.proc;
+  try { fs.mkdirSync(whisperCacheDir(), { recursive: true }); } catch (_) {}
+  const proc = utilityProcess.fork(whisperChildEntry(), [], {
+    serviceName: "framefuse-whisper",
+    stdio: "pipe",
+  });
+  whisperChild.proc = proc;
+  whisperChild.dead = false;
+  if (proc.stdout) proc.stdout.on("data", (d) => console.log("[whisper]", String(d).trim()));
+  if (proc.stderr) proc.stderr.on("data", (d) => console.error("[whisper]", String(d).trim()));
+  proc.on("message", onWhisperChildMessage);
+  proc.on("exit", () => {
+    whisperChild.proc = null;
+    whisperChild.dead = true;
+    // Every pending run must fail fast — the UI can never hang.
+    for (const [runId, run] of Array.from(whisperRuns)) {
+      whisperRuns.delete(runId);
+      run.reject(new Error("The Whisper service stopped unexpectedly. Please try again."));
+    }
+  });
+  return proc;
+}
+
+/** Same curve the renderer's mapWorkerProgress applies (model 10–25 %,
+ *  transcribe 25–80 %) — computed here so the renderer stays a dumb relay. */
+function mapWhisperProgress(stage, progress) {
+  const p = Number.isFinite(progress) ? Math.min(100, Math.max(0, Math.round(progress))) : 0;
+  if (stage === "model") return Math.round(10 + 15 * (p / 100));
+  return Math.min(80, Math.max(25, p));
+}
+
+function sendWhisperProgress(runId, progress, status) {
+  const run = whisperRuns.get(runId);
+  const wc = run && run.sender;
+  if (wc && !wc.isDestroyed()) {
+    wc.send("whisper:progress", { progress, status });
+  }
+}
+
+function onWhisperChildMessage(msg) {
+  if (!msg || typeof msg !== "object" || typeof msg.type !== "string") return;
+  if (msg.runId === -1) return; // "service-ready" ping from the child
+  if (typeof msg.runId !== "number") return;
+  const run = whisperRuns.get(msg.runId);
+  if (!run) return; // stale (cancelled) — discard
+  switch (msg.type) {
+    case "progress": {
+      const progress = mapWhisperProgress(msg.stage, msg.progress);
+      sendWhisperProgress(msg.runId, progress, msg.status || "");
+      break;
+    }
+    case "result":
+      whisperRuns.delete(msg.runId);
+      run.resolve({
+        chunks: msg.chunks ?? null,
+        language: msg.language ?? null,
+        wordLevel: !!msg.wordLevel,
+      });
+      break;
+    case "error":
+      whisperRuns.delete(msg.runId);
+      run.reject(new Error(msg.message || "Whisper service failed"));
+      break;
+    default:
+      break;
+  }
+}
+
+/** Decode any audio/video file to mono 16 kHz f32le PCM with ffmpeg —
+ *  async + streamed, so the main process NEVER blocks. */
+function decodeAudioToPcm16k(filePath) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(ffmpegPath, [
+      "-hide_banner", "-loglevel", "error",
+      "-i", filePath,
+      "-vn", "-ac", "1", "-ar", "16000",
+      "-f", "f32le", "pipe:1",
+    ], { windowsHide: true });
+    const chunks = [];
+    let stderrTail = "";
+    proc.stdout.on("data", (d) => chunks.push(d));
+    proc.stderr.on("data", (d) => { stderrTail = (stderrTail + d.toString()).slice(-2000); });
+    proc.on("error", (err) => reject(new Error(err.message)));
+    proc.on("exit", (code) => {
+      if (code === 0) {
+        const buf = Buffer.concat(chunks);
+        const pcm = new Float32Array(Math.floor(buf.length / 4));
+        for (let i = 0; i < pcm.length; i++) pcm[i] = buf.readFloatLE(i * 4);
+        resolve(pcm);
+      } else {
+        const detail = stderrTail.trim().split("\n").slice(-3).join(" ");
+        reject(new Error(`Audio decode failed: ${detail || `ffmpeg exit ${code}`}`));
+      }
+    });
+  });
+}
+
+ipcMain.handle("whisper:transcribe", async (event, payload) => {
+  const { name, bytes, language } = payload || {};
+  if (!bytes || !bytes.byteLength) throw new Error("No audio data received");
+  ensureTempDir();
+  const ext = path.extname(name || "") || ".audio";
+  const tmp = path.join(tempDir, `whisper_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
+  fs.writeFileSync(tmp, Buffer.from(bytes));
+  const runId = ++whisperRunSeq;
+  try {
+    sendWhisperProgress(runId, 2, "Decoding audio…");
+    const pcm = await decodeAudioToPcm16k(tmp);
+    if (pcm.length === 0) throw new Error("Audio file is empty or silent");
+    const durationMs = Math.round((pcm.length / 16000) * 1000);
+    sendWhisperProgress(runId, 10, "Loading Whisper-tiny model…");
+
+    const child = getWhisperChild();
+    const result = await new Promise((resolve, reject) => {
+      whisperRuns.set(runId, { resolve, reject, sender: event.sender });
+      try {
+        // Zero-copy: transfer the PCM buffer to the service.
+        child.postMessage(
+          { type: "transcribe", runId, pcm, sampleRate: 16000, language: language || "auto", cacheDir: whisperCacheDir() },
+          [pcm.buffer],
+        );
+      } catch (err) {
+        whisperRuns.delete(runId);
+        reject(new Error(`Could not reach the Whisper service: ${err.message}`));
+      }
+    });
+    sendWhisperProgress(runId, 80, "Aligning word timestamps…");
+    return { ...result, durationMs };
+  } finally {
+    whisperRuns.delete(runId);
+    try { fs.unlinkSync(tmp); } catch (_) {}
+  }
+});
+
+ipcMain.handle("whisper:preload", async (event) => {
+  const runId = ++whisperRunSeq;
+  const child = getWhisperChild();
+  return await new Promise((resolve, reject) => {
+    whisperRuns.set(runId, { resolve: () => resolve({ ok: true }), reject, sender: event.sender });
+    try {
+      child.postMessage({ type: "preload", runId, cacheDir: whisperCacheDir() });
+    } catch (err) {
+      whisperRuns.delete(runId);
+      reject(new Error(`Could not reach the Whisper service: ${err.message}`));
+    }
+  });
+});
+
+ipcMain.handle("whisper:cancel", async () => {
+  const child = whisperChild.proc;
+  let cancelled = 0;
+  for (const [runId, run] of Array.from(whisperRuns)) {
+    whisperRuns.delete(runId);
+    try { if (child) child.postMessage({ type: "cancel", runId }); } catch (_) {}
+    run.reject(new Error("Transcription cancelled"));
+    cancelled++;
+  }
+  return cancelled;
+});
+
+// ---------------------------------------------------------------------------
 // GPU encoder detection + RUNTIME PROBE.
 // Listing an encoder isn't enough (drivers can be broken) — we actually
 // encode 3 tiny test frames. Falls back to libx264 on any failure.
 // ---------------------------------------------------------------------------
-let detectedEncoder = null;
+let detectedEncoder = null;      // resolved value (session cache)
+let encoderDetecting = null;     // in-flight promise
 
-function listEncoders() {
-  try {
-    const output = execSync(`"${ffmpegPath}" -hide_banner -encoders 2>&1`, { encoding: "utf-8", timeout: 10000 });
-    if (output.includes("h264_nvenc")) return { name: "h264_nvenc", label: "NVIDIA NVENC" };
-    if (output.includes("h264_qsv")) return { name: "h264_qsv", label: "Intel QSV" };
-    if (output.includes("h264_amf")) return { name: "h264_amf", label: "AMD AMF" };
-  } catch (_) { /* ignore */ }
-  return null;
+// v5.1: ALL detection is ASYNC (spawn, never execSync). The v5.0 code ran
+// execSync listEncoders + probeEncoder inside the export handler — up to
+// 25 s of a COMPLETELY FROZEN main process (no window events, no IPC) before
+// the first frame encoded. Detection now runs once at app start (warm) and
+// the export handler just awaits the cached promise.
+
+/** Async encoder list — parse the full -encoders table. */
+async function listEncodersAsync() {
+  const r = await ffmpegCapture(["-hide_banner", "-encoders"], 10000);
+  if (r.code !== 0) return [];
+  const out = r.out;
+  const order = [
+    { name: "h264_nvenc", label: "NVIDIA NVENC" },
+    { name: "h264_qsv", label: "Intel QSV" },
+    { name: "h264_amf", label: "AMD AMF" },
+  ];
+  return order.filter((e) => out.includes(e.name));
 }
 
-function probeEncoder(name) {
-  try {
-    execSync(
-      `"${ffmpegPath}" -hide_banner -loglevel error -f lavfi -i color=c=black:s=256x256:r=30:d=0.1 ` +
-      `-frames:v 3 -c:v ${name} -f null - 2>&1`,
-      { encoding: "utf-8", timeout: 15000, windowsHide: true },
-    );
-    return true;
-  } catch (_) { return false; }
+/** Runtime probe — actually encode 3 tiny test frames. Listed ≠ working
+ * (drivers can be broken), and a listed-but-broken NVENC must not hide a
+ * perfectly good AMF/QSV — every listed candidate is probed in order. */
+async function probeEncoderAsync(name) {
+  const r = await ffmpegCapture([
+    "-hide_banner", "-loglevel", "error",
+    "-f", "lavfi", "-i", "color=c=black:s=256x256:r=30:d=0.1",
+    "-frames:v", "3", "-c:v", name, "-f", "null", "-",
+  ], 15000);
+  return r.code === 0;
 }
 
-function detectGpuEncoder() {
+async function detectGpuEncoderAsync() {
   if (detectedEncoder) return detectedEncoder;
-  const listed = listEncoders();
-  if (listed && probeEncoder(listed.name)) {
-    detectedEncoder = listed;
-  } else {
-    detectedEncoder = { name: "libx264", label: "CPU (libx264)" };
-  }
-  console.log("Export encoder:", detectedEncoder.label, `(${detectedEncoder.name})`);
-  return detectedEncoder;
+  if (encoderDetecting) return encoderDetecting;
+  encoderDetecting = (async () => {
+    let pick = { name: "libx264", label: "CPU (libx264)" };
+    try {
+      const candidates = await listEncodersAsync();
+      for (const cand of candidates) {
+        if (await probeEncoderAsync(cand.name)) { pick = cand; break; }
+      }
+    } catch (_) { /* fall back to CPU */ }
+    detectedEncoder = pick;
+    console.log("Export encoder:", pick.label, `(${pick.name})`);
+    return pick;
+  })();
+  return encoderDetecting;
 }
 
 /** Build encoder args for a quality-first, speed-optimized encode.
@@ -327,20 +686,32 @@ function runFfmpeg(args, totalSec, onTime) {
 // ---------------------------------------------------------------------------
 const probeCache = new Map();
 
-function probeMedia(p) {
-  if (typeof p !== "string" || !p) return { hasAudio: false, width: 0, height: 0 };
-  if (probeCache.has(p)) return probeCache.get(p);
-  let info = { hasAudio: false, width: 0, height: 0 };
-  try {
-    const r = spawnSync(ffmpegPath, ["-hide_banner", "-i", p], {
-      encoding: "utf8", timeout: 15000, windowsHide: true,
-    });
-    const stderr = `${(r && r.stderr) || ""}`;
-    const parsed = G.videoProbeParser(stderr);
-    info = { hasAudio: parsed.hasAudio, width: parsed.width, height: parsed.height };
-  } catch (_) { /* unreadable source → treated as silent/unknown dims */ }
-  probeCache.set(p, info);
-  return info;
+/** v5.1: ASYNC media probe (`ffmpeg -i <path>` stderr parsed once per file,
+ * cached). The v5.0 spawnSync version blocked the ENTIRE main process for
+ * up to 15 s per file, sequentially — with a handful of imported videos the
+ * app visibly froze before the first encode. All probes are now warmed in
+ * PARALLEL before the job loop (see export-native).
+ * NOTE: `ffmpeg -i` alone exits 1 ("at least one output file") — the probe
+ * data lives on stderr, which ffmpegCapture concatenates into `out`, so the
+ * parser runs regardless of the exit code. */
+function probeMediaAsync(p) {
+  if (typeof p !== "string" || !p) {
+    return Promise.resolve({ hasAudio: false, width: 0, height: 0 });
+  }
+  if (probeCache.has(p)) return Promise.resolve(probeCache.get(p));
+  const job = (async () => {
+    let info = { hasAudio: false, width: 0, height: 0 };
+    try {
+      const r = await ffmpegCapture(["-hide_banner", "-i", p], 15000);
+      const parsed = G.videoProbeParser(r.out);
+      info = { hasAudio: parsed.hasAudio, width: parsed.width, height: parsed.height };
+    } catch (_) { /* unreadable source → treated as silent/unknown dims */ }
+    probeCache.set(p, info);
+    return info;
+  })();
+  // On failure cache the fallback synchronously so retries don't re-probe.
+  job.catch(() => {});
+  return job;
 }
 
 // ---------------------------------------------------------------------------
@@ -1063,7 +1434,9 @@ ipcMain.handle("export-native", async (event, opts) => {
   const headlinesEnabled = Array.isArray(headlines) && headlines.some((h) => h && h.text && h.endMs > h.startMs);
   const totalMs = segments.reduce((sum, s) => Math.max(sum, s.endMs ?? (s.startMs ?? 0) + s.durationMs), 0) || segments.reduce((sum, s) => sum + s.durationMs, 0);
   const totalSec = totalMs / 1000;
-  const encoder = detectGpuEncoder();
+  // v5.1: async warm-started GPU detection — the handler NEVER blocks the
+  // main process before the first frame (was: execSync up to 25 s).
+  const encoder = await detectGpuEncoderAsync();
 
   ensureTempDir();
   const tempFiles = [];
@@ -1118,10 +1491,26 @@ ipcMain.handle("export-native", async (event, opts) => {
     // probing the temp file's stderr) or any SFX placement. A music-only
     // v4.9-shaped project keeps the EXACT v4.9 mux path; a project with no
     // audio at all keeps the video-only concat (both byte-identical).
+    //
+    // v5.1 PERF: every needed media probe is warmed in PARALLEL here (async
+    // spawn) — the job loop below then reads everything from the cache. The
+    // v5.0 code probed sequentially with spawnSync, freezing the app.
+    const probePaths = new Set();
+    for (const s of segments) {
+      if (s && s.mediaType === "video" && s.videoPath) probePaths.add(s.videoPath);
+    }
+    for (const ov of overlaySegs) {
+      const p = ov.mediaType === "video" && ov.videoPath ? ov.videoPath : ov.imagePath;
+      if (p && !(Number(ov.sourceWidth) > 0 && Number(ov.sourceHeight) > 0)) {
+        probePaths.add(p);
+      }
+    }
+    await Promise.all(Array.from(probePaths).map((p) => probeMediaAsync(p)));
+
     let anyVideoAudio = false;
     for (const s of segments) {
       if (s && s.mediaType === "video" && s.videoPath) {
-        if (probeMedia(s.videoPath).hasAudio) { anyVideoAudio = true; break; }
+        if ((await probeMediaAsync(s.videoPath)).hasAudio) { anyVideoAudio = true; break; }
       }
     }
     const anyAudio = sfxList.length > 0 || anyVideoAudio;
@@ -1181,7 +1570,7 @@ ipcMain.handle("export-native", async (event, opts) => {
         let srcW = Number(ov.sourceWidth) > 0 ? Number(ov.sourceWidth) : 0;
         let srcH = Number(ov.sourceHeight) > 0 ? Number(ov.sourceHeight) : 0;
         if (!srcW || !srcH) {
-          const probe = probeMedia(srcPath);
+          const probe = await probeMediaAsync(srcPath);
           srcW = probe.width;
           srcH = probe.height;
         }
@@ -1204,7 +1593,7 @@ ipcMain.handle("export-native", async (event, opts) => {
       const segHasAudio = !!(
         seg.mediaType === "video" &&
         seg.videoPath &&
-        probeMedia(seg.videoPath).hasAudio
+        (await probeMediaAsync(seg.videoPath)).hasAudio
       );
 
       const built = G.buildClipArgs({
@@ -1225,6 +1614,10 @@ ipcMain.handle("export-native", async (event, opts) => {
         anyAudio,
         segHasAudio,
         overlaySpecs,
+        // v5.1: hardware DECODE for base video clips (d3d11va on Windows,
+        // auto-detected; silently falls back to software when unavailable —
+        // the filters still run on CPU, ffmpeg copies frames across).
+        hwaccel: true,
       });
 
       jobs.push({
@@ -1322,10 +1715,18 @@ app.whenReady().then(() => {
   ensureTempDir();
   buildApplicationMenu();
   createWindow();
+  // v5.1: warm the GPU-encoder probe at startup so the FIRST export starts
+  // encoding immediately instead of paying the detection latency up front.
+  detectGpuEncoderAsync();
   app.on("activate", () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 
 app.on("window-all-closed", () => { if (process.platform !== "darwin") app.quit(); });
+
+// v5.1: the Whisper utility process must not outlive the app.
+app.on("will-quit", () => {
+  try { if (whisperChild.proc) whisperChild.proc.kill(); } catch (_) {}
+});
 
 // Test hook — exposes the ASS builder to the dev verification harness.
 // Harmless in production: nothing requires the Electron main entry.

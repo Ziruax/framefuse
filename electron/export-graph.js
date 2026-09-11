@@ -26,13 +26,16 @@
 // v4.3/v4.9 transition tables + helpers (moved verbatim from main.js)
 // ---------------------------------------------------------------------------
 
-/** v4.3 transition style → xfade transition name (offset=0 head composite). */
+/** v4.3 transition style → xfade transition name (offset=0 head composite).
+ *  v5.1: circleopen joins the xfade family (canvas painter = renderer.ts
+ *  computeTransitionFx kind "circle" — growing center circle reveal). */
 const XFADE_NAMES = {
   dissolve: "fade",
   "slide-left": "slideleft",
   "slide-right": "slideright",
   "wipe-left": "wipeleft",
   "wipe-right": "wiperight",
+  circleopen: "circleopen",
 };
 /** v4.3 dip styles → fade filter color. */
 const DIP_COLORS = { "dip-black": "black", "dip-white": "white" };
@@ -240,24 +243,80 @@ function chromaDespillType(color) {
 // ---------------------------------------------------------------------------
 
 /**
- * Input args for a base-lane video segment: `-ss <trimIn/1000> -i <path>`.
+ * Input args for a base-lane video segment: `[-hwaccel auto]? -ss <trimIn/1000>
+ * [-t <sourceWindow/1000>]? -i <path>`.
  * (The clip-duration `-t` is an OUTPUT option appended by buildClipArgs —
  * identical semantics to the v4.9 `-loop 1 -i img … -t dur` layout.)
+ * v5.1: `o.hwaccel` prepends `-hwaccel auto` — hardware DECODE (d3d11va on
+ * Windows) with silent software fallback. Frames still cross to system
+ * memory for the CPU filter graph, so argv validity never changes; the flag
+ * is absent by default, keeping every pre-v5.1 call byte-identical.
+ * v5.1: `o.durMs` (SOURCE window, ms) adds the input `-t` so a sped-up clip
+ * demuxes exactly the window setpts will retime. Absent (speed 1) → no `-t`,
+ * byte-identical to the pre-v5.1 argv.
  */
 function buildVideoInputArgs(o) {
   const ss = fmt3(Math.max(0, Number(o && o.trimInMs) || 0));
-  return ["-ss", ss, "-i", o && o.path];
+  const hw = o && o.hwaccel ? ["-hwaccel", "auto"] : [];
+  const durMs = Number(o && o.durMs);
+  const t =
+    o && Number.isFinite(durMs) && durMs > 0
+      ? ["-t", fmt3(durMs)]
+      : [];
+  return [...hw, "-ss", ss, ...t, "-i", o && o.path];
+}
+
+/** v5.1: format a speed factor for ffmpeg expressions (≤6 decimals). */
+function fmtSpeed(v) {
+  return String(Number(v.toFixed(6)));
+}
+
+/**
+ * v5.1: atempo filter chain for a playback speed. atempo accepts 0.5–2.0
+ * only — speeds outside that window chain two stages whose factors
+ * multiply to the requested speed (4× = atempo=2,atempo=2; 0.25× =
+ * atempo=0.5,atempo=0.5). speed 1 (or invalid) → EMPTY array so the audio
+ * chain is untouched and byte-identical for every pre-v5.1 clip.
+ */
+function atempoFilters(speed) {
+  const n = Number(speed);
+  if (!Number.isFinite(n) || n <= 0 || n === 1) return [];
+  if (n >= 0.5 && n <= 2) return [`atempo=${fmtSpeed(n)}`];
+  if (n > 2) {
+    const b = n / 2;
+    return b === 1 ? ["atempo=2"] : ["atempo=2", `atempo=${fmtSpeed(b)}`];
+  }
+  const b = n / 0.5;
+  return b === 1 ? ["atempo=0.5"] : ["atempo=0.5", `atempo=${fmtSpeed(b)}`];
+}
+
+/**
+ * v5.1: resolve a segment playback speed (0.25..4; anything missing,
+ * non-finite or exactly 1 → 1 = "no speed feature" — the guard value that
+ * keeps argv byte-identical for all v4.9/v5.0 projects).
+ */
+function resolveSegSpeed(seg) {
+  const n = Number(seg && seg.speed);
+  if (!Number.isFinite(n) || n <= 0 || n === 1) return 1;
+  return Math.max(0.25, Math.min(4, n));
 }
 
 /**
  * Cover-fit chain for base-lane VIDEO segments — the drawVideoFrame() twin
  * (object-fit: cover, zoom locked to 1, NO Ken Burns):
- *   scale=W:H:force_original_aspect_ratio=increase,crop=W:H,fps,setsar,format
+ *   scale=W:H:force_original_aspect_ratio=increase,crop=W:H[,setpts],fps,setsar,format
+ * v5.1: `o.speed` (≠1) inserts `setpts=PTS/speed` AFTER the cover-fit chain
+ * and BEFORE fps — PTS divided by speed retimes the decoded frames onto
+ * the clip's timeline clock. speed 1 → no setpts, chain unchanged.
  */
 function buildVideoFilterChain(o) {
+  const speed = resolveSegSpeed({ speed: o && o.speed });
+  const pts =
+    speed !== 1 ? [`setpts=PTS/${fmtSpeed(speed)}`] : [];
   return [
     `scale=${o.width}:${o.height}:force_original_aspect_ratio=increase`,
     `crop=${o.width}:${o.height}`,
+    ...pts,
     `fps=${o.fps}`,
     `setsar=1`,
     `format=yuv420p`,
@@ -448,6 +507,7 @@ function buildAudioMixGraph(o) {
  *   anyAudio,                   // project needs an audio track on EVERY clip
  *   segHasAudio,                // this clip's video source carries audio
  *   overlaySpecs,               // [{ inputArgs, x, y, dw, dh, chroma, a, b }] for this clip
+ *   hwaccel,                    // v5.1: base video inputs get -hwaccel auto
  * }
  */
 function buildClipArgs(ctx) {
@@ -455,7 +515,7 @@ function buildClipArgs(ctx) {
     i, seg, segments, fps, width, height,
     kbEnabled, zoomMax, globalDir,
     transition, wm, assSuffix, clipPath, encArgs,
-    anyAudio, segHasAudio, overlaySpecs,
+    anyAudio, segHasAudio, overlaySpecs, hwaccel,
   } = ctx;
 
   const overlays = Array.isArray(overlaySpecs) ? overlaySpecs : [];
@@ -651,19 +711,40 @@ function buildClipArgs(ctx) {
     // Inputs: [0] = trimmed video source, [1..K] = overlays, then the
     // generated-silence input (when the clip has no audio of its own),
     // then the watermark image — indices assigned in push order.
-    const inputs = [...buildVideoInputArgs({ trimInMs: seg.trimInMs, path: seg.videoPath })];
+    //
+    // v5.1 SPEED: base-lane video clips with speed ≠ 1 —
+    //   • input gains `-t <sourceWindow>` (durationMs·speed = the source
+    //     window setpts will retime onto durationMs),
+    //   • filter chain gains `setpts=PTS/speed` after the cover-fit chain,
+    //   • own-audio path gains the atempo chain (0.5–2 per stage, chained
+    //     when speed sits outside that window),
+    //   • output `-t` stays the TIMELINE duration (seg.durationMs already
+    //     resolves window/speed in timeline.ts).
+    // speed 1/undefined → every one of these is a no-op (byte-identical argv
+    // with pre-v5.1 builds — the harness differentials prove it).
+    const speed = resolveSegSpeed(seg);
+    const sourceWinMs = speed !== 1 ? Math.max(0, Number(seg.durationMs) || 0) * speed : 0;
+    const inputs = [
+      ...buildVideoInputArgs({
+        trimInMs: seg.trimInMs,
+        path: seg.videoPath,
+        hwaccel,
+        durMs: speed !== 1 ? sourceWinMs : undefined,
+      }),
+    ];
     let inputIdx = 1;
     for (const ov of overlays) {
       inputs.push(...ov.inputArgs);
       inputIdx += 1;
     }
-    const videoChain = buildVideoFilterChain({ width, height, fps });
+    const videoChain = buildVideoFilterChain({ width, height, fps, speed });
+    const tempo = atempoFilters(speed);
     const audioMaps = [];
     let audioGraph = null;
     if (anyAudio) {
       if (segHasAudio) {
-        // the clip's OWN audio: per-segment volume + uniform format
-        audioGraph = `[0:a]volume=${String(vol)},${AFORMAT}[aclip]`;
+        // the clip's OWN audio: per-segment volume [+ atempo] + uniform format
+        audioGraph = `[0:a]${["volume=" + String(vol), ...tempo, AFORMAT].join(",")}[aclip]`;
         audioMaps.push("-map", "[aclip]");
       } else {
         inputs.push("-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo");
@@ -715,7 +796,7 @@ function buildClipArgs(ctx) {
     ];
     if (anyAudio) {
       if (segHasAudio) {
-        args.push("-map", "0:v", "-map", "0:a", "-af", `volume=${String(vol)},${AFORMAT}`);
+        args.push("-map", "0:v", "-map", "0:a", "-af", ["volume=" + String(vol), ...tempo, AFORMAT].join(","));
       } else {
         args.push("-map", "0:v", "-map", "1:a");
       }
@@ -884,6 +965,10 @@ module.exports = {
   hexToFfmpegColor,
   hexToRgbParts,
   chromaDespillType,
+  // v5.1 speed helpers
+  fmtSpeed,
+  atempoFilters,
+  resolveSegSpeed,
   // base video clip builders
   buildVideoInputArgs,
   buildVideoFilterChain,

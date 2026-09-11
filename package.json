@@ -1,8 +1,8 @@
 {
   "name": "framefuse",
-  "version": "5.0.0",
+  "version": "5.1.0",
   "private": true,
-  "description": "FrameFuse v5.0 — Multi-track video studio: video clips, green-screen chroma key, overlay lane, synthesized SFX, non-blocking Whisper captions, tabbed UI, and GPU-accelerated parallel FFmpeg export.",
+  "description": "FrameFuse v5.1 — Multi-track video studio: video clips, green-screen chroma key, overlay lane, synthesized SFX, native Whisper captions, non-blocking GPU-accelerated parallel FFmpeg export, native project files.",
   "main": "electron/main.js",
   "author": "FrameFuse",
   "license": "MIT",
@@ -15,7 +15,8 @@
     "electron": "electron electron/main.js",
     "electron:dev": "concurrently -k \"npm run dev\" \"wait-on http://localhost:3000 && electron electron/main.js\"",
     "fetch:ffmpeg": "node scripts/fetch-windows-ffmpeg.js",
-    "electron:build": "npm run clean && next build --webpack && node scripts/copy-wasm.js && node scripts/fetch-windows-ffmpeg.js && electron-builder --win dir --publish never"
+    "stage:whisper": "node scripts/stage-whisper-service.js",
+    "electron:build": "npm run clean && next build --webpack && node scripts/copy-wasm.js && node scripts/fetch-windows-ffmpeg.js && node scripts/stage-whisper-service.js && electron-builder --win dir --publish never"
   },
   "dependencies": {
     "@xenova/transformers": "^2.17.2",
@@ -24,6 +25,7 @@
     "lucide-react": "^0.525.0",
     "mp4-muxer": "^5.2.2",
     "next": "^16.1.1",
+    "onnxruntime-node": "1.14.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "tailwind-merge": "^3.3.1"
@@ -56,6 +58,10 @@
     ],
     "extraResources": [
       {
+        "from": "whisper-service",
+        "to": "whisper-service"
+      },
+      {
         "from": "node_modules/@xenova/transformers/dist",
         "to": "transformers-wasm",
         "filter": [
@@ -86,7 +92,7 @@
       "createStartMenuShortcut": true,
       "shortcutName": "FrameFuse",
       "perMachine": false,
-      "uninstallDisplayName": "FrameFuse v4",
+      "uninstallDisplayName": "FrameFuse v5",
       "deleteAppDataOnUninstall": false
     },
     "npmRebuild": false

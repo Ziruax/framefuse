@@ -1,6 +1,18 @@
 "use client";
 
-import { Film, Download, X, Cpu, Clock, ImageIcon, Timer, Undo2, Redo2, Gauge } from "lucide-react";
+import {
+  Film,
+  Download,
+  X,
+  Cpu,
+  Clock,
+  FileJson,
+  ImageIcon,
+  Timer,
+  Undo2,
+  Redo2,
+  Gauge,
+} from "lucide-react";
 import type { TimelineMode, ExportProgress, VideoSettings } from "@/lib/merger/types";
 import { fmtBytes, fmtTimecode } from "@/lib/merger/timeline";
 import { cn } from "@/lib/utils";
@@ -29,6 +41,10 @@ interface HeaderProps {
   /** v4.5: export summary (settings + timeline length) for the estimate chip. */
   settings?: VideoSettings;
   totalMs?: number;
+  /** v5.1: name of the project file on disk (native save/open); null while
+   *  the session is unsaved / browser-only. Rendered as a chip next to the
+   *  version badge. */
+  projectName?: string | null;
 }
 
 function timeAgo(at: number): string {
@@ -67,6 +83,7 @@ export function Header({
   onRedo,
   settings,
   totalMs = 0,
+  projectName,
 }: HeaderProps) {
   const pct = exportProgress?.progress ?? 0;
   // v4.5 export estimate: bitrate × duration / 8 → MB cap (CRF encodes
@@ -89,16 +106,16 @@ export function Header({
         boxShadow: "0 1px 0 rgba(255,255,255,0.03) inset, 0 8px 24px rgba(0,0,0,0.35)",
       }}
     >
-      {/* Brand */}
+      {/* Brand — v5.1 CapCut: compact 8px-rounded gradient mark. */}
       <div className="flex items-center gap-3">
         <div
-          className="flex size-9 items-center justify-center rounded-lg shadow-lg transition-transform duration-200 hover:scale-105"
+          className="flex size-8 shrink-0 items-center justify-center rounded-[8px] transition-transform duration-200 hover:scale-105"
           style={{
             backgroundImage: "linear-gradient(135deg, #8b5cf6 0%, #7c3aed 40%, #c026d3 100%)",
             boxShadow: "0 4px 14px rgba(124, 58, 237, 0.4)",
           }}
         >
-          <Film className="size-5" style={{ color: "#ffffff" }} />
+          <Film className="size-4" style={{ color: "#ffffff" }} />
         </div>
         <div className="leading-tight">
           <div className="flex items-center gap-2">
@@ -108,16 +125,33 @@ export function Header({
             >
               FrameFuse
             </span>
+            {/* v5.1: quiet mono version chip (was a violet gradient badge). */}
             <span
-              className="whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-bold"
+              className="whitespace-nowrap rounded border px-1.5 py-0.5 font-mono text-[10px] font-medium"
               style={{
-                background: "linear-gradient(135deg, rgba(124, 58, 237, 0.35), rgba(192, 38, 211, 0.3))",
-                border: "1px solid rgba(139, 92, 246, 0.35)",
-                color: "#ddd6fe",
+                borderColor: "#27272a",
+                backgroundColor: "#18181b",
+                color: "#a1a1aa",
               }}
+              title="FrameFuse v5.1 — multi-track video studio"
             >
-              v5.0
+              v5.1
             </span>
+            {/* v5.1: on-disk project file chip (native save/open sessions). */}
+            {projectName && (
+              <span
+                className="flex max-w-[220px] items-center gap-1 truncate rounded border px-1.5 py-0.5 text-[10px] font-medium"
+                style={{
+                  borderColor: "#27272a",
+                  backgroundColor: "#18181b",
+                  color: "#a1a1aa",
+                }}
+                title={`Saved project — ${projectName}`}
+              >
+                <FileJson className="size-2.5 shrink-0 text-zinc-500" aria-hidden />
+                <span className="truncate">{projectName}</span>
+              </span>
+            )}
           </div>
           <div className="text-[11px]" style={{ color: "#71717a" }}>
             Multi-Track Video Studio · Native FFmpeg
@@ -173,7 +207,7 @@ export function Header({
 
       <div className="flex-1" />
 
-      {/* Undo / Redo (v4.3) */}
+      {/* Undo / Redo (v4.3) — v5.1: 28px icon-only buttons. */}
       <div className="flex items-center gap-1 rounded-lg border p-0.5" style={{ borderColor: "#27272a", backgroundColor: "#131316" }}>
         <button
           type="button"
@@ -182,10 +216,10 @@ export function Header({
           title="Undo (Ctrl+Z)"
           aria-label="Undo"
           className={cn(
-            "rounded-md p-1.5 transition-all active:scale-90",
+            "flex size-7 items-center justify-center rounded-md transition-all active:scale-90",
             canUndo
               ? "text-zinc-300 hover:bg-white/10 hover:text-white"
-              : "cursor-not-allowed text-zinc-600",
+              : "cursor-not-allowed text-zinc-600 opacity-40",
           )}
         >
           <Undo2 className="size-4" />
@@ -198,10 +232,10 @@ export function Header({
           title="Redo (Ctrl+Shift+Z)"
           aria-label="Redo"
           className={cn(
-            "rounded-md p-1.5 transition-all active:scale-90",
+            "flex size-7 items-center justify-center rounded-md transition-all active:scale-90",
             canRedo
               ? "text-zinc-300 hover:bg-white/10 hover:text-white"
-              : "cursor-not-allowed text-zinc-600",
+              : "cursor-not-allowed text-zinc-600 opacity-40",
           )}
         >
           <Redo2 className="size-4" />
@@ -305,14 +339,15 @@ export function Header({
         </div>
       )}
 
-      {/* Export button */}
+      {/* Export button — v5.1 CapCut: cyan→emerald gradient primary action
+          (hover brightness, desaturated while disabled). */}
       {!isExporting && (
         <button
           type="button"
           onClick={onExport}
           disabled={imageCount === 0}
           className={cn(
-            "ff-btn-primary flex items-center gap-2 rounded-md px-4 py-2 text-[13px] font-semibold transition-all",
+            "ff-btn-export flex h-10 items-center gap-2 rounded-lg px-4 text-[13px] font-semibold transition-all",
             "active:scale-[0.97] active:brightness-90",
             imageCount === 0 && "cursor-not-allowed opacity-50 grayscale",
           )}

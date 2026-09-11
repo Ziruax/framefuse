@@ -127,6 +127,11 @@ export interface ItemEdit {
   trimInMs?: number;
   /** Playback volume 0..2, 1 = unity. */
   volume?: number;
+  /** v5.1: playback speed for VIDEO clips, 0.25..4 (default undefined = 1).
+   *  The timeline duration is the SOURCE window divided by speed — a 10s
+   *  source window at 2× becomes a 5s timeline clip. Images and overlay-lane
+   * clips resolve speed 1 (the export overlay graph is speed-1 by design). */
+  speed?: number;
   /** Chroma key settings — stored RAW here; chroma.ts owns sanitization
    *  (sanitizeChromaKeySettings) at the UI boundary. */
   chroma?: ChromaKeySettings;
@@ -169,6 +174,9 @@ export interface MediaSegment {
   trimInMs: number;
   /** Full source duration for video items when known, else null. */
   sourceDurationMs: number | null;
+  /** v5.1: resolved playback speed (videos on the base lane, 0.25..4;
+   *  images / overlays = 1). durationMs = sourceWindow / speed. */
+  speed: number;
   /** Resolved chroma key settings or null. NOT sanitized in the timeline —
    *  chroma.ts owns sanitization at the UI boundary. */
   chroma: ChromaKeySettings | null;
@@ -482,7 +490,8 @@ export type TransitionStyle =
   | "slide-left"
   | "slide-right"
   | "wipe-left"
-  | "wipe-right";
+  | "wipe-right"
+  | "circleopen";
 
 export interface TransitionSettings {
   style: TransitionStyle;
@@ -612,6 +621,11 @@ export const TRANSITION_STYLE_INFO: Record<
     hint: "The next segment is wiped in from the left edge.",
     xfade: "wiperight",
   },
+  circleopen: {
+    label: "Circle",
+    hint: "The next segment reveals through an expanding circle from the center.",
+    xfade: "circleopen",
+  },
 };
 
 // Augment the window with the Electron bridge (optional, only present in app).
@@ -637,6 +651,32 @@ declare global {
       cancelExport: () => Promise<boolean>;
       onExportProgress: (cb: (d: ExportProgress) => void) => () => void;
       onMenu: (channel: string, cb: (d?: unknown) => void) => () => void;
+      /** v5.1: result of the async GPU-encoder probe (export-tab badge). */
+      getExportInfo: () => Promise<{ encoder: string; encoderName: string }>;
+      /** ── v5.1 Native Whisper (utilityProcess service) ──
+       * transcribe: main decodes via ffmpeg + runs onnxruntime-node; progress
+       * streams via onWhisperProgress. */
+      whisperTranscribe: (p: {
+        name: string;
+        bytes: ArrayBuffer;
+        language?: string;
+      }) => Promise<{
+        chunks: Array<{ text: string; timestamp: [number | null, number | null] }> | null;
+        language: string | null;
+        wordLevel: boolean;
+        durationMs: number;
+      }>;
+      whisperPreload: () => Promise<{ ok: boolean }>;
+      whisperCancel: () => Promise<number>;
+      onWhisperProgress: (cb: (d: { progress: number; status: string }) => void) => () => void;
+      /** ── v5.1 native project files (dialog-backed) ── */
+      saveProject: (p: { doc: unknown; currentPath?: string | null }) => Promise<{ path: string; name: string } | null>;
+      saveProjectAs: (p: { doc: unknown }) => Promise<{ path: string; name: string } | null>;
+      openProject: () => Promise<{ path: string; name: string; doc: unknown } | null>;
+      recentProjects: () => Promise<Array<{ path: string; name: string; savedAt: number }>>;
+      removeRecentProject: (p: { path: string }) => Promise<boolean>;
+      /** v5.1: absolute path of a picked File (Electron ≥ 32 removed File.path). */
+      getFilePath: (file: File) => string | null;
       /** Export the full-timeline ASS subtitle file (sidecar). v4.1 */
       exportAssFile: (opts: {
         cues: unknown[];

@@ -34,8 +34,8 @@ export function middleEllipsis(name: string, max = 42): string {
  */
 export function splitMiddle(
   name: string,
-  minSplit = 34,
-  tailLen = 14,
+  minSplit = 30,
+  tailLen = 11,
 ): { head: string; tail: string } {
   if (name.length <= minSplit) return { head: name, tail: "" };
   // Never split inside a short extension like ".jpg" (up to 5 chars).

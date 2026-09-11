@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   ChevronDown,
   Zap,
+  Cpu,
   Film,
   Captions,
   AudioLines,
@@ -144,6 +145,12 @@ interface SettingsPanelProps {
   onRemoveHeadline: (id: string) => void;
   /** Master timeline duration (for headline default windows). */
   totalMs: number;
+  /** v5.1: assign a random transition mix to every boundary (page owns the
+   *  base-lane boundary list; one commit = one undo step). */
+  onRandomMix?: () => void;
+  /** v5.1: number of boundaries the random mix would cover (enables the
+   *  button; 0/undefined hides it). */
+  boundaryCount?: number;
   debug: {
     imageCount: number;
     mode: string | null;
@@ -170,11 +177,17 @@ function Section({
 }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <div className="border-b" style={{ borderColor: "#27272a" }}>
+    // v5.1 CapCut: uniform section CARD — rounded-lg, 1px #27272a border,
+    // #131316 body, 12px uppercase zinc-500 header with tracking (was a
+    // full-width border-b list row). Logic (accordion state) unchanged.
+    <div
+      className="mx-2 mb-2 overflow-hidden rounded-lg border"
+      style={{ borderColor: "#27272a", backgroundColor: "#131316" }}
+    >
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-2 rounded-none px-4 py-3 text-left transition-colors hover:bg-white/5"
+        className="flex w-full items-center gap-2 rounded-none px-3 py-2.5 text-left transition-colors hover:bg-white/5"
         aria-expanded={open}
       >
         {/* v4.8: one rotating chevron (was a two-icon swap) — the motion
@@ -187,11 +200,11 @@ function Section({
           )}
         />
         <span className="shrink-0 text-zinc-400">{icon}</span>
-        <span className="flex-1 text-xs font-semibold uppercase tracking-wider text-zinc-300">
+        <span className="flex-1 text-xs font-semibold uppercase tracking-wide text-zinc-500">
           {title}
         </span>
       </button>
-      {open && <div className="px-4 pb-4 pt-1">{children}</div>}
+      {open && <div className="px-3 pb-3 pt-1">{children}</div>}
     </div>
   );
 }
@@ -439,10 +452,37 @@ export function SettingsPanel(props: SettingsPanelProps) {
     onUpdateHeadline,
     onRemoveHeadline,
     totalMs,
+    onRandomMix,
+    boundaryCount,
     debug,
   } = props;
 
   const zoomMax = 1.06 + (kenBurns.intensity / 100) * 0.18;
+
+  // v5.1: async GPU-encoder probe (Electron only) for the export-tab badge.
+  const [exportInfo, setExportInfo] = useState<{
+    encoder: string;
+    encoderName: string;
+  } | null>(null);
+  useEffect(() => {
+    if (!inElectron) return; // browser: no badge
+    const api = window.electronAPI;
+    if (!api?.getExportInfo) return;
+    let cancelled = false;
+    api
+      .getExportInfo()
+      .then((info) => {
+        if (!cancelled && info && typeof info.encoderName === "string") {
+          setExportInfo(info);
+        }
+      })
+      .catch(() => {
+        /* probe failed — no badge */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [inElectron]);
 
   // Ken Burns pool toggle: clicking a chip toggles it in the pool while
   // staying in "random" mode (2+ selected = random among those). A single
@@ -612,7 +652,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 onClick={() => setTab(t.id)}
                 className={cn(
                   "group relative flex flex-col items-center gap-1 px-1 py-2.5 transition-colors duration-150",
-                  active ? "bg-white/[0.04]" : "hover:bg-white/[0.03]",
+                  active ? "bg-[#18181b]" : "hover:bg-white/[0.03]",
                 )}
               >
                 <span className="relative flex items-center">
@@ -656,14 +696,16 @@ export function SettingsPanel(props: SettingsPanelProps) {
               </button>
             );
           })}
-          {/* Sliding accent indicator under the active tab. */}
+          {/* v5.1 CapCut: the active tab's CYAN TOP BORDER — a sliding 2px
+              indicator along the rail's top edge (icon keeps its semantic
+              accent; the rail accent itself is the app's cyan). */}
           <span
             aria-hidden
-            className="pointer-events-none absolute bottom-0 left-0 h-[2px] w-1/5 transition-all duration-200 ease-out"
+            className="pointer-events-none absolute left-0 top-0 h-[2px] w-1/5 transition-all duration-200 ease-out"
             style={{
               transform: `translateX(${activeTabIndex * 100}%)`,
-              backgroundColor: activeTab.accent,
-              boxShadow: `0 0 8px ${activeTab.glow}`,
+              backgroundColor: "#22d3ee",
+              boxShadow: "0 0 8px rgba(34, 211, 238, 0.55)",
             }}
           />
         </div>
@@ -674,7 +716,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
           role="tabpanel"
           aria-labelledby="ff-settings-tab-media"
           tabIndex={tab === "media" ? 0 : -1}
-          className={cn("pb-2", tab === "media" ? "ff-tab-panel-in" : "hidden")}
+          className={cn("pb-2 pt-2", tab === "media" ? "ff-tab-panel-in" : "hidden")}
         >
           {/* ─── Ken Burns ─────────────────────────────────────────────── */}
           <Section
@@ -707,7 +749,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                   })
                 }
                 disabled={!kenBurns.enabled}
-                className="w-full accent-emerald-500"
+                className="w-full accent-cyan-500"
                 aria-label="Ken Burns zoom intensity"
               />
             </Field>
@@ -774,10 +816,31 @@ export function SettingsPanel(props: SettingsPanelProps) {
           aria-labelledby="ff-settings-tab-export"
           tabIndex={tab === "export" ? 0 : -1}
           className={cn(
-            "pb-2",
+            "pb-2 pt-2",
             tab === "export" ? "ff-tab-panel-in" : "hidden",
           )}
         >
+          {/* v5.1: encoder badge — bordered chip, Zap (GPU) / Cpu (software)
+              icon + label (Electron only; hidden in the browser). */}
+          {exportInfo && (
+            <div
+              className="ff-fade-up mb-3 flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-[10px] font-medium"
+              style={{
+                borderColor: "rgba(14, 116, 144, 0.55)",
+                backgroundColor: "rgba(8, 51, 68, 0.25)",
+                color: "#67e8f9",
+              }}
+              title={`Exports encode with ${exportInfo.encoderName} (${exportInfo.encoder})`}
+            >
+              {/nvenc|qsv|amf|videotoolbox|hw/i.test(exportInfo.encoder) ? (
+                <Zap size={12} aria-hidden />
+              ) : (
+                <Cpu size={12} aria-hidden />
+              )}
+              Video encoder: {exportInfo.encoderName}
+            </div>
+          )}
+
           {/* ─── Video ─────────────────────────────────────────────────── */}
           <Section icon={<Film size={13} />} title="Video" defaultOpen>
             {/* v4.5: one-click encode-quality profiles. */}
@@ -943,7 +1006,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                     quality: "custom",
                   })
                 }
-                className="w-full accent-emerald-500"
+                className="w-full accent-cyan-500"
                 aria-label="Video bitrate"
               />
             </Field>
@@ -968,7 +1031,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                     quality: "custom",
                   })
                 }
-                className="w-full accent-emerald-500"
+                className="w-full accent-cyan-500"
                 aria-label="Constant quality factor"
               />
               <p className="mt-0.5 text-[9px]" style={{ color: "#52525b" }}>
@@ -998,7 +1061,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
           aria-labelledby="ff-settings-tab-effects"
           tabIndex={tab === "effects" ? 0 : -1}
           className={cn(
-            "pb-2",
+            "pb-2 pt-2",
             tab === "effects" ? "ff-tab-panel-in" : "hidden",
           )}
         >
@@ -1011,6 +1074,8 @@ export function SettingsPanel(props: SettingsPanelProps) {
             <TransitionSection
               transition={transition}
               onTransitionChange={onTransitionChange}
+              onRandomMix={onRandomMix}
+              boundaryCount={boundaryCount}
             />
           </Section>
 
@@ -1045,7 +1110,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
           role="tabpanel"
           aria-labelledby="ff-settings-tab-audio"
           tabIndex={tab === "audio" ? 0 : -1}
-          className={cn("pb-2", tab === "audio" ? "ff-tab-panel-in" : "hidden")}
+          className={cn("pb-2 pt-2", tab === "audio" ? "ff-tab-panel-in" : "hidden")}
         >
           <Section icon={<AudioLines size={13} />} title="Audio" defaultOpen>
             <Row label="Normalize loudness">
@@ -1081,7 +1146,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                     fadeInMs: Number(e.target.value),
                   })
                 }
-                className="w-full accent-emerald-500"
+                className="w-full accent-cyan-500"
                 aria-label="Audio fade in"
               />
             </Field>
@@ -1105,7 +1170,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                     fadeOutMs: Number(e.target.value),
                   })
                 }
-                className="w-full accent-emerald-500"
+                className="w-full accent-cyan-500"
                 aria-label="Audio fade out"
               />
             </Field>
@@ -1119,7 +1184,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
           aria-labelledby="ff-settings-tab-captions"
           tabIndex={tab === "captions" ? 0 : -1}
           className={cn(
-            "pb-2",
+            "pb-2 pt-2",
             tab === "captions" ? "ff-tab-panel-in" : "hidden",
           )}
         >
@@ -1184,16 +1249,25 @@ const TX_STYLE_ORDER: TransitionStyle[] = [
   "slide-right",
   "wipe-left",
   "wipe-right",
+  "circleopen",
 ];
 
 function TransitionSection({
   transition,
   onTransitionChange,
+  onRandomMix,
+  boundaryCount = 0,
 }: {
   transition: TransitionSettings;
   onTransitionChange: (t: TransitionSettings) => void;
+  /** v5.1: random mix across every boundary (page-level handler — it owns
+   *  the boundary list + the single-commit history push). */
+  onRandomMix?: () => void;
+  boundaryCount?: number;
 }) {
   const info = TRANSITION_STYLE_INFO[transition.style];
+  const hasOverrides =
+    !!transition.overrides && Object.keys(transition.overrides).length > 0;
   return (
     <div>
       <Field
@@ -1249,6 +1323,37 @@ function TransitionSection({
         </div>
       </Field>
 
+      {/* v5.1: one-click boundary strategies. Random mix pins a no-repeat
+          random style to EVERY boundary via the overrides map (page-level,
+          one undo step); Apply-to-all keeps the global style and clears the
+          overrides. */}
+      {(onRandomMix != null || hasOverrides) && boundaryCount > 0 && (
+        <div className="mb-3 flex items-center gap-1.5">
+          {onRandomMix != null && boundaryCount > 1 && (
+            <button
+              type="button"
+              onClick={onRandomMix}
+              className="ff-btn-ghost flex flex-1 items-center justify-center gap-1.5 rounded-md border px-2 py-1.5 text-[10px] font-semibold transition-all duration-150 active:scale-[0.97]"
+              title={`Assign a random transition (no back-to-back repeats) to all ${boundaryCount} boundaries`}
+            >
+              <Dices className="size-3" /> Random mix
+            </button>
+          )}
+          {hasOverrides && (
+            <button
+              type="button"
+              onClick={() =>
+                onTransitionChange({ ...transition, overrides: undefined })
+              }
+              className="ff-btn-ghost flex flex-1 items-center justify-center gap-1.5 rounded-md border px-2 py-1.5 text-[10px] font-semibold transition-all duration-150 active:scale-[0.97]"
+              title="Use the global style everywhere — clears every per-boundary pin"
+            >
+              <RotateCcw className="size-3" /> Apply to all
+            </button>
+          )}
+        </div>
+      )}
+
       {transition.style !== "none" && (
         <Field
           label={`Duration — ${(transition.durationMs / 1000).toFixed(1)}s`}
@@ -1266,7 +1371,7 @@ function TransitionSection({
                 durationMs: Number(e.target.value),
               })
             }
-            className="w-full accent-fuchsia-500"
+            className="w-full accent-cyan-500"
             aria-label="Transition duration"
           />
         </Field>
@@ -1446,7 +1551,7 @@ function WatermarkSection({
                   sizePercent: Number(e.target.value),
                 })
               }
-              className="w-full accent-emerald-500"
+              className="w-full accent-cyan-500"
               aria-label="Watermark size"
             />
           </Field>
@@ -1464,7 +1569,7 @@ function WatermarkSection({
                   opacity: Number(e.target.value),
                 })
               }
-              className="w-full accent-emerald-500"
+              className="w-full accent-cyan-500"
               aria-label="Watermark opacity"
             />
           </Field>
@@ -1485,7 +1590,7 @@ function WatermarkSection({
                   marginPercent: Number(e.target.value),
                 })
               }
-              className="w-full accent-emerald-500"
+              className="w-full accent-cyan-500"
               aria-label="Watermark margin"
             />
           </Field>
@@ -1733,7 +1838,7 @@ function HeadlineSection({
                     onChange={(e) =>
                       onUpdate(item.id, { sizeScale: Number(e.target.value) })
                     }
-                    className="w-full accent-amber-500"
+                    className="w-full accent-cyan-500"
                     aria-label={`Headline ${idx + 1} size`}
                   />
                 </Field>

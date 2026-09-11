@@ -42,6 +42,7 @@ import {
   MoveDiagonal,
   AudioLines,
   FileVideo,
+  Gauge,
   Layers,
   Play,
   SlidersHorizontal,
@@ -411,6 +412,7 @@ export function MediaPanelBase({
             type="button"
             onClick={() => onMediaViewChange("list")}
             aria-pressed={mediaView === "list"}
+            aria-label="List view"
             title="List view — details, durations, boundary links"
             className={cn(
               "flex items-center justify-center rounded-[4px] p-1.5 transition-all duration-150",
@@ -425,6 +427,7 @@ export function MediaPanelBase({
             type="button"
             onClick={() => onMediaViewChange("grid")}
             aria-pressed={mediaView === "grid"}
+            aria-label="Grid view"
             title="Grid view — compact tiles for large storyboards"
             className={cn(
               "flex items-center justify-center rounded-[4px] p-1.5 transition-all duration-150",
@@ -440,6 +443,7 @@ export function MediaPanelBase({
         <button
           type="button"
           onClick={onSaveProject}
+          aria-label="Save project"
           className="ff-btn-ghost flex items-center gap-1 rounded-md px-2 py-1.5 text-[11px] font-medium"
           title="Save the full session (media + captions + headlines + settings) as a self-contained .framefuse.json"
         >
@@ -448,6 +452,7 @@ export function MediaPanelBase({
         <button
           type="button"
           onClick={onOpenProject}
+          aria-label="Open project"
           className="ff-btn-ghost flex items-center gap-1 rounded-md px-2 py-1.5 text-[11px] font-medium"
           title="Open a saved .framefuse.json project"
         >
@@ -467,21 +472,29 @@ export function MediaPanelBase({
               onDragLeave={() => setDragOver(false)}
               onDrop={handleDrop}
               onClick={openImagePicker}
-              className="ff-grid-bg flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-12 text-center transition-all duration-200"
+              data-dragging={dragOver ? "true" : undefined}
+              className="ff-dropzone ff-grid-bg flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-[#3f3f46] px-6 py-12 text-center transition-all duration-200 hover:border-cyan-500/60 hover:bg-cyan-950/20"
               style={{
-                borderColor: dragOver ? "#7c3aed" : "#3f3f46",
-                backgroundColor: dragOver ? "rgba(124, 58, 237, 0.1)" : "transparent",
-                boxShadow: dragOver ? "0 0 32px rgba(124, 58, 237, 0.25) inset" : "none",
+                ...(dragOver
+                  ? {
+                      borderColor: "#06b6d4",
+                      backgroundColor: "rgba(8, 51, 68, 0.25)",
+                      boxShadow: "0 0 32px rgba(6, 182, 212, 0.25) inset",
+                    }
+                  : {}),
               }}
             >
               <div
                 className="mb-3 flex size-12 items-center justify-center rounded-full transition-transform duration-200"
                 style={{
-                  backgroundColor: dragOver ? "rgba(124, 58, 237, 0.25)" : "#27272a",
+                  backgroundColor: dragOver ? "rgba(6, 182, 212, 0.22)" : "#27272a",
                   transform: dragOver ? "scale(1.08)" : "scale(1)",
                 }}
               >
-                <Upload className="size-5" style={{ color: "#a1a1aa" }} />
+                <Upload
+                  className="size-5"
+                  style={{ color: dragOver ? "#67e8f9" : "#a1a1aa" }}
+                />
               </div>
               <p
                 className="text-[13px] font-medium"
@@ -532,14 +545,17 @@ export function MediaPanelBase({
               onDragLeave={() => setDragOver(false)}
               onDrop={handleDrop}
               onClick={openImagePicker}
-              className="mb-2 flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-dashed py-2.5 text-[11px] font-semibold transition-all duration-200 hover:border-violet-500/50 hover:bg-violet-500/5 hover:text-zinc-200 active:scale-[0.98]"
-              style={{
-                borderColor: dragOver ? "#7c3aed" : "#2e2e33",
-                color: dragOver ? "#c4b5fd" : "#a8a8b0",
-                backgroundColor: dragOver
-                  ? "rgba(124, 58, 237, 0.1)"
-                  : "transparent",
-              }}
+              data-dragging={dragOver ? "true" : undefined}
+              className="ff-dropzone mb-2 flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-dashed border-[#2e2e33] py-2.5 text-[11px] font-semibold text-[#a8a8b0] transition-all duration-200 hover:border-cyan-500/60 hover:bg-cyan-950/20 hover:text-zinc-200 active:scale-[0.98]"
+              style={
+                dragOver
+                  ? {
+                      borderColor: "#06b6d4",
+                      color: "#67e8f9",
+                      backgroundColor: "rgba(8, 51, 68, 0.25)",
+                    }
+                  : undefined
+              }
             >
               <Plus
                 className={cn(
@@ -764,6 +780,7 @@ export function MediaPanelBase({
                           }}
                           className="flex items-center justify-center rounded bg-black/70 p-1 backdrop-blur-sm transition-colors hover:bg-red-500/40"
                           style={{ color: "#d4d4d8" }}
+                          aria-label={`Remove segment ${idx + 1}`}
                           title="Remove"
                         >
                           <Trash2 className="size-3" />
@@ -981,13 +998,16 @@ export function MediaPanelBase({
                     setDropTargetIdx(null);
                   }}
                   className={cn(
-                    "group relative flex items-center gap-2.5 rounded-lg border p-2 transition-all duration-150 hover:-translate-y-px",
-                    draggedId === seg.id && "opacity-40",
+                    // v5.1 CapCut: card row — #1a1a1e hover fill (was inline
+                    // #18181b, moved to classes so the hover state can win).
+                    "group relative flex items-center gap-2.5 rounded-lg border border-[#27272a] bg-[#18181b] p-2 transition-all duration-150 hover:-translate-y-px hover:bg-[#1a1a1e]",
+                    draggedId === seg.id && "bg-[#0f0f11] opacity-40",
                     dropTargetIdx === idx && draggedId && draggedId !== seg.id && "ring-1 ring-violet-400/70",
                   )}
                   style={{
-                    borderColor: dropTargetIdx === idx && draggedId ? "#8b5cf6" : "#27272a",
-                    backgroundColor: draggedId === seg.id ? "#0f0f11" : "#18181b",
+                    ...(dropTargetIdx === idx && draggedId
+                      ? { borderColor: "#8b5cf6" }
+                      : {}),
                     cursor: draggedId ? "grabbing" : undefined,
                   }}
                 >
@@ -1109,6 +1129,7 @@ export function MediaPanelBase({
                             onClick={commitEdit}
                             className="rounded p-0.5 transition-colors hover:bg-white/10"
                             style={{ color: "#34d399" }}
+                            aria-label="Apply duration"
                             title="Apply duration"
                           >
                             <Check className="size-3.5" />
@@ -1118,6 +1139,7 @@ export function MediaPanelBase({
                             onClick={() => setEditingId(null)}
                             className="rounded p-0.5 transition-colors hover:bg-white/10"
                             style={{ color: "#71717a" }}
+                            aria-label="Cancel duration edit"
                             title="Cancel"
                           >
                             <X className="size-3.5" />
@@ -1370,6 +1392,7 @@ export function MediaPanelBase({
                       onClick={() => onDuplicate(seg.id)}
                       className="rounded-md p-1.5 opacity-40 transition-all hover:bg-violet-500/15 hover:opacity-100 group-hover:opacity-100"
                       style={{ color: "#c4b5fd" }}
+                      aria-label={`Duplicate segment ${idx + 1}`}
                       title="Duplicate segment"
                     >
                       <Copy className="size-3.5" />
@@ -1379,6 +1402,7 @@ export function MediaPanelBase({
                       onClick={() => onRemove(seg.id)}
                       className="rounded-md p-1.5 opacity-40 transition-all hover:bg-red-500/15 hover:text-red-400 group-hover:opacity-100"
                       style={{ color: "#a1a1aa" }}
+                      aria-label={`Remove segment ${idx + 1}`}
                       title="Remove"
                     >
                       <Trash2 className="size-3.5" />
@@ -2123,9 +2147,19 @@ function ClipSettings({
   // it as 0–200%.
   const volumePct = Math.round(Math.min(2, Math.max(0, edit?.volume ?? 1)) * 100);
   const trimInMs = Math.max(0, Math.round(edit?.trimInMs ?? seg.trimInMs ?? 0));
+  // v5.1: speed resolves on BASE-lane videos only — the timeline duration
+  // is the source window ÷ speed (seg.durationMs already carries it).
+  const speedEnabled = isVideo && !onOverlay;
+  const speedVal =
+    edit?.speed != null && Number.isFinite(edit.speed) && edit.speed > 0
+      ? Math.min(4, Math.max(0.25, edit.speed))
+      : 1;
+  const speedDurMs = Math.round(seg.durationMs); // timeline duration (window/speed)
+  // The TRIM slider sets the SOURCE window; maxTrim = what's left of the
+  // source after this clip's scaled window.
   const maxTrimMs =
     isVideo && sourceDurMs != null && sourceDurMs > 0
-      ? Math.max(0, Math.round(sourceDurMs - seg.durationMs))
+      ? Math.max(0, Math.round(sourceDurMs - speedDurMs * speedVal))
       : 0;
   const trimVal = Math.min(trimInMs, maxTrimMs);
 
@@ -2260,6 +2294,91 @@ function ClipSettings({
           )}
         </div>
 
+        {/* Speed (base-lane video only, v5.1) */}
+        <div className={cn(!speedEnabled && "opacity-50")}>
+          <div className="mb-1 flex items-center justify-between">
+            <span
+              className="flex items-center gap-1 text-[8px] font-semibold uppercase tracking-[0.12em]"
+              style={{ color: "#71717a" }}
+            >
+              <Gauge className="size-2.5" /> Speed
+            </span>
+            <span
+              className="text-[9px] font-semibold tabular-nums"
+              style={{ color: speedVal !== 1 ? "#67e8f9" : "#a1a1aa" }}
+            >
+              {speedVal === 1 ? "normal" : `${speedVal}×`}
+              {isVideo && !onOverlay ? ` · ${fmtSec(speedDurMs)}` : ""}
+            </span>
+          </div>
+          <div
+            className="flex rounded-md border p-0.5"
+            role="radiogroup"
+            aria-label={`Playback speed for ${seg.fileName}`}
+            style={{ borderColor: "#27272a", backgroundColor: "rgba(9, 9, 11, 0.5)" }}
+          >
+            {[0.5, 1, 1.5, 2].map((v) => {
+              const active = Math.abs(speedVal - v) < 0.001;
+              return (
+                <button
+                  key={v}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  disabled={!speedEnabled}
+                  onClick={() =>
+                    onSetItemEdit(seg.id, v === 1 ? { speed: undefined } : { speed: v })
+                  }
+                  title={
+                    v === 1
+                      ? "Normal speed — clears the speed edit"
+                      : `${v}× playback — the timeline clip shortens to source window ÷ ${v}`
+                  }
+                  className={cn(
+                    "flex-1 rounded px-1 py-1 text-[9px] font-semibold tabular-nums transition-all duration-150 disabled:cursor-not-allowed",
+                    !active && "text-zinc-500 hover:text-zinc-300",
+                  )}
+                  style={
+                    active
+                      ? {
+                          backgroundColor: "rgba(8, 51, 68, 0.55)",
+                          color: "#67e8f9",
+                          boxShadow: "inset 0 0 0 1px rgba(34, 211, 238, 0.4)",
+                        }
+                      : undefined
+                  }
+                >
+                  {v === 1 ? "1×" : `${v}×`}
+                </button>
+              );
+            })}
+          </div>
+          <input
+            type="range"
+            min={0.25}
+            max={4}
+            step={0.05}
+            value={speedVal}
+            disabled={!speedEnabled}
+            onChange={(e) => {
+              const v = Number(e.target.value);
+              onSetItemEdit(
+                seg.id,
+                Math.abs(v - 1) < 0.001 ? { speed: undefined } : { speed: v },
+              );
+            }}
+            aria-label={`Custom playback speed for ${seg.fileName}`}
+            className="mt-1 w-full accent-cyan-500 disabled:cursor-not-allowed"
+          />
+          {!speedEnabled && (
+            <p className="mt-0.5 px-0.5 text-[9px]" style={{ color: "#52525b" }}>
+              {isVideo
+                ? "Speed works on the Video track — overlays play at native rate."
+                : "Video only — images have no speed."}
+            </p>
+          )}
+        </div>
+
         {/* Trim start (video only) */}
         <div className={cn(!isVideo && "opacity-50")}>
           <div className="mb-1 flex items-center justify-between">
@@ -2289,7 +2408,13 @@ function ClipSettings({
           <p className="mt-0.5 px-0.5 text-[9px]" style={{ color: "#52525b" }}>
             {isVideo
               ? sourceDurMs != null
-                ? `source ${fmtSec(sourceDurMs)} · window ${fmtSec(trimVal)} → ${fmtSec(trimVal + seg.durationMs)}`
+                ? `source ${fmtSec(sourceDurMs)} · window ${fmtSec(trimVal)} → ${fmtSec(
+                    trimVal + speedDurMs * speedVal,
+                  )}${
+                    speedVal !== 1
+                      ? ` · clip ${fmtSec(speedDurMs)} at ${speedVal}×`
+                      : ""
+                  }`
                 : "Source duration not probed yet — trim unavailable."
               : "Video only — images use the full frame."}
           </p>
@@ -2696,22 +2821,22 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
 
   return (
     <div
-      className="rounded-lg border p-2.5"
-      style={{ borderColor: "rgba(6, 182, 212, 0.35)", backgroundColor: "rgba(8, 51, 68, 0.18)" }}
+      className="ff-fade-up rounded-lg border p-2.5"
+      style={{ borderColor: "rgba(245, 158, 11, 0.3)", backgroundColor: "rgba(120, 53, 15, 0.12)" }}
     >
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
-        className="flex w-full items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.12em] transition-colors hover:text-cyan-200"
-        style={{ color: "#a5f3fc" }}
+        className="flex w-full items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.12em] transition-colors hover:text-amber-200"
+        style={{ color: "#fcd34d" }}
       >
         <AudioLines className="size-3.5 shrink-0" />
         Sound effects
         {sfxItems != null && sfxItems.length > 0 && (
           <span
             className="rounded-full px-1.5 py-0.5 text-[8px] font-bold"
-            style={{ backgroundColor: "rgba(34, 211, 238, 0.2)", color: "#a5f3fc" }}
+            style={{ backgroundColor: "rgba(245, 158, 11, 0.18)", color: "#fcd34d" }}
           >
             {sfxItems.length}
           </span>
@@ -2722,7 +2847,7 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
 
       {open && (
         <div className="mt-2 space-y-2">
-          <p className="text-[9px]" style={{ color: "#67e8f9" }}>
+          <p className="text-[9px]" style={{ color: "#fcd34d" }}>
             Click a chip to preview it · <span className="font-semibold">+</span> places it at the
             playhead ({playhead})
           </p>
@@ -2756,12 +2881,15 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
                         }}
                         title={`${def.hint} (${def.defaultDurMs} ms)`}
                         className={cn(
-                          "group/chip flex cursor-pointer select-none items-center gap-1 rounded-md border px-1.5 py-1 transition-all duration-150 hover:border-cyan-400/50 hover:bg-cyan-400/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70 active:scale-[0.98]",
-                          playing && "border-cyan-400/70 bg-cyan-400/15",
+                          // v5.1 CapCut: amber SFX chips (VIDEO=cyan /
+                          // OVL=violet / SFX=amber kind system) with a real
+                          // press feedback (scale + brightness).
+                          "group/chip flex cursor-pointer select-none items-center gap-1 rounded-md border px-1.5 py-1 transition-all duration-150 hover:border-amber-400/50 hover:bg-amber-400/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/70 active:scale-[0.95] active:brightness-110",
+                          playing && "border-amber-400/70 bg-amber-400/15",
                         )}
                         style={{
-                          borderColor: playing ? "rgba(34, 211, 238, 0.7)" : "rgba(34, 211, 238, 0.25)",
-                          backgroundColor: playing ? "rgba(34, 211, 238, 0.12)" : "rgba(9, 9, 11, 0.45)",
+                          borderColor: playing ? "rgba(245, 158, 11, 0.7)" : "rgba(245, 158, 11, 0.28)",
+                          backgroundColor: playing ? "rgba(245, 158, 11, 0.12)" : "rgba(9, 9, 11, 0.45)",
                         }}
                       >
                         <span aria-hidden className={cn("text-[12px] leading-none", playing && "animate-pulse")}>
@@ -2773,7 +2901,7 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
                         >
                           {def.label}
                         </span>
-                        <span className="shrink-0 text-[8px] tabular-nums" style={{ color: "#67e8f9" }}>
+                        <span className="shrink-0 text-[8px] tabular-nums" style={{ color: "#fcd34d" }}>
                           {def.defaultDurMs}ms
                         </span>
                         <button
@@ -2784,8 +2912,8 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
                           }}
                           aria-label={`Add ${def.label} at playhead ${playhead}`}
                           title={`Add at playhead (${playhead})`}
-                          className="flex size-5 shrink-0 items-center justify-center rounded transition-colors hover:bg-cyan-400/25"
-                          style={{ color: "#a5f3fc" }}
+                          className="flex size-5 shrink-0 items-center justify-center rounded transition-all hover:bg-amber-400/25 active:scale-90"
+                          style={{ color: "#fcd34d" }}
                         >
                           <Plus className="size-3" />
                         </button>
@@ -2798,7 +2926,7 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
           })}
 
           {sfxItems != null && (
-            <div className="border-t pt-1.5" style={{ borderColor: "rgba(34, 211, 238, 0.2)" }}>
+            <div className="border-t pt-1.5" style={{ borderColor: "rgba(245, 158, 11, 0.2)" }}>
               <p
                 className="mb-1 text-[8px] font-semibold uppercase tracking-wider"
                 style={{ color: "#71717a" }}
@@ -2838,7 +2966,7 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
                         </span>
                         <span
                           className="shrink-0 text-[9px] tabular-nums"
-                          style={{ color: "#67e8f9" }}
+                          style={{ color: "#fcd34d" }}
                           title="Start time"
                         >
                           {fmtTimecode(item.startMs)}
@@ -2873,8 +3001,8 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
                           }}
                           aria-label={`Preview ${def?.label ?? "effect"}`}
                           title="Preview"
-                          className="flex size-5 shrink-0 items-center justify-center rounded transition-colors hover:bg-cyan-400/25"
-                          style={{ color: "#67e8f9" }}
+                          className="flex size-5 shrink-0 items-center justify-center rounded transition-all hover:bg-amber-400/25 active:scale-90"
+                          style={{ color: "#fcd34d" }}
                         >
                           <Play className="size-3" />
                         </button>

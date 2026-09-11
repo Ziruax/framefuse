@@ -169,8 +169,18 @@ interface ResolvedEntry {
   volume: number;
   trimInMs: number;
   sourceDurationMs: number | null;
+  /** v5.1: resolved playback speed. BASE-lane videos honor edit.speed
+   *  (clamped 0.25..4); images and overlay-lane items are locked to 1 —
+   *  the FFmpeg overlay graph composites overlays at native rate. */
+  speed: number;
   chroma: ChromaKeySettings | null;
   overlay: OverlayTransform | null;
+}
+
+/** v5.1: clamp a playback speed edit to the supported 0.25..4 window. */
+function clampSpeed(v: number | undefined | null): number {
+  const n = typeof v === "number" && Number.isFinite(v) ? v : 1;
+  return Math.max(0.25, Math.min(4, n)) || 1;
 }
 
 function resolveEntry(
@@ -188,6 +198,8 @@ function resolveEntry(
   const trimInMs = numOr(edit?.trimInMs, 0);
   const sourceDurationMs: number | null =
     mediaType === "video" ? numOr(videoDurations?.[e.id], 0) || null : null;
+  // v5.1: speed only on BASE-lane VIDEO items (see ResolvedEntry.speed).
+  const speed = mediaType === "video" && track === 0 ? clampSpeed(edit?.speed) : 1;
   return {
     entry: e,
     mediaType,
@@ -195,6 +207,7 @@ function resolveEntry(
     volume,
     trimInMs,
     sourceDurationMs,
+    speed,
     // Raw passthrough — chroma.ts owns sanitization at the UI boundary.
     chroma: edit?.chroma ?? null,
     overlay: edit?.overlay ?? null,
@@ -229,9 +242,25 @@ function makeSegment(
     volume: r.volume,
     trimInMs: r.trimInMs,
     sourceDurationMs: r.sourceDurationMs,
+    speed: r.speed,
     chroma: r.chroma,
     overlay: r.overlay,
   };
+}
+
+/** v5.1: scale a resolved natural (source-window) duration to the TIMELINE
+ *  duration for a base-lane video: source window / speed. speed 1 (the
+ *  default everywhere) divides by 1 → the v5.0 value is returned unchanged,
+ *  so every pre-v5.1 project resolves byte-identical durations.
+ *  EXPLICIT user overrides are NEVER passed here — an override (drag trim,
+ *  duration slider, split half) is the FINAL timeline duration the user
+ *  sees, not a source quantity; only the implicit defaults (filename
+ *  range/beat tail/duration pattern/source length) are source windows. */
+function scaleDur(r: ResolvedEntry, durMs: number): number {
+  if (r.mediaType !== "video" || r.track !== 0 || r.speed === 1 || r.speed <= 0) {
+    return durMs;
+  }
+  return durMs / r.speed;
 }
 
 /**
@@ -340,7 +369,18 @@ export function buildTimeline(
 
     for (const we of withEnds) {
       const startMs = we.r.entry.parsed.startMs ?? 0;
-      const endMs = Math.max(startMs + 200, we.endMs); // min 200ms
+      // v5.1: an explicit override is the FINAL timeline duration (applied
+      // above, possibly overlap-clipped since) — NOT divided by speed. Only
+      // the implicit window (natural end − start) is a source window that
+      // speed rescales.
+      const ov = overrides[we.r.entry.id];
+      const endMs =
+        ov && ov > 0
+          ? Math.max(startMs + 200, we.endMs) // min 200ms
+          : Math.max(
+              startMs + 200,
+              startMs + scaleDur(we.r, we.endMs - startMs),
+            ); // min 200ms
       const dir =
         motionOverrides?.[we.r.entry.id] ??
         resolveDirection(we.r.entry.id, kenBurns.direction, kenBurns.directionPool);
@@ -374,7 +414,11 @@ export function buildTimeline(
               ? e.parsed.durationMs
               : r.sourceDurationMs ?? DEFAULT_DURATION_MS;
         const startMs = cursor;
-        const endMs = cursor + Math.max(200, dur);
+        // v5.1: an override is the final timeline duration (unscaled); the
+        // implicit source window is what speed divides.
+        const endMs =
+          cursor +
+          Math.max(200, ov && ov > 0 ? ov : scaleDur(r, dur));
         const dir =
           motionOverrides?.[e.id] ??
           resolveDirection(e.id, kenBurns.direction, kenBurns.directionPool);
@@ -392,6 +436,9 @@ export function buildTimeline(
   } else {
     // Sequential: stack durations in original order. A video without an
     // explicit duration defaults to its source length (5000ms when unknown).
+    // v5.1: base-lane video durations are SOURCE windows — the timeline
+    // duration is window/speed, so the cursor (and every following clip)
+    // shifts left when a clip is sped up. Images are always speed 1.
     let cursor = 0;
     for (const r of baseEntries) {
       const e = r.entry;
@@ -405,7 +452,10 @@ export function buildTimeline(
               ? r.sourceDurationMs ?? DEFAULT_DURATION_MS
               : DEFAULT_DURATION_MS;
       const startMs = cursor;
-      const endMs = cursor + dur;
+      // v5.1: an override is the final timeline duration (unscaled); the
+      // implicit source window is what speed divides.
+      const endMs =
+        cursor + Math.max(200, ov && ov > 0 ? ov : scaleDur(r, dur));
       const dir =
         motionOverrides?.[e.id] ??
         resolveDirection(e.id, kenBurns.direction, kenBurns.directionPool);

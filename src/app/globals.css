@@ -41,15 +41,15 @@
   }
 }
 
-/* ===== Custom dark scrollbars ===== */
+/* ===== Custom dark scrollbars (v5.1 CapCut pass: 8px thin) ===== */
 * {
   scrollbar-width: thin;
   scrollbar-color: #3f3f46 transparent;
 }
 
 *::-webkit-scrollbar {
-  width: 9px;
-  height: 9px;
+  width: 8px;
+  height: 8px;
 }
 
 *::-webkit-scrollbar-track {
@@ -120,9 +120,9 @@ input[type="range"]:active::-moz-range-thumb {
   transform: scale(1.18);
 }
 
-/* ===== Selection ===== */
+/* ===== Selection (v5.1: cyan-500/30 — matches the playhead accent) ===== */
 ::selection {
-  background: rgba(124, 58, 237, 0.4);
+  background: rgba(6, 182, 212, 0.3);
   color: #ffffff;
 }
 
@@ -245,12 +245,21 @@ summary::-webkit-details-marker {
   animation: ff-beat-tick-live-pulse 0.42s ease-in-out infinite;
 }
 
-/* Focus-visible ring — consistent, keyboard-friendly. */
+/* Focus-visible ring — consistent, keyboard-friendly.
+   v5.1: cyan-500/60 across ALL interactive elements (buttons, inputs,
+   sliders, custom-widget roles, links, summaries). */
 button:focus-visible,
 input:focus-visible,
 select:focus-visible,
-textarea:focus-visible {
-  outline: 2px solid #7c3aed;
+textarea:focus-visible,
+a:focus-visible,
+summary:focus-visible,
+[role="button"]:focus-visible,
+[role="tab"]:focus-visible,
+[role="switch"]:focus-visible,
+[role="radio"]:focus-visible,
+[role="slider"]:focus-visible {
+  outline: 2px solid rgba(6, 182, 212, 0.6);
   outline-offset: 1px;
 }
 
@@ -258,6 +267,36 @@ textarea:focus-visible {
 .ff-scroll {
   scroll-behavior: smooth;
   overscroll-behavior: contain;
+}
+
+/* v5.1 — subtle 150ms ease-out fade + 2px slide (cards / chips mount feel).
+   The heavier ff-tab-panel-in (220ms, 6px) stays the tab-switch signature. */
+@keyframes ff-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.ff-fade-up {
+  animation: ff-fade-up 150ms ease-out;
+}
+
+/* v5.1 — CapCut-grade motion off-switch: no transitions, no animations,
+   no smooth scroll for users who ask the OS for calm. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0s !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 
@@ -398,6 +437,19 @@ textarea:focus-visible {
   100% { clip-path: inset(0 100% 0 0); }
 }
 
+/* Circle open (v5.1): B revealed by a circle expanding from the center —
+   the canvas painter + xfade circleopen twin. */
+.ff-anim-circleopen {
+  clip-path: circle(0% at 50% 50%);
+  animation: ff-tx-circle-open 2.4s ease-in-out infinite;
+}
+@keyframes ff-tx-circle-open {
+  0% { clip-path: circle(0% at 50% 50%); }
+  40% { clip-path: circle(75% at 50% 50%); }
+  85% { clip-path: circle(75% at 50% 50%); }
+  100% { clip-path: circle(0% at 50% 50%); }
+}
+
 /* Live transition badges / zones (preview + ruler). */
 .ff-tx-live {
   animation: ff-tx-live-pulse 1.4s ease-in-out infinite;
@@ -480,4 +532,112 @@ textarea:focus-visible {
     opacity: 1;
     transform: translateY(0) scale(1);
   }
+}
+
+/* ===== v5.1 — CapCut polish: timeline clip chrome ===== */
+
+/* Edge-trim affordance — 6px semi-transparent cyan handle zones that fade
+   in on clip hover. PURE VISUAL: pointer-events none, so the v5.1 drag
+   interaction (deadzone → move/trim math) is untouched. */
+.ff-clip {
+  /* v5.1 CapCut clip card: 1px #27272a hairline + resting dim/desat so the
+     active clip pops without extra chrome. Replaces the v4.9 inline
+     filter/box-shadow (values preserved, now hoverable). */
+  box-shadow:
+    inset 0 0 0 1px #27272a,
+    inset 0 -1px 0 rgba(0, 0, 0, 0.35),
+    0 1px 3px rgba(0, 0, 0, 0.4);
+  filter: saturate(0.78) brightness(0.82);
+}
+.ff-clip:hover {
+  filter: saturate(0.96) brightness(0.94);
+  box-shadow:
+    inset 0 0 0 1px rgba(6, 182, 212, 0.5),
+    0 4px 12px rgba(0, 0, 0, 0.55);
+  transform: translateY(-1px);
+}
+/* ACTIVE clip: 2px cyan ring + slightly raised (declared after :hover so
+   the active treatment wins the specificity tie while hovered). */
+.ff-clip.ff-clip-active {
+  z-index: 1;
+  filter: saturate(1.15) brightness(1.08);
+  box-shadow:
+    inset 0 0 0 1px rgba(34, 211, 238, 0.65),
+    0 0 0 2px rgba(34, 211, 238, 0.6),
+    0 0 16px rgba(34, 211, 238, 0.35),
+    0 4px 12px rgba(0, 0, 0, 0.55);
+  transform: translateY(-1px);
+}
+/* Drag-in-flight: lifted + hot-tracked (highest source order wins). */
+.ff-clip.ff-clip-drag {
+  z-index: 2;
+  filter: saturate(1.2) brightness(1.12);
+  box-shadow:
+    inset 0 0 0 1px rgba(34, 211, 238, 0.7),
+    0 0 0 2px rgba(255, 255, 255, 0.55),
+    0 6px 16px rgba(0, 0, 0, 0.6);
+}
+.ff-clip::before,
+.ff-clip::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  z-index: 3;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+.ff-clip::before {
+  left: 0;
+  border-radius: 5px 0 0 5px;
+  background: linear-gradient(to right, rgba(34, 211, 238, 0.42), rgba(34, 211, 238, 0.05));
+  box-shadow: inset 1px 0 0 rgba(34, 211, 238, 0.55);
+}
+.ff-clip::after {
+  right: 0;
+  border-radius: 0 5px 5px 0;
+  background: linear-gradient(to left, rgba(34, 211, 238, 0.42), rgba(34, 211, 238, 0.05));
+  box-shadow: inset -1px 0 0 rgba(34, 211, 238, 0.55);
+}
+.ff-clip:hover::before,
+.ff-clip:hover::after {
+  opacity: 1;
+}
+
+/* Playhead grabber glow — the cyan triangle that pulses softly. */
+@keyframes ff-playhead-glow {
+  0%, 100% { filter: drop-shadow(0 0 2px rgba(34, 211, 238, 0.5)); }
+  50% { filter: drop-shadow(0 0 6px rgba(34, 211, 238, 0.95)); }
+}
+.ff-playhead-grab {
+  animation: ff-playhead-glow 2.2s ease-in-out infinite;
+}
+
+/* Dropzone drag state — cyan invite (border-cyan-500/60 + cyan-950/20 bg).
+   Toggled by the [data-dragging] attribute the MediaPanel sets. */
+.ff-dropzone[data-dragging="true"] {
+  border-color: rgba(6, 182, 212, 0.6) !important;
+  background-color: rgba(8, 51, 68, 0.2) !important;
+}
+
+/* v5.1 — primary export action (Header): cyan→emerald gradient. */
+.ff-btn-export {
+  background-image: linear-gradient(135deg, #06b6d4 0%, #0891b2 48%, #059669 100%);
+  color: #ffffff;
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.4),
+    0 4px 16px rgba(6, 182, 212, 0.3);
+  transition: all 160ms ease;
+}
+.ff-btn-export:hover:not(:disabled) {
+  filter: brightness(1.1);
+  box-shadow:
+    0 2px 4px rgba(0, 0, 0, 0.4),
+    0 6px 22px rgba(16, 185, 129, 0.38);
+}
+.ff-btn-export:active:not(:disabled) {
+  transform: translateY(0.5px);
+  filter: brightness(0.95);
 }

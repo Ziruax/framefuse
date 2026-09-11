@@ -1,5 +1,5 @@
 // electron/preload.js — contextBridge IPC surface for the renderer.
-const { contextBridge, ipcRenderer } = require("electron");
+const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 contextBridge.exposeInMainWorld("electronAPI", {
   isElectron: () => ipcRenderer.invoke("is-electron"),
@@ -7,6 +7,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Diagnostics — verify FFmpeg is reachable. Returns
   // { ok, path, version, error }.
   ffmpegStatus: () => ipcRenderer.invoke("ffmpeg-status"),
+
+  // v5.1: result of the async GPU-encoder probe (for the export badge).
+  // { encoder: "NVIDIA NVENC" | "Intel QSV" | "AMD AMF" | "CPU (libx264)",
+  //   encoderName: "h264_nvenc" | … | "libx264" }
+  getExportInfo: () => ipcRenderer.invoke("export-info"),
 
   exportNative: (opts) => ipcRenderer.invoke("export-native", opts),
 
@@ -22,6 +27,40 @@ contextBridge.exposeInMainWorld("electronAPI", {
   cleanupTemp: () => ipcRenderer.invoke("cleanup-temp"),
 
   cancelExport: () => ipcRenderer.invoke("cancel-export"),
+
+  // ── v5.1 NATIVE WHISPER (utilityProcess service) ──────────────────────────
+  // transcribe: ({ name, bytes: ArrayBuffer, language }) →
+  //   { chunks, language, wordLevel, durationMs } — the main process decodes
+  //   the audio with ffmpeg and runs Whisper in a utility process; the UI
+  //   never blocks. Progress arrives via onWhisperProgress.
+  whisperTranscribe: (payload) => ipcRenderer.invoke("whisper:transcribe", payload),
+  whisperPreload: () => ipcRenderer.invoke("whisper:preload"),
+  whisperCancel: () => ipcRenderer.invoke("whisper:cancel"),
+  onWhisperProgress: (callback) => {
+    const handler = (_event, data) => callback(data);
+    ipcRenderer.on("whisper:progress", handler);
+    return () => ipcRenderer.removeListener("whisper:progress", handler);
+  },
+
+  // ── v5.1 NATIVE PROJECT FILES ─────────────────────────────────────────────
+  // saveProject: ({ doc, currentPath? }) → { path, name } | null (canceled)
+  saveProject: (payload) => ipcRenderer.invoke("project:save", payload),
+  saveProjectAs: (payload) => ipcRenderer.invoke("project:save-as", payload),
+  // openProject: () → { path, name, doc } | null (canceled) — doc is the parsed
+  // .framefuse.json document; the renderer restores it with its own loader.
+  openProject: () => ipcRenderer.invoke("project:open"),
+  recentProjects: () => ipcRenderer.invoke("project:recent"),
+  removeRecentProject: (payload) => ipcRenderer.invoke("project:remove-recent", payload),
+
+  // v5.1: absolute filesystem path of a picked File (Electron ≥ 32 removed
+  // File.path — webUtils.getPathForFile is the supported bridge).
+  getFilePath: (file) => {
+    try {
+      return webUtils.getPathForFile(file) || null;
+    } catch (_) {
+      return null;
+    }
+  },
 
   // v4.1: export the full-timeline ASS subtitle sidecar.
   exportAssFile: (opts) => ipcRenderer.invoke("export-ass-file", opts),
