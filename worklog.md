@@ -133,3 +133,23 @@ Work Log:
 Stage Summary:
 - tsc clean, lint clean, dev.log GET / 200
 - PENDING (main agent): wire the 5 new props in page.tsx (previewFit from settings, onPreviewFitChange → setSettings, onMatchAspect via closestAspectForRatio from stored video dims, canMatchAspect, onOverlayTransformChange → applyItemEdit overlay), plus auto-aspect on first video import
+
+---
+Task ID: 4-7 (combined)
+Agent: main (Z.ai Code)
+Task: Music/SFX timeline overhaul, export speed refactor, defaults-off, full E2E verification
+
+Work Log:
+- MUSIC (Task 4): TimelineRuler audio lane → draggable music clip (press-seek, snap, drag preview, commit on pointerup); hover popover (volume slider 0-200% + "Loop full video" toggle); WaveformStrip gained startMs anchoring + loop repetitions (progress stays audio-relative); page.tsx musicPosFor/syncMusicElement placement-aware playback (start offset / loop wrap / drift re-sync >0.25s; preview volume capped 0..1 — HTMLMediaElement throws >1); SettingsPanel Audio tab music section; export-graph music branch [volume]→[loudnorm]→[fades music-local]→[adelay]→aformat + -stream_loop -1 loop-to-fill input; v4.9 -af path same treatment + alimiter
+- OVERLAY LOOP: buildOverlayVideoInputArgs loop (-stream_loop -1, ss modulo srcDur); probe parser parses Duration; maxDurFor allows overlay extension when looping; MediaPanel ClipSettings "Overlay window" section (Span entire video + Loop source buttons, baseTotalMs target)
+- EXPORT SPEED (Task 5): step-1 clips VIDEO-ONLY + parallel PCM WAV extraction jobs in the same pool; step-2 single-pass audio mix (per-clip volume+adelay branches + music + SFX → amix → AAC once) — kills double-AAC encode + per-image silence tracks; master alimiter (0.97); thread budget = cores/poolN per ffmpeg (was -threads 0 × 4 = oversubscription); static-image fast path (skip 1.1× lanczos supersample + zoompan when KB off — the dominant slideshow cost); cinema preset medium→faster; async save-temp writes
+- DEFAULTS (Task 6): SRT import no longer auto-enables burn-in (toast points at toggle); layout metadata v5.2
+- E2E (agent-browser, 1600×900): upload video+gs+image+music ✓; Ken Burns OFF by default ✓; music clip renders, hover popover opens (React-state hover — see fix), loop toggle → aria "looping to fill the video" ✓, volume 100→40 via keyboard ✓, drag 00:00→00:02 ✓; greenscreen→Overlay track + chroma ON + Span entire video → canvas pixels show ZERO green (key works) ✓; on-canvas PiP: cyan selection chrome + hint chip ✓, drag-move (box 260..728/0..260) ✓, corner-resize (468×260→506×328) ✓; Fit/Fill toggle ✓; splitter drag 300→417px ✓; SFX add ✓; playback ✓; fresh session = 0 console errors
+- Export harness (/home/z/harness-tests/export-harness.mjs): 9 scenarios with REAL ffmpeg — vidaudio, fullmix (vids+music+sfx), imgmusic, musicloop (loop+start+volume), kb, overlayloop (chroma+loop), xfade, volboost, speed 2× — ALL PASS with duration/stream assertions
+- BUGS FOUND & FIXED during E2E: (a) buildConcatArgs musicInputIdx ReferenceError; (b) leading-comma filter chain when volume/adelay no-ops; (c) music popover unclickable — 4px hover gap + clip z-[2] stacking-context trap + Tailwind pointer-events specificity tie → flush top-0 + no clip z + React-state hover control
+- TOOLING NOTE: bash tool output strips literal "[m" sequences (ANSI misparse) — verify file contents with Read tool only
+
+Stage Summary:
+- All 8 user requirements implemented and browser-verified
+- Commits: data model → whisper/panels/preview → music → export perf → defaults → popover fixes
+- Next: GitHub push, Windows NSIS installer build, GitHub release, cron job

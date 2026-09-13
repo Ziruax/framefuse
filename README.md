@@ -1,8 +1,18 @@
-# FrameFuse v5.1
+# FrameFuse v5.2
 
-Native desktop **multi-track video studio** with a **filmstrip storyboard timeline** (thumbnails in every segment, double-click to jump), **middle-truncating filename rows**, **click-to-aim Ken Burns motion**, a **grid media library for 100+ image storyboards**, a **live audio waveform timeline**, **beat-synced cutting with a strength dial**, **viral kinetic captions with favorites**, **segment transitions**, **per-boundary transition overrides**, **export quality profiles**, **watermark/logo overlay**, **undo/redo**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
+Native desktop **multi-track video studio** with a **resizable Shotcut-style panel layout**, **CapCut-style on-canvas overlay manipulation**, **first-class background music (drag to place, volume, loop-to-fill)**, a **filmstrip storyboard timeline** (thumbnails in every segment, double-click to jump), **middle-truncating filename rows**, **click-to-aim Ken Burns motion**, a **grid media library for 100+ image storyboards**, a **live audio waveform timeline**, **beat-synced cutting with a strength dial**, **viral kinetic captions with favorites**, **segment transitions**, **per-boundary transition overrides**, **export quality profiles**, **watermark/logo overlay**, **undo/redo**, exact **word-by-word timing**, **GPU-accelerated export**, and a preview that matches the exported video **pixel-for-pixel**.
 
 ## Highlights
+
+### 🔧 What's new in v5.2 — the "make it work like a real editor" release
+- **Fixed Whisper tiny downloads** — sharp-runtime guard, HuggingFace mirror fallback (`hf-mirror.com`) with retries, per-file download progress, model status diagnostics + one-click pre-download, per-run cancellation. The model (~42 MB) downloads once and works offline after.
+- **Preview that fills the panel** — the stage is now fully responsive (letterboxed to the available space instead of a fixed 960px box), auto-matches the project aspect to your first imported video, and has a Fit (letterbox) / Fill (cover) toggle.
+- **Resizable editor panels** — draggable, keyboard-accessible splitters between the media panel, preview column, settings panel, and the timeline (persisted, snap-to-default, double-click reset).
+- **Background music done right** — the music track is now a first-class timeline clip: drag it to reposition, adjust volume (0–200%), and **loop it to fill the entire video** (background tracks are usually longer than the edit). Export mixes with volume/delay/loop exactly as previewed.
+- **Green screen like CapCut** — click an overlay on the preview canvas to select it, **drag to move, corner-handles to resize** (with center snapping), key-color picker + auto-detect, and **"Span entire video"** so short green-screen clips loop to cover the whole timeline.
+- **2–5× faster export** — static clips skip the zoompan supersampler entirely, clips encode video-only while audio extracts in parallel as PCM and mixes in a single pass (no double AAC encode, no synthesized silence tracks, master limiter), CPU threads are budgeted across the encode pool instead of oversubscribing, and the cinema preset uses `faster`.
+- **Nothing applies by default** — Ken Burns, caption burn-in and effects are strictly opt-in now; features turn on when YOU add them.
+
 
 ### 🧠 Native Whisper captions — fixed + 5× faster (new in v5.1)
 Transcription now runs in an Electron **utility process** with **onnxruntime-node** (native, multi-threaded CPU inference) instead of the renderer Web Worker — which also fixes the packaged-app worker path failure that broke every transcription in v5.0. Audio is decoded by **FFmpeg** (streamed, native), and the whisper-tiny model downloads **once** to `<userData>/whisper-models` on disk and stays there forever — offline after the first run.
