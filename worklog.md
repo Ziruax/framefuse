@@ -273,3 +273,24 @@ UNRESOLVED ISSUES / RISKS + NEXT-PHASE PRIORITIES:
 - v5.4 scope notes: (a) SFX pills and the music clip are NOT selectable yet (SFX ids would need routing through a separate remove path — a small follow-up); (b) group MOVE of selected clips is not implemented (each clip's neighbor clamps interdepend — needs a coordinated clamp strategy); (c) Shift-range uses full segment order, which interleaves base+overlay clips by their array position (deterministic, documented).
 - Recommended next phases (priority order): 1) multi-select group move + SFX/music selection (completes the selection story); 2) right-click context menu on clips (settings/split/duplicate/delete/track-move — Shotcut pattern); 3) 2-pass loudnorm export audio; 4) keyframe-able overlay motion; 5) GPU filter graphs (scale_cuda/hwupload).
 - Standing risks unchanged: NsisTarget.js node_modules patch is still manual after bun install (the transformers patch is now automatic via postinstall — same treatment could be applied); whisper in-flight downloads cannot be cancelled (transformers.js 2.17 limitation).
+
+---
+Task ID: 13 (v5.4.1 sprint — cron review round)
+Agent: main (Z.ai Code)
+Task: Scheduled QA round → picked next-phase candidate #2: right-click context menus (Shotcut pattern) + mandatory styling
+
+STATUS ASSESSMENT (start of round):
+- agent-browser QA: clean load, uploads, playback, v5.4 multi-select regression (click/Ctrl+A/Esc) all pass, 0 console errors → stable, proceeded to feature work.
+
+GOALS / COMPLETED / VERIFICATION:
+- Implemented context menus for EVERY timeline target kind (base clips, overlay clips, SFX pills, the music clip, empty lane space):
+  - Context-sensitive items route through the SAME handlers the toolbar/shortcuts use (one undo step each): Jump/Split (playhead-gated)/Duplicate/track moves/Span entire video (duration→base end + loop, identical math to the MediaPanel button)/Loop source/Loop full video/Move to 00:00/Select all/Clear selection/Fit timeline/Delete — relabeled "Delete N clips" when the right-clicked clip belongs to a multi-selection (right-click KEEPS a containing selection, selects solo otherwise).
+  - Keyboard: menu focuses on open; arrows cycle ENABLED rows; Enter/Space activates; Esc closes WITHOUT clearing the selection (menu keydown swallows propagation before the page-level shortcuts — verified); Home/End jump. Outside click / right-click closes via a transparent backdrop; panning the timeline closes (fixed anchor would detach); a layout effect viewport-clamps the card.
+  - Styling (mandatory): .ff-ctx-menu dark-glass card (backdrop-blur + 110ms pop animation), icon+label+kbd-chip rows, cyan active row, red danger row, hairline separators.
+- VERIFICATION: tsc + eslint clean (had to keep ref-reading closures OUT of the render-built items array — react-hooks/refs rule; the "Fit" item uses a data-only action flag invoked from event-handler sinks). agent-browser E2E: all 4 target kinds render the correct items with accurate disabled states (Split disabled outside the clip window, Move-to-00:00 disabled at 0); menu actions execute — Move to Overlay (clip transfers lanes), Span entire video (4s→6s window), group Delete 2 clips (base clips gone, overlay clip survives, Ctrl+Z restores), Select all from the empty-lane menu; REAL-key keyboard nav (3×ArrowDown → Span, Enter executes + closes); playback + 0 console/page errors; VLM review confirms the polished card (items, icons, kbd chips, danger styling, positioning, no glitches).
+- Committed c444cdc, pushed to github.com/Ziruax/framefuse (main).
+
+UNRESOLVED ISSUES / RISKS + NEXT-PHASE PRIORITIES:
+- v5.4.1 scope notes: (a) SFX "Edit duration" menu item is a disabled placeholder (duration editing stays on the pill edges / palette slider — a menu-slider sub-row is a possible polish); (b) the context menu only covers the timeline — the preview canvas and media cards still use their own affordances (by design); (c) "Jump to clip" also fires the jump toast (existing onJumpToSegment behavior).
+- Recommended next phases (priority order): 1) multi-select GROUP MOVE (coordinated clamp strategy) + SFX/music pills selectable; 2) 2-pass loudnorm export audio; 3) keyframe-able overlay motion; 4) GPU filter graphs (scale_cuda/hwupload); 5) timeline clip copy/paste (Ctrl+C/V) — natural follow-on from the selection + menu work.
+- Standing risks unchanged: NsisTarget.js patch manual after bun install; whisper in-flight downloads not cancellable (transformers.js 2.17).
