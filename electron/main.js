@@ -364,6 +364,71 @@ function ffmpegCapture(args, timeoutMs = 12000) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// v1.2 2-PASS MEASURED LOUDNORM — pass 1 (measurement)
+// ---------------------------------------------------------------------------
+/**
+ * Measure a file's loudness for 2-pass loudnorm: decodes audio ONLY (fast —
+ * ebur128 runs hundreds of× realtime) through `loudnorm … print_format=json`
+ * and parses the flat JSON summary the filter prints at the end.
+ * Resolves { i, lra, tp, thresh, offset } or null when nothing parseable
+ * (missing file, silent input measuring as -inf, timeout) — the graph then
+ * falls back to single-pass loudnorm for that branch.
+ */
+function measureLoudnessAsync(p) {
+  if (typeof p !== "string" || !p) return Promise.resolve(null);
+  return ffmpegCapture(
+    [
+      "-hide_banner", "-nostats",
+      "-i", p,
+      "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
+      "-f", "null", "-",
+    ],
+    60000,
+  ).then((r) => {
+    const out = r && r.out ? r.out : "";
+    const start = out.lastIndexOf("{");
+    if (start < 0) return null;
+    const end = out.indexOf("}", start);
+    if (end < 0) return null;
+    let j = null;
+    try { j = JSON.parse(out.slice(start, end + 1)); } catch (_) { return null; }
+    const num = (v) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    const i = num(j.input_i);
+    const lra = num(j.input_lra);
+    const tp = num(j.input_tp);
+    const th = num(j.input_thresh);
+    if (i == null || lra == null || tp == null || th == null) return null;
+    return { i, lra, tp, thresh: th, offset: num(j.target_offset) };
+  }).catch(() => null);
+}
+
+/**
+ * Measure every audio source for the 2-pass loudnorm (bounded 8-parallel —
+ * same chunk discipline as the duration probes: a 100-clip project must not
+ * spawn 100 ffmpeg children at once on a weak machine).
+ * Returns { clip: [measure|null per clip WAV], music: measure|null }.
+ */
+async function measureLoudnormContext(clipAudioJobs, audioPath) {
+  const clip = new Array(clipAudioJobs.length).fill(null);
+  let music = null;
+  const tasks = [];
+  clipAudioJobs.forEach((j, k) => tasks.push({ kind: "clip", k, p: j.wavPath }));
+  if (audioPath) tasks.push({ kind: "music", p: audioPath });
+  for (let c = 0; c < tasks.length; c += 8) {
+    const chunk = tasks.slice(c, c + 8);
+    const res = await Promise.all(chunk.map((t) => measureLoudnessAsync(t.p)));
+    chunk.forEach((t, i) => {
+      if (t.kind === "clip") clip[t.k] = res[i];
+      else music = res[i];
+    });
+  }
+  return { clip, music };
+}
+
 ipcMain.handle("cancel-export", async () => {
   try {
     killAllProcs();
@@ -1629,7 +1694,7 @@ ipcMain.handle("export-ass-file", async (event, opts) => {
 // ---------------------------------------------------------------------------
 
 ipcMain.handle("export-native", async (event, opts) => {
-  const { outputPath, fps, width, height, bitrateMbps, quality, crf, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark, overlays, sfx } = opts;
+  const { outputPath, fps, width, height, bitrateMbps, quality, crf, audioKbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark, overlays, sfx } = opts;
 
   if (!outputPath) throw new Error("No output path");
   if (!segments || segments.length === 0) throw new Error("No segments");
@@ -1663,6 +1728,9 @@ ipcMain.handle("export-native", async (event, opts) => {
   const headlinesEnabled = Array.isArray(headlines) && headlines.some((h) => h && h.text && h.endMs > h.startMs);
   const totalMs = segments.reduce((sum, s) => Math.max(sum, s.endMs ?? (s.startMs ?? 0) + s.durationMs), 0) || segments.reduce((sum, s) => sum + s.durationMs, 0);
   const totalSec = totalMs / 1000;
+  // v1.2: export audio bitrate — validated against the allowed ladder,
+  // 192 default (the v1.1 constant).
+  const abr = [96, 128, 192, 256, 320].includes(Number(audioKbps)) ? Number(audioKbps) : 192;
   // v5.1: async warm-started GPU detection — the handler NEVER blocks the
   // main process before the first frame (was: execSync up to 25 s).
   const encoder = await detectGpuEncoderAsync();
@@ -2099,6 +2167,21 @@ ipcMain.handle("export-native", async (event, opts) => {
     const concatListPath = path.join(tempDir, `concat_${Date.now()}.txt`);
     tempFiles.push(concatListPath);
 
+    // ─── v1.2: 2-PASS LOUDNORM measurement (pass 1) ────────────────
+    // When normalize is ON, every audio SOURCE (each clip WAV + the music
+    // track) is measured now — audio-only ffmpeg passes, bounded 8-parallel,
+    // typically <1 s each — so the step-2 graph applies a STATIC linear gain
+    // per source (the ffmpeg 2-pass loudnorm recipe) instead of single-pass
+    // dynamic normalization, which pumps on variable material. SFX WAVs are
+    // deliberately NOT normalized: they are synthesized at designed levels.
+    // Measurement failure per file → null → that branch falls back to
+    // single-pass loudnorm (the v5.2 behavior); normalize OFF → argv
+    // unchanged (byte-identical to v1.1).
+    let loudnormCtx = null;
+    if (audio && audio.normalize && (clipAudioJobs.length > 0 || audioPath)) {
+      loudnormCtx = await measureLoudnormContext(clipAudioJobs, audioPath);
+    }
+
     const concatContent = clipPaths.map(p => {
       const safePath = p.replace(/\\/g, "/").replace(/'/g, "'\\''");
       return `file '${safePath}'`;
@@ -2116,6 +2199,8 @@ ipcMain.handle("export-native", async (event, opts) => {
       outputPath,
       totalSec: actualTotalSec,
       sfx: sfxList,
+      loudnorm: loudnormCtx,
+      audioKbps: abr,
       clipAudio: clipAudioJobs.map((j) => ({
         wavPath: j.wavPath,
         startMs: j.startMs,

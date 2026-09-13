@@ -455,6 +455,41 @@ function clampNum(v, lo, hi, dflt) {
   return Math.max(lo, Math.min(hi, n));
 }
 
+// ---------------------------------------------------------------------------
+// v1.2 2-PASS MEASURED LOUDNORM
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the MEASURED (2nd-pass) loudnorm filter string from a pass-1
+ * measurement { i, lra, tp, thresh, offset } (see main.js
+ * measureLoudnessAsync — the ffmpeg loudnorm JSON summary). This is the
+ * canonical ffmpeg 2-pass recipe: measured_* + offset + linear=true apply
+ * a STATIC gain instead of the single-pass dynamic mode, which pumps and
+ * breathes on variable material and defeats per-source consistency.
+ * Returns null when the measurement is unusable (caller falls back to
+ * single-pass loudnorm).
+ */
+function measuredLoudnormFilter(m) {
+  if (!m) return null;
+  const i = Number(m.i);
+  const lra = Number(m.lra);
+  const tp = Number(m.tp);
+  const th = Number(m.thresh);
+  if (!Number.isFinite(i) || !Number.isFinite(lra) || !Number.isFinite(tp) || !Number.isFinite(th)) {
+    return null;
+  }
+  // Silent inputs measure as -inf/-70dB-ish — a static gain from those
+  // numbers would be meaningless; let the caller fall back.
+  if (i <= -70 || i >= 0) return null;
+  const off = Number(m.offset);
+  const offStr = Number.isFinite(off) && off !== 0 ? `:offset=${off}` : "";
+  return (
+    `loudnorm=I=-16:TP=-1.5:LRA=11` +
+    `:measured_I=${i}:measured_LRA=${lra}:measured_TP=${tp}:measured_thresh=${th}` +
+    `${offStr}:linear=true`
+  );
+}
+
 /** Parse "#rgb" / "#rrggbb" / "0x…"-less hex → 0–255 channels, else null. */
 function hexToRgbParts(hex) {
   const s = String(hex == null ? "" : hex).trim();
@@ -739,12 +774,21 @@ function buildAudioMixGraph(o) {
   // clip, volume + absolute-timeline adelay. This replaces the v5.0/5.1
   // scheme (per-clip AAC encodes + a concat-demuxer [0:a] branch) which
   // double-encoded audio and padded image clips with synthesized silence.
+  // v1.2: with normalize ON each clip branch opens with the MEASURED 2-pass
+  // loudnorm (static linear gain → every source lands at −16 LUFS before
+  // the user's volume rides on top). Measurement must see the RAW wav —
+  // loudnorm runs BEFORE volume/adelay.
+  const loudnorm = (o && o.loudnorm) || null;
   const clipAudio = Array.isArray(o && o.clipAudio) ? o.clipAudio : [];
   clipAudio.forEach((c, k) => {
     const vol = clampNum(c && c.volume, 0, 2, 1);
     const d = Math.max(0, Math.round(Number(c && c.startMs) || 0));
     const label = `[ca${k}]`;
     const parts = [];
+    if (audio.normalize) {
+      const ln = measuredLoudnormFilter(loudnorm && Array.isArray(loudnorm.clip) ? loudnorm.clip[k] : null);
+      if (ln) parts.push(ln);
+    }
     if (vol !== 1) parts.push(`volume=${String(vol)}`);
     if (d > 0) parts.push(`adelay=${d}|${d}`);
     parts.push(AFORMAT);
@@ -756,10 +800,17 @@ function buildAudioMixGraph(o) {
     // → [adelay=startMs] → aformat. adelay comes LAST so loudnorm/fades
     // measure the music itself, not the leading silence; the fade-out end
     // aligns with the VIDEO end (stream-local st = totalSec - start - dur).
+    // v1.2 2-PASS: the order is now [loudnorm(measured)] → [volume] → … —
+    // the MEASURED gain must act on the same signal that was measured (the
+    // raw file). This also fixes a v5.2 quirk: volume-before-DYNAMIC-loudnorm
+    // let the normalizer undo the user's volume knob; normalize-first means
+    // the knob scales the NORMALIZED track (the DAW-standard order).
     const m = [];
+    if (audio.normalize) {
+      m.push(measuredLoudnormFilter(loudnorm && loudnorm.music) || "loudnorm=I=-16:TP=-1.5:LRA=11");
+    }
     const musicVol = clampNum(audio.musicVolume, 0, 2, 1);
     if (musicVol !== 1) m.push(`volume=${String(musicVol)}`);
-    if (audio.normalize) m.push("loudnorm=I=-16:TP=-1.5:LRA=11");
     const startMs = Math.max(0, Math.round(Number(audio.musicStartMs) || 0));
     if (audio.fadeInMs > 0) {
       m.push(`afade=t=in:st=0:d=${(audio.fadeInMs / 1000).toFixed(3)}`);
@@ -1235,6 +1286,10 @@ function buildConcatArgs(o) {
     ? o.clipAudio.filter((c) => c && typeof c.wavPath === "string" && c.wavPath)
     : [];
   const hasMusic = !!o.audioPath;
+  // v1.2: export audio bitrate ladder (invalid/omitted → 192 = v1.1).
+  const abr = [96, 128, 192, 256, 320].includes(Number(o.audioKbps))
+    ? `${Number(o.audioKbps)}k`
+    : "192k";
   // v5.2: loop-to-fill — -stream_loop -1 makes the music input infinite;
   // -shortest (video stream) + apad=whole_dur cap the output at the video
   // length, so the track repeats until the video ends.
@@ -1266,19 +1321,20 @@ function buildConcatArgs(o) {
         })),
         hasMusic,
         musicInputIdx: musicIdx,
+        loudnorm: o.loudnorm,
         sfx: sfxList.map((s, k) => ({ inputIdx: sfxBase + k, startMs: s.startMs, volume: s.volume })),
       });
       args.push(
         "-filter_complex", graph,
         "-map", "0:v", "-map", "[aout]",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-c:a", "aac", "-b:a", abr, "-ar", "48000",
         "-shortest",
       );
     } else {
       // Only clip audio (video-with-audio sources, no music, no SFX).
       args.push(
         "-map", "0:v", "-map", "0:a",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+        "-c:a", "aac", "-b:a", abr, "-ar", "48000",
         "-shortest",
       );
     }
@@ -1289,10 +1345,17 @@ function buildConcatArgs(o) {
     // the fade-out END aligns with the video end. apad=whole_dur pads the
     // delayed stream exactly to the video duration so a short track no
     // longer TRUNCATES the video (v4.9 behavior preserved at startMs=0).
+    // v1.2 2-PASS: normalize now leads with the MEASURED static gain (the
+    // volume knob rides on the normalized track, DAW-standard order).
     const af = [];
+    if (o.audio && o.audio.normalize) {
+      af.push(
+        measuredLoudnormFilter(o.loudnorm && o.loudnorm.music) ||
+          "loudnorm=I=-16:TP=-1.5:LRA=11",
+      );
+    }
     const musicVol = clampNum(o.audio && o.audio.musicVolume, 0, 2, 1);
     if (musicVol !== 1) af.push(`volume=${String(musicVol)}`);
-    if (o.audio && o.audio.normalize) af.push("loudnorm=I=-16:TP=-1.5:LRA=11");
     const startMs = Math.max(0, Math.round(Number(o.audio && o.audio.musicStartMs) || 0));
     if (o.audio && o.audio.fadeInMs > 0) {
       af.push(`afade=t=in:st=0:d=${(o.audio.fadeInMs / 1000).toFixed(3)}`);
@@ -1306,7 +1369,7 @@ function buildConcatArgs(o) {
     // v5.2: guard boosted music against hard clipping.
     af.push("alimiter=limit=0.97:level=false");
     args.push("-af", af.join(","));
-    args.push("-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-shortest");
+    args.push("-c:a", "aac", "-b:a", abr, "-ar", "48000", "-shortest");
   }
 
   args.push("-movflags", "+faststart", "-y", o.outputPath);
@@ -1355,6 +1418,7 @@ module.exports = {
   buildOverlayFilter,
   // step-2 audio graph
   buildAudioMixGraph,
+  measuredLoudnormFilter,
   AFORMAT,
   // full argv builders
   buildClipArgs,

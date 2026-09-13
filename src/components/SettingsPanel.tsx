@@ -1180,6 +1180,45 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 for social uploads.
               </p>
             </Field>
+            <Field
+              label="Audio bitrate"
+              hint={`${settings.audioKbps ?? 192} kbps`}
+            >
+              <div className="flex items-center gap-2">
+                {[96, 128, 192, 256, 320].map((k) => {
+                  const active = (settings.audioKbps ?? 192) === k;
+                  return (
+                    <button
+                      key={k}
+                      type="button"
+                      onClick={() =>
+                        onSettingsChange({ ...settings, audioKbps: k as 96 | 128 | 192 | 256 | 320 })
+                      }
+                      aria-pressed={active}
+                      title={`${k} kbps${
+                        k === 96
+                          ? " — smallest files (voice-heavy edits)"
+                          : k === 320
+                            ? " — near-transparent music quality"
+                            : ""
+                      }`}
+                      className={cn(
+                        "flex-1 rounded-md border py-1 text-[10px] font-medium tabular-nums transition-colors",
+                        active
+                          ? "border-cyan-400/60 bg-cyan-400/10 text-cyan-200"
+                          : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:border-zinc-600 hover:text-zinc-200",
+                      )}
+                    >
+                      {k}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="mt-0.5 text-[9px]" style={{ color: "#52525b" }}>
+                AAC export bitrate for clips + music. 192 suits most social
+                video; 320 keeps music projects near-transparent.
+              </p>
+            </Field>
           </Section>
 
           {/* ─── Debug ─────────────────────────────────────────────────── */}
@@ -1314,17 +1353,33 @@ export function SettingsPanel(props: SettingsPanelProps) {
               </p>
             )}
             <Row label="Normalize loudness">
-              <Toggle
-                checked={audioSettings.normalize}
-                onChange={(v) =>
-                  onAudioSettingsChange({ ...audioSettings, normalize: v })
-                }
-                label=""
-              />
+              <div className="flex items-center gap-1.5">
+                <span
+                  className="rounded border px-1 py-px font-mono text-[9px] font-semibold uppercase tracking-wide"
+                  style={{
+                    borderColor: "#3f3f46",
+                    backgroundColor: "#18181b",
+                    color: "#c4b5fd",
+                  }}
+                  title="Every source is measured first, then a single static gain is applied (no dynamic pumping)"
+                >
+                  2-pass
+                </span>
+                <Toggle
+                  checked={audioSettings.normalize}
+                  onChange={(v) =>
+                    onAudioSettingsChange({ ...audioSettings, normalize: v })
+                  }
+                  label=""
+                />
+              </div>
             </Row>
             <p className="mb-3 mt-[-8px] text-[10px] leading-relaxed text-zinc-500">
-              Master to −16 LUFS (social-media standard) — evens out quiet/loud
-              recordings.
+              Measures every clip and the music track first, then masters each
+              to −16 LUFS (social-media standard) with a static gain — evens
+              out quiet/loud sources with none of the pumping of one-pass
+              normalization. Volume settings ride on top of the normalized
+              audio.
             </p>
             <Field
               label="Fade in"

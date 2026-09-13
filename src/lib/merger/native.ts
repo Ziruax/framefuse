@@ -588,6 +588,8 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
       // v4.5 encode-quality profile ("social" keeps v4.4 behavior).
       quality: settings.quality || "social",
       crf: typeof settings.crf === "number" ? settings.crf : 20,
+      // v1.2: export audio bitrate (192 default = v1.1 behavior).
+      audioKbps: settings.audioKbps ?? 192,
       kenBurns,
       segments: segPayload,
       audioPath,
@@ -868,6 +870,9 @@ async function exportViaMediaRecorder(
   const recorder = new MediaRecorder(stream, {
     mimeType,
     videoBitsPerSecond: browserQualityBitrate(settings),
+    // v1.2: honor the audio-bitrate setting as a recorder hint (browsers
+    // treat this as advisory and may clamp it).
+    audioBitsPerSecond: (settings.audioKbps ?? 192) * 1000,
   });
   const chunks: BlobPart[] = [];
   recorder.ondataavailable = (e) => {

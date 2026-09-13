@@ -11,6 +11,7 @@ import {
 import { toast } from "@/lib/toast";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 import { Header, type LastExport } from "@/components/Header";
+import { ShortcutsOverlay } from "@/components/ShortcutsOverlay";
 import { MediaPanel } from "@/components/MediaPanel";
 import { PreviewPanel } from "@/components/PreviewPanel";
 import { MUSIC_SEL_ID, TimelineRuler } from "@/components/TimelineRuler";
@@ -351,6 +352,14 @@ export default function Page() {
   const [lastExport, setLastExport] = useState<LastExport | null>(null);
   const [inElectron, setInElectron] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+
+  // ---- v1.2: keyboard shortcuts overlay (`?`) -----------------------------
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const shortcutsOpenRef = useRef(false);
+  const closeShortcuts = useCallback(() => {
+    shortcutsOpenRef.current = false;
+    setShortcutsOpen(false);
+  }, []);
 
   // ---- v5.1: native project file identity (null = unsaved session) --------
   const [currentProjectPath, setCurrentProjectPath] = useState<string | null>(null);
@@ -1096,6 +1105,12 @@ export default function Page() {
   useEffect(() => {
     exportRef.current = handleExport;
   }, [handleExport]);
+
+  // v1.2: keep the overlay's open-flag in lockstep with late remounts
+  // (dev HMR) so a stale true can never swallow the keyboard.
+  useEffect(() => {
+    if (!shortcutsOpen) shortcutsOpenRef.current = false;
+  }, [shortcutsOpen]);
 
   // ---- v5.1: native project-file menu handlers (ref-synced so the menu
   // registrations never re-bind — the exportRef pattern).
@@ -3279,6 +3294,22 @@ const handleRandomTransitionMix = useCallback(() => {
         return;
       }
       const mod = e.ctrlKey || e.metaKey;
+      // v1.2: while the shortcuts overlay is open it owns the keyboard —
+      // only Esc / `?` act (close + toggle), everything else falls through
+      // to the page without firing editor shortcuts (Space, S, Del…).
+      if (shortcutsOpenRef.current) {
+        if (e.key === "Escape" || e.key === "?") {
+          e.preventDefault();
+          closeShortcuts();
+        }
+        return;
+      }
+      if (e.key === "?") {
+        e.preventDefault();
+        shortcutsOpenRef.current = true;
+        setShortcutsOpen(true);
+        return;
+      }
       if (mod && (e.key === "z" || e.key === "Z")) {
         e.preventDefault();
         if (e.shiftKey) redo();
@@ -3367,7 +3398,7 @@ const handleRandomTransitionMix = useCallback(() => {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, seek, stepSegment, undo, redo, removeItems, copySelection, pasteClipboard]);
+  }, [togglePlay, seek, stepSegment, undo, redo, removeItems, copySelection, pasteClipboard, closeShortcuts]);
 
   // ---- Cleanup object URLs on unmount -------------------------------------
   // URLs are deliberately kept alive during the whole session so undo can
@@ -3536,6 +3567,10 @@ const handleRandomTransitionMix = useCallback(() => {
         canRedo={historyState.canRedo}
         onUndo={undo}
         onRedo={redo}
+        onShowShortcuts={() => {
+          shortcutsOpenRef.current = true;
+          setShortcutsOpen(true);
+        }}
         settings={settings}
         totalMs={timeline.totalMs}
         projectName={currentProjectName}
@@ -4003,6 +4038,9 @@ const handleRandomTransitionMix = useCallback(() => {
           style={{ display: "none" }}
         />
       )}
+
+      {/* v1.2: keyboard shortcuts reference overlay (`?`) */}
+      {shortcutsOpen && <ShortcutsOverlay onClose={closeShortcuts} />}
     </div>
   );
 }

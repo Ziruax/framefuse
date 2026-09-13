@@ -274,6 +274,10 @@ export interface VideoSettings {
    *  to the source (with a toast) so vertical/square video is never
    *  silently center-cropped. */
   aspectTouched?: boolean;
+  /** v1.2: export AAC audio bitrate (kbps). Optional — omitted/invalid falls
+   *  back to 192 (the v1.1 behavior) so old project files stay byte-compatible.
+   *  Drives the desktop FFmpeg -b:a and hints the browser MediaRecorder. */
+  audioKbps?: 96 | 128 | 192 | 256 | 320;
 }
 
 /** Result of parsing a single filename. */

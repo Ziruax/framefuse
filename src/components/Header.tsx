@@ -12,6 +12,7 @@ import {
   Undo2,
   Redo2,
   Gauge,
+  Keyboard,
 } from "lucide-react";
 import type { TimelineMode, ExportProgress, VideoSettings } from "@/lib/merger/types";
 import { fmtBytes, fmtTimecode } from "@/lib/merger/timeline";
@@ -43,6 +44,8 @@ interface HeaderProps {
   canRedo: boolean;
   onUndo: () => void;
   onRedo: () => void;
+  /** v1.2: opens the keyboard-shortcuts overlay. */
+  onShowShortcuts: () => void;
   /** v4.5: export summary (settings + timeline length) for the estimate chip. */
   settings?: VideoSettings;
   totalMs?: number;
@@ -96,6 +99,7 @@ export function Header({
   canRedo,
   onUndo,
   onRedo,
+  onShowShortcuts,
   settings,
   totalMs = 0,
   projectName,
@@ -140,7 +144,7 @@ export function Header({
             >
               FrameFuse
             </span>
-            {/* v1: quiet mono version chip (was a violet gradient badge). */}
+            {/* v1.2: quiet mono version chip (was a violet gradient badge). */}
             <span
               className="whitespace-nowrap rounded border px-1.5 py-0.5 font-mono text-[10px] font-medium"
               style={{
@@ -148,9 +152,9 @@ export function Header({
                 backgroundColor: "#18181b",
                 color: "#a1a1aa",
               }}
-              title="FrameFuse v1 — multi-track video studio"
+              title="FrameFuse v1.2 — multi-track video studio"
             >
-              v1
+              v1.2
             </span>
             {/* v5.1: on-disk project file chip (native save/open sessions). */}
             {projectName && (
@@ -254,6 +258,17 @@ export function Header({
           )}
         >
           <Redo2 className="size-4" />
+        </button>
+        {/* v1.2: shortcuts overlay toggle */}
+        <div className="h-4 w-px" style={{ backgroundColor: "#27272a" }} />
+        <button
+          type="button"
+          onClick={onShowShortcuts}
+          title="Keyboard shortcuts (?)"
+          aria-label="Keyboard shortcuts"
+          className="flex size-7 items-center justify-center rounded-md text-zinc-400 transition-all hover:bg-white/10 hover:text-white active:scale-90"
+        >
+          <Keyboard className="size-4" />
         </button>
       </div>
 
