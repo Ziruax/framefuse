@@ -1,6 +1,6 @@
 {
   "name": "framefuse",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "FrameFuse v1 — Multi-track video studio: video clips, green/white/black screen chroma key with on-canvas PiP, overlay lane, background music with volume/loop, synthesized SFX, native Whisper captions, non-blocking GPU-accelerated parallel FFmpeg export, native project files.",
   "main": "electron/main.js",

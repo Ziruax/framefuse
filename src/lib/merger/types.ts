@@ -304,6 +304,16 @@ export interface ExportProgress {
 export interface ExportResult {
   path: string;
   size: number;
+  /**
+   * v1.1 TURBO export telemetry (desktop FFmpeg path only; browser
+   * fallbacks omit them). encoder = the detected hardware/CPU encoder
+   * label, elapsedSec = wall-clock export time, copiedClips/encodedClips
+   * = how many clips took the stream-copy fast path vs a re-encode.
+   */
+  encoder?: string;
+  elapsedSec?: number;
+  copiedClips?: number;
+  encodedClips?: number;
 }
 
 export interface CaptionSettings {

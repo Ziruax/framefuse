@@ -1035,9 +1035,35 @@ export default function Page() {
         size: res.size,
         method: inElectron ? "Native FFmpeg" : "WebCodecs",
         at: Date.now(),
+        // v1.1 TURBO telemetry (desktop only — browser exports omit these).
+        encoder: res.encoder,
+        elapsedSec: res.elapsedSec,
+        copiedClips: res.copiedClips,
+        encodedClips: res.encodedClips,
       });
+      // v1.1 TURBO: the success toast carries the performance story —
+      // export time + encoder + stream-copy count — so a fast export is
+      // visible and a slow one is diagnosable at a glance.
+      const turboBits: string[] = [];
+      if (res.elapsedSec != null && res.elapsedSec >= 1) {
+        turboBits.push(
+          res.elapsedSec < 60
+            ? `${res.elapsedSec}s`
+            : `${Math.floor(res.elapsedSec / 60)}m ${String(res.elapsedSec % 60).padStart(2, "0")}s`,
+        );
+      }
+      if (res.encoder) turboBits.push(res.encoder);
+      if (res.copiedClips != null && res.copiedClips > 0) {
+        turboBits.push(
+          `${res.copiedClips} clip${res.copiedClips === 1 ? "" : "s"} copied without re-encode`,
+        );
+      }
       toast.success(`Exported ${fmtBytes(res.size)}`, {
-        description: inElectron ? res.path : "Saved to your downloads",
+        description: inElectron
+          ? turboBits.length > 0
+            ? `${turboBits.join(" · ")}\n${res.path}`
+            : res.path
+          : "Saved to your downloads",
       });
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);

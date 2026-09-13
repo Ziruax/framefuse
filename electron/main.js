@@ -731,7 +731,25 @@ ipcMain.handle("whisper:status", async () => {
 // ---------------------------------------------------------------------------
 // GPU encoder detection + RUNTIME PROBE.
 // Listing an encoder isn't enough (drivers can be broken) — we actually
-// encode 3 tiny test frames. Falls back to libx264 on any failure.
+// encode real test frames. Falls back to libx264 on any failure.
+//
+// v1.1 TURBO: the probe got a THROUGHPUT GATE. The old 3-frame 256×256
+// probe only caught "encoder missing/broken init" — but the far nastier
+// failure mode on Windows is a driver stack that ACCEPTS the encode and
+// then crawls at 0.5–5 fps (broken QSV on outdated Intel drivers, AMF on
+// half-installed Adrenalin, hybrid-GPU laptops with the iGPU parked).
+// A user on such a machine exported a 19-minute video for 5–10 HOURS —
+// the exact failure this gate exists to prevent. The probe now encodes
+// 48 frames of REAL 1080p30 content and REQUIRES ≥ 12 fps effective
+// throughput (healthy NVENC/QSV/AMF run 100–400+ fps; a healthy probe
+// completes in well under a second). Anything slower is treated as a
+// broken hardware path and the export rides the (fast, predictable)
+// CPU libx264 path instead.
+//
+// Probe order also changed: NVENC → AMF → QSV (QSV is the most commonly
+// broken of the three in the wild — it is probed LAST so a working AMF
+// is preferred over a QSV that might pass the tiny probe and crawl on
+// real content).
 // ---------------------------------------------------------------------------
 let detectedEncoder = null;      // resolved value (session cache)
 let encoderDetecting = null;     // in-flight promise
@@ -749,23 +767,41 @@ async function listEncodersAsync() {
   const out = r.out;
   const order = [
     { name: "h264_nvenc", label: "NVIDIA NVENC" },
-    { name: "h264_qsv", label: "Intel QSV" },
     { name: "h264_amf", label: "AMD AMF" },
+    { name: "h264_qsv", label: "Intel QSV" },
   ];
   return order.filter((e) => out.includes(e.name));
 }
 
-/** Runtime probe — actually encode 3 tiny test frames. Listed ≠ working
- * (drivers can be broken), and a listed-but-broken NVENC must not hide a
- * perfectly good AMF/QSV — every listed candidate is probed in order. */
+/** Runtime probe — actually encode REAL 1080p content and GATE ON
+ * THROUGHPUT (v1.1). Listed ≠ working (drivers can be broken), and a
+ * listed-but-crawling encoder is worse than none — see the header comment.
+ * 48 frames of 1080p30 testsrc2 ≈ 1.6 s of real video: healthy hardware
+ * paths finish in < 1 s; broken ones blow the 12 s timeout or the 12 fps
+ * floor. Returns the measured fps (0 when rejected). */
 async function probeEncoderAsync(name) {
+  const FRAMES = 48;
+  const t0 = Date.now();
   const r = await ffmpegCapture([
     "-hide_banner", "-loglevel", "error",
-    "-f", "lavfi", "-i", "color=c=black:s=256x256:r=30:d=0.1",
-    "-frames:v", "3", "-c:v", name, "-f", "null", "-",
-  ], 15000);
-  return r.code === 0;
+    "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30",
+    "-frames:v", String(FRAMES),
+    "-c:v", name, "-pix_fmt", "yuv420p",
+    "-f", "null", "-",
+  ], 12000);
+  if (r.code !== 0) return 0;
+  const sec = Math.max(0.001, (Date.now() - t0) / 1000);
+  return FRAMES / sec; // effective fps (probe includes encoder init)
 }
+
+/**
+ * v1.1: minimum effective probe throughput for a hardware encoder to be
+ * trusted with a real export (fps over the 48-frame 1080p probe).
+ * Healthy: 100–400+. Broken-driver crawls: 0.5–5. Floor 12 fps keeps a
+ * huge safety margin below "healthy" while rejecting every documented
+ * pathological case (they measure single digits).
+ */
+const GPU_PROBE_MIN_FPS = 12;
 
 async function detectGpuEncoderAsync() {
   if (detectedEncoder) return detectedEncoder;
@@ -775,11 +811,20 @@ async function detectGpuEncoderAsync() {
     try {
       const candidates = await listEncodersAsync();
       for (const cand of candidates) {
-        if (await probeEncoderAsync(cand.name)) { pick = cand; break; }
+        const fps = await probeEncoderAsync(cand.name);
+        if (fps >= GPU_PROBE_MIN_FPS) {
+          pick = cand;
+          console.log(`Export encoder: ${pick.label} (${pick.name}, probe ${fps.toFixed(0)} fps)`);
+          break;
+        } else if (fps > 0) {
+          // Probe completed but crawled — log it: this is exactly the
+          // machine state that used to turn exports into 5–10 hour jobs.
+          console.warn(`Export encoder: ${cand.name} probed OK but only ${fps.toFixed(1)} fps (< ${GPU_PROBE_MIN_FPS}) — treating as broken, trying next`);
+        }
       }
     } catch (_) { /* fall back to CPU */ }
     detectedEncoder = pick;
-    console.log("Export encoder:", pick.label, `(${pick.name})`);
+    if (pick.name === "libx264") console.log("Export encoder: CPU (libx264)");
     return pick;
   })();
   return encoderDetecting;
@@ -860,6 +905,15 @@ function runFfmpeg(args, totalSec, onTime) {
 // ---------------------------------------------------------------------------
 const probeCache = new Map();
 
+/** v1.1: the full probe shape — every field the export handler consults
+ * (stream-copy eligibility + overlay loop math + audio detection). */
+function emptyProbe() {
+  return {
+    hasAudio: false, width: 0, height: 0, durationMs: 0,
+    codec: "", pixFmt: "", fps: 0, rotated: false,
+  };
+}
+
 /** v5.1: ASYNC media probe (`ffmpeg -i <path>` stderr parsed once per file,
  * cached). The v5.0 spawnSync version blocked the ENTIRE main process for
  * up to 15 s per file, sequentially — with a handful of imported videos the
@@ -867,18 +921,19 @@ const probeCache = new Map();
  * PARALLEL before the job loop (see export-native).
  * NOTE: `ffmpeg -i` alone exits 1 ("at least one output file") — the probe
  * data lives on stderr, which ffmpegCapture concatenates into `out`, so the
- * parser runs regardless of the exit code. */
+ * parser runs regardless of the exit code.
+ * v1.1: the cache carries the FULL parsed probe (codec/pixFmt/fps/rotated/
+ * durationMs) — the stream-copy eligibility gate reads them. */
 function probeMediaAsync(p) {
   if (typeof p !== "string" || !p) {
-    return Promise.resolve({ hasAudio: false, width: 0, height: 0 });
+    return Promise.resolve(emptyProbe());
   }
   if (probeCache.has(p)) return Promise.resolve(probeCache.get(p));
   const job = (async () => {
-    let info = { hasAudio: false, width: 0, height: 0 };
+    let info = emptyProbe();
     try {
       const r = await ffmpegCapture(["-hide_banner", "-i", p], 15000);
-      const parsed = G.videoProbeParser(r.out);
-      info = { hasAudio: parsed.hasAudio, width: parsed.width, height: parsed.height };
+      info = G.videoProbeParser(r.out);
     } catch (_) { /* unreadable source → treated as silent/unknown dims */ }
     probeCache.set(p, info);
     return info;
@@ -1707,8 +1762,26 @@ ipcMain.handle("export-native", async (event, opts) => {
     // v5.2: thread budget — divide the cores across the parallel pool so N
     // concurrent encoders never oversubscribe the CPU (the v5.1 scheme gave
     // EVERY child `-threads 0` = all cores → 4× oversubscription thrash).
-    const poolN = Math.min(4, Math.max(1, os.cpus().length - 2));
-    const threadBudget = Math.max(1, Math.floor(os.cpus().length / poolN));
+    // v1.1 TURBO: the pool is now ENCODER-AWARE — hardware encoders are the
+    // shared resource (consumer GPUs serialize internally and allow few
+    // concurrent sessions), so a GPU export runs a TIGHTER pool with
+    // per-process threads freed for the CPU filter graphs; the CPU pool
+    // keeps the v5.2 core-division scheme.
+    const isGpuEncoder = encoder.name !== "libx264";
+    const poolN = isGpuEncoder
+      ? Math.min(3, Math.max(1, os.cpus().length - 1))
+      : Math.min(4, Math.max(1, os.cpus().length - 2));
+    const threadBudget = isGpuEncoder
+      ? Math.max(2, os.cpus().length)
+      : Math.max(1, Math.floor(os.cpus().length / poolN));
+
+    // v1.1 TURBO: stream-copy counters for the result payload + a shared
+    // actual-duration accumulator (post-step-1 probe of each clip file —
+    // stream copies cut at packet granularity, so the real concat length
+    // can differ from the requested timeline by a frame per clip; the
+    // audio graph should pad/mix to the ACTUAL video length).
+    let copiedClips = 0;
+    let encodedClips = 0;
 
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i];
@@ -1827,6 +1900,73 @@ ipcMain.handle("export-native", async (event, opts) => {
         (await probeMediaAsync(seg.videoPath)).hasAudio
       );
 
+      // ── v1.1 TURBO: STREAM-COPY fast path ──────────────────────
+      // Cuts-only clips whose source already matches the output spec
+      // are remuxed with ZERO decode/filter/encode — this is the
+      // "simple cut exports in seconds" technique every fast editor
+      // uses. Eligibility has two halves:
+      //   (a) timeline-side (pure): G.clipNeedsReEncode — no speed, no
+      //       head trim, no overlays in window, no captions/headlines,
+      //       no watermark, no transition fades at this boundary;
+      //   (b) source-side (probe): h264 + yuv420p + output dims + fps
+      //       match + no rotation + the window covers the whole source
+      //       (tail-only trim ≤ 300 ms — packet-granularity cut).
+      // Mixed projects are fine: copied and re-encoded parts share the
+      // exact output stream spec (h264 yuv420p WxH fps), so the concat
+      // demuxer + `-c copy` mux stay uniform.
+      if (!G.clipNeedsReEncode({
+          i, seg, segments, transition,
+          overlayCount: overlaySpecs.length,
+          assSuffix, wm,
+        })) {
+        const probe = await probeMediaAsync(seg.videoPath);
+        const srcDur = Number(probe.durationMs) || 0;
+        const formatOk =
+          probe.codec === "h264" &&
+          probe.pixFmt === "yuv420p" &&
+          !probe.rotated &&
+          probe.width === width &&
+          probe.height === height &&
+          Math.abs((probe.fps || 0) - fps) < 0.06 &&
+          srcDur > 0 &&
+          (Number(seg.trimInMs) || 0) === 0 &&
+          seg.durationMs >= srcDur - 300;
+        if (formatOk) {
+          jobs.push({
+            idx: i,
+            args: G.buildStreamCopyArgs({
+              path: seg.videoPath,
+              durMs: seg.durationMs,
+              clipPath,
+            }),
+            durSec: seg.durationMs / 1000,
+            durationMs: seg.durationMs,
+            segId: seg.id,
+            copy: true,
+          });
+          copiedClips += 1;
+          cumulativeMs += seg.durationMs;
+          if (segHasAudio) {
+            // PCM extraction still rides the pool (audio is mixed in
+            // step 2 regardless of how the video got there).
+            const wavPath = path.join(tempDir, `audio_${String(i).padStart(4, "0")}_${Date.now()}.wav`);
+            tempFiles.push(wavPath);
+            clipAudioJobs.push({
+              idx: jobs.length + clipAudioJobs.length,
+              args: ["-i", seg.videoPath, "-vn", "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le", "-y", wavPath],
+              wavPath,
+              startMs: segStartMs,
+              volume: G.normalizeVolume(seg.volume),
+              durSec: seg.durationMs / 1000,
+              durationMs: seg.durationMs,
+              segId: seg.id,
+            });
+          }
+          continue; // skip the encode path entirely
+        }
+      }
+      encodedClips += 1;
+
       // v5.2: video-only clip encode — audio never rides the concat demuxer.
       const built = G.buildClipArgs({
         i,
@@ -1846,10 +1986,15 @@ ipcMain.handle("export-native", async (event, opts) => {
         anyAudio: false,
         segHasAudio: false,
         overlaySpecs,
-        // v5.1: hardware DECODE for base video clips (d3d11va on Windows,
-        // auto-detected; silently falls back to software when unavailable —
-        // the filters still run on CPU, ffmpeg copies frames across).
-        hwaccel: true,
+        // v1.1 TURBO: hardware DECODE is DISABLED by default. `-hwaccel
+        // auto` on Windows can silently land on a WARP (software
+        // rasterizer) d3d11va path or a broken driver path with NO
+        // fallback — decoding 1080p at ~1 fps and turning a 19-minute
+        // export into a multi-hour job. CPU H.264 decode runs at
+        // 200–400 fps and is never the bottleneck (mpv ships hw decode
+        // OFF by default for the same reliability reason). The
+        // buildVideoInputArgs capability stays for future opt-in.
+        hwaccel: false,
         // v5.2: thread budget (see the pool below).
         threads: threadBudget,
       });
@@ -1923,7 +2068,33 @@ ipcMain.handle("export-native", async (event, opts) => {
     });
 
     // ─── STEP 2: Concat all clips + mix audio ONCE (video: -c copy) ──
+    // v1.1 TURBO: stream copies cut at PACKET granularity and re-encodes
+    // round to whole frames, so the REAL concatenated video length can
+    // differ from the requested timeline by a frame per clip. The audio
+    // graph (apad/whole_dur + fade-out end + -shortest) should target the
+    // ACTUAL length — measure each clip file (parallel, cached probe) and
+    // sum. A failed probe falls back to the requested duration for that
+    // clip, and the whole total falls back when nothing is measurable.
     sendProgress(96, totalSec, etaFor(0.96));
+    // Probes run in bounded chunks (8 at a time) — a 100-clip project must
+    // not spawn 100 ffmpeg children simultaneously on a weak machine.
+    const clipDurProbe = [];
+    for (let c = 0; c < clipPaths.length; c += 8) {
+      const chunk = clipPaths.slice(c, c + 8);
+      const ds = await Promise.all(
+        chunk.map((p) => probeMediaAsync(p).then((info) => info.durationMs).catch(() => 0)),
+      );
+      clipDurProbe.push(...ds);
+    }
+    let actualTotalSec = totalSec;
+    if (clipDurProbe.length > 0 && clipDurProbe.every((d) => d > 0)) {
+      const actualMs = clipDurProbe.reduce((a, b) => a + b, 0);
+      // Guard: a wildly-off measurement (bad probe) must never skew the
+      // mix — only accept when within 2% + 1s of the requested timeline.
+      if (Math.abs(actualMs - totalMs) <= totalMs * 0.02 + 1000) {
+        actualTotalSec = actualMs / 1000;
+      }
+    }
 
     const concatListPath = path.join(tempDir, `concat_${Date.now()}.txt`);
     tempFiles.push(concatListPath);
@@ -1937,12 +2108,13 @@ ipcMain.handle("export-native", async (event, opts) => {
     // v5.2: G.buildConcatArgs muxes the concat video with the SINGLE-PASS
     // audio mix (clip WAVs + music + SFX → amix → AAC once). Music-only /
     // no-audio projects keep the exact v4.9 -af / copy paths.
+    // v1.1: totalSec = the ACTUAL concatenated video length (see above).
     const concatArgs = G.buildConcatArgs({
       concatListPath,
       audioPath,
       audio,
       outputPath,
-      totalSec,
+      totalSec: actualTotalSec,
       sfx: sfxList,
       clipAudio: clipAudioJobs.map((j) => ({
         wavPath: j.wavPath,
@@ -1952,22 +2124,31 @@ ipcMain.handle("export-native", async (event, opts) => {
       newAudioGraph: anyVideoAudio || sfxList.length > 0,
     });
 
-    await runFfmpeg(concatArgs, totalSec, (sec) => {
-      const frac = 0.96 + 0.04 * Math.min(1, sec / Math.max(0.01, totalSec));
+    await runFfmpeg(concatArgs, actualTotalSec, (sec) => {
+      const frac = 0.96 + 0.04 * Math.min(1, sec / Math.max(0.01, actualTotalSec));
       // v5 fix (pre-existing v4.9 bug): sendProgress takes PERCENT — the old
       // code passed the 0.96..1.0 fraction, so the bar dipped 96 → ~1 → 100
       // during the mux. Payload shape (progress/fps/eta/timemark) unchanged.
       sendProgress(frac * 100, sec, etaFor(frac));
     });
 
-    sendProgress(100, totalSec, 0);
+    sendProgress(100, actualTotalSec, 0);
 
     // Cleanup
     for (const f of tempFiles) { try { fs.unlinkSync(f); } catch (_) {} }
 
     let size = 0;
     try { size = fs.statSync(outputPath).size; } catch {}
-    return { path: outputPath, size, encoder: encoder.label };
+    // v1.1 TURBO: the result carries the performance story so the UI can
+    // show users WHY the export was fast (encoder + stream-copy counts).
+    return {
+      path: outputPath,
+      size,
+      encoder: encoder.label,
+      elapsedSec: Math.round((Date.now() - startTime) / 1000),
+      copiedClips,
+      encodedClips,
+    };
 
   } catch (err) {
     for (const f of tempFiles) { try { fs.unlinkSync(f); } catch (_) {} }

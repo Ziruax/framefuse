@@ -22,6 +22,11 @@ export interface LastExport {
   size: number;
   method: string;
   at: number;
+  /** v1.1 TURBO telemetry (desktop FFmpeg path only). */
+  encoder?: string;
+  elapsedSec?: number;
+  copiedClips?: number;
+  encodedClips?: number;
 }
 
 interface HeaderProps {
@@ -54,6 +59,16 @@ function timeAgo(at: number): string {
   if (m < 60) return `${m}m ago`;
   const h = Math.floor(m / 60);
   return `${h}h ago`;
+}
+
+/** v1.1 TURBO: compact elapsed-time label ("42s", "4m 12s", "1h 03m"). */
+function fmtElapsed(sec: number): string {
+  const s = Math.max(0, Math.round(sec));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${String(m % 60).padStart(2, "0")}m`;
 }
 
 /** Parse an ffmpeg timemark "HH:MM:SS.xx" into milliseconds. */
@@ -310,6 +325,17 @@ export function Header({
             backgroundColor: "rgba(24, 24, 27, 0.6)",
             color: "#a1a1aa",
           }}
+          title={
+            lastExport.elapsedSec != null
+              ? `Exported in ${fmtElapsed(lastExport.elapsedSec)}${
+                  lastExport.encoder ? ` · ${lastExport.encoder}` : ""
+                }${
+                  lastExport.copiedClips
+                    ? ` · ${lastExport.copiedClips} clip${lastExport.copiedClips === 1 ? "" : "s"} stream-copied (no re-encode)`
+                    : ""
+                }`
+              : undefined
+          }
         >
           <Clock className="size-3" style={{ color: "#71717a" }} />
           <span className="font-medium" style={{ color: "#d4d4d8" }}>
@@ -317,6 +343,31 @@ export function Header({
           </span>
           <span style={{ color: "#52525b" }}>·</span>
           <span>{lastExport.method}</span>
+          {lastExport.elapsedSec != null && (
+            <>
+              <span style={{ color: "#52525b" }}>·</span>
+              <span
+                className="flex items-center gap-1 tabular-nums"
+                style={{ color: "#f59e0b" }}
+                title="Wall-clock export time"
+              >
+                <Gauge className="size-3" />
+                {fmtElapsed(lastExport.elapsedSec)}
+              </span>
+            </>
+          )}
+          {lastExport.copiedClips != null && lastExport.copiedClips > 0 && (
+            <>
+              <span style={{ color: "#52525b" }}>·</span>
+              <span
+                className="rounded px-1 py-px font-medium"
+                style={{ backgroundColor: "rgba(16, 185, 129, 0.12)", color: "#34d399" }}
+                title="Turbo export: these clips were remuxed without decoding or re-encoding"
+              >
+                turbo ×{lastExport.copiedClips}
+              </span>
+            </>
+          )}
           <span style={{ color: "#52525b" }}>·</span>
           <span>{timeAgo(lastExport.at)}</span>
         </div>

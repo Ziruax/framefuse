@@ -49,6 +49,119 @@ function clampTrMs(ms, segDurMs) {
     : 0;
 }
 
+// ---------------------------------------------------------------------------
+// v1.1 TURBO EXPORT — pure helpers for the stream-copy fast path
+// ---------------------------------------------------------------------------
+
+/**
+ * v1.1: boundary/transition planning extracted VERBATIM from buildClipArgs
+ * (same inputs → same outputs — the harness differentials prove the argv of
+ * buildClipArgs is unchanged). Exported so the stream-copy eligibility
+ * check (clipNeedsReEncode) can consult the SAME math the encoder path
+ * uses: a clip is only copy-safe when this plan produces NO fades at all.
+ * Returns { curStyle, nextStyle, xfadeName, dipColor, headMs, dipTailMs,
+ * startFadeMs, endFadeMs, useXfadeHead } — see buildClipArgs for semantics.
+ */
+function planBoundaryFades(i, seg, segments, transition) {
+  const trGlobal = transition && transition.style ? transition.style : "none";
+  const trOverrides =
+    transition && transition.overrides && typeof transition.overrides === "object"
+      ? transition.overrides
+      : null;
+  const boundaryStyleAt = (s) =>
+    s && trOverrides && Object.prototype.hasOwnProperty.call(trOverrides, s.id)
+      ? trOverrides[s.id]
+      : trGlobal;
+  const trWanted =
+    transition && Number(transition.durationMs) > 0
+      ? Number(transition.durationMs)
+      : 0;
+  const fadeStartEnd = !!(transition && transition.fadeStartEnd);
+  const curStyle = i > 0 ? boundaryStyleAt(seg) : "none";
+  const nextStyle = !isLastSeg(i, segments) ? boundaryStyleAt(segments[i + 1]) : "none";
+  const xfadeName = XFADE_NAMES[curStyle] || null;
+  const dipColor = DIP_COLORS[curStyle] || null;
+  const headMs =
+    i > 0 && curStyle !== "none" ? clampTrMs(trWanted, seg.durationMs) : 0;
+  const dipTailMs =
+    DIP_COLORS[nextStyle] && !isLastSeg(i, segments) ? clampTrMs(trWanted, seg.durationMs) : 0;
+  const startFadeMs =
+    i === 0 && fadeStartEnd ? clampTrMs(trWanted, seg.durationMs) : 0;
+  const endFadeMs =
+    isLastSeg(i, segments) && fadeStartEnd ? clampTrMs(trWanted, seg.durationMs) : 0;
+  return {
+    curStyle, nextStyle, xfadeName, dipColor, headMs, dipTailMs, startFadeMs, endFadeMs,
+    trWanted, fadeStartEnd,
+  };
+}
+
+function isLastSeg(i, segments) {
+  return i === segments.length - 1;
+}
+
+/**
+ * v1.1 TURBO: does this clip REQUIRE a re-encode? Everything that makes a
+ * clip visually different from its source forces the encode path. The
+ * SOURCE-format half of the eligibility (codec h264 + output dims + fps +
+ * pix_fmt + full-window) is checked in main.js against the async probe —
+ * this pure half covers the timeline-side reasons:
+ *   - not a base-lane video segment, or a playback speed change
+ *   - a head trim (stream copy cannot cut mid-GOP frame-accurately)
+ *   - ANY overlay intersecting the clip window
+ *   - burned captions/headlines for this clip (assSuffix)
+ *   - a watermark anywhere in the project
+ *   - a REAL fade filter touching this clip: dip heads/tails and the
+ *     fadeStartEnd bookends. An xfade-FAMILY style at a VIDEO boundary is
+ *     a HARD CUT (the v5.0 video rule — both preview and export render it
+ *     as a plain concatenation, no filter), so dissolve/slide/wipe
+ *     transitions between video clips stay copy-eligible. Ken Burns is
+ *     image-only (videos never get zoompan), so it is not consulted here.
+ */
+function clipNeedsReEncode(ctx) {
+  const {
+    i, seg, segments, transition,
+    overlayCount, assSuffix, wm,
+  } = ctx;
+  const isVideo = !!(seg && seg.mediaType === "video" && seg.videoPath);
+  if (!isVideo) return true;
+  if (resolveSegSpeed(seg) !== 1) return true;
+  if ((Number(seg.trimInMs) || 0) > 0) return true;
+  if (Number(overlayCount) > 0) return true;
+  if (assSuffix) return true;
+  if (wm) return true;
+  const plan = planBoundaryFades(i, seg, segments, transition);
+  // A head FADE filter only exists for dip styles at this boundary
+  // (postFades: `dipColor && headMs > 0`); xfade heads on video
+  // boundaries never materialize (hard cut).
+  const headFadeFilter = !!(plan.dipColor && plan.headMs > 0);
+  if (headFadeFilter || plan.dipTailMs > 0 || plan.startFadeMs > 0 || plan.endFadeMs > 0) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * v1.1 TURBO: step-1 argv for a STREAM-COPY clip — demux the source window
+ * and remux the video packets UNTOUCHED (no decode, no filter graph, no
+ * encode). Eligibility is decided upstream (clipNeedsReEncode + the probe
+ * format checks in main.js); this builder only lays out the fast argv:
+ *   -t <dur> -i <src> -c:v copy -an -avoid_negative_ts make_zero -y <out>
+ * `-t` rides the INPUT side so demux stops early; `-an` keeps the clip
+ * video-only (audio is mixed separately in step 2); make_zero normalizes
+ * packet timestamps so the concat demuxer offsets cleanly.
+ */
+function buildStreamCopyArgs(o) {
+  const durMs = Math.max(0, Number(o && o.durMs) || 0);
+  return [
+    "-t", fmt3(durMs),
+    "-i", o && o.path,
+    "-c:v", "copy",
+    "-an",
+    "-avoid_negative_ts", "make_zero",
+    "-y", o && o.clipPath,
+  ];
+}
+
 /**
  * Frozen zoompan expressions = the PREVIOUS segment's Ken Burns END state
  * (eased = 1). Used as input A of the xfade head composite so the preview's
@@ -274,9 +387,20 @@ function videoHasAudioParser(stderr) {
  * to). width/height stay 0 when no video stream line is found.
  * v5.2: durationMs parsed from the container "Duration: HH:MM:SS.ms" line —
  * drives the -ss modulo for looped overlay inputs.
+ * v1.1 TURBO: codec / pixFmt / fps / rotated parsed from the same video
+ * stream line — the stream-copy eligibility gate needs them (h264 +
+ * yuv420p + matching fps; rotated sources must re-encode because copy
+ * keeps the rotation display matrix while re-encoded clips don't).
+ *   "Stream #0:0…: Video: h264 (High) (avc1 / 0x31637661), yuv420p,
+ *    1920x1080 [SAR 1:1 DAR 16:9], 2132 kb/s, 30 fps, 30 tbr, 15360 tbn"
+ * fps prefers the explicit "N fps" field, else "N tbr" (VFR sources
+ * report an average tbr — close enough for the ±0.06 gate).
  */
 function videoProbeParser(stderr) {
-  const out = { hasAudio: false, width: 0, height: 0, durationMs: 0 };
+  const out = {
+    hasAudio: false, width: 0, height: 0, durationMs: 0,
+    codec: "", pixFmt: "", fps: 0, rotated: false,
+  };
   if (typeof stderr !== "string") return out;
   out.hasAudio = videoHasAudioParser(stderr);
   const lines = stderr.split(/\r?\n/);
@@ -287,6 +411,12 @@ function videoProbeParser(stderr) {
   if (vline) {
     const m = vline.match(/(\d{2,5})x(\d{2,5})/);
     if (m) { out.width = +m[1]; out.height = +m[2]; }
+    const c = vline.match(/Video:\s*([a-z0-9_-]+)/i);
+    if (c) out.codec = c[1].toLowerCase();
+    const pf = vline.match(/,\s*(yuv[a-z0-9]+|nv12|nv21|rgb[a-z0-9]*|gray[a-z0-9]*)\b/i);
+    if (pf) out.pixFmt = pf[1].toLowerCase();
+    const f = vline.match(/([\d.]+)\s*fps/) || vline.match(/([\d.]+)\s*tbr/);
+    if (f) out.fps = parseFloat(f[1]) || 0;
   }
   const dur = stderr.match(/Duration:\s*(\d+):(\d{2}):(\d{2}\.\d{2})/);
   if (dur) {
@@ -297,6 +427,7 @@ function videoProbeParser(stderr) {
     const r = Math.abs(parseFloat(rot[1])) % 360;
     if (Math.abs(r - 90) < 0.01 || Math.abs(r - 270) < 0.01) {
       const t = out.width; out.width = out.height; out.height = t;
+      out.rotated = true;
     }
   }
   return out;
@@ -725,42 +856,26 @@ function buildClipArgs(ctx) {
   // ── v4.3 transition planning (mirrors renderer.ts formulas exactly;
   //    v4.5 per-boundary overrides — the style at the boundary ENTERING
   //    segments[i] is transition.overrides[segments[i].id] ?? global).
-  const trGlobal = transition && transition.style ? transition.style : "none";
-  const trOverrides =
-    transition && transition.overrides && typeof transition.overrides === "object"
-      ? transition.overrides
-      : null;
-  const boundaryStyleAt = (s) =>
-    s && trOverrides && Object.prototype.hasOwnProperty.call(trOverrides, s.id)
-      ? trOverrides[s.id]
-      : trGlobal;
-  const trWanted =
-    transition && Number(transition.durationMs) > 0
-      ? Number(transition.durationMs)
-      : 0;
-  const fadeStartEnd = !!(transition && transition.fadeStartEnd);
+  //    v1.1: extracted into planBoundaryFades (verbatim math — see harness).
+  const plan = planBoundaryFades(i, seg, segments, transition);
+  const curStyle = plan.curStyle;
+  const nextStyle = plan.nextStyle;
+  const xfadeName = plan.xfadeName;
+  const dipColor = plan.dipColor;
+  const headMs = plan.headMs;
+  const dipTailMs = plan.dipTailMs;
+  const startFadeMs = plan.startFadeMs;
+  const endFadeMs = plan.endFadeMs;
+  const fadeStartEnd = plan.fadeStartEnd;
 
+  // ── Build zoompan expressions — EXACT canvas parity (images only; video
+  //    clips never get Ken Burns — their own motion is the content).
   const segDurSec = seg.durationMs / 1000;
   const segFrames = Math.max(2, Math.round(segDurSec * fps));
   const enabled = kbEnabled;
   const dir = enabled ? seg.direction || globalDir : "none";
   const isLast = i === segments.length - 1;
 
-  const curStyle = i > 0 ? boundaryStyleAt(seg) : "none";
-  const nextStyle = !isLast ? boundaryStyleAt(segments[i + 1]) : "none";
-  const xfadeName = XFADE_NAMES[curStyle] || null;
-  const dipColor = DIP_COLORS[curStyle] || null;
-  const headMs =
-    i > 0 && curStyle !== "none" ? clampTrMs(trWanted, seg.durationMs) : 0;
-  const dipTailMs =
-    DIP_COLORS[nextStyle] && !isLast ? clampTrMs(trWanted, seg.durationMs) : 0;
-  const startFadeMs =
-    i === 0 && fadeStartEnd ? clampTrMs(trWanted, seg.durationMs) : 0;
-  const endFadeMs =
-    isLast && fadeStartEnd ? clampTrMs(trWanted, seg.durationMs) : 0;
-
-  // ── Build zoompan expressions — EXACT canvas parity (images only; video
-  //    clips never get Ken Burns — their own motion is the content).
   let zExpr, xExpr, yExpr;
   if (!enabled || dir === "none") {
     zExpr = "1.1"; xExpr = "iw/2-(iw/zoom/2)"; yExpr = "ih/2-(ih/zoom/2)";
@@ -1225,6 +1340,10 @@ module.exports = {
   fmtSpeed,
   atempoFilters,
   resolveSegSpeed,
+  // v1.1 TURBO export helpers
+  planBoundaryFades,
+  clipNeedsReEncode,
+  buildStreamCopyArgs,
   // base video clip builders
   buildVideoInputArgs,
   buildVideoFilterChain,
