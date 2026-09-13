@@ -1534,6 +1534,14 @@ export function TimelineRuler({
 
   const handleMusicDragAbort = () => setMusicDrag(null);
 
+  // v5.2: music-clip hover state drives the volume/loop popover. React state
+  // (not CSS group-hover): Tailwind's `pointer-events-none` and the
+  // `group-hover:pointer-events-auto` variant share specificity, so cascade
+  // order decides — inline styles are deterministic. The popover is a DOM
+  // descendant of the clip, so moving the pointer from the clip into the
+  // (flush, top-0) popover never fires pointerleave — the chain is unbroken.
+  const [musicHover, setMusicHover] = useState(false);
+
   /**
    * Begin a clip gesture (body = move, edges = trim). Guards: only when the
    * parent accepts edits (onEditItem) and only for the primary pointer — any
@@ -2409,7 +2417,14 @@ export function TimelineRuler({
                         tabIndex={0}
                         aria-label={`Background music clip starting at ${fmtTimecode(musicStart)}${musicLoop ? ", looping to fill the video" : ""}`}
                         className={cn(
-                          "group absolute top-1 bottom-1 z-[2] flex select-none items-center gap-1 overflow-hidden rounded-md border pl-1.5 text-[8px] font-semibold",
+                          // NOTE: no overflow-hidden AND no z-index — the
+                          // hover popover (volume + loop) floats ABOVE the
+                          // 34px lane and its z-[60] must escape this clip's
+                          // subtree (a z here would create a stacking context
+                          // that traps the popover under the video lane's
+                          // z-[3] filmstrip bars). The clip still paints over
+                          // the waveform strip (later absolute sibling).
+                          "group absolute top-1 bottom-1 flex select-none items-center gap-1 rounded-md border pl-1.5 text-[8px] font-semibold",
                           onMusicMove
                             ? "cursor-grab touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sky-300/70"
                             : "cursor-pointer",
@@ -2435,6 +2450,8 @@ export function TimelineRuler({
                         onPointerUp={handleMusicPointerUp}
                         onPointerCancel={handleMusicDragAbort}
                         onLostPointerCapture={handleMusicDragAbort}
+                        onPointerEnter={() => setMusicHover(true)}
+                        onPointerLeave={() => setMusicHover(false)}
                         onKeyDown={(e) => {
                           if (e.key === "Enter" || e.key === " ") {
                             e.preventDefault();
@@ -2473,10 +2490,19 @@ export function TimelineRuler({
                           {volPct}%
                         </span>
                         {/* Hover popover: volume slider + loop toggle (floats
-                            ABOVE the 34px lane so nothing is crammed). */}
+                            ABOVE the 34px lane so nothing is crammed).
+                            top-0 + -translate-y-full keeps the popover's
+                            bottom edge FLUSH with the clip's top edge — a
+                            gap would break the pointer chain (the pointer
+                            would fall through to the lane above and the
+                            popover would close before the click lands). */}
                         {(onMusicVolumeChange || onMusicLoopChange) && (
                           <div
-                            className="pointer-events-none absolute -top-1 left-1/2 z-[6] -translate-x-1/2 -translate-y-full opacity-0 transition-opacity duration-100 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100"
+                            className="absolute top-0 left-1/2 z-[60] -translate-x-1/2 -translate-y-full transition-opacity duration-100"
+                            style={{
+                              opacity: musicHover || musicDrag ? 1 : 0,
+                              pointerEvents: musicHover || musicDrag ? "auto" : "none",
+                            }}
                           >
                             <div
                               className="flex items-center gap-2 rounded-lg border px-2.5 py-1.5 shadow-xl backdrop-blur-md"
