@@ -398,3 +398,30 @@ Stage Summary:
 - v1.1.0 SHIPPED end-to-end: code + installer + GitHub release. The 5-10h export failure modes are eliminated (WARP decode hazard removed, broken-encoder throughput gate, stream-copy fast path measured at 177× per clip).
 - The Windows cross-build no longer needs a working wine for rcedit/uninstaller extraction — both are native JS now (durable via postinstall).
 - OPERATIONAL NOTE for future rounds: dev server must be started with the double-fork pattern (`setsid bash -c 'bash -c "exec node node_modules/.bin/next dev -p 3000 >> dev.log 2>&1" &'`) — plain nohup/setsid gets reaped ~60s after the spawning tool call; long builds must run in foreground tool calls; multi-CPU-second single commands get SIGKILLed (budget ~5 CPU-s/command).
+
+---
+Task ID: 17 (v1.2 sprint — cron review round)
+Agent: main (Z.ai Code)
+Task: Scheduled review round → QA + the worklog's #1 next-phase candidate (2-pass loudnorm) + mandatory styling/features
+
+STATUS ASSESSMENT (start of round):
+- Repo ahead of summary: Task 16/16b already SHIPPED the v1.1 TURBO EXPORT fix (stream-copy 177×/clip, WARP-decode hazard removed, encoder throughput gate) AND the v1.1.0 Windows installer + GitHub release. All pushed.
+- Live QA: clean load, uploads (3 clips), playback, Ctrl+A/Esc multi-select — 0 console errors. No bugs to prioritize → next-phase development.
+- Export cancel (old candidate #5) verified ALREADY fully wired (Header Cancel → abort → cancel-export IPC → killAllProcs → "Export cancelled" toast).
+
+GOALS / COMPLETED / VERIFICATION:
+1. FEATURE A — 2-PASS MEASURED LOUDNORM (the #1 worklog candidate):
+   - main.js: measureLoudnessAsync (ffmpeg loudnorm print_format=json parse → {i,lra,tp,thresh,offset}; -inf/timeout → null) + measureLoudnormContext (clip WAVs + music, bounded 8-parallel) run after step-1 pool when audio.normalize; passed to buildConcatArgs.
+   - export-graph.js: measuredLoudnormFilter (canonical measured_* + offset + linear=true static-gain recipe); clip branches open with it (BEFORE volume/adelay — must act on the measured signal); music branch + music-only -af path upgraded the same way; volume-knob order fixed to normalize-first (v5.2 quirk: volume-before-DYNAMIC-loudnorm let the normalizer silently undo the user's volume).
+   - SFX deliberately NOT normalized (synthesized at designed levels). Per-file failure → single-pass fallback (v5.2 behavior). normalize OFF → argv byte-identical to v1.1 (differential: 3 contexts IDENTICAL).
+   - REAL-FFMPEG VERIFICATION: quiet.wav -41.75 LUFS → round-trip -16.02; full amix E2E (2 real clips, measured graph): seg0 -41.8→-16.05, seg1 -22.3→-16.02.
+2. FEATURE B — KEYBOARD SHORTCUTS OVERLAY: src/components/ShortcutsOverlay.tsx (4 groups × kbd chips, role=dialog, backdrop-pop animations + prefers-reduced-motion, slim custom scrollbar). Opens via `?` or new header keyboard button; Esc/backdrop/X close; while open the overlay owns the keyboard (Space/S/Del guarded — E2E verified). Fixed own duplicate-key React warning (`Redo` twice → composite keys; fresh-session console 0).
+3. FEATURE C — EXPORT AUDIO BITRATE: VideoSettings.audioKbps 96/128/192/256/320 (optional, default 192 = v1.1 constant, old project files byte-compatible) → native.ts payload → main.js validated ladder → -b:a on all 3 concat paths + MediaRecorder audioBitsPerSecond hint. Segmented-control UI in EXPORT tab (E2E: hint updates 192→320→96 kbps).
+4. STYLING (mandatory): VLM review round — real fixes applied: overlay footer contrast (#52525b/#71717a → #71717a/#a1a1aa), Audio-tab normalize copy rewritten for 2-pass semantics + violet "2-PASS" badge, header version chip v1 → v1.2 (title consistency). VLM claims verified before acting: "Covv selection" typo = VLM misread of downscaled 12px text (DOM text verified "Copy selection"); Toggle-active-color + track-header-padding + clip-badge-overflow claims = already handled in code (violet+glow toggle; 64px centered LaneLabel gutter; width-guarded badges).
+5. GATES: tsc 0 · eslint 0 · agent-browser E2E regression (upload, Ctrl+A/Esc, play/pause, overlay lifecycle, audioKbps UI, 0 console errors) · dev.log clean. Version 1.1.0 → 1.2.0 (package.json + doc title + chip). Committed 6b13571.
+
+UNRESOLVED ISSUES / RISKS + NEXT-PHASE PRIORITIES:
+- PUSH BLOCKED: the GitHub token in the origin URL was REDACTED by the environment between sessions (remote now literally "[REDACTED:github_token]@github.com/..."). Commit 6b13571 is local-only; push needs the user to re-provide the token (git remote set-url). All prior work through 9e07785 IS pushed.
+- Windows installer v1.2.0 not built this round (code-complete; build when push access is restored — follow Task 16b's foreground + rcedit-native recipe).
+- The loudnorm measurement adds one audio-only ffmpeg pass per source (~sub-second each, 8-parallel); pathological many-clip projects pay a small one-time cost — acceptable, but a "skip normalize for very short clips (<2s)" micro-optimization is possible.
+- Next-phase candidates: 1) GPU filter graphs (scale_cuda/hwupload+overlay_cuda) for the overlay-heavy re-encode path (needs a GPU box to validate); 2) keyframe-aligned stream-copy trims (head-trimmed clips currently always re-encode); 3) master-bus loudnorm on the summed mix (currently per-source only — summing N normalized sources can exceed -16); 4) per-overlay fps normalization.
