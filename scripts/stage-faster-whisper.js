@@ -124,7 +124,7 @@ async function main() {
     "--platform", "win_amd64",
     "--only-binary=:all:",
     "--target", SITE,
-    "--nocompile",
+    "--no-compile",
     FASTER_WHISPER_SPEC,
   ];
   try {
