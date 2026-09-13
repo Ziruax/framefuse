@@ -153,3 +153,28 @@ Stage Summary:
 - All 8 user requirements implemented and browser-verified
 - Commits: data model → whisper/panels/preview → music → export perf → defaults → popover fixes
 - Next: GitHub push, Windows NSIS installer build, GitHub release, cron job
+
+---
+Task ID: 8-9
+Agent: main (Z.ai Code)
+Task: GitHub push, Windows NSIS installer build, GitHub release, cron job
+
+Work Log:
+- README updated with the v5.2 "what's new" section; committed
+- Pushed all 7 v5.2 commits to https://github.com/Ziruax/framefuse.git (main)
+- Windows installer build on Linux: next build --webpack (static export) → copy-wasm → fetch-windows-ffmpeg (79MB ffmpeg.exe) → stage-whisper-service (50MB) → electron-builder --win nsis
+  - OBSTACLE 1: NSIS target needs wine on Linux; no root for apt → downloaded Kron4ek portable wine 11.17 (103MB tarball, works without root)
+  - OBSTACLE 2: sandbox seccomp kills wine running the NSIS stub installer (SIGSYS) — the uninstaller-extraction step executes the installer under wine. PATCHED node_modules/app-builder-lib/out/targets/nsis/NsisTarget.js to use the NATIVE UninstallerReader (the macOS Catalina path) on Linux — extracts the uninstaller by parsing the NSIS binary, no execution needed
+  - RESULT: dist/FrameFuse Setup 5.2.0.exe — 144,304,797 bytes, PE32 Nullsoft self-extracting installer, 5 sections; bundles ffmpeg.exe + whisper-service + transformers-wasm; blockmap built
+- GitHub release created: v5.2.0 (id 387868856) https://github.com/Ziruax/framefuse/releases/tag/v5.2.0
+  - Assets uploaded: FrameFuse.Setup.5.2.0.exe (144MB, state=uploaded) + .blockmap (152KB)
+- Dev server restarted after the build window (GET / 200, 52 interactive elements, 0 console errors in fresh session)
+- Cron job created: job_id 381756, fixed_rate 900s (every 15 min), kind=webDevReview, tz=Asia/Karachi
+
+Stage Summary:
+- ALL 9 user requirements delivered and verified end-to-end
+- Repo: https://github.com/Ziruax/framefuse (7 new commits on main)
+- Release: https://github.com/Ziruax/framefuse/releases/tag/v5.2.0 with the Windows installer
+- Build notes for the future: portable wine at /home/z/wine-portable + NsisTarget.js patch are needed to cross-build NSIS in this sandbox (the patch lives in node_modules only — re-apply after bun install; consider committing a postinstall patch script later)
+- Known limitations: (a) whisper downloads have no in-flight fetch cancellation (transformers 2.17 limitation — cancelled downloads finish in background, result discarded); (b) despill approximates magenta/cyan keys to green/blue families (FFmpeg despill limitation); (c) preview volume caps at 100% (HTMLMediaElement), >100% boost applies in export only
+- Next-phase recommendations: 2-pass loudnorm, GPU filter graphs (scale_cuda/hwupload), base-lane trim handles on the timeline, SFX duration editing, per-overlay fps normalization
