@@ -173,6 +173,8 @@ interface ResolvedEntry {
    *  (clamped 0.25..4); images and overlay-lane items are locked to 1 —
    *  the FFmpeg overlay graph composites overlays at native rate. */
   speed: number;
+  /** v5.2: loop the overlay source so it spans its full timeline window. */
+  overlayLoop: boolean;
   chroma: ChromaKeySettings | null;
   overlay: OverlayTransform | null;
 }
@@ -200,6 +202,9 @@ function resolveEntry(
     mediaType === "video" ? numOr(videoDurations?.[e.id], 0) || null : null;
   // v5.1: speed only on BASE-lane VIDEO items (see ResolvedEntry.speed).
   const speed = mediaType === "video" && track === 0 ? clampSpeed(edit?.speed) : 1;
+  // v5.2: loop the overlay source so short green-screen clips can span the
+  // whole video (export -stream_loop -1, preview wraps currentTime).
+  const overlayLoop = edit?.overlayLoop === true && track >= 1;
   return {
     entry: e,
     mediaType,
@@ -208,6 +213,7 @@ function resolveEntry(
     trimInMs,
     sourceDurationMs,
     speed,
+    overlayLoop,
     // Raw passthrough — chroma.ts owns sanitization at the UI boundary.
     chroma: edit?.chroma ?? null,
     overlay: edit?.overlay ?? null,
@@ -243,6 +249,7 @@ function makeSegment(
     trimInMs: r.trimInMs,
     sourceDurationMs: r.sourceDurationMs,
     speed: r.speed,
+    overlayLoop: r.overlayLoop,
     chroma: r.chroma,
     overlay: r.overlay,
   };

@@ -98,6 +98,8 @@ interface NativeOverlayPayload {
   volume: number;
   chroma: ChromaKeySettings | null;
   overlay: OverlayTransform | null;
+  /** v5.2: loop the source to fill the whole timeline window. */
+  overlayLoop?: boolean;
   imagePath?: string;
   videoPath?: string;
   /** Source dims when cheaply known (image natural size) — else the main
@@ -331,6 +333,7 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
           volume: seg.volume,
           chroma: seg.chroma ? sanitizeChromaKeySettings(seg.chroma) : null,
           overlay: seg.overlay,
+          ...(seg.overlayLoop ? { overlayLoop: true } : {}),
           videoPath,
         });
       } else {
@@ -379,6 +382,7 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
         volume: seg.volume,
         chroma: seg.chroma ? sanitizeChromaKeySettings(seg.chroma) : null,
         overlay: seg.overlay,
+        ...(seg.overlayLoop ? { overlayLoop: true } : {}),
         imagePath,
         ...(img && img.naturalWidth > 0 && img.naturalHeight > 0
           ? { sourceWidth: img.naturalWidth, sourceHeight: img.naturalHeight }

@@ -283,6 +283,10 @@ export function sanitizeItemEdits(
     if (edit.chroma && typeof edit.chroma === "object") {
       clean.chroma = edit.chroma;
     }
+    // v5.2: loop the overlay source to span its full timeline window.
+    if (edit.overlayLoop === true) {
+      clean.overlayLoop = true;
+    }
     if (
       edit.overlay &&
       typeof edit.overlay === "object" &&
@@ -293,6 +297,13 @@ export function sanitizeItemEdits(
       clean.overlay = {
         scalePercent: edit.overlay.scalePercent,
         position: edit.overlay.position as OverlayPos,
+        // v5.2: free-form canvas placement (normalized 0..1 center).
+        ...(typeof edit.overlay.x === "number" && Number.isFinite(edit.overlay.x)
+          ? { x: Math.min(1, Math.max(0, edit.overlay.x)) }
+          : {}),
+        ...(typeof edit.overlay.y === "number" && Number.isFinite(edit.overlay.y)
+          ? { y: Math.min(1, Math.max(0, edit.overlay.y)) }
+          : {}),
       };
     }
     if (Object.keys(clean).length > 0) {

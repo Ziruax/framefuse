@@ -44,20 +44,42 @@ export function resolveDimensions(
   }
 }
 
-/** Downscaled preview dimensions that fit a typical panel. */
+/** Downscaled preview dimensions that fit a typical panel. The v5.2 preview
+ *  stage is fully responsive (a ResizeObserver letterboxes it inside the
+ *  available panel space), so these are only the CANVAS BUFFER resolution —
+ *  the on-screen size is decoupled from the buffer. */
 export function previewDimensions(aspect: AspectRatio): { w: number; h: number } {
   switch (aspect) {
     case "16:9":
       return { w: 960, h: 540 };
     case "9:16":
-      return { w: 380, h: 676 };
+      return { w: 540, h: 960 };
     case "1:1":
       return { w: 620, h: 620 };
     case "4:5":
-      return { w: 496, h: 620 };
+      return { w: 620, h: 775 };
     default:
       return { w: 960, h: 540 };
   }
+}
+
+/** v5.2: map an intrinsic source aspect ratio (w/h) to the closest supported
+ *  output AspectRatio. Used to auto-match the project aspect when the first
+ *  video is imported so vertical/square sources are never silently cropped,
+ *  and by the preview "Match source" button. */
+export function closestAspectForRatio(ratio: number): AspectRatio {
+  if (!Number.isFinite(ratio) || ratio <= 0) return "16:9";
+  const candidates: Array<{ id: AspectRatio; r: number }> = [
+    { id: "16:9", r: 16 / 9 },
+    { id: "9:16", r: 9 / 16 },
+    { id: "1:1", r: 1 },
+    { id: "4:5", r: 4 / 5 },
+  ];
+  let best = candidates[0];
+  for (const c of candidates) {
+    if (Math.abs(Math.log(c.r / ratio)) < Math.abs(Math.log(best.r / ratio))) best = c;
+  }
+  return best.id;
 }
 
 function clamp(v: number, lo: number, hi: number): number {
@@ -659,6 +681,18 @@ export function overlayGeometry(
   // Vertical anchor: top row / middle row / bottom row.
   const row = pos.startsWith("top") ? 0 : pos.startsWith("bottom") ? 2 : 1;
 
+  // v5.2: free-form placement (dragged on the preview canvas) overrides the
+  // 9-grid anchor. x/y are normalized 0..1 center coordinates against the
+  // OUTPUT frame; at least 8% of the overlay stays visible on every edge so
+  // a drag can never strand the clip completely off-canvas.
+  if (Number.isFinite(t.x) && Number.isFinite(t.y)) {
+    const cx = clamp(t.x as number, 0, 1) * videoW;
+    const cy = clamp(t.y as number, 0, 1) * videoH;
+    const fx = Math.round(clamp(cx - dw / 2, -dw * 0.92, videoW - dw * 0.08));
+    const fy = Math.round(clamp(cy - dh / 2, -dh * 0.92, videoH - dh * 0.08));
+    return { dx: fx, dy: fy, dw, dh };
+  }
+
   const dx =
     col === 0 ? m : col === 2 ? Math.round(videoW - dw - m) : Math.round((videoW - dw) / 2);
   const dy =
@@ -673,12 +707,17 @@ export function overlayGeometry(
  * is the content). Black letterbox fill first, identity transform, high
  * smoothing. Sources without intrinsic dimensions yet (metadata not
  * loaded) leave the black frame.
+ *
+ * v5.2: `fit` = "contain" letterboxes instead of cover-cropping (preview
+ * toggle — the full source frame stays visible with black bars). Export
+ * keeps the default cover behavior so the output frame is always filled.
  */
 export function drawVideoFrame(
   ctx: CanvasRenderingContext2D,
   source: VideoFrameSource | null | undefined,
   cw: number,
   ch: number,
+  fit: "cover" | "contain" = "cover",
 ): void {
   // Clear + black background (letterbox fallback).
   ctx.fillStyle = "#000000";
@@ -691,10 +730,10 @@ export function drawVideoFrame(
   const ih = typeof sh === "number" && Number.isFinite(sh) ? sh : 0;
   if (!iw || !ih) return;
 
-  // object-fit: cover base scale.
-  const cover = Math.max(cw / iw, ch / ih);
-  const dw = iw * cover;
-  const dh = ih * cover;
+  // object-fit: cover / contain base scale.
+  const scale = fit === "contain" ? Math.min(cw / iw, ch / ih) : Math.max(cw / iw, ch / ih);
+  const dw = iw * scale;
+  const dh = ih * scale;
   const dx = (cw - dw) / 2;
   const dy = (ch - dh) / 2;
 

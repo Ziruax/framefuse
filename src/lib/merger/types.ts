@@ -112,6 +112,12 @@ export interface OverlayTransform {
   /** Destination width as a percentage of the video width (10 – 100). */
   scalePercent: number;
   position: OverlayPos;
+  /** v5.2: free-form center position, normalized 0..1 against the OUTPUT
+   *  frame. When both are finite they OVERRIDE the 9-grid anchor — set by
+   *  dragging the overlay directly on the preview canvas (CapCut-style PiP).
+   *  Keep optional so v5.0/5.1 project files load unchanged. */
+  x?: number;
+  y?: number;
 }
 
 /** Per-item user edits (all optional; absent fields keep their defaults). */
@@ -132,6 +138,11 @@ export interface ItemEdit {
    *  source window at 2× becomes a 5s timeline clip. Images and overlay-lane
    * clips resolve speed 1 (the export overlay graph is speed-1 by design). */
   speed?: number;
+  /** v5.2: loop the overlay source so it spans the full clip window even
+   *  when the source is shorter than the timeline duration (green-screen
+   *  clips stretched to the whole video). Export uses -stream_loop -1;
+   *  preview wraps the video element currentTime. */
+  overlayLoop?: boolean;
   /** Chroma key settings — stored RAW here; chroma.ts owns sanitization
    *  (sanitizeChromaKeySettings) at the UI boundary. */
   chroma?: ChromaKeySettings;
@@ -177,6 +188,9 @@ export interface MediaSegment {
   /** v5.1: resolved playback speed (videos on the base lane, 0.25..4;
    *  images / overlays = 1). durationMs = sourceWindow / speed. */
   speed: number;
+  /** v5.2: true when the overlay source should LOOP to fill its whole
+   *  timeline window (short green-screen clip spanning the full video). */
+  overlayLoop: boolean;
   /** Resolved chroma key settings or null. NOT sanitized in the timeline —
    *  chroma.ts owns sanitization at the UI boundary. */
   chroma: ChromaKeySettings | null;
@@ -215,7 +229,9 @@ export interface KenBurnsConfig {
 
 export function defaultKenBurnsConfig(): KenBurnsConfig {
   return {
-    enabled: true,
+    // v5.2: OFF by default — effects must be opt-in per user request, not
+    // silently applied to every imported image.
+    enabled: false,
     intensity: 35,
     direction: "random",
     directionPool: ["in", "out", "left", "right", "up", "down"],
@@ -232,6 +248,15 @@ export interface VideoSettings {
   /** Constant-quality target (CRF / cq / QP). Used when quality="custom",
    * otherwise the profile's value wins. 18 – 28, lower = better. */
   crf?: number;
+  /** v5.2: how the preview draws media whose aspect differs from the output
+   *  frame — "cover" crops to fill (export behavior), "contain" letterboxes
+   *  so the full frame is visible. Preview-only; export always covers. */
+  previewFit?: "cover" | "contain";
+  /** v5.2: false until the user manually picks an aspect in Settings —
+   *  before that, importing the first video auto-matches the output aspect
+   *  to the source (with a toast) so vertical/square video is never
+   *  silently center-cropped. */
+  aspectTouched?: boolean;
 }
 
 /** Result of parsing a single filename. */
@@ -455,7 +480,9 @@ export interface ExportNativeOptions {
   signal?: AbortSignal;
 }
 
-/** Audio post-processing options for export (v4.1). */
+/** Audio post-processing options for export (v4.1). v5.2 adds background
+ *  music placement controls — the music track is now a first-class timeline
+ *  citizen (draggable on the audio lane, volume, loop-to-fill). */
 export interface AudioSettings {
   /** Normalize loudness to -16 LUFS (social-media standard) via ffmpeg loudnorm. */
   normalize: boolean;
@@ -463,10 +490,24 @@ export interface AudioSettings {
   fadeInMs: number;
   /** Fade-out duration in ms (0 = off). */
   fadeOutMs: number;
+  /** v5.2: background music volume 0..2 (1 = unity, 0 = muted). */
+  musicVolume: number;
+  /** v5.2: background music start offset on the master timeline (ms). */
+  musicStartMs: number;
+  /** v5.2: loop the music so it spans the ENTIRE video duration — background
+   *  tracks are usually 2+ minutes while the edit is shorter. */
+  musicLoop: boolean;
 }
 
 export function defaultAudioSettings(): AudioSettings {
-  return { normalize: false, fadeInMs: 0, fadeOutMs: 0 };
+  return {
+    normalize: false,
+    fadeInMs: 0,
+    fadeOutMs: 0,
+    musicVolume: 1,
+    musicStartMs: 0,
+    musicLoop: false,
+  };
 }
 
 // ---------------------------------------------------------------------------

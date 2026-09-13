@@ -1,13 +1,13 @@
 {
   "name": "framefuse",
-  "version": "5.1.0",
+  "version": "5.2.0",
   "private": true,
-  "description": "FrameFuse v5.1 — Multi-track video studio: video clips, green-screen chroma key, overlay lane, synthesized SFX, native Whisper captions, non-blocking GPU-accelerated parallel FFmpeg export, native project files.",
+  "description": "FrameFuse v5.2 — Multi-track video studio: video clips, green-screen chroma key with on-canvas PiP, overlay lane, background music with volume/loop, synthesized SFX, native Whisper captions, non-blocking GPU-accelerated parallel FFmpeg export, native project files.",
   "main": "electron/main.js",
   "author": "FrameFuse",
   "license": "MIT",
   "scripts": {
-    "dev": "next dev -p 3000",
+    "dev": "next dev -p 3000 2>&1 | tee dev.log",
     "clean": "node scripts/clean.js",
     "build": "npm run clean && next build --webpack && node scripts/copy-wasm.js",
     "start": "next start",
@@ -16,8 +16,14 @@
     "electron:dev": "concurrently -k \"npm run dev\" \"wait-on http://localhost:3000 && electron electron/main.js\"",
     "fetch:ffmpeg": "node scripts/fetch-windows-ffmpeg.js",
     "stage:whisper": "node scripts/stage-whisper-service.js",
-    "electron:build": "npm run clean && next build --webpack && node scripts/copy-wasm.js && node scripts/fetch-windows-ffmpeg.js && node scripts/stage-whisper-service.js && electron-builder --win dir --publish never"
+    "electron:build": "npm run clean && next build --webpack && node scripts/copy-wasm.js && node scripts/fetch-windows-ffmpeg.js && node scripts/stage-whisper-service.js && electron-builder --win nsis --publish never"
   },
+  "trustedDependencies": [
+    "electron",
+    "ffmpeg-static",
+    "electron-builder",
+    "unrs-resolver"
+  ],
   "dependencies": {
     "@xenova/transformers": "^2.17.2",
     "clsx": "^2.1.1",

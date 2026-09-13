@@ -87,6 +87,10 @@ function frozenZoompanExpr(dir, zoomMax) {
  * (round, min 1), margin = round(videoW·0.02), watermarkGeometry-identical
  * 9-grid col/row anchors. Degenerate dims (≤0 / non-finite / missing t) →
  * all zeros; non-finite scalePercent degrades to 100.
+ *
+ * v5.2: finite t.x + t.y (normalized 0..1 center, set by dragging the
+ * overlay on the preview canvas) OVERRIDE the 9-grid anchor — at least 8%
+ * of the overlay stays visible on every edge. Mirror-identical math.
  */
 function overlayGeometryMirror(videoW, videoH, srcW, srcH, t) {
   if (
@@ -114,6 +118,15 @@ function overlayGeometryMirror(videoW, videoH, srcW, srcH, t) {
   const col = typeof pos === "string" && pos.endsWith("left") ? 0 : typeof pos === "string" && pos.endsWith("right") ? 2 : 1;
   // Vertical anchor: top row / middle row / bottom row.
   const row = typeof pos === "string" && pos.startsWith("top") ? 0 : typeof pos === "string" && pos.startsWith("bottom") ? 2 : 1;
+
+  // v5.2 free-form placement (dragged on the preview canvas).
+  if (Number.isFinite(t.x) && Number.isFinite(t.y)) {
+    const cx = Math.max(0, Math.min(1, t.x)) * videoW;
+    const cy = Math.max(0, Math.min(1, t.y)) * videoH;
+    const fx = Math.round(Math.max(-dw * 0.92, Math.min(videoW - dw * 0.08, cx - dw / 2)));
+    const fy = Math.round(Math.max(-dh * 0.92, Math.min(videoH - dh * 0.08, cy - dh / 2)));
+    return { dx: fx, dy: fy, dw, dh };
+  }
 
   const dx =
     col === 0 ? m : col === 2 ? Math.round(videoW - dw - m) : Math.round((videoW - dw) / 2);
