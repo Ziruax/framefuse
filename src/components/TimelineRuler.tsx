@@ -24,6 +24,7 @@ import {
   useEffect,
   useLayoutEffect,
   type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
 } from "react";
@@ -33,7 +34,9 @@ import {
   Clapperboard,
   Copy,
   Layers,
+  Maximize,
   Music2,
+  Play,
   Repeat,
   Scissors,
   Timer,
@@ -1126,6 +1129,7 @@ function FilmstripBar({
   isActive,
   selected,
   onActivate,
+  onContextMenu,
   drag,
   trim,
   previewStartMs,
@@ -1142,6 +1146,8 @@ function FilmstripBar({
   selected?: boolean;
   /** Double-click (and Enter/Space when draggable) — jump to first frame. */
   onActivate: (e: { stopPropagation: () => void }) => void;
+  /** v5.4.1: right-click → timeline context menu. */
+  onContextMenu?: (e: ReactMouseEvent<HTMLDivElement>) => void;
   /** v5: pointer drag handlers (press-seek + move/lane-switch gestures). */
   drag?: FilmstripBarDrag;
   /** v5.3: base-lane trim handle gestures (edges). The shared move/up
@@ -1177,6 +1183,7 @@ function FilmstripBar({
     <div
       {...(drag ?? {})}
       onDoubleClick={onActivate}
+      onContextMenu={onContextMenu}
       onKeyDown={
         drag
           ? (e) => {
@@ -1409,6 +1416,57 @@ export function TimelineRuler({
   const baseAxisRef = useRef<HTMLDivElement>(null);
   const overlayAxisRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+
+  // v5.4.1 right-click CONTEXT MENU -------------------------------------
+  // Target descriptor + open state. The menu is a fixed-position card
+  // rendered at the click point (viewport-clamped), with keyboard navigation
+  // and a transparent backdrop that closes on outside press.
+  type CtxTarget =
+    | { kind: "clip"; id: string; x: number; y: number }
+    | { kind: "sfx"; id: string; x: number; y: number }
+    | { kind: "music"; id: ""; x: number; y: number }
+    | { kind: "empty"; id: ""; x: number; y: number };
+  const [ctxMenu, setCtxMenu] = useState<CtxTarget | null>(null);
+  const [ctxIdx, setCtxIdx] = useState(0);
+  const ctxListRef = useRef<HTMLDivElement>(null);
+
+  /** Right-click on a clip: standard editor semantics — keep a multi-
+   *  selection that CONTAINS the clip (menu acts on the whole set), else
+   *  select it solo first. */
+  const openClipMenu = (e: ReactMouseEvent, seg: MediaSegment) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (
+      onSelectionChange &&
+      !(selectedIdsProp ?? []).includes(seg.id)
+    ) {
+      onSelectionChange([seg.id]);
+      anchorIdRef.current = seg.id;
+    }
+    setCtxIdx(0);
+    setCtxMenu({ kind: "clip", id: seg.id, x: e.clientX, y: e.clientY });
+  };
+
+  const openSfxMenu = (e: ReactMouseEvent, id: string) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setCtxIdx(0);
+    setCtxMenu({ kind: "sfx", id, x: e.clientX, y: e.clientY });
+  };
+
+  const openMusicMenu = (e: ReactMouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setCtxIdx(0);
+    setCtxMenu({ kind: "music", id: "", x: e.clientX, y: e.clientY });
+  };
+
+  const openLaneMenu = (e: ReactMouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setCtxIdx(0);
+    setCtxMenu({ kind: "empty", id: "", x: e.clientX, y: e.clientY });
+  };
 
   // v5 mode: ANY new prop present => render the 4-lane editor; otherwise the
   // exact v4.9 single-track layout (page.tsx keeps working unchanged).
@@ -2228,6 +2286,268 @@ export function TimelineRuler({
     </button>
   );
 
+  // ------------------------------------------------------------------
+  // v5.4.1 CONTEXT MENU — items (built per target) + rendering.
+  // ------------------------------------------------------------------
+  /** Total BASE-lane extent (the "entire video" target for overlays). */
+  const baseTotalMs = baseSegs.reduce(
+    (a, s) => Math.max(a, s.startMs + s.durationMs),
+    0,
+  );
+
+  interface CtxItem {
+    icon?: LucideIcon;
+    label: string;
+    kbd?: string;
+    onClick?: () => void;
+    /** Data-only action for the ONE item whose handler reads a ref — keeps
+     *  the items array free of ref-reading closures (react-hooks/refs). */
+    action?: "fit";
+    disabled?: boolean;
+    danger?: boolean;
+    sep?: boolean;
+  }
+
+  const ctxClose = () => setCtxMenu(null);
+
+  /** Fit action as a stable callback (the react-hooks/refs rule forbids
+   *  ref reads inside render-built closures — same pattern as zoomTo). */
+  const fitTimeline = useCallback(() => {
+    const el = scrollRef.current;
+    setPxPerSec(fitPxPerSec());
+    if (el) el.scrollLeft = 0;
+  }, [fitPxPerSec]);
+
+  const ctxItems: CtxItem[] = (() => {
+    if (!ctxMenu) return [];
+    if (ctxMenu.kind === "clip") {
+      const seg = segments.find((s) => s.id === ctxMenu.id);
+      if (!seg) return [];
+      const sel = selectedIdsProp ?? [];
+      const multi = sel.length > 1 && sel.includes(seg.id);
+      const isOverlay = seg.track >= 1;
+      const canSplitHere =
+        onSplit != null &&
+        currentMs > seg.startMs + 100 &&
+        currentMs < seg.endMs - 100;
+      const items: CtxItem[] = [
+        {
+          icon: Play,
+          label: "Jump to clip",
+          kbd: "dbl-click",
+          onClick: () => {
+            onSeek(seg.startMs + 5);
+            onJumpToSegment?.(seg.id);
+          },
+        },
+        {
+          icon: Scissors,
+          label: "Split at playhead",
+          kbd: "S",
+          disabled: !canSplitHere,
+          onClick: onSplit,
+        },
+        {
+          icon: Copy,
+          label: "Duplicate",
+          onClick: onDuplicate ? () => onDuplicate(seg.id) : undefined,
+          disabled: onDuplicate == null,
+        },
+        { sep: true, label: "" },
+      ];
+      if (isOverlay) {
+        const startMs = Math.max(0, seg.startMs);
+        items.push({
+          icon: Clapperboard,
+          label: "Move to Video track",
+          onClick: onEditItem
+            ? () => onEditItem(seg.id, { track: 0, startMs })
+            : undefined,
+          disabled: onEditItem == null,
+        });
+        if (seg.mediaType === "video") {
+          items.push(
+            {
+              icon: Repeat,
+              label: "Span entire video",
+              disabled: baseTotalMs <= 0,
+              onClick: onEditItem
+                ? () =>
+                    onEditItem(seg.id, {
+                      durationMs: Math.max(
+                        200,
+                        Math.round(baseTotalMs - startMs),
+                      ),
+                      overlayLoop: true,
+                    })
+                : undefined,
+            },
+            {
+              icon: Repeat,
+              label: seg.overlayLoop ? "Stop looping source" : "Loop source",
+              onClick: onEditItem
+                ? () =>
+                    onEditItem(seg.id, {
+                      overlayLoop: seg.overlayLoop === true ? undefined : true,
+                    })
+                : undefined,
+            },
+          );
+        }
+      } else {
+        items.push({
+          icon: Layers,
+          label: "Move to Overlay track",
+          onClick: onEditItem
+            ? () => onEditItem(seg.id, { track: 1, startMs: seg.startMs })
+            : undefined,
+          disabled: onEditItem == null,
+        });
+      }
+      items.push(
+        { sep: true, label: "" },
+        {
+          icon: Trash2,
+          label: multi ? `Delete ${sel.length} clips` : "Delete",
+          kbd: "Del",
+          danger: true,
+          onClick: multi
+            ? onRemoveMany
+              ? () => onRemoveMany(sel)
+              : undefined
+            : onRemove
+              ? () => onRemove(seg.id)
+              : undefined,
+          disabled:
+            (multi && onRemoveMany == null) || (!multi && onRemove == null),
+        },
+      );
+      return items;
+    }
+    if (ctxMenu.kind === "sfx") {
+      const item = sfxList.find((s) => s.id === ctxMenu.id);
+      if (!item) return [];
+      const def = getSfxDef(item.sfxId);
+      return [
+        {
+          icon: Play,
+          label: `Jump to ${def?.label ?? "effect"}`,
+          onClick: () => onSeek(Math.max(0, item.startMs)),
+        },
+        {
+          icon: Timer,
+          label: "Edit duration",
+          onClick: undefined,
+          disabled: true,
+        },
+        { sep: true, label: "" },
+        {
+          icon: Trash2,
+          label: "Remove effect",
+          kbd: "Alt+click",
+          danger: true,
+          onClick: onRemoveSfx ? () => onRemoveSfx(item.id) : undefined,
+          disabled: onRemoveSfx == null,
+        },
+      ];
+    }
+    if (ctxMenu.kind === "music") {
+      return [
+        {
+          icon: Play,
+          label: "Jump to music start",
+          onClick: () => onSeek(Math.max(0, musicStart)),
+        },
+        {
+          icon: Maximize,
+          label: "Move to 00:00",
+          onClick: onMusicMove ? () => onMusicMove(0) : undefined,
+          disabled: onMusicMove == null || musicStart <= 0,
+        },
+        {
+          icon: Repeat,
+          label: musicLoop ? "Stop looping" : "Loop full video",
+          onClick: onMusicLoopChange
+            ? () => onMusicLoopChange(!musicLoop)
+            : undefined,
+          disabled: onMusicLoopChange == null,
+        },
+      ];
+    }
+    // Empty lane space
+    return [
+      {
+        icon: Layers,
+        label: "Select all clips",
+        kbd: "Ctrl+A",
+        disabled: segments.length === 0,
+        onClick: onSelectionChange
+          ? () => onSelectionChange(segments.map((s) => s.id))
+          : undefined,
+      },
+      {
+        icon: X,
+        label: "Clear selection",
+        kbd: "Esc",
+        disabled: selCount === 0 || onSelectionChange == null,
+        onClick: onSelectionChange ? () => onSelectionChange([]) : undefined,
+      },
+      { sep: true, label: "" },
+      {
+        icon: Maximize,
+        label: "Fit timeline to panel",
+        disabled: totalMs <= 0,
+        action: "fit",
+      },
+    ];
+  })();
+
+  /** Indices of actionable rows (for keyboard navigation). */
+  const ctxEnabled = ctxItems
+    .map((it, i) => ({ it, i }))
+    .filter(
+      ({ it }) =>
+        !it.sep && !it.disabled && (it.onClick != null || it.action != null),
+    );
+
+  const ctxMove = (dir: 1 | -1) => {
+    if (ctxEnabled.length === 0) return;
+    const pos = ctxEnabled.findIndex(({ i }) => i === ctxIdx);
+    const next =
+      ctxEnabled[(pos + dir + ctxEnabled.length) % ctxEnabled.length];
+    setCtxIdx(next.i);
+  };
+  const ctxActivate = () => {
+    const row = ctxItems[ctxIdx];
+    if (!row || row.sep || row.disabled) return;
+    if (row.action === "fit") {
+      fitTimeline();
+      setCtxMenu(null);
+      return;
+    }
+    if (row.onClick) {
+      row.onClick();
+      setCtxMenu(null);
+    }
+  };
+
+  // Viewport clamp: measure the open menu and keep it fully on-screen.
+  useLayoutEffect(() => {
+    const el = ctxListRef.current;
+    if (!el || !ctxMenu) return;
+    const maxX = window.innerWidth - el.offsetWidth - 8;
+    const maxY = window.innerHeight - el.offsetHeight - 8;
+    el.style.left = Math.max(8, Math.min(ctxMenu.x, Math.max(8, maxX))) + "px";
+    el.style.top = Math.max(8, Math.min(ctxMenu.y, Math.max(8, maxY))) + "px";
+  }, [ctxMenu, ctxItems.length]);
+
+  // Focus the menu when it opens (keyboard flow); the backdrop handles
+  // outside clicks. Both stopPropagation so page-level shortcuts (Esc =
+  // clear selection) never fire while the menu is open.
+  useEffect(() => {
+    if (ctxMenu) ctxListRef.current?.focus();
+  }, [ctxMenu]);
+
   return (
     <div
       className="border-t px-4 py-3"
@@ -2495,6 +2815,11 @@ export function TimelineRuler({
             ref={scrollRef}
             className="overflow-x-auto overflow-y-hidden"
             style={{ paddingTop: 7 }}
+            onScroll={() => {
+              // Panning the timeline closes the menu (its anchor is
+              // viewport-fixed and would visually detach).
+              if (ctxMenu != null) setCtxMenu(null);
+            }}
           >
           <div
             ref={contentRef}
@@ -2534,6 +2859,7 @@ export function TimelineRuler({
               ref={baseAxisRef}
               className="relative min-w-0 shrink-0 transition-colors hover:bg-white/[0.02]"
               style={{ width: axisW }}
+              onContextMenu={openLaneMenu}
               {...laneMarqueeHandlers}
             >
               {baseSegs.length === 0 ? (
@@ -2562,6 +2888,9 @@ export function TimelineRuler({
                           isActive={seg.id === activeId}
                           selected={isSel(seg.id)}
                           onActivate={jumpToSeg(seg)}
+                          onContextMenu={
+                            isV5 ? (e) => openClipMenu(e, seg) : undefined
+                          }
                           drag={
                             onEditItem
                               ? {
@@ -2638,6 +2967,7 @@ export function TimelineRuler({
               ref={overlayAxisRef}
               className="relative min-w-0 shrink-0 transition-colors hover:bg-white/[0.02]"
               style={{ width: axisW }}
+              onContextMenu={openLaneMenu}
               {...laneMarqueeHandlers}
             >
               {overlaySegs.length === 0 ? (
@@ -2713,7 +3043,8 @@ export function TimelineRuler({
                               ? "0 0 0 1px rgba(245,158,11,0.4), 0 0 12px rgba(245,158,11,0.22), 0 1px 3px rgba(0,0,0,0.45)"
                               : "0 1px 3px rgba(0,0,0,0.45)",
                       }}
-                      title={`${seg.fileName} · overlay T${seg.track} · ${fmtTimecode(startMs)}–${fmtTimecode(startMs + durMs)} · ${(durMs / 1000).toFixed(1)}s${draggable ? "\ndrag to move · edges trim · drag down to the Video lane" : ""}\ndouble-click jumps to this clip's first frame`}
+                      title={`${seg.fileName} · overlay T${seg.track} · ${fmtTimecode(startMs)}–${fmtTimecode(startMs + durMs)} · ${(durMs / 1000).toFixed(1)}s${draggable ? "\ndrag to move · edges trim · drag down to the Video lane" : ""}\ndouble-click jumps to this clip's first frame\nright-click for actions`}
+                      onContextMenu={(e) => openClipMenu(e, seg)}
                       onDoubleClick={(e) => {
                         e.stopPropagation();
                         onSeek(startMs + 5);
@@ -2874,7 +3205,8 @@ export function TimelineRuler({
                             ? "0 0 0 1.5px rgba(255,255,255,0.55), 0 3px 10px rgba(0,0,0,0.55)"
                             : "0 1px 2px rgba(0,0,0,0.45)",
                         }}
-                        title={`Background music · starts ${fmtTimecode(musicStart)}${musicLoop ? " · loops to fill the video" : ` · ${fmtTimecode(durMs)} long`}${onMusicMove ? " · drag to reposition" : ""}`}
+                        title={`Background music · starts ${fmtTimecode(musicStart)}${musicLoop ? " · loops to fill the video" : ` · ${fmtTimecode(durMs)} long`}${onMusicMove ? " · drag to reposition" : ""}\nright-click for actions`}
+                        onContextMenu={openMusicMenu}
                         onPointerDown={beginMusicDrag}
                         onPointerMove={handleMusicPointerMove}
                         onPointerUp={handleMusicPointerUp}
@@ -3075,7 +3407,8 @@ export function TimelineRuler({
                             ? "0 0 0 1.5px rgba(255,255,255,0.55), 0 3px 10px rgba(0,0,0,0.55)"
                             : "0 1px 2px rgba(0,0,0,0.45)",
                       }}
-                      title={`${def?.label ?? item.sfxId} · ${fmtTimecode(startMs)} · ${(durMs / 1000).toFixed(2)}s · click to seek${onMoveSfx ? ", drag to move" : ""}${onEditSfx ? ", drag edges to resize" : ""}${onRemoveSfx ? ", Alt+click or x to remove" : ""}`}
+                      title={`${def?.label ?? item.sfxId} · ${fmtTimecode(startMs)} · ${(durMs / 1000).toFixed(2)}s · click to seek${onMoveSfx ? ", drag to move" : ""}${onEditSfx ? ", drag edges to resize" : ""}${onRemoveSfx ? ", Alt+click or x to remove" : ""}\nright-click for actions`}
+                      onContextMenu={(e) => openSfxMenu(e, item.id)}
                       onPointerDown={(e) => beginSfxDrag(e, item)}
                       onPointerMove={handleSfxPointerMove}
                       onPointerUp={handleSfxPointerUp}
@@ -3346,6 +3679,93 @@ export function TimelineRuler({
             />
           )}
         </div>
+      )}
+
+      {/* v5.4.1: right-click context menu — fixed-position card + a
+          transparent backdrop that closes on outside press. Rendered at the
+          ROOT level (position:fixed escapes every scroll container). */}
+      {ctxMenu != null && (
+        <>
+          <div
+            className="fixed inset-0 z-[90]"
+            onPointerDown={ctxClose}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              ctxClose();
+            }}
+            aria-hidden
+          />
+          <div
+            ref={ctxListRef}
+            role="menu"
+            tabIndex={-1}
+            aria-label="Clip actions"
+            className="ff-ctx-menu"
+            style={{ left: ctxMenu.x, top: ctxMenu.y }}
+            onKeyDown={(e) => {
+              // Swallow everything at the menu level so page shortcuts
+              // (Esc = clear selection, S = split, Del…) never co-fire.
+              e.stopPropagation();
+              if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                e.preventDefault();
+                ctxMove(e.key === "ArrowDown" ? 1 : -1);
+              } else if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                ctxActivate();
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                ctxClose();
+              } else if (e.key === "Home") {
+                e.preventDefault();
+                if (ctxEnabled.length) setCtxIdx(ctxEnabled[0].i);
+              } else if (e.key === "End") {
+                e.preventDefault();
+                if (ctxEnabled.length)
+                  setCtxIdx(ctxEnabled[ctxEnabled.length - 1].i);
+              }
+            }}
+          >
+            {ctxItems.map((item, i) =>
+              item.sep ? (
+                <div key={i} className="ff-ctx-sep" role="separator" />
+              ) : (
+                <button
+                  key={i}
+                  type="button"
+                  role="menuitem"
+                  disabled={
+                    item.disabled ||
+                    (item.onClick == null && item.action == null)
+                  }
+                  onMouseEnter={() => setCtxIdx(i)}
+                  onClick={() => {
+                    if (item.disabled) return;
+                    if (item.action === "fit") {
+                      fitTimeline();
+                      setCtxMenu(null);
+                      return;
+                    }
+                    if (item.onClick) {
+                      item.onClick();
+                      setCtxMenu(null);
+                    }
+                  }}
+                  className={cn(
+                    "ff-ctx-item",
+                    i === ctxIdx && !item.disabled && "ff-ctx-item-active",
+                    item.danger && "ff-ctx-item-danger",
+                  )}
+                >
+                  {item.icon && <item.icon className="size-3.5 shrink-0" aria-hidden />}
+                  <span className="min-w-0 flex-1 truncate text-left">
+                    {item.label}
+                  </span>
+                  {item.kbd && <span className="ff-ctx-kbd">{item.kbd}</span>}
+                </button>
+              ),
+            )}
+          </div>
+        </>
       )}
     </div>
   );

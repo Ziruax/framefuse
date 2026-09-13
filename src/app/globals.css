@@ -594,6 +594,84 @@ summary:focus-visible,
     0 0 0 1px rgba(0, 0, 0, 0.3),
     inset 0 0 24px rgba(245, 158, 11, 0.06);
 }
+/* v5.4.1: right-click context menu — dark glassy card, fixed-positioned
+   at the click point (viewport-clamped in a layout effect). */
+.ff-ctx-menu {
+  position: fixed;
+  z-index: 91;
+  min-width: 172px;
+  max-width: 260px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  border-radius: 8px;
+  border: 1px solid rgba(63, 63, 70, 0.9);
+  background: rgba(24, 24, 27, 0.97);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  box-shadow:
+    0 12px 32px rgba(0, 0, 0, 0.6),
+    0 0 0 1px rgba(0, 0, 0, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  outline: none;
+  animation: ff-ctx-pop 110ms ease-out;
+}
+@keyframes ff-ctx-pop {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.ff-ctx-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 500;
+  color: #d4d4d8;
+  cursor: pointer;
+  transition: background 80ms ease, color 80ms ease;
+}
+.ff-ctx-item:disabled {
+  color: #52525b;
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.ff-ctx-item-active:not(:disabled) {
+  background: rgba(34, 211, 238, 0.12);
+  color: #e4e4e7;
+}
+.ff-ctx-item-danger:not(:disabled) {
+  color: #fca5a5;
+}
+.ff-ctx-item-danger:not(:disabled):hover,
+.ff-ctx-item-danger.ff-ctx-item-active:not(:disabled) {
+  background: rgba(239, 68, 68, 0.14);
+  color: #fecaca;
+}
+.ff-ctx-sep {
+  height: 1px;
+  margin: 4px 6px;
+  background: rgba(63, 63, 70, 0.8);
+}
+.ff-ctx-kbd {
+  margin-left: auto;
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid rgba(82, 82, 91, 0.7);
+  background: rgba(9, 9, 11, 0.8);
+  color: #a1a1aa;
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+}
 /* Drag-in-flight: lifted + hot-tracked (highest source order wins). */
 .ff-clip.ff-clip-drag {
   z-index: 2;
