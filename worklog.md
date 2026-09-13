@@ -491,3 +491,35 @@ UNRESOLVED ISSUES / RISKS + NEXT-PHASE PRIORITIES:
 - Windows installer v1.3.1 not rebuilt this round (code changes are additive to main.js/preload + renderer; the shipped v1.3.0 installer lacks them — rebuild when a user-visible milestone accumulates, using the Task 16b/18 foreground recipe).
 - Remaining top candidates from previous rounds: 1) GPU filter graphs (scale_cuda/hwupload+overlay_cuda) for the overlay-heavy re-encode path; 2) keyframe-aligned stream-copy trims (head-trimmed clips always re-encode — needs a frame-accuracy tradeoff decision); 3) master-bus loudnorm (per-source only today); 4) per-overlay fps normalization.
 - The 15-min cron cadence is tight for deep export-pipeline work — prefer small, verifiable increments per round and keep the worklog's candidate list authoritative.
+
+---
+Task ID: 20 (v1.4 cron review round — shuttle + QA methodology)
+Agent: main (Z.ai Code)
+Task: Scheduled review: QA → fix bugs → mandatory features/styling → worklog handover.
+
+STATUS ASSESSMENT (start of round):
+- Repo was at 02279f3 (v1.3.1): all 5 user escalations from the previous round already shipped and pushed (turbo export root-cause fixes, faster-whisper sidecar, hover-gated HUD, media tabs, new icon). Master-bus loudnorm ALSO already exists in electron/main.js (v1.3 code, "MASTER-BUS loudnorm (render → measure → mux)") — the Task 19 risk list entry "per-source only" is stale.
+- Dev server healthy (GET / 200, clean dev.log); tsc/eslint green on a fresh checkout.
+- IMPORTANT QA-METHODOLOGY FINDINGS (not app bugs — remember these for future rounds):
+  1. `agent-browser upload` MUST use ABSOLUTE paths. A relative path silently uploads a 0-byte File → the app's graceful "undecodable → 5s placeholder" fallback fires → looks like a playback bug but is a test artifact. Diagnosed by monkey-patching URL.createObjectURL to log blob sizes (size=0).
+  2. Synthetic events (el.value=… + dispatchEvent, new KeyboardEvent) do NOT sync React controlled state. Always use native Playwright interactions (fill/click/press) for React inputs. Several earlier "Esc doesn't clear search" observations were this artifact; with native fill + press, Esc clearing and the 1/3 chip work correctly.
+- Live QA with correct methodology: clean load, uploads (real durations 4/3/2s), play/pause with active video advancing, tabs with live counts, hover-gated HUD (VLM: badges visible on hover, NONE without), search filter + Esc restore — 0 console/page errors.
+
+GOALS / COMPLETED / VERIFICATION:
+1. FEATURE — PREVIEW PLAYBACK SPEED + J/K/L SHUTTLE (v1.4, the round's main feature):
+   - Shared ladder in src/lib/merger/timeline.ts: PREVIEW_RATE_LADDER (0.25/0.5/0.75/1/1.25/1.5/1.75/2) + clampPreviewRate/stepPreviewRate/fmtPreviewRate — one source of truth for the chip and the keys.
+   - page.tsx: previewRate state + previewRateRef; the master-clock rAF tick advances currentMs at previewRate× wall time; music <audio> gets el.playbackRate (ref-read, applies next tick); SFX AudioBufferSources get playbackRate=rate and schedule delays divided by rate; the SFX reschedule effect gained previewRate in deps (mid-play rate change re-schedules from the CURRENT playhead — placements already started don't restart, same tradeoff as a seek).
+   - PreviewPanel: new props previewRate/onPreviewRateChange; syncVideoTo sets element rate = clipSpeed × previewRate (drift window unchanged, both sides are source-time); previewRate added to the paint effect deps so paused elements pre-arm the rate.
+   - Keyboard: L = play (if paused) + step UP; J = step DOWN (plays if paused); K = pause; Space never touches the rate. Input/textarea/select/contentEditable guarded (existing early-return); shortcuts overlay still owns the keyboard while open. Transient toast (new `duration` opt on the toast lib, 1400ms) shows "Playback 1.75×".
+   - Transport UI: SPEED chip (Gauge icon + tabular rate, violet when ≠1×) in a right-pinned cluster with the timecode chip; popover = compact 4×2 GRID (first version was a vertical list — 302px tall, clipped ABOVE the viewport at y=-94 on the 577px test viewport; VLM confirmed truncation) → redesigned to ~123px, fits any window, violet active cell, header + "J / K / L shuttle · export renders 1×" footer; role=menu/menuitemradio + aria-checked; Esc (capture-phase stopPropagation so it doesn't also clear the timeline selection) + outside pointerdown close.
+   - ShortcutsOverlay: J/K/L rows added to the Playback group (E2E: rows render, overlay opens via ? and closes via Esc).
+   - VERIFIED E2E: chip + popover open; picked 2× → video element rate 2, t=2.49 after 1s; j/j → 1.75×/1.5×; k pauses (rate preserved); l resumes, l steps to 1.75×; playhead timing math 00:00.3→00:02.6 in 1.31s wall = exactly 1.75×; 0.5× → 0.8s/1.59s wall, element rate 0.5; reset to 1× → element rate 1; fresh-page L,L → 1.25× playing. VLM review of the grid popover: clean, no truncation, clear active state, aligned.
+2. STYLING (mandatory): timeline EmptyHint contrast zinc-600 → zinc-400 (VLM had flagged "No overlay clips / No music track / No sound effects" as unreadable); the amber SFX accents were audited and deliberately KEPT (they are the documented kind-system: VIDEO=cyan / OVL=violet / SFX=amber — changing them would break the lane legend); popover itself is fully themed (violet actives, tabular-nums, custom shadow).
+3. GATES: tsc 0 · eslint 0 · agent-browser E2E (uploads, speed flows, keys, popover Esc/outside close, tabs, HUD hover, search, 0 console errors) · dev.log clean · title/version bumped 1.3.0 → 1.4.0 (package.json + layout title + header chip — consistent). Committed fe00bc1, pushed to main.
+
+UNRESOLVED ISSUES / RISKS + NEXT-PHASE PRIORITIES:
+- Windows installer v1.4.0 NOT rebuilt this round (renderer-only changes; the packaged v1.3.0 exe lacks the shuttle). Rebuild when a user-visible milestone accumulates — foreground electron-builder + scripts/rcedit-native.js + patch-electron-builder.js recipe (Task 16b/18).
+- The shuttle is preview-only by design; a "render at preview rate" export option is possible but redundant with per-clip speed — deliberately not built.
+- Reverse playback (J below 0.25× / true reverse) was scoped out: HTMLMediaElement cannot play at negative rates in Chromium; emulation via per-frame seeks is jank-prone. Revisit only if requested.
+- Top remaining candidates from earlier rounds: 1) GPU filter graphs (scale_cuda/hwupload+overlay_cuda) for the overlay re-encode path — needs a GPU box to validate; 2) keyframe-aligned stream-copy trims (head-trimmed clips always re-encode); 3) per-overlay fps normalization; 4) simplified 16–24px icon variant.
+- QA methodology reminders (see status section): absolute upload paths + native Playwright interactions — bake these into every future round's QA steps.
