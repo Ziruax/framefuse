@@ -212,6 +212,12 @@ const PIPELINE_HOSTS: readonly string[] = [
 export function classifyWhisperError(err: unknown): string | null {
   const raw = err instanceof Error ? err.message : String(err);
   const m = raw.toLowerCase();
+  if (/cannot convert undefined or null to object/.test(m)) {
+    // Turbopack (Next.js dev server) stubs node builtins as `void 0` instead
+    // of webpack's empty-object stub — transformers.js env.js then throws at
+    // module evaluation. The repo's postinstall patch fixes the install.
+    return `The Whisper library failed to load in this environment. Re-run "bun install" (or "npm install") to apply the FrameFuse patch and restart the dev server. [${raw}]`;
+  }
   if (
     /fetch failed|failed to fetch|enotfound|etimedout|timeout|timed out|econnrefused|econnreset|econnaborted|eai_again|getaddrinfo|socket hang up|network|tls|certificate|self-signed|hostname\/ip|und_err_|other side closed|terminated/.test(
       m,
@@ -300,7 +306,22 @@ async function getPipeline(runId: number): Promise<any> {
   progressRunId = runId;
   if (!pipelinePromise) {
     const build = (async () => {
-      const { pipeline, env } = await import("@xenova/transformers");
+      // Import failures are CLASSIFIED before rejecting — e.g. Turbopack's
+      // `void 0` node-builtin stubs make transformers.js env.js throw
+      // "Cannot convert undefined or null to object" at module evaluation;
+      // the classifier turns that into an actionable reinstall hint instead
+      // of a cryptic TypeError.
+      let imported: typeof import("@xenova/transformers");
+      try {
+        imported = await import("@xenova/transformers");
+      } catch (err) {
+        const classified = classifyWhisperError(err);
+        throw new Error(
+          classified ??
+            (err instanceof Error ? err.message : String(err)),
+        );
+      }
+      const { pipeline, env } = imported;
       env.allowRemoteModels = true;
       env.allowLocalModels = false;
       // Persistent across sessions (Cache API storage): download once, reuse
