@@ -29,10 +29,16 @@
 //         Transformers.js pipeline has no cancellation API) — its result is
 //         simply discarded by the main thread.
 //   worker → main:
-//     { type: "progress", runId, stage: "model" | "transcribe", progress: number, status: string }
+//     { type: "progress", runId, stage: "model" | "download" | "transcribe",
+//       progress: number, status: string, file?: string }
 //       — stage "model": raw file-download percent (0–100) from the
-//         Transformers.js progress_callback. The main thread maps this into
-//         the 10–25 % band (see mapWorkerProgress in whisper.ts).
+//         Transformers.js progress_callback, plus v5.2 host-attempt labels
+//         ("Downloading Whisper model…" / "Retrying via mirror …"). The main
+//         thread maps this into the 10–25 % band (see mapWorkerProgress in
+//         whisper.ts).
+//       — stage "download" (v5.2): richer per-file events emitted IN
+//         ADDITION to the paired "model" event — carry `file` so the UI can
+//         show WHICH file is downloading and how far along it is.
 //       — stage "transcribe": absolute values on the 25–80 % band (25 when
 //         inference starts, 40 when word-alignment falls back to chunk mode).
 //     { type: "result", runId, chunks: RawWhisperChunk[] | null, language: string | null, wordLevel: boolean }
@@ -62,7 +68,7 @@ export interface RawWhisperChunk {
 }
 
 /** Progress stages the worker reports to the main thread. */
-export type WhisperWorkerStage = "model" | "transcribe";
+export type WhisperWorkerStage = "model" | "download" | "transcribe";
 
 /** Messages the MAIN thread sends to the worker. */
 export type WhisperWorkerRequest =
@@ -84,9 +90,11 @@ export type WhisperWorkerResponse =
       type: "progress";
       runId: number;
       stage: WhisperWorkerStage;
-      /** 0–100: file-download % for "model", absolute 25–80 for "transcribe". */
+      /** 0–100: file-download % for "model"/"download", absolute 25–80 for "transcribe". */
       progress: number;
       status: string;
+      /** v5.2: the file being downloaded (stage "download" events only). */
+      file?: string;
     }
   | {
       type: "result";
@@ -186,6 +194,50 @@ const workerSelf: WorkerSelf | null = (() => {
 
 const MODEL_ID = "Xenova/whisper-tiny";
 
+// v5.2 mirror + retry (same strategy as the native whisper-core.js): try the
+// official HuggingFace Hub, then the hf-mirror.com mirror (identical repo
+// layout), then the official host once more. Completed files persist in the
+// browser cache, so each attempt CONTINUES where the previous stopped.
+const DEFAULT_REMOTE_HOST = "https://huggingface.co/";
+const MIRROR_REMOTE_HOST = "https://hf-mirror.com/";
+const PIPELINE_HOSTS: readonly string[] = [
+  DEFAULT_REMOTE_HOST,
+  MIRROR_REMOTE_HOST,
+  DEFAULT_REMOTE_HOST,
+];
+
+/** v5.2: map a pipeline-build failure onto a friendly message, or null to
+ *  surface the raw error verbatim. Mirrors whisper-core.js — the underlying
+ *  message always rides along as a bracketed suffix. */
+export function classifyWhisperError(err: unknown): string | null {
+  const raw = err instanceof Error ? err.message : String(err);
+  const m = raw.toLowerCase();
+  if (
+    /fetch failed|failed to fetch|enotfound|etimedout|timeout|timed out|econnrefused|econnreset|econnaborted|eai_again|getaddrinfo|socket hang up|network|tls|certificate|self-signed|hostname\/ip|und_err_|other side closed|terminated/.test(
+      m,
+    )
+  ) {
+    return `Could not download the Whisper model. Check your internet connection or firewall (the model is fetched once from huggingface.co, ~42 MB, with an automatic mirror retry). [${raw}]`;
+  }
+  if (/rate limit|error \(429\)/.test(m)) {
+    return `HuggingFace is rate-limiting downloads right now. Wait a minute and try again — the app also retries automatically via the hf-mirror.com mirror. [${raw}]`;
+  }
+  if (/file does not exist|could not locate file/.test(m)) {
+    return `A Whisper model file was not found on the server — the Xenova/whisper-tiny repository may have changed. [${raw}]`;
+  }
+  if (
+    /internal server error|bad gateway|service unavailable|gateway timeout|error \(5\d\d\)/.test(
+      m,
+    )
+  ) {
+    return `The model server reported an error. This is usually temporary — try again; already-downloaded files are kept, so a retry continues where it stopped. [${raw}]`;
+  }
+  if (/permission denied|unauthorized access|forbidden access/.test(m)) {
+    return `Access to the model file was denied by the server. [${raw}]`;
+  }
+  return null;
+}
+
 /** Singleton pipeline promise (module scope — the model is built ONCE). */
 let pipelinePromise: Promise<any> | null = null;
 
@@ -239,8 +291,10 @@ function configureWasm(env: any): void {
 }
 
 /**
- * Get (or build) the singleton Whisper pipeline. The build is started at most
- * once; on failure the singleton is cleared so a later call can retry.
+ * Get (or build) the singleton Whisper pipeline. The whole v5.2 host-retry
+ * sequence lives inside the singleton promise: on total failure the singleton
+ * is cleared so a later call can retry from the default host, while completed
+ * model files stay in the browser cache (downloads resume, never restart).
  */
 async function getPipeline(runId: number): Promise<any> {
   progressRunId = runId;
@@ -257,20 +311,73 @@ async function getPipeline(runId: number): Promise<any> {
       const progress_callback = (info: unknown) => {
         if (progressRunId == null) return;
         const p = toModelProgress(info);
-        if (p) {
+        if (!p) return;
+        post({
+          type: "progress",
+          runId: progressRunId,
+          stage: "model",
+          progress: p.progress,
+          status: p.status,
+        });
+        // v5.2: richer file-level download events — emitted in addition to
+        // the "model" event above so the UI can show the exact file + %.
+        const i = info as { status?: unknown; file?: unknown } | null;
+        if (
+          i &&
+          typeof i === "object" &&
+          i.status === "progress" &&
+          typeof i.file === "string" &&
+          i.file
+        ) {
           post({
             type: "progress",
             runId: progressRunId,
-            stage: "model",
+            stage: "download",
             progress: p.progress,
-            status: p.status,
+            file: i.file,
+            status: `${p.status} ${p.progress}%`,
           });
         }
       };
 
-      return await pipeline("automatic-speech-recognition", MODEL_ID, {
-        progress_callback,
-      });
+      let lastError: unknown = null;
+      for (let attempt = 0; attempt < PIPELINE_HOSTS.length; attempt++) {
+        const host = PIPELINE_HOSTS[attempt];
+        env.remoteHost = host;
+        const label =
+          attempt === 0
+            ? "Downloading Whisper model…"
+            : host === MIRROR_REMOTE_HOST
+              ? "Retrying via mirror (hf-mirror.com)…"
+              : "Retrying download (huggingface.co)…";
+        if (progressRunId != null) {
+          post({
+            type: "progress",
+            runId: progressRunId,
+            stage: "model",
+            progress: 0,
+            status: label,
+          });
+        }
+        try {
+          return await pipeline("automatic-speech-recognition", MODEL_ID, {
+            progress_callback,
+          });
+        } catch (err) {
+          lastError = err;
+          // Completed files stay in the browser cache — the next attempt
+          // continues the download instead of restarting it.
+        }
+      }
+      // All attempts failed — start the NEXT build on the default host again.
+      env.remoteHost = DEFAULT_REMOTE_HOST;
+      const classified = classifyWhisperError(lastError);
+      throw new Error(
+        classified ??
+          (lastError instanceof Error
+            ? lastError.message
+            : String(lastError)),
+      );
     })();
     // Reset on failure so a retry can rebuild; the awaiting caller still sees
     // the original rejection and reports it as { type: "error" }.

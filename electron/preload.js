@@ -29,13 +29,21 @@ contextBridge.exposeInMainWorld("electronAPI", {
   cancelExport: () => ipcRenderer.invoke("cancel-export"),
 
   // ── v5.1 NATIVE WHISPER (utilityProcess service) ──────────────────────────
-  // transcribe: ({ name, bytes: ArrayBuffer, language }) →
+  // transcribe: ({ name, bytes: ArrayBuffer, language, runId? }) →
   //   { chunks, language, wordLevel, durationMs } — the main process decodes
   //   the audio with ffmpeg and runs Whisper in a utility process; the UI
-  //   never blocks. Progress arrives via onWhisperProgress.
+  //   never blocks. Progress arrives via onWhisperProgress. `runId` (v5.2) is
+  //   the renderer's client run id (crypto.randomUUID) used for per-run
+  //   cancellation.
   whisperTranscribe: (payload) => ipcRenderer.invoke("whisper:transcribe", payload),
   whisperPreload: () => ipcRenderer.invoke("whisper:preload"),
-  whisperCancel: () => ipcRenderer.invoke("whisper:cancel"),
+  // v5.2: cancel ALL runs (legacy, no argument) or exactly ONE run
+  // ({ runId }) — returns the number of runs rejected.
+  whisperCancel: (payload) => ipcRenderer.invoke("whisper:cancel", payload),
+  // v5.2: model cache diagnostics for the Captions settings panel →
+  //   { cacheDir, hostUsed, modelReady, cacheFiles, totalCacheBytes,
+  //     lastError, childAlive, activeRuns }.
+  whisperStatus: () => ipcRenderer.invoke("whisper:status"),
   onWhisperProgress: (callback) => {
     const handler = (_event, data) => callback(data);
     ipcRenderer.on("whisper:progress", handler);

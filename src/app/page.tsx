@@ -14,6 +14,7 @@ import { MediaPanel } from "@/components/MediaPanel";
 import { PreviewPanel } from "@/components/PreviewPanel";
 import { TimelineRuler } from "@/components/TimelineRuler";
 import { SettingsPanel } from "@/components/SettingsPanel";
+import { Splitter, useResizableLayout } from "@/components/ResizableSplitters";
 import {
   buildTimeline,
   fmtBytes,
@@ -60,6 +61,8 @@ import {
   type WatermarkSettings,
 } from "@/lib/merger/types";
 import { getCaptionPreset, getFontOption, CAPTION_PRESETS } from "@/lib/merger/captionPresets";
+import { closestAspectForRatio } from "@/lib/merger/renderer";
+import { middleEllipsis } from "@/lib/merger/text";
 import {
   buildProjectFile,
   downloadProjectFile,
@@ -242,6 +245,10 @@ export default function Page() {
    *  payload (native.ts computes image dims itself; video dims are probed by
    *  the main process, so this map is a page-level record / undecodable flag). */
   const [videoDims, setVideoDims] = useState<Record<string, { w: number; h: number }>>({});
+  /** v5.2: one-shot gate for the auto aspect-match on the first imported
+   *  video (see probeVideoItem). Reset on "New project", armed-off when a
+   *  saved project loads (its aspect is an explicit user choice). */
+  const autoAspectRef = useRef(false);
   /** Probed video poster thumbnails (id → 96×54 JPEG dataURL) — used as
    *  segment thumbnailUrl so the media list, filmstrips and overlays show a
    *  real frame instead of a broken image. */
@@ -392,6 +399,35 @@ export default function Page() {
         : null,
     [timeline.segments, currentMs],
   );
+
+  /** v5.2: "Match source aspect" — the active video wins, else the first
+   *  video with probed dims. Enabled only when its closest aspect differs
+   *  from the current output aspect (button otherwise pointless). */
+  const matchAspectTarget = useMemo(() => {
+    const cand =
+      activeSegment?.mediaType === "video" && videoDims[activeSegment.id]
+        ? activeSegment
+        : timeline.segments.find(
+            (s) => s.mediaType === "video" && videoDims[s.id],
+          ) ?? null;
+    return cand && videoDims[cand.id] ? { seg: cand, dims: videoDims[cand.id] } : null;
+  }, [activeSegment, timeline.segments, videoDims]);
+
+  const canMatchAspect =
+    matchAspectTarget != null &&
+    closestAspectForRatio(matchAspectTarget.dims.w / matchAspectTarget.dims.h) !==
+      settings.aspect;
+
+  const handleMatchAspect = useCallback(() => {
+    if (!matchAspectTarget) return;
+    const { seg, dims } = matchAspectTarget;
+    const next = closestAspectForRatio(dims.w / dims.h);
+    if (next === settings.aspect) return;
+    setSettings((prev) => ({ ...prev, aspect: next, aspectTouched: true }));
+    toast.success(`Aspect set to ${next} — matches "${middleEllipsis(seg.fileName, 32)}"`, {
+      description: `${dims.w}×${dims.h} source frame.`,
+    });
+  }, [matchAspectTarget, settings.aspect]);
 
   /** v5.1: number of base-lane boundaries (drives the Random-mix button). */
   const boundaryCount = useMemo(() => {
@@ -973,6 +1009,23 @@ export default function Page() {
     (item: MediaItem, opts?: { onUndecodable?: (name: string) => void }) => {
       const { id, url } = item;
       let settled = false;
+      // v5.2: one-shot aspect auto-match — the FIRST video with known dims
+      // rewrites the output aspect (unless the user already picked one) so
+      // vertical / square sources are never silently center-cropped. The
+      // ref gates it to a single decision per project session (first wins).
+      const maybeAutoAspect = (dims: { w: number; h: number }) => {
+        if (autoAspectRef.current) return;
+        autoAspectRef.current = true;
+        setSettings((prev) => {
+          if (prev.aspectTouched) return prev;
+          const next = closestAspectForRatio(dims.w / dims.h);
+          if (next === prev.aspect) return prev;
+          toast.success(`Aspect matched to your video — ${next}`, {
+            description: `${dims.w}×${dims.h} source detected. Change it any time in Settings → Export.`,
+          });
+          return { ...prev, aspect: next };
+        });
+      };
       const finish = (
         durationMs: number | null,
         dims: { w: number; h: number } | null,
@@ -987,6 +1040,7 @@ export default function Page() {
         }
         if (dims && dims.w > 0 && dims.h > 0) {
           setVideoDims((prev) => ({ ...prev, [id]: dims }));
+          maybeAutoAspect(dims);
         } else {
           opts?.onUndecodable?.(item.file.name);
         }
@@ -2440,6 +2494,9 @@ const handleRandomTransitionMix = useCallback(() => {
         );
         // Probe restored videos (durations/dims/thumbnails) — async, never
         // blocks the session; saved durations cover the gap meanwhile.
+        // v5.2: the project file carries an explicit aspect choice — the
+        // first-video auto-match stays disarmed for loaded projects.
+        autoAspectRef.current = true;
         for (const it of restored) {
           if (it.mediaType === "video") probeVideoItem(it);
         }
@@ -2603,6 +2660,8 @@ const handleRandomTransitionMix = useCallback(() => {
     // v5.1: stale per-item probe caches keyed by the (now removed) ids.
     setVideoDims({});
     setVideoThumbnails({});
+    // v5.2: fresh project → re-arm the first-video aspect auto-match.
+    autoAspectRef.current = false;
     setWatermarkImage(null);
     clearBeatInfo();
     clearWaveform();
@@ -2822,6 +2881,20 @@ const handleRandomTransitionMix = useCallback(() => {
     [requestHistoryPush],
   );
 
+  // ---- v5.2 resizable panel layout (task 3-b) ------------------------------
+  // Splitter-driven panel widths + timeline height, persisted separately
+  // from framefuse.settings.v50 (layout concern, not settings — see
+  // src/components/ResizableSplitters.tsx). Below 1024px window width the
+  // hook reports compact and the fixed v5.1 layout applies (splitters hidden).
+  const layout = useResizableLayout();
+
+  // TimelineRuler's internal v5 gate (new v5 props present) is always true —
+  // page.tsx unconditionally passes onEditItem / sfxItems / onMoveSfx /
+  // onRemoveSfx / videoDurations — so the 4-lane timeline always takes the
+  // resizable height in non-compact mode. Legacy v4.9 single-track (fixed
+  // 120/140px inside TimelineRuler) keeps its auto height via compact branch.
+  const timelineIsV5 = true;
+
   const debug = {
     imageCount: timeline.segments.length,
     mode: timeline.mode,
@@ -2854,11 +2927,13 @@ const handleRandomTransitionMix = useCallback(() => {
         projectName={currentProjectName}
       />
 
-      {/* 3-column grid: 300px | 1fr | 320px */}
+      {/* 3-column grid — v5.2 (task 3-b): columns resizable via splitters
+          (6px gutters), persisted in framefuse.layout.v52. Below 1024px the
+          hook reports compact → fixed 300px | 1fr | 320px, splitters hidden. */}
       <main
         className="grid min-h-0 flex-1 overflow-hidden"
         style={{
-          gridTemplateColumns: "300px 1fr 320px",
+          gridTemplateColumns: layout.gridTemplateColumns,
           backgroundColor: "#0a0a0a",
         }}
       >
@@ -2927,7 +3002,10 @@ const handleRandomTransitionMix = useCallback(() => {
           />
         </section>
 
-        {/* Center column — Preview (flex-1) + Timeline (120px) */}
+        {/* v5.2 (task 3-b): col splitter — drag to resize the media panel. */}
+        {!layout.compact && <Splitter {...layout.media} />}
+
+        {/* Center column — Preview (flex-1) + resizable Timeline */}
         <section
           className="flex min-h-0 flex-col overflow-hidden"
           style={{ backgroundColor: "#0a0a0a" }}
@@ -2960,8 +3038,42 @@ const handleRandomTransitionMix = useCallback(() => {
                   description: `Segment "${seg.fileName.slice(0, 42)}" now uses ${dir}. Undo (Ctrl+Z) restores it.`,
                 });
               }}
+              // ---- v5.2 preview overhaul wiring ----
+              previewFit={settings.previewFit ?? "cover"}
+              onPreviewFitChange={(fit) =>
+                setSettings((prev) =>
+                  prev.previewFit === fit ? prev : { ...prev, previewFit: fit },
+                )
+              }
+              onMatchAspect={handleMatchAspect}
+              canMatchAspect={canMatchAspect}
+              onOverlayTransformChange={(segId, t) => {
+                // Commit an on-canvas PiP edit (drag move / corner resize /
+                // keyboard nudge) into the item's edit map — the same store
+                // the timeline and export read. One history entry per commit.
+                requestHistoryPush();
+                applyItemEdit(segId, { overlay: t });
+              }}
             />
           </div>
+          {/* v5.2 (task 3-b): row splitter — drag to resize the timeline. */}
+          {!layout.compact && <Splitter {...layout.timeline} />}
+
+          {/* v5 4-lane timeline: explicit resizable height + custom scrollbar
+              so tall lane stacks scroll (timelineIsV5 mirrors TimelineRuler's
+              internal v5 gate — page.tsx always passes the v5 props). Compact
+              or legacy v4.9 single-track keeps the auto/fixed height. */}
+          <div
+            className={
+              "min-h-0 shrink-0" +
+              (!layout.compact && timelineIsV5 ? " ff-timeline-scroll" : "")
+            }
+            style={
+              !layout.compact && timelineIsV5
+                ? { height: `${layout.timelineH}px` }
+                : undefined
+            }
+          >
           <TimelineRuler
             segments={timeline.segments}
             totalMs={timeline.totalMs}
@@ -2994,9 +3106,13 @@ const handleRandomTransitionMix = useCallback(() => {
             onRemove={removeItem}
             activeSegment={activeSegment}
           />
+          </div>
         </section>
 
-        {/* Right column — Settings Panel (320px) */}
+        {/* v5.2 (task 3-b): col splitter — drag to resize the settings panel. */}
+        {!layout.compact && <Splitter {...layout.settings} />}
+
+        {/* Right column — Settings Panel (resizable, default 320px) */}
         <section
           className="min-h-0 overflow-y-auto overflow-x-hidden border-l"
           style={{

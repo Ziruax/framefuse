@@ -381,8 +381,16 @@ ipcMain.handle("cancel-export", async () => {
 // cache in userData — downloaded once, available forever).
 // ---------------------------------------------------------------------------
 const whisperChild = { proc: null, dead: true };
-const whisperRuns = new Map(); // runId → { resolve, reject, sender }
+const whisperRuns = new Map(); // runId → { resolve, reject, sender, clientRunId? }
 let whisperRunSeq = 0;
+
+/** v5.2 whisper diagnostics state — surfaced by the whisper:status IPC so
+ *  the Captions settings panel can show model/cache health at a glance. */
+const whisperState = {
+  lastError: null,
+  lastErrorAt: 0,
+  hostUsed: null,
+};
 
 function whisperCacheDir() {
   return path.join(app.getPath("userData"), "whisper-models");
@@ -398,7 +406,18 @@ function whisperChildEntry() {
 
 function getWhisperChild() {
   if (whisperChild.proc && !whisperChild.dead) return whisperChild.proc;
-  try { fs.mkdirSync(whisperCacheDir(), { recursive: true }); } catch (_) {}
+  // v5.2: a cache-dir creation failure must NOT be silent — it is the #1
+  // cause of "model downloaded but never reused" confusion.
+  try {
+    fs.mkdirSync(whisperCacheDir(), { recursive: true });
+  } catch (err) {
+    const message = `Could not create the Whisper model cache folder (${whisperCacheDir()}): ${
+      err instanceof Error ? err.message : String(err)
+    }`;
+    whisperState.lastError = message;
+    whisperState.lastErrorAt = Date.now();
+    console.error("[whisper]", message);
+  }
   const proc = utilityProcess.fork(whisperChildEntry(), [], {
     serviceName: "framefuse-whisper",
     stdio: "pipe",
@@ -411,45 +430,74 @@ function getWhisperChild() {
   proc.on("exit", () => {
     whisperChild.proc = null;
     whisperChild.dead = true;
+    const hadRuns = whisperRuns.size > 0;
     // Every pending run must fail fast — the UI can never hang.
     for (const [runId, run] of Array.from(whisperRuns)) {
       whisperRuns.delete(runId);
       run.reject(new Error("The Whisper service stopped unexpectedly. Please try again."));
     }
+    // Only record a crash as lastError when work was actually in flight —
+    // normal app-quit kills must not pollute the diagnostics view.
+    if (hadRuns) {
+      whisperState.lastError = "The Whisper service stopped unexpectedly. Please try again.";
+      whisperState.lastErrorAt = Date.now();
+    }
   });
   return proc;
 }
 
-/** Same curve the renderer's mapWorkerProgress applies (model 10–25 %,
- *  transcribe 25–80 %) — computed here so the renderer stays a dumb relay. */
+/** Same curve the renderer's mapWorkerProgress applies (model/download
+ *  10–25 %, transcribe 25–80 %) — computed here so the renderer stays a dumb
+ *  relay. "download" events carry the same per-file percent as the paired
+ *  "model" event (the child emits both), so they share the model band — no
+ *  bar jitter, and the file name rides along in the status message. */
 function mapWhisperProgress(stage, progress) {
   const p = Number.isFinite(progress) ? Math.min(100, Math.max(0, Math.round(progress))) : 0;
-  if (stage === "model") return Math.round(10 + 15 * (p / 100));
+  if (stage === "model" || stage === "download") return Math.round(10 + 15 * (p / 100));
   return Math.min(80, Math.max(25, p));
 }
 
-function sendWhisperProgress(runId, progress, status) {
+function sendWhisperProgress(runId, progress, status, extra) {
   const run = whisperRuns.get(runId);
   const wc = run && run.sender;
   if (wc && !wc.isDestroyed()) {
-    wc.send("whisper:progress", { progress, status });
+    wc.send("whisper:progress", { progress, status, ...(extra || {}) });
   }
 }
 
 function onWhisperChildMessage(msg) {
   if (!msg || typeof msg !== "object" || typeof msg.type !== "string") return;
+  // v5.2 diagnostics: which host/mirror served the model (has no runId).
+  if (msg.type === "model-info") {
+    if (typeof msg.host === "string") whisperState.hostUsed = msg.host;
+    return;
+  }
   if (msg.runId === -1) return; // "service-ready" ping from the child
   if (typeof msg.runId !== "number") return;
   const run = whisperRuns.get(msg.runId);
   if (!run) return; // stale (cancelled) — discard
   switch (msg.type) {
     case "progress": {
-      const progress = mapWhisperProgress(msg.stage, msg.progress);
-      sendWhisperProgress(msg.runId, progress, msg.status || "");
+      const raw = msg.stage === "download" ? msg.percent : msg.progress;
+      const progress = mapWhisperProgress(msg.stage, raw);
+      // Pass the new download stage through so the renderer can show the
+      // file name and rescale the band for standalone pre-downloads.
+      const extra =
+        msg.stage === "download"
+          ? {
+              stage: "download",
+              file: typeof msg.file === "string" ? msg.file : undefined,
+            }
+          : { stage: typeof msg.stage === "string" ? msg.stage : undefined };
+      sendWhisperProgress(msg.runId, progress, msg.status || "", extra);
       break;
     }
     case "result":
       whisperRuns.delete(msg.runId);
+      // A successful run means the service is healthy again — clear stale
+      // error diagnostics so the status row does not cry wolf.
+      whisperState.lastError = null;
+      whisperState.lastErrorAt = 0;
       run.resolve({
         chunks: msg.chunks ?? null,
         language: msg.language ?? null,
@@ -458,6 +506,8 @@ function onWhisperChildMessage(msg) {
       break;
     case "error":
       whisperRuns.delete(msg.runId);
+      whisperState.lastError = msg.message || "Whisper service failed";
+      whisperState.lastErrorAt = Date.now();
       run.reject(new Error(msg.message || "Whisper service failed"));
       break;
     default:
@@ -496,6 +546,12 @@ function decodeAudioToPcm16k(filePath) {
 
 ipcMain.handle("whisper:transcribe", async (event, payload) => {
   const { name, bytes, language } = payload || {};
+  // v5.2: the renderer passes a client runId (crypto.randomUUID) so a cancel
+  // can target THIS run without killing other queued runs.
+  const clientRunId =
+    payload && typeof payload.runId === "string" && payload.runId
+      ? payload.runId
+      : null;
   if (!bytes || !bytes.byteLength) throw new Error("No audio data received");
   ensureTempDir();
   const ext = path.extname(name || "") || ".audio";
@@ -511,7 +567,7 @@ ipcMain.handle("whisper:transcribe", async (event, payload) => {
 
     const child = getWhisperChild();
     const result = await new Promise((resolve, reject) => {
-      whisperRuns.set(runId, { resolve, reject, sender: event.sender });
+      whisperRuns.set(runId, { resolve, reject, sender: event.sender, clientRunId });
       try {
         // Zero-copy: transfer the PCM buffer to the service.
         child.postMessage(
@@ -545,8 +601,27 @@ ipcMain.handle("whisper:preload", async (event) => {
   });
 });
 
-ipcMain.handle("whisper:cancel", async () => {
+ipcMain.handle("whisper:cancel", async (_event, payload) => {
   const child = whisperChild.proc;
+  const target =
+    payload && typeof payload === "object" && typeof payload.runId === "string"
+      ? payload.runId
+      : null;
+  if (target) {
+    // v5.2: cancel ONE renderer run (by its client runId) — other queued
+    // runs keep going. The child adds the numeric runId to its cancelled set
+    // so a queued-but-unstarted job is skipped outright.
+    for (const [runId, run] of Array.from(whisperRuns)) {
+      if (run.clientRunId === target) {
+        whisperRuns.delete(runId);
+        try { if (child) child.postMessage({ type: "cancel", runId }); } catch (_) {}
+        run.reject(new Error("Transcription cancelled"));
+        return 1;
+      }
+    }
+    return 0; // already finished / never started — nothing to cancel
+  }
+  // Legacy behavior (no argument): reject ALL pending runs.
   let cancelled = 0;
   for (const [runId, run] of Array.from(whisperRuns)) {
     whisperRuns.delete(runId);
@@ -555,6 +630,89 @@ ipcMain.handle("whisper:cancel", async () => {
     cancelled++;
   }
   return cancelled;
+});
+
+// ── v5.2 whisper:status — model cache diagnostics for the Captions panel ──
+
+/** Recursive cache scan: [{ name (posix-relative), sizeBytes }] — the
+ *  whisper cache holds ~7 small entries, so an unbounded walk is fine. */
+function scanWhisperCache(root) {
+  const files = [];
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (_) {
+      return; // missing dir → empty cache
+    }
+    for (const entry of entries) {
+      const p = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(p);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      try {
+        files.push({
+          name: path.relative(root, p).split(path.sep).join("/"),
+          sizeBytes: fs.statSync(p).size,
+        });
+      } catch (_) {
+        /* raced deletion — skip */
+      }
+    }
+  };
+  walk(root);
+  files.sort((a, b) => a.name.localeCompare(b.name));
+  return files;
+}
+
+/** modelReady heuristic: quantized (or fp32) ONNX encoder + merged decoder
+ *  plus the config/tokenizer/preprocessor files transformers.js needs.
+ *  Measured file set (verified by the 3-a sandbox smoke test):
+ *    Xenova/whisper-tiny/config.json
+ *    Xenova/whisper-tiny/generation_config.json
+ *    Xenova/whisper-tiny/preprocessor_config.json
+ *    Xenova/whisper-tiny/tokenizer.json + tokenizer_config.json
+ *    Xenova/whisper-tiny/onnx/encoder_model_quantized.onnx     (~10.1 MB)
+ *    Xenova/whisper-tiny/onnx/decoder_model_merged_quantized.onnx (~30.7 MB) */
+function whisperModelReady(files) {
+  const names = new Set(files.map((f) => f.name));
+  const base = "Xenova/whisper-tiny";
+  const has = (n) => names.has(`${base}/${n}`);
+  const encoder =
+    has("onnx/encoder_model_quantized.onnx") || has("onnx/encoder_model.onnx");
+  const decoder =
+    has("onnx/decoder_model_merged_quantized.onnx") ||
+    has("onnx/decoder_model_merged.onnx");
+  if (!encoder || !decoder) return false;
+  // Guard against truncated/partial downloads: the ONNX pair must be
+  // substantive (> 1 MB combined).
+  const onnxBytes = files
+    .filter((f) => f.name.startsWith(`${base}/onnx/`) && f.name.endsWith(".onnx"))
+    .reduce((n, f) => n + f.sizeBytes, 0);
+  if (onnxBytes < 1024 * 1024) return false;
+  return (
+    has("config.json") &&
+    has("preprocessor_config.json") &&
+    (has("tokenizer.json") || has("vocab.json"))
+  );
+}
+
+ipcMain.handle("whisper:status", async () => {
+  const cacheDir = whisperCacheDir();
+  const cacheFiles = scanWhisperCache(cacheDir);
+  const totalCacheBytes = cacheFiles.reduce((n, f) => n + f.sizeBytes, 0);
+  return {
+    cacheDir,
+    hostUsed: whisperState.hostUsed,
+    modelReady: whisperModelReady(cacheFiles),
+    cacheFiles,
+    totalCacheBytes,
+    lastError: whisperState.lastError,
+    childAlive: !!(whisperChild.proc && !whisperChild.dead),
+    activeRuns: whisperRuns.size,
+  };
 });
 
 // ---------------------------------------------------------------------------

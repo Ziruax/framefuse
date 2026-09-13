@@ -286,13 +286,16 @@ export function clampPercent(progress: number): number {
   return Math.min(100, Math.max(0, Math.round(p)));
 }
 
-/** Map a worker progress event onto the overall transcribeWithWhisper curve. */
+/** Map a worker progress event onto the overall transcribeWithWhisper curve.
+ *  v5.2: "download" events (per-file, emitted alongside the paired "model"
+ *  event with the same percent) share the model 10–25 % band so the bar
+ *  never jitters — the file name rides along in the status message. */
 export function mapWorkerProgress(
-  stage: "model" | "transcribe",
+  stage: "model" | "download" | "transcribe",
   progress: number,
 ): number {
   const pct = clampPercent(progress);
-  if (stage === "model") {
+  if (stage === "model" || stage === "download") {
     // Model download occupies the 10–25 % band.
     return Math.round(10 + 15 * (pct / 100));
   }
@@ -304,13 +307,85 @@ export function mapWorkerProgress(
 // v5.1 NATIVE branch — Electron desktop: Whisper behind IPC.
 // ---------------------------------------------------------------------------
 
+/** v5.2 model-cache diagnostics (main-process whisper:status handler). */
+export interface WhisperModelStatus {
+  /** Absolute path of the persistent model cache folder. */
+  cacheDir: string;
+  /** Host that served the model files ("https://huggingface.co/" or the
+   *  "https://hf-mirror.com/" mirror) — null before the first build. */
+  hostUsed: string | null;
+  /** Heuristic: ONNX encoder+decoder + config/tokenizer files present. */
+  modelReady: boolean;
+  /** Files currently in the cache (posix-relative names + sizes). */
+  cacheFiles: Array<{ name: string; sizeBytes: number }>;
+  /** Sum of all cached file sizes. */
+  totalCacheBytes: number;
+  /** Last error message recorded by the main process (null = healthy). */
+  lastError: string | null;
+  /** True when the whisper utilityProcess is alive. */
+  childAlive: boolean;
+  /** Number of transcription/preload runs currently in flight. */
+  activeRuns: number;
+}
+
+/**
+ * Local view of the whisper slice of the Electron bridge. The global Window
+ * augmentation lives in types.ts (owned by the data-model layer) — the v5.2
+ * additions (runId-targeted cancel, status) are declared here so this module
+ * stays self-contained and backward-compatible with old preloads.
+ */
+interface NativeWhisperBridge {
+  whisperTranscribe: (p: {
+    name: string;
+    bytes: ArrayBuffer;
+    language?: string;
+    /** v5.2 client run id — lets whisperCancel target THIS run only. */
+    runId?: string;
+  }) => Promise<{
+    chunks: Array<{ text: string; timestamp: [number | null, number | null] }> | null;
+    language: string | null;
+    wordLevel: boolean;
+    durationMs: number;
+  }>;
+  whisperPreload: () => Promise<{ ok: boolean }>;
+  /** v5.2: no argument = cancel all (legacy); { runId } = cancel one. */
+  whisperCancel: (p?: { runId: string }) => Promise<number>;
+  /** Present since the v5.2 preload — optional so old builds still typecheck. */
+  whisperStatus?: () => Promise<WhisperModelStatus>;
+  onWhisperProgress: (cb: (d: {
+    progress: number;
+    status: string;
+    /** v5.2 passthrough: "model" | "download" | "transcribe". */
+    stage?: string;
+    /** v5.2: the file being downloaded (stage "download" only). */
+    file?: string;
+  }) => void) => () => void;
+}
+
 /** The v5.1 Electron bridge (present only in the packaged/dev app with the
  *  whisper service wired). Also guards against OLD packaged builds: an app
  *  whose preload lacks whisperTranscribe falls through to the worker path. */
-function nativeWhisperBridge(): Window["electronAPI"] | null {
+function nativeWhisperBridge(): NativeWhisperBridge | null {
   if (typeof window === "undefined") return null;
   const api = window.electronAPI;
-  return api && typeof api.whisperTranscribe === "function" ? api : null;
+  return api && typeof api.whisperTranscribe === "function"
+    ? (api as unknown as NativeWhisperBridge)
+    : null;
+}
+
+/** Client run ids (v5.2) — prefer crypto.randomUUID, fall back to a
+ *  time+counter id for exotic contexts. */
+let clientRunSeq = 0;
+function newClientRunId(): string {
+  const uuid =
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : null;
+  if (uuid) return uuid;
+  clientRunSeq += 1;
+  return `run-${Date.now().toString(36)}-${clientRunSeq}-${Math.random()
+    .toString(36)
+    .slice(2, 10)}`;
 }
 
 /** Transcribe via the main-process Whisper service (ffmpeg decode +
@@ -335,27 +410,49 @@ async function transcribeWithWhisperNative(
     );
   }
 
+  // v5.2: a client run id lets the cancel below target THIS run only —
+  // other queued runs (e.g. a parallel pre-download) are unaffected.
+  const runId = newClientRunId();
+
   // Progress events already carry the mapped overall curve (decode 2 →
-  // model 10–25 → transcribe 25–80) — relay them verbatim (clamped).
+  // model/download 10–25 → transcribe 25–80) — relay them verbatim
+  // (clamped). The v5.2 stage/file passthrough is consumed by
+  // preloadWhisper for the standalone pre-download UI.
   const unsubscribe = api.onWhisperProgress((d) => {
     if (d && typeof d.progress === "number") {
       onProgress?.({ progress: clampPercent(d.progress), status: d.status || "" });
     }
   });
 
+  // v5.2 snappy cancel: the signal rejects the await IMMEDIATELY (no
+  // "Working…" zombie while a hung download eventually resolves), and the
+  // main process cancels exactly this runId. The in-flight IPC promise is
+  // raced — its late result is simply discarded.
+  let rejectOnAbort: ((err: Error) => void) | null = null;
+  const abortPromise = signal
+    ? new Promise<never>((_, reject) => {
+        rejectOnAbort = reject;
+      })
+    : null;
   const onAbort = () => {
-    // Best-effort: the main process rejects the pending run AND tells the
-    // service to skip it; a late result is discarded as a stale run there.
-    api.whisperCancel().catch(() => {});
+    api.whisperCancel({ runId }).catch(() => {});
+    rejectOnAbort?.(new Error("Transcription cancelled"));
   };
   signal?.addEventListener("abort", onAbort, { once: true });
 
   try {
-    const raw = await api.whisperTranscribe({
+    const invoke = api.whisperTranscribe({
       name: audioFile.name || "audio",
       bytes,
       language: opts.language || "auto",
+      runId,
     });
+    // Classified/native error messages propagate VERBATIM — page.tsx shows
+    // them in the failure toast, so users see the actionable text from
+    // whisper-core's error classification, not a generic wrapper.
+    const raw = abortPromise
+      ? await Promise.race([invoke, abortPromise])
+      : await invoke;
     if (signal?.aborted) throw new Error("Transcription cancelled");
 
     onProgress?.({ progress: 80, status: "Aligning word timestamps…" });
@@ -643,7 +740,16 @@ export async function preloadWhisper(
     onProgress?.({ progress: 0, status: "Loading Whisper-tiny model…" });
     const unsubscribe = api.onWhisperProgress((d) => {
       if (d && typeof d.progress === "number") {
-        onProgress?.({ progress: clampPercent(d.progress), status: d.status || "" });
+        // Standalone pre-download: the main process maps model/download
+        // events onto the 10–25 % band of the TRANSCRIPTION curve — rescale
+        // onto 0–100 so the pre-download button's own bar reflects the
+        // download itself.
+        const p = clampPercent(d.progress);
+        const scaled =
+          d.stage === "model" || d.stage === "download"
+            ? clampPercent(((p - 10) / 15) * 100)
+            : p;
+        onProgress?.({ progress: scaled, status: d.status || "" });
       }
     });
     try {

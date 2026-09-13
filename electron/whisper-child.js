@@ -22,8 +22,16 @@
 //       sampleRate: number, language: string, cacheDir?: string }
 //     { type: "cancel",     runId: number }
 //   child → host:
-//     { type: "progress", runId, stage: "model" | "transcribe",
-//       progress: number, status: string }
+//     { type: "progress", runId, stage: "model" | "download" | "transcribe",
+//       progress: number, status: string, file?: string }
+//       — "model": raw file-download percent (0–100) + attempt labels
+//         ("Downloading Whisper model…" / "Retrying via mirror …").
+//       — "download" (v5.2): richer per-file events emitted IN ADDITION to
+//         the "model" ones — { file, percent } so the UI can show WHICH
+//         file is downloading and how far along it is.
+//       — "transcribe": absolute values on the 25–80 % band.
+//     { type: "model-info", host: string } — v5.2 diagnostics: which host
+//       served the model files once the pipeline is ready.
 //     { type: "result", runId, chunks: Array|null, language: string|null,
 //       wordLevel: boolean }
 //     { type: "error",   runId, message: string }
@@ -63,9 +71,9 @@ let modelProgressRunId = null;
 async function ensurePipeline(runId, cacheDir) {
   modelProgressRunId = runId;
   const dir = cacheDir || DEFAULT_CACHE_DIR;
-  return core.buildPipeline({
+  const pipe = await core.buildPipeline({
     cacheDir: dir,
-    onModelProgress: (p) => {
+    onModelProgress: (p, info) => {
       if (modelProgressRunId == null) return;
       post({
         type: "progress",
@@ -74,8 +82,30 @@ async function ensurePipeline(runId, cacheDir) {
         progress: p.progress,
         status: p.status,
       });
+      // v5.2: richer file-level download events (same callback, extra
+      // detail) — emitted in addition to the stage "model" event above.
+      if (
+        info &&
+        typeof info === "object" &&
+        info.status === "progress" &&
+        typeof info.file === "string" &&
+        info.file
+      ) {
+        post({
+          type: "progress",
+          runId: modelProgressRunId,
+          stage: "download",
+          file: info.file,
+          percent: p.progress,
+          progress: p.progress,
+          status: `${p.status} ${p.progress}%`,
+        });
+      }
     },
   });
+  // v5.2 diagnostics: tell the host which mirror/host served the model.
+  post({ type: "model-info", host: core.getLastHostUsed() });
+  return pipe;
 }
 
 async function handleTranscribe(msg) {

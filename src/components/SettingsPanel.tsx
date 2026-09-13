@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ChevronDown,
   Zap,
@@ -56,7 +56,12 @@ import {
   getHeadlinePreset,
 } from "@/lib/merger/headlinePresets";
 import { ANIMATION_LABELS } from "@/lib/merger/captionAnimations";
-import type { WhisperProgress } from "@/lib/merger/whisper";
+import {
+  preloadWhisper,
+  type WhisperModelStatus,
+  type WhisperProgress,
+} from "@/lib/merger/whisper";
+import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 
 // ---------------------------------------------------------------------------
@@ -956,7 +961,11 @@ export function SettingsPanel(props: SettingsPanelProps) {
                   { value: "4:5", label: "4:5" },
                 ]}
                 value={settings.aspect}
-                onChange={(v) => onSettingsChange({ ...settings, aspect: v })}
+                onChange={(v) =>
+                  // v5.2: a manual pick is an explicit choice — disables the
+                  // first-video aspect auto-match from then on.
+                  onSettingsChange({ ...settings, aspect: v, aspectTouched: true })
+                }
               />
             </Field>
             <Field label="Resolution">
@@ -1960,6 +1969,86 @@ function CaptionsSection(props: CaptionsSectionProps) {
   const hasWords =
     hasCues && subtitles!.cues.some((c) => c.words && c.words.length > 0);
 
+  // ── v5.2 Whisper model status + pre-download (desktop only) ──────────────
+  // The status row only renders when the Electron bridge exists; in the
+  // browser fallback the model lives in opaque Cache API storage.
+  const whisperStatusApi =
+    typeof window !== "undefined" && window.electronAPI
+      ? (window.electronAPI as unknown as {
+          whisperStatus?: () => Promise<WhisperModelStatus>;
+        })
+      : undefined;
+  const [modelStatus, setModelStatus] = useState<WhisperModelStatus | null>(
+    null,
+  );
+  const [statusChecking, setStatusChecking] = useState(false);
+  const [predownloading, setPredownloading] = useState(false);
+  const [predownloadProgress, setPredownloadProgress] = useState<
+    WhisperProgress | null
+  >(null);
+
+  const checkWhisperStatus = useCallback(async () => {
+    if (!whisperStatusApi?.whisperStatus || statusChecking) return;
+    setStatusChecking(true);
+    try {
+      const s = await whisperStatusApi.whisperStatus();
+      if (s) setModelStatus(s);
+    } catch (err) {
+      toast.error("Could not read Whisper model status", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setStatusChecking(false);
+    }
+  }, [whisperStatusApi, statusChecking]);
+
+  // Auto-check once on mount (async setState — safe under the
+  // react-hooks/set-state-in-effect rule).
+  useEffect(() => {
+    const api = whisperStatusApi?.whisperStatus;
+    if (!api) return;
+    let cancelled = false;
+    api()
+      .then((s) => {
+        if (!cancelled && s) setModelStatus(s);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [whisperStatusApi]);
+
+  const handlePredownload = useCallback(async () => {
+    if (predownloading || whisperBusy) return;
+    setPredownloading(true);
+    setPredownloadProgress({
+      progress: 0,
+      status: "Downloading Whisper-tiny model…",
+    });
+    try {
+      await preloadWhisper((p) => setPredownloadProgress(p));
+      toast.success("Whisper model ready", {
+        description: "Captions can now be generated offline.",
+      });
+      // Refresh the status row with the freshly cached files.
+      const api = whisperStatusApi?.whisperStatus;
+      if (api) {
+        api()
+          .then((s) => {
+            if (s) setModelStatus(s);
+          })
+          .catch(() => {});
+      }
+    } catch (err) {
+      toast.error("Could not download the Whisper model", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setPredownloading(false);
+      setPredownloadProgress(null);
+    }
+  }, [predownloading, whisperBusy, whisperStatusApi]);
+
   return (
     <Section icon={<Captions size={13} />} title="Captions" defaultOpen>
       {/* ── Whisper generation ── */}
@@ -2020,11 +2109,113 @@ function CaptionsSection(props: CaptionsSectionProps) {
           </div>
         )}
         <p className="mt-2 text-[10px] leading-relaxed text-zinc-500">
-          Whisper-tiny runs locally (in-app, ~75 MB download once, then
+          Whisper-tiny runs locally (in-app, ~42 MB download once, then
           offline). Produces{" "}
           <span className="text-zinc-300">exact word-by-word timing</span> for
           karaoke &amp; kinetic captions.
         </p>
+
+        {/* ── v5.2: model cache status + pre-download (desktop only) ── */}
+        {inElectron && whisperStatusApi?.whisperStatus && (
+          <div
+            className="mt-2 rounded border p-2"
+            style={{ borderColor: "#27272a", backgroundColor: "#111113" }}
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
+                Whisper model
+              </span>
+              <div className="flex gap-1">
+                <button
+                  type="button"
+                  onClick={checkWhisperStatus}
+                  disabled={statusChecking}
+                  className="rounded border px-2 py-1 text-[10px] font-medium text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+                  style={{ borderColor: "#3f3f46" }}
+                  aria-label="Check Whisper model download status"
+                >
+                  {statusChecking ? "Checking…" : "Check status"}
+                </button>
+                <button
+                  type="button"
+                  onClick={handlePredownload}
+                  disabled={predownloading || whisperBusy}
+                  className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+                  style={{ borderColor: "#3f3f46" }}
+                  aria-label="Pre-download the Whisper model now"
+                >
+                  {predownloading ? (
+                    <Loader2 size={10} className="animate-spin" />
+                  ) : (
+                    <Download size={10} />
+                  )}
+                  {predownloading ? "Downloading…" : "Pre-download now"}
+                </button>
+              </div>
+            </div>
+
+            {modelStatus && (
+              <div className="mt-1.5 space-y-1">
+                <div className="flex items-center gap-1.5 text-[10px]">
+                  <span
+                    className={cn(
+                      "inline-block h-1.5 w-1.5 shrink-0 rounded-full",
+                      modelStatus.modelReady
+                        ? "bg-emerald-400"
+                        : "bg-amber-400",
+                    )}
+                    aria-hidden
+                  />
+                  <span className="truncate text-zinc-300">
+                    {modelStatus.modelReady
+                      ? `Model cached · ${(modelStatus.totalCacheBytes / 1048576).toFixed(1)} MB`
+                      : "Not downloaded yet"}
+                    {modelStatus.hostUsed ?
+                      ` · via ${
+                        modelStatus.hostUsed.includes("hf-mirror")
+                          ? "hf-mirror.com"
+                          : "huggingface.co"
+                      }`
+                      : ""}
+                  </span>
+                  {modelStatus.activeRuns > 0 && (
+                    <span className="shrink-0 text-zinc-500">
+                      · {modelStatus.activeRuns} active
+                    </span>
+                  )}
+                </div>
+                <p
+                  className="truncate text-[9px] text-zinc-600"
+                  title={modelStatus.cacheDir}
+                >
+                  {modelStatus.cacheDir}
+                </p>
+                {modelStatus.lastError && (
+                  <p
+                    className="text-[9px] leading-relaxed text-red-400"
+                    title={modelStatus.lastError}
+                  >
+                    Last error: {modelStatus.lastError}
+                  </p>
+                )}
+              </div>
+            )}
+
+            {predownloadProgress && (
+              <div className="mt-1.5">
+                <div className="h-1 w-full overflow-hidden rounded-full bg-zinc-800">
+                  <div
+                    className="h-full bg-amber-500 transition-all"
+                    style={{ width: `${predownloadProgress.progress}%` }}
+                  />
+                </div>
+                <p className="mt-1 truncate text-[10px] text-zinc-500">
+                  {predownloadProgress.status}
+                </p>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* ── Burn-in toggle + source status ── */}
