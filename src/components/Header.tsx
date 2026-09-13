@@ -152,9 +152,9 @@ export function Header({
                 backgroundColor: "#18181b",
                 color: "#a1a1aa",
               }}
-              title="FrameFuse v1.3 — multi-track video studio"
+              title="FrameFuse v1.4 — multi-track video studio"
             >
-              v1.3
+              v1.4
             </span>
             {/* v5.1: on-disk project file chip (native save/open sessions). */}
             {projectName && (

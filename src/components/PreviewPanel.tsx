@@ -28,6 +28,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Eraser,
+  Gauge,
 } from "lucide-react";
 import type {
   AspectRatio,
@@ -60,7 +61,12 @@ import { ChromaKeyer } from "@/lib/merger/chroma";
 import { overlaySegmentsAt } from "@/lib/merger/timeline";
 import { drawCaption, drawHeadline } from "@/lib/merger/native";
 import { cueAt } from "@/lib/merger/subtitles";
-import { fmtTimecode } from "@/lib/merger/timeline";
+import {
+  clampPreviewRate,
+  fmtPreviewRate,
+  fmtTimecode,
+  PREVIEW_RATE_LADDER,
+} from "@/lib/merger/timeline";
 import { middleEllipsis } from "@/lib/merger/text";
 
 /** v4.5: middle-ellipsis — moved to lib/merger/text.ts in v4.9 (shared
@@ -249,6 +255,12 @@ interface PreviewPanelProps {
    *  HTMLMediaElement/gain ranges — the >1 boost remains export-only,
    *  same convention as the music volume knob. Default 1. */
   masterVolume?: number;
+  /** v1.4: preview playback speed (shuttle). The master clock, music
+   * element, SFX sources and every hidden video element advance at this
+   * rate — preview only (exports render at 1×). Default 1. */
+  previewRate?: number;
+  /** v1.4: fired when the user picks a new speed from the transport chip. */
+  onPreviewRateChange?: (rate: number) => void;
 }
 
 /** v4.8: which concrete motion does a click at (nx, ny) ∈ [0,1]² aim at?
@@ -308,6 +320,8 @@ export function PreviewPanel({
   canMatchAspect,
   onOverlayTransformChange,
   masterVolume = 1,
+  previewRate = 1,
+  onPreviewRateChange,
 }: PreviewPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const chromeRef = useRef<HTMLCanvasElement | null>(null);
@@ -329,6 +343,34 @@ export function PreviewPanel({
   // v5.1: the aiming hint only appears while the pointer is over the canvas —
   // context-sensitive guidance instead of a permanent fixture (VLM review).
   const [canvasHover, setCanvasHover] = useState(false);
+  // v1.4: transport SPEED popover (ladder chip). Closed on outside pointer
+  // press, Escape, or any pick — standard transient-menu behavior.
+  const [speedOpen, setSpeedOpen] = useState(false);
+  const speedMenuRef = useRef<HTMLDivElement | null>(null);
+  const speedActive = clampPreviewRate(previewRate) !== 1;
+  useEffect(() => {
+    if (!speedOpen) return;
+    const onDown = (e: PointerEvent) => {
+      if (
+        speedMenuRef.current &&
+        !speedMenuRef.current.contains(e.target as Node)
+      ) {
+        setSpeedOpen(false);
+      }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        setSpeedOpen(false);
+      }
+    };
+    window.addEventListener("pointerdown", onDown, true);
+    window.addEventListener("keydown", onKey, true);
+    return () => {
+      window.removeEventListener("pointerdown", onDown, true);
+      window.removeEventListener("keydown", onKey, true);
+    };
+  }, [speedOpen]);
   const aimActive =
     !!onSetMotion &&
     kenBurns.enabled &&
@@ -993,9 +1035,14 @@ export function PreviewPanel({
       const targetSec = Math.max(0, localMs) / 1000;
       const dur = Number.isFinite(el.duration) && el.duration > 0 ? el.duration : null;
       const clampedSec = dur != null ? Math.min(targetSec, Math.max(0, dur - 0.05)) : targetSec;
-      if (el.playbackRate !== speed) {
+      // v1.4: shuttle — the ELEMENT rate is the per-clip speed × the preview
+      // rate; the master clock advances at previewRate× wall time, so the
+      // element's source time stays in lockstep (localMs already includes
+      // the clip speed; the drift window below keeps it honest).
+      const elemRate = speed * (clampPreviewRate(previewRate) || 1);
+      if (el.playbackRate !== elemRate) {
         try {
-          el.playbackRate = speed;
+          el.playbackRate = elemRate;
         } catch {
           /* rate out of range — native rate is a fine fallback */
         }
@@ -1212,6 +1259,9 @@ export function PreviewPanel({
     dragTransform,
     overlayOverrides,
     fitMode,
+    // v1.4: shuttle — rate changes re-run so paused elements pre-arm the
+    // new playbackRate (playing elements pick it up on the next tick).
+    previewRate,
   ]);
 
   // ---- v5.2 C: selection chrome (separate canvas, purely additive) -----------
@@ -1963,23 +2013,102 @@ export function PreviewPanel({
             <SkipForward className="size-3.5" />
           </button>
 
-          {/* Time display — tabular mono chip, pinned right. */}
-          <div
-            className="absolute right-0 top-1/2 -translate-y-1/2 rounded-md border px-2 py-0.5 font-mono text-[11px] tabular-nums"
-            style={{
-              borderColor: "#27272a",
-              backgroundColor: "#18181b",
-            }}
-          >
-            <span style={{ color: "#e4e4e7" }}>
-              {fmtTenths(currentMs)}
-            </span>
-            <span className="mx-0.5" style={{ color: "#52525b" }}>
-              /
-            </span>
-            <span style={{ color: "#8b8b93" }}>
-              {fmtTenths(totalMs)}
-            </span>
+          {/* v1.4: right cluster — playback SPEED chip + the timecode chip.
+              The speed opens a ladder popover (0.25×–2×); J/K/L shuttle from
+              the keyboard use the same ladder. Violet when not 1×. */}
+          <div className="absolute right-0 top-1/2 flex -translate-y-1/2 items-center gap-1.5">
+            <div className="relative" ref={speedMenuRef}>
+              <button
+                type="button"
+                onClick={() =>
+                  onPreviewRateChange != null && setSpeedOpen((v) => !v)
+                }
+                disabled={segments.length === 0}
+                className="flex h-7 items-center gap-1 rounded-lg px-1.5 transition-all hover:bg-white/10 active:scale-90 disabled:opacity-30 disabled:hover:bg-transparent"
+                style={{ color: speedActive ? "#c4b5fd" : "#a1a1aa" }}
+                title="Playback speed — L speeds up, J slows down, K pauses (preview only; exports render at 1×)"
+                aria-label={`Playback speed ${fmtPreviewRate(previewRate)} — open speed menu`}
+                aria-haspopup="menu"
+                aria-expanded={speedOpen}
+              >
+                <Gauge className="size-3.5 shrink-0" />
+                <span className="text-[10px] font-semibold tabular-nums">
+                  {fmtPreviewRate(previewRate)}
+                </span>
+              </button>
+              {speedOpen && onPreviewRateChange != null && (
+                <div
+                  role="menu"
+                  aria-label="Playback speed"
+                  className="absolute bottom-full right-0 z-40 mb-1.5 w-[188px] overflow-hidden rounded-lg border shadow-2xl"
+                  style={{
+                    borderColor: "#2e2e33",
+                    backgroundColor: "#161618",
+                    boxShadow:
+                      "0 12px 32px rgba(0,0,0,0.55), 0 0 0 1px rgba(139,92,246,0.08)",
+                  }}
+                >
+                  <div
+                    className="border-b px-2.5 py-1.5 text-[8px] font-semibold uppercase tracking-[0.14em]"
+                    style={{ borderColor: "#27272a", color: "#71717a" }}
+                  >
+                    Preview speed
+                  </div>
+                  {/* Compact 4×2 grid — the whole popover stays ~120px tall so
+                      it never clips off the top on short windows. */}
+                  <div className="grid grid-cols-4 gap-1 p-1.5" role="presentation">
+                    {PREVIEW_RATE_LADDER.map((r) => {
+                      const active = clampPreviewRate(previewRate) === r;
+                      return (
+                        <button
+                          key={r}
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={active}
+                          onClick={() => {
+                            onPreviewRateChange(r);
+                            setSpeedOpen(false);
+                          }}
+                          className="flex h-7 items-center justify-center rounded-md border text-[10px] font-semibold tabular-nums transition-all hover:border-violet-400/50 hover:bg-violet-400/10 active:scale-90"
+                          style={{
+                            borderColor: active ? "rgba(167,139,250,0.55)" : "#27272a",
+                            backgroundColor: active ? "rgba(139,92,246,0.18)" : "#1b1b1e",
+                            color: active ? "#d6c7ff" : "#d4d4d8",
+                          }}
+                        >
+                          {fmtPreviewRate(r)}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div
+                    className="border-t px-2.5 py-1.5 text-[8px] leading-snug"
+                    style={{ borderColor: "#27272a", color: "#71717a" }}
+                  >
+                    J / K / L shuttle · export renders 1×
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Time display — tabular mono chip, pinned right. */}
+            <div
+              className="rounded-md border px-2 py-0.5 font-mono text-[11px] tabular-nums"
+              style={{
+                borderColor: "#27272a",
+                backgroundColor: "#18181b",
+              }}
+            >
+              <span style={{ color: "#e4e4e7" }}>
+                {fmtTenths(currentMs)}
+              </span>
+              <span className="mx-0.5" style={{ color: "#52525b" }}>
+                /
+              </span>
+              <span style={{ color: "#8b8b93" }}>
+                {fmtTenths(totalMs)}
+              </span>
+            </div>
           </div>
         </div>
 

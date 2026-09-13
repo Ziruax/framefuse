@@ -20,9 +20,11 @@ import { Splitter, SPLITTER_W, useResizableLayout } from "@/components/Resizable
 import {
   buildTimeline,
   fmtBytes,
+  fmtPreviewRate,
   fmtTimecode,
   parseFilename,
   segmentAtTime,
+  stepPreviewRate,
   type TimelineEntry,
 } from "@/lib/merger/timeline";
 import {
@@ -352,6 +354,18 @@ export default function Page() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentMs, setCurrentMs] = useState(0);
   const currentMsRef = useRef(0);
+  // v1.4: PREVIEW PLAYBACK SPEED (shuttle). The master clock advances at
+  // previewRate× wall time; the music <audio>, SFX sources and every hidden
+  // video element play at the same rate so audio/video stay locked. Preview
+  // only — the EXPORT always renders at 1× (per-clip speed is a separate
+  // segment property). Ladder + J/K/L stepping live in PreviewPanel's chip.
+  const [previewRate, setPreviewRate] = useState(1);
+  const previewRateRef = useRef(1);
+  useEffect(() => {
+    const r =
+      Number.isFinite(previewRate) && previewRate > 0 ? previewRate : 1;
+    previewRateRef.current = r;
+  }, [previewRate]);
 
   // ---- Export -------------------------------------------------------------
   const [isExporting, setIsExporting] = useState(false);
@@ -872,6 +886,11 @@ export default function Page() {
         if (!buf) continue; // unrenderable effect — skip silently
         const src = ctx.createBufferSource();
         src.buffer = buf;
+        // v1.4: shuttle — SFX sources play at the preview rate, and the
+        // schedule delay shrinks by the same factor (timeline time runs
+        // previewRate× faster than the wall clock).
+        const rate = previewRateRef.current || 1;
+        src.playbackRate.value = rate;
         const gain = ctx.createGain();
         // v1.3: master volume scales SFX too (capped at 1 — export-only boost).
         const masterVol =
@@ -883,7 +902,7 @@ export default function Page() {
         src.connect(gain);
         gain.connect(ctx.destination);
         try {
-          const delaySec = Math.max(0, (item.startMs - fromMs) / 1000);
+          const delaySec = Math.max(0, (item.startMs - fromMs) / 1000 / rate);
           src.start(baseTime + delaySec);
           sfxSourcesRef.current.add(src);
           src.onended = () => {
@@ -900,14 +919,17 @@ export default function Page() {
   // Reschedule whenever playback starts or the placement list changes while
   // playing (add/move/volume mid-playback); stop everything when paused.
   // Runs AFTER the stateRef sync effect above (declaration order) so it always
-  // reads the freshest sfxItems.
+  // reads the freshest sfxItems. v1.4: previewRate joins the deps — a
+  // mid-playback speed change re-schedules from the CURRENT playhead (the
+  // live sources are stopped; placements that already started don't restart,
+  // the same tradeoff a seek makes).
   useEffect(() => {
     if (!isPlaying) {
       stopSfxSources();
       return;
     }
     void scheduleSfxFrom(currentMsRef.current);
-  }, [isPlaying, sfxItems, scheduleSfxFrom, stopSfxSources]);
+  }, [isPlaying, sfxItems, scheduleSfxFrom, stopSfxSources, previewRate]);
 
   // ---- Playback rAF loop --------------------------------------------------
   /**
@@ -958,6 +980,17 @@ export default function Page() {
         if (!el.paused) el.pause();
         return;
       }
+      // v1.4: shuttle — the music element plays at the preview rate (set via
+      // ref so mid-playback rate changes apply on the next tick without
+      // rebuilding this callback).
+      const shuttle = previewRateRef.current || 1;
+      if (Number.isFinite(el.playbackRate) && el.playbackRate !== shuttle) {
+        try {
+          el.playbackRate = shuttle;
+        } catch {
+          /* rate out of range — keep the native rate */
+        }
+      }
       if (Math.abs(el.currentTime - pos) > 0.25 || el.paused) {
         try {
           el.currentTime = pos;
@@ -989,7 +1022,8 @@ export default function Page() {
       const now = performance.now();
       const dt = now - last;
       last = now;
-      let m = currentMsRef.current + dt;
+      // v1.4: shuttle — the master clock advances at previewRate× wall time.
+      let m = currentMsRef.current + dt * (previewRateRef.current || 1);
       const total = totalMsRef.current;
       if (m >= total) {
         m = total;
@@ -3454,6 +3488,31 @@ const handleRandomTransitionMix = useCallback(() => {
       } else if (e.key === "Home") {
         e.preventDefault();
         seek(0);
+      } else if (!mod && (e.key === "l" || e.key === "L")) {
+        // v1.4 shuttle: L plays (if paused) and steps the preview rate UP
+        // the ladder; J steps DOWN; K pauses. Space never touches the rate.
+        e.preventDefault();
+        const next = isPlayingRef.current
+          ? stepPreviewRate(previewRateRef.current, 1)
+          : previewRateRef.current || 1;
+        if (previewRateRef.current !== next) {
+          setPreviewRate(next);
+          toast.success(`Playback ${fmtPreviewRate(next)}`, { duration: 1400 });
+        }
+        if (!isPlayingRef.current) togglePlay();
+      } else if (!mod && (e.key === "j" || e.key === "J")) {
+        e.preventDefault();
+        const next = isPlayingRef.current
+          ? stepPreviewRate(previewRateRef.current, -1)
+          : previewRateRef.current || 1;
+        if (previewRateRef.current !== next) {
+          setPreviewRate(next);
+          toast.success(`Playback ${fmtPreviewRate(next)}`, { duration: 1400 });
+        }
+        if (!isPlayingRef.current) togglePlay();
+      } else if (!mod && (e.key === "k" || e.key === "K")) {
+        e.preventDefault();
+        if (isPlayingRef.current) togglePlay();
       } else if ((e.key === "s" || e.key === "S") && !mod) {
         // v5.1: split the active base clip at the playhead (one undo step).
         e.preventDefault();
@@ -3476,7 +3535,7 @@ const handleRandomTransitionMix = useCallback(() => {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, seek, stepSegment, undo, redo, removeItems, copySelection, pasteClipboard, closeShortcuts]);
+  }, [togglePlay, seek, stepSegment, undo, redo, removeItems, copySelection, pasteClipboard, closeShortcuts, setPreviewRate]);
 
   // ---- Cleanup object URLs on unmount -------------------------------------
   // URLs are deliberately kept alive during the whole session so undo can
@@ -3822,6 +3881,8 @@ const handleRandomTransitionMix = useCallback(() => {
                 applyItemEdit(segId, { overlay: t });
               }}
               masterVolume={audioSettings.masterVolume ?? 1}
+              previewRate={previewRate}
+              onPreviewRateChange={setPreviewRate}
             />
           </div>
           {/* v5.2 (task 3-b): row splitter — drag to resize the timeline

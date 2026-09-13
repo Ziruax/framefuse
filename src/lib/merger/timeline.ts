@@ -601,3 +601,48 @@ export function fmtBytes(bytes: number): string {
   const i = Math.floor(Math.log(bytes) / Math.log(1024));
   return `${(bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
+
+// ---------------------------------------------------------------------------
+// v1.4: PREVIEW PLAYBACK SPEED (shuttle) ladder — shared by the transport
+// speed chip (PreviewPanel) and the J/K/L keyboard shuttle (page.tsx).
+// Preview-only; exports always render at 1× (per-clip speed is separate).
+// ---------------------------------------------------------------------------
+
+/** The speed ladder (ascending). 1× sits in the middle; J/L step along it. */
+export const PREVIEW_RATE_LADDER = [
+  0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2,
+] as const;
+
+/** Clamp an arbitrary rate onto the ladder (nearest rung, ties → the lower
+ * rung so a stray value never reads faster than requested). */
+export function clampPreviewRate(rate: number): number {
+  const r = Number.isFinite(rate) && rate > 0 ? rate : 1;
+  let best: number = PREVIEW_RATE_LADDER[0];
+  let bestErr = Infinity;
+  for (const rung of PREVIEW_RATE_LADDER) {
+    const err = Math.abs(rung - r);
+    if (err < bestErr) {
+      best = rung;
+      bestErr = err;
+    }
+  }
+  return best;
+}
+
+/** Step one rung along the ladder (dir +1 = faster, -1 = slower). Clamped
+ * at the ends — stepping past 2× or 0.25× stays put (no wrap: predictable). */
+export function stepPreviewRate(rate: number, dir: 1 | -1): number {
+  const cur = clampPreviewRate(rate);
+  const idx = PREVIEW_RATE_LADDER.indexOf(cur as (typeof PREVIEW_RATE_LADDER)[number]);
+  const next = Math.max(
+    0,
+    Math.min(PREVIEW_RATE_LADDER.length - 1, idx + dir),
+  );
+  return PREVIEW_RATE_LADDER[next];
+}
+
+/** Chip/label format: "1×", "0.75×", "2×" (trailing zeros trimmed). */
+export function fmtPreviewRate(rate: number): string {
+  const r = clampPreviewRate(rate);
+  return `${String(r).replace(/\.?0+$/, "")}×`;
+}

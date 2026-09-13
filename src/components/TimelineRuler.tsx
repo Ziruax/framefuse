@@ -1420,7 +1420,7 @@ function LaneLabel({
 /** Tiny centered muted hint for an empty lane — never blocks interaction. */
 function EmptyHint({ children }: { children: ReactNode }) {
   return (
-    <div className="pointer-events-none absolute inset-0 flex items-center justify-center px-2 text-center text-[9px] font-medium text-zinc-600">
+    <div className="pointer-events-none absolute inset-0 flex items-center justify-center px-2 text-center text-[9px] font-medium text-zinc-400">
       {children}
     </div>
   );

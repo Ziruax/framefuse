@@ -26,7 +26,7 @@ function getContainer(): HTMLDivElement {
 
 type ToastType = "success" | "error" | "info";
 
-function showToast(type: ToastType, message: string, description?: string): void {
+function showToast(type: ToastType, message: string, description?: string, durationMs?: number): void {
   const container = getContainer();
 
   const colors: Record<ToastType, { bg: string; border: string; text: string }> = {
@@ -75,23 +75,24 @@ function showToast(type: ToastType, message: string, description?: string): void
     toast.style.transform = "translateX(0)";
   });
 
-  // Auto-remove after 4 seconds
+  // Auto-remove (default 4s; transient shuttle/scrub feedback uses less)
+  const ttl = Number.isFinite(durationMs) && (durationMs ?? 0) > 0 ? durationMs : 4000;
   setTimeout(() => {
     toast.style.opacity = "0";
     toast.style.transform = "translateX(100%)";
     setTimeout(() => toast.remove(), 200);
-  }, 4000);
+  }, ttl);
 }
 
 export const toast = Object.assign(
   (message: string): void => showToast("info", message),
   {
-    success: (message: string, opts?: { description?: string }): void =>
-      showToast("success", message, opts?.description),
-    error: (message: string, opts?: { description?: string }): void =>
-      showToast("error", message, opts?.description),
-    info: (message: string, opts?: { description?: string }): void =>
-      showToast("info", message, opts?.description),
+    success: (message: string, opts?: { description?: string; duration?: number }): void =>
+      showToast("success", message, opts?.description, opts?.duration),
+    error: (message: string, opts?: { description?: string; duration?: number }): void =>
+      showToast("error", message, opts?.description, opts?.duration),
+    info: (message: string, opts?: { description?: string; duration?: number }): void =>
+      showToast("info", message, opts?.description, opts?.duration),
     message: (message: string): void => showToast("info", message),
   }
 );
