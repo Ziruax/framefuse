@@ -536,9 +536,8 @@ summary:focus-visible,
 
 /* ===== v5.1 — CapCut polish: timeline clip chrome ===== */
 
-/* Edge-trim affordance — 6px semi-transparent cyan handle zones that fade
-   in on clip hover. PURE VISUAL: pointer-events none, so the v5.1 drag
-   interaction (deadzone → move/trim math) is untouched. */
+/* Clip card chrome — the interactive edge-trim handles are real DOM children
+   rendered by FilmstripBar (v5.3), not pseudo-elements. */
 .ff-clip {
   /* v5.1 CapCut clip card: 1px #27272a hairline + resting dim/desat so the
      active clip pops without extra chrome. Replaces the v4.9 inline
@@ -577,34 +576,10 @@ summary:focus-visible,
     0 0 0 2px rgba(255, 255, 255, 0.55),
     0 6px 16px rgba(0, 0, 0, 0.6);
 }
-.ff-clip::before,
-.ff-clip::after {
-  content: "";
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  width: 6px;
-  z-index: 3;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 120ms ease;
-}
-.ff-clip::before {
-  left: 0;
-  border-radius: 5px 0 0 5px;
-  background: linear-gradient(to right, rgba(34, 211, 238, 0.42), rgba(34, 211, 238, 0.05));
-  box-shadow: inset 1px 0 0 rgba(34, 211, 238, 0.55);
-}
-.ff-clip::after {
-  right: 0;
-  border-radius: 0 5px 5px 0;
-  background: linear-gradient(to left, rgba(34, 211, 238, 0.42), rgba(34, 211, 238, 0.05));
-  box-shadow: inset -1px 0 0 rgba(34, 211, 238, 0.55);
-}
-.ff-clip:hover::before,
-.ff-clip:hover::after {
-  opacity: 1;
-}
+/* v5.3: the old ::before/::after VISUAL-ONLY edge zones were REMOVED —
+   base clips now render real interactive trim-handle divs (cursor-ew-resize,
+   group-hover fade-in) wired to the shared gesture machinery, exactly like
+   the overlay clips. No double chrome. */
 
 /* Playhead grabber glow — the cyan triangle that pulses softly. */
 @keyframes ff-playhead-glow {

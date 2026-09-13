@@ -54,6 +54,10 @@ export interface SfxItem {
   startMs: number;
   /** Playback volume, 0..1. */
   volume: number;
+  /** v5.3: custom duration override, ms (20..10000). Absent = the def's
+   *  defaultDurMs. The synth recipes scale with T, so a 2× whoosh is a
+   *  genuinely longer sweep, not a stretched copy. */
+  durMs?: number;
 }
 
 /**
@@ -130,20 +134,31 @@ export function makeSfxItem(partial: Partial<SfxItem> = {}): SfxItem {
     typeof partial.volume === "number" && Number.isFinite(partial.volume)
       ? partial.volume
       : 1;
+  const durMs =
+    typeof partial.durMs === "number" && Number.isFinite(partial.durMs)
+      ? Math.min(10000, Math.max(20, Math.round(partial.durMs)))
+      : undefined;
   return {
     id: partial.id ?? `sfx_${Date.now().toString(36)}_${sfxSeq.toString(36)}`,
     sfxId: partial.sfxId ?? SFX_LIBRARY[0]?.id ?? "whoosh",
     startMs,
     volume: Math.min(1, Math.max(0, rawVol)),
+    ...(durMs != null ? { durMs } : {}),
   };
 }
 
 /**
- * Total ms an item occupies on the timeline. Pure: uses the referenced def's
- * defaultDurMs; items pointing at unknown defs occupy 0 ms.
+ * Total ms an item occupies on the timeline. Pure: a custom durMs override
+ * (v5.3) wins over the referenced def's defaultDurMs; items pointing at
+ * unknown defs occupy 0 ms.
  */
 export function sfxDurationMs(item: SfxItem): number {
-  return getSfxDef(item.sfxId)?.defaultDurMs ?? 0;
+  const def = getSfxDef(item.sfxId);
+  if (!def) return 0;
+  if (typeof item.durMs === "number" && Number.isFinite(item.durMs)) {
+    return Math.min(10000, Math.max(20, item.durMs));
+  }
+  return def.defaultDurMs;
 }
 
 /**

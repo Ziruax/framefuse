@@ -305,6 +305,14 @@ export function buildTimeline(
   const warnings: OverlapWarning[] = [];
   const skipped: string[] = [];
 
+  // v5.3: BASE-LANE startMs edits are honored (timeline trim handles / clip
+  // moves). A helper reads the user's explicit placement with the filename
+  // timing as fallback — projects without edits resolve identically to v5.2.
+  const editStartOf = (id: string, fallback: number): number => {
+    const es = itemEdits?.[id]?.startMs;
+    return typeof es === "number" && Number.isFinite(es) && es >= 0 ? es : fallback;
+  };
+
   // v5.0: resolve edits once, then partition into lanes. Without itemEdits
   // every entry lands on the base lane → identical to the v4.9 flow.
   const resolved = entries.map((e) => resolveEntry(e, itemEdits, videoDurations));
@@ -324,27 +332,41 @@ export function buildTimeline(
   const segments: MediaSegment[] = [];
 
   if (mode === "absolute") {
-    // Sort by start time, then original order for stability.
+    // Sort by start time (v5.3: the EDITED start — a moved/trimmed clip
+    // re-sorts so the overlap chain below resolves in visual order), then
+    // original order for stability.
     const sorted = [...startBearing].sort((a, b) => {
-      const sa = a.entry.parsed.startMs ?? 0;
-      const sb = b.entry.parsed.startMs ?? 0;
+      const sa = editStartOf(a.entry.id, a.entry.parsed.startMs ?? 0);
+      const sb = editStartOf(b.entry.id, b.entry.parsed.startMs ?? 0);
       return sa - sb || a.entry.order - b.entry.order;
     });
 
-    // Compute initial ends.
+    // Compute initial ends. v5.3: an edited start TRANSLATES the natural
+    // window (a horizontal move shifts the whole clip; a trim commit always
+    // carries a duration override which wins below, so the end lands where
+    // the gesture math put it).
     const withEnds = sorted.map((r, i) => {
+      const start = editStartOf(r.entry.id, r.entry.parsed.startMs ?? 0);
       let endMs: number;
       if (r.entry.parsed.kind === "absolute" && r.entry.parsed.endMs != null) {
-        endMs = r.entry.parsed.endMs;
+        endMs = start + ((r.entry.parsed.endMs ?? 0) - (r.entry.parsed.startMs ?? 0));
       } else {
         // beat: extend to next beat's start, or default tail (v5.0: a VIDEO
         // beat with no next beat runs for its SOURCE duration, else 5s).
+        // v5.3: when the next beat was moved/trimmed, cap the extension at
+        // the position it VACATED (min of edited + parsed start) so the
+        // user's gap survives the commit instead of being auto-filled.
         const next = sorted[i + 1];
-        const nextStart = next ? next.entry.parsed.startMs ?? 0 : null;
+        const nextStart = next
+          ? Math.min(
+              editStartOf(next.entry.id, next.entry.parsed.startMs ?? 0),
+              next.entry.parsed.startMs ?? 0,
+            )
+          : null;
         endMs =
           nextStart != null
-            ? nextStart
-            : (r.entry.parsed.startMs ?? 0) +
+            ? Math.max(start + 200, nextStart)
+            : start +
               (r.mediaType === "video"
                 ? r.sourceDurationMs ?? DEFAULT_BEAT_TAIL_MS
                 : DEFAULT_BEAT_TAIL_MS);
@@ -352,11 +374,11 @@ export function buildTimeline(
       return { r, endMs };
     });
 
-    // Apply per-segment duration overrides (end = start + override).
+    // Apply per-segment duration overrides (end = edited start + override).
     for (const we of withEnds) {
       const ov = overrides[we.r.entry.id];
       if (ov && ov > 0) {
-        we.endMs = (we.r.entry.parsed.startMs ?? 0) + ov;
+        we.endMs = editStartOf(we.r.entry.id, we.r.entry.parsed.startMs ?? 0) + ov;
       }
     }
 
@@ -364,7 +386,7 @@ export function buildTimeline(
     for (let i = 1; i < withEnds.length; i++) {
       const prev = withEnds[i - 1];
       const cur = withEnds[i];
-      const curStart = cur.r.entry.parsed.startMs ?? 0;
+      const curStart = editStartOf(cur.r.entry.id, cur.r.entry.parsed.startMs ?? 0);
       if (curStart < prev.endMs) {
         warnings.push({
           message: `Overlap: "${prev.r.entry.fileName}" clipped at ${fmtTimecode(curStart)} (latest start wins)`,
@@ -375,7 +397,7 @@ export function buildTimeline(
     }
 
     for (const we of withEnds) {
-      const startMs = we.r.entry.parsed.startMs ?? 0;
+      const startMs = editStartOf(we.r.entry.id, we.r.entry.parsed.startMs ?? 0);
       // v5.1: an explicit override is the FINAL timeline duration (applied
       // above, possibly overlap-clipped since) — NOT divided by speed. Only
       // the implicit window (natural end − start) is a source window that
@@ -420,11 +442,13 @@ export function buildTimeline(
             : e.parsed.durationMs != null
               ? e.parsed.durationMs
               : r.sourceDurationMs ?? DEFAULT_DURATION_MS;
-        const startMs = cursor;
+        // v5.3: honor an edited start (trim/move); never overlap the clips
+        // already placed — a start before the cursor packs at the cursor.
+        const startMs = Math.max(cursor, editStartOf(e.id, cursor));
         // v5.1: an override is the final timeline duration (unscaled); the
         // implicit source window is what speed divides.
         const endMs =
-          cursor +
+          startMs +
           Math.max(200, ov && ov > 0 ? ov : scaleDur(r, dur));
         const dir =
           motionOverrides?.[e.id] ??
@@ -446,6 +470,9 @@ export function buildTimeline(
     // v5.1: base-lane video durations are SOURCE windows — the timeline
     // duration is window/speed, so the cursor (and every following clip)
     // shifts left when a clip is sped up. Images are always speed 1.
+    // v5.3: an edited start is honored (trim handles) — a start past the
+    // cursor opens a gap (non-ripple trim); a start before it packs at the
+    // cursor so sequential clips can never overlap.
     let cursor = 0;
     for (const r of baseEntries) {
       const e = r.entry;
@@ -458,11 +485,11 @@ export function buildTimeline(
             : r.mediaType === "video"
               ? r.sourceDurationMs ?? DEFAULT_DURATION_MS
               : DEFAULT_DURATION_MS;
-      const startMs = cursor;
+      const startMs = Math.max(cursor, editStartOf(e.id, cursor));
       // v5.1: an override is the final timeline duration (unscaled); the
       // implicit source window is what speed divides.
       const endMs =
-        cursor + Math.max(200, ov && ov > 0 ? ov : scaleDur(r, dur));
+        startMs + Math.max(200, ov && ov > 0 ? ov : scaleDur(r, dur));
       const dir =
         motionOverrides?.[e.id] ??
         resolveDirection(e.id, kenBurns.direction, kenBurns.directionPool);

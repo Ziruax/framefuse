@@ -332,11 +332,17 @@ export function sanitizeSfxItems(
     if (typeof it.startMs !== "number" || !Number.isFinite(it.startMs)) continue;
     const rawVol =
       typeof it.volume === "number" && Number.isFinite(it.volume) ? it.volume : 1;
+    // v5.3: round-trip the custom duration (clamped to the sfx.ts contract).
+    const rawDur =
+      typeof it.durMs === "number" && Number.isFinite(it.durMs)
+        ? Math.min(10000, Math.max(20, Math.round(it.durMs)))
+        : undefined;
     out.push({
       id: it.id,
       sfxId: it.sfxId,
       startMs: it.startMs,
       volume: Math.min(1, Math.max(0, rawVol)),
+      ...(rawDur != null ? { durMs: rawDur } : {}),
     });
   }
   return out.length > 0 ? out : undefined;

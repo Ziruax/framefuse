@@ -23,7 +23,12 @@ import {
   segmentAtTime,
   type TimelineEntry,
 } from "@/lib/merger/timeline";
-import { makeSfxItem, renderSfxBuffer, type SfxItem } from "@/lib/merger/sfx";
+import {
+  makeSfxItem,
+  renderSfxBuffer,
+  sfxDurationMs,
+  type SfxItem,
+} from "@/lib/merger/sfx";
 import { exportNative, isElectron } from "@/lib/merger/native";
 import { parseSrt, serializeSrt, serializeVtt, serializeVttWords } from "@/lib/merger/subtitles";
 import {
@@ -737,13 +742,19 @@ export default function Page() {
     return sfxAudioRef.current.ctx;
   }, []);
 
-  const getSfxBuffer = useCallback(async (sfxId: string): Promise<AudioBuffer | null> => {
-    const cached = sfxAudioRef.current.buffers.get(sfxId);
-    if (cached) return cached;
-    const buf = await renderSfxBuffer(sfxId); // null in Node / on failure
-    if (buf) sfxAudioRef.current.buffers.set(sfxId, buf);
-    return buf;
-  }, []);
+  /** v5.3: buffers are cached per (sfxId, durMs) — placements with custom
+   *  durations get their own render (deterministic per pair). */
+  const getSfxBuffer = useCallback(
+    async (sfxId: string, durMs?: number): Promise<AudioBuffer | null> => {
+      const key = `${sfxId}:${durMs ?? "d"}`;
+      const cached = sfxAudioRef.current.buffers.get(key);
+      if (cached) return cached;
+      const buf = await renderSfxBuffer(sfxId, durMs); // null in Node / on failure
+      if (buf) sfxAudioRef.current.buffers.set(key, buf);
+      return buf;
+    },
+    [],
+  );
 
   const stopSfxSources = useCallback(() => {
     sfxSchedTokenRef.current += 1; // invalidate in-flight schedules
@@ -776,7 +787,7 @@ export default function Page() {
       for (const item of items) {
         // Loop-boundary rule: never reschedule items that already passed.
         if (item.startMs < fromMs) continue;
-        const buf = await getSfxBuffer(item.sfxId);
+        const buf = await getSfxBuffer(item.sfxId, sfxDurationMs(item));
         if (token !== sfxSchedTokenRef.current) return; // superseded
         if (!buf) continue; // unrenderable effect — skip silently
         const src = ctx.createBufferSource();
@@ -2202,10 +2213,15 @@ const handleRandomTransitionMix = useCallback(() => {
   /**
    * Shared translation logic for item-edit patches (see the doc comment on
    * handleSetItemEdit / handleTimelineEdit below for the full contract).
-   * v5.1 adds (3): the BASE lane pins clip durations through the v4.x
+   * v5.1 added (3): the BASE lane pins clip durations through the v4.x
    * `overrides` map (edit.durationMs only drives the overlay lane), so any
    * effective duration is mirrored there while the clip sits on the base
    * lane — timeline trim drags actually stick.
+   *
+   * v5.3 REMOVED the old (1) base-lane startMs auto-route to the overlay
+   * lane: buildTimeline now honors edit.startMs on the BASE lane (trim
+   * handles + horizontal moves land exactly where the user dragged them,
+   * with a live-preview-accurate commit).
    */
   const translateItemEdit = useCallback(
     (
@@ -2213,19 +2229,14 @@ const handleRandomTransitionMix = useCallback(() => {
       patch: Partial<ItemEdit>,
     ): {
       patch: Partial<ItemEdit>;
-      routedFromBase: boolean;
       baseDurationMs: number | undefined;
     } => {
       const existing = stateRef.current?.itemEdits[id] ?? {};
       const eff: Partial<ItemEdit> = { ...patch };
-      // (1) base-lane horizontal move → auto-route to the overlay lane.
-      const patchSetsTrack = "track" in patch;
-      const currentTrack = existing.track ?? 0;
-      const routedFromBase =
-        eff.startMs !== undefined && !patchSetsTrack && currentTrack === 0;
-      if (routedFromBase) eff.track = 1;
+      // (1) v5.3: base-lane startMs edits stay on the base lane (see the
+      // doc comment above) — no routing, no lane switch.
       // (2) overlay default geometry when moving to any overlay lane.
-      const finalTrack = (eff.track !== undefined ? eff.track : currentTrack) ?? 0;
+      const finalTrack = (eff.track !== undefined ? eff.track : existing.track) ?? 0;
       const finalOverlay =
         eff.overlay !== undefined ? eff.overlay : existing.overlay;
       if (finalTrack >= 1 && !finalOverlay) {
@@ -2244,7 +2255,7 @@ const handleRandomTransitionMix = useCallback(() => {
         mergedDur > 0
           ? mergedDur
           : undefined;
-      return { patch: eff, routedFromBase, baseDurationMs };
+      return { patch: eff, baseDurationMs };
     },
     [],
   );
@@ -2252,13 +2263,8 @@ const handleRandomTransitionMix = useCallback(() => {
   /** MediaPanel clip-settings channel (sliders → debounced history push).
    *
    * Two page-level translations keep the frozen data model honest:
-   * 1. BASE-LANE startMs (7-a's caveat): absolute-mode base clips emit
-   *    `{ startMs }` on horizontal drags, but buildTimeline ignores
-   *    edit.startMs on the base lane (filename timing rules there). Per
-   *    7-a's recommended option, the patch is AUTO-ROUTED to the overlay
-   *    lane (`{ track: 1, startMs }`) so the clip stays where the user
-   *    dropped it — a toast explains the lane change. Sequential mode never
-   *    emits horizontal base moves, so nothing to translate there.
+   * 1. v5.3: BASE-LANE startMs edits (trim handles, horizontal moves) are
+   *    honored directly by buildTimeline — no overlay routing anymore.
    * 2. DEFAULT OVERLAY GEOMETRY: items moved to the overlay lane without an
    *    explicit transform get DEFAULT_OVERLAY_TRANSFORM written into their
    *    edit — the FFmpeg overlay composite skips null transforms, so
@@ -2268,17 +2274,10 @@ const handleRandomTransitionMix = useCallback(() => {
   const handleSetItemEdit = useCallback(
     (id: string, patch: Partial<ItemEdit>) => {
       requestHistoryPush(500);
-      const { patch: eff, routedFromBase, baseDurationMs } =
-        translateItemEdit(id, patch);
+      const { patch: eff, baseDurationMs } = translateItemEdit(id, patch);
       applyItemEdit(id, eff);
       if (baseDurationMs != null) {
         setOverrides((prev) => ({ ...prev, [id]: baseDurationMs }));
-      }
-      if (routedFromBase) {
-        toast.info("Moved to the Overlay track", {
-          description:
-            "Base clips follow filename timing — a horizontal drag places the clip as an overlay. Drop it back on the Video lane to restore it.",
-        });
       }
     },
     [requestHistoryPush, applyItemEdit, translateItemEdit],
@@ -2289,17 +2288,10 @@ const handleRandomTransitionMix = useCallback(() => {
   const handleTimelineEdit = useCallback(
     (id: string, patch: Partial<ItemEdit>) => {
       requestHistoryPush();
-      const { patch: eff, routedFromBase, baseDurationMs } =
-        translateItemEdit(id, patch);
+      const { patch: eff, baseDurationMs } = translateItemEdit(id, patch);
       applyItemEdit(id, eff);
       if (baseDurationMs != null) {
         setOverrides((prev) => ({ ...prev, [id]: baseDurationMs }));
-      }
-      if (routedFromBase) {
-        toast.info("Moved to the Overlay track", {
-          description:
-            "Base clips follow filename timing — a horizontal drag places the clip as an overlay. Drop it back on the Video lane to restore it.",
-        });
       }
     },
     [requestHistoryPush, applyItemEdit, translateItemEdit],
@@ -3158,6 +3150,7 @@ const handleRandomTransitionMix = useCallback(() => {
             onEditItem={handleTimelineEdit}
             sfxItems={sfxItems}
             onMoveSfx={handleMoveSfx}
+            onEditSfx={handleUpdateSfx}
             onRemoveSfx={handleRemoveSfx}
             videoDurations={videoDurations}
             onSplit={splitAtPlayhead}

@@ -57,7 +57,7 @@ import type {
 } from "@/lib/merger/types";
 import { boundaryStyle } from "@/lib/merger/types";
 import { fmtTimecode } from "@/lib/merger/timeline";
-import { getSfxDef } from "@/lib/merger/sfx";
+import { getSfxDef, sfxDurationMs } from "@/lib/merger/sfx";
 import { middleEllipsis } from "@/lib/merger/text";
 import type { WaveformData } from "@/lib/merger/waveform";
 import { cn } from "@/lib/utils";
@@ -85,6 +85,8 @@ interface TimelineRulerProps {
   sfxItems?: SfxItem[];
   /** v5: move an SFX item to a new start time (ms). */
   onMoveSfx?: (id: string, startMs: number) => void;
+  /** v5.3: patch an SFX item (duration resize from the pill edges). */
+  onEditSfx?: (id: string, patch: Partial<SfxItem>) => void;
   /** v5: remove an SFX item. */
   onRemoveSfx?: (id: string) => void;
   /** v5: video source durations (id → ms) for trim clamping. */
@@ -248,15 +250,23 @@ type DragInfo =
       /** v5.2: looped overlays may extend past the source window (their
        * source repeats to fill the timeline window). */
       overlayLoop: boolean;
+      /** v5.3: BASE-lane trim clamps — the trim-l start may not cross the
+       * previous base clip's end, and a trim-r extension may not cross the
+       * next base clip's start (Infinity / 0 when unbounded). */
+      minStartMs: number;
+      maxEndMs: number;
     }
   | {
       kind: "sfx";
       id: string;
+      /** v5.3: move | resize-l | resize-r (pill edge handles). */
+      gesture: "move" | "resize-l" | "resize-r";
       pointerId: number;
       startX: number;
       msPerPx: number;
       didDrag: boolean;
       origStart: number;
+      origDur: number;
     };
 
 /** Live drag feedback mirrored into render (local state; parent state only
@@ -273,7 +283,13 @@ type DragPreview =
       /** Track the clip currently lives on (drop-target highlight source). */
       origTrack: number;
     }
-  | { kind: "sfx"; id: string; startMs: number };
+  | {
+      kind: "sfx";
+      id: string;
+      gesture: "move" | "resize-l" | "resize-r";
+      startMs: number;
+      durMs: number;
+    };
 
 /** Max trimmable TIMELINE duration for a clip (video: the remaining SOURCE
  * window divided by speed — v5.1 scaled clamp; else 300 s). */
@@ -333,7 +349,13 @@ function computeClipDrag(
     let startMs = d.origStart;
     if (horizAllowed) {
       const hi = Math.max(0, totalMs);
-      startMs = Math.max(0, Math.min(hi, snapMs(d.origStart + dx * d.msPerPx)));
+      // v5.3: base-lane moves stay clear of the previous clip too (same
+      // neighbor rule as trim-l — the base lane is a non-overlap zone).
+      const lo = d.origTrack === 0 ? d.minStartMs : 0;
+      startMs = Math.max(
+        lo,
+        Math.min(hi, snapMs(d.origStart + dx * d.msPerPx)),
+      );
     }
     return {
       startMs,
@@ -355,6 +377,8 @@ function computeClipDrag(
       -d.origStart,
       d.origDur - maxDur,
       d.mediaType === "video" ? -d.origTrim / speed : -Infinity,
+      // v5.3 base lane: the previous clip's end bounds the slide.
+      d.origTrack === 0 ? d.minStartMs - d.origStart : -Infinity,
     );
     const deltaMax = d.origDur - MIN_DUR_MS;
     const rawDelta = Math.min(deltaMax, Math.max(deltaMin, dx * d.msPerPx));
@@ -370,28 +394,67 @@ function computeClipDrag(
       horizAllowed: false,
     };
   }
-  // trim-r
+  // trim-r — v5.3: on the base lane the extension may not cross the NEXT
+  // clip's start (a trim never silently swallows a neighbor).
+  const neighborCap =
+    d.origTrack === 0 && Number.isFinite(d.maxEndMs)
+      ? d.maxEndMs - d.origStart
+      : Infinity;
+  const durHi = Math.min(maxDur, neighborCap);
   const nd = snapMs(d.origDur + dx * d.msPerPx);
   return {
     startMs: d.origStart,
-    durationMs: Math.min(maxDur, Math.max(MIN_DUR_MS, nd)),
+    durationMs: Math.max(MIN_DUR_MS, Math.min(Math.max(MIN_DUR_MS, durHi), nd)),
     trimInMs: d.origTrim,
     targetTrack: undefined,
     horizAllowed: false,
   };
 }
 
-/** SFX pill move math: start = orig + dx, snapped, clamped [0, totalMs]. */
+/** SFX pill gesture math (v5.3: move + edge resizes).
+ *  move     : start = orig + dx, snapped, clamped [0, totalMs].
+ *  resize-r : dur = orig + dx, snapped, clamped [MIN_SFX_DUR, MAX_SFX_DUR].
+ *  resize-l : start+dur slide together (end pinned) with a MIN duration. */
+const MIN_SFX_DUR_MS = 40;
+const MAX_SFX_DUR_MS = 10000;
 function computeSfxDrag(
   d: Extract<DragInfo, { kind: "sfx" }>,
   clientX: number,
   totalMs: number,
-): number {
+): { startMs: number; durMs: number } {
   const hi = Math.max(0, totalMs);
-  return Math.max(
-    0,
-    Math.min(hi, snapMs(d.origStart + (clientX - d.startX) * d.msPerPx)),
-  );
+  const dx = clientX - d.startX;
+  if (d.gesture === "resize-r") {
+    const nd = snapMs(d.origDur + dx * d.msPerPx);
+    return {
+      startMs: d.origStart,
+      durMs: Math.min(MAX_SFX_DUR_MS, Math.max(MIN_SFX_DUR_MS, nd)),
+    };
+  }
+  if (d.gesture === "resize-l") {
+    // End pinned: newStart = orig + delta, newDur = origDur - delta.
+    let ns = snapMs(d.origStart + dx * d.msPerPx);
+    ns = Math.max(
+      Math.min(hi - MIN_SFX_DUR_MS, d.origStart + d.origDur - MIN_SFX_DUR_MS),
+      Math.max(0, ns),
+    );
+    const delta = ns - d.origStart;
+    return {
+      startMs: ns,
+      durMs: Math.min(
+        MAX_SFX_DUR_MS,
+        Math.max(MIN_SFX_DUR_MS, d.origDur - delta),
+      ),
+    };
+  }
+  // move
+  return {
+    startMs: Math.max(
+      0,
+      Math.min(hi, snapMs(d.origStart + dx * d.msPerPx)),
+    ),
+    durMs: d.origDur,
+  };
 }
 
 interface OverlayLayoutEntry {
@@ -1052,6 +1115,7 @@ function FilmstripBar({
   isActive,
   onActivate,
   drag,
+  trim,
   previewStartMs,
   previewDurationMs,
   dragging,
@@ -1065,6 +1129,14 @@ function FilmstripBar({
   onActivate: (e: { stopPropagation: () => void }) => void;
   /** v5: pointer drag handlers (press-seek + move/lane-switch gestures). */
   drag?: FilmstripBarDrag;
+  /** v5.3: base-lane trim handle gestures (edges). The shared move/up
+   *  handlers live on the clip root and receive the captured edge events
+   *  via bubbling — the same pattern the overlay clips use. */
+  trim?: {
+    onTrimStart: (e: ReactPointerEvent<HTMLDivElement>) => void;
+    onTrimEnd: (e: ReactPointerEvent<HTMLDivElement>) => void;
+    onLostPointerCapture: (e: ReactPointerEvent<HTMLDivElement>) => void;
+  };
   /** v5: live drag preview overrides (local state; commit on release). */
   previewStartMs?: number;
   previewDurationMs?: number;
@@ -1112,8 +1184,9 @@ function FilmstripBar({
         // with the .ff-clip family in globals.css carrying hover (cyan
         // hairline + 1px lift), active (2px cyan ring + raise) and drag
         // states — previously inline filter/box-shadow, now CSS so hover
-        // works. Edge trim zones = .ff-clip::before/::after (visual only).
-        "ff-clip absolute top-0 overflow-hidden rounded-md text-[8px] font-semibold tabular-nums",
+        // works. v5.3: real interactive trim handles replace the old
+        // ::before/::after visual-only edge zones (group-hover drives them).
+        "ff-clip group absolute top-0 overflow-hidden rounded-md text-[8px] font-semibold tabular-nums",
         drag
           ? "cursor-grab touch-none select-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-cyan-300/70"
           : "cursor-pointer",
@@ -1135,8 +1208,29 @@ function FilmstripBar({
         backgroundSize: "cover",
         backgroundPosition: "center",
       }}
-      title={`${seg.fileName} · ${fmtTimecode(seg.startMs)}–${fmtTimecode(seg.endMs)} · ${(seg.durationMs / 1000).toFixed(1)}s · motion ${seg.direction}\ndouble-click jumps to this clip's first frame`}
+      title={`${seg.fileName} · ${fmtTimecode(seg.startMs)}–${fmtTimecode(seg.endMs)} · ${(seg.durationMs / 1000).toFixed(1)}s · motion ${seg.direction}\ndouble-click jumps to this clip's first frame${trim ? " · drag edges to trim" : ""}`}
     >
+      {/* v5.3: interactive trim handles — 6px cyan zones that fade in on
+          hover, wired to the shared clip gesture machinery ("trim-l" /
+          "trim-r"). Mirrors the overlay-clip handles exactly. */}
+      {trim && (
+        <>
+          <div
+            className="absolute inset-y-0 left-0 z-[2] w-[7px] cursor-ew-resize touch-none bg-cyan-400/25 opacity-0 shadow-[inset_1px_0_0_rgba(34,211,238,0.65)] transition-opacity duration-100 group-hover:opacity-100"
+            title="Drag to trim the start (slides the source window)"
+            aria-hidden
+            onPointerDown={trim.onTrimStart}
+            onLostPointerCapture={trim.onLostPointerCapture}
+          />
+          <div
+            className="absolute inset-y-0 right-0 z-[2] w-[7px] cursor-ew-resize touch-none bg-cyan-400/25 opacity-0 shadow-[inset_-1px_0_0_rgba(34,211,238,0.65)] transition-opacity duration-100 group-hover:opacity-100"
+            title="Drag to trim the end"
+            aria-hidden
+            onPointerDown={trim.onTrimEnd}
+            onLostPointerCapture={trim.onLostPointerCapture}
+          />
+        </>
+      )}
       {/* Index chip — scrimmed so it reads over any footage. */}
       {(layout != null ? (widthPxish as number) > 14 : (widthPxish as number) > 3) ? (
         <span
@@ -1240,6 +1334,7 @@ export function TimelineRuler({
   onEditItem,
   sfxItems,
   onMoveSfx,
+  onEditSfx,
   onRemoveSfx,
   videoDurations,
   onSplit,
@@ -1557,6 +1652,22 @@ export function TimelineRuler({
     if (!onEditItem || e.button !== 0) return;
     e.stopPropagation();
     if (gesture === "move") onSeek(xToMs(e.clientX));
+    // v5.3: base-lane neighbor clamps — the previous clip's end bounds any
+    // start slide, the next clip's start bounds any end extension. (Overlays
+    // overlap freely, so they stay unbounded.)
+    let minStartMs = 0;
+    let maxEndMs = Infinity;
+    if (seg.track === 0) {
+      const neighbors = segments
+        .filter((s) => s.track === 0 && s.id !== seg.id)
+        .sort((a, b) => a.startMs - b.startMs);
+      const prev = neighbors
+        .filter((s) => s.startMs < seg.startMs)
+        .pop();
+      const next = neighbors.find((s) => s.startMs > seg.startMs);
+      if (prev) minStartMs = prev.startMs + prev.durationMs;
+      if (next) maxEndMs = next.startMs;
+    }
     try {
       e.currentTarget.setPointerCapture(e.pointerId);
     } catch {
@@ -1588,6 +1699,8 @@ export function TimelineRuler({
           : 1,
       // v5.2: looped overlays trim beyond the source window.
       overlayLoop: seg.overlayLoop === true,
+      minStartMs,
+      maxEndMs,
     };
   };
 
@@ -1599,11 +1712,13 @@ export function TimelineRuler({
   const beginSfxDrag = (
     e: ReactPointerEvent<HTMLDivElement>,
     item: SfxItem,
+    gesture: "move" | "resize-l" | "resize-r" = "move",
   ) => {
     if (e.button !== 0) return;
     e.stopPropagation();
     if (e.altKey && onRemoveSfx) return;
-    onSeek(Math.max(0, item.startMs));
+    // Press-seek only for the pill body (edge presses carry trim intent).
+    if (gesture === "move") onSeek(Math.max(0, item.startMs));
     if (!onMoveSfx) return;
     try {
       e.currentTarget.setPointerCapture(e.pointerId);
@@ -1613,11 +1728,13 @@ export function TimelineRuler({
     dragRef.current = {
       kind: "sfx",
       id: item.id,
+      gesture,
       pointerId: e.pointerId,
       startX: e.clientX,
       msPerPx: msPerPxNow(),
       didDrag: false,
       origStart: Math.max(0, item.startMs),
+      origDur: sfxDurationMs(item),
     };
   };
 
@@ -1681,10 +1798,13 @@ export function TimelineRuler({
       if (Math.abs(e.clientX - d.startX) <= DRAG_DEADZONE_PX) return;
       d.didDrag = true;
     }
+    const r = computeSfxDrag(d, e.clientX, totalMs);
     setDragPreview({
       kind: "sfx",
       id: d.id,
-      startMs: computeSfxDrag(d, e.clientX, totalMs),
+      gesture: d.gesture,
+      startMs: r.startMs,
+      durMs: r.durMs,
     });
   };
 
@@ -1693,7 +1813,19 @@ export function TimelineRuler({
     if (!d || d.kind !== "sfx" || d.pointerId !== e.pointerId) return;
     dragRef.current = null;
     setDragPreview(null);
-    if (d.didDrag) onMoveSfx?.(d.id, computeSfxDrag(d, e.clientX, totalMs));
+    if (!d.didDrag) return;
+    const r = computeSfxDrag(d, e.clientX, totalMs);
+    if (d.gesture === "move") {
+      onMoveSfx?.(d.id, r.startMs);
+    } else {
+      // v5.3: edge resize — commit the new duration (and, for the left
+      // edge, the pinned-end start) as a patch.
+      const patch: Partial<SfxItem> = { durMs: Math.round(r.durMs) };
+      if (d.gesture === "resize-l" && r.startMs !== d.origStart) {
+        patch.startMs = Math.round(r.startMs);
+      }
+      onEditSfx?.(d.id, patch);
+    }
   };
 
   /** Abort the active gesture WITHOUT committing (pointercancel / capture
@@ -2171,6 +2303,20 @@ export function TimelineRuler({
                                 }
                               : undefined
                           }
+                          // v5.3: base-lane trim handles — same gesture
+                          // machinery as the overlay clips (edge divs press
+                          // "trim-l" / "trim-r"; the root carries move/up).
+                          trim={
+                            onEditItem
+                              ? {
+                                  onTrimStart: (e) =>
+                                    beginClipDrag(e, seg, "trim-l"),
+                                  onTrimEnd: (e) =>
+                                    beginClipDrag(e, seg, "trim-r"),
+                                  onLostPointerCapture: handleDragAbort,
+                                }
+                              : undefined
+                          }
                           previewStartMs={preview?.startMs}
                           previewDurationMs={preview?.durationMs}
                           dragging={preview != null}
@@ -2593,7 +2739,10 @@ export function TimelineRuler({
                   const def = getSfxDef(item.sfxId);
                   const pv = sfxPreviewFor(item.id);
                   const startMs = Math.max(0, pv?.startMs ?? item.startMs);
-                  const durMs = def?.defaultDurMs ?? 0;
+                  // v5.3: width follows the EFFECTIVE duration (custom durMs
+                  // override + live resize preview) — longer effects read as
+                  // longer pills on the lane.
+                  const durMs = pv?.durMs ?? sfxDurationMs(item);
                   const pos =
                     layout != null
                       ? {
@@ -2642,7 +2791,7 @@ export function TimelineRuler({
                             ? "0 0 0 1.5px rgba(255,255,255,0.55), 0 3px 10px rgba(0,0,0,0.55)"
                             : "0 1px 2px rgba(0,0,0,0.45)",
                       }}
-                      title={`${def?.label ?? item.sfxId} · ${fmtTimecode(startMs)} · click to seek${onMoveSfx ? ", drag to move" : ""}${onRemoveSfx ? ", Alt+click or x to remove" : ""}`}
+                      title={`${def?.label ?? item.sfxId} · ${fmtTimecode(startMs)} · ${(durMs / 1000).toFixed(2)}s · click to seek${onMoveSfx ? ", drag to move" : ""}${onEditSfx ? ", drag edges to resize" : ""}${onRemoveSfx ? ", Alt+click or x to remove" : ""}`}
                       onPointerDown={(e) => beginSfxDrag(e, item)}
                       onPointerMove={handleSfxPointerMove}
                       onPointerUp={handleSfxPointerUp}
@@ -2677,8 +2826,33 @@ export function TimelineRuler({
                         {def?.label ?? item.sfxId}
                       </span>
                       <span className="shrink-0 tabular-nums opacity-70">
-                        {fmtTimecode(startMs)}
+                        {(durMs / 1000).toFixed(durMs < 1000 ? 2 : 1)}s
                       </span>
+                      {/* v5.3: edge resize handles — amber (SFX accent) 5px
+                          zones fading in on hover, same gesture plumbing as
+                          the clip trim handles. */}
+                      {onEditSfx && (
+                        <>
+                          <div
+                            className="absolute inset-y-0 left-0 z-[2] w-[5px] cursor-ew-resize touch-none bg-amber-400/30 opacity-0 shadow-[inset_1px_0_0_rgba(251,191,36,0.7)] transition-opacity duration-100 group-hover:opacity-100"
+                            title="Drag to lengthen/shorten the effect (start pinned)"
+                            aria-hidden
+                            onPointerDown={(e) =>
+                              beginSfxDrag(e, item, "resize-l")
+                            }
+                            onLostPointerCapture={handleDragAbort}
+                          />
+                          <div
+                            className="absolute inset-y-0 right-0 z-[2] w-[5px] cursor-ew-resize touch-none bg-amber-400/30 opacity-0 shadow-[inset_-1px_0_0_rgba(251,191,36,0.7)] transition-opacity duration-100 group-hover:opacity-100"
+                            title="Drag to lengthen/shorten the effect"
+                            aria-hidden
+                            onPointerDown={(e) =>
+                              beginSfxDrag(e, item, "resize-r")
+                            }
+                            onLostPointerCapture={handleDragAbort}
+                          />
+                        </>
+                      )}
                       {onRemoveSfx && (
                         <button
                           type="button"
@@ -2779,7 +2953,9 @@ export function TimelineRuler({
               >
                 {dragPreview.kind === "clip" && dragPreview.gesture !== "move"
                   ? `${fmtTimecode(dragPreview.startMs)} · ${(dragPreview.durationMs / 1000).toFixed(1)}s`
-                  : fmtTimecode(dragPreview.startMs)}
+                  : dragPreview.kind === "sfx" && dragPreview.gesture !== "move"
+                    ? `${(dragPreview.durMs / 1000).toFixed(2)}s`
+                    : fmtTimecode(dragPreview.startMs)}
               </div>
             </div>
           )}

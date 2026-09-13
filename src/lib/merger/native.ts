@@ -33,7 +33,7 @@ import {
   type WordTransform,
 } from "./captionAnimations";
 import type { CaptionAnimation } from "./types";
-import { renderSfxWav } from "./sfx";
+import { renderSfxWav, sfxDurationMs } from "./sfx";
 import { sanitizeChromaKeySettings } from "./chroma";
 
 /** True when running inside the FrameFuse Electron shell. */
@@ -411,8 +411,9 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
     });
   }
 
-  // 1.5 v5.0: render + upload SFX WAVs (one render per UNIQUE sfxId per
-  // export run — the cache dedupes repeated placements of the same effect).
+  // 1.5 v5.0: render + upload SFX WAVs. v5.3: the cache is keyed by
+  // (sfxId, durMs) — placements with custom durations get their own render
+  // AND their own temp file (same-name collisions would overwrite).
   // Render failures (no OfflineAudioContext, unknown id, synthesis error)
   // skip that placement with a console warn instead of failing the export.
   const ipcSfx: NativeSfxPayload[] = [];
@@ -420,14 +421,16 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
     const wavCache = new Map<string, { wavPath: string; durationMs: number } | null>();
     for (const item of opts.sfx) {
       if (!item || !item.id || !item.sfxId) continue;
-      if (!wavCache.has(item.sfxId)) {
+      const itemDurMs = sfxDurationMs(item);
+      const cacheKey = `${item.sfxId}:${itemDurMs}`;
+      if (!wavCache.has(cacheKey)) {
         let entry: { wavPath: string; durationMs: number } | null = null;
         try {
-          const rendered = await renderSfxWav(item.sfxId);
+          const rendered = await renderSfxWav(item.sfxId, itemDurMs);
           if (rendered) {
             const bytes = await rendered.blob.arrayBuffer();
             const wavPath = await api.saveTempAudio({
-              name: `sfx_${item.sfxId}.wav`,
+              name: `sfx_${item.sfxId}_${itemDurMs}.wav`,
               bytes,
             });
             entry = { wavPath, durationMs: rendered.durationMs };
@@ -439,9 +442,9 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
         } catch (e) {
           console.warn(`[framefuse] SFX "${item.sfxId}" render failed — skipping placement ${item.id}`, e);
         }
-        wavCache.set(item.sfxId, entry);
+        wavCache.set(cacheKey, entry);
       }
-      const cached = wavCache.get(item.sfxId);
+      const cached = wavCache.get(cacheKey);
       if (cached) {
         ipcSfx.push({
           id: item.id,

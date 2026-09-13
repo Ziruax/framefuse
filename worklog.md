@@ -178,3 +178,49 @@ Stage Summary:
 - Build notes for the future: portable wine at /home/z/wine-portable + NsisTarget.js patch are needed to cross-build NSIS in this sandbox (the patch lives in node_modules only — re-apply after bun install; consider committing a postinstall patch script later)
 - Known limitations: (a) whisper downloads have no in-flight fetch cancellation (transformers 2.17 limitation — cancelled downloads finish in background, result discarded); (b) despill approximates magenta/cyan keys to green/blue families (FFmpeg despill limitation); (c) preview volume caps at 100% (HTMLMediaElement), >100% boost applies in export only
 - Next-phase recommendations: 2-pass loudnorm, GPU filter graphs (scale_cuda/hwupload), base-lane trim handles on the timeline, SFX duration editing, per-overlay fps normalization
+
+---
+Task ID: 10 (v5.3 sprint, round 1)
+Agent: main (Z.ai Code)
+Task: Status assessment + QA, then v5.3 "Timeline Pro" features: base-lane trim handles, SFX duration editing, styling polish
+
+Work Log:
+- STATUS ASSESSMENT (agent-browser QA): app stable — uploads (video+gs+image+music), playback, canvas 960×540 rendering, music clip drag+volume+loop, chroma key (0 green px), PiP selection chrome, splitter drag (300→377), SFX add — all working with 0 console errors. VLM screenshot analysis flagged one real styling issue: 48×48 SQUARE media thumbnails awkwardly crop 16:9 footage.
+- DECISION (per instructions: stable → new development): implement the worklog's own next-phase recommendations — base-lane timeline trim handles (#1), SFX duration editing (#2) — plus the mandatory styling polish (16:9 thumbnails, clip chrome).
+
+- timeline.ts — buildTimeline now honors edit.startMs on the BASE lane:
+  - editStartOf(id, fallback) helper; absolute mode: edited starts drive sort/ends/overlap-resolution/segments (translated windows); beat extension caps at min(nextEffStart, nextParsedStart) so a trimmed neighbor's gap SURVIVES (not auto-filled); sequential + videoTail: start = max(cursor, editStartOf) — gaps allowed (non-ripple), overlaps impossible.
+  - Verified with 8-case bun test (back-compat + trim-l gap + overlap clamp + beat gap preservation + videoTail honored) — all correct.
+- page.tsx: translateItemEdit auto-route REMOVED (base-lane startMs patches stay on base — trim commits + horizontal moves now land where dragged; "Moved to Overlay" toast gone); getSfxBuffer keyed per (sfxId,durMs); scheduleSfxFrom renders at sfxDurationMs(item); onEditSfx wired to handleUpdateSfx.
+- TimelineRuler.tsx:
+  - FilmstripBar: real interactive trim handles (7px cyan zones, group-hover fade-in, cursor-ew-resize) wired to beginClipDrag "trim-l"/"trim-r" — same plumbing as overlay clips; root gains `group`.
+  - beginClipDrag computes base-lane neighbor clamps: minStartMs = prev base end, maxEndMs = next base start (overlays unbounded).
+  - computeClipDrag: trim-l deltaMin includes minStart bound; trim-r duration capped at next clip's start; base-lane horizontal moves clamp ≥ prev end.
+  - SFX: DragInfo/preview gained gesture+origDur/durMs; computeSfxDrag returns {startMs,durMs} with move/resize-l(end-pinned)/resize-r (40ms..10s); pill width ∝ sfxDurationMs; amber edge handles; pill shows duration tag; drag tooltip shows duration while resizing.
+- sfx.ts: SfxItem.durMs? (20..10000, makeSfxItem clamps, optional spread); sfxDurationMs(item) honors the override.
+- project.ts: sanitizeSfxItems round-trips durMs (clamped).
+- native.ts: SFX WAV cache keyed `${sfxId}:${durMs}` + unique temp file names (per-duration renders, no overwrite collisions); renderSfxWav(sfxId, itemDurMs).
+- MediaPanel.tsx: list-view thumbnails 48×48 square → w-[76px] aspect-video (16:9, no more awkward crops); grid tiles aspect-square → aspect-video; SfxPalette "On timeline" rows gained a duration row (Timer icon + 40..3000ms slider + live readout + reset-to-default button).
+- globals.css: removed the .ff-clip::before/::after VISUAL-ONLY edge zones (replaced by the real interactive handles — no double chrome); comments updated.
+
+VERIFICATION:
+- Gates: bunx tsc --noEmit CLEAN; bun run lint 0 errors; dev.log GET / 200.
+- Export harness (/home/z/harness-tests/export-harness.mjs): added scenario 10 "basetrim" (trimInMs=1000 + durationMs=1500 source window + shifted start) — ALL 10 SCENARIOS PASS with duration/stream assertions (real ffmpeg).
+- agent-browser E2E (synthetic pointer events on the real handles):
+  - trim-l main_video: 00:00→00:01 start slide, END PINNED at 00:04, gap created, next clip unaffected ✓
+  - trim-r greenscreen: 00:04→00:05 tail shrink, start pinned ✓
+  - neighbor clamp: +90px trim-r attempt → NO change (capped at next clip's start) ✓
+  - trim-l second clip: precise geometry start 4420ms/dur 1080ms (window slide, end pinned, source trimIn advanced) ✓
+  - SFX resize-r +90px: pill 28→117px (450ms→1.95s), title "1.95s · drag edges to resize" ✓
+  - SFX duration slider 1950→900: pill resizes 54px, reset button enables ✓
+  - SFX pill move regression: 00:00→00:02 ✓; undo→redo machinery functional (pill restored) ✓
+  - 16:9 thumbnails measured 76×43 (was 48×48) ✓; VLM confirms widescreen thumbs
+  - Fresh-session console: 0 runtime errors ✓
+- HistorySnapshot already includes overrides → trims (itemEdits+overrides writes) are fully undoable ✓
+
+Stage Summary:
+- v5.3 delivers the two top-recommended pro-editor features: EVERY base clip is now trimmable directly on the timeline (head/tail, live preview, source-window sliding, neighbor-safe clamps, non-ripple gaps), and SFX effects have editable durations (pill-edge resize + palette slider + reset; synth recipes scale with T so a longer whoosh is a genuinely longer sweep; per-duration WAV renders for export).
+- Preview↔export parity preserved by construction (segments are the single source of truth; harness-verified).
+- REMOVED behavior: base-lane horizontal drags no longer auto-route clips to the overlay lane — they now move the clip on the base lane directly (better UX, was a workaround for startMs being ignored).
+- Known notes: (a) undo granularity for add+move can coalesce (pre-existing); (b) beat clips moved LEFT of another clip squeeze between neighbors (deterministic tiling; unusual op); (c) sequential lane-switch down clamps to cursor (magnetic tail).
+- Next-phase candidates: 2-pass loudnorm export audio, GPU filter graphs (scale_cuda), per-overlay fps normalization, timeline clip multi-select, keyframe-able overlay motion.

@@ -79,6 +79,7 @@ import {
   SFX_LIBRARY,
   getSfxDef,
   renderSfxBuffer,
+  sfxDurationMs,
   type SfxCategory,
   type SfxDef,
   type SfxItem,
@@ -695,7 +696,9 @@ export function MediaPanelBase({
                         }
                       }}
                       className={cn(
-                        "group/tile relative aspect-square cursor-pointer overflow-hidden rounded-lg border outline-none transition-all duration-150 hover:-translate-y-0.5 active:scale-[0.96]",
+                        // v5.3: 16:9 tiles (was square) — footage reads
+                        // undistorted, matching the list-view thumbnails.
+                        "group/tile relative aspect-video cursor-pointer overflow-hidden rounded-lg border outline-none transition-all duration-150 hover:-translate-y-0.5 active:scale-[0.96]",
                         "focus-visible:ring-2 focus-visible:ring-violet-400/80",
                         activeId === seg.id || settingsOpen
                           ? "border-violet-400/70 shadow-[0_0_0_1px_rgba(167,139,250,0.5),0_4px_16px_rgba(0,0,0,0.4)]"
@@ -1034,9 +1037,10 @@ export function MediaPanelBase({
                       opacity: 0.65,
                     }}
                   />
-                  {/* Thumbnail (48x48) */}
+                  {/* Thumbnail — v5.3: 16:9 aspect (was a 48×48 square crop
+                      that awkwardly cropped wide footage, per QA). */}
                   <div
-                    className="relative size-12 shrink-0 overflow-hidden rounded-lg ring-1 ring-black/40"
+                    className="relative aspect-video w-[76px] shrink-0 overflow-hidden rounded-lg ring-1 ring-black/40"
                     style={{ backgroundColor: "#000000" }}
                   >
                     {thumbSrc != null ? (
@@ -3037,12 +3041,13 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
                     return (
                       <div
                         key={item.id}
-                        className="flex items-center gap-1.5 rounded-md border px-1.5 py-1"
+                        className="rounded-md border px-1.5 py-1"
                         style={{
                           borderColor: "rgba(34, 211, 238, 0.2)",
                           backgroundColor: "rgba(9, 9, 11, 0.4)",
                         }}
                       >
+                        <div className="flex items-center gap-1.5">
                         <span aria-hidden className="shrink-0 text-[11px] leading-none">
                           {def?.emoji ?? "🎵"}
                         </span>
@@ -3106,6 +3111,53 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
                           >
                             <Trash2 className="size-3" />
                           </button>
+                        )}
+                        </div>
+                        {/* v5.3: duration editor — slider 40..3000ms +
+                            reset-to-default. The synth recipes scale with T,
+                            so a longer whoosh is a genuinely longer sweep. */}
+                        {onUpdateSfx != null && def != null && (
+                          <div className="mt-1 flex items-center gap-1.5">
+                            <Timer
+                              className="size-2.5 shrink-0"
+                              style={{ color: "#71717a" }}
+                              aria-hidden
+                            />
+                            <input
+                              type="range"
+                              min={40}
+                              max={3000}
+                              step={10}
+                              value={sfxDurationMs(item)}
+                              onChange={(e) =>
+                                onUpdateSfx(item.id, {
+                                  durMs: Number(e.target.value),
+                                })
+                              }
+                              aria-label={`Duration for ${def.label}`}
+                              title="Effect duration (drag the pill edges on the timeline too)"
+                              className="mx-0.5 min-w-0 flex-1"
+                            />
+                            <span
+                              className="w-11 shrink-0 text-right text-[8px] tabular-nums"
+                              style={{ color: "#a1a1aa" }}
+                            >
+                              {(sfxDurationMs(item) / 1000).toFixed(2)}s
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                onUpdateSfx(item.id, { durMs: def.defaultDurMs })
+                              }
+                              disabled={sfxDurationMs(item) === def.defaultDurMs}
+                              aria-label={`Reset ${def.label} duration to default`}
+                              title={`Reset to default (${def.defaultDurMs}ms)`}
+                              className="flex size-4 shrink-0 items-center justify-center rounded transition-colors hover:bg-zinc-500/25 disabled:opacity-30"
+                              style={{ color: "#71717a" }}
+                            >
+                              <RotateCcw className="size-2.5" />
+                            </button>
+                          </div>
                         )}
                       </div>
                     );
