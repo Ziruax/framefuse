@@ -17,15 +17,26 @@
 //   Same signs, comparable magnitudes as FFmpeg's −0.169/−0.331/+0.5
 //   coefficients, so similarity values land in the same ballpark.
 
+export type ChromaKeyMode = "chroma" | "luma";
+
 export interface ChromaKeySettings {
   /** Key color hex like "#00FF00". */
   color: string;
-  /** 0.01–0.5 — FFmpeg chromakey "similarity" (chroma distance). */
+  /** 0.01–0.5 — FFmpeg chromakey "similarity" (chroma distance). In luma
+   *  mode: luma distance from the key color's brightness. */
   similarity: number;
   /** 0–1 — FFmpeg chromakey "blend" (edge softness). */
   blend: number;
-  /** 0–1 — despill strength (green spill suppression on kept pixels). */
+  /** 0–1 — despill strength (green spill suppression on kept pixels).
+   *  Chroma mode only — meaningless for white/black screens. */
   spill: number;
+  /** v1: "chroma" (green/blue/magenta screens — keys on COLOR distance) or
+   *  "luma" (white/black screens — keys on BRIGHTNESS distance). Luma mode
+   *  is the fix for "white/black screen keys eat the whole overlay": a
+   *  chroma key on a neutral color removes EVERY gray pixel (u=v=0 for all
+   *  of them), while a luma key keeps dark content on a white screen (and
+   *  vice versa). Undefined = chroma (legacy saved projects). */
+  mode?: ChromaKeyMode;
 }
 
 /** Studio green — bright, camera-friendly default key color. */
@@ -84,8 +95,9 @@ function clamp(v: number, lo: number, hi: number): number {
 }
 
 /** Validate + clamp: similarity → [0.01, 0.5], blend/spill → [0, 1], color
- * must be valid hex (else default studio green). null/undefined → exact
- * defaults. Non-finite numbers keep the default value. */
+ * must be valid hex (else default studio green), mode ∈ {chroma, luma}
+ * (else chroma). null/undefined → exact defaults. Non-finite numbers keep
+ * the default value. */
 export function sanitizeChromaKeySettings(
   s: Partial<ChromaKeySettings> | null | undefined,
 ): ChromaKeySettings {
@@ -104,6 +116,7 @@ export function sanitizeChromaKeySettings(
   if (typeof s.spill === "number" && Number.isFinite(s.spill)) {
     out.spill = clamp(s.spill, 0, 1);
   }
+  if (s.mode === "chroma" || s.mode === "luma") out.mode = s.mode;
   return out;
 }
 
@@ -111,7 +124,7 @@ export function sanitizeChromaKeySettings(
 // Key-color auto-detection (pure — fed from an offscreen 2D snapshot)
 // ---------------------------------------------------------------------------
 
-type KeyCluster = "green" | "blue" | "magenta";
+type KeyCluster = "green" | "blue" | "magenta" | "white" | "black";
 interface ClusterVote { count: number; r: number; g: number; b: number; }
 
 /** 3×3 (edge-clamped) average around (x, y) — survives mild sensor noise. */
@@ -129,11 +142,20 @@ function avgBlock3x3(
   return { r: r / n, g: g / n, b: b / n };
 }
 
-/** Classify a sample pixel as a key-screen family. Grays (low saturation)
- * and non-standard hues (red/yellow/cyan) return null — subjects, not screens. */
+/** Classify a sample pixel as a key-screen family. v1: bright/dark
+ *  NEUTRAL corners vote "white"/"black" — white and black screens are
+ *  luma-keyed (see ChromaKeySettings.mode) so their content survives.
+ *  Mid grays and non-standard hues (red/yellow/cyan) return null —
+ *  subjects, not screens. */
 function classifyKeyPixel(r: number, g: number, b: number): KeyCluster | null {
   const rn = r / 255, gn = g / 255, bn = b / 255;
-  if (Math.max(rn, gn, bn) - Math.min(rn, gn, bn) < 0.18) return null;
+  const mx = Math.max(rn, gn, bn), mn = Math.min(rn, gn, bn);
+  if (mx - mn < 0.18) {
+    // Neutral — only the EXTREMES are screens (paper-white / studio-black).
+    if (mn > 0.72) return "white";
+    if (mx < 0.28) return "black";
+    return null;
+  }
   if (gn - Math.max(rn, bn) > 0.15) return "green";
   if (bn - Math.max(rn, gn) > 0.15) return "blue";
   if (Math.min(rn, bn) - gn > 0.15) return "magenta";
@@ -143,20 +165,21 @@ function classifyKeyPixel(r: number, g: number, b: number): KeyCluster | null {
 /** Auto-detect the dominant background key color from an offscreen snapshot
  * ({ data, width, height } — ImageData-like). Samples the 4 corners + 4
  * edge midpoints (a centered subject never touches those), votes each
- * 3×3-averaged sample into a green/blue/magenta cluster, and returns the
- * winning cluster's average color. Confidence = winning votes / 8; below
- * 0.5 means an ambiguous frame — keep the current key color. */
+ * 3×3-averaged sample into a green/blue/magenta/white/black cluster, and
+ * returns the winning cluster's average color + keying mode (white/black →
+ * "luma", else "chroma"). Confidence = winning votes / 8; below 0.5 means
+ * an ambiguous frame — keep the current key color. */
 export function detectKeyColor(sample: {
   data: Uint8ClampedArray;
   width: number;
   height: number;
-}): { color: string; confidence: number } {
+}): { color: string; confidence: number; mode: ChromaKeyMode } {
   const d = defaultChromaKeySettings();
   const data = sample?.data;
   const w = sample?.width ?? 0;
   const h = sample?.height ?? 0;
   if (!data || !(w > 0) || !(h > 0) || data.length < w * h * 4) {
-    return { color: d.color, confidence: 0 };
+    return { color: d.color, confidence: 0, mode: "chroma" };
   }
   const mid = (n: number) => Math.floor(n / 2);
   const points: Array<[number, number]> = [
@@ -167,6 +190,8 @@ export function detectKeyColor(sample: {
     green: { count: 0, r: 0, g: 0, b: 0 },
     blue: { count: 0, r: 0, g: 0, b: 0 },
     magenta: { count: 0, r: 0, g: 0, b: 0 },
+    white: { count: 0, r: 0, g: 0, b: 0 },
+    black: { count: 0, r: 0, g: 0, b: 0 },
   };
   for (const [x, y] of points) {
     const px = avgBlock3x3(data, w, h, x, y);
@@ -180,11 +205,12 @@ export function detectKeyColor(sample: {
     if (votes[k].count === 0) continue;
     if (best === null || votes[k].count > votes[best].count) best = k;
   }
-  if (best === null) return { color: d.color, confidence: 0 };
+  if (best === null) return { color: d.color, confidence: 0, mode: "chroma" };
   const v = votes[best];
   return {
     color: rgbToHex(v.r / v.count, v.g / v.count, v.b / v.count),
     confidence: v.count / points.length,
+    mode: best === "white" || best === "black" ? "luma" : "chroma",
   };
 }
 
@@ -212,10 +238,13 @@ const FRAG_SRC = `
 precision mediump float;
 varying vec2 v_uv;
 uniform sampler2D u_tex;
-uniform vec3 u_keyYuv;    // (y, u, v) of the key color — only .yz is used
+uniform vec3 u_keyYuv;    // (y, u, v) of the key color
 uniform float u_similarity;
 uniform float u_blend;
 uniform float u_spill;
+uniform float u_lumaMode;  // v1: 1.0 = key on |luma − key.luma| (white/black
+                           // screens) instead of chroma distance — keeps the
+                           // overlay's neutral content visible.
 
 // Same convention as rgbToYuv() (header): normalized [0,1] channels.
 vec3 yuvOf(vec3 c) {
@@ -225,9 +254,15 @@ vec3 yuvOf(vec3 c) {
 
 void main() {
   vec4 px = texture2D(u_tex, v_uv);
-  // FFmpeg chromakey alpha ramp: 0 below similarity, 1 above
-  // similarity+blend, linear in between.
-  float d = distance(yuvOf(px.rgb).yz, u_keyYuv.yz);
+  vec3 pyuv = yuvOf(px.rgb);
+  // v1: chroma mode keys on chroma distance (FFmpeg chromakey parity);
+  // luma mode keys on luma distance (FFmpeg lumakey parity — white/black
+  // screens). Same similarity/blend ramp either way.
+  float d = mix(
+    distance(pyuv.yz, u_keyYuv.yz),
+    abs(pyuv.x - u_keyYuv.x),
+    u_lumaMode
+  );
   float alpha;
   if (d < u_similarity) {
     alpha = 0.0;
@@ -237,8 +272,9 @@ void main() {
     alpha = 1.0;
   }
   // Despill surviving pixels: pull green down to max(r, b), scaled by spill.
+  // Chroma mode only — a white/black screen has no green fringe to pull.
   vec3 rgb = px.rgb;
-  if (u_spill > 0.0 && alpha > 0.0) {
+  if (u_spill > 0.0 && alpha > 0.0 && u_lumaMode < 0.5) {
     float capped = min(rgb.g, max(rgb.r, rgb.b));
     rgb.g = mix(rgb.g, capped, u_spill);
   }
@@ -253,6 +289,7 @@ interface GlUniforms {
   similarity: WebGLUniformLocation | null;
   blend: WebGLUniformLocation | null;
   spill: WebGLUniformLocation | null;
+  lumaMode: WebGLUniformLocation | null;
   tex: WebGLUniformLocation | null;
   aPos: number;
 }
@@ -413,6 +450,7 @@ export class ChromaKeyer {
     gl.uniform1f(uniforms.similarity, s.similarity);
     gl.uniform1f(uniforms.blend, s.blend);
     gl.uniform1f(uniforms.spill, s.spill);
+    gl.uniform1f(uniforms.lumaMode, s.mode === "luma" ? 1 : 0);
     // u_uvSrc = (u0, v0, du, dv) of the cover crop in FLIPPED texture
     // space — UNPACK_FLIP_Y makes v=0 the image bottom, so the quad's
     // bottom edge (t=0) samples v0 = 1 − (sy + sh)/srcH.
@@ -534,6 +572,7 @@ export class ChromaKeyer {
       similarity: gl.getUniformLocation(prog, "u_similarity"),
       blend: gl.getUniformLocation(prog, "u_blend"),
       spill: gl.getUniformLocation(prog, "u_spill"),
+      lumaMode: gl.getUniformLocation(prog, "u_lumaMode"),
       tex: gl.getUniformLocation(prog, "u_tex"),
       aPos,
     };

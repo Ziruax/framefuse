@@ -965,3 +965,22 @@ body.ff-resizing-row * {
   background-color: #52525b;
   background-clip: content-box;
 }
+
+/* v1 FOCUS MODE — floating panel-collapse toggles pinned to the center
+   column's edges. Semi-opaque chip that brightens on hover; a soft cyan
+   ring signals the workspace-mode affordance. */
+.ff-edge-toggle:hover {
+  border-color: rgba(34, 211, 238, 0.55) !important;
+  background-color: rgba(8, 51, 68, 0.95) !important;
+  box-shadow: 0 0 10px rgba(34, 211, 238, 0.35);
+}
+.ff-edge-toggle:focus-visible {
+  outline: 2px solid #22d3ee;
+  outline-offset: 1px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ff-edge-toggle,
+  .ff-edge-toggle:hover {
+    transition: none;
+  }
+}

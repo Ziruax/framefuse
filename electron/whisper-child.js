@@ -36,10 +36,11 @@
 //       wordLevel: boolean }
 //     { type: "error",   runId, message: string }
 //
-// PCM arrives via structured clone (the host transfers the underlying
-// ArrayBuffer). Work is serialized through a promise queue — one
-// preload/transcribe at a time — and every handler reports failures as
-// { type: "error" } so the host can never hang waiting.
+// PCM arrives via structured clone (a plain copy — Electron's
+// utilityProcess transfer list only accepts MessagePortMain). Work is
+// serialized through a promise queue — one preload/transcribe at a time —
+// and every handler reports failures as { type: "error" } so the host can
+// never hang waiting.
 
 "use strict";
 

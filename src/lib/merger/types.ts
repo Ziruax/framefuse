@@ -643,7 +643,7 @@ export const TRANSITION_STYLE_INFO: Record<
   TransitionStyle,
   { label: string; hint: string; xfade?: string; dipColor?: "black" | "white" }
 > = {
-  none: { label: "Hard Cut", hint: "No transition — instant cuts between segments." },
+  none: { label: "None", hint: "No transition — a hard cut between segments." },
   dissolve: {
     label: "Dissolve",
     hint: "Classic crossfade — the previous frame melts into the next.",

@@ -9,12 +9,13 @@ import {
   type ChangeEvent,
 } from "react";
 import { toast } from "@/lib/toast";
+import { ChevronLeft, ChevronRight } from "lucide-react";
 import { Header, type LastExport } from "@/components/Header";
 import { MediaPanel } from "@/components/MediaPanel";
 import { PreviewPanel } from "@/components/PreviewPanel";
 import { MUSIC_SEL_ID, TimelineRuler } from "@/components/TimelineRuler";
 import { SettingsPanel } from "@/components/SettingsPanel";
-import { Splitter, useResizableLayout } from "@/components/ResizableSplitters";
+import { Splitter, SPLITTER_W, useResizableLayout } from "@/components/ResizableSplitters";
 import {
   buildTimeline,
   fmtBytes,
@@ -235,8 +236,10 @@ export default function Page() {
   const [motionOverrides, setMotionOverrides] = useState<
     Record<string, KenBurnsDirection>
   >({});
-  // v4.8: media library view mode (app-level pref, persisted).
-  const [mediaView, setMediaView] = useState<"list" | "grid">("list");
+  // v4.8: media library view mode (app-level pref, persisted). v1: GRID is
+  // the default (storyboard-first for uploaded media; list stays a click
+  // away in the toolbar toggle).
+  const [mediaView, setMediaView] = useState<"list" | "grid">("grid");
 
   // ---- v5.0 MULTI-TRACK STATE ----------------------------------------------
   /** Per-item user edits (patch-merged; undefined values DELETE keys, so a
@@ -314,9 +317,24 @@ export default function Page() {
         p.favoritePresets.filter((id) => typeof id === "string"),
       );
     }
-    // v4.8: media library layout preference.
+    // v4.8: media library layout preference. v1: one-time migration — the
+    // v5 default was "list", so every existing session PERSISTED "list"
+    // without ever choosing it. Flip those to the new grid default once
+    // (flagged in localStorage); an explicit later switch back to list is
+    // respected forever after.
     if (p.mediaView === "grid" || p.mediaView === "list") {
-      setMediaView(p.mediaView);
+      let view = p.mediaView;
+      if (view === "list") {
+        try {
+          if (window.localStorage.getItem("framefuse.v1.gridDefault") !== "1") {
+            window.localStorage.setItem("framefuse.v1.gridDefault", "1");
+            view = "grid";
+          }
+        } catch {
+          /* storage unavailable — keep the stored view */
+        }
+      }
+      setMediaView(view);
     }
   }, []);
 
@@ -340,9 +358,11 @@ export default function Page() {
 
   // ---- File pickers (page-level so the app menu can trigger them) ---------
   const imageInputRef = useRef<HTMLInputElement>(null);
+  const videoInputRef = useRef<HTMLInputElement>(null);
   const audioInputRef = useRef<HTMLInputElement>(null);
   const subtitleInputRef = useRef<HTMLInputElement>(null);
   const openImagePicker = useCallback(() => imageInputRef.current?.click(), []);
+  const openVideoPicker = useCallback(() => videoInputRef.current?.click(), []);
   const openAudioPicker = useCallback(() => audioInputRef.current?.click(), []);
   const openSubtitlePicker = useCallback(
     () => subtitleInputRef.current?.click(),
@@ -420,6 +440,26 @@ export default function Page() {
         : null,
     [timeline.segments, currentMs],
   );
+
+  // v1 CHROMA TAB target: the timeline's SELECTED clip (click/Ctrl-click on
+  // any lane), falling back to the clip under the playhead. Selection first
+  // so clicking an OVERLAY clip on the timeline keys exactly that clip —
+  // the playhead alone can only ever resolve base-lane segments.
+  const chromaTarget = useMemo(() => {
+    const resolve = (seg: MediaSegment | null | undefined) => {
+      if (seg == null) return null;
+      const edit = itemEdits[seg.id];
+      const overlayOn = (edit?.track ?? 0) >= 1;
+      const trimInMs = Math.max(0, Math.round(edit?.trimInMs ?? seg.trimInMs ?? 0));
+      const isVideo =
+        seg.mediaType === "video" || (videoDurations?.[seg.id] ?? 0) > 0;
+      return { seg, edit, trimInMs, overlayOn, isVideo };
+    };
+    const selected = selectedIds.length
+      ? timeline.segments.find((s) => selectedIds.includes(s.id))
+      : null;
+    return resolve(selected ?? activeSegment);
+  }, [selectedIds, timeline.segments, activeSegment, itemEdits, videoDurations]);
 
   // v5.4: latest-value ref sync for the global keydown listener (runs after
   // every render — the listener itself never re-binds).
@@ -1046,6 +1086,7 @@ export default function Page() {
       const api = window.electronAPI;
       const offExport = api.onMenu("menu:export", () => exportRef.current());
       const offImages = api.onMenu("menu:add-images", () => openImagePicker());
+      const offVideo = api.onMenu("menu:add-video", () => openVideoPicker());
       const offAudio = api.onMenu("menu:add-audio", () => openAudioPicker());
       const offGuide = api.onMenu("menu:naming-guide", () =>
         toast.info("Filename patterns", {
@@ -1079,6 +1120,7 @@ export default function Page() {
       return () => {
         offExport?.();
         offImages?.();
+        offVideo?.();
         offAudio?.();
         offGuide?.();
         offSave?.();
@@ -1088,7 +1130,7 @@ export default function Page() {
       };
     }
     return undefined;
-  }, [openImagePicker, openAudioPicker]);
+  }, [openImagePicker, openVideoPicker, openAudioPicker]);
 
   // ---- Handlers -----------------------------------------------------------
   /**
@@ -2436,6 +2478,16 @@ const handleRandomTransitionMix = useCallback(() => {
     [requestHistoryPush, applyItemEdit, translateItemEdit],
   );
 
+  /** v1: the Chroma tab's "Move to Overlay track" — the same edit the
+   *  timeline context menu commits (track 1 keeps the clip's start). */
+  const handleMoveToOverlayTrack = useCallback(
+    (id: string) => {
+      const seg = timeline.segments.find((s) => s.id === id);
+      handleTimelineEdit(id, { track: 1, startMs: seg ? seg.startMs : 0 });
+    },
+    [timeline.segments, handleTimelineEdit],
+  );
+
   /**
    * v5.5: commit a coordinated GROUP MOVE (TimelineRuler multi-select drag)
    * — one delta for every member, ONE undo step. Clip patches go through
@@ -3376,6 +3428,61 @@ const handleRandomTransitionMix = useCallback(() => {
   // 120/140px inside TimelineRuler) keeps its auto height via compact branch.
   const timelineIsV5 = true;
 
+  // ---- v1 FOCUS MODE: hide the left/right panels for a full-width timeline
+  // workspace (floating edge buttons restore them). Persisted per browser.
+  const [mediaCollapsed, setMediaCollapsed] = useState(false);
+  const [settingsCollapsed, setSettingsCollapsed] = useState(false);
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem("framefuse.v1.panels");
+      if (raw) {
+        const p = JSON.parse(raw) as { media?: unknown; settings?: unknown };
+        if (p && typeof p.media === "boolean") setMediaCollapsed(p.media);
+        if (p && typeof p.settings === "boolean") setSettingsCollapsed(p.settings);
+      }
+    } catch {
+      /* storage unavailable — defaults */
+    }
+  }, []);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        "framefuse.v1.panels",
+        JSON.stringify({ media: mediaCollapsed, settings: settingsCollapsed }),
+      );
+    } catch {
+      /* ignore write failures */
+    }
+  }, [mediaCollapsed, settingsCollapsed]);
+
+  // v1: grid columns with the collapsed sides dropped (splitters go too).
+  const gridCols = useMemo(() => {
+    if (layout.compact) {
+      return `${mediaCollapsed ? "0px " : "300px "}1fr${settingsCollapsed ? "" : " 320px"}`;
+    }
+    const parts: string[] = [];
+    if (!mediaCollapsed) parts.push(`${layout.mediaW}px`, `${SPLITTER_W}px`);
+    parts.push("1fr");
+    if (!settingsCollapsed) parts.push(`${SPLITTER_W}px`, `${layout.settingsW}px`);
+    return parts.join(" ");
+  }, [layout, mediaCollapsed, settingsCollapsed]);
+
+  // ---- v1 BIG-TIMELINE MODE: one click swaps the timeline between the
+  // working height and the 65% viewport cap (the row splitter still
+  // fine-tunes; the remembered height restores on toggle-off).
+  const [timelineBig, setTimelineBig] = useState(false);
+  const savedTimelineHRef = useRef<number | null>(null);
+  const toggleTimelineBig = useCallback(() => {
+    if (!timelineBig) {
+      savedTimelineHRef.current = layout.timelineH;
+      layout.timeline.onChange(Math.round(window.innerHeight * 0.65));
+      setTimelineBig(true);
+    } else {
+      layout.timeline.onChange(savedTimelineHRef.current ?? 300);
+      setTimelineBig(false);
+    }
+  }, [timelineBig, layout]);
+
   const debug = {
     imageCount: timeline.segments.length,
     mode: timeline.mode,
@@ -3410,15 +3517,18 @@ const handleRandomTransitionMix = useCallback(() => {
 
       {/* 3-column grid — v5.2 (task 3-b): columns resizable via splitters
           (6px gutters), persisted in framefuse.layout.v52. Below 1024px the
-          hook reports compact → fixed 300px | 1fr | 320px, splitters hidden. */}
+          hook reports compact → fixed 300px | 1fr | 320px, splitters hidden.
+          v1 FOCUS MODE: each side collapses to nothing (floating edge
+          buttons toggle) — gridCols drops the column + its splitter. */}
       <main
         className="grid min-h-0 flex-1 overflow-hidden"
         style={{
-          gridTemplateColumns: layout.gridTemplateColumns,
+          gridTemplateColumns: gridCols,
           backgroundColor: "#0a0a0a",
         }}
       >
-        {/* Left column — Media Panel (300px) */}
+        {/* Left column — Media Panel (collapsible: v1 focus mode) */}
+        {!mediaCollapsed && (
         <section
           className="min-h-0 overflow-y-auto overflow-x-hidden border-r"
           style={{
@@ -3440,6 +3550,7 @@ const handleRandomTransitionMix = useCallback(() => {
             onAddSubtitleFile={addSubtitles}
             onLoadSamples={loadSamples}
             openImagePicker={openImagePicker}
+            openVideoPicker={openVideoPicker}
             openAudioPicker={openAudioPicker}
             openSubtitlePicker={openSubtitlePicker}
             onRemoveAudio={removeAudio}
@@ -3482,15 +3593,51 @@ const handleRandomTransitionMix = useCallback(() => {
             currentMs={currentMs}
           />
         </section>
+        )}
 
-        {/* v5.2 (task 3-b): col splitter — drag to resize the media panel. */}
-        {!layout.compact && <Splitter {...layout.media} />}
+        {/* v5.2 (task 3-b): col splitter — drag to resize the media panel
+            (hidden while the panel is collapsed: v1 focus mode). */}
+        {!layout.compact && !mediaCollapsed && <Splitter {...layout.media} />}
 
-        {/* Center column — Preview (flex-1) + resizable Timeline */}
+        {/* Center column — Preview (flex-1) + resizable Timeline.
+            v1 FOCUS MODE: relative so the floating panel-collapse buttons
+            can pin to its edges. */}
         <section
-          className="flex min-h-0 flex-col overflow-hidden"
+          className="relative flex min-h-0 flex-col overflow-hidden"
           style={{ backgroundColor: "#0a0a0a" }}
         >
+          {/* v1: floating collapse toggles pinned to the center column's
+              edges — hide either side panel for a full-width timeline
+              workspace; the same button brings it back. */}
+          <button
+            type="button"
+            onClick={() => setMediaCollapsed((v) => !v)}
+            aria-label={mediaCollapsed ? "Show media panel" : "Hide media panel"}
+            title={
+              mediaCollapsed
+                ? "Show the media panel"
+                : "Hide the media panel — full-width timeline workspace"
+            }
+            className="ff-edge-toggle absolute left-0 top-2 z-20 flex size-6 items-center justify-center rounded-md border text-zinc-400 transition-all duration-150 hover:text-white active:scale-90"
+            style={{ borderColor: "#3f3f46", backgroundColor: "rgba(24, 24, 27, 0.92)" }}
+          >
+            {mediaCollapsed ? <ChevronRight className="size-3.5" /> : <ChevronLeft className="size-3.5" />}
+          </button>
+          <button
+            type="button"
+            onClick={() => setSettingsCollapsed((v) => !v)}
+            aria-label={settingsCollapsed ? "Show settings panel" : "Hide settings panel"}
+            title={
+              settingsCollapsed
+                ? "Show the settings panel"
+                : "Hide the settings panel — full-width timeline workspace"
+            }
+            className="ff-edge-toggle absolute right-0 top-2 z-20 flex size-6 items-center justify-center rounded-md border text-zinc-400 transition-all duration-150 hover:text-white active:scale-90"
+            style={{ borderColor: "#3f3f46", backgroundColor: "rgba(24, 24, 27, 0.92)" }}
+          >
+            {settingsCollapsed ? <ChevronLeft className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+          </button>
+
           <div className="min-h-0 flex-1 overflow-hidden">
             <PreviewPanel
               segments={timeline.segments}
@@ -3537,7 +3684,9 @@ const handleRandomTransitionMix = useCallback(() => {
               }}
             />
           </div>
-          {/* v5.2 (task 3-b): row splitter — drag to resize the timeline. */}
+          {/* v5.2 (task 3-b): row splitter — drag to resize the timeline
+              (v1: the BIG-timeline button in the timeline toolbar is the
+              one-click version). */}
           {!layout.compact && <Splitter {...layout.timeline} />}
 
           {/* v5 4-lane timeline: explicit resizable height + custom scrollbar
@@ -3638,14 +3787,20 @@ const handleRandomTransitionMix = useCallback(() => {
                   : { ...prev, musicVolume: Math.max(0, Math.min(2, volume)) },
               );
             }}
+            // ---- v1: BIG-TIMELINE mode (one-click 65% height toggle) ----
+            timelineBig={timelineBig}
+            onToggleTimelineBig={toggleTimelineBig}
           />
           </div>
         </section>
 
-        {/* v5.2 (task 3-b): col splitter — drag to resize the settings panel. */}
-        {!layout.compact && <Splitter {...layout.settings} />}
+        {/* v5.2 (task 3-b): col splitter — drag to resize the settings panel
+            (hidden while the panel is collapsed: v1 focus mode). */}
+        {!layout.compact && !settingsCollapsed && <Splitter {...layout.settings} />}
 
-        {/* Right column — Settings Panel (resizable, default 320px) */}
+        {/* Right column — Settings Panel (resizable, default 320px;
+            collapsible: v1 focus mode) */}
+        {!settingsCollapsed && (
         <section
           className="min-h-0 overflow-y-auto overflow-x-hidden border-l"
           style={{
@@ -3697,15 +3852,40 @@ const handleRandomTransitionMix = useCallback(() => {
             onRandomMix={handleRandomTransitionMix}
             boundaryCount={boundaryCount}
             debug={debug}
+            // ---- v1 Chroma tab ----
+            chromaTarget={chromaTarget}
+            onSetItemEdit={handleSetItemEdit}
+            onMoveToOverlayTrack={handleMoveToOverlayTrack}
           />
         </section>
+        )}
       </main>
 
-      {/* Hidden file inputs (inline style, not className hidden) */}
+      {/* Hidden file inputs (inline style, not className hidden). v1: each
+          button opens a FILTERED picker — Images shows images only, Video
+          shows video only, Audio audio, Subs .srt — while DRAG & DROP keeps
+          accepting every media kind (MediaPanel.handleDrop routes by type). */}
       <input
         ref={imageInputRef}
         type="file"
-        accept="image/*,video/mp4,video/webm,video/quicktime,video/x-matroska,video/x-msvideo,.mp4,.webm,.mov,.mkv,.m4v,.avi"
+        accept="image/png,image/jpeg,image/webp,image/gif,image/avif,image/bmp,.png,.jpg,.jpeg,.webp,.gif,.avif,.bmp"
+        multiple
+        style={{
+          position: "absolute",
+          opacity: 0,
+          width: 1,
+          height: 1,
+          pointerEvents: "none",
+        }}
+        onChange={(e: ChangeEvent<HTMLInputElement>) => {
+          if (e.target.files) addFiles(Array.from(e.target.files));
+          e.target.value = "";
+        }}
+      />
+      <input
+        ref={videoInputRef}
+        type="file"
+        accept="video/mp4,video/webm,video/quicktime,video/x-matroska,video/x-msvideo,.mp4,.webm,.mov,.mkv,.m4v,.avi"
         multiple
         style={{
           position: "absolute",

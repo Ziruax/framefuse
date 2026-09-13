@@ -511,16 +511,33 @@ function buildOverlayImageInputArgs(o) {
 
 /**
  * Per-overlay filter chain: scale to the overlayGeometry rect, optional
- * chromakey + despill (settings defensively re-clamped here — main.js is
+ * chromakey/lumakey + despill (settings defensively re-clamped here — main.js is
  * the trust boundary for IPC payloads), format=rgba for the overlay
  * filter's alpha compositing, and a PTS shift onto the CLIP-LOCAL clock:
  *   [i:v]scale=dw:dh[,chromakey=color:sim:blend,despill=type:mix],format=rgba,setpts=PTS+a/TB[ovlI]
+ * v1: mode "luma" (white/black screens) builds ffmpeg `lumakey=threshold:
+ * tolerance:softness` instead — threshold = BT.601 luma of the key color.
+ * A chroma key on a neutral color removes EVERY gray pixel (u=v=0 for all
+ * grays), which made the overlay's content invisible; the luma key keeps
+ * dark content on a white screen and vice versa. Despill is green-screen
+ * only — skipped in luma mode (parity with the preview shader).
  * The input options (-ss/-t / -loop 1 -t) read exactly the overlap window
  * with 0-based timestamps; setpts moves the frames to [a, b] so the overlay
  * filter's framesync and the enable='between(t,a,b)' window agree (without
  * it an overlay starting mid-clip composites at the wrong times and the
  * stream EOFs a seconds too early — real-ffmpeg verified).
  */
+function hexLuma(hex) {
+  // BT.601 luma of a #rrggbb color, 0..1 (ffmpeg lumakey threshold).
+  const m = /^#?([0-9a-f]{6})$/i.exec(String(hex || ""));
+  if (!m) return 1;
+  const v = m[1];
+  const r = parseInt(v.slice(0, 2), 16) / 255;
+  const g = parseInt(v.slice(2, 4), 16) / 255;
+  const b = parseInt(v.slice(4, 6), 16) / 255;
+  return 0.299 * r + 0.587 * g + 0.114 * b;
+}
+
 function buildOverlayChain(o) {
   const chroma = o && o.chroma ? o.chroma : null;
   const parts = [`scale=${o.dw}:${o.dh}`];
@@ -528,8 +545,12 @@ function buildOverlayChain(o) {
     const sim = clampNum(chroma.similarity, 0.01, 0.5, 0.32);
     const blend = clampNum(chroma.blend, 0, 1, 0.08);
     const spill = clampNum(chroma.spill, 0, 1, 0.6);
-    parts.push(`chromakey=${hexToFfmpegColor(chroma.color)}:${String(sim)}:${String(blend)}`);
-    parts.push(`despill=type=${chromaDespillType(chroma.color)}:mix=${String(spill)}`);
+    if (chroma.mode === "luma") {
+      parts.push(`lumakey=${hexLuma(chroma.color).toFixed(3)}:${String(sim)}:${String(blend)}`);
+    } else {
+      parts.push(`chromakey=${hexToFfmpegColor(chroma.color)}:${String(sim)}:${String(blend)}`);
+      parts.push(`despill=type=${chromaDespillType(chroma.color)}:mix=${String(spill)}`);
+    }
   }
   parts.push("format=rgba");
   const aSec = Number(o && o.a) || 0;

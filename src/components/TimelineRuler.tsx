@@ -51,6 +51,8 @@ import {
   ZoomIn,
   ZoomOut,
   Zap,
+  ChevronsDown,
+  ChevronsUp,
   type LucideIcon,
 } from "lucide-react";
 import type {
@@ -148,6 +150,12 @@ interface TimelineRulerProps {
   onPasteClipboard?: () => void;
   /** v5.5: clipboard size (toolbar paste chip + menu enable state). */
   clipboardCount?: number;
+  /** v1: BIG-TIMELINE mode — true when the timeline area is expanded to
+   *  the 65% viewport cap (drives the toolbar toggle's icon/label). */
+  timelineBig?: boolean;
+  /** v1: one-click BIG-TIMELINE toggle — swaps between the working height
+   *  and the 65% cap (the row splitter still fine-tunes either way). */
+  onToggleTimelineBig?: () => void;
 }
 
 /** v5.5: sentinel id of the singleton background-music clip inside the
@@ -220,15 +228,21 @@ function niceStep(totalMs: number): number {
 // v5.1 PIXEL ZOOM — the timeline axis is laid out in px, not percentages.
 // ---------------------------------------------------------------------------
 
-/** Zoom range (px per timeline second). */
-const ZOOM_MIN = 4;
+/** Zoom range (px per timeline second). v1: the MINIMUM is dynamic — it
+ *  equals the "fit" zoom (viewport ÷ total seconds), so the slider's bottom
+ *  ALWAYS shows the complete timeline. The old static floor of 4 px/s made
+ *  timelines longer than ~viewport/4 seconds unviewable in full: zooming
+ *  "all the way out" (slider at 0%) still clipped the tail. For long edits
+ *  the floor drops below 4; for short ones it rises above it — either way
+ *  zoom-out stops exactly at fit (CapCut-style: no zooming past the end). */
+const ZOOM_FLOOR_ABS = 0.25; // hard absolute floor (sanity only)
 const ZOOM_MAX = 400;
 /** Ruler ticks stay ≥ this many px apart (readable timecodes). */
 const TICK_MIN_PX = 70;
 
 function clampPxPerSec(v: number): number {
-  const n = Number.isFinite(v) ? v : ZOOM_MIN;
-  return Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, n));
+  const n = Number.isFinite(v) ? v : ZOOM_FLOOR_ABS;
+  return Math.max(ZOOM_FLOOR_ABS, Math.min(ZOOM_MAX, n));
 }
 
 /** v5.1 adaptive ruler step: the first step from the ms ladder whose px
@@ -1171,7 +1185,7 @@ function TransitionDiamonds({
           <div
             key={`dia-${seg.id}`}
             className="pointer-events-auto absolute z-[4] cursor-pointer"
-            title={`${style === "none" ? "Hard cut" : `${style.replace("-", " ")} transition`}${pinned ? " (custom)" : ""} · boundary at ${fmtTimecode(seg.startMs)} — click to jump to this cut`}
+            title={`${style === "none" ? "None (hard cut)" : `${style.replace("-", " ")} transition`}${pinned ? " (custom)" : ""} · boundary at ${fmtTimecode(seg.startMs)} — click to jump to this cut`}
             style={{
               left: layout.pxOf(seg.startMs),
               top: 30,
@@ -1461,6 +1475,8 @@ export function TimelineRuler({
   onCopySelection,
   onPasteClipboard,
   clipboardCount = 0,
+  timelineBig = false,
+  onToggleTimelineBig,
 }: TimelineRulerProps) {
   const trackRef = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
@@ -1609,11 +1625,12 @@ export function TimelineRuler({
 
   /** Zoom with an anchor: keep the timeline time under `viewportX` stable
    *  after the new pxPerSec lands (wheel = cursor, buttons/slider = view
-   *  center). The actual scrollLeft lands in the layout effect. */
+   *  center). The actual scrollLeft lands in the layout effect. v1: zoom-out
+   *  stops at the FIT floor — the whole timeline is always reachable. */
   const zoomTo = useCallback(
     (next: number, viewportX: number) => {
       const el = scrollRef.current;
-      const n = clampPxPerSec(next);
+      const n = Math.max(fitPxPerSec(), clampPxPerSec(next));
       if (el && pxPerSec > 0) {
         const contentX = el.scrollLeft + viewportX;
         const t = Math.max(0, ((contentX - GUTTER_W) / pxPerSec) * 1000);
@@ -1621,7 +1638,7 @@ export function TimelineRuler({
       }
       setPxPerSec(n);
     },
-    [pxPerSec],
+    [pxPerSec, fitPxPerSec],
   );
 
   // Viewport width tracker (drives "fit" + the shrink clamp below).
@@ -3330,9 +3347,9 @@ export function TimelineRuler({
               { danger: true },
             )}
           </div>
-          {/* v5.1 CapCut: compact zoom strip — 28px icon buttons, an 80px
-              slim slider, and a small text "Fit" button, all in one rounded
-              toolbar strip (matching the clip tools). */}
+          {/* v5.1 CapCut: compact zoom strip — 28px icon buttons, a slim
+              slider (v1: its MINIMUM is the fit zoom — the thumb's bottom
+              stop always shows the complete timeline), and the Fit button. */}
           <div
             className="flex items-center gap-0.5 rounded-lg border p-0.5"
             style={{ borderColor: "#27272a", backgroundColor: "#18181b" }}
@@ -3342,7 +3359,7 @@ export function TimelineRuler({
             <button
               type="button"
               onClick={() => zoomTo(pxPerSec / 1.15, viewportW / 2)}
-              title="Zoom out (Ctrl+scroll on the timeline)"
+              title="Zoom out (Ctrl+scroll on the timeline) — stops at Fit, where the whole timeline is visible"
               aria-label="Zoom out"
               className="flex size-7 items-center justify-center rounded-md text-zinc-300 transition-all hover:bg-white/10 hover:text-white active:scale-90"
             >
@@ -3350,13 +3367,13 @@ export function TimelineRuler({
             </button>
             <input
               type="range"
-              min={ZOOM_MIN}
+              min={fitPxPerSec()}
               max={ZOOM_MAX}
-              step={1}
-              value={Math.round(pxPerSec)}
+              step={fitPxPerSec() < 4 ? 0.05 : 1}
+              value={pxPerSec}
               onChange={(e) => zoomTo(Number(e.target.value), viewportW / 2)}
               aria-label="Timeline zoom (pixels per second)"
-              title={`Timeline zoom — ${Math.round(pxPerSec)} px/s (Ctrl+scroll on the timeline)`}
+              title={`Timeline zoom — ${Math.round(pxPerSec)} px/s · drag to the bottom to fit the whole timeline (Ctrl+scroll works too)`}
               className="w-20 accent-cyan-500"
             />
             <button
@@ -3381,6 +3398,34 @@ export function TimelineRuler({
             >
               Fit
             </button>
+            {/* v1: BIG-TIMELINE toggle — one click expands the timeline area
+                to the 65% viewport cap for detail work (the row splitter
+                between the preview and timeline still fine-tunes). */}
+            {onToggleTimelineBig != null && (
+              <button
+                type="button"
+                onClick={onToggleTimelineBig}
+                title={
+                  timelineBig
+                    ? "Restore the timeline's working height"
+                    : "Enlarge the timeline area — more lanes and clip detail (the preview shrinks)"
+                }
+                aria-pressed={timelineBig}
+                aria-label={timelineBig ? "Shrink timeline area" : "Enlarge timeline area"}
+                className={cn(
+                  "flex size-7 items-center justify-center rounded-md transition-all active:scale-90",
+                  timelineBig
+                    ? "bg-cyan-500/20 text-cyan-200 shadow-[inset_0_0_0_1px_rgba(34,211,238,0.45)]"
+                    : "text-zinc-300 hover:bg-white/10 hover:text-white",
+                )}
+              >
+                {timelineBig ? (
+                  <ChevronsDown className="size-3.5" />
+                ) : (
+                  <ChevronsUp className="size-3.5" />
+                )}
+              </button>
+            )}
           </div>
         </div>
       )}

@@ -125,7 +125,7 @@ export function Header({
             >
               FrameFuse
             </span>
-            {/* v5.1: quiet mono version chip (was a violet gradient badge). */}
+            {/* v1: quiet mono version chip (was a violet gradient badge). */}
             <span
               className="whitespace-nowrap rounded border px-1.5 py-0.5 font-mono text-[10px] font-medium"
               style={{
@@ -133,9 +133,9 @@ export function Header({
                 backgroundColor: "#18181b",
                 color: "#a1a1aa",
               }}
-              title="FrameFuse v5.1 — multi-track video studio"
+              title="FrameFuse v1 — multi-track video studio"
             >
-              v5.1
+              v1
             </span>
             {/* v5.1: on-disk project file chip (native save/open sessions). */}
             {projectName && (

@@ -28,13 +28,19 @@ import {
   Dices,
   Images,
   Download,
+  Palette,
+  Layers,
+  MousePointerClick,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import { ChromaSection } from "@/components/ChromaSection";
 import type {
   AudioSettings,
   CaptionSettings,
   HeadlineItem,
+  ItemEdit,
   KenBurnsConfig,
+  MediaSegment,
   SubtitleFile,
   TransitionSettings,
   TransitionStyle,
@@ -164,6 +170,22 @@ interface SettingsPanelProps {
     activeSegment: string | null;
     inElectron: boolean;
   };
+  /** v1 CHROMA TAB: the clip the tab edits — the ACTIVE timeline segment
+   *  with its resolved edit context (page.tsx computes the same fields the
+   *  media panel's per-item expander uses). null when nothing is active. */
+  chromaTarget: {
+    seg: MediaSegment;
+    edit: ItemEdit | undefined;
+    trimInMs: number;
+    overlayOn: boolean;
+    isVideo: boolean;
+  } | null;
+  /** v1: commits chroma/track edits for the chromaTarget (the same
+   *  handleSetItemEdit the media panel uses — one undo step per patch). */
+  onSetItemEdit: (id: string, patch: Partial<ItemEdit>) => void;
+  /** v1: move the chromaTarget to the overlay lane (needed before keying —
+   *  the keyer only composites overlays). */
+  onMoveToOverlayTrack: (id: string) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +360,7 @@ function Toggle({
 // ---------------------------------------------------------------------------
 const SETTINGS_TAB_IDS = [
   "media",
+  "chroma",
   "captions",
   "effects",
   "audio",
@@ -372,6 +395,13 @@ const SETTINGS_TABS: {
     icon: Images,
     accent: "#34d399",
     glow: "rgba(52, 211, 153, 0.55)",
+  },
+  {
+    id: "chroma",
+    label: "Chroma",
+    icon: Palette,
+    accent: "#6ee7b7",
+    glow: "rgba(110, 231, 183, 0.55)",
   },
   {
     id: "captions",
@@ -460,6 +490,10 @@ export function SettingsPanel(props: SettingsPanelProps) {
     onRandomMix,
     boundaryCount,
     debug,
+    // v1 Chroma tab target + edit pipeline (page.tsx computes).
+    chromaTarget,
+    onSetItemEdit,
+    onMoveToOverlayTrack,
   } = props;
 
   const zoomMax = 1.06 + (kenBurns.intensity / 100) * 0.18;
@@ -552,6 +586,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
   const [tabsHydrated, setTabsHydrated] = useState(false);
   const tabRefs = useRef<Record<SettingsTabId, HTMLButtonElement | null>>({
     media: null,
+    chroma: null,
     captions: null,
     effects: null,
     audio: null,
@@ -631,13 +666,13 @@ export function SettingsPanel(props: SettingsPanelProps) {
       <div className="min-h-0 flex-1 overflow-y-auto">
         <style dangerouslySetInnerHTML={{ __html: TAB_PANEL_CSS }} />
 
-        {/* ── v5.0 tab bar — 5 equal segments, roving tabindex, sliding
-            accent indicator. Sticky so it survives scrolling. ── */}
+        {/* ── tab bar — 6 equal segments (v1: + Chroma), roving tabindex,
+            sliding accent indicator. Sticky so it survives scrolling. ── */}
         <div
           role="tablist"
           aria-label="Settings sections"
           onKeyDown={handleTablistKeyDown}
-          className="sticky top-0 z-30 grid grid-cols-5 border-b"
+          className="sticky top-0 z-30 grid grid-cols-6 border-b"
           style={{ borderColor: "#27272a", backgroundColor: "#121214" }}
         >
           {SETTINGS_TABS.map((t) => {
@@ -703,11 +738,12 @@ export function SettingsPanel(props: SettingsPanelProps) {
           })}
           {/* v5.1 CapCut: the active tab's CYAN TOP BORDER — a sliding 2px
               indicator along the rail's top edge (icon keeps its semantic
-              accent; the rail accent itself is the app's cyan). */}
+              accent; the rail accent itself is the app's cyan). v1: 6 tabs. */}
           <span
             aria-hidden
-            className="pointer-events-none absolute left-0 top-0 h-[2px] w-1/5 transition-all duration-200 ease-out"
+            className="pointer-events-none absolute left-0 top-0 h-[2px] transition-all duration-200 ease-out"
             style={{
+              width: `${100 / SETTINGS_TABS.length}%`,
               transform: `translateX(${activeTabIndex * 100}%)`,
               backgroundColor: "#22d3ee",
               boxShadow: "0 0 8px rgba(34, 211, 238, 0.55)",
@@ -811,6 +847,102 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 pick one to fix it.
               </p>
             </Field>
+          </Section>
+        </div>
+
+        {/* ─── v1 Chroma tab — green/white/black screen keying for the
+            SELECTED clip. A proper dedicated tab (the buried per-item
+            expander in the media panel was hard to find); same ChromaSection
+            component, same edit pipeline, one undo step per change. ─── */}
+        <div
+          id="ff-settings-tabpanel-chroma"
+          role="tabpanel"
+          aria-labelledby="ff-settings-tab-chroma"
+          tabIndex={tab === "chroma" ? 0 : -1}
+          className={cn("pb-2 pt-2", tab === "chroma" ? "ff-tab-panel-in" : "hidden")}
+        >
+          <Section
+            icon={<Palette size={13} />}
+            title="Chroma / Green Screen"
+            defaultOpen
+          >
+            {chromaTarget == null ? (
+              <div
+                className="flex flex-col items-center gap-2 rounded-lg border border-dashed px-4 py-8 text-center"
+                style={{ borderColor: "#3f3f46" }}
+              >
+                <MousePointerClick className="size-5" style={{ color: "#52525b" }} aria-hidden />
+                <p className="text-[11px] font-semibold" style={{ color: "#a1a1aa" }}>
+                  Select a clip to key
+                </p>
+                <p className="max-w-[220px] text-[10px] leading-relaxed" style={{ color: "#71717a" }}>
+                  Click any clip on the timeline (or in the media panel) — its
+                  key settings appear here. Overlay clips show the full keyer.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {/* Target banner — which clip the tab edits. */}
+                <div
+                  className="flex items-center gap-2 rounded-md border px-2 py-1.5"
+                  style={{
+                    borderColor: chromaTarget.overlayOn
+                      ? "rgba(110, 231, 183, 0.35)"
+                      : "rgba(251, 191, 36, 0.35)",
+                    backgroundColor: chromaTarget.overlayOn
+                      ? "rgba(6, 78, 59, 0.15)"
+                      : "rgba(120, 53, 15, 0.12)",
+                  }}
+                  title={chromaTarget.seg.fileName}
+                >
+                  <Layers
+                    className="size-3.5 shrink-0"
+                    style={{ color: chromaTarget.overlayOn ? "#6ee7b7" : "#fbbf24" }}
+                    aria-hidden
+                  />
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate text-[10px] font-semibold" style={{ color: "#e4e4e7" }}>
+                      {chromaTarget.seg.fileName}
+                    </p>
+                    <p className="text-[9px]" style={{ color: "#71717a" }}>
+                      {chromaTarget.overlayOn
+                        ? "Overlay lane — keying active"
+                        : "Base video track — move to overlay to key"}
+                    </p>
+                  </div>
+                </div>
+
+                {!chromaTarget.overlayOn && (
+                  <button
+                    type="button"
+                    onClick={() => onMoveToOverlayTrack(chromaTarget.seg.id)}
+                    className="flex w-full items-center justify-center gap-1.5 rounded-md border px-2 py-1.5 text-[10px] font-semibold transition-all duration-150 active:scale-[0.98]"
+                    style={{
+                      borderColor: "rgba(110, 231, 183, 0.4)",
+                      backgroundColor: "rgba(16, 185, 129, 0.12)",
+                      color: "#6ee7b7",
+                    }}
+                    title="Green-screen keying composites OVER the base track — this moves the clip to the overlay lane (undo-able)"
+                  >
+                    <Layers className="size-3.5" /> Move to Overlay track
+                  </button>
+                )}
+
+                <ChromaSection
+                  seg={chromaTarget.seg}
+                  edit={chromaTarget.edit}
+                  onSetItemEdit={onSetItemEdit}
+                  isVideo={chromaTarget.isVideo}
+                  trimInMs={chromaTarget.trimInMs}
+                  overlayOn={chromaTarget.overlayOn}
+                />
+
+                <p className="px-0.5 text-[9px] leading-relaxed" style={{ color: "#52525b" }}>
+                  Same keyer as the media panel&apos;s clip settings — edits here and
+                  there stay in sync. Preview and export use one geometry.
+                </p>
+              </div>
+            )}
           </Section>
         </div>
 

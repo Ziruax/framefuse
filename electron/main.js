@@ -80,7 +80,7 @@ function createWindow() {
 
   mainWindow = new BrowserWindow({
     width: 1400, height: 900, minWidth: 1100, minHeight: 720,
-    backgroundColor: "#0a0a0a", title: "FrameFuse v5.1",
+    backgroundColor: "#0a0a0a", title: "FrameFuse v1",
     autoHideMenuBar: false,
     icon: iconPath,
     webPreferences: {
@@ -112,7 +112,8 @@ function buildApplicationMenu() {
       { label: "Save Project", accelerator: "CmdOrCtrl+S", click: () => mainWindow && mainWindow.webContents.send("menu:save-project") },
       { label: "Save Project As…", accelerator: "CmdOrCtrl+Shift+S", click: () => mainWindow && mainWindow.webContents.send("menu:save-project-as") },
       { type: "separator" },
-      { label: "Add Media…", click: () => mainWindow && mainWindow.webContents.send("menu:add-images") },
+      { label: "Add Images…", click: () => mainWindow && mainWindow.webContents.send("menu:add-images") },
+      { label: "Add Video…", click: () => mainWindow && mainWindow.webContents.send("menu:add-video") },
       { label: "Add Audio…", click: () => mainWindow && mainWindow.webContents.send("menu:add-audio") },
       { type: "separator" },
       { label: "Export MP4…", accelerator: "CmdOrCtrl+E", click: () => mainWindow && mainWindow.webContents.send("menu:export") },
@@ -571,11 +572,21 @@ ipcMain.handle("whisper:transcribe", async (event, payload) => {
     const result = await new Promise((resolve, reject) => {
       whisperRuns.set(runId, { resolve, reject, sender: event.sender, clientRunId });
       try {
-        // Zero-copy: transfer the PCM buffer to the service.
-        child.postMessage(
-          { type: "transcribe", runId, pcm, sampleRate: 16000, language: language || "auto", cacheDir: whisperCacheDir() },
-          [pcm.buffer],
-        );
+        // v1 fix: Electron's utilityProcess.postMessage accepts ONLY
+        // MessagePortMain objects in its transfer list — transferring the PCM
+        // ArrayBuffer threw "Invalid value for transfer" and killed every
+        // transcription ("Could not reach the Whisper service"). The message
+        // is now plain structured-clone: the Float32Array is copied (one
+        // memcpy of 64 KB per second of audio — negligible next to
+        // inference) and arrives as a real Float32Array in the child.
+        child.postMessage({
+          type: "transcribe",
+          runId,
+          pcm,
+          sampleRate: 16000,
+          language: language || "auto",
+          cacheDir: whisperCacheDir(),
+        });
       } catch (err) {
         whisperRuns.delete(runId);
         reject(new Error(`Could not reach the Whisper service: ${err.message}`));
