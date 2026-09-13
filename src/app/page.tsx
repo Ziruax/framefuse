@@ -1312,12 +1312,11 @@ export default function Page() {
           rawText: normalized,
         });
         toast.success(`Loaded ${cues.length} subtitle cue${cues.length === 1 ? "" : "s"}`, {
-          description: file.name,
+          description: `${file.name} — turn on "Burn captions" in Settings → Captions to render them.`,
         });
-        // Auto-enable captions when subtitles are first added.
-        setCaptionSettings((prev) =>
-          prev.enabled ? prev : { ...prev, enabled: true },
-        );
+        // v5.2: captions are OPT-IN — loading a subtitle file no longer
+        // flips burn-in on automatically (features apply only when the user
+        // asks for them). The toast above points at the toggle.
       };
       reader.onerror = () => {
         toast.error("Failed to read subtitle file");

@@ -2,9 +2,9 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "FrameFuse v4.9 — Image Merger",
+  title: "FrameFuse v5.2 — Video Studio",
   description:
-    "Native desktop tool that fuses images into MP4 video with Ken Burns motion, absolute timelines, and native FFmpeg encoding.",
+    "Multi-track desktop video studio: video clips, green-screen chroma key with on-canvas PiP, background music with volume & loop, SFX, native Whisper captions, and fast parallel FFmpeg export.",
   applicationName: "FrameFuse",
 };
 
