@@ -163,13 +163,15 @@ function videoHasAudioParser(stderr) {
 }
 
 /**
- * Parse `ffmpeg -i <file>` stderr → { hasAudio, width, height }.
+ * Parse `ffmpeg -i <file>` stderr → { hasAudio, width, height, durationMs }.
  * width/height are the EFFECTIVE display dims (already swapped for ±90°/
  * ±270° displaymatrix rotation, matching what ffmpeg decodes+autorotates
  * to). width/height stay 0 when no video stream line is found.
+ * v5.2: durationMs parsed from the container "Duration: HH:MM:SS.ms" line —
+ * drives the -ss modulo for looped overlay inputs.
  */
 function videoProbeParser(stderr) {
-  const out = { hasAudio: false, width: 0, height: 0 };
+  const out = { hasAudio: false, width: 0, height: 0, durationMs: 0 };
   if (typeof stderr !== "string") return out;
   out.hasAudio = videoHasAudioParser(stderr);
   const lines = stderr.split(/\r?\n/);
@@ -180,6 +182,10 @@ function videoProbeParser(stderr) {
   if (vline) {
     const m = vline.match(/(\d{2,5})x(\d{2,5})/);
     if (m) { out.width = +m[1]; out.height = +m[2]; }
+  }
+  const dur = stderr.match(/Duration:\s*(\d+):(\d{2}):(\d{2}\.\d{2})/);
+  if (dur) {
+    out.durationMs = Math.round((+dur[1] * 3600 + +dur[2] * 60 + +dur[3]) * 1000);
   }
   const rot = stderr.match(/displaymatrix:\s*rotation of\s*(-?[\d.]+)/);
   if (rot) {
@@ -371,9 +377,21 @@ function overlayWindow(ov, clipStartMs, clipDurMs) {
  * Input args for a VIDEO overlay trimmed to the overlap window. Both -ss and
  * -t are INPUT options (they must precede -i to bind to THIS input when
  * further inputs follow): `-ss <ss> -t <overlapDur> -i <path>`.
+ *
+ * v5.2: `loop` (overlayLoop) prepends -stream_loop -1 so a source SHORTER
+ * than the window repeats to fill it (green-screen clip spanning the whole
+ * video). -ss is taken modulo the source duration when it is known, so a
+ * long-running window still lands inside the first iteration.
  */
 function buildOverlayVideoInputArgs(o) {
-  return ["-ss", fmt3(Math.max(0, Number(o && o.ssMs) || 0)), "-t", fmt3(Math.max(0, Number(o && o.durMs) || 0)), "-i", o && o.path];
+  const args = [];
+  if (o && o.loop) args.push("-stream_loop", "-1");
+  let ss = Math.max(0, Number(o && o.ssMs) || 0);
+  if (o && o.loop && Number(o.srcDurMs) > 0) {
+    ss = ss % Number(o.srcDurMs);
+  }
+  args.push("-ss", fmt3(ss), "-t", fmt3(Math.max(0, Number(o && o.durMs) || 0)), "-i", o && o.path);
+  return args;
 }
 
 /**
@@ -453,15 +471,25 @@ function buildAudioMixGraph(o) {
     branches.push({ label: "[ca]", chain: `[0:a]${AFORMAT}[ca]` });
   }
   if (o && o.hasMusic) {
+    // v5.2 music placement: [volume] → [loudnorm] → [fades (music-local)]
+    // → [adelay=startMs] → aformat. adelay comes LAST so loudnorm/fades
+    // measure the music itself, not the leading silence; the fade-out end
+    // aligns with the VIDEO end (stream-local st = totalSec - start - dur).
     const m = [];
+    const musicVol = clampNum(audio.musicVolume, 0, 2, 1);
+    if (musicVol !== 1) m.push(`volume=${String(musicVol)}`);
     if (audio.normalize) m.push("loudnorm=I=-16:TP=-1.5:LRA=11");
+    const startMs = Math.max(0, Math.round(Number(audio.musicStartMs) || 0));
     if (audio.fadeInMs > 0) {
       m.push(`afade=t=in:st=0:d=${(audio.fadeInMs / 1000).toFixed(3)}`);
     }
     if (audio.fadeOutMs > 0) {
-      const start = Math.max(0, totalSec - audio.fadeOutMs / 1000);
+      // Stream-local (music) time: audible span is [start, totalSec] on the
+      // video timeline; the fade must END at the video end.
+      const start = Math.max(0, totalSec - startMs / 1000 - audio.fadeOutMs / 1000);
       m.push(`afade=t=out:st=${start.toFixed(3)}:d=${(audio.fadeOutMs / 1000).toFixed(3)}`);
     }
+    if (startMs > 0) m.push(`adelay=${startMs}|${startMs}`);
     m.push(AFORMAT);
     const musicIdx = Number.isFinite(o.musicInputIdx) ? o.musicInputIdx : 1;
     branches.push({ label: "[ma]", chain: `[${musicIdx}:a]${m.join(",")}[ma]` });
@@ -905,8 +933,15 @@ function buildClipArgs(ctx) {
 function buildConcatArgs(o) {
   const sfxList = Array.isArray(o.sfx) ? o.sfx.filter((s) => s && typeof s.wavPath === "string" && s.wavPath) : [];
   const hasMusic = !!o.audioPath;
+  // v5.2: loop-to-fill — -stream_loop -1 makes the music input infinite;
+  // -shortest (video stream) + apad=whole_dur cap the output at the video
+  // length, so the track repeats until the video ends.
+  const loopMusic = hasMusic && !!(o.audio && o.audio.musicLoop);
   const args = ["-f", "concat", "-safe", "0", "-i", o.concatListPath];
-  if (hasMusic) args.push("-i", o.audioPath);
+  if (hasMusic) {
+    if (loopMusic) args.push("-stream_loop", "-1");
+    args.push("-i", o.audioPath);
+  }
   sfxList.forEach((s) => args.push("-i", s.wavPath));
   // ALWAYS -c copy for video (captions already burned in step 1)
   args.push("-c:v", "copy");
@@ -937,18 +972,25 @@ function buildConcatArgs(o) {
       );
     }
   } else if (hasMusic) {
-    // Audio chain: [normalize] → [fade in] → [fade out] → [pad to video
-    // length]. apad=whole_dur pads with silence exactly to the video
-    // duration so a short track no longer TRUNCATES the video (v4.9).
+    // Audio chain (v5.2): [volume] → [normalize] → [fade in] → [fade out]
+    // → [adelay=startMs] → [pad to video length]. Fades run in MUSIC-local
+    // time (before adelay) so loudnorm/fades never measure leading silence;
+    // the fade-out END aligns with the video end. apad=whole_dur pads the
+    // delayed stream exactly to the video duration so a short track no
+    // longer TRUNCATES the video (v4.9 behavior preserved at startMs=0).
     const af = [];
+    const musicVol = clampNum(o.audio && o.audio.musicVolume, 0, 2, 1);
+    if (musicVol !== 1) af.push(`volume=${String(musicVol)}`);
     if (o.audio && o.audio.normalize) af.push("loudnorm=I=-16:TP=-1.5:LRA=11");
+    const startMs = Math.max(0, Math.round(Number(o.audio && o.audio.musicStartMs) || 0));
     if (o.audio && o.audio.fadeInMs > 0) {
       af.push(`afade=t=in:st=0:d=${(o.audio.fadeInMs / 1000).toFixed(3)}`);
     }
     if (o.audio && o.audio.fadeOutMs > 0) {
-      const start = Math.max(0, o.totalSec - o.audio.fadeOutMs / 1000);
+      const start = Math.max(0, o.totalSec - startMs / 1000 - o.audio.fadeOutMs / 1000);
       af.push(`afade=t=out:st=${start.toFixed(3)}:d=${(o.audio.fadeOutMs / 1000).toFixed(3)}`);
     }
+    if (startMs > 0) af.push(`adelay=${startMs}|${startMs}`);
     af.push(`apad=whole_dur=${o.totalSec.toFixed(3)}`);
     args.push("-af", af.join(","));
     args.push("-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-shortest");

@@ -1734,9 +1734,17 @@ ipcMain.handle("export-native", async (event, opts) => {
         }
         const geo = G.overlayGeometryMirror(width, height, srcW, srcH, ov.overlay);
         if (geo.dw <= 0 || geo.dh <= 0) continue;
+        // v5.2: overlayLoop — a short green-screen source repeats to span
+        // its whole timeline window (-stream_loop -1 on the input).
+        const ovLoop = ov.overlayLoop === true;
+        let srcDurMs = Number(ov.sourceDurationMs) > 0 ? Number(ov.sourceDurationMs) : 0;
+        if (!srcDurMs && isVid) {
+          const p = await probeMediaAsync(srcPath);
+          srcDurMs = Number(p.durationMs) > 0 ? Number(p.durationMs) : 0;
+        }
         overlaySpecs.push({
           inputArgs: isVid
-            ? G.buildOverlayVideoInputArgs({ ssMs: win.ssMs, durMs: win.overlapMs, path: srcPath })
+            ? G.buildOverlayVideoInputArgs({ ssMs: win.ssMs, durMs: win.overlapMs, path: srcPath, loop: ovLoop, srcDurMs })
             : G.buildOverlayImageInputArgs({ durMs: win.overlapMs, path: srcPath }),
           x: geo.dx,
           y: geo.dy,

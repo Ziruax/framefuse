@@ -1122,6 +1122,65 @@ export function SettingsPanel(props: SettingsPanelProps) {
           className={cn("pb-2 pt-2", tab === "audio" ? "ff-tab-panel-in" : "hidden")}
         >
           <Section icon={<AudioLines size={13} />} title="Audio" defaultOpen>
+            {/* ── v5.2: Background music placement ───────────────────────── */}
+            {hasAudio ? (
+              <>
+                <Row label="Music volume">
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="range"
+                      min={0}
+                      max={200}
+                      step={5}
+                      value={Math.round(
+                        Math.max(0, Math.min(2, audioSettings.musicVolume)) * 100,
+                      )}
+                      onChange={(e) =>
+                        onAudioSettingsChange({
+                          ...audioSettings,
+                          musicVolume: Math.max(
+                            0,
+                            Math.min(2, Number(e.target.value) / 100),
+                          ),
+                        })
+                      }
+                      className="w-28 accent-sky-400"
+                      aria-label="Background music volume"
+                    />
+                    <span className="w-9 text-right text-[10px] tabular-nums text-zinc-400">
+                      {Math.round(
+                        Math.max(0, Math.min(2, audioSettings.musicVolume)) * 100,
+                      )}
+                      %
+                    </span>
+                  </div>
+                </Row>
+                <Row label="Loop to fill video">
+                  <Toggle
+                    checked={audioSettings.musicLoop}
+                    onChange={(v) =>
+                      onAudioSettingsChange({ ...audioSettings, musicLoop: v })
+                    }
+                    label=""
+                  />
+                </Row>
+                <p className="mb-3 mt-[-8px] text-[10px] leading-relaxed text-zinc-500">
+                  Music placement: drag the clip on the timeline's Audio lane to
+                  reposition it
+                  {audioSettings.musicStartMs > 0
+                    ? ` (currently starting at ${(audioSettings.musicStartMs / 1000).toFixed(1)}s)`
+                    : ""}
+                  . Loop repeats the track until the video ends — ideal when the
+                  music (2 min+) is longer than the edit. Volume above 100%
+                  boosts in the export (preview caps at 100%).
+                </p>
+              </>
+            ) : (
+              <p className="mb-3 text-[10px] leading-relaxed text-zinc-500">
+                Load a music track from the Media tab to unlock volume, loop and
+                timeline placement controls.
+              </p>
+            )}
             <Row label="Normalize loudness">
               <Toggle
                 checked={audioSettings.normalize}

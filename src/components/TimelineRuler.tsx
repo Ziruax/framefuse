@@ -33,9 +33,13 @@ import {
   Clapperboard,
   Copy,
   Layers,
+  Music2,
+  Repeat,
   Scissors,
   Timer,
   Trash2,
+  Volume2,
+  VolumeX,
   X,
   ZoomIn,
   ZoomOut,
@@ -54,6 +58,7 @@ import type {
 import { boundaryStyle } from "@/lib/merger/types";
 import { fmtTimecode } from "@/lib/merger/timeline";
 import { getSfxDef } from "@/lib/merger/sfx";
+import { middleEllipsis } from "@/lib/merger/text";
 import type { WaveformData } from "@/lib/merger/waveform";
 import { cn } from "@/lib/utils";
 
@@ -92,6 +97,17 @@ interface TimelineRulerProps {
   onRemove?: (id: string) => void;
   /** v5.1: the active BASE segment (toolbar enable states + duration chip). */
   activeSegment?: MediaSegment | null;
+  /** v5.2: background music placement — the audio lane renders a DRAGGABLE
+   *  music clip (move to reposition, hover popover for volume + loop). */
+  musicStartMs?: number;
+  musicLoop?: boolean;
+  musicVolume?: number;
+  /** Music track duration (audioTrack.durationMs) — drives the clip width. */
+  musicDurationMs?: number | null;
+  musicName?: string | null;
+  onMusicMove?: (startMs: number) => void;
+  onMusicLoopChange?: (loop: boolean) => void;
+  onMusicVolumeChange?: (volume: number) => void;
 }
 
 // v4.9: bar tints — the segment bar is now a FILMSTRIP (thumbnail shows
@@ -229,6 +245,9 @@ type DragInfo =
       /** v5.1: resolved playback speed — durationMs is timeline time, trimInMs
        * is SOURCE time; the trim-l gesture converts between them (× speed). */
       speed: number;
+      /** v5.2: looped overlays may extend past the source window (their
+       * source repeats to fill the timeline window). */
+      overlayLoop: boolean;
     }
   | {
       kind: "sfx";
@@ -259,7 +278,14 @@ type DragPreview =
 /** Max trimmable TIMELINE duration for a clip (video: the remaining SOURCE
  * window divided by speed — v5.1 scaled clamp; else 300 s). */
 function maxDurFor(d: Extract<DragInfo, { kind: "clip" }>): number {
-  if (d.mediaType === "video" && d.sourceDur != null && d.sourceDur > 0) {
+  if (
+    d.mediaType === "video" &&
+    d.sourceDur != null &&
+    d.sourceDur > 0 &&
+    // v5.2: a LOOPED overlay repeats its source, so the timeline window is
+    // no longer capped by the source length.
+    !d.overlayLoop
+  ) {
     const speed = d.speed > 0 ? d.speed : 1;
     return Math.min(
       MAX_DUR_MS,
@@ -442,11 +468,17 @@ function WaveformStrip({
   data,
   totalMs,
   currentMs,
+  startMs = 0,
+  loop = false,
   className = "pointer-events-none absolute left-1.5 right-1.5 top-[16px] h-[26px]",
 }: {
   data: WaveformData;
   totalMs: number;
   currentMs: number;
+  /** v5.2: timeline offset where the music starts (draggable clip). */
+  startMs?: number;
+  /** v5.2: repeat the waveform to fill the whole timeline (loop-to-fill). */
+  loop?: boolean;
   className?: string;
 }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -473,26 +505,30 @@ function WaveformStrip({
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      // Clear first — drawImage composites, so without this the dim blit
-      // would accumulate alpha over previous frames and bars could never
-      // dim back down after a seek.
       ctx.clearRect(0, 0, cssW, cssH);
 
-      // Audio occupies this fraction of track width (audio may be shorter
-      // or longer than the timeline; clamped, tail truncated).
-      const frac = totalMs > 0 ? Math.min(1, data.durationMs / totalMs) : 1;
-      const waveW = Math.max(8, cssW * frac);
+      // v5.2: the wave is anchored at startMs and spans either one pass of
+      // the track (startMs + durationMs, clamped to the timeline) or — when
+      // looping — repeats until the timeline end. Legacy callers (startMs 0,
+      // no loop) keep the exact v4.9 mapping.
+      const durMs = Math.max(0, data.durationMs);
+      const msToPx = totalMs > 0 ? cssW / totalMs : 0;
+      const x0 = Math.max(0, Math.min(cssW, startMs * msToPx));
+      const spanMs = loop ? Math.max(0, totalMs - startMs) : Math.min(durMs, Math.max(0, totalMs - startMs));
+      const waveW = Math.max(8, Math.min(cssW - x0, spanMs * msToPx));
+      const reps = loop && durMs > 0 ? Math.max(1, Math.ceil(spanMs / durMs)) : 1;
+      const repW = durMs > 0 ? Math.min(waveW, durMs * msToPx) : waveW;
       const mid = cssH / 2;
       const maxBar = cssH / 2 - 1;
 
       // Static pass → offscreen cache (peaks don't change with the playhead).
       // Key includes the decode id — two tracks with identical bucket count
       // and duration must never share a stale bitmap.
-      const key = `${data.id}:${waveW.toFixed(1)}:${cssH}:${dpr}`;
+      const key = `${data.id}:${repW.toFixed(1)}:${cssH}:${dpr}`;
       let off = cacheRef.current.key === key ? cacheRef.current.off : null;
       if (!off) {
         off = document.createElement("canvas");
-        off.width = canvas.width;
+        off.width = Math.max(1, Math.round(repW * dpr));
         off.height = canvas.height;
         const octx = off.getContext("2d");
         if (octx) {
@@ -501,7 +537,7 @@ function WaveformStrip({
           // v4.8: desaturated sky (VLM: bright cyan strobed).
           octx.fillStyle = "#7dd3fc";
           const n = data.peaks.length;
-          const barW = waveW / n;
+          const barW = repW / n;
           for (let i = 0; i < n; i++) {
             const h = Math.max(1, data.peaks[i] * maxBar);
             const x = i * barW;
@@ -511,35 +547,42 @@ function WaveformStrip({
         cacheRef.current = { key, off };
       }
 
-      // Blit the dim pass with a unipolar alpha tint.
-      // v4.8: 0.30 (was 0.42) + desaturated slate-cyan — VLM flagged the
-      // wave as louder than the clip segments; the audio data should recede
-      // while the bright pass keeps progress contrast.
+      // Blit the dim pass (repeat for each loop iteration).
       ctx.globalAlpha = 0.3;
-      ctx.drawImage(off, 0, 0, cssW, cssH);
+      for (let r = 0; r < reps; r++) {
+        ctx.drawImage(off, x0 + r * repW, 0, repW, cssH);
+      }
       ctx.globalAlpha = 1;
       ctx.fillStyle = "rgba(125, 211, 252, 0.48)";
 
-      // Bright pass: bars up to the playhead. Progress is AUDIO-relative
-      // (wave maps 0..durationMs → 0..waveW); when the video outlives the
-      // audio the whole wave ends up bright, when audio outlives the
-      // timeline the tail stays dim.
-      const audioProg =
-        data.durationMs > 0
-          ? Math.max(0, Math.min(1, currentMs / data.durationMs))
-          : 0;
+      // Bright pass: bars up to the playhead, AUDIO-relative (the wave maps
+      // 0..durationMs → 0..repW; looping wraps at each iteration boundary).
+      const relMs = currentMs - startMs;
+      const brightPx =
+        relMs <= 0
+          ? 0
+          : loop && durMs > 0
+            ? ((relMs % durMs) / durMs) * repW + Math.floor(relMs / durMs) * repW
+            : (Math.max(0, Math.min(1, relMs / (durMs || 1))) * repW);
       const n = data.peaks.length;
-      const barW = waveW / n;
-      const cutoffIdx = Math.floor(audioProg * n);
-      for (let i = 0; i < cutoffIdx; i++) {
-        const h = Math.max(1, data.peaks[i] * maxBar);
-        const x = i * barW;
-        ctx.fillRect(x, mid - h, Math.max(0.8, barW - 0.5), h * 2);
+      const barW = repW / n;
+      for (let r = 0; r < reps; r++) {
+        const base = r * repW;
+        // Bars bright within this rep = how far brightPx reaches into it.
+        const upto = Math.max(
+          0,
+          Math.min(n, Math.floor(((brightPx - base) / Math.max(1, repW)) * n)),
+        );
+        for (let i = 0; i < upto; i++) {
+          const h = Math.max(1, data.peaks[i] * maxBar);
+          const x = x0 + base + i * barW;
+          ctx.fillRect(x, mid - h, Math.max(0.8, barW - 0.5), h * 2);
+        }
       }
 
       // Hairline baseline.
       ctx.globalAlpha = 0.25;
-      ctx.fillRect(0, mid - 0.5, waveW, 1);
+      ctx.fillRect(x0, mid - 0.5, waveW, 1);
       ctx.globalAlpha = 1;
     };
 
@@ -547,7 +590,7 @@ function WaveformStrip({
     const ro = new ResizeObserver(draw);
     ro.observe(parent);
     return () => ro.disconnect();
-  }, [data, totalMs, currentMs]);
+  }, [data, totalMs, currentMs, startMs, loop]);
 
   return (
     <div
@@ -1203,6 +1246,14 @@ export function TimelineRuler({
   onDuplicate,
   onRemove,
   activeSegment,
+  musicStartMs = 0,
+  musicLoop = false,
+  musicVolume = 1,
+  musicDurationMs = null,
+  musicName = null,
+  onMusicMove,
+  onMusicLoopChange,
+  onMusicVolumeChange,
 }: TimelineRulerProps) {
   const trackRef = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
@@ -1419,6 +1470,70 @@ export function TimelineRuler({
       ? dragPreview
       : null;
 
+  // ---- v5.2: MUSIC clip drag (self-contained gesture — no lane switching,
+  // no shared DragInfo: the music track is a singleton on the audio lane).
+  // Press seeks to the music start (SFX pill parity); drag previews locally
+  // and commits once on pointerup. Snapped to the same 10ms grid.
+  const [musicDrag, setMusicDrag] = useState<{
+    pointerId: number;
+    startX: number;
+    origStart: number;
+    startMs: number;
+    didDrag: boolean;
+  } | null>(null);
+  /** Effective (preview-aware) music start. */
+  const musicStart = Math.max(
+    0,
+    Math.min(totalMs, musicDrag?.startMs ?? musicStartMs),
+  );
+
+  const beginMusicDrag = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || !onMusicMove) return;
+    e.stopPropagation();
+    onSeek(Math.max(0, musicStartMs));
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // best-effort
+    }
+    setMusicDrag({
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      origStart: Math.max(0, musicStartMs),
+      startMs: Math.max(0, musicStartMs),
+      didDrag: false,
+    });
+  };
+
+  const handleMusicPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const d = musicDrag;
+    if (!d || d.pointerId !== e.pointerId) return;
+    const dx = e.clientX - d.startX;
+    if (!d.didDrag) {
+      if (Math.abs(dx) <= DRAG_DEADZONE_PX) return;
+    }
+    const msPerPx = msPerPxNow();
+    const maxStart = Math.max(0, totalMs - 200);
+    const ns = Math.max(
+      0,
+      Math.min(maxStart, snapMs(d.origStart + dx * msPerPx)),
+    );
+    setMusicDrag((prev) =>
+      prev && prev.pointerId === e.pointerId
+        ? { ...prev, didDrag: true, startMs: ns }
+        : prev,
+    );
+  };
+
+  const handleMusicPointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const d = musicDrag;
+    if (!d || d.pointerId !== e.pointerId) return;
+    setMusicDrag(null);
+    if (d.didDrag && onMusicMove) onMusicMove(d.startMs);
+  };
+
+  const handleMusicDragAbort = () => setMusicDrag(null);
+
   /**
    * Begin a clip gesture (body = move, edges = trim). Guards: only when the
    * parent accepts edits (onEditItem) and only for the primary pointer — any
@@ -1463,6 +1578,8 @@ export function TimelineRuler({
         seg.speed > 0
           ? seg.speed
           : 1,
+      // v5.2: looped overlays trim beyond the source window.
+      overlayLoop: seg.overlayLoop === true,
     };
   };
 
@@ -2235,8 +2352,9 @@ export function TimelineRuler({
             </div>
           </div>
 
-          {/* LANE 3 — AUDIO (music waveform; visual + click-to-seek only) —
-              cyan-900/20-tinted while a waveform is loaded (v5.1). */}
+          {/* LANE 3 — AUDIO (v5.2: DRAGGABLE background-music clip with volume
+              + loop controls — a first-class timeline citizen instead of a
+              read-only strip). Cyan-900/20-tinted while a waveform is loaded. */}
           <div
             role="group"
             aria-label="Audio lane"
@@ -2254,12 +2372,173 @@ export function TimelineRuler({
               {...scrubHandlers}
             >
               {hasWave && waveform ? (
-                <WaveformStrip
-                  data={waveform}
-                  totalMs={totalMs}
-                  currentMs={currentMs}
-                  className="pointer-events-none absolute inset-x-1 inset-y-0"
-                />
+                <>
+                  {/* Waveform anchored at the music start; repeats when the
+                      loop-to-fill mode is on (progress stays audio-relative). */}
+                  <WaveformStrip
+                    data={waveform}
+                    totalMs={totalMs}
+                    currentMs={currentMs}
+                    startMs={musicStart}
+                    loop={musicLoop}
+                    className="pointer-events-none absolute inset-x-1 inset-y-0"
+                  />
+                  {/* The music CLIP — drag to reposition; hover reveals the
+                      volume slider + loop toggle popover. */}
+                  {(() => {
+                    const durMs =
+                      musicDurationMs && musicDurationMs > 0
+                        ? musicDurationMs
+                        : waveform.durationMs;
+                    const endMs = musicLoop
+                      ? Math.max(totalMs, musicStart + 200)
+                      : Math.min(totalMs, musicStart + durMs);
+                    const left = layout ? layout.pxOf(musicStart) : 0;
+                    const width = Math.max(
+                      24,
+                      layout
+                        ? layout.pxOf(endMs) - left
+                        : axisW * (endMs / Math.max(1, totalMs)),
+                    );
+                    const volPct = Math.round(
+                      Math.max(0, Math.min(2, musicVolume)) * 100,
+                    );
+                    return (
+                      <div
+                        role="button"
+                        tabIndex={0}
+                        aria-label={`Background music clip starting at ${fmtTimecode(musicStart)}${musicLoop ? ", looping to fill the video" : ""}`}
+                        className={cn(
+                          "group absolute top-1 bottom-1 z-[2] flex select-none items-center gap-1 overflow-hidden rounded-md border pl-1.5 text-[8px] font-semibold",
+                          onMusicMove
+                            ? "cursor-grab touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sky-300/70"
+                            : "cursor-pointer",
+                          musicDrag && "cursor-grabbing",
+                        )}
+                        style={{
+                          left,
+                          width,
+                          backgroundColor: musicDrag
+                            ? "rgba(14, 165, 233, 0.30)"
+                            : "rgba(14, 165, 233, 0.16)",
+                          borderColor: musicLoop
+                            ? "rgba(56, 189, 248, 0.75)"
+                            : "rgba(56, 189, 248, 0.45)",
+                          color: "#bae6fd",
+                          boxShadow: musicDrag
+                            ? "0 0 0 1.5px rgba(255,255,255,0.55), 0 3px 10px rgba(0,0,0,0.55)"
+                            : "0 1px 2px rgba(0,0,0,0.45)",
+                        }}
+                        title={`Background music · starts ${fmtTimecode(musicStart)}${musicLoop ? " · loops to fill the video" : ` · ${fmtTimecode(durMs)} long`}${onMusicMove ? " · drag to reposition" : ""}`}
+                        onPointerDown={beginMusicDrag}
+                        onPointerMove={handleMusicPointerMove}
+                        onPointerUp={handleMusicPointerUp}
+                        onPointerCancel={handleMusicDragAbort}
+                        onLostPointerCapture={handleMusicDragAbort}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            onSeek(Math.max(0, musicStart));
+                          }
+                        }}
+                      >
+                        <Music2 className="size-2.5 shrink-0" aria-hidden />
+                        <span className="min-w-0 flex-1 truncate">
+                          {musicName
+                            ? middleEllipsis(musicName, 28)
+                            : "Background music"}
+                        </span>
+                        {musicLoop && (
+                          <span
+                            className="flex shrink-0 items-center gap-0.5 rounded px-1 py-px"
+                            style={{
+                              backgroundColor: "rgba(56, 189, 248, 0.22)",
+                              border: "1px solid rgba(56, 189, 248, 0.4)",
+                            }}
+                            title="Looping — the track repeats to cover the ENTIRE video"
+                          >
+                            <Repeat className="size-2.5" aria-hidden />
+                            loop
+                          </span>
+                        )}
+                        <span
+                          className="flex shrink-0 items-center gap-0.5 tabular-nums opacity-80"
+                          title={`Music volume — ${volPct}% (adjust in the hover controls or Settings → Audio)`}
+                        >
+                          {volPct === 0 ? (
+                            <VolumeX className="size-2.5" aria-hidden />
+                          ) : (
+                            <Volume2 className="size-2.5" aria-hidden />
+                          )}
+                          {volPct}%
+                        </span>
+                        {/* Hover popover: volume slider + loop toggle (floats
+                            ABOVE the 34px lane so nothing is crammed). */}
+                        {(onMusicVolumeChange || onMusicLoopChange) && (
+                          <div
+                            className="pointer-events-none absolute -top-1 left-1/2 z-[6] -translate-x-1/2 -translate-y-full opacity-0 transition-opacity duration-100 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100"
+                          >
+                            <div
+                              className="flex items-center gap-2 rounded-lg border px-2.5 py-1.5 shadow-xl backdrop-blur-md"
+                              style={{
+                                backgroundColor: "rgba(24, 24, 27, 0.96)",
+                                borderColor: "rgba(63, 63, 70, 0.9)",
+                              }}
+                              onPointerDown={(e) => e.stopPropagation()}
+                            >
+                              {onMusicVolumeChange && (
+                                <label className="flex items-center gap-1.5 text-[9px] font-medium text-zinc-300">
+                                  <Volume2 className="size-3 text-sky-300" aria-hidden />
+                                  <input
+                                    type="range"
+                                    min={0}
+                                    max={200}
+                                    step={5}
+                                    value={volPct}
+                                    aria-label="Background music volume"
+                                    className="w-24 accent-sky-400"
+                                    onChange={(e) =>
+                                      onMusicVolumeChange(
+                                        Math.max(
+                                          0,
+                                          Math.min(2, Number(e.target.value) / 100),
+                                        ),
+                                      )
+                                    }
+                                  />
+                                  <span className="w-8 tabular-nums text-zinc-400">
+                                    {volPct}%
+                                  </span>
+                                </label>
+                              )}
+                              {onMusicLoopChange && (
+                                <button
+                                  type="button"
+                                  aria-pressed={musicLoop}
+                                  className={cn(
+                                    "flex cursor-pointer items-center gap-1 rounded-md border px-1.5 py-1 text-[9px] font-semibold transition-colors",
+                                    musicLoop
+                                      ? "border-sky-400/70 bg-sky-500/25 text-sky-200"
+                                      : "border-zinc-700 bg-zinc-800/70 text-zinc-300 hover:border-sky-400/50 hover:text-sky-200",
+                                  )}
+                                  title={
+                                    musicLoop
+                                      ? "Looping ON — the music repeats to cover the entire video length"
+                                      : "Loop to fill the ENTIRE video — background tracks are usually longer than the edit"
+                                  }
+                                  onClick={() => onMusicLoopChange(!musicLoop)}
+                                >
+                                  <Repeat className="size-3" aria-hidden />
+                                  {musicLoop ? "Looping" : "Loop full video"}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()}
+                </>
               ) : (
                 <EmptyHint>
                   No music track — load audio from the Media tab

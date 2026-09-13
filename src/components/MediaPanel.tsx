@@ -5,6 +5,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ChangeEvent,
@@ -45,6 +46,7 @@ import {
   Gauge,
   Layers,
   Play,
+  Repeat,
   SlidersHorizontal,
   Video,
   Volume2,
@@ -261,6 +263,18 @@ export function MediaPanelBase({
   // passes only v4.9 props renders the exact v4.9 list/grid.
   const v5EditReady = onSetItemEdit != null && itemEdits != null;
   const v5MediaReady = v5EditReady || videoDurations != null;
+
+  // v5.2: base-lane timeline end — the target for an overlay's
+  // "Span entire video" action (overlays are meant to cover the EDIT, not
+  // extend past it like the timeline total does).
+  const baseTotalMs = useMemo(
+    () =>
+      segments.reduce(
+        (m, s) => ((s.track ?? 0) === 0 ? Math.max(m, s.endMs) : m),
+        0,
+      ),
+    [segments],
+  );
 
   // v5: progressive video thumbnails — probe one frame per video AFTER the
   // list rendered (never blocking). Posters land in a module cache (read at
@@ -796,6 +810,7 @@ export function MediaPanelBase({
                           onClose={() => setOpenSettingsId(null)}
                           isVideo={isVideo}
                           sourceDurMs={sourceDurMs}
+                          baseTotalMs={baseTotalMs}
                         />
                       </div>
                     )}
@@ -1419,6 +1434,7 @@ export function MediaPanelBase({
                       onClose={() => setOpenSettingsId(null)}
                       isVideo={isVideo}
                       sourceDurMs={sourceDurMs}
+                      baseTotalMs={baseTotalMs}
                     />
                   </div>
                 )}
@@ -2131,6 +2147,8 @@ interface ClipSettingsProps {
   onClose: () => void;
   isVideo: boolean;
   sourceDurMs: number | null;
+  /** v5.2: base-lane timeline end (ms) — the target for "span entire video". */
+  baseTotalMs: number;
 }
 
 /** v5: the per-item "pro tool" expander — track, volume, trim, chroma key. */
@@ -2141,6 +2159,7 @@ function ClipSettings({
   onClose,
   isVideo,
   sourceDurMs,
+  baseTotalMs,
 }: ClipSettingsProps) {
   const onOverlay = (edit?.track ?? 0) >= 1;
   // ItemEdit.volume is the frozen 0..2 ratio (6-a data model); the UI presents
@@ -2428,6 +2447,76 @@ function ClipSettings({
           trimInMs={trimInMs}
           overlayOn={onOverlay}
         />
+
+        {/* v5.2: overlay window — span the entire video / loop the source.
+            Green-screen clips are rarely the same length as the edit; this
+            makes an overlay cover the WHOLE timeline in one click. */}
+        {onOverlay && (
+          <div className="rounded-md border p-2" style={{ borderColor: "#27272a", backgroundColor: "rgba(9, 9, 11, 0.5)" }}>
+            <div className="mb-1.5 flex items-center justify-between">
+              <span
+                className="flex items-center gap-1 text-[8px] font-semibold uppercase tracking-[0.12em]"
+                style={{ color: "#71717a" }}
+              >
+                <Repeat className="size-2.5" /> Overlay window
+              </span>
+              <span className="text-[9px] tabular-nums" style={{ color: "#a1a1aa" }}>
+                {fmtSec(seg.durationMs)}
+              </span>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              <button
+                type="button"
+                onClick={() => {
+                  const startMs = Math.max(0, edit?.startMs ?? seg.startMs);
+                  const durMs = Math.max(
+                    200,
+                    Math.round(baseTotalMs > 0 ? baseTotalMs - startMs : seg.durationMs),
+                  );
+                  onSetItemEdit(seg.id, {
+                    durationMs: durMs,
+                    ...(isVideo ? { overlayLoop: true } : {}),
+                  });
+                }}
+                disabled={baseTotalMs <= 0}
+                className="flex flex-1 cursor-pointer items-center justify-center gap-1 rounded border px-2 py-1 text-[9px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+                style={{ borderColor: "rgba(56, 189, 248, 0.45)", backgroundColor: "rgba(14, 165, 233, 0.12)", color: "#bae6fd" }}
+                title="Extend this overlay to cover the ENTIRE video (loops the source when it is shorter)"
+              >
+                <Repeat className="size-2.5" />
+                Span entire video
+              </button>
+              {isVideo && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    onSetItemEdit(seg.id, {
+                      ...(edit?.overlayLoop ? { overlayLoop: undefined } : { overlayLoop: true }),
+                    })
+                  }
+                  aria-pressed={edit?.overlayLoop === true}
+                  className={cn(
+                    "flex cursor-pointer items-center justify-center gap-1 rounded border px-2 py-1 text-[9px] font-semibold transition-colors",
+                  )}
+                  style={
+                    edit?.overlayLoop === true
+                      ? { borderColor: "rgba(56, 189, 248, 0.7)", backgroundColor: "rgba(14, 165, 233, 0.25)", color: "#e0f2fe" }
+                      : { borderColor: "#27272a", backgroundColor: "rgba(9, 9, 11, 0.6)", color: "#a1a1aa" }
+                  }
+                  title="Loop this overlay's source — it repeats to fill its whole timeline window (drag its right edge on the timeline to extend)"
+                >
+                  <Repeat className="size-2.5" />
+                  {edit?.overlayLoop === true ? "Looping" : "Loop source"}
+                </button>
+              )}
+            </div>
+            <p className="mt-1 px-0.5 text-[9px]" style={{ color: "#52525b" }}>
+              {isVideo
+                ? "Green-screen clips rarely match the edit length — span the whole video and the source loops to fill it."
+                : "Still images loop automatically; Span sets the window to the full video."}
+            </p>
+          </div>
+        )}
       </div>
     </div>
   );

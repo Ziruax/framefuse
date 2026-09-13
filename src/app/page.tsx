@@ -271,7 +271,11 @@ export default function Page() {
      
     if (p.captionSettings) setCaptionSettings(p.captionSettings);
      
-    if (p.audio) setAudioSettings(p.audio);
+    if (p.audio) {
+      // v5.2: merge over defaults so settings persisted by ≤5.1 (without the
+      // music placement fields) gain the new keys instead of undefined.
+      setAudioSettings({ ...defaultAudioSettings(), ...p.audio });
+    }
     if (p.transition) setTransitionSettings(p.transition);
     if (p.watermark) setWatermarkSettings(p.watermark);
     if (Array.isArray(p.headlines)) {
@@ -809,6 +813,57 @@ export default function Page() {
   }, [isPlaying, sfxItems, scheduleSfxFrom, stopSfxSources]);
 
   // ---- Playback rAF loop --------------------------------------------------
+  /**
+   * v5.2: background music is now a first-class timeline citizen — map the
+   * master playhead onto the <audio> element's position honoring the user's
+   * placement: musicStartMs offset (null = silence before it starts),
+   * musicLoop wrap (the track repeats to fill the whole video), and natural
+   * end (null when the playhead is past a non-looping track). durationMs
+   * unknown → fall back to raw seconds (pre-v5.2 behavior).
+   */
+  const musicPosFor = useCallback(
+    (timelineMs: number): number | null => {
+      if (!audioTrack) return null;
+      const durMs = audioTrack.durationMs ?? 0;
+      const rel = timelineMs - audioSettings.musicStartMs;
+      if (rel < 0) return null;
+      if (durMs > 0) {
+        if (audioSettings.musicLoop) return (rel % durMs) / 1000;
+        if (rel >= durMs) return null;
+      }
+      return rel / 1000;
+    },
+    [audioTrack, audioSettings.musicStartMs, audioSettings.musicLoop],
+  );
+
+  /** v5.2: push the computed music position onto the element (pause when the
+   *  playhead sits outside the music window; re-sync on >0.25s drift while
+   *  playing so loop wraps + late starts stay locked to the timeline). */
+  const syncMusicElement = useCallback(
+    (timelineMs: number, playing: boolean) => {
+      const el = audioRef.current;
+      if (!el || !audioTrack) return;
+      // HTMLMediaElement.volume is 0..1 (values >1 throw) — the >1 boost
+      // range is an EXPORT-only gain (FFmpeg volume filter).
+      el.volume = Math.max(0, Math.min(1, audioSettings.musicVolume));
+      const pos = musicPosFor(timelineMs);
+      if (pos == null) {
+        if (!el.paused) el.pause();
+        return;
+      }
+      if (Math.abs(el.currentTime - pos) > 0.25 || el.paused) {
+        try {
+          el.currentTime = pos;
+        } catch {
+          /* seeking before metadata — ignored */
+        }
+      }
+      if (playing && el.paused) el.play().catch(() => {});
+      if (!playing && !el.paused) el.pause();
+    },
+    [audioTrack, audioSettings.musicVolume, musicPosFor],
+  );
+
   useEffect(() => {
     if (!isPlaying) {
       // Pause audio when not playing
@@ -818,11 +873,8 @@ export default function Page() {
       return;
     }
 
-    // Start audio playback synced with timeline
-    if (audioRef.current && audioTrack) {
-      audioRef.current.currentTime = currentMsRef.current / 1000;
-      audioRef.current.play().catch(() => {});
-    }
+    // Start audio playback synced with timeline (v5.2 placement-aware).
+    syncMusicElement(currentMsRef.current, true);
 
     let raf = 0;
     let last = performance.now();
@@ -842,11 +894,21 @@ export default function Page() {
       }
       currentMsRef.current = m;
       setCurrentMs(m);
+      // Keep the music element locked to the timeline (loop wraps, start
+      // offsets, natural end) — cheap: only re-seeks on real drift.
+      syncMusicElement(m, true);
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [isPlaying, audioTrack]);
+  }, [isPlaying, audioTrack, syncMusicElement]);
+
+  // v5.2: live volume changes apply to the element even while paused.
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.volume = Math.max(0, Math.min(1, audioSettings.musicVolume));
+    }
+  }, [audioSettings.musicVolume, audioTrack]);
 
   // ---- Detect Electron + wire app-menu accelerators -----------------------
   const exportRef = useRef<() => void>(() => {});
@@ -2698,16 +2760,14 @@ const handleRandomTransitionMix = useCallback(() => {
       const clamped = Math.max(0, Math.min(ms, totalMsRef.current));
       currentMsRef.current = clamped;
       setCurrentMs(clamped);
-      // Sync audio position
-      if (audioRef.current) {
-        audioRef.current.currentTime = clamped / 1000;
-      }
+      // Sync audio position (v5.2: placement-aware — start offset / loop).
+      syncMusicElement(clamped, isPlayingRef.current);
       // v5.0: SFX sources stop + reschedule at the new playhead (the async
       // schedule self-aborts when superseded, so scrub bursts are cheap).
       if (isPlayingRef.current) void scheduleSfxFrom(clamped);
       else stopSfxSources();
     },
-    [scheduleSfxFrom, stopSfxSources],
+    [scheduleSfxFrom, stopSfxSources, syncMusicElement],
   );
 
   const togglePlay = useCallback(() => {
@@ -3105,6 +3165,41 @@ const handleRandomTransitionMix = useCallback(() => {
             onDuplicate={duplicateItem}
             onRemove={removeItem}
             activeSegment={activeSegment}
+            // ---- v5.2: music placement (draggable clip on the audio lane) ----
+            musicStartMs={audioSettings.musicStartMs}
+            musicLoop={audioSettings.musicLoop}
+            musicVolume={audioSettings.musicVolume}
+            musicDurationMs={audioTrack?.durationMs ?? null}
+            musicName={audioTrack?.fileName ?? null}
+            onMusicMove={(startMs) => {
+              setAudioSettings((prev) =>
+                prev.musicStartMs === startMs
+                  ? prev
+                  : { ...prev, musicStartMs: startMs },
+              );
+            }}
+            onMusicLoopChange={(loop) => {
+              setAudioSettings((prev) =>
+                prev.musicLoop === loop ? prev : { ...prev, musicLoop: loop },
+              );
+              toast.success(
+                loop
+                  ? "Music loops to fill the entire video"
+                  : "Music plays once from its start point",
+                {
+                  description: loop
+                    ? "The track repeats until the video ends — perfect for short edits over long background music."
+                    : "Turn it back on any time from the clip's hover controls.",
+                },
+              );
+            }}
+            onMusicVolumeChange={(volume) => {
+              setAudioSettings((prev) =>
+                prev.musicVolume === volume
+                  ? prev
+                  : { ...prev, musicVolume: Math.max(0, Math.min(2, volume)) },
+              );
+            }}
           />
           </div>
         </section>
