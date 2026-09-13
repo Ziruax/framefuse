@@ -567,6 +567,33 @@ summary:focus-visible,
     0 4px 12px rgba(0, 0, 0, 0.55);
   transform: translateY(-1px);
 }
+/* v5.4 SELECTED clip (multi-select): amber ring + tint — the user-intent
+   accent, deliberately distinct from the cyan PLAYHEAD-tracking active
+   ring. Source order: AFTER .ff-clip-active (a selected+active clip reads
+   selected), BEFORE .ff-clip-drag (an in-flight gesture still reads
+   hot-tracked white). Outline-based so it never fights inline shadows on
+   the overlay cards. */
+.ff-clip-selected {
+  outline: 2px solid rgba(245, 158, 11, 0.95);
+  outline-offset: -1px;
+  z-index: 2;
+}
+.ff-clip.ff-clip-selected {
+  filter: saturate(1.05) brightness(0.95);
+  box-shadow:
+    inset 0 0 0 1px rgba(245, 158, 11, 0.5),
+    0 0 0 2px rgba(245, 158, 11, 0.45),
+    0 0 14px rgba(245, 158, 11, 0.22);
+}
+/* v5.4: marquee rubber band — amber tint to match the selection accent. */
+.ff-marquee {
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.7);
+  border-radius: 3px;
+  box-shadow:
+    0 0 0 1px rgba(0, 0, 0, 0.3),
+    inset 0 0 24px rgba(245, 158, 11, 0.06);
+}
 /* Drag-in-flight: lifted + hot-tracked (highest source order wins). */
 .ff-clip.ff-clip-drag {
   z-index: 2;

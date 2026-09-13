@@ -110,6 +110,17 @@ interface TimelineRulerProps {
   onMusicMove?: (startMs: number) => void;
   onMusicLoopChange?: (loop: boolean) => void;
   onMusicVolumeChange?: (volume: number) => void;
+  /** v5.4: multi-select — ids of the currently SELECTED clips (base +
+   *  overlay lanes). Selection is a user-intent concept (click /
+   *  Ctrl-click / Shift-click / marquee drag / Ctrl+A), distinct from the
+   *  playhead-derived activeId. Empty/undefined = no selection. */
+  selectedIds?: string[];
+  /** v5.4: selection changed (plain click selects solo, Ctrl toggles, Shift
+   *  ranges, marquee bands select, empty-space clicks clear). */
+  onSelectionChange?: (ids: string[]) => void;
+  /** v5.4: remove MANY clips in ONE undo step (toolbar trash + Delete key
+   *  act on the selection when present). */
+  onRemoveMany?: (ids: string[]) => void;
 }
 
 // v4.9: bar tints — the segment bar is now a FILMSTRIP (thumbnail shows
@@ -1113,6 +1124,7 @@ function FilmstripBar({
   idx,
   totalMs,
   isActive,
+  selected,
   onActivate,
   drag,
   trim,
@@ -1125,6 +1137,9 @@ function FilmstripBar({
   idx: number;
   totalMs: number;
   isActive: boolean;
+  /** v5.4: user-selected (amber ring) — distinct from isActive (cyan,
+   *  playhead-derived). */
+  selected?: boolean;
   /** Double-click (and Enter/Space when draggable) — jump to first frame. */
   onActivate: (e: { stopPropagation: () => void }) => void;
   /** v5: pointer drag handlers (press-seek + move/lane-switch gestures). */
@@ -1195,6 +1210,7 @@ function FilmstripBar({
         dragging ? "ff-clip-drag transition-none" : "transition-all duration-150",
         seg.kind === "beat" && !isActive && "ff-beat-pulse",
         isActive && "ff-clip-active",
+        selected && "ff-clip-selected",
         dragging && "cursor-grabbing",
       )}
       style={{
@@ -1349,6 +1365,9 @@ export function TimelineRuler({
   onMusicMove,
   onMusicLoopChange,
   onMusicVolumeChange,
+  selectedIds: selectedIdsProp,
+  onSelectionChange,
+  onRemoveMany,
 }: TimelineRulerProps) {
   const trackRef = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
@@ -1365,6 +1384,31 @@ export function TimelineRuler({
   // pointerup — the same shape as the v4.9 scrub pattern.
   const dragRef = useRef<DragInfo | null>(null);
   const [dragPreview, setDragPreview] = useState<DragPreview | null>(null);
+
+  // v5.4 multi-select -------------------------------------------------------
+  // Click-selection anchor (for Shift ranges) + marquee (rubber-band) gesture
+  // state. The SELECTION SET itself lives in the parent (page.tsx) so the
+  // Delete key, Ctrl+A and future group ops share one source of truth.
+  const anchorIdRef = useRef<string | null>(null);
+  const marqueeOriginRef = useRef<{
+    x: number;
+    y: number;
+    pointerId: number;
+    additive: boolean;
+  } | null>(null);
+  const marqueeActiveRef = useRef(false);
+  const marqueeBaseSelRef = useRef<string[]>([]);
+  const marqueeRectRef = useRef<DOMRect | null>(null);
+  /** Rubber band in CONTENT-LOCAL px (render-ready; null when idle). */
+  const [marquee, setMarquee] = useState<{
+    x0: number;
+    y0: number;
+    x1: number;
+    y1: number;
+  } | null>(null);
+  const baseAxisRef = useRef<HTMLDivElement>(null);
+  const overlayAxisRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
 
   // v5 mode: ANY new prop present => render the 4-lane editor; otherwise the
   // exact v4.9 single-track layout (page.tsx keeps working unchanged).
@@ -1762,13 +1806,54 @@ export function TimelineRuler({
     });
   };
 
+  /**
+   * v5.4: compute the NEXT selection for a plain CLICK on a clip.
+   *   Shift       → contiguous range from the anchor clip (full segment
+   *                 order — stable across lanes; no anchor yet = solo).
+   *   Ctrl / Cmd  → toggle this clip in/out of the current set.
+   *   plain       → solo-select (the standard "click = select" contract).
+   */
+  const clickSelectionFor = (
+    id: string,
+    e: { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean },
+  ): string[] => {
+    const cur = selectedIdsProp ?? [];
+    if (e.shiftKey) {
+      const anchor = anchorIdRef.current;
+      if (anchor && anchor !== id) {
+        const idxOf = new Map(segments.map((s, i) => [s.id, i] as const));
+        const a = idxOf.get(anchor);
+        const b = idxOf.get(id);
+        if (a != null && b != null) {
+          const [lo, hi] = a <= b ? [a, b] : [b, a];
+          return segments.slice(lo, hi + 1).map((s) => s.id);
+        }
+      }
+      return [id];
+    }
+    if (e.ctrlKey || e.metaKey) {
+      return cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id];
+    }
+    return cur.length === 1 && cur[0] === id ? cur : [id];
+  };
+
   const handleClipPointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
     const d = dragRef.current;
     if (!d || d.kind !== "clip" || d.pointerId !== e.pointerId) return;
     dragRef.current = null;
     setDragPreview(null);
-    // No drag = plain click; the press already sought (v4.9 parity).
-    if (!d.didDrag || !onEditItem) return;
+    // v5.4: plain click (no drag) = selection. The press already sought
+    // (v4.9 parity) — the click ALSO selects, so the amber selection ring
+    // follows user intent while the cyan active ring keeps tracking the
+    // playhead. Drags (didDrag) edit, not select.
+    if (!d.didDrag) {
+      if (onSelectionChange) {
+        onSelectionChange(clickSelectionFor(d.id, e));
+        anchorIdRef.current = d.id;
+      }
+      return;
+    }
+    if (!onEditItem) return;
     const r = computeClipDrag(d, e.clientX, e.clientY, totalMs);
     const patch: Partial<ItemEdit> = {};
     if (d.gesture === "move") {
@@ -1930,11 +2015,162 @@ export function TimelineRuler({
         };
   })();
 
+  // ------------------------------------------------------------------
+  // v5.4 MARQUEE (rubber-band) selection — base + overlay lanes.
+  // Press on empty lane space keeps the v4.9 seek parity; moving past the
+  // deadzone CONVERTS the gesture into a rubber band that live-selects
+  // intersecting clips (both lanes; pointer capture keeps events flowing
+  // across lane borders). Shift-drag ADDS to the existing selection; a plain
+  // click on empty space clears it (editor standard).
+  // ------------------------------------------------------------------
+
+  /** Clip ids whose [start,end] window intersects the marquee band. Lane
+   *  participation is vertical: a lane is scanned only when the band reaches
+   *  into its own row band (client-space rects of the lane axis divs). */
+  const marqueeClipIds = (
+    x0: number,
+    x1: number,
+    y0: number,
+    y1: number,
+  ): string[] => {
+    const minX = Math.min(x0, x1);
+    const maxX = Math.max(x0, x1);
+    const minY = Math.min(y0, y1);
+    const maxY = Math.max(y0, y1);
+    const ids: string[] = [];
+    const scan = (axisEl: HTMLElement | null, segs: MediaSegment[]) => {
+      if (!axisEl || segs.length === 0) return;
+      const r = axisEl.getBoundingClientRect();
+      if (maxY < r.top || minY > r.bottom) return; // lane untouched
+      for (const s of segs) {
+        const sx0 =
+          r.left +
+          (layout
+            ? layout.pxOf(s.startMs)
+            : (s.startMs / Math.max(1, totalMs)) * r.width);
+        const sx1 =
+          r.left +
+          (layout
+            ? layout.pxOf(s.endMs)
+            : (s.endMs / Math.max(1, totalMs)) * r.width);
+        if (sx1 >= minX && sx0 <= maxX) ids.push(s.id);
+      }
+    };
+    scan(baseAxisRef.current, baseSegs);
+    scan(overlayAxisRef.current, overlaySegs);
+    return ids;
+  };
+
+  const handleLaneMarqueeDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    // Press = v4.9 seek parity (scrub may still happen below deadzone)…
+    dragging.current = true;
+    setScrubbing(true);
+    try {
+      // Capture on the LANE AXIS itself — empty-space targets (hints, lane
+      // background) are not stable drag surfaces.
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // best-effort — bubbling still delivers the events
+    }
+    onSeek(xToMs(e.clientX));
+    // …and record the origin so a move can convert into a rubber band.
+    marqueeOriginRef.current = {
+      x: e.clientX,
+      y: e.clientY,
+      pointerId: e.pointerId,
+      additive: e.shiftKey,
+    };
+  };
+
+  const handleLaneMarqueeMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const o = marqueeOriginRef.current;
+    if (o && o.pointerId === e.pointerId) {
+      const dx = e.clientX - o.x;
+      const dy = e.clientY - o.y;
+      if (
+        marqueeActiveRef.current ||
+        Math.abs(dx) > DRAG_DEADZONE_PX ||
+        Math.abs(dy) > DRAG_DEADZONE_PX
+      ) {
+        if (!marqueeActiveRef.current) {
+          // Convert: stop scrubbing, snapshot the additive base selection and
+          // the content rect (client → content-local mapping for the band).
+          marqueeActiveRef.current = true;
+          dragging.current = false;
+          setScrubbing(false);
+          marqueeBaseSelRef.current = o.additive ? selectedIdsProp ?? [] : [];
+          marqueeRectRef.current =
+            contentRef.current?.getBoundingClientRect() ?? null;
+        }
+        const cr = marqueeRectRef.current;
+        if (cr) {
+          setMarquee({
+            x0: o.x - cr.left,
+            y0: o.y - cr.top,
+            x1: e.clientX - cr.left,
+            y1: e.clientY - cr.top,
+          });
+        }
+        const band = marqueeClipIds(o.x, e.clientX, o.y, e.clientY);
+        const next =
+          marqueeBaseSelRef.current.length > 0
+            ? Array.from(new Set([...marqueeBaseSelRef.current, ...band]))
+            : band;
+        onSelectionChange?.(next);
+        return;
+      }
+    }
+    // Deadzone not passed (or not our gesture) — legacy scrub + hover ghost.
+    handlePointerMove(e);
+  };
+
+  const handleLaneMarqueeUp = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const o = marqueeOriginRef.current;
+    // A pointerup is a LANE gesture only when THIS lane received the matching
+    // pointerdown (clip pills stopPropagation on the way DOWN, but their UP
+    // events bubble here — treating those as empty-space clicks would wipe
+    // the selection the clip's own handler just committed).
+    const wasLaneGesture = o != null && o.pointerId === e.pointerId;
+    const wasMarquee = marqueeActiveRef.current;
+    marqueeOriginRef.current = null;
+    marqueeActiveRef.current = false;
+    if (!wasLaneGesture) return; // bubbled release from a clip above — ignore
+    if (wasMarquee) {
+      setMarquee(null);
+      return; // selection already committed live during the drag
+    }
+    // Plain click on empty lane space clears the selection.
+    if (onSelectionChange && (selectedIdsProp?.length ?? 0) > 0) {
+      onSelectionChange([]);
+    }
+    handlePointerUp();
+  };
+
+  const handleLaneMarqueeAbort = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const o = marqueeOriginRef.current;
+    if (o == null || o.pointerId !== e.pointerId) return; // not our gesture
+    const wasMarquee = marqueeActiveRef.current;
+    marqueeOriginRef.current = null;
+    marqueeActiveRef.current = false;
+    if (wasMarquee) setMarquee(null);
+    handlePointerUp();
+  };
+
   const scrubHandlers = {
     onPointerDown: handlePointerDown,
     onPointerMove: handlePointerMove,
     onPointerUp: handlePointerUp,
     onPointerCancel: handlePointerUp,
+  };
+
+  /** v5.4: base + overlay lane axes use the marquee-aware handlers (press
+   *  still seeks; drag past the deadzone rubber-bands). The ruler strip,
+   *  playhead grabber, audio + SFX lanes keep the pure scrub handlers. */
+  const laneMarqueeHandlers = {
+    onPointerDown: handleLaneMarqueeDown,
+    onPointerMove: handleLaneMarqueeMove,
+    onPointerUp: handleLaneMarqueeUp,
+    onPointerCancel: handleLaneMarqueeAbort,
   };
 
   const empty = segments.length === 0 && (!isV5 || sfxList.length === 0);
@@ -1958,6 +2194,11 @@ export function TimelineRuler({
     onSplit != null &&
     currentMs > activeSegment.startMs + 100 &&
     currentMs < activeSegment.endMs - 100;
+
+  // v5.4 selection derived (kept cheap — these arrays are tiny).
+  const selCount = selectedIdsProp?.length ?? 0;
+  const isSel = (id: string) =>
+    !!selectedIdsProp && selectedIdsProp.includes(id);
 
   /** Small icon button (28px, header undo/redo styling — v5.1: disabled
    *  reads at 40% opacity, danger hovers red, tooltip + aria-label). */
@@ -2060,6 +2301,29 @@ export function TimelineRuler({
               </span>
             </span>
           )}
+          {/* v5.4: multi-select count chip — amber accent (distinct from the
+              cyan playhead-position chip). X clears; Esc does the same. */}
+          {isV5 && selCount > 0 && (
+            <span
+              className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-bold tabular-nums normal-case"
+              style={{ backgroundColor: "rgba(69, 26, 3, 0.55)", color: "#fcd34d" }}
+              title="Selected clips — Del removes all of them, Esc clears · click, Ctrl-click, Shift-click or drag a band on an empty lane to select"
+            >
+              <Layers className="size-2.5" aria-hidden />
+              {selCount} selected
+              {onSelectionChange && (
+                <button
+                  type="button"
+                  onClick={() => onSelectionChange([])}
+                  aria-label="Clear selection (Esc)"
+                  title="Clear selection (Esc)"
+                  className="-mr-0.5 rounded p-0.5 transition-colors hover:bg-amber-400/25"
+                >
+                  <X className="size-2.5" aria-hidden />
+                </button>
+              )}
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-3 text-[9px] text-zinc-500">
           <span className="flex items-center gap-1">
@@ -2133,11 +2397,15 @@ export function TimelineRuler({
             )}
             {toolBtn(
               <Trash2 className="size-4" />,
-              "Delete (Del)",
-              hasActive && onRemove && activeSegment
-                ? () => onRemove(activeSegment.id)
-                : undefined,
-              !hasActive,
+              selCount > 1
+                ? `Delete ${selCount} selected clips (Del)`
+                : "Delete (Del)",
+              selCount > 0 && onRemoveMany && selectedIdsProp
+                ? () => onRemoveMany(selectedIdsProp)
+                : hasActive && onRemove && activeSegment
+                  ? () => onRemove(activeSegment.id)
+                  : undefined,
+              selCount === 0 && !hasActive,
               { danger: true },
             )}
           </div>
@@ -2229,6 +2497,7 @@ export function TimelineRuler({
             style={{ paddingTop: 7 }}
           >
           <div
+            ref={contentRef}
             className="relative flex flex-col"
             style={{
               width: Math.max(GUTTER_W + axisW, viewportW || GUTTER_W + axisW),
@@ -2262,9 +2531,10 @@ export function TimelineRuler({
           >
             <LaneLabel icon={Clapperboard} text="Video" accent="#22d3ee" sticky />
             <div
+              ref={baseAxisRef}
               className="relative min-w-0 shrink-0 transition-colors hover:bg-white/[0.02]"
               style={{ width: axisW }}
-              {...scrubHandlers}
+              {...laneMarqueeHandlers}
             >
               {baseSegs.length === 0 ? (
                 <EmptyHint>No base clips — media stacks here</EmptyHint>
@@ -2290,6 +2560,7 @@ export function TimelineRuler({
                           idx={idx}
                           totalMs={totalMs}
                           isActive={seg.id === activeId}
+                          selected={isSel(seg.id)}
                           onActivate={jumpToSeg(seg)}
                           drag={
                             onEditItem
@@ -2364,9 +2635,10 @@ export function TimelineRuler({
           >
             <LaneLabel icon={Layers} text="OVL" accent="#a78bfa" sticky />
             <div
+              ref={overlayAxisRef}
               className="relative min-w-0 shrink-0 transition-colors hover:bg-white/[0.02]"
               style={{ width: axisW }}
-              {...scrubHandlers}
+              {...laneMarqueeHandlers}
             >
               {overlaySegs.length === 0 ? (
                 <EmptyHint>
@@ -2392,12 +2664,13 @@ export function TimelineRuler({
                         };
                   const isVideo = seg.mediaType === "video";
                   const draggable = !!onEditItem;
+                  const ovSelected = isSel(seg.id);
                   return (
                     <div
                       key={seg.id}
                       role={draggable ? "button" : undefined}
                       tabIndex={draggable ? 0 : undefined}
-                      aria-label={`${seg.fileName}, overlay clip, ${fmtTimecode(startMs)} to ${fmtTimecode(startMs + durMs)}`}
+                      aria-label={`${seg.fileName}, overlay clip, ${fmtTimecode(startMs)} to ${fmtTimecode(startMs + durMs)}${ovSelected ? ", selected" : ""}`}
                       className={cn(
                         // v5.1 CapCut card: 6px radius, hover lift + cyan
                         // hairline outline, edge-trim zones (below) glow
@@ -2407,6 +2680,9 @@ export function TimelineRuler({
                         draggable
                           ? "cursor-grab touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-violet-300/70"
                           : "cursor-pointer",
+                        // v5.4: amber selection ring (outline — never fights the
+                        // inline boxShadow states below).
+                        ovSelected && "ff-clip-selected",
                         pv != null
                           ? "z-[3] cursor-grabbing transition-none"
                           : "transition-all duration-150 hover:-translate-y-px hover:outline hover:outline-1 hover:outline-cyan-500/40",
@@ -2418,16 +2694,24 @@ export function TimelineRuler({
                         height: OV_ROW_H,
                         // Video overlays tint amber, image overlays violet —
                         // kind at a glance over a dark surface, app palette.
-                        backgroundColor: isVideo
-                          ? "rgba(251, 191, 36, 0.15)"
-                          : "rgba(139, 92, 246, 0.20)",
-                        borderColor: isVideo
-                          ? "rgba(251, 191, 36, 0.42)"
-                          : "rgba(139, 92, 246, 0.55)",
+                        // v5.4: a SELECTED clip swaps its kind tint for the
+                        // amber selection accent so the ring reads instantly.
+                        backgroundColor: ovSelected
+                          ? "rgba(245, 158, 11, 0.22)"
+                          : isVideo
+                            ? "rgba(251, 191, 36, 0.15)"
+                            : "rgba(139, 92, 246, 0.20)",
+                        borderColor: ovSelected
+                          ? "rgba(245, 158, 11, 0.85)"
+                          : isVideo
+                            ? "rgba(251, 191, 36, 0.42)"
+                            : "rgba(139, 92, 246, 0.55)",
                         boxShadow:
                           pv != null
                             ? "0 0 0 1.5px rgba(255,255,255,0.65), 0 4px 12px rgba(0,0,0,0.6)"
-                            : "0 1px 3px rgba(0,0,0,0.45)",
+                            : ovSelected
+                              ? "0 0 0 1px rgba(245,158,11,0.4), 0 0 12px rgba(245,158,11,0.22), 0 1px 3px rgba(0,0,0,0.45)"
+                              : "0 1px 3px rgba(0,0,0,0.45)",
                       }}
                       title={`${seg.fileName} · overlay T${seg.track} · ${fmtTimecode(startMs)}–${fmtTimecode(startMs + durMs)} · ${(durMs / 1000).toFixed(1)}s${draggable ? "\ndrag to move · edges trim · drag down to the Video lane" : ""}\ndouble-click jumps to this clip's first frame`}
                       onDoubleClick={(e) => {
@@ -2882,6 +3166,22 @@ export function TimelineRuler({
             </div>
           </div>
 
+          {/* v5.4: marquee rubber band (content-local px) — amber tint to
+              match the selection accent; lives above the clips (z-8), below
+              the playhead, and never intercepts pointer events. */}
+          {marquee != null && (
+            <div
+              className="ff-marquee pointer-events-none absolute z-[8]"
+              style={{
+                left: Math.min(marquee.x0, marquee.x1),
+                top: Math.min(marquee.y0, marquee.y1),
+                width: Math.abs(marquee.x1 - marquee.x0),
+                height: Math.abs(marquee.y1 - marquee.y0),
+              }}
+              aria-hidden
+            />
+          )}
+
           {/* Drop-target highlight while a vertical lane switch is past the
               threshold (emerald = Video lane, violet = Overlay lane). */}
           {dropTarget && (
@@ -2910,8 +3210,8 @@ export function TimelineRuler({
             grab={isV5 ? scrubHandlers : undefined}
           />
 
-          {/* Hover ghost — hidden while scrubbing OR dragging. */}
-          {hoverMs != null && !scrubbing && dragPreview == null && (
+          {/* Hover ghost — hidden while scrubbing, dragging or marqueeing. */}
+          {hoverMs != null && !scrubbing && dragPreview == null && marquee == null && (
             <HoverGhost
               leftCss={{
                 left: layout

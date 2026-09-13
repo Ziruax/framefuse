@@ -260,6 +260,18 @@ export default function Page() {
   const [videoThumbnails, setVideoThumbnails] = useState<Record<string, string>>({});
   /** SFX placements on the master timeline (preview-scheduled + exported). */
   const [sfxItems, setSfxItems] = useState<SfxItem[]>([]);
+  /** v5.4: timeline multi-select — ids of clips the USER selected (click /
+   *  Ctrl-click / Shift-click / marquee / Ctrl+A). Deliberately NOT
+   *  persisted and NOT playhead-derived (activeSegment covers that): the
+   *  selection is transient editing intent, cleared by Esc / empty clicks /
+   *  deleting. */
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  /** Latest-value refs for the global keydown listener (the exportRef
+   *  pattern — the listener never re-binds). Synced BELOW, after the
+   *  timeline memo (TS block-scoping: the effect must textually follow the
+   *  declarations it reads). */
+  const selectedIdsRef = useRef<string[]>([]);
+  const timelineSegmentsRef = useRef<MediaSegment[]>([]);
 
   // Restore persisted settings AFTER mount (client-only, hydration-safe).
   // Reading localStorage in the state initializers made the first client
@@ -408,6 +420,13 @@ export default function Page() {
         : null,
     [timeline.segments, currentMs],
   );
+
+  // v5.4: latest-value ref sync for the global keydown listener (runs after
+  // every render — the listener itself never re-binds).
+  useEffect(() => {
+    selectedIdsRef.current = selectedIds;
+    timelineSegmentsRef.current = timeline.segments;
+  }, [selectedIds, timeline.segments]);
 
   /** v5.2: "Match source aspect" — the active video wins, else the first
    *  video with probed dims. Enabled only when its closest aspect differs
@@ -1701,6 +1720,11 @@ export default function Page() {
     requestHistoryPush();
     // The object URL stays alive (undo-safe) — revoked on unmount only.
     setItems((prev) => prev.filter((i) => i.id !== id));
+    // v5.4: drop the clip from the multi-selection so deleted ids never
+    // linger (the timeline renders them as ghosts otherwise).
+    setSelectedIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : prev,
+    );
     setOverrides((prev) => {
       if (!(id in prev)) return prev;
       const next = { ...prev };
@@ -1743,6 +1767,71 @@ export default function Page() {
       return { ...prev, overrides: nextOverrides };
     });
   }, [requestHistoryPush]);
+
+  /** v5.4: remove MANY clips in ONE undo step — the multi-select Delete.
+   *  Single-clip calls delegate to removeItem (identical semantics); the
+   *  batch prunes every id-keyed map in one pass so one Ctrl+Z restores the
+   *  whole group byte-perfect. */
+  const removeItems = useCallback(
+    (ids: string[]) => {
+      if (ids.length === 0) return;
+      if (ids.length === 1) {
+        removeItem(ids[0]);
+        return;
+      }
+      requestHistoryPush();
+      const kill = new Set(ids);
+      setItems((prev) => prev.filter((i) => !kill.has(i.id)));
+      setOverrides((prev) => {
+        let changed = false;
+        const next: Record<string, number> = {};
+        for (const [k, v] of Object.entries(prev)) {
+          if (kill.has(k)) changed = true;
+          else next[k] = v;
+        }
+        return changed ? next : prev;
+      });
+      setMotionOverrides((prev) => {
+        let changed = false;
+        const next: Record<string, KenBurnsDirection> = {};
+        for (const [k, v] of Object.entries(prev)) {
+          if (kill.has(k)) changed = true;
+          else next[k] = v;
+        }
+        return changed ? next : prev;
+      });
+      setItemEdits((prev) => {
+        let changed = false;
+        const next: Record<string, ItemEdit> = {};
+        for (const [k, v] of Object.entries(prev)) {
+          if (kill.has(k)) changed = true;
+          else next[k] = v;
+        }
+        return changed ? next : prev;
+      });
+      setVideoDurations((prev) => {
+        let changed = false;
+        const next: Record<string, number> = {};
+        for (const [k, v] of Object.entries(prev)) {
+          if (kill.has(k)) changed = true;
+          else next[k] = v;
+        }
+        return changed ? next : prev;
+      });
+      setTransitionSettings((prev) => {
+        if (!prev.overrides) return prev;
+        let changed = false;
+        const nextOverrides: NonNullable<typeof prev.overrides> = {};
+        for (const [k, v] of Object.entries(prev.overrides)) {
+          if (kill.has(k)) changed = true;
+          else nextOverrides[k] = v;
+        }
+        return changed ? { ...prev, overrides: nextOverrides } : prev;
+      });
+      setSelectedIds([]);
+    },
+    [requestHistoryPush, removeItem],
+  );
 
   const overrideDuration = useCallback((id: string, durationMs: number) => {
     requestHistoryPush(600);
@@ -2809,6 +2898,8 @@ const handleRandomTransitionMix = useCallback(() => {
   // Space: play/pause · ←/→: seek ±1s · Shift+←/→: prev/next segment
   // Ctrl/Cmd+Z: undo · Ctrl/Cmd+Shift+Z / Ctrl+Y: redo
   // v5.1: S = split at playhead · Delete/Backspace = remove active clip.
+  // v5.4: Delete removes the SELECTION when present · Esc clears the
+  // selection · Ctrl/Cmd+A selects every clip on the timeline.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
@@ -2830,6 +2921,21 @@ const handleRandomTransitionMix = useCallback(() => {
       } else if (mod && (e.key === "y" || e.key === "Y")) {
         e.preventDefault();
         redo();
+      } else if (mod && (e.key === "a" || e.key === "A")) {
+        // v5.4: select every clip (base + overlay). Inputs are guarded
+        // above, so this only fires on app-chrome focus.
+        if (timelineSegmentsRef.current.length > 0) {
+          e.preventDefault();
+          setSelectedIds(timelineSegmentsRef.current.map((s) => s.id));
+        }
+      } else if (e.key === "Escape") {
+        // v5.4: clear the timeline multi-selection. (PreviewPanel's Esc —
+        // cancelling an on-canvas PiP drag — has its own focused handler;
+        // a stray co-fire only costs the selection, never data.)
+        if (selectedIdsRef.current.length > 0) {
+          e.preventDefault();
+          setSelectedIds([]);
+        }
       } else if (e.key === " " || e.code === "Space") {
         e.preventDefault();
         togglePlay();
@@ -2852,14 +2958,21 @@ const handleRandomTransitionMix = useCallback(() => {
         (e.key === "Delete" || e.key === "Backspace") &&
         !mod
       ) {
-        // v5.1: remove the active clip (guarded above against inputs).
+        // v5.4: the SELECTION wins over the playhead clip (editor standard
+        // — Del acts on what the user picked); falls back to the active clip.
         e.preventDefault();
-        removeActiveRef.current();
+        const sel = selectedIdsRef.current;
+        if (sel.length > 0) {
+          removeItems(sel);
+          setSelectedIds([]);
+        } else {
+          removeActiveRef.current();
+        }
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, seek, stepSegment, undo, redo]);
+  }, [togglePlay, seek, stepSegment, undo, redo, removeItems]);
 
   // ---- Cleanup object URLs on unmount -------------------------------------
   // URLs are deliberately kept alive during the whole session so undo can
@@ -3157,6 +3270,10 @@ const handleRandomTransitionMix = useCallback(() => {
             onDuplicate={duplicateItem}
             onRemove={removeItem}
             activeSegment={activeSegment}
+            // ---- v5.4: multi-select (click / Ctrl / Shift / marquee) ----
+            selectedIds={selectedIds}
+            onSelectionChange={setSelectedIds}
+            onRemoveMany={removeItems}
             // ---- v5.2: music placement (draggable clip on the audio lane) ----
             musicStartMs={audioSettings.musicStartMs}
             musicLoop={audioSettings.musicLoop}
