@@ -244,6 +244,11 @@ interface PreviewPanelProps {
    *  keyboard nudge). Receives the FULL new transform; the `position`
    *  field is kept as-is (x/y override it downstream in overlayGeometry). */
   onOverlayTransformChange?: (segId: string, transform: OverlayTransform) => void;
+  /** v1.3: master output volume (0..2) applied to the AUDIBLE preview
+   *  (active base clip audio + music + SFX). Capped at 1 per source by the
+   *  HTMLMediaElement/gain ranges — the >1 boost remains export-only,
+   *  same convention as the music volume knob. Default 1. */
+  masterVolume?: number;
 }
 
 /** v4.8: which concrete motion does a click at (nx, ny) ∈ [0,1]² aim at?
@@ -302,6 +307,7 @@ export function PreviewPanel({
   onMatchAspect,
   canMatchAspect,
   onOverlayTransformChange,
+  masterVolume = 1,
 }: PreviewPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const chromeRef = useRef<HTMLCanvasElement | null>(null);
@@ -925,6 +931,13 @@ export function PreviewPanel({
     // and pause; playing → play() at playbackRate=speed + drift-correct over
     // 120ms; segment exit → pause. Muted always (audio comes from the
     // music/SFX tracks; the export handles real clip audio).
+    // v1.3 CLIP-AUDIO PREVIEW: the ACTIVE BASE clip's element is now
+    // UNMUTED (volume = per-segment volume × master, both capped at 1 —
+    // HTMLMediaElement.volume throws above 1, so the >1 boost ranges stay
+    // export-only, same convention as the music knob). Overlays and
+    // inactive elements stay muted; a play() rejection (unmuted autoplay
+    // without a user gesture) falls back to MUTED playback so the picture
+    // never regresses.
     // v5.1: SPEED — source-time mapping is trimIn + local·speed (the export's
     // setpts twin); the element plays at playbackRate=speed so wall-clock
     // playback advances source time at the same rate and the 120ms drift
@@ -934,7 +947,25 @@ export function PreviewPanel({
     // -stream_loop -1) so a short green-screen clip spans its whole
     // (longer) timeline window; the element itself gets loop=true so native
     // playback wraps identically.
-    const syncVideoTo = (el: HTMLVideoElement, vSeg: MediaSegment | null) => {
+    const syncVideoTo = (
+      el: HTMLVideoElement,
+      vSeg: MediaSegment | null,
+      isBase: boolean,
+    ) => {
+      // v1.3: audible only for the active BASE clip while it has a segment.
+      if (vSeg && isBase) {
+        const segVol =
+          vSeg.volume != null && Number.isFinite(vSeg.volume)
+            ? Math.max(0, Math.min(2, vSeg.volume))
+            : 1;
+        const master = Number.isFinite(masterVolume)
+          ? Math.max(0, Math.min(2, masterVolume))
+          : 1;
+        el.volume = Math.max(0, Math.min(1, segVol * master));
+        el.muted = false;
+      } else {
+        if (!el.muted) el.muted = true;
+      }
       if (!vSeg) {
         if (!el.paused) el.pause();
         if (el.loop) el.loop = false;
@@ -987,7 +1018,17 @@ export function PreviewPanel({
           /* noop */
         }
       }
-      if (el.paused) el.play().catch(() => { /* no data yet / autoplay */ });
+      if (el.paused) {
+        el.play().catch(() => {
+          // v1.3: unmuted play() was rejected (autoplay policy — no user
+          // gesture yet). Fall back to MUTED playback so the preview video
+          // itself never stops rendering.
+          if (!el.muted) {
+            el.muted = true;
+            el.play().catch(() => { /* no data yet */ });
+          }
+        });
+      }
     };
 
     if (videoEls.size > 0) {
@@ -1002,9 +1043,10 @@ export function PreviewPanel({
             seg && seg.id === id
               ? seg
               : activeOverlays.find((o) => o.id === id) ?? null;
-          syncVideoTo(el, vSeg);
+          // v1.3: only the active BASE segment is audible (isBase flag).
+          syncVideoTo(el, vSeg, !!(seg && seg.id === id));
         } else {
-          syncVideoTo(el, null); // segment exit → pause
+          syncVideoTo(el, null, false); // segment exit → pause
         }
       }
     }

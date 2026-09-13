@@ -861,7 +861,13 @@ export default function Page() {
         const src = ctx.createBufferSource();
         src.buffer = buf;
         const gain = ctx.createGain();
-        gain.gain.value = item.volume;
+        // v1.3: master volume scales SFX too (capped at 1 — export-only boost).
+        const masterVol =
+          audioSettings.masterVolume != null &&
+          Number.isFinite(audioSettings.masterVolume)
+            ? Math.max(0, Math.min(2, audioSettings.masterVolume))
+            : 1;
+        gain.gain.value = Math.max(0, Math.min(1, item.volume * masterVol));
         src.connect(gain);
         gain.connect(ctx.destination);
         try {
@@ -876,7 +882,7 @@ export default function Page() {
         }
       }
     },
-    [getSfxAudioContext, getSfxBuffer, stopSfxSources],
+    [getSfxAudioContext, getSfxBuffer, stopSfxSources, audioSettings.masterVolume],
   );
 
   // Reschedule whenever playback starts or the placement list changes while
@@ -917,14 +923,24 @@ export default function Page() {
 
   /** v5.2: push the computed music position onto the element (pause when the
    *  playhead sits outside the music window; re-sync on >0.25s drift while
-   *  playing so loop wraps + late starts stay locked to the timeline). */
+   *  playing so loop wraps + late starts stay locked to the timeline).
+   *  v1.3: the master volume scales the music element too (capped at 1 —
+   *  the >1 boost ranges are export-only). */
   const syncMusicElement = useCallback(
     (timelineMs: number, playing: boolean) => {
       const el = audioRef.current;
       if (!el || !audioTrack) return;
       // HTMLMediaElement.volume is 0..1 (values >1 throw) — the >1 boost
       // range is an EXPORT-only gain (FFmpeg volume filter).
-      el.volume = Math.max(0, Math.min(1, audioSettings.musicVolume));
+      const master =
+        audioSettings.masterVolume != null &&
+        Number.isFinite(audioSettings.masterVolume)
+          ? Math.max(0, Math.min(2, audioSettings.masterVolume))
+          : 1;
+      el.volume = Math.max(
+        0,
+        Math.min(1, audioSettings.musicVolume * master),
+      );
       const pos = musicPosFor(timelineMs);
       if (pos == null) {
         if (!el.paused) el.pause();
@@ -940,7 +956,7 @@ export default function Page() {
       if (playing && el.paused) el.play().catch(() => {});
       if (!playing && !el.paused) el.pause();
     },
-    [audioTrack, audioSettings.musicVolume, musicPosFor],
+    [audioTrack, audioSettings.musicVolume, audioSettings.masterVolume, musicPosFor],
   );
 
   useEffect(() => {
@@ -985,9 +1001,17 @@ export default function Page() {
   // v5.2: live volume changes apply to the element even while paused.
   useEffect(() => {
     if (audioRef.current) {
-      audioRef.current.volume = Math.max(0, Math.min(1, audioSettings.musicVolume));
+      const master =
+        audioSettings.masterVolume != null &&
+        Number.isFinite(audioSettings.masterVolume)
+          ? Math.max(0, Math.min(2, audioSettings.masterVolume))
+          : 1;
+      audioRef.current.volume = Math.max(
+        0,
+        Math.min(1, audioSettings.musicVolume * master),
+      );
     }
-  }, [audioSettings.musicVolume, audioTrack]);
+  }, [audioSettings.musicVolume, audioSettings.masterVolume, audioTrack]);
 
   // ---- Detect Electron + wire app-menu accelerators -----------------------
   const exportRef = useRef<() => void>(() => {});
@@ -3743,6 +3767,7 @@ const handleRandomTransitionMix = useCallback(() => {
                 requestHistoryPush();
                 applyItemEdit(segId, { overlay: t });
               }}
+              masterVolume={audioSettings.masterVolume ?? 1}
             />
           </div>
           {/* v5.2 (task 3-b): row splitter — drag to resize the timeline

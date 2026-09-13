@@ -517,6 +517,10 @@ export interface ExportNativeOptions {
 export interface AudioSettings {
   /** Normalize loudness to -16 LUFS (social-media standard) via ffmpeg loudnorm. */
   normalize: boolean;
+  /** v1.3: master output volume 0..2 (1 = unity) — scales the SUMMED mix
+   *  (clip audio + music + SFX) after per-source volumes, before the
+   *  limiter. Optional; omitted/invalid → 1 (v1.2 behavior). */
+  masterVolume?: number;
   /** Fade-in duration in ms (0 = off). */
   fadeInMs: number;
   /** Fade-out duration in ms (0 = off). */
@@ -533,6 +537,7 @@ export interface AudioSettings {
 export function defaultAudioSettings(): AudioSettings {
   return {
     normalize: false,
+    masterVolume: 1,
     fadeInMs: 0,
     fadeOutMs: 0,
     musicVolume: 1,

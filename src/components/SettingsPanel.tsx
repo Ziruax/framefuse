@@ -1293,6 +1293,43 @@ export function SettingsPanel(props: SettingsPanelProps) {
           className={cn("pb-2 pt-2", tab === "audio" ? "ff-tab-panel-in" : "hidden")}
         >
           <Section icon={<AudioLines size={13} />} title="Audio" defaultOpen>
+            {/* ── v1.3: master output volume (scales the summed mix) ─────── */}
+            <Row label="Master volume">
+              <div className="flex items-center gap-2">
+                <input
+                  type="range"
+                  min={0}
+                  max={200}
+                  step={5}
+                  value={Math.round(
+                    Math.max(0, Math.min(2, audioSettings.masterVolume ?? 1)) * 100,
+                  )}
+                  onChange={(e) =>
+                    onAudioSettingsChange({
+                      ...audioSettings,
+                      masterVolume: Math.max(
+                        0,
+                        Math.min(2, Number(e.target.value) / 100),
+                      ),
+                    })
+                  }
+                  className="w-28 accent-violet-400"
+                  aria-label="Master output volume"
+                />
+                <span className="w-9 text-right text-[10px] tabular-nums text-zinc-400">
+                  {Math.round(
+                    Math.max(0, Math.min(2, audioSettings.masterVolume ?? 1)) * 100,
+                  )}
+                  %
+                </span>
+              </div>
+            </Row>
+            <p className="mb-3 mt-[-8px] text-[10px] leading-relaxed text-zinc-500">
+              Scales everything — clip audio, music and sound effects — after
+              their own volume settings. 100% leaves the mix untouched. The
+              preview caps each source at 100%; above-100% boosts apply on
+              export (a limiter guards against clipping).
+            </p>
             {/* ── v5.2: Background music placement ───────────────────────── */}
             {hasAudio ? (
               <>
@@ -1378,7 +1415,9 @@ export function SettingsPanel(props: SettingsPanelProps) {
               Measures every clip and the music track first, then masters each
               to −16 LUFS (social-media standard) with a static gain — evens
               out quiet/loud sources with none of the pumping of one-pass
-              normalization. Volume settings ride on top of the normalized
+              normalization. With several overlapping sources the summed mix
+              gets a final master measurement so the exported file always
+              lands at −16. Volume settings ride on top of the normalized
               audio.
             </p>
             <Field

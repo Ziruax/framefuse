@@ -2182,6 +2182,54 @@ ipcMain.handle("export-native", async (event, opts) => {
       loudnormCtx = await measureLoudnormContext(clipAudioJobs, audioPath);
     }
 
+    // ─── v1.3: MASTER-BUS loudnorm (render → measure → mux) ────────
+    // Per-source normalize lands each SOURCE at −16 LUFS, but N overlapping
+    // sources SUM above it (2 sources ≈ −13). A mastering stage on the summed
+    // mix — exactly what a DAW master chain does — makes the exported file
+    // land at −16 regardless of overlap count. The mix is deterministic, so:
+    //   (a) render the post-volume mix to a temp WAV (audio-only, fast; the
+    //       rawMix graph stops before limiter/pad), output -t bounded (the
+    //       looped music input is infinite here — no video stream to stop it);
+    //   (b) MEASURE that WAV (measureLoudnessAsync);
+    //   (c) the final mux uses the WAV as its single audio input with the
+    //       measured master loudnorm + limiter + pad (buildConcatArgs'
+    //       masterMix mode).
+    // Only when normalize is ON and ≥2 branches actually overlap-sum; a
+    // single branch is already at −16 (the per-source pass), and normalize
+    // OFF keeps the byte-identical v1.2 argv. A failed render or measurement
+    // falls back to the v1.2 direct graph — never to a failed export.
+    let masterMix = null;
+    const audioBranchCount =
+      (audioPath ? 1 : 0) + clipAudioJobs.length + sfxList.length;
+    if (
+      audio && audio.normalize && audioBranchCount >= 2 && actualTotalSec > 0
+    ) {
+      try {
+        const mixWavPath = path.join(tempDir, `mixmaster_${Date.now()}.wav`);
+        tempFiles.push(mixWavPath);
+        const renderArgs = G.buildAudioMixRenderArgs({
+          audioPath,
+          audio,
+          totalSec: actualTotalSec,
+          sfx: sfxList,
+          loudnorm: loudnormCtx,
+          clipAudio: clipAudioJobs.map((j) => ({
+            wavPath: j.wavPath,
+            startMs: j.startMs,
+            volume: j.volume,
+          })),
+          mixWavPath,
+        });
+        await runFfmpeg(renderArgs, actualTotalSec, () => {});
+        const masterMeasure = await measureLoudnessAsync(mixWavPath);
+        if (fs.existsSync(mixWavPath) && fs.statSync(mixWavPath).size > 44) {
+          masterMix = { wavPath: mixWavPath, loudnorm: masterMeasure };
+        }
+      } catch (_) {
+        masterMix = null; // render failed → v1.2 direct graph
+      }
+    }
+
     const concatContent = clipPaths.map(p => {
       const safePath = p.replace(/\\/g, "/").replace(/'/g, "'\\''");
       return `file '${safePath}'`;
@@ -2200,6 +2248,7 @@ ipcMain.handle("export-native", async (event, opts) => {
       totalSec: actualTotalSec,
       sfx: sfxList,
       loudnorm: loudnormCtx,
+      masterMix,
       audioKbps: abr,
       clipAudio: clipAudioJobs.map((j) => ({
         wavPath: j.wavPath,

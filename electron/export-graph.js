@@ -854,11 +854,78 @@ function buildAudioMixGraph(o) {
     );
     last = "[mix]";
   }
+  // v1.3 MASTER VOLUME: one gain on the summed mix (after every per-source
+  // volume, before the limiter). rawMix mode (the master-bus loudnorm
+  // pre-render) stops here — the limiter + pad move to the final mux -af.
+  const masterVol = clampNum(audio.masterVolume, 0, 2, 1);
+  const masterChain = masterVol !== 1 ? `volume=${String(masterVol)},` : "";
+  if (o && o.rawMix) {
+    parts.push(`${last}${masterChain}aformat=sample_rates=48000:channel_layouts=stereo[aout]`);
+    return { graph: parts.join(";"), outLabel: "[aout]" };
+  }
   // v5.2 master bus: amix with normalize=0 lets branches SUM above 0 dBFS
   // (music + clip + SFX) — a limiter right before the pad keeps int16 output
   // from hard-clipping (the standard master-chain practice in Shotcut et al).
-  parts.push(`${last}alimiter=limit=0.97:level=false,apad=whole_dur=${totalSec.toFixed(3)}[aout]`);
+  parts.push(`${last}${masterChain}alimiter=limit=0.97:level=false,apad=whole_dur=${totalSec.toFixed(3)}[aout]`);
   return { graph: parts.join(";"), outLabel: "[aout]" };
+}
+
+/**
+ * v1.3 MASTER-BUS RENDER: argv that renders the mixed audio (per-source
+ * normalize + volumes + adelay + amix + master volume) to a temp WAV — the
+ * first half of the master-bus loudnorm path. main.js then MEASURES this
+ * WAV and muxes it with the measured master gain (see buildConcatArgs'
+ * masterMix mode). Inputs: music (with loop flags) + clip WAVs + SFX WAVs,
+ * in that order — indexes are assigned here, 0-based.
+ * totalSec (the ACTUAL concat length) is passed through to the graph for the
+ * music fade-out alignment AND used as the output -t cap — the looped music
+ * input is infinite (amix duration=longest + no video stream here), so the
+ * render MUST be bounded or it would never terminate.
+ */
+function buildAudioMixRenderArgs(o) {
+  const audio = (o && o.audio) || {};
+  const totalSec = Number(o && o.totalSec) || 0;
+  const clipAudio = Array.isArray(o && o.clipAudio)
+    ? o.clipAudio.filter((c) => c && typeof c.wavPath === "string" && c.wavPath)
+    : [];
+  const sfxList = Array.isArray(o && o.sfx) ? o.sfx.filter((s) => s && typeof s.wavPath === "string" && s.wavPath) : [];
+  const hasMusic = !!o.audioPath;
+  const loopMusic = hasMusic && !!(audio.musicLoop);
+  const args = [];
+  let idx = 0;
+  if (hasMusic) {
+    if (loopMusic) args.push("-stream_loop", "-1");
+    args.push("-i", o.audioPath);
+    idx = 1;
+  }
+  const musicIdx = hasMusic ? 0 : -1;
+  const clipBase = idx;
+  clipAudio.forEach((c) => { args.push("-i", c.wavPath); idx += 1; });
+  const sfxBase = idx;
+  sfxList.forEach((s) => { args.push("-i", s.wavPath); idx += 1; });
+
+  const { graph } = buildAudioMixGraph({
+    totalSec,
+    audio,
+    clipAudio: clipAudio.map((c, k) => ({
+      inputIdx: clipBase + k,
+      startMs: c.startMs,
+      volume: c.volume,
+    })),
+    hasMusic,
+    musicInputIdx: musicIdx,
+    loudnorm: o.loudnorm,
+    rawMix: true,
+    sfx: sfxList.map((s, k) => ({ inputIdx: sfxBase + k, startMs: s.startMs, volume: s.volume })),
+  });
+  args.push(
+    "-filter_complex", graph,
+    "-map", "[aout]",
+    "-c:a", "pcm_s16le", "-ar", "48000",
+    "-t", totalSec.toFixed(3),
+    "-y", o.mixWavPath,
+  );
+  return args;
 }
 
 // ---------------------------------------------------------------------------
@@ -1278,6 +1345,9 @@ function buildClipArgs(ctx) {
  * v5 mode (newAudioGraph — video-with-audio and/or SFX present):
  *   - clip audio + music + SFX → amix graph, -map 0:v -map [aout]
  *   - clip audio only           → -map 0:v -map 0:a re-encode
+ * v1.3 masterMix mode (normalize ON with ≥2 branches): the mix was
+ * pre-rendered to a WAV and MEASURED — mux that single input with the
+ * measured master loudnorm instead of re-running the whole graph.
  * sfx items: [{ wavPath, startMs, volume }] (already uploaded WAVs).
  */
 function buildConcatArgs(o) {
@@ -1290,6 +1360,27 @@ function buildConcatArgs(o) {
   const abr = [96, 128, 192, 256, 320].includes(Number(o.audioKbps))
     ? `${Number(o.audioKbps)}k`
     : "192k";
+  // v1.3 MASTER-BUS path: the pre-rendered + measured mix replaces every
+  // audio input and the whole graph — one WAV in, measured master loudnorm
+  // + limiter + pad out. (Nothing before this point added audio inputs yet.)
+  if (o.masterMix && o.masterMix.wavPath) {
+    const mm = o.masterMix;
+    const af = [];
+    const ln = measuredLoudnormFilter(mm.loudnorm || null);
+    if (ln) af.push(ln);
+    af.push("alimiter=limit=0.97:level=false");
+    af.push(`apad=whole_dur=${Number(o.totalSec || 0).toFixed(3)}`);
+    return [
+      "-f", "concat", "-safe", "0", "-i", o.concatListPath,
+      "-i", mm.wavPath,
+      "-c:v", "copy",
+      "-map", "0:v", "-map", "1:a",
+      "-af", af.join(","),
+      "-c:a", "aac", "-b:a", abr, "-ar", "48000",
+      "-shortest",
+      "-movflags", "+faststart", "-y", o.outputPath,
+    ];
+  }
   // v5.2: loop-to-fill — -stream_loop -1 makes the music input infinite;
   // -shortest (video stream) + apad=whole_dur cap the output at the video
   // length, so the track repeats until the video ends.
@@ -1365,6 +1456,9 @@ function buildConcatArgs(o) {
       af.push(`afade=t=out:st=${start.toFixed(3)}:d=${(o.audio.fadeOutMs / 1000).toFixed(3)}`);
     }
     if (startMs > 0) af.push(`adelay=${startMs}|${startMs}`);
+    // v1.3: master volume scales the (delayed) music output too.
+    const masterVol = clampNum(o.audio && o.audio.masterVolume, 0, 2, 1);
+    if (masterVol !== 1) af.push(`volume=${String(masterVol)}`);
     af.push(`apad=whole_dur=${o.totalSec.toFixed(3)}`);
     // v5.2: guard boosted music against hard clipping.
     af.push("alimiter=limit=0.97:level=false");
@@ -1418,6 +1512,7 @@ module.exports = {
   buildOverlayFilter,
   // step-2 audio graph
   buildAudioMixGraph,
+  buildAudioMixRenderArgs,
   measuredLoudnormFilter,
   AFORMAT,
   // full argv builders
