@@ -467,9 +467,23 @@ function buildAudioMixGraph(o) {
   const audio = (o && o.audio) || {};
   const branches = [];
 
-  if (o && o.hasClipAudio) {
-    branches.push({ label: "[ca]", chain: `[0:a]${AFORMAT}[ca]` });
-  }
+  // v5.2: clip audio now arrives as PRE-EXTRACTED WAV inputs (48 kHz stereo
+  // PCM, speed already applied by the extraction command) — one branch per
+  // clip, volume + absolute-timeline adelay. This replaces the v5.0/5.1
+  // scheme (per-clip AAC encodes + a concat-demuxer [0:a] branch) which
+  // double-encoded audio and padded image clips with synthesized silence.
+  const clipAudio = Array.isArray(o && o.clipAudio) ? o.clipAudio : [];
+  clipAudio.forEach((c, k) => {
+    const vol = clampNum(c && c.volume, 0, 2, 1);
+    const d = Math.max(0, Math.round(Number(c && c.startMs) || 0));
+    const label = `[ca${k}]`;
+    const parts = [];
+    if (vol !== 1) parts.push(`volume=${String(vol)}`);
+    if (d > 0) parts.push(`adelay=${d}|${d}`);
+    parts.push(AFORMAT);
+    branches.push({ label, chain: `[${c.inputIdx}:a]${parts.join(",")}${label}` });
+  });
+
   if (o && o.hasMusic) {
     // v5.2 music placement: [volume] → [loudnorm] → [fades (music-local)]
     // → [adelay=startMs] → aformat. adelay comes LAST so loudnorm/fades
@@ -514,13 +528,18 @@ function buildAudioMixGraph(o) {
       parts.push(`[0:a]${AFORMAT}[ca]`);
       last = "[ca]";
     }
+    // v5.2: even a single branch can exceed 0 dBFS after a volume boost —
+    // the master limiter below guards it.
   } else {
     parts.push(
       `${branches.map((b) => b.label).join("")}amix=inputs=${branches.length}:duration=longest:normalize=0[mix]`,
     );
     last = "[mix]";
   }
-  parts.push(`${last}apad=whole_dur=${totalSec.toFixed(3)}[aout]`);
+  // v5.2 master bus: amix with normalize=0 lets branches SUM above 0 dBFS
+  // (music + clip + SFX) — a limiter right before the pad keeps int16 output
+  // from hard-clipping (the standard master-chain practice in Shotcut et al).
+  parts.push(`${last}alimiter=limit=0.97:level=false,apad=whole_dur=${totalSec.toFixed(3)}[aout]`);
   return { graph: parts.join(";"), outLabel: "[aout]" };
 }
 
@@ -557,6 +576,10 @@ function buildClipArgs(ctx) {
     kbEnabled, zoomMax, globalDir,
     transition, wm, assSuffix, clipPath, encArgs,
     anyAudio, segHasAudio, overlaySpecs, hwaccel,
+    // v5.2: per-process encoder thread budget (0 = auto/legacy). The main
+    // process divides the cores across the parallel pool so concurrent
+    // encoders never oversubscribe the CPU.
+    threads,
   } = ctx;
 
   const overlays = Array.isArray(overlaySpecs) ? overlaySpecs : [];
@@ -665,7 +688,7 @@ function buildClipArgs(ctx) {
     "-r", String(fps),
     ...(anyAudio ? ["-c:a", "aac", "-b:a", "192k", "-ar", "48000"] : []),
     ...(needShortest ? ["-shortest"] : []),
-    "-threads", "0",
+    "-threads", String(Number.isFinite(threads) && threads > 0 ? Math.round(threads) : 0),
     "-y",
     clipPath,
   ];
@@ -848,13 +871,25 @@ function buildClipArgs(ctx) {
   if (wm || overlays.length > 0) {
     // ── v4.4 single-input + watermark → filter_complex — v4.9 verbatim
     //    core, extended with v5 overlays between base and watermark ──
+    //
+    // v5.2 SPEED: static frames (Ken Burns off) skip the 1.1× lanczos
+    // supersample + per-frame zoompan entirely — a plain bilinear-ish
+    // cover-fit at the OUTPUT resolution is byte-equivalent visually and
+    // an order of magnitude faster (zoompan is single-threaded and was the
+    // dominant cost for slideshows).
+    const staticImg = !enabled || dir === "none";
+    const baseChain = staticImg
+      ? `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},fps=${fps},setsar=1,format=yuv420p`
+      : `scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase:flags=lanczos,crop=${scaleW}:${scaleH},` +
+        `zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${segFrames}:s=${width}x${height}:fps=${fps},setsar=1,format=yuv420p`;
+    const baseInputs = staticImg
+      ? ["-loop", "1", "-framerate", String(fps), "-i", seg.imagePath]
+      : ["-loop", "1", "-i", seg.imagePath];
     const state = applyOverlays({
-      graph:
-        `[0:v]scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase:flags=lanczos,crop=${scaleW}:${scaleH},` +
-        `zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${segFrames}:s=${width}x${height}:fps=${fps},setsar=1,format=yuv420p[base]`,
+      graph: `[0:v]${baseChain}[base]`,
       label: "[base]",
       inputIdx: 1,
-      inputs: ["-loop", "1", "-i", seg.imagePath],
+      inputs: baseInputs,
     });
     if (wm) {
       state.graph += `;${wmChain(state.inputIdx)};${wmOverlay(state.label, "[vw]")}`;
@@ -883,19 +918,33 @@ function buildClipArgs(ctx) {
   }
 
   // ── Plain single-input path (no watermark) — v4.9 verbatim ──
-  const vfParts = [
-    `scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase:flags=lanczos`,
-    `crop=${scaleW}:${scaleH}`,
-    `zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${segFrames}:s=${width}x${height}:fps=${fps}`,
-    `setsar=1`,
-    `format=yuv420p`,
-  ];
+  // v5.2 SPEED: static frames (Ken Burns off — the new default) skip the
+  // supersample + zoompan pipeline for a plain cover-fit scale/crop.
+  const staticImg = !enabled || dir === "none";
+  const vfParts = staticImg
+    ? [
+        `scale=${width}:${height}:force_original_aspect_ratio=increase`,
+        `crop=${width}:${height}`,
+        `fps=${fps}`,
+        `setsar=1`,
+        `format=yuv420p`,
+      ]
+    : [
+        `scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase:flags=lanczos`,
+        `crop=${scaleW}:${scaleH}`,
+        `zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${segFrames}:s=${width}x${height}:fps=${fps}`,
+        `setsar=1`,
+        `format=yuv420p`,
+      ];
+  const imgInputOpts = staticImg
+    ? ["-loop", "1", "-framerate", String(fps), "-i", seg.imagePath]
+    : ["-loop", "1", "-i", seg.imagePath];
   if (assSuffix) vfParts.push(assSuffix);
   vfParts.push(...postFades);
   if (anyAudio) {
     return {
       args: [
-        "-loop", "1", "-i", seg.imagePath,
+        ...imgInputOpts,
         "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
         "-t", segDurSec.toFixed(3),
         "-vf", vfParts.join(","),
@@ -907,8 +956,7 @@ function buildClipArgs(ctx) {
   }
   return {
     args: [
-      "-loop", "1",
-      "-i", seg.imagePath,
+      ...imgInputOpts,
       "-t", segDurSec.toFixed(3),
       "-vf", vfParts.join(","),
       ...encodeTail,
@@ -932,29 +980,41 @@ function buildClipArgs(ctx) {
  */
 function buildConcatArgs(o) {
   const sfxList = Array.isArray(o.sfx) ? o.sfx.filter((s) => s && typeof s.wavPath === "string" && s.wavPath) : [];
+  const clipAudio = Array.isArray(o.clipAudio)
+    ? o.clipAudio.filter((c) => c && typeof c.wavPath === "string" && c.wavPath)
+    : [];
   const hasMusic = !!o.audioPath;
   // v5.2: loop-to-fill — -stream_loop -1 makes the music input infinite;
   // -shortest (video stream) + apad=whole_dur cap the output at the video
   // length, so the track repeats until the video ends.
   const loopMusic = hasMusic && !!(o.audio && o.audio.musicLoop);
   const args = ["-f", "concat", "-safe", "0", "-i", o.concatListPath];
+  // Input layout: 0 = concat video (audio-less clips), 1 = music (when
+  // present), then the pre-extracted clip-audio WAVs, then the SFX WAVs.
   if (hasMusic) {
     if (loopMusic) args.push("-stream_loop", "-1");
     args.push("-i", o.audioPath);
   }
+  const musicIdx = 1;
+  const clipBase = hasMusic ? 2 : 1;
+  clipAudio.forEach((c) => args.push("-i", c.wavPath));
+  const sfxBase = clipBase + clipAudio.length;
   sfxList.forEach((s) => args.push("-i", s.wavPath));
   // ALWAYS -c copy for video (captions already burned in step 1)
   args.push("-c:v", "copy");
 
   if (o.newAudioGraph) {
-    if (hasMusic || sfxList.length > 0) {
-      const sfxBase = hasMusic ? 2 : 1; // 0 = concat demuxer, 1 = music (when present)
+    if (hasMusic || clipAudio.length > 0 || sfxList.length > 0) {
       const { graph } = buildAudioMixGraph({
         totalSec: o.totalSec,
         audio: o.audio,
-        hasClipAudio: true,
+        clipAudio: clipAudio.map((c, k) => ({
+          inputIdx: clipBase + k,
+          startMs: c.startMs,
+          volume: c.volume,
+        })),
         hasMusic,
-        musicInputIdx: 1,
+        musicInputIdx: musicIdx,
         sfx: sfxList.map((s, k) => ({ inputIdx: sfxBase + k, startMs: s.startMs, volume: s.volume })),
       });
       args.push(
@@ -992,6 +1052,8 @@ function buildConcatArgs(o) {
     }
     if (startMs > 0) af.push(`adelay=${startMs}|${startMs}`);
     af.push(`apad=whole_dur=${o.totalSec.toFixed(3)}`);
+    // v5.2: guard boosted music against hard clipping.
+    af.push("alimiter=limit=0.97:level=false");
     args.push("-af", af.join(","));
     args.push("-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-shortest");
   }

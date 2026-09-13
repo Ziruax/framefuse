@@ -162,7 +162,9 @@ ipcMain.handle("save-temp-image", async (_evt, { name, bytes }) => {
   ensureTempDir();
   const ext = path.extname(name) || ".jpg";
   const p = path.join(tempDir, `img_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
-  fs.writeFileSync(p, Buffer.from(bytes));
+  // v5.2 PERF: async write — the sync variant blocked the main-process event
+  // loop for the duration of every media upload (hundreds of MB = seconds).
+  await fs.promises.writeFile(p, Buffer.from(bytes));
   return p;
 });
 
@@ -170,7 +172,7 @@ ipcMain.handle("save-temp-audio", async (_evt, { name, bytes }) => {
   ensureTempDir();
   const ext = path.extname(name) || ".mp3";
   const p = path.join(tempDir, `aud_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
-  fs.writeFileSync(p, Buffer.from(bytes));
+  await fs.promises.writeFile(p, Buffer.from(bytes));
   return p;
 });
 
@@ -182,7 +184,7 @@ ipcMain.handle("save-temp-video", async (_evt, { name, bytes }) => {
   ensureTempDir();
   const ext = path.extname(name) || ".mp4";
   const p = path.join(tempDir, `vid_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
-  fs.writeFileSync(p, Buffer.from(bytes));
+  await fs.promises.writeFile(p, Buffer.from(bytes));
   return p;
 });
 
@@ -779,7 +781,10 @@ async function detectGpuEncoderAsync() {
 const QUALITY_ENCODER = {
   draft:  { crf: 27, x264: "veryfast", nvencPreset: "p1", nvencCq: 27, qsvQ: 27, amfI: 26, amfP: 28 },
   social: { crf: 20, x264: "veryfast", nvencPreset: "p4", nvencCq: 23, qsvQ: 23, amfI: 22, amfP: 24 },
-  cinema: { crf: 17, x264: "medium",   nvencPreset: "p6", nvencCq: 19, qsvQ: 19, amfI: 19, amfP: 21 },
+  // v5.2 SPEED: cinema x264 preset medium → faster. Open-source editors
+  // (Shotcut/Kdenlive) default to faster-class presets — ~2× faster than
+  // medium at a visually indistinguishable CRF 17 master.
+  cinema: { crf: 17, x264: "faster",  nvencPreset: "p6", nvencCq: 19, qsvQ: 19, amfI: 19, amfP: 21 },
 };
 
 function encoderArgs(encoderName, bitrateMbps, width, height, quality, crf) {
@@ -1671,16 +1676,28 @@ ipcMain.handle("export-native", async (event, opts) => {
         if ((await probeMediaAsync(s.videoPath)).hasAudio) { anyVideoAudio = true; break; }
       }
     }
-    const anyAudio = sfxList.length > 0 || anyVideoAudio;
 
     // ─── STEP 1 (build): probes → per-clip argv jobs ───────────────
     // v4.3 transition planning + zoompan math + all three v4.9 branches
     // (xfade head / watermark graph / plain -vf) live in
     // G.buildClipArgs — byte-identical for v4.9-shaped payloads.
+    //
+    // v5.2 AUDIO PIPELINE: step-1 clips are now VIDEO-ONLY. Clip audio is
+    // extracted in parallel as 48 kHz stereo PCM WAVs and mixed ONCE in
+    // step 2 (volume + absolute-timeline adelay per clip + music + SFX →
+    // amix → a single AAC encode). This removes the v5.0/5.1 double AAC
+    // encode, the per-image-clip synthesized-silence tracks, and the
+    // AAC→AAC generational loss — the layout used by Shotcut-class editors.
     const jobs = [];
     const clipPaths = [];
+    const clipAudioJobs = [];
     let cumulativeMs = 0;
     const encArgs = encoderArgs(encoder.name, bitrateMbps, width, height, quality, crf);
+    // v5.2: thread budget — divide the cores across the parallel pool so N
+    // concurrent encoders never oversubscribe the CPU (the v5.1 scheme gave
+    // EVERY child `-threads 0` = all cores → 4× oversubscription thrash).
+    const poolN = Math.min(4, Math.max(1, os.cpus().length - 2));
+    const threadBudget = Math.max(1, Math.floor(os.cpus().length / poolN));
 
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i];
@@ -1762,6 +1779,7 @@ ipcMain.handle("export-native", async (event, opts) => {
         (await probeMediaAsync(seg.videoPath)).hasAudio
       );
 
+      // v5.2: video-only clip encode — audio never rides the concat demuxer.
       const built = G.buildClipArgs({
         i,
         seg,
@@ -1777,13 +1795,15 @@ ipcMain.handle("export-native", async (event, opts) => {
         assSuffix,
         clipPath,
         encArgs,
-        anyAudio,
-        segHasAudio,
+        anyAudio: false,
+        segHasAudio: false,
         overlaySpecs,
         // v5.1: hardware DECODE for base video clips (d3d11va on Windows,
         // auto-detected; silently falls back to software when unavailable —
         // the filters still run on CPU, ffmpeg copies frames across).
         hwaccel: true,
+        // v5.2: thread budget (see the pool below).
+        threads: threadBudget,
       });
 
       jobs.push({
@@ -1793,29 +1813,59 @@ ipcMain.handle("export-native", async (event, opts) => {
         durationMs: seg.durationMs,
         segId: seg.id,
       });
+
+      // v5.2: parallel PCM extraction for the clip's own audio (speed
+      // applied here via atempo; volume stays in the step-2 mix graph).
+      if (segHasAudio) {
+        const wavPath = path.join(tempDir, `audio_${String(i).padStart(4, "0")}_${Date.now()}.wav`);
+        tempFiles.push(wavPath);
+        const speed = Number(seg.speed) > 0 ? Number(seg.speed) : 1;
+        const sourceWinMs = speed !== 1 ? Math.max(0, Number(seg.durationMs) || 0) * speed : 0;
+        const tempo = speed !== 1 ? G.atempoFilters(speed) : [];
+        clipAudioJobs.push({
+          idx: jobs.length + clipAudioJobs.length,
+          args: [
+            ...(sourceWinMs > 0 ? ["-t", (sourceWinMs / 1000).toFixed(3)] : []),
+            "-i", seg.videoPath,
+            "-vn",
+            ...(tempo.length > 0 ? ["-af", tempo.join(",")] : []),
+            "-ar", "48000", "-ac", "2",
+            "-c:a", "pcm_s16le",
+            "-y", wavPath,
+          ],
+          wavPath,
+          startMs: segStartMs,
+          volume: G.normalizeVolume(seg.volume),
+          durSec: seg.durationMs / 1000,
+          durationMs: seg.durationMs,
+          segId: seg.id,
+        });
+      }
       cumulativeMs += seg.durationMs;
     }
 
-    // ─── STEP 1 (run): PARALLEL encode pool — the v5 PERF core ─────
+    // ─── STEP 1 (run): PARALLEL encode + audio-extraction pool ────
     // N = min(4, max(1, os.cpus() − 2)) concurrent ffmpeg children
     // (child_process.spawn). Per-clip "time=" marks aggregate into the
     // SAME export-progress channel + payload shape the UI already
     // consumes, weighted by clip duration on the master timeline.
-    const poolN = Math.min(4, Math.max(1, os.cpus().length - 2));
-    const clipFrac = jobs.map(() => 0);
+    // v5.2: the PCM extraction jobs ride the SAME pool — they are cheap
+    // (decode + WAV write) and fill idle slots while big encodes run.
+    const poolJobs = [...jobs, ...clipAudioJobs];
+    const clipFrac = poolJobs.map(() => 0);
     let lastEmit = 0;
     const emitProgress = (force) => {
       const now = Date.now();
       if (!force && now - lastEmit < 100) return; // ≤10 Hz progress IPC
       lastEmit = now;
       let doneMs = 0;
-      for (let k = 0; k < jobs.length; k++) doneMs += clipFrac[k] * jobs[k].durationMs;
+      for (let k = 0; k < poolJobs.length; k++) doneMs += clipFrac[k] * poolJobs[k].durationMs;
       const frac = doneMs / Math.max(1, totalMs);
       sendProgress(frac * 95, doneMs / 1000, etaFor(frac));
     };
-    await runPool(jobs, poolN, {
+    await runPool(poolJobs, poolN, {
       onTime: (idx, sec) => {
-        clipFrac[idx] = Math.min(1, sec / Math.max(0.01, jobs[idx].durSec));
+        clipFrac[idx] = Math.min(1, sec / Math.max(0.01, poolJobs[idx].durSec));
         emitProgress(false);
       },
       onDone: (idx) => {
@@ -1824,7 +1874,7 @@ ipcMain.handle("export-native", async (event, opts) => {
       },
     });
 
-    // ─── STEP 2: Concat all clips + mux audio (INSTANT: -c copy) ───
+    // ─── STEP 2: Concat all clips + mix audio ONCE (video: -c copy) ──
     sendProgress(96, totalSec, etaFor(0.96));
 
     const concatListPath = path.join(tempDir, `concat_${Date.now()}.txt`);
@@ -1836,9 +1886,9 @@ ipcMain.handle("export-native", async (event, opts) => {
     }).join("\n");
     fs.writeFileSync(concatListPath, concatContent, "utf-8");
 
-    // v5: G.buildConcatArgs keeps the v4.9 mux argv byte-identical for
-    // music-only / no-audio projects and emits the amix graph (clip audio
-    // + music + adelay'd SFX → apad) when the new audio mode is active.
+    // v5.2: G.buildConcatArgs muxes the concat video with the SINGLE-PASS
+    // audio mix (clip WAVs + music + SFX → amix → AAC once). Music-only /
+    // no-audio projects keep the exact v4.9 -af / copy paths.
     const concatArgs = G.buildConcatArgs({
       concatListPath,
       audioPath,
@@ -1846,7 +1896,12 @@ ipcMain.handle("export-native", async (event, opts) => {
       outputPath,
       totalSec,
       sfx: sfxList,
-      newAudioGraph: anyAudio,
+      clipAudio: clipAudioJobs.map((j) => ({
+        wavPath: j.wavPath,
+        startMs: j.startMs,
+        volume: j.volume,
+      })),
+      newAudioGraph: anyVideoAudio || sfxList.length > 0,
     });
 
     await runFfmpeg(concatArgs, totalSec, (sec) => {
