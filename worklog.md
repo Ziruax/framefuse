@@ -251,3 +251,25 @@ Stage Summary:
 - NO installer rebuild needed: the Windows installer (v5.2.0 release) was webpack-built and never had this bug. A v5.2.1 release with the worker classifier improvement is optional/low-value.
 - Remaining known limitations unchanged (in-flight download cancellation, despill approximation, preview volume cap).
 - Next-phase candidates (from v5.3 notes): 2-pass loudnorm export audio, GPU filter graphs (scale_cuda), per-overlay fps normalization, timeline clip multi-select, keyframe-able overlay motion.
+
+---
+Task ID: 12 (v5.4 sprint — cron review round)
+Agent: main (Z.ai Code)
+Task: Scheduled QA round → picked worklog's #1 next-phase candidate: timeline multi-select (+ mandatory styling/features)
+
+STATUS ASSESSMENT (start of round):
+- agent-browser QA on the live app: clean load (0 errors), playback, uploads, timeline interactions all healthy; v5.2.1 Whisper hotfix from the previous round still verified (model cached, transcription instant). No bugs to prioritize → proceeded to feature development per the round rules.
+
+GOALS / COMPLETED / VERIFICATION:
+- Implemented v5.4 "Timeline Multi-Select" (the top next-phase candidate — the app previously had NO click-to-select; the only 'active' clip was playhead-derived):
+  - Selection semantics: plain click = solo select · Ctrl/Cmd+click = toggle · Shift+click = contiguous range from the anchor (segment order) · Ctrl+A = select all · Esc = clear · empty-space click = clear · DRAGS STILL EDIT (never select — press-seek parity preserved).
+  - Marquee rubber band on empty base/overlay lane space: press seeks (v4.9 parity), >3px deadzone converts into an amber band that LIVE-selects intersecting clips across BOTH lanes (pointer capture survives lane-border crossings); Shift-drag adds; clip-released pointerups are filtered by pointerId so they never wipe a clip's own click-selection (bug found & fixed during E2E).
+  - Group delete: Del key + toolbar trash act on the selection when present (fallback: active clip); removeItems() removes N clips in ONE undo step (single Ctrl+Z restores the whole group byte-perfect — verified 3→1→3).
+  - Styling (mandatory): amber .ff-clip-selected ring + tint (deliberately distinct from the cyan playhead-tracking active ring; CSS source-ordered active→selected→drag), overlay clips swap kind tint to amber + outline ring, .ff-marquee band, "N selected" header chip with X-clear, toolbar trash relabels "Delete N selected clips (Del)".
+- VERIFICATION: tsc clean · eslint clean · agent-browser E2E (synthetic pointer/keyboard events): solo/Ctrl/Shift/Ctrl+A/Esc/empty-click all pass; marquee band renders + live selection + exact intersection math (2 of 3 clips for a 75% band); group delete via key AND toolbar; undo restores; trim-handle regression (+60px exact, neighbor clamp intact); drag-move does not select; sequential-mode move clamp intact; playback OK; 0 console/page errors; VLM screenshot review confirms amber rings, chip, no visual glitches, professional lane layout.
+- Committed a8077e5, pushed to github.com/Ziruax/framefuse (main).
+
+UNRESOLVED ISSUES / RISKS + NEXT-PHASE PRIORITIES:
+- v5.4 scope notes: (a) SFX pills and the music clip are NOT selectable yet (SFX ids would need routing through a separate remove path — a small follow-up); (b) group MOVE of selected clips is not implemented (each clip's neighbor clamps interdepend — needs a coordinated clamp strategy); (c) Shift-range uses full segment order, which interleaves base+overlay clips by their array position (deterministic, documented).
+- Recommended next phases (priority order): 1) multi-select group move + SFX/music selection (completes the selection story); 2) right-click context menu on clips (settings/split/duplicate/delete/track-move — Shotcut pattern); 3) 2-pass loudnorm export audio; 4) keyframe-able overlay motion; 5) GPU filter graphs (scale_cuda/hwupload).
+- Standing risks unchanged: NsisTarget.js node_modules patch is still manual after bun install (the transformers patch is now automatic via postinstall — same treatment could be applied); whisper in-flight downloads cannot be cancelled (transformers.js 2.17 limitation).
