@@ -1751,6 +1751,41 @@ ipcMain.handle("export-native", async (event, opts) => {
         }
         const geo = G.overlayGeometryMirror(width, height, srcW, srcH, ov.overlay);
         if (geo.dw <= 0 || geo.dh <= 0) continue;
+        // v5.6 MOTION PATHS: 1 keyframe = pinned position (resolved to a
+        // static rect through the geometry mirror with that kf as free-form
+        // x/y); ≥2 keyframes = the overlay filter's x/y become piecewise-
+        // linear TIME EXPRESSIONS (the exact preview curve). tOffsetSec
+        // shifts the clip-local clock to the overlay's window-local clock.
+        const motion = G.sanitizeMotionMirror(
+          ov.overlay && ov.overlay.motion,
+        );
+        let x = geo.dx;
+        let y = geo.dy;
+        let xExpr = null;
+        let yExpr = null;
+        if (motion.length === 1) {
+          const pinned = G.overlayGeometryMirror(width, height, srcW, srcH, {
+            ...(ov.overlay || {}),
+            x: motion[0].x,
+            y: motion[0].y,
+          });
+          x = pinned.dx;
+          y = pinned.dy;
+        } else if (motion.length >= 2) {
+          const tOffsetSec = (segStartMs - Number(ov.startMs) || 0) / 1000;
+          const exprs = G.buildMotionOverlayExpr({
+            videoW: width,
+            videoH: height,
+            dw: geo.dw,
+            dh: geo.dh,
+            tOffsetSec,
+            motion,
+          });
+          if (exprs) {
+            xExpr = exprs.xExpr;
+            yExpr = exprs.yExpr;
+          }
+        }
         // v5.2: overlayLoop — a short green-screen source repeats to span
         // its whole timeline window (-stream_loop -1 on the input).
         const ovLoop = ov.overlayLoop === true;
@@ -1763,8 +1798,10 @@ ipcMain.handle("export-native", async (event, opts) => {
           inputArgs: isVid
             ? G.buildOverlayVideoInputArgs({ ssMs: win.ssMs, durMs: win.overlapMs, path: srcPath, loop: ovLoop, srcDurMs })
             : G.buildOverlayImageInputArgs({ durMs: win.overlapMs, path: srcPath }),
-          x: geo.dx,
-          y: geo.dy,
+          x,
+          y,
+          xExpr,
+          yExpr,
           dw: geo.dw,
           dh: geo.dh,
           chroma: ov.chroma || null,

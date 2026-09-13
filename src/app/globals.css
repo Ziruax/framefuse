@@ -688,6 +688,63 @@ summary:focus-visible,
   line-height: 1.2;
   white-space: nowrap;
 }
+
+/* ===== v5.6 MOTION PATHS ===== */
+
+/* Keyframe diamond on an overlay clip (timeline) — a 7×7px rotated square
+   riding a bottom strip. Amber = the selection-accent family; the dark
+   outline keeps it readable over any clip tint. Hover grows + glows. */
+.ff-kf {
+  width: 7px;
+  height: 7px;
+  background: #fbbf24;
+  transform: rotate(45deg);
+  border-radius: 1px;
+  box-shadow:
+    0 0 0 1px rgba(9, 9, 11, 0.85),
+    0 0 6px rgba(245, 158, 11, 0.45);
+  transition: transform 100ms ease, box-shadow 100ms ease;
+  animation: ff-kf-in 160ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+.ff-kf:hover {
+  transform: rotate(45deg) scale(1.5);
+  box-shadow:
+    0 0 0 1px rgba(9, 9, 11, 0.9),
+    0 0 0 3px rgba(245, 158, 11, 0.35),
+    0 0 10px rgba(245, 158, 11, 0.7);
+}
+@keyframes ff-kf-in {
+  from {
+    transform: rotate(45deg) scale(0.2);
+    opacity: 0;
+  }
+  to {
+    transform: rotate(45deg) scale(1);
+    opacity: 1;
+  }
+}
+
+/* Motion HUD count chip — pops on every count change (key={count}
+   remount), same family as the v5.5 selection chip. */
+.ff-kf-count {
+  animation: ff-sel-pop 180ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+/* Motion HUD bar — slides up when an overlay gets selected. */
+.ff-motion-bar {
+  animation: ff-motion-in 140ms ease-out;
+}
+@keyframes ff-motion-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 6px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
 /* Drag-in-flight: lifted + hot-tracked (highest source order wins). */
 .ff-clip.ff-clip-drag {
   z-index: 2;

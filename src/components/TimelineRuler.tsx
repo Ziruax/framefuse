@@ -35,6 +35,8 @@ import {
   ClipboardCopy,
   ClipboardPaste,
   Copy,
+  Diamond,
+  Eraser,
   Layers,
   Maximize,
   Music2,
@@ -55,6 +57,7 @@ import type {
   HeadlineItem,
   ItemEdit,
   MediaSegment,
+  OverlayTransform,
   SfxItem,
   TimelineMode,
   TransitionSettings,
@@ -62,6 +65,11 @@ import type {
 } from "@/lib/merger/types";
 import { boundaryStyle } from "@/lib/merger/types";
 import { fmtTimecode } from "@/lib/merger/timeline";
+import {
+  applyMotionKeyframe,
+  overlayAnchorCenter,
+  sanitizeMotionKeyframes,
+} from "@/lib/merger/renderer";
 import { getSfxDef, sfxDurationMs } from "@/lib/merger/sfx";
 import { middleEllipsis } from "@/lib/merger/text";
 import type { WaveformData } from "@/lib/merger/waveform";
@@ -2840,6 +2848,52 @@ export function TimelineRuler({
             : undefined,
           disabled: onEditItem == null,
         });
+        // ── v5.6 MOTION PATH items ────────────────────────────────────
+        // "Keyframe at playhead" pins the overlay's CURRENT position via
+        // the shared overlayAnchorCenter helper (exact for sampled/dragged
+        // positions; 9-grid anchors resolve to the anchor-cell center).
+        const kfs = sanitizeMotionKeyframes(seg.overlay?.motion);
+        const inWindow =
+          currentMs >= seg.startMs && currentMs < seg.endMs;
+        items.push(
+          {
+            icon: Diamond,
+            label: kfs.length > 0 ? "Keyframe at playhead" : "Add motion path",
+            disabled: onEditItem == null || !inWindow,
+            onClick: onEditItem
+              ? () => {
+                  const base: OverlayTransform =
+                    seg.overlay ?? { scalePercent: 60, position: "center" };
+                  const c = overlayAnchorCenter(
+                    base,
+                    currentMs - seg.startMs,
+                  );
+                  onEditItem(seg.id, {
+                    overlay: applyMotionKeyframe(
+                      base,
+                      currentMs - seg.startMs,
+                      c.x,
+                      c.y,
+                    ),
+                  });
+                }
+              : undefined,
+          },
+          {
+            icon: Eraser,
+            label: "Clear motion path",
+            disabled: onEditItem == null || kfs.length === 0,
+            onClick: onEditItem
+              ? () => {
+                  const base = seg.overlay;
+                  if (!base) return;
+                  const cleared = { ...base };
+                  delete cleared.motion;
+                  onEditItem(seg.id, { overlay: cleared });
+                }
+              : undefined,
+          },
+        );
         if (seg.mediaType === "video") {
           items.push(
             {
@@ -3661,6 +3715,39 @@ export function TimelineRuler({
                           />
                         </>
                       )}
+                      {/* v5.6 MOTION PATH keyframe diamonds — one per
+                          keyframe, window-local time → % of the clip width.
+                          Visual + tooltip (hover shows the timecode and
+                          center position); pointer-events-none so clip
+                          drags/trims never fight 7px targets — seek via the
+                          preview HUD's prev/next buttons or the context
+                          menu. Keyframes PAST the current trim (durMs)
+                          clamp to the edge (path times are window-local,
+                          trims resize the window). */}
+                      {(() => {
+                        const kfs = sanitizeMotionKeyframes(
+                          seg.overlay?.motion,
+                        );
+                        if (kfs.length === 0) return null;
+                        const span = Math.max(1, durMs);
+                        return (
+                          <div
+                            className="ff-kf-strip pointer-events-none absolute inset-x-0 bottom-0 z-[3] flex h-[7px] items-center"
+                            aria-hidden="true"
+                          >
+                            {kfs.map((kf) => (
+                              <span
+                                key={kf.tMs}
+                                className="ff-kf pointer-events-auto absolute bottom-0 cursor-help"
+                                style={{
+                                  left: `clamp(0px, ${(Math.min(kf.tMs, span) / span) * 100}%, calc(100% - 7px))`,
+                                }}
+                                title={`Motion keyframe @ +${fmtTimecode(kf.tMs)} — center (${(kf.x * 100).toFixed(0)}%, ${(kf.y * 100).toFixed(0)}%)${kf.tMs > span ? " (past the trimmed end)" : ""}`}
+                              />
+                            ))}
+                          </div>
+                        );
+                      })()}
                     </div>
                   );
                 })

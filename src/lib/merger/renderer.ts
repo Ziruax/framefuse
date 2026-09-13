@@ -10,6 +10,7 @@ import type {
   AspectRatio,
   KenBurnsConfig,
   MediaSegment,
+  OverlayKeyframe,
   OverlayPos,
   OverlayTransform,
   Resolution,
@@ -21,6 +22,164 @@ import { TRANSITION_STYLE_INFO, boundaryStyle } from "./types";
 /** easeInOutSine: -(cos(PI*t) - 1) / 2 */
 export function easeInOutSine(t: number): number {
   return -(Math.cos(Math.PI * t) - 1) / 2;
+}
+
+// ---------------------------------------------------------------------------
+// v5.6 MOTION PATHS — position keyframes on overlay clips.
+//
+// One shared contract consumed by the canvas preview, the timeline diamonds
+// and the FFmpeg export mirror (electron/export-graph.js builds the exact
+// same piecewise-linear curve as overlay x/y time expressions):
+//   - keyframe time is OVERLAY-WINDOW-LOCAL (0 = the clip's timeline start);
+//   - keyframe x/y are normalized 0..1 CENTER coords (the canvas drag space,
+//     identical to OverlayTransform.x/y);
+//   - the curve is piecewise LINEAR with HOLD-FIRST / HOLD-LAST ends
+//     (a keyframe at the window edges is never required);
+//   - 0 keyframes = static transform (x/y or 9-grid anchor as before);
+//     1 keyframe = a pinned position; ≥2 = animation.
+// ---------------------------------------------------------------------------
+
+/** Snap tolerance: a gesture at most this far from an existing keyframe
+ * (ms, window-local) MOVES that keyframe instead of creating a new one. */
+export const MOTION_KF_TOLERANCE_MS = 350;
+
+/** Coerce arbitrary user/undo payload into a clean sorted keyframe list:
+ * finite tMs ≥ 0, x/y clamped 0..1, sorted by time, exact-time duplicates
+ * collapsed (last wins). Returns [] for anything unusable. */
+export function sanitizeMotionKeyframes(
+  motion: unknown,
+): OverlayKeyframe[] {
+  if (!Array.isArray(motion)) return [];
+  const out: OverlayKeyframe[] = [];
+  for (const raw of motion) {
+    if (!raw || typeof raw !== "object") continue;
+    const tMs = Number((raw as OverlayKeyframe).tMs);
+    const x = Number((raw as OverlayKeyframe).x);
+    const y = Number((raw as OverlayKeyframe).y);
+    if (!Number.isFinite(tMs) || tMs < 0) continue;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    out.push({
+      tMs: Math.round(tMs),
+      x: Math.max(0, Math.min(1, x)),
+      y: Math.max(0, Math.min(1, y)),
+    });
+  }
+  out.sort((a, b) => a.tMs - b.tMs);
+  const deduped: OverlayKeyframe[] = [];
+  for (const kf of out) {
+    if (deduped.length > 0 && deduped[deduped.length - 1].tMs === kf.tMs) {
+      deduped[deduped.length - 1] = kf; // same-time → replace
+    } else {
+      deduped.push(kf);
+    }
+  }
+  return deduped;
+}
+
+/** Interpolated position at a window-local time, or null when the transform
+ * has no motion (caller keeps the static x/y / 9-grid behavior). Hold ends:
+ * before the first / after the last keyframe the nearest value is held. */
+export function sampleOverlayMotion(
+  t: OverlayTransform | null | undefined,
+  localMs: number,
+): { x: number; y: number } | null {
+  const kfs = sanitizeMotionKeyframes(t?.motion);
+  if (kfs.length === 0) return null;
+  if (kfs.length === 1) return { x: kfs[0].x, y: kfs[0].y };
+  const time = Number.isFinite(localMs) ? localMs : 0;
+  if (time <= kfs[0].tMs) return { x: kfs[0].x, y: kfs[0].y };
+  const last = kfs[kfs.length - 1];
+  if (time >= last.tMs) return { x: last.x, y: last.y };
+  // Binary search the bracketing pair.
+  let lo = 0;
+  let hi = kfs.length - 1;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (kfs[mid].tMs <= time) lo = mid;
+    else hi = mid;
+  }
+  const a = kfs[lo];
+  const b = kfs[hi];
+  const span = b.tMs - a.tMs;
+  const p = span > 0 ? (time - a.tMs) / span : 0;
+  return {
+    x: a.x + (b.x - a.x) * p,
+    y: a.y + (b.y - a.y) * p,
+  };
+}
+
+/**
+ * v5.6: the authored CENTER of an overlay at a window-local time — the
+ * position a keyframe gesture (HUD button / timeline menu) pins. Exact
+ * when a motion path exists (sampled) or the overlay was dragged (x/y);
+ * the 9-grid anchor falls back to the anchor-cell center (x exact by
+ * scalePercent; y assumes a 16:9 source aspect for dh — documented
+ * approximation, only reachable for never-dragged corner-anchored
+ * overlays; the preview canvas draws the exact rect regardless).
+ */
+export function overlayAnchorCenter(
+  t: OverlayTransform | null | undefined,
+  localMs: number,
+): { x: number; y: number } {
+  if (!t) return { x: 0.5, y: 0.5 };
+  const sampled = sampleOverlayMotion(t, localMs);
+  if (sampled) return sampled;
+  if (Number.isFinite(t.x) && Number.isFinite(t.y)) {
+    return {
+      x: Math.max(0, Math.min(1, t.x as number)),
+      y: Math.max(0, Math.min(1, t.y as number)),
+    };
+  }
+  const sp = Number.isFinite(t.scalePercent)
+    ? Math.max(10, Math.min(100, t.scalePercent))
+    : 60;
+  const col = t.position.endsWith("left") ? 0 : t.position.endsWith("right") ? 2 : 1;
+  const row = t.position.startsWith("top") ? 0 : t.position.startsWith("bottom") ? 2 : 1;
+  const halfX = sp / 200;
+  const halfY = (sp * (9 / 16)) / 200;
+  return {
+    x: col === 0 ? 0.02 + halfX : col === 2 ? 0.98 - halfX : 0.5,
+    y: row === 0 ? 0.02 + halfY : row === 2 ? 0.98 - halfY : 0.5,
+  };
+}
+
+/**
+ * v5.6: edit a motion path at a window-local time — the ONE rule every
+ * keyframe gesture (HUD button, canvas drag, timeline menu) shares:
+ * a keyframe within MOTION_KF_TOLERANCE_MS of `localMs` MOVES to the new
+ * position; otherwise a NEW keyframe is inserted at `localMs`. When the
+ * transform has no motion yet, the first keyframe is created from the
+ * given position. Pure — returns a new OverlayTransform, never mutates.
+ */
+export function applyMotionKeyframe(
+  t: OverlayTransform,
+  localMs: number,
+  x: number,
+  y: number,
+): OverlayTransform {
+  const nx = Math.max(0, Math.min(1, Number.isFinite(x) ? x : 0.5));
+  const ny = Math.max(0, Math.min(1, Number.isFinite(y) ? y : 0.5));
+  const at = Math.max(0, Math.round(Number.isFinite(localMs) ? localMs : 0));
+  const kfs = sanitizeMotionKeyframes(t?.motion);
+  const next: OverlayKeyframe[] = [];
+  let replaced = false;
+  for (const kf of kfs) {
+    if (Math.abs(kf.tMs - at) <= MOTION_KF_TOLERANCE_MS) {
+      // Nearest-in-tolerance wins; earlier duplicates fall through.
+      if (!replaced) {
+        next.push({ tMs: at, x: nx, y: ny });
+        replaced = true;
+      }
+      continue;
+    }
+    next.push(kf);
+  }
+  if (!replaced) next.push({ tMs: at, x: nx, y: ny });
+  next.sort((a, b) => a.tMs - b.tMs);
+  // Keep the static x/y in sync with the FIRST keyframe so the transform
+  // stays self-consistent when motion is later cleared / trimmed away.
+  const first = next[0];
+  return { ...t, x: first.x, y: first.y, motion: next };
 }
 
 /** Full export resolution for an aspect + resolution pair. */

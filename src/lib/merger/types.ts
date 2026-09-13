@@ -118,6 +118,23 @@ export interface OverlayTransform {
    *  Keep optional so v5.0/5.1 project files load unchanged. */
   x?: number;
   y?: number;
+  /** v5.6: position keyframes for MOTION PATHS. Local to the overlay's
+   *  timeline window (0 = clip start). When ≥2 keyframes exist the
+   *  interpolated position overrides the static x/y / 9-grid anchor at
+   *  every point in the window (hold-first / hold-last, piecewise linear —
+   *  the same curve the FFmpeg export reproduces via overlay x/y time
+   *  expressions). 1 keyframe = a pinned position. Absent/empty = static. */
+  motion?: OverlayKeyframe[];
+}
+
+/** v5.6: one keyframe on an overlay motion path. */
+export interface OverlayKeyframe {
+  /** Time into the overlay clip's window, ms (≥ 0). */
+  tMs: number;
+  /** Normalized 0..1 CENTER coordinates (same space as OverlayTransform
+   *  x/y — the canvas drag space). */
+  x: number;
+  y: number;
 }
 
 /** Per-item user edits (all optional; absent fields keep their defaults). */

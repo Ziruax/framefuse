@@ -142,6 +142,111 @@ function isXfadeStyleMirror(style) {
   return Object.prototype.hasOwnProperty.call(XFADE_NAMES, style);
 }
 
+// ---------------------------------------------------------------------------
+// v5.6 MOTION PATHS — the export mirror of renderer.ts' keyframe math.
+//
+// The preview samples a piecewise-LINEAR curve (hold-first / hold-last) in
+// NORMALIZED center coords and converts per frame through
+// overlayGeometry()'s free-form branch (cx = x·W, dx = clamp(cx − dw/2,
+// −dw·0.92, W − dw·0.08)). The export reproduces the same curve as an
+// overlay filter x/y TIME EXPRESSION (evaluated per frame, `t` is the
+// CLIP-LOCAL timestamp — the same clock `enable='between(t,a,b)'` uses):
+//
+//   dx(t) = clip( NORMX(t)·W − dw/2, −dw·0.92, W − dw·0.08 )
+//   NORMX(t) = piecewise-linear of the keyframes' x values at
+//              overlay-local time t + tOffsetSec  (tOffsetSec shifts the
+//              clip-local clock onto the overlay's window-local clock —
+//              (clipStart − ovStart)/1000, ≥ 0 when the overlay started
+//              in an earlier base clip).
+//
+// Lerp happens in NORMALIZED space (identical to the preview) and the
+// visibility clamp runs per frame AFTER the lerp — the exact same order
+// overlayGeometry applies, so preview and export can never drift.
+// ---------------------------------------------------------------------------
+
+/** EXACT mirror of sanitizeMotionKeyframes() in renderer.ts: coerce an
+ *  arbitrary IPC payload into a clean sorted keyframe list. */
+function sanitizeMotionMirror(motion) {
+  if (!Array.isArray(motion)) return [];
+  const out = [];
+  for (const raw of motion) {
+    if (!raw || typeof raw !== "object") continue;
+    const tMs = Number(raw.tMs);
+    const x = Number(raw.x);
+    const y = Number(raw.y);
+    if (!Number.isFinite(tMs) || tMs < 0) continue;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    out.push({
+      tMs: Math.round(tMs),
+      x: Math.max(0, Math.min(1, x)),
+      y: Math.max(0, Math.min(1, y)),
+    });
+  }
+  out.sort((a, b) => a.tMs - b.tMs);
+  const deduped = [];
+  for (const kf of out) {
+    if (deduped.length > 0 && deduped[deduped.length - 1].tMs === kf.tMs) {
+      deduped[deduped.length - 1] = kf;
+    } else {
+      deduped.push(kf);
+    }
+  }
+  return deduped;
+}
+
+/**
+ * Build the piecewise-linear NORMALIZED expression for one coordinate
+ * axis of a motion path. `kfs` must be pre-sanitized (sorted, ≥ 2), `axis`
+ * is "x" or "y". Returns an ffmpeg expression string in the variable T
+ * (overlay-local seconds). No quoting here — buildMotionOverlayExpr owns
+ * the final wrap.
+ */
+function motionNormExpr(kfs, axis, T) {
+  const n = kfs.length;
+  const v = (kf) => Number(kf[axis]).toFixed(6);
+  const tk = (kf) => (kf.tMs / 1000).toFixed(6);
+  // Segment i covers [t_i, t_i+1): lerp between kfs i and i+1.
+  const seg = (i) =>
+    `${v(kfs[i])}+(${v(kfs[i + 1])}-${v(kfs[i])})*(${T}-${tk(kfs[i])})/(${tk(kfs[i + 1])}-${tk(kfs[i])})`;
+  // Nested from the tail: E = seg(n-2); E = if(lt(T,t_{i+1}), seg(i), E).
+  let E = seg(n - 2);
+  for (let i = n - 3; i >= 0; i--) {
+    E = `if(lt(${T},${tk(kfs[i + 1])}),${seg(i)},${E})`;
+  }
+  // Hold-first / hold-last wrap.
+  return `if(lt(${T},${tk(kfs[0])}),${v(kfs[0])},if(gte(${T},${tk(kfs[n - 1])}),${v(kfs[n - 1])},${E}))`;
+}
+
+/**
+ * v5.6: overlay filter x/y EXPRESSIONS for an animated motion path.
+ *   o = { videoW, videoH, dw, dh, tOffsetSec, motion }   (motion ≥ 2 kfs)
+ * Returns { xExpr, yExpr } (unquoted — the caller wraps in '…'). The dw/dh
+ * MUST come from overlayGeometryMirror (scale-derived, aspect-preserved)
+ * so the pixel clamp math matches the preview exactly.
+ */
+function buildMotionOverlayExpr(o) {
+  const kfs = sanitizeMotionMirror(o && o.motion);
+  const videoW = Number(o && o.videoW) || 0;
+  const videoH = Number(o && o.videoH) || 0;
+  const dw = Number(o && o.dw) || 0;
+  const dh = Number(o && o.dh) || 0;
+  if (kfs.length < 2 || videoW <= 0 || videoH <= 0 || dw <= 0 || dh <= 0) {
+    return null;
+  }
+  const off = Number(o && o.tOffsetSec) || 0;
+  const T = `(t${off >= 0 ? "+" : ""}${off.toFixed(6)})`;
+  const nx = motionNormExpr(kfs, "x", T);
+  const ny = motionNormExpr(kfs, "y", T);
+  // overlayGeometry free-form mirror: dx = clamp(x·W − dw/2, −dw·0.92,
+  // W − dw·0.08). ffmpeg clip(x, min, max) — same semantics. The outer
+  // floor(…+0.5) mirrors the preview's Math.round: without it the filter
+  // TRUNCATES the interpolated float (e.g. 45.99999 → 45) and drifts 1px
+  // from the canvas on mid-lerp frames.
+  const xExpr = `floor(clip(${nx}*${videoW}-${(dw / 2).toFixed(3)},${(-dw * 0.92).toFixed(3)},${(videoW - dw * 0.08).toFixed(3)})+0.5)`;
+  const yExpr = `floor(clip(${ny}*${videoH}-${(dh / 2).toFixed(3)},${(-dh * 0.92).toFixed(3)},${(videoH - dh * 0.08).toFixed(3)})+0.5)`;
+  return { xExpr, yExpr };
+}
+
 /** EXACT mirror of videoAtBoundary() in renderer.ts: does the boundary
  *  entering `segIdx` touch a VIDEO segment on either side? (Segments
  *  without mediaType — hand-built / legacy — are treated as images.) */
@@ -437,11 +542,21 @@ function buildOverlayChain(o) {
  *   [acc][ovlI]overlay=x:y:enable='between(t,a,b)':eof_action=pass:shortest=0[out]
  * a/b are CLIP-LOCAL seconds (the overlay window relative to the clip).
  * accLabel/outLabel arrive as FULL bracketed labels ("[base]", "[o1]").
+ * v5.6: when the overlay has a MOTION PATH the static x/y numbers are
+ * replaced by the piecewise-linear time expressions from
+ * buildMotionOverlayExpr (single-quoted — the filtergraph parser protects
+ * the commas/colons inside, same mechanism as enable='between(t,a,b)').
  */
 function buildOverlayFilter(o) {
   const a = Number(o.a).toFixed(3);
   const b = Number(o.b).toFixed(3);
-  return `${o.accLabel}[ovl${o.inputIdx}]overlay=${o.x}:${o.y}:enable='between(t,${a},${b})':eof_action=pass:shortest=0${o.outLabel}`;
+  let x = String(o.x);
+  let y = String(o.y);
+  if (o.xExpr && o.yExpr) {
+    x = `'${o.xExpr}'`;
+    y = `'${o.yExpr}'`;
+  }
+  return `${o.accLabel}[ovl${o.inputIdx}]overlay=x=${x}:y=${y}:enable='between(t,${a},${b})':eof_action=pass:shortest=0${o.outLabel}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1073,6 +1188,9 @@ module.exports = {
   overlayGeometryMirror,
   isXfadeStyleMirror,
   videoAtBoundaryMirror,
+  // v5.6 motion-path mirrors
+  sanitizeMotionMirror,
+  buildMotionOverlayExpr,
   // stderr parsers
   videoHasAudioParser,
   videoProbeParser,

@@ -24,6 +24,10 @@ import {
   MoveDiagonal,
   Maximize,
   Move,
+  Diamond,
+  ChevronLeft,
+  ChevronRight,
+  Eraser,
 } from "lucide-react";
 import type {
   AspectRatio,
@@ -45,7 +49,11 @@ import {
   drawVideoFrame,
   drawWatermark,
   overlayGeometry,
+  overlayAnchorCenter,
   previewDimensions,
+  sampleOverlayMotion,
+  sanitizeMotionKeyframes,
+  applyMotionKeyframe,
   type VideoFrameSource,
 } from "@/lib/merger/renderer";
 import { ChromaKeyer } from "@/lib/merger/chroma";
@@ -174,11 +182,18 @@ function sameTransform(
   b: OverlayTransform,
 ): boolean {
   if (!a) return false;
+  const ma = sanitizeMotionKeyframes(a.motion);
+  const mb = sanitizeMotionKeyframes(b.motion);
+  const sameMotion =
+    ma.length === mb.length && ma.every((k, i) =>
+      k.tMs === mb[i].tMs && k.x === mb[i].x && k.y === mb[i].y,
+    );
   return (
     a.scalePercent === b.scalePercent &&
     a.position === b.position &&
     (a.x ?? undefined) === (b.x ?? undefined) &&
-    (a.y ?? undefined) === (b.y ?? undefined)
+    (a.y ?? undefined) === (b.y ?? undefined) &&
+    sameMotion
   );
 }
 
@@ -437,8 +452,13 @@ export function PreviewPanel({
   const effectiveTransform = (seg: MediaSegment): OverlayTransform => {
     if (dragTransform && dragTransform.segId === seg.id) return dragTransform.transform;
     const ov = overlayOverrides[seg.id];
-    if (ov) return ov.t;
-    return seg.overlay ?? DEFAULT_OVERLAY_TRANSFORM;
+    const base = ov ? ov.t : (seg.overlay ?? DEFAULT_OVERLAY_TRANSFORM);
+    // v5.6: motion keyframes interpolate the position at the playhead —
+    // hit testing, the chrome rect and keyboard nudges all see the SAME
+    // position the draw loop paints (never the stale static x/y).
+    const sample = sampleOverlayMotion(base, currentMs - seg.startMs);
+    if (!sample) return base;
+    return { ...base, x: clamp01(sample.x), y: clamp01(sample.y) };
   };
 
   const geometryFor = (seg: MediaSegment, t: OverlayTransform): OverlayGeo | null => {
@@ -726,7 +746,24 @@ export function PreviewPanel({
     // A click that only SELECTED the overlay (no move/resize) must not
     // commit — it would write an identical transform (spurious undo step).
     if (commit && !sameTransform(g0.base, g0.transform)) {
-      commitTransform(g0.segId, g0.transform);
+      // v5.6: a drag on an ANIMATED overlay edits the motion path — the
+      // dropped position becomes (or updates) the keyframe at the
+      // playhead; a drag on a static overlay keeps writing x/y directly.
+      const seg = segments.find((s) => s.id === g0.segId);
+      const hasMotion = sanitizeMotionKeyframes(g0.base.motion).length > 0;
+      if (seg && hasMotion) {
+        commitTransform(
+          g0.segId,
+          applyMotionKeyframe(
+            g0.transform,
+            currentMs - seg.startMs,
+            g0.transform.x ?? 0.5,
+            g0.transform.y ?? 0.5,
+          ),
+        );
+      } else {
+        commitTransform(g0.segId, g0.transform);
+      }
     }
     // The click that follows a drag belongs to the gesture, not the aim.
     window.setTimeout(() => {
@@ -780,7 +817,24 @@ export function PreviewPanel({
     }
     e.preventDefault();
     e.stopPropagation();
-    if (next) commitTransform(seg.id, next);
+    if (next) {
+      // v5.6: nudges on an animated overlay keyframe at the playhead
+      // (same rule as a drag); scale nudges (+/-) stay transform-level.
+      const hasMotion = sanitizeMotionKeyframes(base.motion).length > 0;
+      if (hasMotion) {
+        commitTransform(
+          seg.id,
+          applyMotionKeyframe(
+            next,
+            currentMs - seg.startMs,
+            next.x ?? 0.5,
+            next.y ?? 0.5,
+          ),
+        );
+      } else {
+        commitTransform(seg.id, next);
+      }
+    }
   };
 
   // v5.0: hidden <video> lifecycle — create on new ids, rewire when the URL
@@ -1023,10 +1077,17 @@ export function PreviewPanel({
         if (!src) continue; // image not decoded yet / video not created
         const sd = sourceDims(src);
         if (sd.w <= 0 || sd.h <= 0) continue; // no metadata yet
+        const base: OverlayTransform =
+          overlayOverrides[ov.id]?.t ?? ov.overlay ?? DEFAULT_OVERLAY_TRANSFORM;
+        // v5.6: motion keyframes animate the rect through the window —
+        // sample the piecewise-linear curve at the playhead (hold ends).
+        const sample = sampleOverlayMotion(base, currentMs - ov.startMs);
         const transform: OverlayTransform =
           dragTransform && dragTransform.segId === ov.id
             ? dragTransform.transform
-            : (overlayOverrides[ov.id]?.t ?? ov.overlay ?? DEFAULT_OVERLAY_TRANSFORM);
+            : sample
+              ? { ...base, x: clamp01(sample.x), y: clamp01(sample.y) }
+              : base;
         const g = overlayGeometry(dims.w, dims.h, sd.w, sd.h, transform);
         if (g.dw <= 0 || g.dh <= 0) continue;
         const keyed =
@@ -1155,10 +1216,17 @@ export function PreviewPanel({
     if (!src) return;
     const sd = sourceDims(src);
     if (sd.w <= 0 || sd.h <= 0) return;
-    const transform: OverlayTransform =
+    const baseT: OverlayTransform =
       dragTransform && dragTransform.segId === seg.id
         ? dragTransform.transform
         : (overlayOverrides[seg.id]?.t ?? seg.overlay ?? DEFAULT_OVERLAY_TRANSFORM);
+    // v5.6: the selection rect tracks the ANIMATED position at the
+    // playhead (same sample the draw loop paints) — never the stale
+    // static x/y. The raw baseT is kept for the motion-path overlay below.
+    const mSample = sampleOverlayMotion(baseT, currentMs - seg.startMs);
+    const transform: OverlayTransform = mSample
+      ? { ...baseT, x: clamp01(mSample.x), y: clamp01(mSample.y) }
+      : baseT;
     const g = overlayGeometry(dims.w, dims.h, sd.w, sd.h, transform);
     if (g.dw <= 0 || g.dh <= 0) return;
     const k = w / dims.w; // buffer px → CSS px
@@ -1187,6 +1255,78 @@ export function PreviewPanel({
       const hy = p.y * k - half;
       ctx.fillRect(hx, hy, HANDLE_DRAW_PX, HANDLE_DRAW_PX);
       ctx.strokeRect(hx, hy, HANDLE_DRAW_PX, HANDLE_DRAW_PX);
+    }
+
+    // ── v5.6 MOTION PATH ────────────────────────────────────────────────
+    // Dashed amber polyline through the keyframe CENTERS (normalized 0..1
+    // against the output frame), an amber diamond per keyframe and a white
+    // ring + dot at the interpolated playhead position. Keyframes sit at
+    // path centers — the rect may clamp near the frame edges (≥8% stays
+    // visible), the path shows the authored intent.
+    const kfs = sanitizeMotionKeyframes(baseT.motion);
+    if (kfs.length > 0) {
+      const pts = kfs.map((kf) => ({ x: clamp01(kf.x) * w, y: clamp01(kf.y) * h }));
+      // Path segments before/after the current time draw dimmer so the
+      // "already travelled" part of the curve reads instantly.
+      const curX = mSample ? clamp01(mSample.x) * w : null;
+      const splitAt = (px: number): 0 | 1 | 2 => {
+        if (curX == null || kfs.length < 2) return 2;
+        return px <= curX ? 0 : 1;
+      };
+      ctx.save();
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([5, 4]);
+      for (let i = 0; i < pts.length - 1; i++) {
+        const side = splitAt((pts[i].x + pts[i + 1].x) / 2);
+        ctx.strokeStyle =
+          side === 0 ? "rgba(245, 158, 11, 0.38)" : "rgba(245, 158, 11, 0.9)";
+        ctx.beginPath();
+        ctx.moveTo(pts[i].x, pts[i].y);
+        ctx.lineTo(pts[i + 1].x, pts[i + 1].y);
+        ctx.stroke();
+      }
+      if (kfs.length === 1) {
+        // Pinned: a small crosshair marks the single keyframe position.
+        ctx.strokeStyle = "rgba(245, 158, 11, 0.85)";
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x - 7, pts[0].y);
+        ctx.lineTo(pts[0].x + 7, pts[0].y);
+        ctx.moveTo(pts[0].x, pts[0].y - 7);
+        ctx.lineTo(pts[0].x, pts[0].y + 7);
+        ctx.stroke();
+      }
+      ctx.restore();
+      // Diamonds (7px rotated squares, dark outline — readable on any
+      // content, amber = the selection-accent family).
+      for (const p of pts) {
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        ctx.rotate(Math.PI / 4);
+        ctx.fillStyle = "#fbbf24";
+        ctx.strokeStyle = "rgba(12, 12, 14, 0.9)";
+        ctx.lineWidth = 1;
+        ctx.fillRect(-3.5, -3.5, 7, 7);
+        ctx.strokeRect(-3.5, -3.5, 7, 7);
+        ctx.restore();
+      }
+      // Playhead position marker — white ring + amber core (the same
+      // position the drawn rect is using right now).
+      if (mSample) {
+        const px = clamp01(mSample.x) * w;
+        const py = clamp01(mSample.y) * h;
+        ctx.save();
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.95)";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(px, py, 5.5, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.fillStyle = "#fbbf24";
+        ctx.beginPath();
+        ctx.arc(px, py, 1.8, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
     }
   }, [
     dragTransform,
@@ -1524,20 +1664,133 @@ export function PreviewPanel({
           </div>
         )}
 
-        {/* v5.2 PiP hint chip — below the stage while an overlay is selected. */}
-        {overlaySelected && (
-          <div
-            className="pointer-events-none absolute bottom-1.5 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1.5 whitespace-nowrap rounded-md px-2 py-1 text-[9px] backdrop-blur-sm"
-            style={{
-              backgroundColor: "rgba(0, 0, 0, 0.62)",
-              color: "#67e8f9",
-              border: "1px solid rgba(103, 232, 249, 0.28)",
-            }}
-          >
-            <Move className="size-3" />
-            Drag to move · corners resize · Esc deselect
-          </div>
-        )}
+        {/* v5.6 PiP + MOTION HUD — interactive bar below the stage while an
+            overlay is selected at the playhead. Keyframe button pins the
+            CURRENT position at the playhead (CapCut rule: nearest keyframe
+            within ±350ms moves, otherwise a new one lands here); prev/next
+            hop between keyframes; clear wipes the path back to static. */}
+        {overlaySelected &&
+          (() => {
+            const seg = visibleOverlays.find((s) => s.id === overlaySelectionId);
+            if (!seg) return null;
+            const base = effectiveTransform(seg);
+            const kfs = sanitizeMotionKeyframes(base.motion);
+            const localMs = currentMs - seg.startMs;
+            const animated = kfs.length >= 2;
+            const prevKf = [...kfs].reverse().find((k) => k.tMs < localMs - 1);
+            const nextKf = kfs.find((k) => k.tMs > localMs + 1);
+            return (
+              <div
+                className="ff-motion-bar absolute bottom-1.5 left-1/2 z-20 flex -translate-x-1/2 items-center gap-1 rounded-lg px-1.5 py-1 text-[9px] backdrop-blur-md"
+                style={{
+                  backgroundColor: "rgba(10, 10, 12, 0.82)",
+                  border: `1px solid ${
+                    kfs.length > 0
+                      ? "rgba(245, 158, 11, 0.45)"
+                      : "rgba(103, 232, 249, 0.30)"
+                  }`,
+                  boxShadow:
+                    kfs.length > 0
+                      ? "0 4px 16px rgba(245, 158, 11, 0.16), 0 0 0 1px rgba(245, 158, 11, 0.10)"
+                      : "0 4px 16px rgba(0, 0, 0, 0.5)",
+                }}
+                role="toolbar"
+                aria-label="Overlay motion controls"
+              >
+                <span
+                  className="flex select-none items-center gap-1 pl-1 pr-0.5 text-[9px]"
+                  style={{ color: "#a1a1aa" }}
+                >
+                  <Move className="size-3" />
+                  drag · corners resize · Esc deselect
+                </span>
+                <span className="mx-0.5 h-3 w-px" style={{ backgroundColor: "#27272a" }} />
+                <button
+                  type="button"
+                  className="flex h-6 items-center gap-1 rounded-md px-1.5 font-semibold transition-all hover:bg-amber-400/15 hover:shadow-[0_0_10px_rgba(245,158,11,0.25)] active:scale-90"
+                  style={{ color: kfs.length > 0 ? "#fbbf24" : "#d4d4d8" }}
+                  title={
+                    kfs.length > 0
+                      ? `Keyframe the current position at ${fmtTimecode(currentMs)} (updates the nearest keyframe within ±350 ms)`
+                      : `Start a motion path — pin the current position at ${fmtTimecode(currentMs)}`
+                  }
+                  aria-label="Add motion keyframe at playhead"
+                  onClick={() => {
+                    // Ref-free (react-hooks/refs): the shared anchor-center
+                    // helper resolves the exact sampled/dragged position and
+                    // the 9-grid anchor-cell center from transform data.
+                    const c = overlayAnchorCenter(base, localMs);
+                    const next = applyMotionKeyframe(base, localMs, c.x, c.y);
+                    commitTransform(seg.id, next);
+                  }}
+                >
+                  <Diamond className="size-3" />
+                  {kfs.length > 0 ? "Keyframe" : "Add motion"}
+                </button>
+                {kfs.length > 0 && (
+                  <>
+                    <span
+                      key={kfs.length}
+                      className="ff-kf-count rounded px-1 py-px font-mono font-bold tabular-nums"
+                      style={{
+                        backgroundColor: "rgba(245, 158, 11, 0.16)",
+                        color: "#fde68a",
+                        border: "1px solid rgba(245, 158, 11, 0.35)",
+                      }}
+                      title={`${kfs.length} keyframe${kfs.length === 1 ? "" : "s"} on this motion path${animated ? " — the overlay animates between them" : " — add a second keyframe to animate"}`}
+                    >
+                      {kfs.length}
+                    </span>
+                    <button
+                      type="button"
+                      className="flex size-6 items-center justify-center rounded-md transition-all hover:bg-white/10 active:scale-90 disabled:opacity-25 disabled:hover:bg-transparent"
+                      style={{ color: "#a1a1aa" }}
+                      disabled={prevKf == null}
+                      title={
+                        prevKf
+                          ? `Previous keyframe — ${fmtTimecode(seg.startMs + prevKf.tMs)}`
+                          : "No earlier keyframe"
+                      }
+                      aria-label="Seek to previous keyframe"
+                      onClick={() => prevKf && onSeek(seg.startMs + prevKf.tMs)}
+                    >
+                      <ChevronLeft className="size-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      className="flex size-6 items-center justify-center rounded-md transition-all hover:bg-white/10 active:scale-90 disabled:opacity-25 disabled:hover:bg-transparent"
+                      style={{ color: "#a1a1aa" }}
+                      disabled={nextKf == null}
+                      title={
+                        nextKf
+                          ? `Next keyframe — ${fmtTimecode(seg.startMs + nextKf.tMs)}`
+                          : "No later keyframe"
+                      }
+                      aria-label="Seek to next keyframe"
+                      onClick={() => nextKf && onSeek(seg.startMs + nextKf.tMs)}
+                    >
+                      <ChevronRight className="size-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      className="flex h-6 items-center gap-1 rounded-md px-1.5 transition-all hover:bg-red-400/15 hover:text-red-300 active:scale-90"
+                      style={{ color: "#a1a1aa" }}
+                      title="Remove every keyframe — the overlay returns to its static position"
+                      aria-label="Clear motion path"
+                      onClick={() => {
+                        const cleared = { ...base };
+                        delete cleared.motion;
+                        commitTransform(seg.id, cleared);
+                      }}
+                    >
+                      <Eraser className="size-3" />
+                      Clear
+                    </button>
+                  </>
+                )}
+              </div>
+            );
+          })()}
       </div>
 
       {/* Transport */}
