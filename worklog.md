@@ -224,3 +224,30 @@ Stage Summary:
 - REMOVED behavior: base-lane horizontal drags no longer auto-route clips to the overlay lane — they now move the clip on the base lane directly (better UX, was a workaround for startMs being ignored).
 - Known notes: (a) undo granularity for add+move can coalesce (pre-existing); (b) beat clips moved LEFT of another clip squeeze between neighbors (deterministic tiling; unusual op); (c) sequential lane-switch down clamps to cursor (magnetic tail).
 - Next-phase candidates: 2-pass loudnorm export audio, GPU filter graphs (scale_cuda), per-overlay fps normalization, timeline clip multi-select, keyframe-able overlay motion.
+
+---
+Task ID: 11 (v5.2.1 hotfix)
+Agent: main (Z.ai Code)
+Task: Fix user-reported bug: "Whisper transcription failed — Cannot convert undefined or null to object"
+
+Work Log:
+- Reproduced EXACTLY in dev via agent-browser: upload speech.wav as music track → Captions tab → "Generate from audio" → error toast within 500ms, no model download attempted.
+- Traced to module evaluation: the whisper web worker's `import("@xenova/transformers")` chunk loaded, but transformers' env.js threw at top level BEFORE any network I/O. Turbopack (Next.js 16 dev server) stubs node builtins (`import fs from "fs"`) as `void 0`, whereas webpack's browser-field stub ("fs": false) produces `{}`. env.js does `isEmpty(fs)` → `Object.keys(undefined)` → **TypeError: Cannot convert undefined or null to object**. Verified in the served chunk: `const FS_AVAILABLE = !isEmpty(void 0);`.
+- Why it slipped through v5.2 QA: the packaged app (next build --webpack) stubs fs as {} → unaffected; the native Electron path has real fs → unaffected; earlier dev E2E never exercised captions (only uploads/music/chroma/PiP/splitters/SFX).
+- FIX 1 (root cause): node_modules/@xenova/transformers/src/env.js — null-safe checks `fs != null && !isEmpty(fs)` (same for path). Behavior-identical in all three environments (Node: true; webpack {}: false; Turbopack void 0: false WITHOUT throwing).
+- FIX 2 (durability): scripts/patch-transformers.js — idempotent postinstall patcher (marker-comment detection, loud no-op when upstream changes shape), wired as root "postinstall" in package.json so `bun install` re-applies it. Version bumped 5.2.0 → 5.2.1.
+- FIX 3 (diagnostics): whisper-worker.ts — the dynamic import() previously bypassed classifyWhisperError (it sat outside the host-retry loop); now import failures route through the classifier, and a new branch maps "Cannot convert undefined or null to object" to an actionable reinstall hint.
+- Verified Node native path unaffected: neutralizeSharp + patched import → env.useFS=true, cacheDir/localModelPath correct (whisper-core.js + packaged app unchanged).
+
+VERIFICATION (all gates green):
+- agent-browser E2E (dev server, browser worker path): 12s real speech → model downloaded (7 files, ~42MB, Cache API "transformers-cache") → "Transcribed 34 words (exact word timing) — 7 cues · word-by-word mode ready" toast → captions panel shows "speech.whisper.srt · 7 cues · word timing ✓" + burn-in auto-enabled. Fresh-session console: 0 errors. (Note: agent-browser's network panel does NOT track worker-context fetches — verify downloads via `caches.keys()` instead.)
+- Second run (model cached): completes in seconds — persistence works.
+- bunx tsc --noEmit clean; bun run lint 0 errors; dev.log GET / 200 with no runtime errors.
+- Committed 923b4c4 and pushed to github.com/Ziruax/framefuse (main).
+
+Stage Summary:
+- User-reported Whisper failure FIXED end-to-end in the dev/browser path; native + packaged paths proven unaffected.
+- The postinstall patcher also future-proofs the NsisTarget.js patch pattern (same caveat class: node_modules edits need re-application after install — NsisTarget is still manual, this one is now automatic).
+- NO installer rebuild needed: the Windows installer (v5.2.0 release) was webpack-built and never had this bug. A v5.2.1 release with the worker classifier improvement is optional/low-value.
+- Remaining known limitations unchanged (in-flight download cancellation, despill approximation, preview volume cap).
+- Next-phase candidates (from v5.3 notes): 2-pass loudnorm export audio, GPU filter graphs (scale_cuda), per-overlay fps normalization, timeline clip multi-select, keyframe-able overlay motion.
