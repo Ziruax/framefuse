@@ -40,3 +40,6 @@ tool-results/
 
 dist/
 whisper-service/
+# QA round artifacts (synthetic test media + programmatic upload fixtures)
+test-media/
+public/qa/

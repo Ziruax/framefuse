@@ -12,7 +12,7 @@ import { toast } from "@/lib/toast";
 import { Header, type LastExport } from "@/components/Header";
 import { MediaPanel } from "@/components/MediaPanel";
 import { PreviewPanel } from "@/components/PreviewPanel";
-import { TimelineRuler } from "@/components/TimelineRuler";
+import { MUSIC_SEL_ID, TimelineRuler } from "@/components/TimelineRuler";
 import { SettingsPanel } from "@/components/SettingsPanel";
 import { Splitter, useResizableLayout } from "@/components/ResizableSplitters";
 import {
@@ -1775,12 +1775,62 @@ export default function Page() {
   const removeItems = useCallback(
     (ids: string[]) => {
       if (ids.length === 0) return;
-      if (ids.length === 1) {
-        removeItem(ids[0]);
+      // v5.5: the selection may MIX kinds — segment ids, SFX pill ids and
+      // the MUSIC sentinel. Route each kind through its own channel; the
+      // debounced history push coalesces the whole burst into ONE undo
+      // step (requestHistoryPush restarts a single 80ms flush timer).
+      const segIds = ids.filter((id) => id !== MUSIC_SEL_ID);
+      const hasMusic = ids.includes(MUSIC_SEL_ID);
+      // Resolve SFX ids against the live placements (exact — never guesses
+      // from id prefixes; a clip id can never collide with a placement id).
+      const liveSfx = stateRef.current?.sfxItems ?? [];
+      const sfxIdSet = new Set(liveSfx.map((s) => s.id));
+      const sfxIds = new Set(segIds.filter((id) => sfxIdSet.has(id)));
+      const itemIds = segIds.filter((id) => !sfxIds.has(id));
+
+      // SFX removal channel (one setSfxItems for any count).
+      if (sfxIds.size > 0 && itemIds.length === 0 && !hasMusic) {
+        requestHistoryPush();
+        setSfxItems((prev) => prev.filter((s) => !sfxIds.has(s.id)));
+        setSelectedIds([]);
+        toast.success(
+          sfxIds.size === 1
+            ? "Removed sound effect"
+            : `Removed ${sfxIds.size} sound effects`,
+        );
+        return;
+      }
+      // Music removal channel (removeAudio clears beat/waveform too).
+      if (hasMusic && itemIds.length === 0 && sfxIds.size === 0) {
+        removeAudio();
+        setSelectedIds([]);
+        toast.success("Removed background music", {
+          description: "Ctrl+Z restores the track (beat grid + waveform).",
+        });
+        return;
+      }
+      // Mixed / clips-only: clips go through the (history-coalesced) clip
+      // removal, sfx + music ride the same push burst.
+      if (sfxIds.size > 0) {
+        requestHistoryPush();
+        setSfxItems((prev) => prev.filter((s) => !sfxIds.has(s.id)));
+      }
+      if (hasMusic) {
+        removeAudio();
+        toast.success("Removed background music", {
+          description: "Ctrl+Z restores the track (beat grid + waveform).",
+        });
+      }
+      if (itemIds.length === 0) {
+        setSelectedIds([]);
+        return;
+      }
+      if (itemIds.length === 1 && sfxIds.size === 0 && !hasMusic) {
+        removeItem(itemIds[0]);
         return;
       }
       requestHistoryPush();
-      const kill = new Set(ids);
+      const kill = new Set(itemIds);
       setItems((prev) => prev.filter((i) => !kill.has(i.id)));
       setOverrides((prev) => {
         let changed = false;
@@ -1830,7 +1880,7 @@ export default function Page() {
       });
       setSelectedIds([]);
     },
-    [requestHistoryPush, removeItem],
+    [requestHistoryPush, removeItem, removeAudio],
   );
 
   const overrideDuration = useCallback((id: string, durationMs: number) => {
@@ -2386,6 +2436,243 @@ const handleRandomTransitionMix = useCallback(() => {
     [requestHistoryPush, applyItemEdit, translateItemEdit],
   );
 
+  /**
+   * v5.5: commit a coordinated GROUP MOVE (TimelineRuler multi-select drag)
+   * — one delta for every member, ONE undo step. Clip patches go through
+   * translateItemEdit (overlay default geometry + base duration mirroring,
+   * same contract as handleTimelineEdit) but are applied in a SINGLE
+   * setItemEdits pass; SFX placements + the music start ride the same
+   * debounced history push.
+   */
+  const handleGroupMove = useCallback(
+    (move: {
+      clips: { id: string; startMs: number }[];
+      sfx: { id: string; startMs: number }[];
+      musicStartMs?: number;
+    }) => {
+      if (move.clips.length === 0 && move.sfx.length === 0) return;
+      requestHistoryPush();
+      if (move.clips.length > 0) {
+        setItemEdits((prev) => {
+          const next = { ...prev };
+          for (const c of move.clips) {
+            const { patch: eff } = translateItemEdit(c.id, {
+              startMs: Math.max(0, Math.round(c.startMs)),
+            });
+            const base: ItemEdit = { ...(prev[c.id] ?? {}) };
+            for (const [key, value] of Object.entries(eff) as [
+              keyof ItemEdit,
+              ItemEdit[keyof ItemEdit],
+            ][]) {
+              if (value === undefined) delete base[key];
+              else (base[key] as unknown) = value;
+            }
+            if (Object.keys(base).length === 0) delete next[c.id];
+            else next[c.id] = base;
+          }
+          return next;
+        });
+      }
+      if (move.sfx.length > 0) {
+        const byId = new Map(move.sfx.map((s) => [s.id, s.startMs]));
+        setSfxItems((prev) =>
+          prev.map((s) =>
+            byId.has(s.id)
+              ? {
+                  ...s,
+                  startMs: Math.max(
+                    0,
+                    Math.min(byId.get(s.id) ?? s.startMs, totalMsRef.current),
+                  ),
+                }
+              : s,
+          ),
+        );
+      }
+      if (move.musicStartMs != null) {
+        const ms = Math.max(0, Math.round(move.musicStartMs));
+        setAudioSettings((prev) =>
+          prev.musicStartMs === ms ? prev : { ...prev, musicStartMs: ms },
+        );
+      }
+      const n =
+        move.clips.length +
+        move.sfx.length +
+        (move.musicStartMs != null ? 1 : 0);
+      toast.info(`Moved ${n} item${n === 1 ? "" : "s"} together`, {
+        description: "One undo step — Ctrl+Z restores every position.",
+      });
+    },
+    [requestHistoryPush, translateItemEdit],
+  );
+
+  // ---- v5.5: timeline clipboard (Ctrl+C / Ctrl+V) -----------------------
+  // Copies are REFERENCES into the media library (item ids) + their edits;
+  // paste materializes fresh items (own ids + object URLs) so the copies are
+  // independent timeline citizens. SFX placements are self-contained and
+  // copy verbatim (relative arrangement preserved via the origin offset).
+  const [clipboard, setClipboard] = useState<{
+    clips: { itemId: string; edit: ItemEdit | undefined; startMs: number }[];
+    sfx: { sfxId: string; startMs: number; durMs?: number; volume: number }[];
+    originMs: number;
+  } | null>(null);
+  // Mirror for the keydown effect (registered once — reads the live value
+  // at event time without re-subscribing on every clipboard change).
+  const clipboardRef = useRef<{
+    clips: { itemId: string; edit: ItemEdit | undefined; startMs: number }[];
+    sfx: { sfxId: string; startMs: number; durMs?: number; volume: number }[];
+    originMs: number;
+  } | null>(null);
+  useEffect(() => {
+    clipboardRef.current = clipboard;
+  }, [clipboard]);
+
+  const copySelection = useCallback(() => {
+    const sel = selectedIdsRef.current;
+    const segs = timelineSegmentsRef.current;
+    // Selection wins; fallback = the active (playhead) clip — editor std.
+    let picked: MediaSegment[] = [];
+    if (sel.length > 0) {
+      picked = segs.filter((s) => sel.includes(s.id));
+    } else {
+      const t = currentMsRef.current;
+      picked = segs.filter((s) => t >= s.startMs && t < s.endMs).slice(0, 1);
+    }
+    const sfxPicked = (stateRef.current?.sfxItems ?? []).filter((s) =>
+      sel.includes(s.id),
+    );
+    if (picked.length === 0 && sfxPicked.length === 0) {
+      toast.info("Nothing to copy", {
+        description: "Select clips (click / Ctrl-click / marquee) first.",
+      });
+      return;
+    }
+    const edits = stateRef.current?.itemEdits ?? {};
+    const clips = picked.map((s) => ({
+      itemId: s.id,
+      edit: edits[s.id],
+      startMs: s.startMs,
+    }));
+    const sfx = sfxPicked.map((s) => ({
+      sfxId: s.sfxId,
+      startMs: s.startMs,
+      durMs: s.durMs,
+      volume: s.volume,
+    }));
+    const originMs = Math.min(
+      ...[...clips.map((c) => c.startMs), ...sfx.map((s) => s.startMs)],
+    );
+    setClipboard({ clips, sfx, originMs });
+    const n = clips.length + sfx.length;
+    toast.success(`Copied ${n} item${n === 1 ? "" : "s"}`, {
+      description:
+        "Ctrl+V (or the toolbar paste button) places a copy at the playhead.",
+    });
+  }, []);
+
+  /** v5.5: materialize the paste copies from the CURRENT items snapshot
+   *  (stateRef mirror) — deterministic fresh ids, one history push. */
+  const pasteFromSnapshot = useCallback(
+    (
+      cb: NonNullable<typeof clipboard>,
+      atMs: number,
+      delta: number,
+      total: number,
+    ) => {
+      const itemsNow = stateRef.current?.items ?? [];
+      const clipCopies: { id: string; src: MediaItem; edit: ItemEdit | undefined; startMs: number }[] = [];
+      for (const c of cb.clips) {
+        const src = itemsNow.find((i) => i.id === c.itemId);
+        if (!src) continue;
+        clipCopies.push({
+          id: genId(),
+          src,
+          edit: c.edit,
+          startMs: Math.max(0, Math.round(c.startMs + delta)),
+        });
+      }
+      const newSel: string[] = clipCopies.map((c) => c.id);
+      if (clipCopies.length > 0) {
+        setItems((prev) => {
+          const idx = prev.findIndex((i) => i.id === clipCopies[0]?.src.id);
+          const insertAt = idx >= 0 ? idx + 1 : prev.length;
+          const next = [...prev];
+          next.splice(
+            insertAt,
+            0,
+            ...clipCopies.map((c) => ({
+              id: c.id,
+              file: c.src.file,
+              url: trackUrl(URL.createObjectURL(c.src.file)),
+              mediaType: c.src.mediaType,
+            })),
+          );
+          return next;
+        });
+        // Carry probed video metadata (no re-decode — duplicateItem pattern).
+        setVideoDurations((vd) => {
+          const next = { ...vd };
+          for (const c of clipCopies) {
+            if (next[c.src.id] != null) next[c.id] = next[c.src.id];
+          }
+          return next;
+        });
+        setVideoDims((dm) => {
+          const next = { ...dm };
+          for (const c of clipCopies) {
+            if (next[c.src.id]) next[c.id] = next[c.src.id];
+          }
+          return next;
+        });
+        setVideoThumbnails((th) => {
+          const next = { ...th };
+          for (const c of clipCopies) {
+            if (next[c.src.id]) next[c.id] = next[c.src.id];
+          }
+          return next;
+        });
+        // Edits carried + shifted to the paste origin.
+        setItemEdits((prev) => {
+          const next = { ...prev };
+          for (const c of clipCopies) {
+            const shifted: ItemEdit = { ...(c.edit ?? {}) };
+            shifted.startMs = c.startMs;
+            next[c.id] = shifted;
+          }
+          return next;
+        });
+      }
+      const sfxCopies = cb.sfx.map((s) =>
+        makeSfxItem({
+          sfxId: s.sfxId,
+          startMs: Math.max(0, Math.min(total, Math.round(s.startMs + delta))),
+          volume: s.volume,
+          durMs: s.durMs,
+        }),
+      );
+      if (sfxCopies.length > 0) {
+        setSfxItems((prev) => [...prev, ...sfxCopies]);
+        newSel.push(...sfxCopies.map((s) => s.id));
+      }
+      setSelectedIds(newSel);
+      const n = newSel.length;
+      toast.success(`Pasted ${n} item${n === 1 ? "" : "s"} at ${fmtTimecode(atMs)}`, {
+        description:
+          "The copies keep their settings and relative spacing — they're independent clips.",
+      });
+    },
+    [trackUrl],
+  );
+
+  const pasteClipboard = useCallback(() => {
+    if (!clipboard) return;
+    if (clipboard.clips.length === 0 && clipboard.sfx.length === 0) return;
+    requestHistoryPush();
+    const atMs = Math.max(0, Math.round(currentMsRef.current));
+    const delta = atMs - clipboard.originMs;
+    pasteFromSnapshot(clipboard, atMs, delta, totalMsRef.current);
+  }, [clipboard, requestHistoryPush, pasteFromSnapshot]);
+
   /** v5.0: add an SFX placement at the playhead (MediaPanel palette). */
   const handleAddSfx = useCallback(
     (sfxId: string) => {
@@ -2923,10 +3210,40 @@ const handleRandomTransitionMix = useCallback(() => {
         redo();
       } else if (mod && (e.key === "a" || e.key === "A")) {
         // v5.4: select every clip (base + overlay). Inputs are guarded
-        // above, so this only fires on app-chrome focus.
-        if (timelineSegmentsRef.current.length > 0) {
+        // above, so this only fires on app-chrome focus. v5.5: SFX pills
+        // and the music clip join Ctrl+A (the full selection story). The
+        // music gate is PRESENCE (audioTrack != null) — durationMs can be
+        // null right after an undo restore (the async probe never
+        // re-pushes history), and the clip still exists.
+        const segs = timelineSegmentsRef.current;
+        const sfx = stateRef.current?.sfxItems ?? [];
+        const musicTrack = stateRef.current?.audioTrack;
+        const music = musicTrack != null ? [MUSIC_SEL_ID] : [];
+        if (segs.length + sfx.length + music.length > 0) {
           e.preventDefault();
-          setSelectedIds(timelineSegmentsRef.current.map((s) => s.id));
+          setSelectedIds([
+            ...segs.map((s) => s.id),
+            ...sfx.map((s) => s.id),
+            ...music,
+          ]);
+        }
+      } else if (mod && (e.key === "c" || e.key === "C")) {
+        // v5.5: copy the selection (segments + SFX pills) to the timeline
+        // clipboard. Browser text-copy stays untouched when nothing is
+        // selectable on the timeline.
+        if (
+          selectedIdsRef.current.length > 0 ||
+          timelineSegmentsRef.current.length > 0
+        ) {
+          e.preventDefault();
+          copySelection();
+        }
+      } else if (mod && (e.key === "v" || e.key === "V")) {
+        // v5.5: paste the clipboard at the playhead (guarded — the
+        // browser's own paste stays intact when the clipboard is empty).
+        if (clipboardRef.current != null) {
+          e.preventDefault();
+          pasteClipboard();
         }
       } else if (e.key === "Escape") {
         // v5.4: clear the timeline multi-selection. (PreviewPanel's Esc —
@@ -2972,7 +3289,7 @@ const handleRandomTransitionMix = useCallback(() => {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, seek, stepSegment, undo, redo, removeItems]);
+  }, [togglePlay, seek, stepSegment, undo, redo, removeItems, copySelection, pasteClipboard]);
 
   // ---- Cleanup object URLs on unmount -------------------------------------
   // URLs are deliberately kept alive during the whole session so undo can
@@ -3274,6 +3591,15 @@ const handleRandomTransitionMix = useCallback(() => {
             selectedIds={selectedIds}
             onSelectionChange={setSelectedIds}
             onRemoveMany={removeItems}
+            // ---- v5.5: group move + clipboard ----
+            onGroupMove={handleGroupMove}
+            onCopySelection={copySelection}
+            onPasteClipboard={pasteClipboard}
+            clipboardCount={
+              clipboard
+                ? clipboard.clips.length + clipboard.sfx.length
+                : 0
+            }
             // ---- v5.2: music placement (draggable clip on the audio lane) ----
             musicStartMs={audioSettings.musicStartMs}
             musicLoop={audioSettings.musicLoop}
@@ -3281,6 +3607,9 @@ const handleRandomTransitionMix = useCallback(() => {
             musicDurationMs={audioTrack?.durationMs ?? null}
             musicName={audioTrack?.fileName ?? null}
             onMusicMove={(startMs) => {
+              // v5.5: music drags are now undoable (one push per gesture —
+              // the debounced flush coalesces pointerup bursts).
+              requestHistoryPush();
               setAudioSettings((prev) =>
                 prev.musicStartMs === startMs
                   ? prev

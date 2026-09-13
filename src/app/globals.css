@@ -594,6 +594,22 @@ summary:focus-visible,
     0 0 0 1px rgba(0, 0, 0, 0.3),
     inset 0 0 24px rgba(245, 158, 11, 0.06);
 }
+/* v5.5: selection count chip — pops on every count change (the key={count}
+   remount restarts the animation). Reads as a live counter, not a static
+   label. */
+.ff-sel-chip {
+  animation: ff-sel-pop 180ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+@keyframes ff-sel-pop {
+  from {
+    transform: scale(0.92);
+    opacity: 0.6;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
 /* v5.4.1: right-click context menu — dark glassy card, fixed-positioned
    at the click point (viewport-clamped in a layout effect). */
 .ff-ctx-menu {

@@ -32,6 +32,8 @@ import {
   Type,
   AudioLines,
   Clapperboard,
+  ClipboardCopy,
+  ClipboardPaste,
   Copy,
   Layers,
   Maximize,
@@ -122,9 +124,27 @@ interface TimelineRulerProps {
    *  ranges, marquee bands select, empty-space clicks clear). */
   onSelectionChange?: (ids: string[]) => void;
   /** v5.4: remove MANY clips in ONE undo step (toolbar trash + Delete key
-   *  act on the selection when present). */
+   *  act on the selection when present). v5.5: ids may MIX segments, SFX
+   *  pills and MUSIC_SEL_ID — the page routes each kind. */
   onRemoveMany?: (ids: string[]) => void;
+  /** v5.5: commit a coordinated GROUP MOVE (dragging any selected item
+   *  moves the whole selection with one clamped delta; one undo step). */
+  onGroupMove?: (move: {
+    clips: { id: string; startMs: number }[];
+    sfx: { id: string; startMs: number }[];
+    musicStartMs?: number;
+  }) => void;
+  /** v5.5: copy the selection (segments + SFX pills) to the clipboard. */
+  onCopySelection?: () => void;
+  /** v5.5: paste the clipboard at the playhead. */
+  onPasteClipboard?: () => void;
+  /** v5.5: clipboard size (toolbar paste chip + menu enable state). */
+  clipboardCount?: number;
 }
+
+/** v5.5: sentinel id of the singleton background-music clip inside the
+ *  selection array (page.tsx routes it to the audio-track removal). */
+export const MUSIC_SEL_ID = "__ff_music__";
 
 // v4.9: bar tints — the segment bar is now a FILMSTRIP (thumbnail shows
 // through), so these gradients are translucent kind-tints layered over the
@@ -281,6 +301,32 @@ type DragInfo =
       didDrag: boolean;
       origStart: number;
       origDur: number;
+    }
+  | {
+      /** v5.5: coordinated GROUP drag — pressing an item that belongs to a
+       *  multi-selection (≥ 2 entries) and dragging moves the WHOLE group
+       *  with one delta. The driver (whichever item was pressed) routes the
+       *  pointer events here; lane switching is disabled for the gesture
+       *  (the group keeps its lanes — vertical intent stays single-clip). */
+      kind: "group";
+      driver: { type: "clip" | "sfx" | "music"; id: string };
+      pointerId: number;
+      startX: number;
+      startY: number;
+      msPerPx: number;
+      didDrag: boolean;
+      /** Coordinated delta bounds (ms) — the intersection of every
+       *  member's [timeline-start, timeline-end] window plus the base-lane
+       *  non-overlap rule (a member's previous neighbor bounds it unless
+       *  that neighbor is ALSO in the group — it moves away). */
+      loDelta: number;
+      hiDelta: number;
+      /** Clip members (driver included when it is a clip). */
+      clips: { id: string; origStart: number; origDur: number }[];
+      /** SFX members (driver included when it is an SFX pill). */
+      sfx: { id: string; origStart: number; origDur: number }[];
+      /** Music member start (null when the singleton isn't selected). */
+      musicOrigStart: number | null;
     };
 
 /** Live drag feedback mirrored into render (local state; parent state only
@@ -296,6 +342,8 @@ type DragPreview =
       targetTrack: number | undefined;
       /** Track the clip currently lives on (drop-target highlight source). */
       origTrack: number;
+      /** v5.5: group-drag member previews (OTHER clips + sfx + music). */
+      group?: GroupPreview;
     }
   | {
       kind: "sfx";
@@ -303,7 +351,16 @@ type DragPreview =
       gesture: "move" | "resize-l" | "resize-r";
       startMs: number;
       durMs: number;
+      /** v5.5: group-drag member previews (OTHER clips + sfx + music). */
+      group?: GroupPreview;
     };
+
+/** v5.5: previews for the non-driver members of a group drag. */
+type GroupPreview = {
+  clips: { id: string; startMs: number; durMs: number }[];
+  sfx: { id: string; startMs: number; durMs: number }[];
+  musicStart?: number;
+};
 
 /** Max trimmable TIMELINE duration for a clip (video: the remaining SOURCE
  * window divided by speed — v5.1 scaled clamp; else 300 s). */
@@ -469,6 +526,23 @@ function computeSfxDrag(
     ),
     durMs: d.origDur,
   };
+}
+
+/**
+ * v5.5: pure math for a GROUP move at a pointer position. One delta for
+ * every member, clamped to the coordinated bounds captured at gesture
+ * start ([loDelta, hiDelta] — see tryBeginGroupDrag), snapped to the 10ms
+ * grid, then re-clamped (snap can overshoot by <10ms). Shared by the live
+ * preview and the commit so both always agree (computeClipDrag parity).
+ */
+function computeGroupDelta(
+  d: Extract<DragInfo, { kind: "group" }>,
+  clientX: number,
+): number {
+  const raw = (clientX - d.startX) * d.msPerPx;
+  const clamped = Math.max(d.loDelta, Math.min(d.hiDelta, raw));
+  const snapped = snapMs(clamped);
+  return Math.max(d.loDelta, Math.min(d.hiDelta, snapped));
 }
 
 interface OverlayLayoutEntry {
@@ -1375,6 +1449,10 @@ export function TimelineRuler({
   selectedIds: selectedIdsProp,
   onSelectionChange,
   onRemoveMany,
+  onGroupMove,
+  onCopySelection,
+  onPasteClipboard,
+  clipboardCount = 0,
 }: TimelineRulerProps) {
   const trackRef = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
@@ -1415,6 +1493,9 @@ export function TimelineRuler({
   } | null>(null);
   const baseAxisRef = useRef<HTMLDivElement>(null);
   const overlayAxisRef = useRef<HTMLDivElement>(null);
+  // v5.5: audio + sfx lane axes (marquee scans them like the clip lanes).
+  const audioAxisRef = useRef<HTMLDivElement>(null);
+  const sfxAxisRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
 
   // v5.4.1 right-click CONTEXT MENU -------------------------------------
@@ -1450,6 +1531,12 @@ export function TimelineRuler({
   const openSfxMenu = (e: ReactMouseEvent, id: string) => {
     e.preventDefault();
     e.stopPropagation();
+    // v5.5: clip-menu parity — a right-click OUTSIDE a containing selection
+    // selects the pill solo first (menu actions act on the selection).
+    if (onSelectionChange && !(selectedIdsProp ?? []).includes(id)) {
+      onSelectionChange([id]);
+      anchorIdRef.current = id;
+    }
     setCtxIdx(0);
     setCtxMenu({ kind: "sfx", id, x: e.clientX, y: e.clientY });
   };
@@ -1457,6 +1544,9 @@ export function TimelineRuler({
   const openMusicMenu = (e: ReactMouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    if (onSelectionChange && !(selectedIdsProp ?? []).includes(MUSIC_SEL_ID)) {
+      onSelectionChange([MUSIC_SEL_ID]);
+    }
     setCtxIdx(0);
     setCtxMenu({ kind: "music", id: "", x: e.clientX, y: e.clientY });
   };
@@ -1658,14 +1748,44 @@ export function TimelineRuler({
     return w > 0 && totalMs > 0 ? totalMs / w : 0;
   }, [totalMs, isV5, pxPerSec]);
 
-  const clipPreviewFor = (id: string) =>
-    dragPreview && dragPreview.kind === "clip" && dragPreview.id === id
-      ? dragPreview
-      : null;
-  const sfxPreviewFor = (id: string) =>
-    dragPreview && dragPreview.kind === "sfx" && dragPreview.id === id
-      ? dragPreview
-      : null;
+  const clipPreviewFor = (id: string) => {
+    if (!dragPreview) return null;
+    if (dragPreview.kind === "clip" && dragPreview.id === id) {
+      return dragPreview;
+    }
+    // v5.5: group member — synthesize a move preview (duration carried at
+    // gesture start; targetTrack stays the member's own lane).
+    const g = dragPreview.group?.clips.find((c) => c.id === id);
+    if (g) {
+      return {
+        kind: "clip" as const,
+        id,
+        gesture: "move" as const,
+        startMs: g.startMs,
+        durationMs: g.durMs,
+        targetTrack: undefined,
+        origTrack: 0,
+      };
+    }
+    return null;
+  };
+  const sfxPreviewFor = (id: string) => {
+    if (!dragPreview) return null;
+    if (dragPreview.kind === "sfx" && dragPreview.id === id) {
+      return dragPreview;
+    }
+    const g = dragPreview.group?.sfx.find((s) => s.id === id);
+    if (g) {
+      return {
+        kind: "sfx" as const,
+        id,
+        gesture: "move" as const,
+        startMs: g.startMs,
+        durMs: g.durMs,
+      };
+    }
+    return null;
+  };
 
   // ---- v5.2: MUSIC clip drag (self-contained gesture — no lane switching,
   // no shared DragInfo: the music track is a singleton on the audio lane).
@@ -1688,6 +1808,11 @@ export function TimelineRuler({
     if (e.button !== 0 || !onMusicMove) return;
     e.stopPropagation();
     onSeek(Math.max(0, musicStartMs));
+    // v5.5: a press on a multi-selected music clip hijacks into a GROUP
+    // gesture (the whole selection moves together).
+    if (tryBeginGroupDrag(e, "music", MUSIC_SEL_ID, Math.max(0, musicStartMs))) {
+      return;
+    }
     try {
       e.currentTarget.setPointerCapture(e.pointerId);
     } catch {
@@ -1703,6 +1828,12 @@ export function TimelineRuler({
   };
 
   const handleMusicPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    // v5.5: group gestures route through the shared group handler.
+    const gd = dragRef.current;
+    if (gd && gd.kind === "group" && gd.pointerId === e.pointerId) {
+      handleGroupPointerMove(e, gd);
+      return;
+    }
     const d = musicDrag;
     if (!d || d.pointerId !== e.pointerId) return;
     const dx = e.clientX - d.startX;
@@ -1723,13 +1854,251 @@ export function TimelineRuler({
   };
 
   const handleMusicPointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
+    // v5.5: group release (commit or click-select) — before the solo path.
+    const gd = dragRef.current;
+    if (gd && gd.kind === "group" && gd.pointerId === e.pointerId) {
+      handleGroupPointerUp(e, gd);
+      return;
+    }
     const d = musicDrag;
     if (!d || d.pointerId !== e.pointerId) return;
     setMusicDrag(null);
-    if (d.didDrag && onMusicMove) onMusicMove(d.startMs);
+    if (d.didDrag) {
+      if (onMusicMove) onMusicMove(d.startMs);
+    } else if (onSelectionChange) {
+      // v5.5: a plain music-clip click SELECTS it (clip parity).
+      onSelectionChange([MUSIC_SEL_ID]);
+    }
   };
 
   const handleMusicDragAbort = () => setMusicDrag(null);
+
+  // ------------------------------------------------------------------
+  // v5.5 GROUP drag — pressing an item that belongs to a multi-selection
+  // (≥ 2 entries) and dragging moves the WHOLE selection with one
+  // coordinated, clamped delta. Vertical lane switching is a single-clip
+  // gesture (the group keeps its lanes). Trim/resize gestures never group.
+  // ------------------------------------------------------------------
+
+  /** Shared click-selection commit (driver release without a drag). */
+  const commitClickSelection = (
+    driver: { type: "clip" | "sfx" | "music"; id: string },
+    e: { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean },
+  ) => {
+    if (!onSelectionChange) return;
+    if (driver.type === "music") {
+      onSelectionChange([MUSIC_SEL_ID]);
+    } else {
+      onSelectionChange(clickSelectionFor(driver.id, e));
+      anchorIdRef.current = driver.id;
+    }
+  };
+
+  /**
+   * Try to start a group gesture for this press. Returns true when the
+   * group owns the pointer (caller must NOT begin a solo gesture). The
+   * coordinated bounds: every member stays inside [0, totalMs]; a BASE-lane
+   * member may not cross its previous neighbor's end UNLESS that neighbor
+   * is also in the group (it moves away); the music clip keeps its
+   * [0, totalMs − 200] window (music-drag parity).
+   */
+  const tryBeginGroupDrag = (
+    e: ReactPointerEvent<HTMLDivElement>,
+    driverType: "clip" | "sfx" | "music",
+    driverId: string,
+    driverStartMs: number,
+  ): boolean => {
+    if (!onGroupMove) return false;
+    const sel = selectedIdsProp ?? [];
+    if (sel.length < 2) return false;
+    const selSet = new Set(sel);
+    // Resolve members from the LIVE selection (ids that no longer exist
+    // resolve to nothing — stale ids are inert, never crash the gesture).
+    const clipMembers = segments.filter((s) => selSet.has(s.id));
+    const sfxMembers = sfxList.filter((s) => selSet.has(s.id));
+    const musicSelected =
+      selSet.has(MUSIC_SEL_ID) && onMusicMove != null && musicStartMs != null;
+    const musicStart = Math.max(0, musicStartMs ?? 0);
+    const memberCount =
+      clipMembers.length + sfxMembers.length + (musicSelected ? 1 : 0);
+    if (memberCount < 2) return false;
+    const driverIn =
+      (driverType === "clip" && clipMembers.some((m) => m.id === driverId)) ||
+      (driverType === "sfx" && sfxMembers.some((m) => m.id === driverId)) ||
+      (driverType === "music" && musicSelected);
+    if (!driverIn) return false;
+
+    // Coordinated bounds (ms deltas).
+    let lo = -Infinity;
+    let hi = Infinity;
+    for (const s of clipMembers) {
+      const start = driverType === "clip" && s.id === driverId ? driverStartMs : s.startMs;
+      lo = Math.max(lo, -start);
+      hi = Math.min(hi, totalMs - start);
+      if (s.track === 0) {
+        // Base-lane non-overlap: the previous base clip bounds the slide
+        // unless it is in the group too (it moves away with us).
+        const prev = segments
+          .filter((x) => x.track === 0 && x.id !== s.id && x.startMs < s.startMs)
+          .sort((a, b) => a.startMs - b.startMs)
+          .pop();
+        if (prev && !selSet.has(prev.id)) {
+          lo = Math.max(lo, prev.startMs + prev.durationMs - start);
+        }
+      }
+    }
+    for (const s of sfxMembers) {
+      const start = driverType === "sfx" && s.id === driverId ? driverStartMs : s.startMs;
+      lo = Math.max(lo, -start);
+      hi = Math.min(hi, totalMs - start);
+    }
+    if (musicSelected) {
+      const start = driverType === "music" ? driverStartMs : musicStart;
+      lo = Math.max(lo, -start);
+      hi = Math.min(hi, Math.max(0, totalMs - 200) - start);
+    }
+    // A degenerate window (fully clamped) still allows the gesture — the
+    // preview pins in place and the release is a plain click-select.
+
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // best-effort — bubbling still delivers the events
+    }
+    dragRef.current = {
+      kind: "group",
+      driver: { type: driverType, id: driverId },
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      msPerPx: msPerPxNow(),
+      didDrag: false,
+      loDelta: lo,
+      hiDelta: hi,
+      clips: clipMembers.map((s) => ({
+        id: s.id,
+        origStart:
+          driverType === "clip" && s.id === driverId ? driverStartMs : s.startMs,
+        origDur: s.durationMs,
+      })),
+      sfx: sfxMembers.map((s) => ({
+        id: s.id,
+        origStart:
+          driverType === "sfx" && s.id === driverId ? driverStartMs : s.startMs,
+        origDur: sfxDurationMs(s),
+      })),
+      musicOrigStart: musicSelected
+        ? driverType === "music"
+          ? driverStartMs
+          : musicStart
+        : null,
+    };
+    return true;
+  };
+
+  /** Group move: one delta for everything (clips + sfx + music previews). */
+  const handleGroupPointerMove = (
+    e: ReactPointerEvent<HTMLDivElement>,
+    d: Extract<DragInfo, { kind: "group" }>,
+  ) => {
+    if (!d.didDrag) {
+      if (
+        Math.abs(e.clientX - d.startX) <= DRAG_DEADZONE_PX &&
+        Math.abs(e.clientY - d.startY) <= DRAG_DEADZONE_PX
+      ) {
+        return;
+      }
+      d.didDrag = true;
+    }
+    const delta = computeGroupDelta(d, e.clientX);
+    const driverClip = d.clips.find((c) => c.id === d.driver.id);
+    const driverSfx = d.sfx.find((c) => c.id === d.driver.id);
+    const group: GroupPreview = {
+      clips: d.clips
+        .filter((c) => c.id !== d.driver.id)
+        .map((c) => ({
+          id: c.id,
+          startMs: c.origStart + delta,
+          durMs: c.origDur,
+        })),
+      sfx: d.sfx
+        .filter((c) => c.id !== d.driver.id)
+        .map((c) => ({
+          id: c.id,
+          startMs: c.origStart + delta,
+          durMs: c.origDur,
+        })),
+      musicStart:
+        d.musicOrigStart != null ? d.musicOrigStart + delta : undefined,
+    };
+    if (driverClip) {
+      setDragPreview({
+        kind: "clip",
+        id: driverClip.id,
+        gesture: "move",
+        startMs: driverClip.origStart + delta,
+        durationMs: driverClip.origDur,
+        targetTrack: undefined,
+        origTrack: 0,
+        group,
+      });
+    } else if (driverSfx) {
+      setDragPreview({
+        kind: "sfx",
+        id: driverSfx.id,
+        gesture: "move",
+        startMs: driverSfx.origStart + delta,
+        durMs: driverSfx.origDur,
+        group,
+      });
+    } else {
+      // Music-driven: no dragPreview driver entry, only the group.
+      setDragPreview({
+        kind: "sfx",
+        id: "__music_driver__",
+        gesture: "move",
+        startMs: 0,
+        durMs: 0,
+        group,
+      });
+    }
+    // The music clip previews through the musicDrag channel (musicStart
+    // reads it in render).
+    if (d.musicOrigStart != null) {
+      setMusicDrag({
+        pointerId: d.pointerId,
+        startX: d.startX,
+        origStart: d.musicOrigStart,
+        startMs: d.musicOrigStart + delta,
+        didDrag: true,
+      });
+    }
+  };
+
+  /** Group release: commit every member through ONE onGroupMove (single
+   *  undo step) — or, when the press never crossed the deadzone, run the
+   *  driver's click-selection instead (press-select parity). */
+  const handleGroupPointerUp = (
+    e: ReactPointerEvent<HTMLDivElement>,
+    d: Extract<DragInfo, { kind: "group" }>,
+  ) => {
+    dragRef.current = null;
+    setDragPreview(null);
+    setMusicDrag(null);
+    if (!d.didDrag) {
+      commitClickSelection(d.driver, e);
+      return;
+    }
+    if (d.loDelta > d.hiDelta) return; // degenerate window — nothing to do
+    const delta = computeGroupDelta(d, e.clientX);
+    if (delta === 0) return;
+    onGroupMove?.({
+      clips: d.clips.map((c) => ({ id: c.id, startMs: c.origStart + delta })),
+      sfx: d.sfx.map((c) => ({ id: c.id, startMs: c.origStart + delta })),
+      musicStartMs:
+        d.musicOrigStart != null ? d.musicOrigStart + delta : undefined,
+    });
+  };
 
   // v5.2: music-clip hover state drives the volume/loop popover. React state
   // (not CSS group-hover): Tailwind's `pointer-events-none` and the
@@ -1753,6 +2122,14 @@ export function TimelineRuler({
   ) => {
     if (!onEditItem || e.button !== 0) return;
     e.stopPropagation();
+    // v5.5: a MOVE press on a multi-selected clip hijacks into a GROUP
+    // gesture (the whole selection moves; trims stay single-clip).
+    if (
+      gesture === "move" &&
+      tryBeginGroupDrag(e, "clip", seg.id, seg.startMs)
+    ) {
+      return;
+    }
     if (gesture === "move") onSeek(xToMs(e.clientX));
     // v5.3: base-lane neighbor clamps — the previous clip's end bounds any
     // start slide, the next clip's start bounds any end extension. (Overlays
@@ -1819,6 +2196,14 @@ export function TimelineRuler({
     if (e.button !== 0) return;
     e.stopPropagation();
     if (e.altKey && onRemoveSfx) return;
+    // v5.5: a MOVE press on a multi-selected pill hijacks into a GROUP
+    // gesture (resizes stay single-pill).
+    if (
+      gesture === "move" &&
+      tryBeginGroupDrag(e, "sfx", item.id, item.startMs)
+    ) {
+      return;
+    }
     // Press-seek only for the pill body (edge presses carry trim intent).
     if (gesture === "move") onSeek(Math.max(0, item.startMs));
     if (!onMoveSfx) return;
@@ -1842,7 +2227,13 @@ export function TimelineRuler({
 
   const handleClipPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
     const d = dragRef.current;
-    if (!d || d.kind !== "clip" || d.pointerId !== e.pointerId) return;
+    if (!d || d.pointerId !== e.pointerId) return;
+    // v5.5: group gestures route through the shared group handler.
+    if (d.kind === "group") {
+      handleGroupPointerMove(e, d);
+      return;
+    }
+    if (d.kind !== "clip") return;
     if (!d.didDrag) {
       if (
         Math.abs(e.clientX - d.startX) <= DRAG_DEADZONE_PX &&
@@ -1897,7 +2288,13 @@ export function TimelineRuler({
 
   const handleClipPointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
     const d = dragRef.current;
-    if (!d || d.kind !== "clip" || d.pointerId !== e.pointerId) return;
+    if (!d || d.pointerId !== e.pointerId) return;
+    // v5.5: group release (commit or click-select) — before the solo path.
+    if (d.kind === "group") {
+      handleGroupPointerUp(e, d);
+      return;
+    }
+    if (d.kind !== "clip") return;
     dragRef.current = null;
     setDragPreview(null);
     // v5.4: plain click (no drag) = selection. The press already sought
@@ -1936,7 +2333,13 @@ export function TimelineRuler({
 
   const handleSfxPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
     const d = dragRef.current;
-    if (!d || d.kind !== "sfx" || d.pointerId !== e.pointerId) return;
+    if (!d || d.pointerId !== e.pointerId) return;
+    // v5.5: group gestures route through the shared group handler.
+    if (d.kind === "group") {
+      handleGroupPointerMove(e, d);
+      return;
+    }
+    if (d.kind !== "sfx") return;
     if (!d.didDrag) {
       if (Math.abs(e.clientX - d.startX) <= DRAG_DEADZONE_PX) return;
       d.didDrag = true;
@@ -1953,10 +2356,24 @@ export function TimelineRuler({
 
   const handleSfxPointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
     const d = dragRef.current;
-    if (!d || d.kind !== "sfx" || d.pointerId !== e.pointerId) return;
+    if (!d || d.pointerId !== e.pointerId) return;
+    // v5.5: group release (commit or click-select) — before the solo path.
+    if (d.kind === "group") {
+      handleGroupPointerUp(e, d);
+      return;
+    }
+    if (d.kind !== "sfx") return;
     dragRef.current = null;
     setDragPreview(null);
-    if (!d.didDrag) return;
+    if (!d.didDrag) {
+      // v5.5: a plain pill click SELECTS it (clip parity — the press
+      // already seeked to its start).
+      if (onSelectionChange && !e.altKey) {
+        onSelectionChange(clickSelectionFor(d.id, e));
+        anchorIdRef.current = d.id;
+      }
+      return;
+    }
     const r = computeSfxDrag(d, e.clientX, totalMs);
     if (d.gesture === "move") {
       onMoveSfx?.(d.id, r.startMs);
@@ -1978,6 +2395,9 @@ export function TimelineRuler({
     if (d && d.pointerId === e.pointerId) {
       dragRef.current = null;
       setDragPreview(null);
+      // v5.5: a group drag may be previewing the music clip via musicDrag
+      // — clear it too (a stale preview would freeze the clip mid-air).
+      if (d.kind === "group") setMusicDrag(null);
     }
   };
 
@@ -2116,6 +2536,52 @@ export function TimelineRuler({
     };
     scan(baseAxisRef.current, baseSegs);
     scan(overlayAxisRef.current, overlaySegs);
+    // v5.5: the rubber band also sweeps the AUDIO + SFX lanes — every
+    // timeline target (clips, SFX pills, the music clip) is selectable.
+    const scanRange = (
+      axisEl: HTMLElement | null,
+      entries: { id: string; startMs: number; endMs: number }[],
+    ) => {
+      if (!axisEl || entries.length === 0) return;
+      const r = axisEl.getBoundingClientRect();
+      if (maxY < r.top || minY > r.bottom) return;
+      for (const s of entries) {
+        const sx0 =
+          r.left +
+          (layout
+            ? layout.pxOf(s.startMs)
+            : (s.startMs / Math.max(1, totalMs)) * r.width);
+        const sx1 =
+          r.left +
+          (layout
+            ? layout.pxOf(s.endMs)
+            : (s.endMs / Math.max(1, totalMs)) * r.width);
+        if (sx1 >= minX && sx0 <= maxX) ids.push(s.id);
+      }
+    };
+    scanRange(
+      sfxAxisRef.current,
+      sfxList.map((s) => {
+        const dur = sfxDurationMs(s);
+        return { id: s.id, startMs: s.startMs, endMs: s.startMs + dur };
+      }),
+    );
+    // Music geometry: loop → the whole timeline; else start + duration
+    // (musicDurationMs falls back to the WAVEFORM duration — durationMs
+    // can be null right after an undo restore). Presence = musicName
+    // (audioTrack.fileName) — the one prop that tracks the track itself.
+    if (musicName != null && musicStartMs != null) {
+      const mDur =
+        musicDurationMs && musicDurationMs > 0
+          ? musicDurationMs
+          : waveform?.durationMs ?? totalMs;
+      const musicEnd = musicLoop
+        ? totalMs
+        : Math.min(totalMs, musicStartMs + mDur);
+      scanRange(audioAxisRef.current, [
+        { id: MUSIC_SEL_ID, startMs: musicStartMs, endMs: musicEnd },
+      ]);
+    }
     return ids;
   };
 
@@ -2353,6 +2819,15 @@ export function TimelineRuler({
           onClick: onDuplicate ? () => onDuplicate(seg.id) : undefined,
           disabled: onDuplicate == null,
         },
+        {
+          // v5.5: clipboard copy of the whole selection (kbd parity with
+          // the page-level Ctrl+C handler).
+          icon: ClipboardCopy,
+          label: sel.length > 1 ? `Copy ${sel.length} selected` : "Copy",
+          kbd: "Ctrl+C",
+          onClick: onCopySelection,
+          disabled: onCopySelection == null,
+        },
         { sep: true, label: "" },
       ];
       if (isOverlay) {
@@ -2408,7 +2883,9 @@ export function TimelineRuler({
         { sep: true, label: "" },
         {
           icon: Trash2,
-          label: multi ? `Delete ${sel.length} clips` : "Delete",
+          // v5.5: generic label — the selection may mix clips, SFX pills
+          //  and the music clip.
+          label: multi ? `Delete ${sel.length} selected` : "Delete",
           kbd: "Del",
           danger: true,
           onClick: multi
@@ -2428,6 +2905,8 @@ export function TimelineRuler({
       const item = sfxList.find((s) => s.id === ctxMenu.id);
       if (!item) return [];
       const def = getSfxDef(item.sfxId);
+      const sel = selectedIdsProp ?? [];
+      const multi = sel.length > 1 && sel.includes(item.id);
       return [
         {
           icon: Play,
@@ -2440,18 +2919,35 @@ export function TimelineRuler({
           onClick: undefined,
           disabled: true,
         },
+        {
+          icon: ClipboardCopy,
+          label: multi ? `Copy ${sel.length} selected` : "Copy",
+          kbd: "Ctrl+C",
+          onClick: onCopySelection,
+          disabled: onCopySelection == null,
+        },
         { sep: true, label: "" },
         {
           icon: Trash2,
-          label: "Remove effect",
-          kbd: "Alt+click",
+          label: multi ? `Delete ${sel.length} selected` : "Remove effect",
+          kbd: multi ? "Del" : "Alt+click",
           danger: true,
-          onClick: onRemoveSfx ? () => onRemoveSfx(item.id) : undefined,
-          disabled: onRemoveSfx == null,
+          onClick: multi
+            ? onRemoveMany
+              ? () => onRemoveMany(sel)
+              : undefined
+            : onRemoveSfx
+              ? () => onRemoveSfx(item.id)
+              : undefined,
+          disabled:
+            (multi && onRemoveMany == null) ||
+            (!multi && onRemoveSfx == null),
         },
       ];
     }
     if (ctxMenu.kind === "music") {
+      const sel = selectedIdsProp ?? [];
+      const multi = sel.length > 1 && sel.includes(MUSIC_SEL_ID);
       return [
         {
           icon: Play,
@@ -2472,6 +2968,19 @@ export function TimelineRuler({
             : undefined,
           disabled: onMusicLoopChange == null,
         },
+        ...(multi
+          ? [
+              { sep: true, label: "" } as CtxItem,
+              {
+                icon: Trash2,
+                label: `Delete ${sel.length} selected`,
+                kbd: "Del",
+                danger: true,
+                onClick: onRemoveMany ? () => onRemoveMany(sel) : undefined,
+                disabled: onRemoveMany == null,
+              } as CtxItem,
+            ]
+          : []),
       ];
     }
     // Empty lane space
@@ -2480,9 +2989,17 @@ export function TimelineRuler({
         icon: Layers,
         label: "Select all clips",
         kbd: "Ctrl+A",
-        disabled: segments.length === 0,
+        disabled:
+          segments.length === 0 &&
+          sfxList.length === 0 &&
+          musicName == null,
         onClick: onSelectionChange
-          ? () => onSelectionChange(segments.map((s) => s.id))
+          ? () =>
+              onSelectionChange([
+                ...segments.map((s) => s.id),
+                ...sfxList.map((s) => s.id),
+                ...(musicName != null ? [MUSIC_SEL_ID] : []),
+              ])
           : undefined,
       },
       {
@@ -2493,6 +3010,16 @@ export function TimelineRuler({
         onClick: onSelectionChange ? () => onSelectionChange([]) : undefined,
       },
       { sep: true, label: "" },
+      {
+        icon: ClipboardPaste,
+        label:
+          clipboardCount > 0
+            ? `Paste ${clipboardCount} at playhead`
+            : "Paste at playhead",
+        kbd: "Ctrl+V",
+        onClick: onPasteClipboard,
+        disabled: onPasteClipboard == null || clipboardCount === 0,
+      },
       {
         icon: Maximize,
         label: "Fit timeline to panel",
@@ -2622,12 +3149,14 @@ export function TimelineRuler({
             </span>
           )}
           {/* v5.4: multi-select count chip — amber accent (distinct from the
-              cyan playhead-position chip). X clears; Esc does the same. */}
+              cyan playhead-position chip). X clears; Esc does the same.
+              v5.5: ff-sel-chip pop animation on count change. */}
           {isV5 && selCount > 0 && (
             <span
-              className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-bold tabular-nums normal-case"
+              key={selCount}
+              className="ff-sel-chip flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-bold tabular-nums normal-case"
               style={{ backgroundColor: "rgba(69, 26, 3, 0.55)", color: "#fcd34d" }}
-              title="Selected clips — Del removes all of them, Esc clears · click, Ctrl-click, Shift-click or drag a band on an empty lane to select"
+              title="Selected items — Del removes all of them, Esc clears · click, Ctrl-click, Shift-click or drag a band on any empty lane to select · drag any selected item to move the whole group"
             >
               <Layers className="size-2.5" aria-hidden />
               {selCount} selected
@@ -2716,9 +3245,27 @@ export function TimelineRuler({
               !hasActive,
             )}
             {toolBtn(
+              <ClipboardCopy className="size-4" />,
+              selCount > 0
+                ? `Copy ${selCount} selected (Ctrl+C)`
+                : "Copy clip (Ctrl+C)",
+              onCopySelection,
+              onCopySelection == null,
+            )}
+            {toolBtn(
+              <ClipboardPaste className="size-4" />,
+              clipboardCount > 0
+                ? `Paste ${clipboardCount} clips at playhead (Ctrl+V)`
+                : "Paste at playhead (Ctrl+V)",
+              onPasteClipboard && clipboardCount > 0
+                ? () => onPasteClipboard?.()
+                : undefined,
+              clipboardCount === 0 || onPasteClipboard == null,
+            )}
+            {toolBtn(
               <Trash2 className="size-4" />,
               selCount > 1
-                ? `Delete ${selCount} selected clips (Del)`
+                ? `Delete ${selCount} selected (Del)`
                 : "Delete (Del)",
               selCount > 0 && onRemoveMany && selectedIdsProp
                 ? () => onRemoveMany(selectedIdsProp)
@@ -3136,9 +3683,10 @@ export function TimelineRuler({
           >
             <LaneLabel icon={AudioLines} text="Audio" accent="#67e8f9" sticky />
             <div
+              ref={audioAxisRef}
               className="relative min-w-0 shrink-0 transition-colors hover:bg-white/[0.02]"
               style={{ width: axisW }}
-              {...scrubHandlers}
+              {...laneMarqueeHandlers}
             >
               {hasWave && waveform ? (
                 <>
@@ -3172,11 +3720,13 @@ export function TimelineRuler({
                     const volPct = Math.round(
                       Math.max(0, Math.min(2, musicVolume)) * 100,
                     );
+                    // v5.5: a selected music clip carries the amber accent.
+                    const musicSelected = isSel(MUSIC_SEL_ID);
                     return (
                       <div
                         role="button"
                         tabIndex={0}
-                        aria-label={`Background music clip starting at ${fmtTimecode(musicStart)}${musicLoop ? ", looping to fill the video" : ""}`}
+                        aria-label={`Background music clip starting at ${fmtTimecode(musicStart)}${musicLoop ? ", looping to fill the video" : ""}${musicSelected ? ", selected" : ""}`}
                         className={cn(
                           // NOTE: no overflow-hidden AND no z-index — the
                           // hover popover (volume + loop) floats ABOVE the
@@ -3190,20 +3740,28 @@ export function TimelineRuler({
                             ? "cursor-grab touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sky-300/70"
                             : "cursor-pointer",
                           musicDrag && "cursor-grabbing",
+                          // v5.5: amber selection ring (clip parity).
+                          musicSelected && "ff-clip-selected",
                         )}
                         style={{
                           left,
                           width,
-                          backgroundColor: musicDrag
-                            ? "rgba(14, 165, 233, 0.30)"
-                            : "rgba(14, 165, 233, 0.16)",
-                          borderColor: musicLoop
-                            ? "rgba(56, 189, 248, 0.75)"
-                            : "rgba(56, 189, 248, 0.45)",
-                          color: "#bae6fd",
+                          backgroundColor: musicSelected
+                            ? "rgba(245, 158, 11, 0.24)"
+                            : musicDrag
+                              ? "rgba(14, 165, 233, 0.30)"
+                              : "rgba(14, 165, 233, 0.16)",
+                          borderColor: musicSelected
+                            ? "rgba(245, 158, 11, 0.9)"
+                            : musicLoop
+                              ? "rgba(56, 189, 248, 0.75)"
+                              : "rgba(56, 189, 248, 0.45)",
+                          color: musicSelected ? "#fde68a" : "#bae6fd",
                           boxShadow: musicDrag
                             ? "0 0 0 1.5px rgba(255,255,255,0.55), 0 3px 10px rgba(0,0,0,0.55)"
-                            : "0 1px 2px rgba(0,0,0,0.45)",
+                            : musicSelected
+                              ? "0 0 0 2px rgba(245, 158, 11, 0.4), 0 0 12px rgba(245, 158, 11, 0.2)"
+                              : "0 1px 2px rgba(0,0,0,0.45)",
                         }}
                         title={`Background music · starts ${fmtTimecode(musicStart)}${musicLoop ? " · loops to fill the video" : ` · ${fmtTimecode(durMs)} long`}${onMusicMove ? " · drag to reposition" : ""}\nright-click for actions`}
                         onContextMenu={openMusicMenu}
@@ -3344,9 +3902,10 @@ export function TimelineRuler({
           >
             <LaneLabel icon={Zap} text="SFX" accent="#fbbf24" sticky />
             <div
+              ref={sfxAxisRef}
               className="relative min-w-0 shrink-0 transition-colors hover:bg-white/[0.02]"
               style={{ width: axisW }}
-              {...scrubHandlers}
+              {...laneMarqueeHandlers}
             >
               {sfxList.length === 0 ? (
                 <EmptyHint>No sound effects — add from the Media tab</EmptyHint>
@@ -3354,6 +3913,9 @@ export function TimelineRuler({
                 sfxList.map((item) => {
                   const def = getSfxDef(item.sfxId);
                   const pv = sfxPreviewFor(item.id);
+                  // v5.5: selected pills carry the amber selection accent
+                  // (clip parity — the selection ring reads instantly).
+                  const pillSelected = isSel(item.id);
                   const startMs = Math.max(0, pv?.startMs ?? item.startMs);
                   // v5.3: width follows the EFFECTIVE duration (custom durMs
                   // override + live resize preview) — longer effects read as
@@ -3388,6 +3950,9 @@ export function TimelineRuler({
                           ? "cursor-grab touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-violet-300/70"
                           : "cursor-pointer",
                         pv != null && "z-[3] cursor-grabbing",
+                        // v5.5: amber selection ring (outline — never fights
+                        // the inline boxShadow states below).
+                        pillSelected && "ff-clip-selected",
                       )}
                       style={{
                         ...pos,
@@ -3395,17 +3960,23 @@ export function TimelineRuler({
                         top: 4,
                         height: 22,
                         // v5.1 CapCut: violet pills (overlay-lane accent),
-                        // hot-tracked while dragging.
-                        backgroundColor:
-                          pv != null
+                        // hot-tracked while dragging; SELECTED swaps to the
+                        // amber selection tint.
+                        backgroundColor: pillSelected
+                          ? "rgba(245, 158, 11, 0.26)"
+                          : pv != null
                             ? "rgba(139, 92, 246, 0.34)"
                             : "rgba(139, 92, 246, 0.16)",
-                        borderColor: "rgba(167, 139, 250, 0.5)",
-                        color: "#ddd6fe",
+                        borderColor: pillSelected
+                          ? "rgba(245, 158, 11, 0.9)"
+                          : "rgba(167, 139, 250, 0.5)",
+                        color: pillSelected ? "#fde68a" : "#ddd6fe",
                         boxShadow:
                           pv != null
                             ? "0 0 0 1.5px rgba(255,255,255,0.55), 0 3px 10px rgba(0,0,0,0.55)"
-                            : "0 1px 2px rgba(0,0,0,0.45)",
+                            : pillSelected
+                              ? "0 0 0 2px rgba(245, 158, 11, 0.4), 0 0 12px rgba(245, 158, 11, 0.2)"
+                              : "0 1px 2px rgba(0,0,0,0.45)",
                       }}
                       title={`${def?.label ?? item.sfxId} · ${fmtTimecode(startMs)} · ${(durMs / 1000).toFixed(2)}s · click to seek${onMoveSfx ? ", drag to move" : ""}${onEditSfx ? ", drag edges to resize" : ""}${onRemoveSfx ? ", Alt+click or x to remove" : ""}\nright-click for actions`}
                       onContextMenu={(e) => openSfxMenu(e, item.id)}
