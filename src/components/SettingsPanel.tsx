@@ -64,6 +64,7 @@ import {
 import { ANIMATION_LABELS } from "@/lib/merger/captionAnimations";
 import {
   preloadWhisper,
+  preloadFasterWhisperModel,
   type WhisperModelStatus,
   type WhisperProgress,
 } from "@/lib/merger/whisper";
@@ -2326,10 +2327,19 @@ function CaptionsSection(props: CaptionsSectionProps) {
     setPredownloading(true);
     setPredownloadProgress({
       progress: 0,
-      status: "Downloading Whisper-tiny model…",
+      status: `Downloading Whisper-${whisperModel || "tiny"} model…`,
     });
     try {
-      await preloadWhisper((p) => setPredownloadProgress(p));
+      // v1.3.1: prefer the faster-whisper engine's model pre-download (the
+      // SELECTED size); fall back to the classic tiny pre-download when the
+      // sidecar bridge is unavailable (browser / old preload builds).
+      const fwDone = await preloadFasterWhisperModel(
+        whisperModel || "tiny",
+        (p) => setPredownloadProgress(p),
+      );
+      if (!fwDone) {
+        await preloadWhisper((p) => setPredownloadProgress(p));
+      }
       toast.success("Whisper model ready", {
         description: "Captions can now be generated offline.",
       });
@@ -2350,7 +2360,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
       setPredownloading(false);
       setPredownloadProgress(null);
     }
-  }, [predownloading, whisperBusy, whisperStatusApi]);
+  }, [predownloading, whisperBusy, whisperStatusApi, whisperModel]);
 
   return (
     <Section icon={<Captions size={13} />} title="Captions" defaultOpen>
@@ -2486,13 +2496,16 @@ function CaptionsSection(props: CaptionsSectionProps) {
                   className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
                   style={{ borderColor: "#3f3f46" }}
                   aria-label="Pre-download the Whisper model now"
+                  title={`Pre-download the ${whisperModel || "tiny"} model into the persistent cache — the first transcription then runs fully offline`}
                 >
                   {predownloading ? (
                     <Loader2 size={10} className="animate-spin" />
                   ) : (
                     <Download size={10} />
                   )}
-                  {predownloading ? "Downloading…" : "Pre-download now"}
+                  {predownloading
+                    ? "Downloading…"
+                    : `Pre-download ${whisperModel || "tiny"}`}
                 </button>
               </div>
             </div>
@@ -2527,11 +2540,52 @@ function CaptionsSection(props: CaptionsSectionProps) {
                     </span>
                   )}
                 </div>
+                {/* v1.3: active engine chip + faster-whisper cache line. */}
+                {modelStatus.engine && (
+                  <div className="flex items-center gap-1.5">
+                    <span
+                      className={cn(
+                        "rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide",
+                        modelStatus.engine === "faster-whisper"
+                          ? "bg-amber-500/15 text-amber-300"
+                          : "bg-zinc-700/40 text-zinc-400",
+                      )}
+                      title={
+                        modelStatus.engine === "faster-whisper"
+                          ? "CTranslate2 int8 sidecar — ~4× faster, VAD silence skipping"
+                          : "onnxruntime utility process (fallback engine)"
+                      }
+                    >
+                      {modelStatus.engine === "faster-whisper"
+                        ? "⚡ faster-whisper"
+                        : "onnxruntime"}
+                    </span>
+                    {modelStatus.engine === "faster-whisper" &&
+                      typeof modelStatus.fwCacheBytes === "number" &&
+                      modelStatus.fwCacheBytes > 0 && (
+                        <span className="truncate text-[9px] text-zinc-500">
+                          {modelStatus.fwCacheFiles?.length ?? 0} files ·{" "}
+                          {(modelStatus.fwCacheBytes / 1048576).toFixed(1)} MB
+                          {modelStatus.fwCacheFiles?.some((f) =>
+                            f.name.includes(`models--Systran--faster-whisper-${whisperModel || "tiny"}`),
+                          )
+                            ? ` · ${whisperModel || "tiny"} ready`
+                            : ""}
+                        </span>
+                      )}
+                  </div>
+                )}
                 <p
                   className="truncate text-[9px] text-zinc-600"
-                  title={modelStatus.cacheDir}
+                  title={
+                    modelStatus.engine === "faster-whisper"
+                      ? modelStatus.fwCacheDir || modelStatus.cacheDir
+                      : modelStatus.cacheDir
+                  }
                 >
-                  {modelStatus.cacheDir}
+                  {modelStatus.engine === "faster-whisper"
+                    ? modelStatus.fwCacheDir || modelStatus.cacheDir
+                    : modelStatus.cacheDir}
                 </p>
                 {modelStatus.lastError && (
                   <p

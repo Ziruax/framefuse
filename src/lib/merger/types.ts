@@ -755,6 +755,9 @@ declare global {
         engine?: string;
       }>;
       whisperPreload: () => Promise<{ ok: boolean }>;
+      /** v1.3.1: pre-download a faster-whisper model (tiny/base/small/medium)
+       * into the persistent cache — first transcription is then offline. */
+      whisperFwPreload?: (p: { model: string }) => Promise<{ ok: boolean; model: string }>;
       whisperCancel: () => Promise<number>;
       onWhisperProgress: (cb: (d: { progress: number; status: string }) => void) => () => void;
       /** ── v5.1 native project files (dialog-backed) ── */

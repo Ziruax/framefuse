@@ -334,6 +334,13 @@ export interface WhisperModelStatus {
   childAlive: boolean;
   /** Number of transcription/preload runs currently in flight. */
   activeRuns: number;
+  /** v1.3: active engine — "faster-whisper" when the Python sidecar runtime
+   *  is staged, else "onnxruntime". */
+  engine?: string;
+  /** v1.3: faster-whisper model cache report (same shape as the primary). */
+  fwCacheDir?: string;
+  fwCacheFiles?: Array<{ name: string; sizeBytes: number }>;
+  fwCacheBytes?: number;
 }
 
 /**
@@ -362,6 +369,9 @@ interface NativeWhisperBridge {
     engine?: string;
   }>;
   whisperPreload: () => Promise<{ ok: boolean }>;
+  /** v1.3.1: pre-download a faster-whisper model (tiny/base/small/medium)
+   * into the persistent cache — first transcription is then offline. */
+  whisperFwPreload?: (p: { model: string }) => Promise<{ ok: boolean; model: string }>;
   /** v5.2: no argument = cancel all (legacy); { runId } = cancel one. */
   whisperCancel: (p?: { runId: string }) => Promise<number>;
   /** Present since the v5.2 preload — optional so old builds still typecheck. */
@@ -824,4 +834,36 @@ export function isWhisperAvailable(): boolean {
     typeof OfflineAudioContext !== "undefined" &&
     typeof Worker !== "undefined"
   );
+}
+
+/**
+ * v1.3.1: pre-download a faster-whisper MODEL (tiny/base/small/medium) via
+ * the Python sidecar's --preload mode. Returns false when the bridge/engine
+ * is unavailable (caller falls back to the classic tiny pre-download).
+ */
+export async function preloadFasterWhisperModel(
+  model: string,
+  onProgress?: (p: WhisperProgress) => void,
+): Promise<boolean> {
+  const api = nativeWhisperBridge();
+  if (!api || typeof api.whisperFwPreload !== "function") return false;
+  const safeModel = ["tiny", "base", "small", "medium"].includes(model)
+    ? model
+    : "tiny";
+  onProgress?.({
+    progress: 0,
+    status: `Downloading faster-whisper ${safeModel} model…`,
+  });
+  const unsubscribe = api.onWhisperProgress((d) => {
+    if (d && typeof d.progress === "number") {
+      onProgress?.({ progress: clampPercent(d.progress), status: d.status || "" });
+    }
+  });
+  try {
+    await api.whisperFwPreload({ model: safeModel });
+    onProgress?.({ progress: 100, status: "Model cached" });
+    return true;
+  } finally {
+    unsubscribe?.();
+  }
 }

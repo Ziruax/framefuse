@@ -35,12 +35,19 @@ def emit(obj):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--audio", required=True)
+    ap.add_argument("--audio", default=None)
     ap.add_argument("--model", default="tiny")
     ap.add_argument("--language", default="auto")
     ap.add_argument("--cache", default=None)
     ap.add_argument("--cpu-threads", type=int, default=0)
+    # v1.3.1: preload mode — load (download) the model and exit. Used by the
+    # Captions panel's pre-download button so first transcription is offline.
+    ap.add_argument("--preload", action="store_true")
     args = ap.parse_args()
+
+    if not args.preload and not args.audio:
+        emit({"type": "error", "message": "--audio is required (or pass --preload)"})
+        return 1
 
     try:
         from faster_whisper import WhisperModel
@@ -61,6 +68,13 @@ def main():
     except Exception as e:  # noqa: BLE001
         emit({"type": "error", "message": f"Model load failed: {e}"})
         return 1
+
+    if args.preload:
+        # The model constructor above already downloaded + cached the files;
+        # report success in the same protocol and stop.
+        emit({"type": "result", "chunks": None, "language": None,
+              "wordLevel": False, "durationMs": 0, "preloaded": True})
+        return 0
 
     try:
         segments, info = model.transcribe(

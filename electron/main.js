@@ -855,6 +855,74 @@ ipcMain.handle("whisper:preload", async (event) => {
   });
 });
 
+// v1.3.1: pre-download a faster-whisper MODEL (tiny/base/small/medium) —
+// spawns the sidecar with --preload, which loads (and caches) the model
+// then exits. First real transcription is then fully offline. Progress
+// rides the same whisper:progress channel (load band 10–25 %).
+ipcMain.handle("whisper:fw-preload", async (event, payload) => {
+  if (!fasterWhisperAvailable()) {
+    throw new Error("faster-whisper runtime not staged on this machine");
+  }
+  const model =
+    payload && typeof payload.model === "string" &&
+    ["tiny", "base", "small", "medium"].includes(payload.model)
+      ? payload.model
+      : "tiny";
+  const runId = ++whisperRunSeq;
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    const args = [
+      fasterWhisperTranscriberPath(),
+      "--preload",
+      "--model", model,
+      "--cache", fasterWhisperCacheDir(),
+      "--cpu-threads", String(Math.max(1, os.cpus().length)),
+    ];
+    const child = spawn(fasterWhisperPython(), args, {
+      windowsHide: true,
+      env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+    });
+    const run = { resolve: () => { if (!settled) { settled = true; resolve({ ok: true, model }); } }, reject, sender: event.sender, python: child };
+    whisperRuns.set(runId, run);
+    let stderrTail = "";
+    const finish = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      const r = whisperRuns.get(runId);
+      if (r) r.python = null;
+      whisperRuns.delete(runId);
+      fn(arg);
+    };
+    child.stdout.on("data", (d) => {
+      for (const line of d.toString("utf8").split("\n")) {
+        const t = line.trim();
+        if (!t) continue;
+        let msg;
+        try { msg = JSON.parse(t); } catch (_) { continue; }
+        if (msg && msg.type === "stage") {
+          sendWhisperProgress(runId, 12, `Downloading faster-whisper ${model} model…`);
+        } else if (msg && msg.type === "result" && msg.preloaded) {
+          try { child.kill(); } catch (_) {}
+          finish(run.resolve);
+        } else if (msg && msg.type === "error") {
+          try { child.kill(); } catch (_) {}
+          finish((e) => reject(new Error(String(e))), msg.message || "faster-whisper preload failed");
+        }
+      }
+    });
+    child.stderr.on("data", (d) => { stderrTail = (stderrTail + d.toString()).slice(-1200); });
+    child.on("error", (err) => finish((e) => reject(new Error(String(e))), `Could not start faster-whisper: ${err.message}`));
+    child.on("exit", (code, signal) => {
+      if (settled) return;
+      if (signal === "SIGTERM" || signal === "SIGKILL") {
+        finish((e) => reject(new Error(String(e))), "Transcription cancelled");
+      } else {
+        finish((e) => reject(new Error(String(e))), `faster-whisper exited (${code})${stderrTail ? `: ${stderrTail.trim().split("\n").slice(-2).join(" ")}` : ""}`);
+      }
+    });
+  });
+});
+
 ipcMain.handle("whisper:cancel", async (_event, payload) => {
   const child = whisperChild.proc;
   const target =

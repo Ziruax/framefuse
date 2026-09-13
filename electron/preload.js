@@ -37,6 +37,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   //   cancellation.
   whisperTranscribe: (payload) => ipcRenderer.invoke("whisper:transcribe", payload),
   whisperPreload: () => ipcRenderer.invoke("whisper:preload"),
+  // v1.3.1: pre-download a faster-whisper model (tiny/base/small/medium).
+  whisperFwPreload: (p) => ipcRenderer.invoke("whisper:fw-preload", p),
   // v5.2: cancel ALL runs (legacy, no argument) or exactly ONE run
   // ({ runId }) — returns the number of runs rejected.
   whisperCancel: (payload) => ipcRenderer.invoke("whisper:cancel", payload),

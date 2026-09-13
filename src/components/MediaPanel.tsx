@@ -52,6 +52,10 @@ import {
   Volume2,
   VolumeX,
   Wand,
+  Image as ImageIcon,
+  Search,
+  X as XIcon,
+  Captions as CaptionsIcon,
 } from "lucide-react";
 import { splitMiddle } from "@/lib/merger/text";
 import type {
@@ -268,6 +272,12 @@ export function MediaPanelBase({
   const [mediaTab, setMediaTab] = useState<
     "all" | "videos" | "images" | "audio" | "subs"
   >("all");
+  // v1.3.1: library SEARCH — filename substring filter across the active
+  // media tab (large storyboards). Empty query = unfiltered; the count chip
+  // shows "n of m" while active; Esc/X clears.
+  const [mediaQuery, setMediaQuery] = useState("");
+  const query = mediaQuery.trim().toLowerCase();
+  const queryActive = query.length > 0;
   const posterRequestedRef = useRef<Set<string>>(new Set());
   // v5 gates — every v5 affordance hides behind one of these so a parent that
   // passes only v4.9 props renders the exact v4.9 list/grid.
@@ -397,8 +407,14 @@ export function MediaPanelBase({
             : mediaTab === "images"
               ? !isVideoSegment(seg, videoDurations)
               : true,
+        )
+        // v1.3.1: search filter (media tabs only — audio/subs have no list).
+        .filter(
+          ({ seg }) =>
+            !queryActive ||
+            (seg.fileName || "").toLowerCase().includes(query),
         ),
-    [segments, mediaTab, videoDurations],
+    [segments, mediaTab, videoDurations, queryActive, query],
   );
 
   return (
@@ -520,7 +536,9 @@ export function MediaPanelBase({
           Subs) with live counts. The classic mixed library lives under "All";
           each filtered tab shows ONLY its kind (and its management controls:
           the audio tab also hosts beat-sync + the SFX palette, the subs tab
-          hosts the subtitle file card). */}
+          hosts the subtitle file card).
+          v1.3.1 styling: per-tab icon glyph + the library SEARCH row (media
+          tabs with content) — "n of m" result count while a query is active. */}
       <div
         className="flex items-center gap-1 border-b px-2.5 py-1.5"
         style={{ borderColor: "#27272a", backgroundColor: "#0e0e10" }}
@@ -529,13 +547,13 @@ export function MediaPanelBase({
       >
         {(
           [
-            ["all", "All", segments.length],
-            ["videos", "Videos", videoSegCount],
-            ["images", "Images", imageSegCount],
-            ["audio", "Audio", (audioTrack ? 1 : 0) + (sfxItems?.length ?? 0)],
-            ["subs", "Subs", subtitles ? subtitles.cues.length : 0],
+            ["all", "All", segments.length, Layers],
+            ["videos", "Videos", videoSegCount, Video],
+            ["images", "Images", imageSegCount, ImageIcon],
+            ["audio", "Audio", (audioTrack ? 1 : 0) + (sfxItems?.length ?? 0), Music],
+            ["subs", "Subs", subtitles ? subtitles.cues.length : 0, CaptionsIcon],
           ] as const
-        ).map(([tab, label, count]) => {
+        ).map(([tab, label, count, Icon]) => {
           const active = mediaTab === tab;
           const empty = count === 0 && tab !== "all";
           return (
@@ -551,7 +569,14 @@ export function MediaPanelBase({
                   ? "bg-violet-500/20 text-violet-200 shadow-[inset_0_0_0_1px_rgba(167,139,250,0.35)]"
                   : "text-zinc-500 hover:bg-white/5 hover:text-zinc-300",
               )}
+              title={`${label} library${tab === "all" ? " — every clip in the project" : ""}`}
             >
+              <Icon
+                className={cn(
+                  "size-3 transition-colors",
+                  active ? "text-violet-300" : "text-zinc-600 group-hover:text-zinc-400",
+                )}
+              />
               {label}
               <span
                 className={cn(
@@ -569,6 +594,53 @@ export function MediaPanelBase({
           );
         })}
       </div>
+
+      {/* v1.3.1: library search row — media tabs with content only. */}
+      {showMediaList && segments.length > 0 && (
+        <div
+          className="flex items-center gap-1.5 border-b px-2.5 py-1.5"
+          style={{ borderColor: "#27272a" }}
+        >
+          <div
+            className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md border px-2 py-1 transition-colors focus-within:border-violet-500/50"
+            style={{ borderColor: "#27272a", backgroundColor: "#131316" }}
+          >
+            <Search
+              className={cn(
+                "size-3 shrink-0 transition-colors",
+                queryActive ? "text-violet-300" : "text-zinc-600",
+              )}
+            />
+            <input
+              value={mediaQuery}
+              onChange={(e) => setMediaQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") setMediaQuery("");
+              }}
+              placeholder={`Search ${mediaTab === "all" ? "clips" : mediaTab} by name…`}
+              className="min-w-0 flex-1 bg-transparent text-[11px] text-zinc-200 outline-none placeholder:text-zinc-600"
+              aria-label="Search media library by filename"
+              spellCheck={false}
+            />
+            {queryActive && (
+              <span className="shrink-0 text-[9px] font-semibold tabular-nums text-zinc-500">
+                {renderableSegs.length}/{segments.length}
+              </span>
+            )}
+            {queryActive && (
+              <button
+                type="button"
+                onClick={() => setMediaQuery("")}
+                className="shrink-0 rounded p-0.5 text-zinc-500 transition-colors hover:bg-white/5 hover:text-zinc-300"
+                aria-label="Clear search"
+                title="Clear search (Esc)"
+              >
+                <XIcon className="size-3" />
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Scrollable content area */}
       <div className="ff-scroll flex-1 overflow-y-auto">
@@ -794,8 +866,27 @@ export function MediaPanelBase({
               </div>
             )}
 
+            {/* v1.3.1: search no-match state — keeps the dropzone/summaries
+                above but replaces the library with a hint. */}
+            {queryActive && renderableSegs.length === 0 && (
+              <div className="flex flex-col items-center justify-center rounded-lg border border-dashed py-8 text-center" style={{ borderColor: "#27272a" }}>
+                <Search className="mb-2 size-4" style={{ color: "#52525b" }} />
+                <p className="text-[11px] font-medium" style={{ color: "#a1a1aa" }}>
+                  No {mediaTab === "all" ? "clips" : mediaTab} match “{mediaQuery.trim()}”
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setMediaQuery("")}
+                  className="mt-2 rounded border px-2 py-1 text-[10px] font-medium text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-200"
+                  style={{ borderColor: "#3f3f46" }}
+                >
+                  Clear search
+                </button>
+              </div>
+            )}
+
             {/* v1.3: the grid/list library renders ONLY on media tabs. */}
-            {showMediaList && (mediaView === "grid" ? (
+            {showMediaList && (!queryActive || renderableSegs.length > 0) && (mediaView === "grid" ? (
               /* v4.8: compact tile grid — built for 100+ image storyboards.
                * Tiles show index + duration; click seeks; hover reveals
                * remove; drag-reorder works in sequential mode.
