@@ -130,7 +130,8 @@ interface PersistedSettings {
   captionSettings: CaptionSettings;
   audio: AudioSettings;
   whisperLanguage: string;
-  /** Headline overlay items (persisted so hook titles survive reloads). v4.2 */
+  /** v1.3: whisper model size ("tiny" | "base" | "small" | "medium"). */
+  whisperModel?: string;
   headlines?: HeadlineItem[];
   /** Segment transitions (v4.3). */
   transition?: TransitionSettings;
@@ -226,6 +227,10 @@ export default function Page() {
 
   // Whisper language: "auto" = auto-detect, or a 2-letter code like "en".
   const [whisperLanguage, setWhisperLanguage] = useState<string>("auto");
+  // v1.3: faster-whisper model size — tiny (fastest) / base / small / medium
+  // (most accurate). The bundled faster-whisper engine makes small/medium
+  // practical on CPU; the onnxruntime fallback always runs tiny.
+  const [whisperModel, setWhisperModel] = useState<string>("tiny");
 
   // v4.7: beat-snap strength — boundaries land on every Nth beat (1/2/4/8).
   // Declared above the restore effect (it references the setter).
@@ -308,6 +313,10 @@ export default function Page() {
      
     if (p.whisperLanguage && p.whisperLanguage !== "auto") {
       setWhisperLanguage(p.whisperLanguage);
+    }
+    // v1.3: persisted whisper model choice (tiny default = v5.x behavior).
+    if (p.whisperModel && ["tiny", "base", "small", "medium"].includes(p.whisperModel)) {
+      setWhisperModel(p.whisperModel);
     }
     // v4.7 prefs: beat-snap strength + starred presets.
     if (p.beatStride === 1 || p.beatStride === 2 || p.beatStride === 4 || p.beatStride === 8) {
@@ -537,6 +546,8 @@ export default function Page() {
     audioSettings: AudioSettings;
     audioTrack: AudioTrack | null;
     whisperLanguage: string;
+    /** v1.3: whisper model size ("tiny" | "base" | "small" | "medium"). */
+    whisperModel?: string;
     transition: TransitionSettings;
     watermarkImage: MediaItem | null;
     watermarkSettings: WatermarkSettings;
@@ -579,6 +590,7 @@ export default function Page() {
       audioSettings,
       audioTrack,
       whisperLanguage,
+      whisperModel,
       transition: transitionSettings,
       watermarkImage,
       watermarkSettings,
@@ -1396,7 +1408,19 @@ export default function Page() {
         );
       };
       a.src = url;
-      return { fileName: file.name, url, durationMs: null };
+      // v1.3 zero-copy: remember the on-disk path (Electron only) so export
+      // and Whisper address the ORIGINAL file instead of re-uploading bytes.
+      const nativePath =
+        typeof window !== "undefined" &&
+        window.electronAPI?.getFilePath
+          ? window.electronAPI.getFilePath(file)
+          : null;
+      return {
+        fileName: file.name,
+        url,
+        durationMs: null,
+        sourcePath: typeof nativePath === "string" && nativePath ? nativePath : null,
+      };
     });
     toast.success(`Audio: ${file.name}`);
   }, [requestHistoryPush, trackUrl, clearBeatInfo, clearWaveform]);
@@ -1674,6 +1698,7 @@ export default function Page() {
       captionSettings,
       audio: audioSettings,
       whisperLanguage,
+      whisperModel,
       headlines: headlineItems.length ? headlineItems : [],
       transition: transitionSettings,
       watermark: watermarkSettings,
@@ -1692,12 +1717,46 @@ export default function Page() {
     } catch {
       /* storage full / private mode — non-fatal */
     }
-  }, [kenBurns, settings, captionSettings, audioSettings, whisperLanguage, headlineItems, transitionSettings, watermarkSettings, beatStride, favoritePresets, mediaView]);
+  }, [kenBurns, settings, captionSettings, audioSettings, whisperLanguage, whisperModel, headlineItems, transitionSettings, watermarkSettings, beatStride, favoritePresets, mediaView]);
 
   const generateCaptionsFromAudio = useCallback(async () => {
-    if (!audioTrack) {
-      toast.error("Add an audio track first", {
-        description: "Whisper transcribes your audio into word-by-word captions.",
+    // v1.3: the transcription source is the MUSIC track when present, else
+    // the first base-lane VIDEO clip (its speech is usually what users want
+    // captioned — requiring a separate audio upload was backwards).
+    let sourceFile: File | null = null;
+    let sourcePath: string | null = null;
+    if (audioTrack) {
+      sourcePath = audioTrack.sourcePath ?? null;
+      if (sourcePath) {
+        sourceFile = new File([], audioTrack.fileName, { type: "audio/mpeg" });
+      } else {
+        try {
+          const resp = await fetch(audioTrack.url);
+          const blob = await resp.blob();
+          sourceFile = new File([blob], audioTrack.fileName, {
+            type: blob.type || "audio/mpeg",
+          });
+        } catch {
+          sourceFile = null;
+        }
+      }
+    }
+    if (!sourceFile) {
+      const seg = timeline.segments.find(
+        (s) => s.mediaType === "video" && (s.track ?? 0) === 0 && s.file,
+      );
+      if (seg?.file) {
+        sourceFile = seg.file;
+        sourcePath =
+          typeof window !== "undefined" && window.electronAPI?.getFilePath
+            ? window.electronAPI.getFilePath(seg.file)
+            : null;
+        if (!sourcePath) sourcePath = null;
+      }
+    }
+    if (!sourceFile) {
+      toast.error("Add an audio track or a video clip first", {
+        description: "Whisper transcribes speech into word-by-word captions.",
       });
       return;
     }
@@ -1712,15 +1771,10 @@ export default function Page() {
 
     const ac = new AbortController();
     try {
-      // Fetch the audio File back from the object URL.
-      const resp = await fetch(audioTrack.url);
-      const blob = await resp.blob();
-      const file = new File([blob], audioTrack.fileName, {
-        type: blob.type || "audio/mpeg",
-      });
-
       const result = await transcribeWithWhisper({
-        audioFile: file,
+        audioFile: sourceFile,
+        sourcePath,
+        model: whisperModel,
         signal: ac.signal,
         language: whisperLanguage,
         onProgress: (p) => setWhisperProgress(p),
@@ -1739,7 +1793,7 @@ export default function Page() {
       );
       requestHistoryPush(250);
       setSubtitles({
-        fileName: `${audioTrack.fileName.replace(/\.[^.]+$/, "")}.whisper.srt`,
+        fileName: `${sourceFile.name.replace(/\.[^.]+$/, "")}.whisper.srt`,
         cues: result.cues,
         rawText: serializeSrt(result.cues),
       });
@@ -1786,7 +1840,7 @@ export default function Page() {
       setWhisperBusy(false);
       setWhisperProgress(null);
     }
-  }, [audioTrack, whisperBusy, whisperLanguage, requestHistoryPush]);
+  }, [audioTrack, timeline.segments, whisperBusy, whisperLanguage, whisperModel, requestHistoryPush]);
 
   const loadSamples = useCallback(async () => {
     try {
@@ -3930,6 +3984,11 @@ const handleRandomTransitionMix = useCallback(() => {
             whisperProgress={whisperProgress}
             whisperLanguage={whisperLanguage}
             onWhisperLanguageChange={handleWhisperLanguageChange}
+            whisperModel={whisperModel}
+            onWhisperModelChange={setWhisperModel}
+            hasVideoClip={timeline.segments.some(
+              (s) => s.mediaType === "video" && (s.track ?? 0) === 0,
+            )}
             headlineItems={headlineItems}
             onAddHeadline={addHeadline}
             onUpdateHeadline={updateHeadline}

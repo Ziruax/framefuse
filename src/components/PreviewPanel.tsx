@@ -1044,6 +1044,9 @@ export function PreviewPanel({
               ? seg
               : activeOverlays.find((o) => o.id === id) ?? null;
           // v1.3: only the active BASE segment is audible (isBase flag).
+          // (Imperative media-element control on ref-held nodes — volume,
+          // currentTime, rate, pause/play — the standard escape hatch.)
+          // eslint-disable-next-line react-hooks/immutability
           syncVideoTo(el, vSeg, !!(seg && seg.id === id));
         } else {
           syncVideoTo(el, null, false); // segment exit → pause
@@ -1416,10 +1419,17 @@ export function PreviewPanel({
       style={{ backgroundColor: "#0c0c0e" }}
     >
       {/* Canvas stage — v5.2: the wrapper is measured (ResizeObserver) and
-          the stage letterboxes the aspect buffer into the available space. */}
+          the stage letterboxes the aspect buffer into the available space.
+          v1.3 CLEAN PREVIEW: hover-tracking lives on the WRAPPER (stage +
+          letterbox + the motion HUD bar) — every HUD badge / selection
+          chrome fades in only while the cursor is over the preview, so
+          watching playback is a clean canvas and adjusting is fully
+          labeled (user request: "show when cursor is at preview screen"). */}
       <div
         ref={stageWrapRef}
         className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden p-4"
+        onMouseEnter={() => setCanvasHover(true)}
+        onMouseLeave={() => setCanvasHover(false)}
         style={{
           background:
             "radial-gradient(ellipse at 50% 20%, rgba(124, 58, 237, 0.07) 0%, rgba(12, 12, 14, 0) 65%)",
@@ -1461,7 +1471,8 @@ export function PreviewPanel({
             aria-label={`Video preview stage — ${aspect} aspect, ${dims.w}×${dims.h} canvas${overlaySelected ? ", overlay selected: drag to move, corner handles resize" : ""}`}
             tabIndex={0}
             onKeyDown={onStageKeyDown}
-            onMouseEnter={() => setCanvasHover(true)}
+            // v1.3: hover tracking is owned by the WRAPPER (see above) so the
+            // HUD stays visible while the cursor rides the motion HUD bar.
             onMouseMove={
               aimActive
                 ? (e: ReactMouseEvent<HTMLDivElement>) => {
@@ -1475,7 +1486,6 @@ export function PreviewPanel({
                 : undefined
             }
             onMouseLeave={() => {
-              setCanvasHover(false);
               if (aimActive) setAim(null);
             }}
             onClick={
@@ -1505,11 +1515,15 @@ export function PreviewPanel({
             />
             {/* v5.2: selection chrome — purely additive overlay canvas (rect
                 border, corner handles, snap guides); pointer-events none,
-                the main canvas below owns all interaction. */}
+                the main canvas below owns all interaction. v1.3: fades with
+                the rest of the HUD (clean canvas unless the cursor is over
+                the preview — the handles are adjust-UI, not content). */}
             <canvas
               ref={chromeRef}
               aria-hidden="true"
-              className="pointer-events-none absolute inset-0 block size-full"
+              className={`pointer-events-none absolute inset-0 block size-full transition-opacity duration-200 ${
+                canvasHover || dragTransform ? "opacity-100" : "opacity-0"
+              }`}
             />
             {/* v4.8: motion-aiming overlay — crosshair follows the cursor,
                 the chip names the direction a click would pin. Hidden while
@@ -1588,10 +1602,13 @@ export function PreviewPanel({
               </div>
             )}
             {/* Segment label overlay (v4.5: middle-ellipsis so BOTH the
-                timestamp prefix and the descriptive tail stay readable). */}
+                timestamp prefix and the descriptive tail stay readable).
+                v1.3 CLEAN PREVIEW: fade-gated on cursor-over-preview. */}
             {activeSegment && (
               <div
-                className="pointer-events-none absolute left-2 top-2 rounded-md px-2 py-1 backdrop-blur-sm"
+                className={`pointer-events-none absolute left-2 top-2 rounded-md px-2 py-1 backdrop-blur-sm transition-opacity duration-200 ${
+                  canvasHover ? "opacity-100" : "opacity-0"
+                }`}
                 style={{
                   backgroundColor: "rgba(0, 0, 0, 0.6)",
                   border: "1px solid rgba(255, 255, 255, 0.06)",
@@ -1613,7 +1630,9 @@ export function PreviewPanel({
             {/* Direction badge — Ken Burns applies to images only (v5.0). */}
             {activeSegment && kenBurns.enabled && !activeIsVideo && (
               <div
-                className="pointer-events-none absolute right-2 top-2 rounded px-1.5 py-0.5 text-[9px] capitalize backdrop-blur-sm"
+                className={`pointer-events-none absolute right-2 top-2 rounded px-1.5 py-0.5 text-[9px] capitalize backdrop-blur-sm transition-opacity duration-200 ${
+                  canvasHover ? "opacity-100" : "opacity-0"
+                }`}
                 style={{
                   backgroundColor: "rgba(0, 0, 0, 0.6)",
                   color: "#c4b5fd",
@@ -1626,7 +1645,9 @@ export function PreviewPanel({
             {/* v5.0: VIDEO base chip — fit-mode aware (v5.2). */}
             {activeIsVideo && (
               <div
-                className="pointer-events-none absolute right-2 top-8 flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide backdrop-blur-sm"
+                className={`pointer-events-none absolute right-2 top-8 flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide backdrop-blur-sm transition-opacity duration-200 ${
+                  canvasHover ? "opacity-100" : "opacity-0"
+                }`}
                 style={{
                   backgroundColor: "rgba(0, 0, 0, 0.55)",
                   color: "#67e8f9",
@@ -1643,10 +1664,13 @@ export function PreviewPanel({
               </div>
             )}
             {/* Active transition indicator (v4.3) — v5.1: moved to the
-                bottom-center so the aspect chip owns the bottom-right. */}
+                bottom-center so the aspect chip owns the bottom-right. v1.3:
+                fade-gated on cursor-over-preview (clean playback view). */}
             {txLabel && (
               <div
-                className="pointer-events-none absolute bottom-2 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-medium capitalize backdrop-blur-sm ff-tx-live"
+                className={`pointer-events-none absolute bottom-2 left-1/2 flex -translate-x-1/2 items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-medium capitalize backdrop-blur-sm ff-tx-live transition-opacity duration-200 ${
+                  canvasHover ? "opacity-100" : "opacity-0"
+                }`}
                 style={{
                   backgroundColor: "rgba(0, 0, 0, 0.55)",
                   color: "#f0abfc",
@@ -1658,9 +1682,12 @@ export function PreviewPanel({
                 {txLabel}
               </div>
             )}
-            {/* v5.1 CapCut: aspect label chip — bottom-right of the stage. */}
+            {/* v5.1 CapCut: aspect label chip — bottom-right of the stage.
+                v1.3: fade-gated on cursor-over-preview. */}
             <div
-              className="pointer-events-none absolute bottom-2 right-2 flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[9px] font-semibold uppercase tracking-wide backdrop-blur-sm"
+              className={`pointer-events-none absolute bottom-2 right-2 flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[9px] font-semibold uppercase tracking-wide backdrop-blur-sm transition-opacity duration-200 ${
+                canvasHover ? "opacity-100" : "opacity-0"
+              }`}
               style={{
                 backgroundColor: "rgba(0, 0, 0, 0.55)",
                 color: "#a5f3fc",
@@ -1670,10 +1697,12 @@ export function PreviewPanel({
             >
               {aspect}
             </div>
-            {/* Watermark indicator (v4.4) */}
+            {/* Watermark indicator (v4.4) — v1.3: fade-gated. */}
             {watermarkImage && watermarkSettings && (
               <div
-                className="pointer-events-none absolute left-2 top-12 flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] backdrop-blur-sm"
+                className={`pointer-events-none absolute left-2 top-12 flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] backdrop-blur-sm transition-opacity duration-200 ${
+                  canvasHover ? "opacity-100" : "opacity-0"
+                }`}
                 style={{
                   backgroundColor: "rgba(0, 0, 0, 0.55)",
                   color: "#86efac",
@@ -1685,10 +1714,12 @@ export function PreviewPanel({
                 watermark
               </div>
             )}
-            {/* Headline indicator (v4.2) */}
+            {/* Headline indicator (v4.2) — v1.3: fade-gated. */}
             {headlineItems.length > 0 && (
               <div
-                className="pointer-events-none absolute bottom-2 left-2 flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] backdrop-blur-sm"
+                className={`pointer-events-none absolute bottom-2 left-2 flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] backdrop-blur-sm transition-opacity duration-200 ${
+                  canvasHover ? "opacity-100" : "opacity-0"
+                }`}
                 style={{
                   backgroundColor: "rgba(0, 0, 0, 0.55)",
                   color: "#fbbf24",

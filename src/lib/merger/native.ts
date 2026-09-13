@@ -138,6 +138,29 @@ async function videoSourceBytes(
   );
 }
 
+/**
+ * v1.3 ZERO-COPY export: absolute on-disk path of a picked File inside the
+ * Electron app (webUtils.getPathForFile via the preload bridge). When this
+ * resolves, the export ships the PATH to ffmpeg instead of copying the
+ * whole file renderer→IPC→temp — the v5.x byte-copy flow is what made a
+ * multi-GB project sit "5–10 minutes before the save dialog even opened".
+ * Restored-from-project media (blob-reconstructed Files) and browser mode
+ * return null and keep the byte-upload fallback. This is exactly how
+ * Shotcut/Kdenlive address sources (they never copy media on export).
+ */
+function nativeSourcePath(file?: File | null): string | null {
+  if (!file) return null;
+  try {
+    const api = (window as Window & {
+      electronAPI?: { getFilePath?: (f: File) => string | null };
+    }).electronAPI;
+    const p = api && typeof api.getFilePath === "function" ? api.getFilePath(file) : null;
+    return typeof p === "string" && p.length > 0 ? p : null;
+  } catch {
+    return null;
+  }
+}
+
 /** v5 features the browser fallback exporters cannot render (yet). */
 const DESKTOP_ONLY_EXPORT_MSG =
   "Video, chroma-key, overlay and SFX export requires the FrameFuse desktop app";
@@ -302,13 +325,25 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
 
   const dims = resolveDimensions(settings.aspect, settings.resolution);
 
-  // 1. Persist segment sources to temp files.
+  // 0. v1.3 UX: the save dialog opens IMMEDIATELY on the Export click —
+  // BEFORE any media prep. The v5.x order (upload every source byte → THEN
+  // ask where to save) is what users experienced as "5 to 10 minutes just
+  // for showing the save dialog". Cancelling here now costs zero work.
+  const outputPath = await api.chooseOutput();
+  if (!outputPath) {
+    throw new Error("Export cancelled");
+  }
+
+  // 1. Resolve segment sources.
+  // v1.3 ZERO-COPY: local files are passed to ffmpeg by ABSOLUTE PATH
+  // (nativeSourcePath → webUtils.getPathForFile) — no renderer→main byte
+  // upload, no temp-file duplicate, no double disk write. Media restored
+  // from project files (blob URLs) keeps the v5.0 byte-upload fallback.
   // v5.0: the multi-track timeline is split here — BASE-lane segments
   // (track 0) become concat clips exactly as in v4.9 (images via
   // saveTempImage, videos via saveTempVideo); OVERLAY-lane segments
-  // (track ≥ 1) are uploaded too but shipped in a separate `overlays`
-  // array — the main process composites them per clip instead of
-  // concatenating them. Include absolute startMs/endMs so the main process
+  // (track ≥ 1) are shipped in a separate `overlays` array — the main
+  // process composites them per clip instead of concatenating them.
   // can map SRT cue timestamps (which are in master-timeline absolute time)
   // onto each per-segment clip (whose internal clock starts at 0). Without
   // this mapping, only cues whose original startMs falls within [0, dur] of
@@ -317,12 +352,18 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
   const overlayPayload: NativeOverlayPayload[] = [];
   for (const seg of segments) {
     const onOverlayLane = (seg.track ?? 0) >= 1;
+    const directPath = nativeSourcePath(seg.file);
     if (seg.mediaType === "video") {
-      const bytes = await videoSourceBytes(seg, imageUrls);
-      const videoPath = await api.saveTempVideo({
-        name: seg.fileName || `seg_${seg.id}.mp4`,
-        bytes,
-      });
+      let videoPath: string;
+      if (directPath) {
+        videoPath = directPath;
+      } else {
+        const bytes = await videoSourceBytes(seg, imageUrls);
+        videoPath = await api.saveTempVideo({
+          name: seg.fileName || `seg_${seg.id}.mp4`,
+          bytes,
+        });
+      }
       if (onOverlayLane) {
         overlayPayload.push({
           id: seg.id,
@@ -363,13 +404,19 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
       }
       continue;
     }
-    // Image flow (v4.9 verbatim for base clips).
+    // Image flow (v4.9 verbatim for base clips; v1.3 zero-copy for local
+    // files — the original path is handed to ffmpeg directly).
     const url = imageUrls[seg.id] || seg.thumbnailUrl;
-    const bytes = await fetchBytes(url);
-    const imagePath = await api.saveTempImage({
-      name: seg.fileName || `seg_${seg.id}.jpg`,
-      bytes,
-    });
+    let imagePath: string;
+    if (directPath) {
+      imagePath = directPath;
+    } else {
+      const bytes = await fetchBytes(url);
+      imagePath = await api.saveTempImage({
+        name: seg.fileName || `seg_${seg.id}.jpg`,
+        bytes,
+      });
+    }
     if (onOverlayLane) {
       // Overlay images: ship natural dims when cheaply available so the
       // main process can skip probing (it still probes as a fallback).
@@ -458,14 +505,24 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
     }
   }
 
-  // 2. Persist audio if present.
+  // 2. Resolve the music track. v1.3 zero-copy: a locally-picked track
+  // ships its absolute path (audioTrack.sourcePath, resolved at import);
+  // restored-from-project tracks keep the byte-upload fallback.
   let audioPath: string | null = null;
   if (audioTrack) {
-    const bytes = await fetchBytes(audioTrack.url);
-    audioPath = await api.saveTempAudio({
-      name: audioTrack.fileName,
-      bytes,
-    });
+    const directAudio =
+      typeof audioTrack.sourcePath === "string" && audioTrack.sourcePath
+        ? audioTrack.sourcePath
+        : null;
+    if (directAudio) {
+      audioPath = directAudio;
+    } else {
+      const bytes = await fetchBytes(audioTrack.url);
+      audioPath = await api.saveTempAudio({
+        name: audioTrack.fileName,
+        bytes,
+      });
+    }
   }
 
   // 3. Build caption payload if captions are enabled.
@@ -558,14 +615,7 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
     api.saveTempImage,
   );
 
-  // 4. Choose output path.
-  const outputPath = await api.chooseOutput();
-  if (!outputPath) {
-    await api.cleanupTemp();
-    throw new Error("Export cancelled");
-  }
-
-  // 5. Subscribe to progress.
+  // 4. Subscribe to progress.
   const unsubscribe = api.onExportProgress((d: ExportProgress) => {
     onProgress?.(d);
   });

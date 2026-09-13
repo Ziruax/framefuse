@@ -149,6 +149,10 @@ interface SettingsPanelProps {
   whisperProgress: WhisperProgress | null;
   whisperLanguage: string;
   onWhisperLanguageChange: (lang: string) => void;
+  /** v1.3: faster-whisper model size + whether a video clip can supply speech. */
+  whisperModel: string;
+  onWhisperModelChange: (model: string) => void;
+  hasVideoClip: boolean;
   /** Headline overlay items (v4.2). */
   headlineItems: HeadlineItem[];
   onAddHeadline: () => void;
@@ -482,6 +486,9 @@ export function SettingsPanel(props: SettingsPanelProps) {
     whisperProgress,
     whisperLanguage,
     onWhisperLanguageChange,
+    whisperModel,
+    onWhisperModelChange,
+    hasVideoClip,
     headlineItems,
     onAddHeadline,
     onUpdateHeadline,
@@ -1501,6 +1508,9 @@ export function SettingsPanel(props: SettingsPanelProps) {
             whisperProgress={whisperProgress}
             whisperLanguage={whisperLanguage}
             onWhisperLanguageChange={onWhisperLanguageChange}
+            whisperModel={whisperModel}
+            onWhisperModelChange={onWhisperModelChange}
+            hasSpeechSource={hasAudio || hasVideoClip}
           />
         </div>
       </div>
@@ -2179,6 +2189,11 @@ interface CaptionsSectionProps {
   whisperProgress: WhisperProgress | null;
   whisperLanguage: string;
   onWhisperLanguageChange: (lang: string) => void;
+  /** v1.3: faster-whisper model size (tiny/base/small/medium). */
+  whisperModel: string;
+  onWhisperModelChange: (model: string) => void;
+  /** v1.3: transcription source available (audio track OR a video clip). */
+  hasSpeechSource: boolean;
 }
 
 function CaptionsSection(props: CaptionsSectionProps) {
@@ -2200,6 +2215,9 @@ function CaptionsSection(props: CaptionsSectionProps) {
     whisperProgress,
     whisperLanguage,
     onWhisperLanguageChange,
+    whisperModel,
+    onWhisperModelChange,
+    hasSpeechSource,
   } = props;
 
   const set = (patch: Partial<CaptionSettings>) =>
@@ -2362,13 +2380,51 @@ function CaptionsSection(props: CaptionsSectionProps) {
             ))}
           </select>
         </div>
+        {/* v1.3: model quality selector — the bundled faster-whisper engine
+            (CTranslate2 int8) makes larger models practical on CPU. */}
+        <div className="mb-2">
+          <div className="mb-1 flex items-center justify-between">
+            <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
+              Model
+            </span>
+            <span className="text-[10px] text-zinc-600">
+              {whisperModel === "tiny" && "fastest"}
+              {whisperModel === "base" && "balanced"}
+              {whisperModel === "small" && "accurate"}
+              {whisperModel === "medium" && "most accurate"}
+            </span>
+          </div>
+          <div className="grid grid-cols-4 gap-1">
+            {([
+              ["tiny", "Tiny"],
+              ["base", "Base"],
+              ["small", "Small"],
+              ["medium", "Med"],
+            ] as const).map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                onClick={() => onWhisperModelChange(value)}
+                className={cn(
+                  "rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
+                  whisperModel === value
+                    ? "border-amber-500/60 bg-amber-500/15 text-amber-300"
+                    : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200",
+                )}
+                aria-pressed={whisperModel === value}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
         <button
           type="button"
           onClick={onGenerateCaptions}
-          disabled={whisperBusy || !hasAudio}
+          disabled={whisperBusy || !hasSpeechSource}
           className={cn(
             "flex w-full items-center justify-center gap-2 rounded-md px-3 py-2 text-xs font-semibold transition-colors",
-            whisperBusy || !hasAudio
+            whisperBusy || !hasSpeechSource
               ? "cursor-not-allowed bg-zinc-800 text-zinc-500"
               : "bg-amber-500 text-zinc-900 hover:bg-amber-400",
           )}
@@ -2378,7 +2434,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
           ) : (
             <Sparkles size={13} />
           )}
-          {whisperBusy ? "Working…" : "Generate from audio"}
+          {whisperBusy ? "Working…" : "Generate captions"}
         </button>
         {whisperProgress && (
           <div className="mt-2">
@@ -2394,10 +2450,12 @@ function CaptionsSection(props: CaptionsSectionProps) {
           </div>
         )}
         <p className="mt-2 text-[10px] leading-relaxed text-zinc-500">
-          Whisper-tiny runs locally (in-app, ~42 MB download once, then
-          offline). Produces{" "}
+          <span className="text-amber-400/90">faster-whisper</span> (CTranslate2
+          int8) runs locally — about 4× faster than the old engine, with VAD
+          silence skipping and{" "}
           <span className="text-zinc-300">exact word-by-word timing</span> for
-          karaoke &amp; kinetic captions.
+          karaoke &amp; kinetic captions. Speech is taken from your audio track,
+          or the first video clip when no track is loaded.
         </p>
 
         {/* ── v5.2: model cache status + pre-download (desktop only) ── */}

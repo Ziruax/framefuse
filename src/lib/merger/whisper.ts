@@ -54,6 +54,14 @@ export interface WhisperOptions {
    * ISO code ("en"), or a full name ("english"). Default "auto".
    */
   language?: string;
+  /** v1.3 ZERO-COPY: absolute on-disk path of the source (Electron app,
+   * local file). When set, the native path is shipped to the main process
+   * instead of the whole file's bytes over IPC. */
+  sourcePath?: string | null;
+  /** v1.3: faster-whisper model size ("tiny" | "base" | "small" | "medium").
+   * Default "tiny" (v5.x behavior). Only the faster-whisper engine uses
+   * larger models — the onnxruntime fallback always runs tiny. */
+  model?: string;
 }
 
 export interface WhisperResult {
@@ -337,8 +345,13 @@ export interface WhisperModelStatus {
 interface NativeWhisperBridge {
   whisperTranscribe: (p: {
     name: string;
-    bytes: ArrayBuffer;
+    bytes?: ArrayBuffer;
+    /** v1.3 ZERO-COPY: original on-disk path (Electron, local file) — skips
+     * the renderer→main byte upload entirely. */
+    sourcePath?: string;
     language?: string;
+    /** v1.3: faster-whisper model size. */
+    model?: string;
     /** v5.2 client run id — lets whisperCancel target THIS run only. */
     runId?: string;
   }) => Promise<{
@@ -346,6 +359,7 @@ interface NativeWhisperBridge {
     language: string | null;
     wordLevel: boolean;
     durationMs: number;
+    engine?: string;
   }>;
   whisperPreload: () => Promise<{ ok: boolean }>;
   /** v5.2: no argument = cancel all (legacy); { runId } = cancel one. */
@@ -401,13 +415,20 @@ async function transcribeWithWhisperNative(
   onProgress?.({ progress: 2, status: "Decoding audio…" });
   if (signal?.aborted) throw new Error("Transcription cancelled");
 
-  let bytes: ArrayBuffer;
-  try {
-    bytes = await audioFile.arrayBuffer();
-  } catch (err) {
-    throw new Error(
-      `Could not read audio: ${err instanceof Error ? err.message : String(err)}`,
-    );
+  // v1.3 ZERO-COPY: a local on-disk source ships its PATH — the whole-file
+  // byte upload over IPC is skipped (multi-GB videos used to spend minutes
+  // just crossing the bridge before decoding even started).
+  const sourcePath =
+    typeof opts.sourcePath === "string" && opts.sourcePath ? opts.sourcePath : null;
+  let bytes: ArrayBuffer | undefined;
+  if (!sourcePath) {
+    try {
+      bytes = await audioFile.arrayBuffer();
+    } catch (err) {
+      throw new Error(
+        `Could not read audio: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   // v5.2: a client run id lets the cancel below target THIS run only —
@@ -443,8 +464,10 @@ async function transcribeWithWhisperNative(
   try {
     const invoke = api.whisperTranscribe({
       name: audioFile.name || "audio",
-      bytes,
+      ...(bytes ? { bytes } : {}),
+      ...(sourcePath ? { sourcePath } : {}),
       language: opts.language || "auto",
+      model: opts.model || "tiny",
       runId,
     });
     // Classified/native error messages propagate VERBATIM — page.tsx shows

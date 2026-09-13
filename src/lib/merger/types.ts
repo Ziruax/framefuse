@@ -219,6 +219,11 @@ export interface AudioTrack {
   fileName: string;
   url: string;
   durationMs: number | null;
+  /** v1.3 ZERO-COPY: absolute on-disk path when the track was picked from a
+   * local file inside the Electron app (webUtils.getPathForFile) — export and
+   * Whisper hand the PATH to ffmpeg instead of re-uploading bytes over IPC.
+   * Null for tracks restored from project files. */
+  sourcePath?: string | null;
 }
 
 export interface OverlapWarning {
@@ -732,16 +737,22 @@ declare global {
       getExportInfo: () => Promise<{ encoder: string; encoderName: string }>;
       /** ── v5.1 Native Whisper (utilityProcess service) ──
        * transcribe: main decodes via ffmpeg + runs onnxruntime-node; progress
-       * streams via onWhisperProgress. */
+       * streams via onWhisperProgress. v1.3: `sourcePath` (zero-copy local
+       * file), `model` (faster-whisper size) and the result's `engine` field
+       * were added — bytes stays optional for browser-side media. */
       whisperTranscribe: (p: {
         name: string;
-        bytes: ArrayBuffer;
+        bytes?: ArrayBuffer;
+        sourcePath?: string;
         language?: string;
+        model?: string;
+        runId?: string;
       }) => Promise<{
         chunks: Array<{ text: string; timestamp: [number | null, number | null] }> | null;
         language: string | null;
         wordLevel: boolean;
         durationMs: number;
+        engine?: string;
       }>;
       whisperPreload: () => Promise<{ ok: boolean }>;
       whisperCancel: () => Promise<number>;

@@ -612,23 +612,199 @@ function decodeAudioToPcm16k(filePath) {
   });
 }
 
+// ── v1.3 FASTER-WHISPER SIDECAR (CTranslate2 int8) ─────────────────────────
+// The user-reported pain: "whisper is very slow". The v5.x engine runs
+// whisper-tiny through onnxruntime — decent, but CTranslate2's int8
+// reimplementation (faster-whisper) is ~4× faster on the same CPU, gets
+// exact word timestamps for free, and VAD-filters silence (long videos
+// transcribe in a fraction of the wall time). It ships as a self-contained
+// embeddable Python runtime (extraResources) — PyAV decodes the audio, so
+// the ORIGINAL source path is passed straight through (zero-copy) with no
+// ffmpeg pre-decode. Engine chain: faster-whisper → onnxruntime utility
+// process → renderer web worker. FRAMEFUSE_FW_PYTHON=<exe> overrides the
+// interpreter for Linux dev boxes.
+const fwRuntime = { available: null };
+
+function fasterWhisperRuntimeDir() {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, "faster-whisper-runtime")
+    : path.join(__dirname, "..", "faster-whisper-runtime");
+}
+
+function fasterWhisperTranscriberPath() {
+  return path.join(fasterWhisperRuntimeDir(), "transcriber.py");
+}
+
+function fasterWhisperPython() {
+  if (process.env.FRAMEFUSE_FW_PYTHON) return process.env.FRAMEFUSE_FW_PYTHON;
+  return path.join(fasterWhisperRuntimeDir(), "python", "python.exe");
+}
+
+function fasterWhisperAvailable() {
+  if (fwRuntime.available != null) return fwRuntime.available;
+  let ok = false;
+  try {
+    if (process.env.FRAMEFUSE_FW_PYTHON) {
+      ok = fs.existsSync(process.env.FRAMEFUSE_FW_PYTHON);
+    } else {
+      ok =
+        fs.existsSync(fasterWhisperPython()) &&
+        fs.existsSync(fasterWhisperTranscriberPath());
+    }
+  } catch (_) { ok = false; }
+  fwRuntime.available = ok;
+  return ok;
+}
+
+function fasterWhisperCacheDir() {
+  return path.join(app.getPath("userData"), "faster-whisper-models");
+}
+
+/** Spawn the sidecar and stream its JSON-lines to the run bookkeeping.
+ * Progress mapping mirrors the existing UI curve: load 10–25 %, transcribe
+ * 25–80 %, align 80+ stays in the renderer. Returns the raw result payload
+ * ({ chunks, language, wordLevel, durationMs }) — chunk shape is the SAME
+ * contract the onnxruntime child returns. */
+function transcribeWithFasterWhisper(runId, { inputPath, language, model }) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const args = [
+      fasterWhisperTranscriberPath(),
+      "--audio", inputPath,
+      "--model", ["tiny", "base", "small", "medium"].includes(model) ? model : "tiny",
+      "--language", typeof language === "string" && language ? language : "auto",
+      "--cache", fasterWhisperCacheDir(),
+      "--cpu-threads", String(Math.max(1, os.cpus().length)),
+    ];
+    const child = spawn(fasterWhisperPython(), args, {
+      windowsHide: true,
+      env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+    });
+    const run = whisperRuns.get(runId);
+    if (run) run.python = child;
+
+    let stdoutBuf = "";
+    let stderrTail = "";
+    const finish = (err, result) => {
+      if (settled) return;
+      settled = true;
+      const r = whisperRuns.get(runId);
+      if (r) r.python = null;
+      if (err) reject(err);
+      else resolve(result);
+    };
+
+    child.stdout.on("data", (d) => {
+      stdoutBuf += d.toString("utf8");
+      let nl;
+      while ((nl = stdoutBuf.indexOf("\n")) >= 0) {
+        const line = stdoutBuf.slice(0, nl).trim();
+        stdoutBuf = stdoutBuf.slice(nl + 1);
+        if (!line) continue;
+        let msg;
+        try { msg = JSON.parse(line); } catch (_) { continue; }
+        if (!msg || typeof msg.type !== "string") continue;
+        switch (msg.type) {
+          case "stage":
+            sendWhisperProgress(runId, 10, "Loading faster-whisper model…");
+            break;
+          case "info":
+            sendWhisperProgress(runId, 25, `Transcribing (model ready, ${(Math.round((msg.durationMs || 0) / 60000))} min audio)…`);
+            break;
+          case "progress": {
+            const p = Number(msg.progress);
+            if (Number.isFinite(p)) {
+              sendWhisperProgress(runId, Math.min(80, 25 + Math.round(p * 0.55)), "Transcribing…");
+            }
+            break;
+          }
+          case "result":
+            child.kill();
+            finish(null, {
+              chunks: Array.isArray(msg.chunks) ? msg.chunks : null,
+              language: typeof msg.language === "string" ? msg.language : null,
+              wordLevel: !!msg.wordLevel,
+              durationMs: Number(msg.durationMs) || 0,
+            });
+            break;
+          case "error":
+            child.kill();
+            finish(new Error(String(msg.message || "faster-whisper failed")));
+            break;
+          default:
+            break;
+        }
+      }
+    });
+    child.stderr.on("data", (d) => { stderrTail = (stderrTail + d.toString()).slice(-1500); });
+    child.on("error", (err) => finish(new Error(`Could not start faster-whisper: ${err.message}`)));
+    child.on("exit", (code, signal) => {
+      if (settled) return;
+      if (signal === "SIGTERM" || signal === "SIGKILL") {
+        finish(new Error("Transcription cancelled"));
+      } else {
+        finish(new Error(`faster-whisper exited (${code})${stderrTail ? `: ${stderrTail.trim().split("\n").slice(-2).join(" ")}` : ""}`));
+      }
+    });
+  });
+}
+
 ipcMain.handle("whisper:transcribe", async (event, payload) => {
   const { name, bytes, language } = payload || {};
+  const sourcePath =
+    payload && typeof payload.sourcePath === "string" ? payload.sourcePath : null;
+  const model =
+    payload && typeof payload.model === "string" ? payload.model : "tiny";
   // v5.2: the renderer passes a client runId (crypto.randomUUID) so a cancel
   // can target THIS run without killing other queued runs.
   const clientRunId =
     payload && typeof payload.runId === "string" && payload.runId
       ? payload.runId
       : null;
-  if (!bytes || !bytes.byteLength) throw new Error("No audio data received");
-  ensureTempDir();
-  const ext = path.extname(name || "") || ".audio";
-  const tmp = path.join(tempDir, `whisper_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
-  fs.writeFileSync(tmp, Buffer.from(bytes));
+  // v1.3 ZERO-COPY: a local on-disk source (webUtils path from the renderer)
+  // is addressed DIRECTLY — no renderer→main byte upload, no temp copy. The
+  // byte path remains for browser-side media / project-restored blobs.
+  let inputPath = null;
+  let tmpUploaded = null;
+  if (sourcePath && fs.existsSync(sourcePath)) {
+    inputPath = sourcePath;
+  } else {
+    if (!bytes || !bytes.byteLength) throw new Error("No audio data received");
+    ensureTempDir();
+    const ext = path.extname(name || "") || ".audio";
+    tmpUploaded = path.join(tempDir, `whisper_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
+    fs.writeFileSync(tmpUploaded, Buffer.from(bytes));
+    inputPath = tmpUploaded;
+  }
   const runId = ++whisperRunSeq;
   try {
+    // ── v1.3 ENGINE 1: faster-whisper sidecar (CTranslate2 int8) ──────
+    // ~4× faster than the onnxruntime path, exact word timestamps, VAD
+    // silence filtering, and base/small/medium models become practical.
+    // Any failure that is NOT a cancellation falls through to engine 2 so
+    // a broken runtime never takes transcription down with it.
+    if (fasterWhisperAvailable()) {
+      try {
+        const fw = await transcribeWithFasterWhisper(runId, {
+          inputPath,
+          language,
+          model,
+        });
+        whisperState.lastError = null;
+        whisperState.lastErrorAt = 0;
+        return { ...fw, engine: "faster-whisper" };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("cancelled")) throw err;
+        console.warn(`[whisper] faster-whisper failed, falling back to onnxruntime: ${msg}`);
+        whisperState.lastError = `faster-whisper: ${msg}`;
+        whisperState.lastErrorAt = Date.now();
+      }
+    }
+
+    // ── ENGINE 2: onnxruntime utility process (v5.x path) ────────────
     sendWhisperProgress(runId, 2, "Decoding audio…");
-    const pcm = await decodeAudioToPcm16k(tmp);
+    const pcm = await decodeAudioToPcm16k(inputPath);
     if (pcm.length === 0) throw new Error("Audio file is empty or silent");
     const durationMs = Math.round((pcm.length / 16000) * 1000);
     sendWhisperProgress(runId, 10, "Loading Whisper-tiny model…");
@@ -658,10 +834,10 @@ ipcMain.handle("whisper:transcribe", async (event, payload) => {
       }
     });
     sendWhisperProgress(runId, 80, "Aligning word timestamps…");
-    return { ...result, durationMs };
+    return { ...result, durationMs, engine: "onnxruntime" };
   } finally {
     whisperRuns.delete(runId);
-    try { fs.unlinkSync(tmp); } catch (_) {}
+    if (tmpUploaded) { try { fs.unlinkSync(tmpUploaded); } catch (_) {} }
   }
 });
 
@@ -687,11 +863,13 @@ ipcMain.handle("whisper:cancel", async (_event, payload) => {
       : null;
   if (target) {
     // v5.2: cancel ONE renderer run (by its client runId) — other queued
-    // runs keep going. The child adds the numeric runId to its cancelled set
-    // so a queued-but-unstarted job is skipped outright.
+    // runs keep going. v1.3: faster-whisper python runs are killed via the
+    // tracked child handle (the sidecar exits on SIGTERM/SIGKILL and its
+    // promise rejects with "Transcription cancelled").
     for (const [runId, run] of Array.from(whisperRuns)) {
       if (run.clientRunId === target) {
         whisperRuns.delete(runId);
+        try { if (run.python) run.python.kill(); } catch (_) {}
         try { if (child) child.postMessage({ type: "cancel", runId }); } catch (_) {}
         run.reject(new Error("Transcription cancelled"));
         return 1;
@@ -703,6 +881,7 @@ ipcMain.handle("whisper:cancel", async (_event, payload) => {
   let cancelled = 0;
   for (const [runId, run] of Array.from(whisperRuns)) {
     whisperRuns.delete(runId);
+    try { if (run.python) run.python.kill(); } catch (_) {}
     try { if (child) child.postMessage({ type: "cancel", runId }); } catch (_) {}
     run.reject(new Error("Transcription cancelled"));
     cancelled++;
@@ -781,6 +960,10 @@ ipcMain.handle("whisper:status", async () => {
   const cacheDir = whisperCacheDir();
   const cacheFiles = scanWhisperCache(cacheDir);
   const totalCacheBytes = cacheFiles.reduce((n, f) => n + f.sizeBytes, 0);
+  // v1.3: engine report — the sidecar wins when its runtime is staged;
+  // its model cache lives in a sibling folder of userData.
+  let fwCacheFiles = [];
+  try { fwCacheFiles = scanWhisperCache(fasterWhisperCacheDir()); } catch (_) {}
   return {
     cacheDir,
     hostUsed: whisperState.hostUsed,
@@ -790,6 +973,10 @@ ipcMain.handle("whisper:status", async () => {
     lastError: whisperState.lastError,
     childAlive: !!(whisperChild.proc && !whisperChild.dead),
     activeRuns: whisperRuns.size,
+    engine: fasterWhisperAvailable() ? "faster-whisper" : "onnxruntime",
+    fwCacheDir: fasterWhisperCacheDir(),
+    fwCacheFiles,
+    fwCacheBytes: fwCacheFiles.reduce((n, f) => n + f.sizeBytes, 0),
   };
 });
 
@@ -842,16 +1029,18 @@ async function listEncodersAsync() {
  * THROUGHPUT (v1.1). Listed ≠ working (drivers can be broken), and a
  * listed-but-crawling encoder is worse than none — see the header comment.
  * 48 frames of 1080p30 testsrc2 ≈ 1.6 s of real video: healthy hardware
- * paths finish in < 1 s; broken ones blow the 12 s timeout or the 12 fps
- * floor. Returns the measured fps (0 when rejected). */
-async function probeEncoderAsync(name) {
+ * paths finish in < 1 s; broken ones blow the 12 s timeout or the fps
+ * floor. Returns the measured fps (0 when rejected). v1.3: `extraArgs`
+ * lets the libx264 baseline probe match the real export preset
+ * (veryfast + crf 20) so the GPU-vs-CPU comparison is apples-to-apples. */
+async function probeEncoderAsync(name, extraArgs = []) {
   const FRAMES = 48;
   const t0 = Date.now();
   const r = await ffmpegCapture([
     "-hide_banner", "-loglevel", "error",
     "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30",
     "-frames:v", String(FRAMES),
-    "-c:v", name, "-pix_fmt", "yuv420p",
+    "-c:v", name, ...extraArgs, "-pix_fmt", "yuv420p",
     "-f", "null", "-",
   ], 12000);
   if (r.code !== 0) return 0;
@@ -862,11 +1051,14 @@ async function probeEncoderAsync(name) {
 /**
  * v1.1: minimum effective probe throughput for a hardware encoder to be
  * trusted with a real export (fps over the 48-frame 1080p probe).
- * Healthy: 100–400+. Broken-driver crawls: 0.5–5. Floor 12 fps keeps a
- * huge safety margin below "healthy" while rejecting every documented
- * pathological case (they measure single digits).
+ * v1.3: raised 12 → 24 fps AND gated against the measured CPU baseline —
+ * a hardware encoder must be BOTH absolutely plausible (≥ 24 fps) and
+ * RELATIVELY better than the same machine's libx264 veryfast (≥ 1.2×) to
+ * be selected. A GPU path slower than the CPU alternative is exactly the
+ * "hardware acceleration" trap that turned exports into multi-hour jobs.
  */
-const GPU_PROBE_MIN_FPS = 12;
+const GPU_PROBE_MIN_FPS = 24;
+const GPU_VS_CPU_RATIO = 1.2;
 
 async function detectGpuEncoderAsync() {
   if (detectedEncoder) return detectedEncoder;
@@ -875,12 +1067,25 @@ async function detectGpuEncoderAsync() {
     let pick = { name: "libx264", label: "CPU (libx264)" };
     try {
       const candidates = await listEncodersAsync();
+      // v1.3: measure the CPU baseline ONLY when a hardware candidate
+      // exists (CPU-only boxes skip the extra probe entirely).
+      let cpuFps = 0;
+      let cpuMeasured = false;
       for (const cand of candidates) {
         const fps = await probeEncoderAsync(cand.name);
         if (fps >= GPU_PROBE_MIN_FPS) {
-          pick = cand;
-          console.log(`Export encoder: ${pick.label} (${pick.name}, probe ${fps.toFixed(0)} fps)`);
-          break;
+          if (!cpuMeasured) {
+            cpuFps = await probeEncoderAsync("libx264", ["-preset", "veryfast", "-crf", "20"]);
+            cpuMeasured = true;
+          }
+          if (fps >= Math.max(GPU_PROBE_MIN_FPS, cpuFps * GPU_VS_CPU_RATIO)) {
+            pick = cand;
+            console.log(`Export encoder: ${pick.label} (${pick.name}, probe ${fps.toFixed(0)} fps vs CPU ${cpuFps.toFixed(0)} fps)`);
+            break;
+          }
+          // Listed + passes the absolute floor but LOSES to the CPU —
+          // trust the predictable CPU path instead.
+          console.warn(`Export encoder: ${cand.name} probed ${fps.toFixed(1)} fps but CPU libx264 measures ${cpuFps.toFixed(0)} fps — using CPU (GPU not ≥ ${GPU_VS_CPU_RATIO}× faster)`);
         } else if (fps > 0) {
           // Probe completed but crawled — log it: this is exactly the
           // machine state that used to turn exports into 5–10 hour jobs.
@@ -1751,9 +1956,16 @@ ipcMain.handle("export-native", async (event, opts) => {
   }
 
   // Elapsed/ETA for the UI.
+  // v1.3: ETA requires a REAL sample before it is shown — the old ≥2% gate
+  // still extrapolated ffmpeg startup + filter warm-up into multi-hour
+  // estimates ("estimated 22445s" on a 19-minute video) that panicked
+  // users before the rate settled. 4% of content AND ≥ 5 s elapsed, and the
+  // same gate applies on re-estimates (the elapsed/fraction formula is an
+  // all-run average, so it only ever smooths).
   function etaFor(fraction) {
-    if (fraction <= 0.02) return undefined;
+    if (fraction <= 0.04) return undefined;
     const elapsed = (Date.now() - startTime) / 1000;
+    if (elapsed < 5) return undefined;
     return Math.max(0, Math.round(elapsed / fraction - elapsed));
   }
 
@@ -1839,9 +2051,19 @@ ipcMain.handle("export-native", async (event, opts) => {
     const poolN = isGpuEncoder
       ? Math.min(3, Math.max(1, os.cpus().length - 1))
       : Math.min(4, Math.max(1, os.cpus().length - 2));
+    // v1.3 THREAD-STARVATION FIX: the v5.2 budget divided the cores by the
+    // POOL SIZE (min(4, cpus−2)) even when the project had FEWER clips than
+    // pool slots — a 1–2 long-clip project (the common "one 19-minute
+    // video" case) encoded with `-threads 1–2` on an 8-core machine, i.e.
+    // 25–50% CPU utilization and 2–4× slower than necessary. The budget now
+    // divides by the number of jobs that will ACTUALLY run concurrently
+    // (min(poolN, segment count)), so a single long clip gets every core —
+    // the HandBrake/Shotcut single-job layout — while many-clip projects
+    // keep the v5.2 oversubscription-free division.
+    const activeJobs = Math.max(1, Math.min(poolN, segments.length));
     const threadBudget = isGpuEncoder
       ? Math.max(2, os.cpus().length)
-      : Math.max(1, Math.floor(os.cpus().length / poolN));
+      : Math.max(1, Math.floor(os.cpus().length / activeJobs));
 
     // v1.1 TURBO: stream-copy counters for the result payload + a shared
     // actual-duration accumulator (post-step-1 probe of each clip file —

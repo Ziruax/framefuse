@@ -260,6 +260,14 @@ export function MediaPanelBase({
   const [openSettingsId, setOpenSettingsId] = useState<string | null>(null);
   const [videoPosters, setVideoPosters] = useState<Record<string, string>>({});
   const [brokenThumbs, setBrokenThumbs] = useState<Record<string, boolean>>({});
+  // ── v1.3 MEDIA TABS ──────────────────────────────────────────────────────
+  // Separate library tabs (user request): videos / images / audio / subs get
+  // their own filtered view so a 50-clip project stays manageable. "All"
+  // keeps the classic mixed library. Local state — the tab is a view, not a
+  // project property.
+  const [mediaTab, setMediaTab] = useState<
+    "all" | "videos" | "images" | "audio" | "subs"
+  >("all");
   const posterRequestedRef = useRef<Set<string>>(new Set());
   // v5 gates — every v5 affordance hides behind one of these so a parent that
   // passes only v4.9 props renders the exact v4.9 list/grid.
@@ -369,6 +377,29 @@ export function MediaPanelBase({
     }
     setEditingId(null);
   };
+
+  // ── v1.3 tab bookkeeping ── filtered segment views KEEP the full-array
+  // index so display numbering, reorder arrows, and drag-move targets stay
+  // semantically identical to the unfiltered library.
+  const videoSegCount = useMemo(
+    () => segments.filter((s) => isVideoSegment(s, videoDurations)).length,
+    [segments, videoDurations],
+  );
+  const imageSegCount = segments.length - videoSegCount;
+  const showMediaList = mediaTab === "all" || mediaTab === "videos" || mediaTab === "images";
+  const renderableSegs = useMemo(
+    () =>
+      segments
+        .map((seg, idx) => ({ seg, idx }))
+        .filter(({ seg }) =>
+          mediaTab === "videos"
+            ? isVideoSegment(seg, videoDurations)
+            : mediaTab === "images"
+              ? !isVideoSegment(seg, videoDurations)
+              : true,
+        ),
+    [segments, mediaTab, videoDurations],
+  );
 
   return (
     <div
@@ -485,9 +516,65 @@ export function MediaPanelBase({
         </button>
       </div>
 
+      {/* v1.3 MEDIA TABS — library views (All / Videos / Images / Audio /
+          Subs) with live counts. The classic mixed library lives under "All";
+          each filtered tab shows ONLY its kind (and its management controls:
+          the audio tab also hosts beat-sync + the SFX palette, the subs tab
+          hosts the subtitle file card). */}
+      <div
+        className="flex items-center gap-1 border-b px-2.5 py-1.5"
+        style={{ borderColor: "#27272a", backgroundColor: "#0e0e10" }}
+        role="tablist"
+        aria-label="Media library tabs"
+      >
+        {(
+          [
+            ["all", "All", segments.length],
+            ["videos", "Videos", videoSegCount],
+            ["images", "Images", imageSegCount],
+            ["audio", "Audio", (audioTrack ? 1 : 0) + (sfxItems?.length ?? 0)],
+            ["subs", "Subs", subtitles ? subtitles.cues.length : 0],
+          ] as const
+        ).map(([tab, label, count]) => {
+          const active = mediaTab === tab;
+          const empty = count === 0 && tab !== "all";
+          return (
+            <button
+              key={tab}
+              type="button"
+              role="tab"
+              aria-selected={active}
+              onClick={() => setMediaTab(tab)}
+              className={cn(
+                "flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-semibold transition-all duration-150",
+                active
+                  ? "bg-violet-500/20 text-violet-200 shadow-[inset_0_0_0_1px_rgba(167,139,250,0.35)]"
+                  : "text-zinc-500 hover:bg-white/5 hover:text-zinc-300",
+              )}
+            >
+              {label}
+              <span
+                className={cn(
+                  "rounded-full px-1.5 py-0.5 text-[9px] font-bold tabular-nums transition-colors",
+                  active
+                    ? "bg-violet-500/30 text-violet-100"
+                    : empty
+                      ? "bg-zinc-800 text-zinc-600"
+                      : "bg-zinc-800 text-zinc-400",
+                )}
+              >
+                {count}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
       {/* Scrollable content area */}
       <div className="ff-scroll flex-1 overflow-y-auto">
-        {segments.length === 0 && (
+        {/* v1.3: the empty state follows the ACTIVE TAB — each tab teaches
+            its own next action instead of the generic dropzone. */}
+        {segments.length === 0 && mediaTab !== "audio" && mediaTab !== "subs" && (
           <div className="p-4">
             <div
               onDragOver={(e) => {
@@ -496,7 +583,7 @@ export function MediaPanelBase({
               }}
               onDragLeave={() => setDragOver(false)}
               onDrop={handleDrop}
-              onClick={openImagePicker}
+              onClick={mediaTab === "videos" ? openVideoPicker : openImagePicker}
               data-dragging={dragOver ? "true" : undefined}
               className="ff-dropzone ff-grid-bg flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-[#3f3f46] px-6 py-12 text-center transition-all duration-200 hover:border-cyan-500/60 hover:bg-cyan-950/20"
               style={{
@@ -525,9 +612,11 @@ export function MediaPanelBase({
                 className="text-[13px] font-medium"
                 style={{ color: "#e4e4e7" }}
               >
-                {v5MediaReady
-                  ? "Drop images or videos or click to browse"
-                  : "Drop images or click to browse"}
+                {mediaTab === "videos"
+                  ? "Drop video clips or click to browse"
+                  : v5MediaReady
+                    ? "Drop images or videos or click to browse"
+                    : "Drop images or click to browse"}
               </p>
               <p className="mt-1 text-[11px]" style={{ color: "#71717a" }}>
                 {v5MediaReady
@@ -542,7 +631,7 @@ export function MediaPanelBase({
             >
               <Sparkles className="size-3.5" /> Load sample storyboard (9 beats)
             </button>
-            {onAddSfx != null && (
+            {onAddSfx != null && mediaTab === "all" && (
               <div className="mt-3">
                 <SfxPalette
                   onAddSfx={onAddSfx}
@@ -556,10 +645,64 @@ export function MediaPanelBase({
           </div>
         )}
 
-        {/* Segment list */}
+        {/* v1.3: AUDIO tab empty state (segments or not — the audio tab owns
+            the track card, beat sync and the SFX palette). */}
+        {mediaTab === "audio" && (
+          <div className="space-y-1.5 p-3">
+            {!audioTrack && (
+              <button
+                type="button"
+                onClick={openAudioPicker}
+                className="ff-dropzone ff-grid-bg flex w-full cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-[#3f3f46] px-6 py-10 text-center transition-all duration-200 hover:border-fuchsia-500/60 hover:bg-fuchsia-950/20"
+              >
+                <Music className="mb-2 size-5" style={{ color: "#a1a1aa" }} />
+                <span className="text-[12px] font-medium" style={{ color: "#e4e4e7" }}>
+                  Attach an audio track
+                </span>
+                <span className="mt-1 text-[10px]" style={{ color: "#71717a" }}>
+                  MP3 · WAV · M4A · OGG — music or voiceover, mixed into the export
+                </span>
+              </button>
+            )}
+            {onAddSfx != null && (
+              <SfxPalette
+                onAddSfx={onAddSfx}
+                sfxItems={sfxItems}
+                onUpdateSfx={onUpdateSfx}
+                onRemoveSfx={onRemoveSfx}
+                currentMs={currentMs}
+              />
+            )}
+          </div>
+        )}
+
+        {/* v1.3: SUBS tab empty state — loads .srt or points at AI captions. */}
+        {mediaTab === "subs" && !subtitles && (
+          <div className="p-3">
+            <button
+              type="button"
+              onClick={openSubtitlePicker}
+              className="ff-dropzone ff-grid-bg flex w-full cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-[#3f3f46] px-6 py-10 text-center transition-all duration-200 hover:border-violet-500/60 hover:bg-violet-950/20"
+            >
+              <Captions className="mb-2 size-5" style={{ color: "#a1a1aa" }} />
+              <span className="text-[12px] font-medium" style={{ color: "#e4e4e7" }}>
+                Load an .srt subtitle file
+              </span>
+              <span className="mt-1 text-[10px]" style={{ color: "#71717a" }}>
+                Or generate word-by-word AI captions from the Captions settings tab
+              </span>
+            </button>
+          </div>
+        )}
+
+        {/* Segment list — v1.3: the outer block stays mounted whenever any
+            media exists; the SEGMENT-specific pieces (dropzone, summaries,
+            grid/list) are gated to the media tabs so the Audio / Subs tabs
+            show their own cards without the clip library. */}
         {segments.length > 0 && (
           <div className="space-y-1.5 p-3">
-            {/* Dropzone (compact) when segments exist */}
+            {/* Dropzone (compact) when segments exist — media tabs only. */}
+            {showMediaList && (
             <div
               onDragOver={(e) => {
                 // v4.5: card drags (reorder) must not light up the file zone.
@@ -569,7 +712,7 @@ export function MediaPanelBase({
               }}
               onDragLeave={() => setDragOver(false)}
               onDrop={handleDrop}
-              onClick={openImagePicker}
+              onClick={mediaTab === "videos" ? openVideoPicker : openImagePicker}
               data-dragging={dragOver ? "true" : undefined}
               className="ff-dropzone mb-2 flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-dashed border-[#2e2e33] py-2.5 text-[11px] font-semibold text-[#a8a8b0] transition-all duration-200 hover:border-cyan-500/60 hover:bg-cyan-950/20 hover:text-zinc-200 active:scale-[0.98]"
               style={
@@ -588,11 +731,20 @@ export function MediaPanelBase({
                   !dragOver && "group-hover:rotate-90",
                 )}
               />{" "}
-              {v5MediaReady ? "Add more media" : "Add more images"}
+              {mediaTab === "videos"
+                ? "Add more videos"
+                : mediaTab === "images"
+                  ? renderableSegs.length === 0
+                    ? "Add images"
+                    : "Add more images"
+                  : v5MediaReady
+                    ? "Add more media"
+                    : "Add more images"}
             </div>
+            )}
 
-            {/* v4.5: per-boundary override summary + reset-all. */}
-            {transition.overrides && Object.keys(transition.overrides).length > 0 && (
+            {/* v4.5: per-boundary override summary + reset-all (media tabs). */}
+            {showMediaList && transition.overrides && Object.keys(transition.overrides).length > 0 && (
               <div
                 className="mb-2 flex items-center justify-between rounded-md border px-2 py-1"
                 style={{
@@ -617,7 +769,7 @@ export function MediaPanelBase({
               </div>
             )}
 
-            {segments.length > 0 && Object.keys(motionOverrides).length > 0 && (
+            {showMediaList && segments.length > 0 && Object.keys(motionOverrides).length > 0 && (
               <div
                 className="mb-2 flex items-center justify-between rounded-md border px-2 py-1"
                 style={{
@@ -642,12 +794,15 @@ export function MediaPanelBase({
               </div>
             )}
 
-            {mediaView === "grid" ? (
+            {/* v1.3: the grid/list library renders ONLY on media tabs. */}
+            {showMediaList && (mediaView === "grid" ? (
               /* v4.8: compact tile grid — built for 100+ image storyboards.
                * Tiles show index + duration; click seeks; hover reveals
-               * remove; drag-reorder works in sequential mode. */
+               * remove; drag-reorder works in sequential mode.
+               * v1.3: renders the TAB-FILTERED list (idx = full-array index
+               * so numbering/reorder/move-to semantics are unchanged). */
               <div className="grid grid-cols-3 gap-1.5">
-                {segments.map((seg, idx) => {
+                {renderableSegs.map(({ seg, idx }) => {
                   const motionPinned = Object.prototype.hasOwnProperty.call(
                     motionOverrides,
                     seg.id,
@@ -842,7 +997,7 @@ export function MediaPanelBase({
                 </button>
               </div>
             ) : (
-            <>{segments.map((seg, idx) => {
+            <>{renderableSegs.map(({ seg, idx }) => {
               const overridden =
                 seg.rawDurationMs != null &&
                 Math.abs(seg.rawDurationMs - seg.durationMs) > 50;
@@ -1455,10 +1610,10 @@ export function MediaPanelBase({
                 </div>
               );
             })}</>
-            )}
+            ))}
 
-            {/* Audio track chip */}
-            {audioTrack && (
+            {/* Audio track chip — v1.3: lives on All + Audio tabs. */}
+            {audioTrack && (mediaTab === "all" || mediaTab === "audio") && (
               <div
                 className="flex items-center gap-2.5 rounded-lg border p-2 transition-colors"
                 style={{
@@ -1502,8 +1657,8 @@ export function MediaPanelBase({
               </div>
             )}
 
-            {/* Beat-sync card (v4.6) — cut on the pulse */}
-            {audioTrack && (
+            {/* Beat-sync card (v4.6) — cut on the pulse. v1.3: All + Audio tabs. */}
+            {audioTrack && (mediaTab === "all" || mediaTab === "audio") && (
               <div
                 className="rounded-lg border p-2.5"
                 style={{
@@ -1670,8 +1825,10 @@ export function MediaPanelBase({
             {/* Whisper caption generation moved to the right Settings panel
                 (Captions section) so all caption controls are in one place. */}
 
-            {/* Subtitles chip */}
-            {subtitles && subtitles.cues.length > 0 && (
+            {/* Subtitles chip — v1.3: lives on All + Subs tabs. */}
+            {(mediaTab === "all" || mediaTab === "subs") &&
+              subtitles &&
+              subtitles.cues.length > 0 && (
               <div
                 className="flex items-center gap-2.5 rounded-lg border p-2 transition-colors"
                 style={{
@@ -1716,8 +1873,8 @@ export function MediaPanelBase({
               </div>
             )}
 
-            {/* Empty subtitles hint when none loaded */}
-            {!subtitles && (
+            {/* Empty subtitles hint when none loaded — v1.3: All + Subs. */}
+            {!subtitles && (mediaTab === "all" || mediaTab === "subs") && (
               <button
                 type="button"
                 onClick={openSubtitlePicker}
@@ -1733,8 +1890,10 @@ export function MediaPanelBase({
               </button>
             )}
 
-            {/* v5.0: synthesized SFX palette + placed effects (playhead adds). */}
-            {onAddSfx != null && (
+            {/* v5.0: synthesized SFX palette + placed effects (playhead adds).
+                v1.3: shown on the All tab here — the Audio tab renders its own
+                copy at the top level. */}
+            {onAddSfx != null && mediaTab === "all" && (
               <SfxPalette
                 onAddSfx={onAddSfx}
                 sfxItems={sfxItems}
@@ -1744,8 +1903,8 @@ export function MediaPanelBase({
               />
             )}
 
-            {/* Warnings */}
-            {warnings.length > 0 && (
+            {/* Warnings — v1.3: segment-relevant tabs only. */}
+            {warnings.length > 0 && mediaTab !== "audio" && mediaTab !== "subs" && (
               <div
                 className="mt-2 space-y-1 rounded-lg border p-2"
                 style={{

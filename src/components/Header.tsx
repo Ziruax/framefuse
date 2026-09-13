@@ -152,9 +152,9 @@ export function Header({
                 backgroundColor: "#18181b",
                 color: "#a1a1aa",
               }}
-              title="FrameFuse v1.2 — multi-track video studio"
+              title="FrameFuse v1.3 — multi-track video studio"
             >
-              v1.2
+              v1.3
             </span>
             {/* v5.1: on-disk project file chip (native save/open sessions). */}
             {projectName && (
@@ -300,7 +300,9 @@ export function Header({
               </span>
             ) : null}
             {exportProgress?.eta ? (
-              <span style={{ color: "#71717a" }}>ETA {exportProgress.eta}s</span>
+              <span style={{ color: "#71717a" }}>
+                ETA {fmtElapsed(exportProgress.eta)}
+              </span>
             ) : null}
           </div>
           <div
