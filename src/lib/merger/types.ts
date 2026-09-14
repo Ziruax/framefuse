@@ -321,12 +321,19 @@ export interface ExportResult {
    * v1.4.1: keyframeCuts = copied clips that entered the fast path via a
    * keyframe-aligned head trim (requested cut within one frame of a
    * source keyframe).
+   * v1.4.2: chunkedClips/totalChunks = the chunked parallel encode (long
+   * re-encode clips split into frame-aligned chunks across the pool — the
+   * fix for multi-hour single-clip exports); hwDecodeClips = sources
+   * riding the throughput-probed hardware decode path.
    */
   encoder?: string;
   elapsedSec?: number;
   copiedClips?: number;
   encodedClips?: number;
   keyframeCuts?: number;
+  chunkedClips?: number;
+  totalChunks?: number;
+  hwDecodeClips?: number;
 }
 
 export interface CaptionSettings {

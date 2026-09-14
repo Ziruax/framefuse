@@ -30,6 +30,10 @@ export interface LastExport {
   encodedClips?: number;
   /** v1.4.1: copied clips that entered the fast path via a keyframe-aligned head trim. */
   keyframeCuts?: number;
+  /** v1.4.2: chunked parallel encode + probe-gated hardware decode. */
+  chunkedClips?: number;
+  totalChunks?: number;
+  hwDecodeClips?: number;
 }
 
 interface HeaderProps {
@@ -154,9 +158,9 @@ export function Header({
                 backgroundColor: "#18181b",
                 color: "#a1a1aa",
               }}
-              title="FrameFuse v1.4 — multi-track video studio"
+              title="FrameFuse v1.4.2 — multi-track video studio · turbo chunked export"
             >
-              v1.4
+              v1.4.2
             </span>
             {/* v5.1: on-disk project file chip (native save/open sessions). */}
             {projectName && (
@@ -349,6 +353,14 @@ export function Header({
               ? `Exported in ${fmtElapsed(lastExport.elapsedSec)}${
                   lastExport.encoder ? ` · ${lastExport.encoder}` : ""
                 }${
+                  lastExport.totalChunks && lastExport.totalChunks > 1
+                    ? ` · ${lastExport.totalChunks} chunks encoded in parallel`
+                    : ""
+                }${
+                  lastExport.hwDecodeClips
+                    ? ` · ${lastExport.hwDecodeClips} source${lastExport.hwDecodeClips === 1 ? "" : "s"} on hardware decode`
+                    : ""
+                }${
                   lastExport.copiedClips
                     ? ` · ${lastExport.copiedClips} clip${lastExport.copiedClips === 1 ? "" : "s"} stream-copied (no re-encode)` +
                       (lastExport.keyframeCuts
@@ -375,6 +387,23 @@ export function Header({
               >
                 <Gauge className="size-3" />
                 {fmtElapsed(lastExport.elapsedSec)}
+              </span>
+            </>
+          )}
+          {lastExport.totalChunks != null && lastExport.totalChunks > 1 && (
+            <>
+              <span style={{ color: "#52525b" }}>·</span>
+              <span
+                className="rounded px-1 py-px font-medium"
+                style={{ backgroundColor: "rgba(139, 92, 246, 0.12)", color: "#a78bfa" }}
+                title={
+                  "Parallel chunks: long re-encode clips were split into frame-aligned chunks and encoded concurrently" +
+                  (lastExport.hwDecodeClips
+                    ? ` · ${lastExport.hwDecodeClips} source${lastExport.hwDecodeClips === 1 ? "" : "s"} decoded in hardware (probe-gated)`
+                    : "")
+                }
+              >
+                ⧉ {lastExport.totalChunks} parallel
               </span>
             </>
           )}

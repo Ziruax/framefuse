@@ -1168,6 +1168,54 @@ async function detectGpuEncoderAsync() {
   return encoderDetecting;
 }
 
+// ---------------------------------------------------------------------------
+// v1.4.2 HARDWARE DECODE PROBE — per source file, throughput-gated.
+//
+// v1.1 shipped hw decode UNCONDITIONALLY OFF (-hwaccel auto could silently
+// land on a WARP/broken-driver path decoding 1080p at ~1 fps). But CPU
+// decode of 4K/H.265 sources is a real bottleneck on the re-encode path —
+// so instead of a blanket flag, we now MEASURE: decode 72 real frames of
+// the ACTUAL file twice (CPU vs -hwaccel auto) and enable hw decode only
+// when it is ≥ 1.3× faster. Broken driver stacks lose the probe and stay
+// on CPU — the same evidence-over-assumption philosophy as the encoder
+// probe above. Both arms include the frame download (the null muxer forces
+// system-memory frames), which is the exact cost our software filter graph
+// pays. Cached per path; any error → CPU (never a failed export).
+// ---------------------------------------------------------------------------
+const hwDecodeCache = new Map();
+
+async function probeHwDecode(path) {
+  if (hwDecodeCache.has(path)) return hwDecodeCache.get(path);
+  let use = false;
+  try {
+    const FRAMES = 72;
+    const arm = (hw) => [
+      "-hide_banner", "-loglevel", "error",
+      ...(hw ? ["-hwaccel", "auto"] : []),
+      "-i", path,
+      "-map", "0:v:0",
+      "-frames:v", String(FRAMES),
+      "-f", "null", "-",
+    ];
+    const t0 = Date.now();
+    const cpu = await ffmpegCapture(arm(false), 20000);
+    if (cpu.code === 0) {
+      const cpuMs = Math.max(1, Date.now() - t0);
+      const t1 = Date.now();
+      const gpu = await ffmpegCapture(arm(true), 20000);
+      if (gpu.code === 0) {
+        const gpuMs = Math.max(1, Date.now() - t1);
+        use = gpuMs * 1.3 < cpuMs; // ≥30% faster or stay on CPU
+        console.log(
+          `hw-decode probe ${path}: cpu ${cpuMs}ms vs hw ${gpuMs}ms → ${use ? "ENABLED" : "cpu (not ≥1.3× faster)"}`,
+        );
+      }
+    }
+  } catch (_) { use = false; }
+  hwDecodeCache.set(path, use);
+  return use;
+}
+
 /** Build encoder args for a quality-first, speed-optimized encode.
  * v4.5: the `quality` profile ("draft" | "social" | "cinema" | "custom")
  * drives CRF/cq + the encoder speed preset; `crf` is the explicit target
@@ -2199,16 +2247,37 @@ ipcMain.handle("export-native", async (event, opts) => {
     const poolN = isGpuEncoder
       ? Math.min(3, Math.max(1, os.cpus().length - 1))
       : Math.min(4, Math.max(1, os.cpus().length - 2));
+    // v1.4.2 CHUNKED PARALLEL ENCODE: long re-encode clips split into
+    // frame-aligned ~60 s chunks (capped at the pool width — more chunks
+    // than workers only adds seek overhead, fewer wastes the pool). This is
+    // THE fix for the "one 19-minute video exports for hours" case: the
+    // per-clip filter graph (libass subtitles, scale, overlay) is
+    // single-threaded, so a single-process encode cannot use the machine —
+    // chunks turn it into the many-clips layout the pool already
+    // parallelizes, with the concat still riding `-c copy`.
+    const CHUNK_TARGET_SEC = 60;
+    const maxChunks = Math.max(2, poolN);
     // v1.3 THREAD-STARVATION FIX: the v5.2 budget divided the cores by the
     // POOL SIZE (min(4, cpus−2)) even when the project had FEWER clips than
     // pool slots — a 1–2 long-clip project (the common "one 19-minute
     // video" case) encoded with `-threads 1–2` on an 8-core machine, i.e.
     // 25–50% CPU utilization and 2–4× slower than necessary. The budget now
-    // divides by the number of jobs that will ACTUALLY run concurrently
-    // (min(poolN, segment count)), so a single long clip gets every core —
-    // the HandBrake/Shotcut single-job layout — while many-clip projects
-    // keep the v5.2 oversubscription-free division.
-    const activeJobs = Math.max(1, Math.min(poolN, segments.length));
+    // divides by the number of jobs that will ACTUALLY run concurrently,
+    // so a single long clip gets every core — the HandBrake/Shotcut
+    // single-job layout — while many-clip projects keep the v5.2
+    // oversubscription-free division.
+    // v1.4.2: the estimate is now CHUNK-AWARE — a chunkable long video
+    // counts as its chunk count (the pool will run that many encode jobs
+    // for it). Non-chunkable projects estimate exactly segments.length,
+    // keeping the legacy budget byte-for-byte.
+    const estVideoJobs = segments.reduce((n, s) => {
+      if (s && s.mediaType === "video" && s.videoPath) {
+        const plan = G.planChunkFrames(Number(s.durationMs) || 0, fps, CHUNK_TARGET_SEC, maxChunks);
+        return n + (plan ? plan.length : 1);
+      }
+      return n + 1;
+    }, 0);
+    const activeJobs = Math.max(1, Math.min(poolN, estVideoJobs || segments.length));
     const threadBudget = isGpuEncoder
       ? Math.max(2, os.cpus().length)
       : Math.max(1, Math.floor(os.cpus().length / activeJobs));
@@ -2223,47 +2292,36 @@ ipcMain.handle("export-native", async (event, opts) => {
     // v1.4.1: how many of the copied clips took the keyframe-aligned
     // head-trim path (result telemetry — surfaced in the export toast).
     let keyframeCuts = 0;
+    // v1.4.2 chunked-encode telemetry: chunkedClips = segments split into
+    // chunks, totalChunks = chunk encode jobs emitted, hwDecodeClips =
+    // sources riding the throughput-gated -hwaccel auto decode path.
+    let chunkedClips = 0;
+    let totalChunks = 0;
+    let hwDecodeClips = 0;
 
-    for (let i = 0; i < segments.length; i++) {
-      const seg = segments[i];
-      const clipPath = path.join(tempDir, `clip_${String(i).padStart(4, "0")}.mp4`);
-      tempFiles.push(clipPath);
-      clipPaths.push(clipPath);
+    // v1.4.2: write an ASS document to a temp file → the subtitles= filter
+    // suffix. Shared by the segment path (tag = clip index) and the chunk
+    // path (tag = clip index _ chunk index).
+    const writeAssFile = (doc, tag) => {
+      const assPath = path.join(tempDir, `captions_${tag}_${Date.now()}.ass`);
+      fs.writeFileSync(assPath, doc, "utf-8");
+      tempFiles.push(assPath);
+      const escapedAssPath = assPath
+        .replace(/\\/g, "/")
+        .replace(/:/g, "\\:")
+        .replace(/'/g, "\\'")
+        .replace(/,/g, "\\,");
+      return `subtitles=filename='${escapedAssPath}'`;
+    };
 
-      const segStartMs = (typeof seg.startMs === "number") ? seg.startMs : cumulativeMs;
-      const segEndMs = (typeof seg.endMs === "number") ? seg.endMs : (cumulativeMs + seg.durationMs);
-
-      let assDoc = null;
-      if (captionsEnabled || headlinesEnabled) {
-        assDoc = buildAssDocument(
-          captionsEnabled ? subtitleCues : [],
-          captionsEnabled ? captionSettings : null,
-          headlinesEnabled ? headlines : null,
-          width, height, segStartMs, segEndMs, seg.durationMs,
-        );
-      }
-
-      const assSuffix = assDoc
-        ? (() => {
-            const assPath = path.join(tempDir, `captions_${String(i).padStart(4, "0")}_${Date.now()}.ass`);
-            fs.writeFileSync(assPath, assDoc, "utf-8");
-            tempFiles.push(assPath);
-            const escapedAssPath = assPath
-              .replace(/\\/g, "/")
-              .replace(/:/g, "\\:")
-              .replace(/'/g, "\\'")
-              .replace(/,/g, "\\,");
-            return `subtitles=filename='${escapedAssPath}'`;
-          })()
-        : null;
-
-      // v5 overlay specs for THIS clip window: every overlay whose
-      // [startMs, endMs) intersects [segStartMs, segStartMs + dur). Source
-      // dims prefer the payload (image natural dims shipped by native.ts),
-      // else probed from the file. Geometry mirrors renderer.overlayGeometry.
-      const overlaySpecs = [];
+    // v1.4.2: overlay specs for ANY window (segment OR chunk). The chunked
+    // encode path re-runs this per chunk with the chunk window so overlay
+    // playback position, motion clock, and enable=between() windows stay
+    // correct — identical semantics to the old inline segment loop.
+    const buildOverlaySpecsForWindow = async (winStartMs, winDurMs) => {
+      const specs = [];
       for (const ov of overlaySegs) {
-        const win = G.overlayWindow(ov, segStartMs, seg.durationMs);
+        const win = G.overlayWindow(ov, winStartMs, winDurMs);
         if (!win || win.overlapMs <= 0) continue;
         const isVid = ov.mediaType === "video" && ov.videoPath;
         const srcPath = isVid ? ov.videoPath : ov.imagePath;
@@ -2280,7 +2338,7 @@ ipcMain.handle("export-native", async (event, opts) => {
         // static rect through the geometry mirror with that kf as free-form
         // x/y); ≥2 keyframes = the overlay filter's x/y become piecewise-
         // linear TIME EXPRESSIONS (the exact preview curve). tOffsetSec
-        // shifts the clip-local clock to the overlay's window-local clock.
+        // shifts the window-local clock to the overlay's window-local clock.
         const motion = G.sanitizeMotionMirror(
           ov.overlay && ov.overlay.motion,
         );
@@ -2297,7 +2355,7 @@ ipcMain.handle("export-native", async (event, opts) => {
           x = pinned.dx;
           y = pinned.dy;
         } else if (motion.length >= 2) {
-          const tOffsetSec = (segStartMs - Number(ov.startMs) || 0) / 1000;
+          const tOffsetSec = (winStartMs - Number(ov.startMs) || 0) / 1000;
           const exprs = G.buildMotionOverlayExpr({
             videoW: width,
             videoH: height,
@@ -2334,7 +2392,7 @@ ipcMain.handle("export-native", async (event, opts) => {
           const ovFps = Number(ovProbe.fps) || 0;
           if (ovFps > fps + 0.5) normFps = fps;
         }
-        overlaySpecs.push({
+        specs.push({
           inputArgs: isVid
             ? G.buildOverlayVideoInputArgs({ ssMs: win.ssMs, durMs: win.overlapMs, path: srcPath, loop: ovLoop, srcDurMs })
             : G.buildOverlayImageInputArgs({ durMs: win.overlapMs, path: srcPath }),
@@ -2350,6 +2408,31 @@ ipcMain.handle("export-native", async (event, opts) => {
           b: win.b,
         });
       }
+      return specs;
+    };
+
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      const clipPath = path.join(tempDir, `clip_${String(i).padStart(4, "0")}.mp4`);
+
+      const segStartMs = (typeof seg.startMs === "number") ? seg.startMs : cumulativeMs;
+      const segEndMs = (typeof seg.endMs === "number") ? seg.endMs : (cumulativeMs + seg.durationMs);
+
+      let assDoc = null;
+      if (captionsEnabled || headlinesEnabled) {
+        assDoc = buildAssDocument(
+          captionsEnabled ? subtitleCues : [],
+          captionsEnabled ? captionSettings : null,
+          headlinesEnabled ? headlines : null,
+          width, height, segStartMs, segEndMs, seg.durationMs,
+        );
+      }
+
+      const assSuffix = assDoc ? writeAssFile(assDoc, String(i).padStart(4, "0")) : null;
+
+      // v5 overlay specs for THIS clip window (segment-level — used by the
+      // copy gate + the whole-clip encode path; chunks re-window below).
+      const overlaySpecs = await buildOverlaySpecsForWindow(segStartMs, seg.durationMs);
 
       const segHasAudio = !!(
         seg.mediaType === "video" &&
@@ -2428,6 +2511,8 @@ ipcMain.handle("export-native", async (event, opts) => {
           (trimInMs === 0 || trimKeyAligned) &&
           (trimInMs + seg.durationMs) >= srcDur - 300;
         if (formatOk) {
+          tempFiles.push(clipPath);
+          clipPaths.push(clipPath);
           jobs.push({
             idx: i,
             args: G.buildStreamCopyArgs({
@@ -2468,45 +2553,125 @@ ipcMain.handle("export-native", async (event, opts) => {
       }
       encodedClips += 1;
 
-      // v5.2: video-only clip encode — audio never rides the concat demuxer.
-      const built = G.buildClipArgs({
-        i,
-        seg,
-        segments,
-        fps,
-        width,
-        height,
-        kbEnabled: enabled,
-        zoomMax,
-        globalDir,
-        transition,
-        wm,
-        assSuffix,
-        clipPath,
-        encArgs,
-        anyAudio: false,
-        segHasAudio: false,
-        overlaySpecs,
-        // v1.1 TURBO: hardware DECODE is DISABLED by default. `-hwaccel
-        // auto` on Windows can silently land on a WARP (software
-        // rasterizer) d3d11va path or a broken driver path with NO
-        // fallback — decoding 1080p at ~1 fps and turning a 19-minute
-        // export into a multi-hour job. CPU H.264 decode runs at
-        // 200–400 fps and is never the bottleneck (mpv ships hw decode
-        // OFF by default for the same reliability reason). The
-        // buildVideoInputArgs capability stays for future opt-in.
-        hwaccel: false,
-        // v5.2: thread budget (see the pool below).
-        threads: threadBudget,
-      });
+      // ── v1.4.2 CHUNKED PARALLEL ENCODE + throughput-gated hw decode ──
+      // A long re-encode clip is ONE ffmpeg process whose filter graph
+      // (libass subtitles, scale, overlay) is single-threaded — the
+      // "19-minute video exports for 3.5 hours" pathology. Frame-aligned
+      // chunks (planChunkFrames) turn it into the many-clips layout the
+      // pool already parallelizes; the concat rides `-c copy` as always.
+      // Images are deliberately NOT chunked (zoompan frame indexing +
+      // slideshows are inherently many-clip).
+      const segIsVideo = seg.mediaType === "video" && seg.videoPath;
+      const chunkPlan = segIsVideo
+        ? G.planChunkFrames(Number(seg.durationMs) || 0, fps, CHUNK_TARGET_SEC, maxChunks)
+        : null;
+      // v1.4.2: hw decode only after the PROBE proves it ≥ 1.3× faster on
+      // THIS file (≥ 20 s sources only — shorter clips don't pay back the
+      // two probe arms). Replaces the v1.1 unconditional-off policy with
+      // evidence per source; failures stay on CPU silently.
+      const hw = segIsVideo && (Number(seg.durationMs) || 0) >= 20000
+        ? await probeHwDecode(seg.videoPath)
+        : false;
+      if (hw) hwDecodeClips += 1;
 
-      jobs.push({
-        idx: i,
-        args: built.args,
-        durSec: seg.durationMs / 1000,
-        durationMs: seg.durationMs,
-        segId: seg.id,
-      });
+      if (chunkPlan) {
+        for (let k = 0; k < chunkPlan.length; k++) {
+          const ch = chunkPlan[k];
+          const chunkPath = path.join(
+            tempDir,
+            `clip_${String(i).padStart(4, "0")}_${String(k).padStart(2, "0")}.mp4`,
+          );
+          tempFiles.push(chunkPath);
+          clipPaths.push(chunkPath);
+          const chunkStartMs = segStartMs + ch.offsetMs;
+          // Per-chunk ASS window — a cue crossing a chunk boundary renders
+          // partially in each chunk, the EXACT semantics of cues crossing
+          // segment boundaries (buildAssDocument clamps to the window).
+          let chunkAssSuffix = null;
+          if (captionsEnabled || headlinesEnabled) {
+            const doc = buildAssDocument(
+              captionsEnabled ? subtitleCues : [],
+              captionsEnabled ? captionSettings : null,
+              headlinesEnabled ? headlines : null,
+              width, height, chunkStartMs, chunkStartMs + ch.durMs, ch.durMs,
+            );
+            chunkAssSuffix = doc
+              ? writeAssFile(doc, `${String(i).padStart(4, "0")}_${String(k).padStart(2, "0")}`)
+              : null;
+          }
+          const chunkOverlaySpecs = await buildOverlaySpecsForWindow(chunkStartMs, ch.durMs);
+          const built = G.buildClipArgs({
+            i,
+            seg,
+            segments,
+            fps,
+            width,
+            height,
+            kbEnabled: enabled,
+            zoomMax,
+            globalDir,
+            transition,
+            wm,
+            assSuffix: chunkAssSuffix,
+            clipPath: chunkPath,
+            encArgs,
+            anyAudio: false,
+            segHasAudio: false,
+            overlaySpecs: chunkOverlaySpecs,
+            hwaccel: hw,
+            threads: threadBudget,
+            chunk: { offsetMs: ch.offsetMs, durMs: ch.durMs, first: ch.first, last: ch.last },
+          });
+          jobs.push({
+            idx: i,
+            args: built.args,
+            durSec: ch.durMs / 1000,
+            durationMs: ch.durMs,
+            segId: seg.id,
+          });
+        }
+        chunkedClips += 1;
+        totalChunks += chunkPlan.length;
+      } else {
+        // Whole-clip encode (legacy path — argv byte-identical apart from
+        // the probed hwaccel flag, which is still false on CPU-only boxes).
+        tempFiles.push(clipPath);
+        clipPaths.push(clipPath);
+        // v5.2: video-only clip encode — audio never rides the concat demuxer.
+        const built = G.buildClipArgs({
+          i,
+          seg,
+          segments,
+          fps,
+          width,
+          height,
+          kbEnabled: enabled,
+          zoomMax,
+          globalDir,
+          transition,
+          wm,
+          assSuffix,
+          clipPath,
+          encArgs,
+          anyAudio: false,
+          segHasAudio: false,
+          overlaySpecs,
+          // v1.4.2: hardware decode is PER-SOURCE, PROBE-GATED (see
+          // probeHwDecode above) — no longer unconditionally disabled, but
+          // enabled only where it measured ≥ 1.3× faster than CPU decode.
+          hwaccel: hw,
+          // v5.2: thread budget (see the pool below).
+          threads: threadBudget,
+        });
+
+        jobs.push({
+          idx: i,
+          args: built.args,
+          durSec: seg.durationMs / 1000,
+          durationMs: seg.durationMs,
+          segId: seg.id,
+        });
+      }
 
       // v5.2: parallel PCM extraction for the clip's own audio (speed
       // applied here via atempo; volume stays in the step-2 mix graph).
@@ -2710,6 +2875,9 @@ ipcMain.handle("export-native", async (event, opts) => {
     // show users WHY the export was fast (encoder + stream-copy counts).
     // v1.4.1: keyframeCuts = copied clips that entered the fast path via a
     // keyframe-aligned head trim (vs. trimIn=0 copies).
+    // v1.4.2: chunkedClips/totalChunks = the chunked parallel encode (long
+    // re-encode clips split across the pool), hwDecodeClips = sources
+    // riding the throughput-gated hardware decode path.
     return {
       path: outputPath,
       size,
@@ -2718,6 +2886,9 @@ ipcMain.handle("export-native", async (event, opts) => {
       copiedClips,
       encodedClips,
       keyframeCuts,
+      chunkedClips,
+      totalChunks,
+      hwDecodeClips,
     };
 
   } catch (err) {
@@ -2748,8 +2919,10 @@ app.on("will-quit", () => {
   try { if (whisperChild.proc) whisperChild.proc.kill(); } catch (_) {}
 });
 
-// Test hook — exposes the ASS builder to the dev verification harness.
+// Test hook — exposes the ASS builder + the v1.4.2 hw-decode probe to the
+// dev verification harness (scripts/verify-chunked-encode.js stubs the
+// electron module so main.js loads in plain node).
 // Harmless in production: nothing requires the Electron main entry.
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { buildAssDocument, assAnimTags, buildHeadlineEvents };
+  module.exports = { buildAssDocument, assAnimTags, buildHeadlineEvents, probeHwDecode };
 }

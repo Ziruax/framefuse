@@ -568,7 +568,14 @@ function chromaDespillType(color) {
  * byte-identical to the pre-v5.1 argv.
  */
 function buildVideoInputArgs(o) {
-  const ss = fmt3(Math.max(0, Number(o && o.trimInMs) || 0));
+  // v1.4.2: `ssSec` (µs-precision preformatted seconds) lets the chunked
+  // encode path pass EXACT frame-aligned seek points — fmt3()'s ms
+  // truncation can straddle a frame edge at 60 fps (16.7 ms/frame).
+  // Legacy callers (no ssSec) keep the byte-identical fmt3 output.
+  const ss =
+    o && o.ssSec != null
+      ? o.ssSec
+      : fmt3(Math.max(0, Number(o && o.trimInMs) || 0));
   const hw = o && o.hwaccel ? ["-hwaccel", "auto"] : [];
   const durMs = Number(o && o.durMs);
   const t =
@@ -611,6 +618,63 @@ function resolveSegSpeed(seg) {
   const n = Number(seg && seg.speed);
   if (!Number.isFinite(n) || n <= 0 || n === 1) return 1;
   return Math.max(0.25, Math.min(4, n));
+}
+
+/**
+ * v1.4.2 CHUNKED PARALLEL ENCODE — frame-aligned chunk plan for a long
+ * re-encode clip. A single 19-minute clip today = ONE ffmpeg process whose
+ * filter graph (libass subtitles, scale, overlay) is single-threaded → the
+ * classic ~3 fps pathology = multi-hour exports even on many-core machines.
+ * Splitting the clip into frame-aligned chunks lets the EXISTING parallel
+ * pool encode them concurrently (concat stays `-c copy` — uniform output
+ * spec), turning the one-long-clip case into the many-clips case.
+ *
+ * Rules:
+ *  - a clip shorter than ONE target chunk isn't split (nothing to gain);
+ *  - chunk count n = max(2, ceil(dur/target)), capped at maxChunks — so
+ *    every chunk is ≥ target/2 (seek/GOP re-decode overhead stays < ~5%);
+ *  - chunk boundaries land EXACTLY on output frames: total frames are
+ *    split into nearly-equal INTEGER frame counts, so the concatenated
+ *    frame count equals the single-process frame count (no dup/drop);
+ *  - each chunk's offset/duration derive from frame counts / fps with FULL
+ *    float precision (µs-formatted at the argv layer — see ssSec).
+ * Returns null when chunking doesn't apply; otherwise an array of
+ *   { firstFrame, frames, offsetMs, durMs, first, last }.
+ */
+function planChunkFrames(durationMs, fps, targetSec, maxChunks) {
+  const durMs = Number(durationMs) || 0;
+  const rate = Number(fps) || 0;
+  const tgt = Number(targetSec) || 60;
+  if (durMs <= 0 || rate <= 0) return null;
+  const durSec = durMs / 1000;
+  if (durSec < tgt) return null; // shorter than one target chunk — don't split
+  const cap = Math.max(2, Math.max(2, Number(maxChunks) || 2));
+  let n = Math.min(cap, Math.max(2, Math.ceil(durSec / tgt)));
+  if (n < 2) return null;
+  const totalFrames = Math.max(2, Math.round(durSec * rate));
+  if (totalFrames < n * 8) return null; // frames too coarse to split
+  const base = Math.floor(totalFrames / n);
+  const rem = totalFrames % n;
+  const chunks = [];
+  let f0 = 0;
+  for (let k = 0; k < n; k++) {
+    const frames = base + (k < rem ? 1 : 0);
+    if (frames <= 0) continue;
+    chunks.push({
+      firstFrame: f0,
+      frames,
+      offsetMs: (f0 / rate) * 1000,
+      durMs: (frames / rate) * 1000,
+      first: k === 0,
+      last: k === n - 1,
+    });
+    f0 += frames;
+  }
+  if (chunks.length < 2) return null;
+  // Integrity: the plan must cover the clip exactly (frame-sum parity).
+  const covered = chunks.reduce((a, c) => a + c.frames, 0);
+  if (covered !== totalFrames) return null;
+  return chunks;
 }
 
 /**
@@ -997,11 +1061,23 @@ function buildClipArgs(ctx) {
     // process divides the cores across the parallel pool so concurrent
     // encoders never oversubscribe the CPU.
     threads,
+    // v1.4.2 CHUNKED PARALLEL ENCODE: { offsetMs, durMs, first, last } for
+    // ONE chunk of a long re-encode video clip (video branch ONLY — image
+    // clips keep whole-clip zoompan frame indexing). null/undefined = the
+    // legacy whole-clip behavior, byte-identical argv.
+    chunk,
   } = ctx;
 
   const overlays = Array.isArray(overlaySpecs) ? overlaySpecs : [];
   const isVideo = !!(seg && seg.mediaType === "video" && seg.videoPath);
   const vol = normalizeVolume(seg && seg.volume);
+  // v1.4.2: chunk context — only honored for VIDEO clips (defensive guard:
+  // a chunk on an image/xfade clip is ignored, keeping those argv shapes
+  // legacy-exact).
+  const ch = chunk && isVideo ? chunk : null;
+  const effDurSec = ch ? ch.durMs / 1000 : seg.durationMs / 1000;
+  const fadeAtStart = !ch || ch.first;
+  const fadeAtEnd = !ch || ch.last;
 
   // ── v4.3 transition planning (mirrors renderer.ts formulas exactly;
   //    v4.5 per-boundary overrides — the style at the boundary ENTERING
@@ -1060,22 +1136,26 @@ function buildClipArgs(ctx) {
   // Post-subtitle fades (applied AFTER captions like a real video — matches
   // the canvas applyGlobalFade pass): dips + start/end fades. v4.5: the TAIL
   // dip color comes from the NEXT boundary's style.
+  // v1.4.2 CHUNKING: head/start fades exist only on the FIRST chunk and
+  // tail fades only on the LAST chunk (a mid-chunk fade would flash); tail
+  // fade `st` is chunk-local (ends at the last chunk's end = clip end).
+  // No chunk → all four, exactly as before (byte-identical argv).
   const postFades = [];
-  if (dipColor && headMs > 0) {
+  if (dipColor && headMs > 0 && fadeAtStart) {
     postFades.push(`fade=t=in:st=0:d=${(headMs / 1000).toFixed(3)}:color=${dipColor}`);
   }
-  if (dipTailMs > 0) {
+  if (dipTailMs > 0 && fadeAtEnd) {
     const tailColor = DIP_COLORS[nextStyle] || "black";
     postFades.push(
-      `fade=t=out:st=${(segDurSec - dipTailMs / 1000).toFixed(3)}:d=${(dipTailMs / 1000).toFixed(3)}:color=${tailColor}`,
+      `fade=t=out:st=${(effDurSec - dipTailMs / 1000).toFixed(3)}:d=${(dipTailMs / 1000).toFixed(3)}:color=${tailColor}`,
     );
   }
-  if (startFadeMs > 0) {
+  if (startFadeMs > 0 && fadeAtStart) {
     postFades.push(`fade=t=in:st=0:d=${(startFadeMs / 1000).toFixed(3)}`);
   }
-  if (endFadeMs > 0) {
+  if (endFadeMs > 0 && fadeAtEnd) {
     postFades.push(
-      `fade=t=out:st=${(segDurSec - endFadeMs / 1000).toFixed(3)}:d=${(endFadeMs / 1000).toFixed(3)}`,
+      `fade=t=out:st=${(effDurSec - endFadeMs / 1000).toFixed(3)}:d=${(endFadeMs / 1000).toFixed(3)}`,
     );
   }
 
@@ -1177,6 +1257,11 @@ function buildClipArgs(ctx) {
     // generated-silence input (when the clip has no audio of its own),
     // then the watermark image — indices assigned in push order.
     //
+    // v1.4.2 CHUNKED: a chunk seeks to trimIn + offsetMs×speed (chunk
+    // offsets are TIMELINE ms; the source window is timeline × speed) and
+    // encodes only the chunk's duration; the µs-precision ssSec keeps the
+    // boundary EXACTLY on the frame grid (see planChunkFrames).
+    //
     // v5.1 SPEED: base-lane video clips with speed ≠ 1 —
     //   • input gains `-t <sourceWindow>` (durationMs·speed = the source
     //     window setpts will retime onto durationMs),
@@ -1188,10 +1273,13 @@ function buildClipArgs(ctx) {
     // speed 1/undefined → every one of these is a no-op (byte-identical argv
     // with pre-v5.1 builds — the harness differentials prove it).
     const speed = resolveSegSpeed(seg);
-    const sourceWinMs = speed !== 1 ? Math.max(0, Number(seg.durationMs) || 0) * speed : 0;
+    const effDurMs = ch ? ch.durMs : Math.max(0, Number(seg.durationMs) || 0);
+    const sourceWinMs = speed !== 1 ? effDurMs * speed : 0;
+    const ssMs = (Number(seg.trimInMs) || 0) + (ch ? ch.offsetMs * speed : 0);
     const inputs = [
       ...buildVideoInputArgs({
-        trimInMs: seg.trimInMs,
+        trimInMs: ssMs,
+        ssSec: ch ? (ssMs / 1000).toFixed(6) : undefined,
         path: seg.videoPath,
         hwaccel,
         durMs: speed !== 1 ? sourceWinMs : undefined,
@@ -1241,7 +1329,7 @@ function buildClipArgs(ctx) {
       return {
         args: [
           ...inputs,
-          "-t", segDurSec.toFixed(3),
+          "-t", effDurSec.toFixed(3),
           "-filter_complex", g,
           "-map", outLabel,
           ...audioMaps,
@@ -1256,7 +1344,7 @@ function buildClipArgs(ctx) {
     vfParts.push(...postFades);
     const args = [
       ...inputs,
-      "-t", segDurSec.toFixed(3),
+      "-t", effDurSec.toFixed(3),
       "-vf", vfParts.join(","),
     ];
     if (anyAudio) {
@@ -1533,6 +1621,8 @@ module.exports = {
   planBoundaryFades,
   clipNeedsReEncode,
   buildStreamCopyArgs,
+  // v1.4.2 chunked parallel encode
+  planChunkFrames,
   // base video clip builders
   buildVideoInputArgs,
   buildVideoFilterChain,

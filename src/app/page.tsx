@@ -1120,6 +1120,9 @@ export default function Page() {
         copiedClips: res.copiedClips,
         encodedClips: res.encodedClips,
         keyframeCuts: res.keyframeCuts,
+        chunkedClips: res.chunkedClips,
+        totalChunks: res.totalChunks,
+        hwDecodeClips: res.hwDecodeClips,
       });
       // v1.1 TURBO: the success toast carries the performance story —
       // export time + encoder + stream-copy count — so a fast export is
@@ -1133,6 +1136,16 @@ export default function Page() {
         );
       }
       if (res.encoder) turboBits.push(res.encoder);
+      // v1.4.2: the parallel-chunk story — "4 chunks in parallel" explains
+      // WHY a 19-minute re-encode finished in minutes instead of hours.
+      if (res.totalChunks != null && res.totalChunks > 1) {
+        turboBits.push(
+          `${res.totalChunks} chunks encoded in parallel` +
+            (res.hwDecodeClips != null && res.hwDecodeClips > 0 ? " · hardware decode" : ""),
+        );
+      } else if (res.hwDecodeClips != null && res.hwDecodeClips > 0) {
+        turboBits.push("hardware decode");
+      }
       if (res.copiedClips != null && res.copiedClips > 0) {
         turboBits.push(
           `${res.copiedClips} clip${res.copiedClips === 1 ? "" : "s"} copied without re-encode` +
