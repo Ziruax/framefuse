@@ -334,6 +334,15 @@ export interface ExportResult {
   chunkedClips?: number;
   totalChunks?: number;
   hwDecodeClips?: number;
+  /** v1.5: the export pipeline that actually ran. "parallel-pass" = the
+   *  CPU-first chunked single-pass (W timeline windows rendered
+   *  concurrently + one audio pass + concat/mux); "single-pass" = one
+   *  process for the whole timeline (GPU boxes / short timelines);
+   *  "two-step" = the per-clip pool fallback. */
+  mode?: "single-pass" | "parallel-pass" | "two-step";
+  /** v1.5: W — the number of parallel single-pass windows (parallel-pass
+   *  only; aliases totalChunks for that mode). */
+  parallelChunks?: number;
 }
 
 export interface CaptionSettings {
@@ -731,6 +740,15 @@ declare global {
         path: string;
         version: string | null;
         error: string | null;
+        /** v1.5: which ffmpeg build is in use + its compiled capabilities —
+         *  the facts that decide export speed on an install (full build →
+         *  NVENC/QSV/AMF possible + ffprobe-backed fast probes). */
+        build?: "bundled-full" | "ffmpeg-static" | "system-path";
+        hasFfprobe?: boolean;
+        hasNvenc?: boolean;
+        hasQsv?: boolean;
+        hasAmf?: boolean;
+        hasLibass?: boolean;
       }>;
       exportNative: (opts: unknown) => Promise<ExportResult>;
       saveTempImage: (p: { name: string; bytes: ArrayBuffer }) => Promise<string>;

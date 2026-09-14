@@ -226,6 +226,7 @@ fs.mkdirSync(OLD_DIR, { recursive: true });
 const { execSync } = require("child_process");
 fs.writeFileSync(path.join(OLD_DIR, "main.js"), execSync("git show HEAD:electron/main.js"));
 fs.writeFileSync(path.join(OLD_DIR, "export-graph.js"), execSync("git show HEAD:electron/export-graph.js"));
+fs.writeFileSync(path.join(OLD_DIR, "export-singlepass.js"), execSync("git show HEAD:electron/export-singlepass.js"));
 fs.writeFileSync(path.join(OLD_DIR, "preload.js"), "// stub");
 for (const k of Object.keys(handlers)) delete handlers[k];
 for (const k of Object.keys(require.cache)) {
@@ -277,6 +278,61 @@ async function benchOne(key) {
   for (const key of ["F1", "F2", "F3"]) {
     if (only && key !== only) continue;
     await benchOne(key);
+  }
+
+  // ── v6.5 F4: parallel-pass routing under an 8-core mask (CPU-first ─────
+  // chunked single-pass). Same real handler; os.cpus() is masked to 8 cores
+  // so spWorkers = max(2, min(4, floor(8/3))) = 2 → the timeline splits into
+  // W window renders + 1 audio pass + 1 concat/mux. On this 2-core box the
+  // mask changes ROUTING (parallelism), not measured wall-clock.
+  if (!only || only === "F4") {
+    console.log("\n══ F4: 8-core emulation — parallel-pass routing (40s fixture) ══");
+    const os = require("os");
+    const realCpus = os.cpus;
+    const sample = realCpus()[0] || { model: "bench-mask" };
+    const eight = Array.from({ length: 8 }, () => sample);
+    os.cpus = () => eight;
+    const F4 = {
+      name: "parallel-pass (8-core mask, 10 clips + captions + overlay + music, 40s)",
+      segments: [
+        ...Array.from({ length: 5 }, (_, k) => ({
+          id: `pv${k}`, mediaType: "video", videoPath: `${TMP}/v${k}.mp4`,
+          durationMs: 4000, trimInMs: 0, volume: 1, startMs: k * 8000, endMs: k * 8000 + 4000,
+        })),
+        ...Array.from({ length: 5 }, (_, k) => ({
+          id: `pi${k}`, mediaType: "image", imagePath: `${TMP}/i${k}.png`,
+          durationMs: 4000, trimInMs: 0, volume: 1, startMs: k * 8000 + 4000, endMs: k * 8000 + 8000,
+        })),
+      ].sort((a, b) => a.startMs - b.startMs),
+      overlays: [
+        { id: "ov4", mediaType: "image", imagePath: `${TMP}/i6.png`, track: 1, startMs: 3000, endMs: 20000, durationMs: 17000, trimInMs: 0, volume: 1, overlay: { scalePercent: 35, position: "bottom-left" }, chroma: null },
+      ],
+      captions: true,
+      audioPath: `${TMP}/music.wav`,
+      transition: { style: "dip-black", durationMs: 300 },
+    };
+    let f4 = { error: "skipped" };
+    try {
+      const run = await runExport(newHandlers["export-native"], F4, `${TMP}/F4_parallel.mp4`, false);
+      const dur = probeDuration(`${TMP}/F4_parallel.mp4`);
+      f4 = {
+        mode: run.result.mode,
+        parallelChunks: run.result.parallelChunks,
+        spawns: run.spawns,
+        ms: run.ms,
+        duration: dur,
+        expectedDuration: 40,
+        progressEvents: run.progressEvents,
+      };
+      const pass = f4.mode === "parallel-pass" && f4.parallelChunks >= 2 && Math.abs(dur - 40) <= 0.4;
+      console.log(`  mode=${f4.mode} W=${f4.parallelChunks} ffmpeg-spawns=${f4.spawns} (${(f4.ms / 1000).toFixed(1)}s) out=${dur.toFixed(2)}s → ${pass ? "PASS" : "FAIL"}`);
+      f4.pass = pass;
+    } catch (e) {
+      console.error(`  F4 FAILED: ${e.message}`);
+      f4 = { error: String(e.message), pass: false };
+    }
+    os.cpus = realCpus;
+    report.f4ParallelPass = f4;
   }
 
   // ── cancellation test: start the v6 single-pass export, cancel at 2s ──

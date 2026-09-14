@@ -511,6 +511,37 @@ export function SettingsPanel(props: SettingsPanelProps) {
     encoder: string;
     encoderName: string;
   } | null>(null);
+  // v1.5: ffmpeg build diagnostics (which binary + its capabilities) — one
+  // async fetch on mount, rendered in the Export tab next to the encoder badge.
+  const [ffStatus, setFfStatus] = useState<{
+    ok: boolean;
+    path: string;
+    version: string | null;
+    error: string | null;
+    build?: "bundled-full" | "ffmpeg-static" | "system-path";
+    hasFfprobe?: boolean;
+    hasNvenc?: boolean;
+    hasQsv?: boolean;
+    hasAmf?: boolean;
+    hasLibass?: boolean;
+  } | null>(null);
+  useEffect(() => {
+    if (!inElectron) return; // browser: no ffmpeg binary
+    const api = window.electronAPI;
+    if (!api?.ffmpegStatus) return;
+    let cancelled = false;
+    api
+      .ffmpegStatus()
+      .then((status) => {
+        if (!cancelled && status && status.ok) setFfStatus(status);
+      })
+      .catch(() => {
+        /* diagnostics only — the encoder badge tells the story otherwise */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [inElectron]);
   useEffect(() => {
     if (!inElectron) return; // browser: no badge
     const api = window.electronAPI;
@@ -969,7 +1000,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
               icon + label (Electron only; hidden in the browser). */}
           {exportInfo && (
             <div
-              className="ff-fade-up mb-3 flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-[10px] font-medium"
+              className="ff-fade-up mb-2 flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-[10px] font-medium"
               style={{
                 borderColor: "rgba(14, 116, 144, 0.55)",
                 backgroundColor: "rgba(8, 51, 68, 0.25)",
@@ -983,6 +1014,69 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 <Cpu size={12} aria-hidden />
               )}
               Video encoder: {exportInfo.encoderName}
+            </div>
+          )}
+
+          {/* v1.5: ffmpeg build + pipeline diagnostics — which binary is in
+              use and what it can do (full build ⇒ hardware encoders possible
+              + ffprobe fast probes; CPU exports run W timeline windows in
+              parallel). Electron only. */}
+          {ffStatus && ffStatus.ok && (
+            <div
+              className="ff-fade-up mb-3 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border px-2.5 py-1.5 text-[10px]"
+              style={{
+                borderColor: "rgba(24, 24, 27, 0.9)",
+                backgroundColor: "rgba(24, 24, 27, 0.35)",
+                color: "#a1a1aa",
+              }}
+              title={`${ffStatus.version || "ffmpeg"}\n${ffStatus.path}`}
+            >
+              <span
+                className="rounded px-1.5 py-0.5 font-bold uppercase tracking-wide"
+                style={
+                  ffStatus.build === "bundled-full"
+                    ? { backgroundColor: "rgba(16, 185, 129, 0.14)", color: "#34d399" }
+                    : { backgroundColor: "rgba(245, 158, 11, 0.12)", color: "#fbbf24" }
+                }
+              >
+                {ffStatus.build === "bundled-full"
+                  ? "full ffmpeg"
+                  : ffStatus.build === "ffmpeg-static"
+                    ? "minimal ffmpeg"
+                    : "system ffmpeg"}
+              </span>
+              {ffStatus.hasNvenc || ffStatus.hasQsv || ffStatus.hasAmf ? (
+                <span
+                  title="Hardware encoders compiled into this build — the runtime probe picks one only if it actually beats the CPU"
+                >
+                  {[
+                    ffStatus.hasNvenc ? "NVENC" : null,
+                    ffStatus.hasQsv ? "QSV" : null,
+                    ffStatus.hasAmf ? "AMF" : null,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </span>
+              ) : (
+                <span title="This build has no hardware encoders — exports always ride the CPU (still parallel)">
+                  CPU-only build
+                </span>
+              )}
+              <span
+                title={
+                  ffStatus.hasFfprobe
+                    ? "ffprobe available — media analysis uses fast JSON probes (cached 24 h)"
+                    : "No ffprobe — media analysis uses the slower ffmpeg parser"
+                }
+              >
+                {ffStatus.hasFfprobe ? "ffprobe ✓" : "no ffprobe"}
+              </span>
+              <span title="Caption burn-in and karaoke tags require libass">
+                {ffStatus.hasLibass ? "libass ✓" : "no libass"}
+              </span>
+              <span title="CPU exports split the timeline across parallel ffmpeg processes (one per window) + one audio pass">
+                parallel CPU export ✓
+              </span>
             </div>
           )}
 
@@ -2523,15 +2617,20 @@ function CaptionsSection(props: CaptionsSectionProps) {
                     aria-hidden
                   />
                   <span className="truncate text-zinc-300">
-                    {modelStatus.modelReady
-                      ? `Model cached · ${(modelStatus.totalCacheBytes / 1048576).toFixed(1)} MB`
-                      : "Not downloaded yet"}
-                    {modelStatus.hostUsed ?
-                      ` · via ${
-                        modelStatus.hostUsed.includes("hf-mirror")
-                          ? "hf-mirror.com"
-                          : "huggingface.co"
-                      }`
+                    {modelStatus.bundled?.available
+                      ? `Bundled with installer · ${(
+                          (modelStatus.bundled.totalBytes || 0) / 1048576
+                        ).toFixed(0)} MB — works offline`
+                      : modelStatus.modelReady
+                        ? `Model cached · ${(modelStatus.totalCacheBytes / 1048576).toFixed(1)} MB`
+                        : "Not downloaded yet"}
+                    {!modelStatus.bundled?.available &&
+                      modelStatus.hostUsed
+                      ? ` · via ${
+                          modelStatus.hostUsed.includes("hf-mirror")
+                            ? "hf-mirror.com"
+                            : "huggingface.co"
+                        }`
                       : ""}
                   </span>
                   {modelStatus.activeRuns > 0 && (

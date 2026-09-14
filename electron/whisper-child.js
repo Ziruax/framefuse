@@ -17,9 +17,11 @@
 // Message protocol (mirrors the old web worker, documented in
 // src/lib/merger/whisper-worker.ts):
 //   host → child:
-//     { type: "preload",    runId: number, cacheDir?: string }
+//     { type: "preload",    runId: number, cacheDir?: string,
+//       bundledModelDir?: string }   // v1.5: installer-shipped models root
 //     { type: "transcribe", runId: number, pcm: Float32Array,
-//       sampleRate: number, language: string, cacheDir?: string }
+//       sampleRate: number, language: string, cacheDir?: string,
+//       bundledModelDir?: string }
 //     { type: "cancel",     runId: number }
 //   child → host:
 //     { type: "progress", runId, stage: "model" | "download" | "transcribe",
@@ -69,11 +71,14 @@ function post(message) {
 /** Current model-download progress relay target. */
 let modelProgressRunId = null;
 
-async function ensurePipeline(runId, cacheDir) {
+async function ensurePipeline(runId, cacheDir, bundledModelDir) {
   modelProgressRunId = runId;
   const dir = cacheDir || DEFAULT_CACHE_DIR;
   const pipe = await core.buildPipeline({
     cacheDir: dir,
+    // v1.5: the installer ships the model under <resources>/whisper-service/
+    // models — local-first (offline) with automatic remote fallback.
+    bundledModelDir: bundledModelDir || null,
     onModelProgress: (p, info) => {
       if (modelProgressRunId == null) return;
       post({
@@ -119,7 +124,7 @@ async function handleTranscribe(msg) {
     throw new Error(`Expected 16 kHz PCM, got ${sampleRate} Hz`);
   }
 
-  const pipe = await ensurePipeline(runId, msg.cacheDir);
+  const pipe = await ensurePipeline(runId, msg.cacheDir, msg.bundledModelDir);
   if (cancelledRuns.has(runId)) return; // aborted while the model was loading
 
   post({
@@ -166,7 +171,7 @@ async function run(request) {
   try {
     if (cancelledRuns.has(runId)) return;
     if (request.type === "preload") {
-      await ensurePipeline(runId, request.cacheDir);
+      await ensurePipeline(runId, request.cacheDir, request.bundledModelDir);
       post({ type: "result", runId, chunks: null, language: null, wordLevel: false });
     } else if (request.type === "transcribe") {
       await handleTranscribe(request);

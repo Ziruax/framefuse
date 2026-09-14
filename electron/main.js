@@ -30,15 +30,23 @@ const G = require("./export-graph");
 // bun verification harness exactly like export-graph).
 const SP = require("./export-singlepass");
 
-// Resolve the FFmpeg binary path. On Windows we need ffmpeg.exe, on
-// Linux/macOS we need ffmpeg. When the app is packaged, the binary is
-// bundled via electron-builder's extraResources config at:
-//   <resourcesPath>/ffmpeg-static/ffmpeg(.exe)
+// Resolve the FFmpeg binary path. v1.5: a FULL bundled build (staged by
+// scripts/fetch-windows-ffmpeg.js into resources/ffmpeg/<plat>/) is PREFERRED
+// over ffmpeg-static — it carries ffprobe.exe (fastProbe) plus the hardware
+// encoders (h264_nvenc/h264_qsv/h264_amf) and libass that the minimal
+// ffmpeg-static builds lack. ffmpeg-static remains the packaged fallback;
+// the system PATH is the last resort.
+const FFMPEG_PLAT_DIR =
+  process.platform === "win32" ? "win" : process.platform === "darwin" ? "mac" : "linux";
 let ffmpegPath;
 if (app.isPackaged) {
   const exeName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
   const altName = process.platform === "win32" ? "ffmpeg" : "ffmpeg.exe";
   const candidates = [
+    // v1.5 full build via electron-builder extraResources (resources/ffmpeg)
+    path.join(process.resourcesPath, "ffmpeg", FFMPEG_PLAT_DIR, exeName),
+    path.join(process.resourcesPath, "ffmpeg", FFMPEG_PLAT_DIR, altName),
+    path.join(process.resourcesPath, "ffmpeg", exeName),
     path.join(process.resourcesPath, "ffmpeg-static", exeName),
     path.join(process.resourcesPath, "ffmpeg-static", altName),
     path.join(process.resourcesPath, "app.asar.unpacked", "node_modules", "ffmpeg-static", exeName),
@@ -53,16 +61,30 @@ if (app.isPackaged) {
     ffmpegPath = candidates[0];
   }
 } else {
-  try {
-    ffmpegPath = require("ffmpeg-static");
-  } catch (e) {
-    ffmpegPath = "ffmpeg";
-  }
-  if (process.platform === "win32" && ffmpegPath && !ffmpegPath.endsWith(".exe")) {
-    try { if (fs.existsSync(ffmpegPath + ".exe")) ffmpegPath += ".exe"; } catch (_) {}
+  const exeName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
+  const devCandidates = [
+    // v1.5 dev: the staged full build next to the repo (fetch-windows-ffmpeg)
+    path.join(__dirname, "..", "resources", "ffmpeg", FFMPEG_PLAT_DIR, exeName),
+    path.join(process.cwd(), "resources", "ffmpeg", FFMPEG_PLAT_DIR, exeName),
+  ];
+  ffmpegPath = devCandidates.find((p) => {
+    try { return fs.existsSync(p); } catch { return false; }
+  });
+  if (!ffmpegPath) {
+    try {
+      ffmpegPath = require("ffmpeg-static");
+    } catch (e) {
+      ffmpegPath = "ffmpeg";
+    }
+    if (process.platform === "win32" && ffmpegPath && !ffmpegPath.endsWith(".exe")) {
+      try { if (fs.existsSync(ffmpegPath + ".exe")) ffmpegPath += ".exe"; } catch (_) {}
+    }
   }
 }
-console.log("FFmpeg path:", ffmpegPath, "exists:", (() => { try { return fs.existsSync(ffmpegPath); } catch { return false; } })());
+const ffmpegBuildKind = /resources[\\/]ffmpeg([\\/]|$)/.test(String(ffmpegPath))
+  ? "bundled-full"
+  : /ffmpeg-static/.test(String(ffmpegPath)) ? "ffmpeg-static" : "system-path";
+console.log(`[FFMPEG] Using: ${ffmpegPath} (${ffmpegBuildKind}) exists:`, (() => { try { return fs.existsSync(ffmpegPath); } catch { return false; } })());
 
 const isDev = !app.isPackaged;
 let mainWindow = null;
@@ -138,6 +160,10 @@ ipcMain.handle("is-electron", () => true);
 
 // Diagnostics — lets the renderer verify ffmpeg is reachable (v5.1: async —
 // the old execSync blocked the main process up to 10 s on slow disks).
+// v1.5: also reports WHICH build is in use (bundled-full / ffmpeg-static /
+// system-path), the hardware encoders it was compiled with, libass, and
+// whether ffprobe resolved — the exact facts that decide export speed on a
+// given install (full build → NVENC/QSV/AMF possible + fast JSON probes).
 ipcMain.handle("ffmpeg-status", async () => {
   try {
     if (!ffmpegPath || !fs.existsSync(ffmpegPath)) {
@@ -145,14 +171,30 @@ ipcMain.handle("ffmpeg-status", async () => {
     }
     const r = await ffmpegCapture(["-version"], 10000);
     const firstLine = r.out.split("\n")[0] || "";
+    const caps = { hasNvenc: false, hasQsv: false, hasAmf: false, hasLibass: false };
+    try {
+      const enc = await ffmpegCapture(["-hide_banner", "-encoders"], 12000);
+      caps.hasNvenc = /h264_nvenc\b/.test(enc.out);
+      caps.hasQsv = /h264_qsv\b/.test(enc.out);
+      caps.hasAmf = /h264_amf\b/.test(enc.out);
+    } catch (_) { /* capability scan is best-effort */ }
+    try {
+      const flt = await ffmpegCapture(["-hide_banner", "-filters"], 12000);
+      caps.hasLibass = /libass/.test(flt.out);
+    } catch (_) { /* capability scan is best-effort */ }
+    let hasFfprobe = false;
+    try { hasFfprobe = !!(await ffprobeAvailable()); } catch (_) {}
     return {
       ok: r.code === 0,
       path: ffmpegPath,
       version: firstLine,
+      build: ffmpegBuildKind,
+      hasFfprobe,
+      ...caps,
       error: r.code === 0 ? null : "FFmpeg did not respond in time.",
     };
   } catch (e) {
-    return { ok: false, path: ffmpegPath || "(none)", version: null, error: e.message };
+    return { ok: false, path: ffmpegPath || "(none)", version: null, build: ffmpegBuildKind, error: e.message };
   }
 });
 
@@ -480,6 +522,18 @@ const whisperState = {
 
 function whisperCacheDir() {
   return path.join(app.getPath("userData"), "whisper-models");
+}
+
+/** v1.5: models root shipped INSIDE the installer — stage-whisper-model.js
+ *  fills whisper-service/models/Xenova/whisper-tiny at build time and
+ *  electron-builder's extraResources places it next to the staged service
+ *  (outside app.asar). The whisper pipeline builds from here FIRST (fully
+ *  offline); the runtime download path remains the fallback. */
+function whisperBundledModelsRoot() {
+  if (app.isPackaged) {
+    return path.join(process.resourcesPath, "whisper-service", "models");
+  }
+  return path.join(__dirname, "..", "whisper-service", "models");
 }
 
 function whisperChildEntry() {
@@ -845,6 +899,8 @@ ipcMain.handle("whisper:transcribe", async (event, payload) => {
           sampleRate: 16000,
           language: language || "auto",
           cacheDir: whisperCacheDir(),
+          // v1.5: installer-bundled model — local-first, offline transcription.
+          bundledModelDir: whisperBundledModelsRoot(),
         });
       } catch (err) {
         whisperRuns.delete(runId);
@@ -865,7 +921,12 @@ ipcMain.handle("whisper:preload", async (event) => {
   return await new Promise((resolve, reject) => {
     whisperRuns.set(runId, { resolve: () => resolve({ ok: true }), reject, sender: event.sender });
     try {
-      child.postMessage({ type: "preload", runId, cacheDir: whisperCacheDir() });
+      child.postMessage({
+        type: "preload",
+        runId,
+        cacheDir: whisperCacheDir(),
+        bundledModelDir: whisperBundledModelsRoot(),
+      });
     } catch (err) {
       whisperRuns.delete(runId);
       reject(new Error(`Could not reach the Whisper service: ${err.message}`));
@@ -1050,10 +1111,23 @@ ipcMain.handle("whisper:status", async () => {
   // its model cache lives in a sibling folder of userData.
   let fwCacheFiles = [];
   try { fwCacheFiles = scanWhisperCache(fasterWhisperCacheDir()); } catch (_) {}
+  // v1.5: the installer-shipped model — bundled availability is the fact the
+  // captions panel cares about first ("works offline out of the box").
+  let bundledFiles = [];
+  try { bundledFiles = scanWhisperCache(path.join(whisperBundledModelsRoot(), "Xenova")); } catch (_) {}
+  const bundledReady = whisperModelReady(
+    bundledFiles.map((f) => ({ ...f, name: `Xenova/${f.name}` })),
+  );
   return {
     cacheDir,
     hostUsed: whisperState.hostUsed,
-    modelReady: whisperModelReady(cacheFiles),
+    modelReady: bundledReady || whisperModelReady(cacheFiles),
+    bundled: {
+      available: bundledReady,
+      dir: whisperBundledModelsRoot(),
+      files: bundledFiles,
+      totalBytes: bundledFiles.reduce((n, f) => n + f.sizeBytes, 0),
+    },
     cacheFiles,
     totalCacheBytes,
     lastError: whisperState.lastError,
@@ -1395,13 +1469,24 @@ function ffprobeAvailable() {
   if (ffprobeChecked) return Promise.resolve(ffprobeBin);
   ffprobeDetecting = (async () => {
     const candidates = [];
+    const exeName = process.platform === "win32" ? "ffprobe.exe" : "ffprobe";
+    const altName = process.platform === "win32" ? "ffprobe" : "ffprobe.exe";
     if (app.isPackaged) {
-      const exeName = process.platform === "win32" ? "ffprobe.exe" : "ffprobe";
-      const altName = process.platform === "win32" ? "ffprobe" : "ffprobe.exe";
+      // v1.5: the full bundled build ships ffprobe NEXT to ffmpeg — before
+      // this, packaged installs had NO ffprobe at all (ffprobe-static is not
+      // a dependency) and every media probe silently fell back to the slow
+      // `ffmpeg -i` stderr parser.
       candidates.push(
+        path.join(process.resourcesPath, "ffmpeg", FFMPEG_PLAT_DIR, exeName),
+        path.join(process.resourcesPath, "ffmpeg", FFMPEG_PLAT_DIR, altName),
+        path.join(process.resourcesPath, "ffmpeg", exeName),
         path.join(process.resourcesPath, "ffprobe-static", exeName),
-        path.join(process.resourcesPath, "ffprobe-static", altName),
         path.join(process.resourcesPath, "app.asar.unpacked", "node_modules", "ffprobe-static", exeName),
+      );
+    } else {
+      candidates.push(
+        path.join(__dirname, "..", "resources", "ffmpeg", FFMPEG_PLAT_DIR, exeName),
+        path.join(process.cwd(), "resources", "ffmpeg", FFMPEG_PLAT_DIR, exeName),
       );
     }
     try {
@@ -3119,27 +3204,50 @@ ipcMain.handle("export-native", async (event, opts) => {
     const encodeWorkMs = jobs.reduce((a, j) => a + (j && !j.copy ? (j.durationMs || 0) : 0), 0);
     const encodeDominant = encodeWorkMs >= 8000 || encodeWorkMs >= totalMs * 0.3;
     if (anyEncodeJob && encodeDominant) {
+      // ── v6.5 CPU-FIRST: CHUNKED SINGLE-PASS ──────────────────────────────
+      // W parallel processes each render one timeline WINDOW through its own
+      // single-pass graph (decode + filters + x264 encode), the audio bus
+      // renders ONCE as its own process, and a final concat+mux glues video
+      // + audio with -c copy. A single process cannot use a many-core CPU
+      // when the filter graph (libass, overlay, zoompan) is the bottleneck —
+      // W processes each get cores/W encoder threads. GPU boxes keep W=1 (a
+      // single NVENC session saturates the GPU; the <40 s target doesn't
+      // need chunking). Fallback ladder: any init-class failure (<4 s) or a
+      // per-chunk graph over budget → the battle-tested two-step pool.
+      const isGpuEncoder = encoder.name !== "libx264";
+      const cpuCount = os.cpus().length;
+      const spWorkers = isGpuEncoder
+        ? 1
+        : cpuCount >= 4
+          ? Math.max(2, Math.min(4, Math.floor(cpuCount / 3)))
+          : 1;
+      // Full-timeline fade strings — the chunk planner's forbidden zones are
+      // derived from these (fade rejects negative st; xfade heads need the
+      // previous segment's input in-process), so boundaries never split a
+      // fade ramp or a head composite.
+      const fullFades = SP.buildGlobalFades({ segments, transition, totalMs });
+      let chunkPlan = null;
+      if (spWorkers >= 2) {
+        chunkPlan = SP.planTimelineChunks({
+          segments,
+          transition,
+          kbEnabled: enabled,
+          globalDir,
+          fps,
+          totalMs,
+          fades: fullFades,
+          workerCount: spWorkers,
+        });
+        if (!chunkPlan || chunkPlan.chunks.length < 2) chunkPlan = null;
+      }
       const eligibility = SP.singlePassEligible({
         segments,
         overlayCount: overlaySegs.length,
         totalSec,
         captionsBurned: captionsEnabled || headlinesEnabled,
+        chunked: !!chunkPlan,
       });
       if (eligibility.ok) {
-        // GLOBAL-window overlay specs — one continuous read per overlay
-        // instead of the per-clip re-seek the two-step pays (probes warm).
-        const globalOverlaySpecs = await buildOverlaySpecsForWindow(0, totalMs);
-        // Full-timeline ASS document — the SAME builder, window [0, total].
-        let globalAssSuffix = null;
-        if (captionsEnabled || headlinesEnabled) {
-          const doc = buildAssDocument(
-            captionsEnabled ? subtitleCues : [],
-            captionsEnabled ? captionSettings : null,
-            headlinesEnabled ? headlines : null,
-            width, height, 0, totalMs, totalMs,
-          );
-          globalAssSuffix = doc ? writeAssFile(doc, "full") : null;
-        }
         // Audio branches from the collected segInfo (video segs with audio).
         const clipAudioBranches = [];
         for (let b = 0; b < segments.length; b++) {
@@ -3202,6 +3310,233 @@ ipcMain.handle("export-native", async (event, opts) => {
             (Number(s.durationMs) || 0) >= 20000 && await probeHwDecode(s.videoPath));
           hwaccelPerSeg.push(use);
           if (use) spHwCount += 1;
+        }
+
+        // v6.5 chunked single-pass: either RETURNS (success) or clears for
+        // the W=1 route / the two-step pool.
+        let spSkipW1 = false;
+        if (chunkPlan) {
+          const W = chunkPlan.chunks.length;
+          const threadsPer = Math.max(1, Math.round(cpuCount / W));
+          const filterThreadsPer = Math.max(2, Math.min(8, Math.floor(cpuCount / W)));
+          const chunkJobs = [];
+          const chunkFiles = [];
+          let chunkOverBudget = false;
+          for (let ci = 0; ci < W && !chunkOverBudget; ci++) {
+            const c = chunkPlan.chunks[ci];
+            const winSegs = SP.windowSegmentsForChunk(segments, chunkPlan.spans, c.f0, c.f1, fps);
+            const segMeta = winSegs.map((w) => ({
+              origIdx: w.origIdx, S: w.S, F: w.F, k0: w.k0, k1: w.k1, ssSec: w.ssSec,
+            }));
+            // Per-chunk overlay specs + ASS window (the v1.4.2 windowing
+            // semantics: specs/cues are chunk-LOCAL, windows clamped). The
+            // overlay INPUT windows are padded ~120 ms past the chunk end so
+            // framesync (eof_action=pass) composites the chunk's LAST frame —
+            // an unpadded input EOFs one base-frame early and drops it.
+            const ovSpecs = SP.padOverlayInputWindows(
+              await buildOverlaySpecsForWindow(c.t0Ms, c.durMs),
+              c.durMs,
+            );
+            let chunkAssSuffix = null;
+            if (captionsEnabled || headlinesEnabled) {
+              const doc = buildAssDocument(
+                captionsEnabled ? subtitleCues : [],
+                captionsEnabled ? captionSettings : null,
+                headlinesEnabled ? headlines : null,
+                width, height, c.t0Ms, c.t0Ms + c.durMs, c.durMs,
+              );
+              chunkAssSuffix = doc ? writeAssFile(doc, `sp${String(ci).padStart(2, "0")}`) : null;
+            }
+            const cPlan = SP.buildSinglePassPlan({
+              segments: winSegs.map((w) => w.seg),
+              fullSegments: segments,
+              window: { t0Ms: c.t0Ms, durMs: c.durMs, segMeta },
+              videoOnly: true,
+              fades: fullFades,
+              fps,
+              width,
+              height,
+              totalMs,
+              kbEnabled: enabled,
+              zoomMax,
+              globalDir,
+              transition,
+              wm,
+              assSuffix: chunkAssSuffix,
+              overlaySpecs: ovSpecs,
+              audio,
+              audioPath: null,
+              sfx: [],
+              clipAudio: [],
+              loudnorm: null,
+              masterLoudnorm: null,
+              hwaccelPerSeg,
+            });
+            if (cPlan.scriptBytes > SP.SINGLEPASS_MAX_SCRIPT_BYTES) {
+              console.warn(`[framefuse] chunked single-pass skipped: chunk ${ci + 1}/${W} graph ${cPlan.scriptBytes}B > ${SP.SINGLEPASS_MAX_SCRIPT_BYTES}B budget → two-step pool`);
+              chunkOverBudget = true;
+              break;
+            }
+            const scriptPath = path.join(tempDir, `graph_sp${ci}_${Date.now()}.txt`);
+            fs.writeFileSync(scriptPath, cPlan.script, "utf-8");
+            tempFiles.push(scriptPath);
+            const chunkPath = path.join(tempDir, `spchunk_${String(ci).padStart(3, "0")}_${Date.now()}.mp4`);
+            tempFiles.push(chunkPath);
+            chunkFiles.push(chunkPath);
+            chunkJobs.push({
+              args: SP.buildSinglePassArgs({
+                plan: cPlan,
+                scriptPath,
+                encArgs,
+                abr: `${abr}k`,
+                fps,
+                outputPath: chunkPath,
+                threads: threadsPer,
+                filterThreads: filterThreadsPer,
+              }),
+              durSec: c.durMs / 1000,
+              durationMs: c.durMs,
+              segId: `parallel window ${ci + 1}/${W}`,
+            });
+          }
+          if (!chunkOverBudget) {
+            console.log(`[framefuse] chunked single-pass: ${W} parallel windows over ${(totalMs / 1000).toFixed(1)}s (${Math.round(cpuCount)} cores)`);
+            const spStart = Date.now();
+            // Pool progress weighted by chunk duration (0 → 92 %).
+            const chunkFrac = chunkJobs.map(() => 0);
+            let lastEmit = 0;
+            const emitChunkProgress = (force) => {
+              const now = Date.now();
+              if (!force && now - lastEmit < 100) return;
+              lastEmit = now;
+              let doneMs = 0;
+              for (let k = 0; k < chunkJobs.length; k++) doneMs += chunkFrac[k] * chunkJobs[k].durationMs;
+              const frac = doneMs / Math.max(1, totalMs);
+              sendProgress(frac * 92, frac * totalSec, etaFor(frac));
+            };
+            try {
+              await runPool(chunkJobs, W, {
+                onTime: (idx, sec) => {
+                  chunkFrac[idx] = Math.min(1, sec / Math.max(0.01, chunkJobs[idx].durSec));
+                  emitChunkProgress(false);
+                },
+                onDone: (idx) => {
+                  chunkFrac[idx] = 1;
+                  emitChunkProgress(true);
+                },
+              });
+              // ── Audio bus: ONE full-timeline pass (no per-chunk AAC
+              //    boundary glitches, no windowed amix math).
+              let spAudioPath = null;
+              const hasAudioBus =
+                clipAudioBranches.length > 0 || !!audioPath || sfxList.length > 0;
+              if (hasAudioBus) {
+                const aPlan = SP.buildSinglePassPlan({
+                  segments,
+                  audioOnly: true,
+                  fps,
+                  width,
+                  height,
+                  totalMs,
+                  audio,
+                  audioPath,
+                  sfx: sfxList,
+                  clipAudio: clipAudioBranches,
+                  loudnorm: spLoudnorm,
+                  masterLoudnorm: spMasterLoudnorm,
+                });
+                if (aPlan.hasAudioOut) {
+                  const aScriptPath = path.join(tempDir, `graph_spa_${Date.now()}.txt`);
+                  fs.writeFileSync(aScriptPath, aPlan.script, "utf-8");
+                  tempFiles.push(aScriptPath);
+                  spAudioPath = path.join(tempDir, `spaudio_${Date.now()}.m4a`);
+                  tempFiles.push(spAudioPath);
+                  const aArgs = SP.buildAudioOnlyArgs({
+                    plan: aPlan,
+                    scriptPath: aScriptPath,
+                    abr: `${abr}k`,
+                    totalSec,
+                    outputPath: spAudioPath,
+                  });
+                  await runFfmpeg(aArgs, totalSec, (sec) => {
+                    const frac = 0.92 + 0.04 * Math.min(1, sec / Math.max(0.01, totalSec));
+                    sendProgress(frac * 100, sec, etaFor(frac));
+                  });
+                }
+              }
+              // ── Concat the chunk videos + mux the audio (-c copy both).
+              sendProgress(96.5, totalSec, etaFor(0.965));
+              const spConcatPath = path.join(tempDir, `spconcat_${Date.now()}.txt`);
+              tempFiles.push(spConcatPath);
+              fs.writeFileSync(
+                spConcatPath,
+                chunkFiles.map((p) => `file '${p.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`).join("\n"),
+                "utf-8",
+              );
+              const muxArgs = [
+                "-y",
+                "-f", "concat", "-safe", "0", "-i", spConcatPath,
+                ...(spAudioPath ? ["-i", spAudioPath] : []),
+                "-map", "0:v:0",
+                ...(spAudioPath ? ["-map", "1:a:0"] : []),
+                "-c", "copy",
+                "-movflags", "+faststart",
+                outputPath,
+              ];
+              await runFfmpeg(muxArgs, totalSec, (sec) => {
+                const frac = 0.965 + 0.035 * Math.min(1, sec / Math.max(0.01, totalSec));
+                sendProgress(frac * 100, sec, etaFor(frac));
+              });
+            } catch (err) {
+              if (err && err.message === "Export cancelled") throw err;
+              if (Date.now() - spStart < 4000) {
+                console.warn("[framefuse] chunked single-pass failed at init — falling back to the two-step pool:", err.message);
+                spSkipW1 = true;
+              } else {
+                throw err;
+              }
+            }
+            if (!spSkipW1) {
+              sendProgress(100, totalSec, 0);
+              for (const f of tempFiles) { try { fs.unlinkSync(f); } catch (_) {} }
+              let size = 0;
+              try { size = fs.statSync(outputPath).size; } catch {}
+              return {
+                path: outputPath,
+                size,
+                encoder: encoder.label,
+                elapsedSec: Math.round((Date.now() - startTime) / 1000),
+                copiedClips: 0,
+                encodedClips: segments.length,
+                keyframeCuts: 0,
+                chunkedClips: 0,
+                totalChunks: W,
+                parallelChunks: W,
+                hwDecodeClips: spHwCount,
+                singlePass: true,
+                mode: "parallel-pass",
+              };
+            }
+          } else {
+            spSkipW1 = true; // per-chunk graph over budget → two-step pool
+          }
+        }
+
+        if (!spSkipW1) {
+        // ── W=1 single-pass (GPU boxes, short timelines, <4-core CPUs) ────
+        // GLOBAL-window overlay specs — one continuous read per overlay
+        // instead of the per-clip re-seek the two-step pays (probes warm).
+        const globalOverlaySpecs = await buildOverlaySpecsForWindow(0, totalMs);
+        // Full-timeline ASS document — the SAME builder, window [0, total].
+        let globalAssSuffix = null;
+        if (captionsEnabled || headlinesEnabled) {
+          const doc = buildAssDocument(
+            captionsEnabled ? subtitleCues : [],
+            captionsEnabled ? captionSettings : null,
+            headlinesEnabled ? headlines : null,
+            width, height, 0, totalMs, totalMs,
+          );
+          globalAssSuffix = doc ? writeAssFile(doc, "full") : null;
         }
 
         const spPlan = SP.buildSinglePassPlan({
@@ -3283,6 +3618,7 @@ ipcMain.handle("export-native", async (event, opts) => {
               mode: "single-pass",
             };
           }
+        }
         }
       } else {
         console.log(`[framefuse] single-pass skipped: ${eligibility.reason} → two-step pool`);

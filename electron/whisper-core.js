@@ -49,6 +49,9 @@
 
 "use strict";
 
+const fs = require("fs");
+const path = require("path");
+
 const MODEL_ID = "Xenova/whisper-tiny";
 
 // Hosts tried in order when building the pipeline: the official HuggingFace
@@ -274,6 +277,14 @@ function installFetchTracking() {
 /**
  * Build (or return) the singleton Whisper pipeline.
  *
+ * v1.5 LOCAL-FIRST: when `o.bundledModelDir` points at a models ROOT that
+ * contains Xenova/whisper-tiny (staged by scripts/stage-whisper-model.js
+ * into <resources>/whisper-service/models), the pipeline is built from the
+ * BUNDLED files with the remote disabled — no network, no first-run
+ * download, works behind any firewall. Any local failure falls through to
+ * the original host-retry sequence below (which continues to serve machines
+ * whose bundled folder is missing, e.g. trimmed installs).
+ *
  * The whole host-retry sequence lives INSIDE the singleton promise: callers
  * await one promise and see the final success/failure. Between attempts only
  * the per-attempt pipeline() construction is reset — transformers.js keeps no
@@ -282,6 +293,8 @@ function installFetchTracking() {
  *
  * @param {object} o
  * @param {string} o.cacheDir  Persistent on-disk model cache (userData).
+ * @param {string} [o.bundledModelDir]  Models root shipped by the installer
+ *        (contains Xenova/whisper-tiny/) — local-first, offline.
  * @param {(p:{progress:number,status:string}, info:?object)=>void} [o.onModelProgress]
  *        Raw model-download progress relay (0–100 per file). `info` is the
  *        original transformers.js progress_callback object (file/loaded/
@@ -290,6 +303,7 @@ function installFetchTracking() {
 async function buildPipeline(o) {
   if (pipelinePromise) return pipelinePromise;
   const cacheDir = o && o.cacheDir;
+  const bundledModelDir = o && o.bundledModelDir;
   const onModelProgress =
     o && typeof o.onModelProgress === "function" ? o.onModelProgress : null;
 
@@ -310,6 +324,53 @@ async function buildPipeline(o) {
     const mod = await import("@xenova/transformers");
     const { pipeline, env } = mod;
 
+    const progress_callback = (info) => {
+      const p = toModelProgress(info);
+      if (p && onModelProgress) onModelProgress(p, info);
+    };
+
+    // ── v1.5 LOCAL-FIRST: the bundled (installer-shipped) model ──────────
+    if (bundledModelDir) {
+      const modelDir = path.join(bundledModelDir, ...MODEL_ID.split("/"));
+      let haveLocal = false;
+      try {
+        haveLocal =
+          fs.existsSync(path.join(modelDir, "config.json")) &&
+          fs.existsSync(path.join(modelDir, "preprocessor_config.json")) &&
+          (fs.existsSync(path.join(modelDir, "tokenizer.json")) ||
+            fs.existsSync(path.join(modelDir, "vocab.json"))) &&
+          fs.existsSync(path.join(modelDir, "onnx", "encoder_model_quantized.onnx")) &&
+          fs.existsSync(path.join(modelDir, "onnx", "decoder_model_merged_quantized.onnx"));
+      } catch (_) {
+        haveLocal = false;
+      }
+      if (haveLocal) {
+        try {
+          if (onModelProgress) {
+            onModelProgress({ progress: 0, status: "Loading bundled Whisper model…" }, null);
+          }
+          env.allowLocalModels = true;
+          env.allowRemoteModels = false; // offline — a missing file must FAIL here
+          env.localModelPath = bundledModelDir;
+          if (cacheDir) env.cacheDir = cacheDir;
+          const pipe = await pipeline("automatic-speech-recognition", MODEL_ID, {
+            progress_callback,
+          });
+          lastHostUsed = null; // served from the local disk — no host
+          if (onModelProgress) {
+            onModelProgress({ progress: 100, status: "Whisper model ready (bundled)" }, null);
+          }
+          return pipe;
+        } catch (err) {
+          // A bundled-model build failure (corrupt file, layout drift) must
+          // never take transcription down — fall through to the remote path.
+          try { console.warn(`[whisper-core] bundled model build failed, falling back to download: ${err && err.message}`); } catch (_) {}
+        }
+      }
+    }
+
+    // ── REMOTE sequence (v5.2 host retry) ────────────────────────────────
+    // Reset the env from any local-first attempt before going remote.
     env.allowRemoteModels = true;
     env.allowLocalModels = false;
     if (cacheDir) {
@@ -317,11 +378,6 @@ async function buildPipeline(o) {
       env.localModelPath = cacheDir;
     }
     installFetchTracking();
-
-    const progress_callback = (info) => {
-      const p = toModelProgress(info);
-      if (p && onModelProgress) onModelProgress(p, info);
-    };
 
     let lastError = null;
     for (let attempt = 0; attempt < PIPELINE_HOSTS.length; attempt++) {

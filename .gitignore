@@ -50,3 +50,4 @@ public/qa/
 
 # v6 bench: staged pre-v6 pipeline for the differential benchmark
 .bench-old/
+.whisper-models-backup

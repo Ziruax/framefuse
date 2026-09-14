@@ -31,6 +31,12 @@ const path = require("path");
 const ROOT = path.join(__dirname, "..");
 const NM = path.join(ROOT, "node_modules");
 const OUT = path.join(ROOT, "whisper-service");
+// v1.5: the bundled Whisper model (stage-whisper-model.js) lives under
+// OUT/models — this script WIPES OUT on every run, so the models move aside
+// first and are restored after the rebuild (stage-whisper-model re-downloads
+// only when the restore itself fails).
+const MODELS_DIR = path.join(OUT, "models");
+const MODELS_BACKUP = path.join(ROOT, ".whisper-models-backup");
 
 function die(msg) {
   console.error(`[stage-whisper-service] ${msg}`);
@@ -74,8 +80,22 @@ function copyFile(src, dest) {
 // ---------------------------------------------------------------------------
 // 1. Clean + entry files.
 // ---------------------------------------------------------------------------
+let modelsPreserved = false;
+try {
+  if (fs.existsSync(MODELS_DIR)) {
+    rmrf(MODELS_BACKUP);
+    fs.renameSync(MODELS_DIR, MODELS_BACKUP);
+    modelsPreserved = true;
+  }
+} catch (_) { /* no models to preserve (fresh build) */ }
 rmrf(OUT);
 mkdirp(path.join(OUT, "node_modules"));
+if (modelsPreserved) {
+  try {
+    fs.renameSync(MODELS_BACKUP, MODELS_DIR);
+    modelsPreserved = false;
+  } catch (_) { /* restore failed — stage-whisper-model re-downloads */ }
+}
 
 for (const f of ["whisper-child.js", "whisper-core.js"]) {
   const src = path.join(ROOT, "electron", f);
@@ -226,7 +246,11 @@ function dirSize(p) {
 }
 const mb = (dirSize(OUT) / 1024 / 1024).toFixed(1);
 console.log(`[stage-whisper-service] staged ${OUT} (${mb} MB)`);
+try { rmrf(MODELS_BACKUP); } catch (_) { /* nothing to clean */ }
 console.log("[stage-whisper-service] contents:");
 for (const top of fs.readdirSync(OUT)) {
   console.log(`  ${top}`);
+}
+if (fs.existsSync(MODELS_DIR)) {
+  console.log(`[stage-whisper-service] bundled models preserved: ${MODELS_DIR} (${(dirSize(MODELS_DIR) / 1024 / 1024).toFixed(0)} MB)`);
 }

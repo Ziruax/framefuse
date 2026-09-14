@@ -1,8 +1,85 @@
-# FrameFuse v6 — Export Performance Pipeline
+# FrameFuse v6.5 — Export Performance Pipeline (CPU-first)
 
-> Branch: `perf/v6-single-pass` · Modules: `electron/export-singlepass.js` (new),
-> `electron/export-graph.js`, `electron/main.js`
-> Verification: `bun run test:export-parity` (50 assertions) · `npm run bench:export`
+> Modules: `electron/export-singlepass.js` (chunk planner + windowed builder),
+> `electron/export-graph.js` (Ken Burns on-offset), `electron/main.js` (routing)
+> Verification: `bun run test:export-parity` (50) · `node scripts/verify-timeline-chunks.js` (30) ·
+> `npm run bench:export` (F1–F4 + cancellation)
+
+## v6.5 — CPU-FIRST PARALLEL SINGLE-PASS (the headline change)
+
+**Most FrameFuse users have no GPU.** A single ffmpeg process cannot use a
+many-core CPU when the filter graph (libass subtitles, overlay compositing,
+zoompan) is the bottleneck — those stages are single-threaded, so an 8-core
+box exported at ~1-core speed. v6.5 splits the timeline into **W frame-aligned
+windows** and renders them in **parallel ffmpeg processes** (each with
+cores/W encoder threads), renders the audio bus **once** as its own process,
+and glues everything with a **lossless concat + mux**:
+
+```
+CPU export (≥4 cores), timeline ≥ 30 s:
+  planTimelineChunks  → W windows on the GLOBAL OUTPUT FRAME GRID
+                      (W = clamp(floor(cpus/3), 2, 4), chunks ≈ 22.5–45 s)
+  W × videoOnly single-pass graphs (pool, cores/W threads each)
+  1 × audioOnly render (full timeline — no per-chunk AAC boundary glitches)
+  1 × concat + mux (-c copy both streams)
+GPU export / short timelines / <4 cores → W=1 single-pass (unchanged v6)
+```
+
+Speedup on an 8-core CPU box: ~2–3× (filter-bound timelines). On 12–16 cores:
+up to ~4×. GPU boxes keep the W=1 single-pass (one NVENC session saturates the
+GPU; the <40 s KPI target does not need chunking).
+
+### Why the chunk math is safe (all verified against real ffmpeg)
+
+- **Frame-grid alignment**: every boundary is a GLOBAL OUTPUT FRAME index;
+  per-segment sub-windows derive from frame counts with µs-precision seeks
+  (`buildVideoInputArgs`' `ssSec`) — the concatenated frames are the W=1
+  frames sliced at the boundary. Emitted-frame model per segment type:
+  video/static-image `ceil(dur×fps)` (empirically measured), Ken Burns
+  `round(dur×fps)` (zoompan `d=`).
+- **Ken Burns mid-chunk cuts** continue the exact curve: the zoompan
+  expressions use `(on + K)` against the FULL segment's frame divisor
+  (`kenBurnsZoompanExprs` onOffset) — frame-MD5-verified.
+- **Fades never straddle a boundary**: ffmpeg's `fade` REJECTS negative `st`
+  (verified empirically), so a mid-ramp continuation is impossible — the
+  planner treats every fade window (and every xfade head zone, which also
+  needs the previous segment's input in-process) as a FORBIDDEN ZONE and
+  routes boundaries around them. Whole-fade containment ⇒ pure shift.
+- **Overlays crossing a boundary** get their input `-t` padded ~120 ms past
+  the chunk end (framesync + `eof_action=pass` would otherwise drop the
+  overlay from the chunk's LAST frame); overlays ENDING inside a chunk keep
+  the unpadded EOF to reproduce the W=1 render's exact end behavior.
+- **Boundary plans read the ORIGINAL segments** (`fullSegments` + `origIdx`)
+  — a windowed duration must never re-clamp a transition duration.
+- The residual W=1↔chunked difference is the measured **xfade chroma-resample
+  rounding** (≤4/255 on ≤2 % of pixels, sub-perceptual ≈50 dB PSNR) on
+  frames whose segments lost the head-composite passthrough — the chunked
+  render is arguably MORE accurate (pure passthrough).
+- `node scripts/verify-timeline-chunks.js` (30 assertions) proves all of it
+  with **lossless (-qp 0) frame-MD5 parity** between the full W=1 render and
+  the chunked render, plus decoded-PCM parity for the audio bus, plus a
+  W=1 **byte-differential vs git HEAD** regression guard (0 drift).
+
+### v6.5 also ships
+
+- **Full FFmpeg build bundled** (`scripts/fetch-windows-ffmpeg.js` →
+  `resources/ffmpeg/win/{ffmpeg,ffprobe}.exe` via electron-builder
+  extraResources; BtbN full GPL build, primary, with the gyan stable 7z as
+  fallback and ffmpeg-static as last resort). The pre-v1.5 packaged app
+  shipped the ffmpeg-static minimal build: **no NVENC/QSV/AMF** (GPU users
+  silently exported on CPU) and **no ffprobe at all** (every media probe fell
+  back to the slow `ffmpeg -i` parser). The resolution matrix prefers the
+  bundled full build; `ffmpeg-status` reports build kind + encoders + libass
+  + ffprobe (Export tab badge).
+- **Whisper-tiny bundled in the installer**
+  (`scripts/stage-whisper-model.js` stages the quantized ONNX model into
+  `whisper-service/models/Xenova/whisper-tiny`, ~42 MB): first transcription
+  works fully OFFLINE — local-first pipeline build, remote download only as
+  the fallback. Captions panel shows "Bundled with installer — works offline".
+- The same BtbN ffmpeg version (N-126549) was validated on Linux by running
+  the entire real-ffmpeg harness suite against it (30/36/22/kenburns all
+  green) — the Windows exe is the same commit.
+
 
 ## TL;DR — what changed and why it is faster
 

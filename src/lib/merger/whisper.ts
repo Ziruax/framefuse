@@ -337,6 +337,14 @@ export interface WhisperModelStatus {
   /** v1.3: active engine — "faster-whisper" when the Python sidecar runtime
    *  is staged, else "onnxruntime". */
   engine?: string;
+  /** v1.5: installer-shipped model report — the captions panel shows this
+   *  first ("works offline out of the box"). */
+  bundled?: {
+    available: boolean;
+    dir: string;
+    files: Array<{ name: string; sizeBytes: number }>;
+    totalBytes: number;
+  };
   /** v1.3: faster-whisper model cache report (same shape as the primary). */
   fwCacheDir?: string;
   fwCacheFiles?: Array<{ name: string; sizeBytes: number }>;

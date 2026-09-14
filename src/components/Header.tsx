@@ -34,6 +34,9 @@ export interface LastExport {
   chunkedClips?: number;
   totalChunks?: number;
   hwDecodeClips?: number;
+  /** v1.5: parallel single-pass windows (CPU-first chunked export). */
+  parallelChunks?: number;
+  mode?: "single-pass" | "parallel-pass" | "two-step";
 }
 
 interface HeaderProps {
@@ -158,9 +161,9 @@ export function Header({
                 backgroundColor: "#18181b",
                 color: "#a1a1aa",
               }}
-              title="FrameFuse v1.4.2 — multi-track video studio · turbo chunked export"
+              title="FrameFuse v1.5.0 — multi-track video studio · CPU-first parallel single-pass export"
             >
-              v1.4.2
+              v1.5.0
             </span>
             {/* v5.1: on-disk project file chip (native save/open sessions). */}
             {projectName && (
@@ -397,10 +400,12 @@ export function Header({
                 className="rounded px-1 py-px font-medium"
                 style={{ backgroundColor: "rgba(139, 92, 246, 0.12)", color: "#a78bfa" }}
                 title={
-                  "Parallel chunks: long re-encode clips were split into frame-aligned chunks and encoded concurrently" +
-                  (lastExport.hwDecodeClips
-                    ? ` · ${lastExport.hwDecodeClips} source${lastExport.hwDecodeClips === 1 ? "" : "s"} decoded in hardware (probe-gated)`
-                    : "")
+                  lastExport.mode === "parallel-pass"
+                    ? `Parallel single-pass: the timeline was split into ${lastExport.totalChunks} frame-aligned windows, each rendered by its own ffmpeg process (CPU-first), plus one audio pass — concatenated losslessly`
+                    : "Parallel chunks: long re-encode clips were split into frame-aligned chunks and encoded concurrently" +
+                      (lastExport.hwDecodeClips
+                        ? ` · ${lastExport.hwDecodeClips} source${lastExport.hwDecodeClips === 1 ? "" : "s"} decoded in hardware (probe-gated)`
+                        : "")
                 }
               >
                 ⧉ {lastExport.totalChunks} parallel

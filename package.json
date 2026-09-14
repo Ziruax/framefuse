@@ -1,8 +1,8 @@
 {
   "name": "framefuse",
-  "version": "1.4.2",
+  "version": "1.5.0",
   "private": true,
-  "description": "FrameFuse v1 \u2014 Multi-track video studio: video clips, green/white/black screen chroma key with on-canvas PiP, overlay lane, background music with volume/loop, synthesized SFX, native Whisper captions, non-blocking GPU-accelerated parallel FFmpeg export, native project files.",
+  "description": "FrameFuse v1 \u2014 Multi-track video studio: video clips, green/white/black screen chroma key with on-canvas PiP, overlay lane, background music with volume/loop, synthesized SFX, native Whisper captions (model bundled with the installer), CPU-first parallel single-pass FFmpeg export with GPU acceleration when available, native project files.",
   "main": "electron/main.js",
   "author": "FrameFuse",
   "license": "MIT",
@@ -19,9 +19,10 @@
     "electron:dev": "concurrently -k \"npm run dev\" \"wait-on http://localhost:3000 && electron electron/main.js\"",
     "fetch:ffmpeg": "node scripts/fetch-windows-ffmpeg.js",
     "stage:whisper": "node scripts/stage-whisper-service.js",
+    "stage:whisper-model": "node scripts/stage-whisper-model.js",
     "stage:faster-whisper": "node scripts/stage-faster-whisper.js",
     "postinstall": "node scripts/patch-transformers.js && node scripts/patch-electron-builder.js",
-    "electron:build": "npm run clean && next build --webpack && node scripts/copy-wasm.js && node scripts/fetch-windows-ffmpeg.js && node scripts/stage-whisper-service.js && node scripts/stage-faster-whisper.js && electron-builder --win nsis --publish never"
+    "electron:build": "npm run clean && next build --webpack && node scripts/copy-wasm.js && node scripts/fetch-windows-ffmpeg.js && node scripts/stage-whisper-service.js && node scripts/stage-whisper-model.js && node scripts/stage-faster-whisper.js && electron-builder --win nsis --publish never"
   },
   "trustedDependencies": [
     "electron",
@@ -91,6 +92,10 @@
           "ffmpeg.LICENSE",
           "ffmpeg.README"
         ]
+      },
+      {
+        "from": "resources/ffmpeg",
+        "to": "ffmpeg"
       }
     ],
     "asarUnpack": [],

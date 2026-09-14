@@ -39,7 +39,14 @@ function kenBurnsZoompanExprs(o) {
   if (!enabled || dir === "none") {
     return { zExpr: "1.1", xExpr: "iw/2-(iw/zoom/2)", yExpr: "ih/2-(ih/zoom/2)" };
   }
-  const tExpr = `on/${Math.max(1, segFrames - 1)}`;
+  // v6.5 CHUNKED SINGLE-PASS: `onOffset` (integer > 0) shifts the zoompan
+  // output-frame clock by K frames — a chunk that starts mid-animation
+  // continues the exact full-segment curve (on' = on + K; the divisor stays
+  // the FULL segment's frame count). Absent/0 → plain `on`, byte-identical
+  // to every pre-v6.5 caller (the two-step and the W=1 single-pass).
+  const onOffset = Number(o && o.onOffset) || 0;
+  const onBase = onOffset > 0 ? `(on+${Math.round(onOffset)})` : "on";
+  const tExpr = `${onBase}/${Math.max(1, segFrames - 1)}`;
   const easeExpr = `-((cos(PI*${tExpr})-1)/2)`; // easeInOutSine (same as canvas)
   const zBase = 1.1;
   const zMaxEff = (1.1 * zoomMax).toFixed(6);
@@ -87,12 +94,20 @@ function kenBurnsImageChain(o) {
   const height = Number(o && o.height) || 0;
   const fps = Number(o && o.fps) || 30;
   const segFrames = Math.max(2, Number(o && o.segFrames) || 2);
+  // v6.5 CHUNKED SINGLE-PASS: `emitFrames` bounds how many frames THIS chain
+  // emits (zoompan d=), while `segFrames` stays the FULL segment's frame
+  // count (the expression divisor, above). Absent → d=segFrames, the exact
+  // legacy chain (byte-identical, verify-kenburns-parity.js).
+  const emitFrames =
+    Number(o && o.emitFrames) > 0
+      ? Math.max(1, Math.round(Number(o.emitFrames)))
+      : segFrames;
   const scaleW = Math.round(width * 1.1);
   const scaleH = Math.round(height * 1.1);
   return [
     `scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase:flags=lanczos`,
     `crop=${scaleW}:${scaleH}`,
-    `zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${segFrames}:s=${width}x${height}:fps=${fps}`,
+    `zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${emitFrames}:s=${width}x${height}:fps=${fps}`,
     `setsar=1`,
     `format=yuv420p`,
   ].join(",");
