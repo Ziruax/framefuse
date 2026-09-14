@@ -639,3 +639,23 @@ UNRESOLVED / NEXT (in progress at write time):
 - Installer v1.5.0 build running next (foreground recipe) — verify packaged contents (resources/ffmpeg/win exes, whisper-service/models) then push + release.
 - Windows field validation needed: NVENC probe with the full build, chunked wall-clock on ≥4-core machines, bundled-model first transcription offline.
 - Known minor: v1.4.2 two-step chunk path has the same 1-frame overlay EOF quirk at chunk boundaries (pre-existing, cosmetic); select-filter n-reset at concat boundaries is an ffmpeg 7.1 quirk (harness-only impact).
+
+---
+Task ID: 23 (continued — review fixes + v1.5.0 release shipped)
+Agent: main (Z.ai Code)
+Task: Complete the v1.5 round: independent code review verdict was FIX-FIRST (1 BLOCKER) → fix, re-verify, rebuild installer, release.
+
+WORK LOG (continuation):
+- Independent review (subagent 8-a) verdict FIX-FIRST. Reproduced the BLOCKER: chunked==W=1 EXACT on my fixtures, but with UNALIGNED trims BOTH paths dup frames (1205 vs 1200 model) — a PRE-EXISTING v6 W=1 bug (concat filter fills the leading sub-frame gap when frac(trimIn×fps) ∈ (0,0.5) → the fps chain's first frame lands one slot late). Isolated empirically: concat n=1 with -ss 0.437 @30fps → 127 frames vs 126.
+- FIX (BLOCKER): setpts=PTS-STARTPTS appended to every single-pass video chain — output count EXACTLY ceil(dur×fps), matching the two-step and the chunk frame model. Harness gains "W=1 emits EXACTLY the frame model" (1200==1200) + a whole new section 5 fixture: 7 video segs with UNALIGNED trims (437/574/711/848/233/966/515 ms), mixed 30+25fps sources, 1.5x speed seg, captions, overlay, dip fades, music.
+- FIX (MAJOR): audioOnly bounded by -t totalFrames/fps + mux carries -shortest → reproduces W=1's -shortest-at-min(video,audio) tail on frame-inexact timelines.
+- FIX (sub-seek law): windowSegmentsForChunk now seeks to F(j0)=ceil(trimIn×g)+floor(j0·g·speed/fps) — the exact frame W=1 displays at the boundary slot (measured law, 3 empirical confirmations). Mid-segment cuts are BIT-EXACT for speed-1 rate-matched sources at any trim alignment; speed≠1/srcFps≠fps keep a documented ±1-SOURCE-FRAME phase jitter (seek resets the fps filter's fractional phase; bounded ≤22-40ms, DRIFT-FREE — counts/boundary/chunk0/audio all bit-exact; comparator = hash-neighbor ±1 or raw-luma ≤13/255, structural guarantees stay exact).
+- FIX (minor/nits): overlayWindow.clippedEnd flag (pads exactly continuing overlays), per-stage init-failure timers (audio pass + mux get their own <4s windows), progress clamp, whisper env reset unconditional.
+- NOTE: commit f9c3b89 is an environment auto-commit of the review-fix working tree (UUID message) — content is mine, verified; the harness differential was made idempotent against it.
+- GATES (final): verify-timeline-chunks 35/35 · test-export-parity 50/50 · verify-kf-trims 22/22 · verify-chunked-encode 36/36 · bench F4 (8-core mask) mode=parallel-pass W=2 out=40.00s exact + cancellation 0 strays · eslint 0 · agent-browser: v1.5.0 loads, 0 console errors.
+- SHIPPED: pushed 1f4838d..149561a to main; installer "FrameFuse Setup 1.5.0.exe" (330.5 MB) built foreground (no wine) — packaged contents verified: resources/ffmpeg/win/{ffmpeg.exe,ffprobe.exe} (164MB each, BtbN N-126549), whisper-service/models/Xenova/whisper-tiny (7 files, 42MB), faster-whisper-runtime (cp311 guard ✓), app.asar contains planTimelineChunks/parallel-pass/whisperBundledModelsRoot/setpts normalizer/seek law; rcedit 1.5.0.0 + icon. GitHub release v1.5.0 (id 388621131) with Setup exe + blockmap + latest.yml uploaded.
+
+Stage Summary:
+- v1.5.0 COMPLETE: CPU-first chunked single-pass export (lossless parity proven incl. the unaligned-trim regime the reviewer exposed), full FFmpeg build in the installer (GPU-capable + ffprobe), Whisper-tiny bundled offline.
+- Known residuals (documented in docs/EXPORT_PERF.md): xfade chroma rounding ≤4/255; ±1-source-frame jitter on speed≠1/rate-mismatch mid-cuts; animated-caption-across-boundary re-runs its entrance (pre-existing v1.4.2 semantics).
+- Field validation wanted: NVENC probe with the full build on Windows, parallel wall-clock on ≥4-core machines, offline first transcription.
