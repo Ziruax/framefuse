@@ -25,7 +25,17 @@
 // Node-safety: this module is importable in Node/bun with no side effects —
 // every bridge/worker is resolved lazily inside function calls.
 
-import type { SubtitleCue, WordTimestamp } from "./subtitles";
+import {
+  groupWordsIntoCues,
+  type RawWord,
+  type SubtitleCue,
+  type WordTimestamp,
+} from "./subtitles";
+
+// v1.7: word grouping moved to ./subtitles (shared with the SRT import
+// path); re-exported here so the historical public surface is unchanged.
+export { groupWordsIntoCues } from "./subtitles";
+export type { RawWord } from "./subtitles";
 import type {
   RawWhisperChunk,
   WhisperWorkerResponse,
@@ -124,71 +134,6 @@ async function decodeAudioToMono16k(
 
   const rendered = await offline.startRendering();
   return { data: rendered.getChannelData(0), sampleRate: targetRate };
-}
-
-// ---------------------------------------------------------------------------
-// Word-level cue grouping — turns Whisper's per-word chunks into display
-// cues that keep EXACT per-word timings. (Pure, exported for the harness.)
-// ---------------------------------------------------------------------------
-
-const MAX_WORDS_PER_CUE = 7;
-const MAX_CUE_MS = 3500;
-const WORD_GAP_BREAK_MS = 700;
-
-export interface RawWord {
-  text: string;
-  startMs: number;
-  endMs: number;
-}
-
-/** Group raw aligned words into cues (sentence-ish windows). */
-export function groupWordsIntoCues(words: RawWord[]): SubtitleCue[] {
-  const cues: SubtitleCue[] = [];
-  let current: RawWord[] = [];
-
-  const flush = () => {
-    if (current.length === 0) return;
-    const startMs = current[0].startMs;
-    const endMs = current[current.length - 1].endMs;
-    const text = current.map((w) => w.text).join(" ");
-    cues.push({
-      id: cues.length + 1,
-      startMs,
-      endMs: Math.max(endMs, startMs + 200),
-      text,
-      words: current.map((w) => ({
-        text: w.text,
-        startMs: w.startMs,
-        endMs: w.endMs,
-      })),
-    });
-    current = [];
-  };
-
-  for (let i = 0; i < words.length; i++) {
-    const w = words[i];
-    const prev = current[current.length - 1];
-
-    if (prev) {
-      const gap = w.startMs - prev.endMs;
-      const cueLen = w.endMs - current[0].startMs;
-      const endsSentence = /[.!?…。！？]$/.test(prev.text);
-      if (
-        current.length >= MAX_WORDS_PER_CUE ||
-        cueLen >= MAX_CUE_MS ||
-        gap > WORD_GAP_BREAK_MS ||
-        endsSentence
-      ) {
-        flush();
-      }
-    }
-    current.push(w);
-  }
-  flush();
-
-  cues.sort((a, b) => a.startMs - b.startMs);
-  cues.forEach((c, i) => (c.id = i + 1));
-  return cues;
 }
 
 // ---------------------------------------------------------------------------

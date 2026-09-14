@@ -259,6 +259,75 @@ ipcMain.handle("choose-output", async () => {
   return res.filePath;
 });
 
+// ── v8 GPU (WebCodecs) export file streamer ────────────────────────────────
+// The renderer's WebCodecs pipeline muxes MP4 bytes and streams them to disk
+// in ~5 MB chunks so a 19-minute 1080p render never has to fit in RAM (the
+// v5.x browser fallback held the whole muxed file in an ArrayBufferTarget).
+// Fire-and-forget channels (ipcMain.on, not handle): the renderer drives the
+// whole export and reports its own progress/errors.
+let exportStream = null;
+
+// Begin a streamed export: end any previous stream, mkdir -p the parent
+// directory (absolute paths only), then open a truncating write stream.
+// Write errors are logged and the stream is dropped — never thrown — so a
+// failing disk can't crash the main process; the renderer's export-end
+// still runs and the caller surfaces the truncated file.
+ipcMain.on("export-start", (event, filePath) => {
+  try {
+    if (typeof filePath !== "string" || !filePath.trim() || !path.isAbsolute(filePath)) {
+      console.warn("[export-stream] export-start ignored: filePath must be a non-empty absolute path");
+      return;
+    }
+    if (exportStream) {
+      // A previous export never called export-end — close it cleanly so the
+      // file handle isn't left dangling on disk.
+      try { exportStream.end(); } catch (_) { /* already ended */ }
+      exportStream = null;
+    }
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const stream = fs.createWriteStream(filePath, { flags: "w" });
+    exportStream = stream;
+    stream.on("error", (err) => {
+      console.error("[export-stream] write failed:", err && err.message ? err.message : err);
+      // Drop the broken stream so a retried export-start opens a fresh one —
+      // but only if a retry hasn't already replaced it (compare identities).
+      try { stream.destroy(); } catch (_) { /* already destroyed */ }
+      if (exportStream === stream) exportStream = null;
+    });
+  } catch (e) {
+    console.error("[export-stream] export-start failed:", e && e.message ? e.message : e);
+  }
+});
+
+// Append one ~5 MB muxed chunk. No open stream (or a broken one) → warn and
+// ignore; whatever was already written stays on disk for export-end to close.
+ipcMain.on("export-chunk", (event, buffer) => {
+  if (!exportStream) {
+    console.warn("[export-stream] export-chunk ignored: no open export stream");
+    return;
+  }
+  try {
+    // Buffer.from copies the IPC-serialized bytes into a Node buffer the
+    // stream can own (input may arrive as Uint8Array or Buffer).
+    exportStream.write(Buffer.from(buffer));
+  } catch (e) {
+    console.error("[export-stream] chunk write failed:", e && e.message ? e.message : e);
+  }
+});
+
+// Finish the streamed export: end() flushes pending writes to disk, then the
+// handle is released. Safe to call with no open stream (idempotent no-op).
+ipcMain.on("export-end", () => {
+  if (!exportStream) return;
+  const stream = exportStream;
+  exportStream = null;
+  try {
+    stream.end();
+  } catch (e) {
+    console.error("[export-stream] export-end failed:", e && e.message ? e.message : e);
+  }
+});
+
 // ---------------------------------------------------------------------------
 // v5.1 NATIVE PROJECT FILES — save/open dialogs + recents (userData).
 // The renderer keeps its self-contained .framefuse.json document (media
@@ -749,6 +818,24 @@ function fasterWhisperCacheDir() {
   return path.join(app.getPath("userData"), "faster-whisper-models");
 }
 
+/** v1.7: the installer BUNDLES the CTranslate2 tiny model inside the
+ * faster-whisper runtime (staged by scripts/stage-faster-whisper-model.js,
+ * shipped via extraResources). Passing this DIRECTORY as --model makes
+ * WhisperModel() load straight from disk — no first-run HuggingFace
+ * download (the root cause of both "very slow first transcription" and
+ * the load-phase watchdog kills that fell users back to the slower ONNX
+ * engine). Non-tiny sizes still download on demand (watchdog-bounded).
+ * Returns null when the bundle is absent (dev boxes, partial installs) —
+ * the sidecar then keeps the historical name-based download path. */
+function fasterWhisperBundledModelDir() {
+  try {
+    const dir = path.join(fasterWhisperRuntimeDir(), "models", "faster-whisper-tiny");
+    return fs.existsSync(path.join(dir, "model.bin")) ? dir : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 /** Spawn the sidecar and stream its JSON-lines to the run bookkeeping.
  * Progress mapping mirrors the existing UI curve: load 10–25 %, transcribe
  * 25–80 %, align 80+ stays in the renderer. Returns the raw result payload
@@ -782,7 +869,10 @@ function transcribeWithFasterWhisper(runId, { inputPath, language, model }) {
     const args = [
       fasterWhisperTranscriberPath(),
       "--audio", inputPath,
-      "--model", ["tiny", "base", "small", "medium"].includes(model) ? model : "tiny",
+      // v1.7: bundled CT2 tiny → local dir path (no download, instant
+      // load). Other sizes keep the name-based download (watchdog-bounded).
+      "--model", fasterWhisperBundledModelDir() ??
+        (["tiny", "base", "small", "medium"].includes(model) ? model : "tiny"),
       "--language", typeof language === "string" && language ? language : "auto",
       "--cache", fasterWhisperCacheDir(),
       "--cpu-threads", String(Math.max(1, os.cpus().length)),
@@ -1084,7 +1174,9 @@ ipcMain.handle("whisper:fw-preload", async (event, payload) => {
     const args = [
       fasterWhisperTranscriberPath(),
       "--preload",
-      "--model", model,
+      // v1.7: bundled CT2 tiny → preload is a local disk verification
+      // (instant); other sizes still download into the cache dir.
+      "--model", fasterWhisperBundledModelDir() ?? model,
       "--cache", fasterWhisperCacheDir(),
       "--cpu-threads", String(Math.max(1, os.cpus().length)),
     ];

@@ -1,6 +1,6 @@
 {
   "name": "framefuse",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "private": true,
   "description": "FrameFuse v1 — Multi-track video studio: video clips, green/white/black screen chroma key with on-canvas PiP, overlay lane, background music with volume/loop, synthesized SFX, native Whisper captions (model bundled with the installer), CPU-first parallel single-pass FFmpeg export with GPU acceleration when available, native project files.",
   "main": "electron/main.js",
@@ -21,8 +21,9 @@
     "stage:whisper": "node scripts/stage-whisper-service.js",
     "stage:whisper-model": "node scripts/stage-whisper-model.js",
     "stage:faster-whisper": "node scripts/stage-faster-whisper.js",
+    "stage:faster-whisper-model": "node scripts/stage-faster-whisper-model.js",
     "postinstall": "node scripts/patch-transformers.js && node scripts/patch-electron-builder.js",
-    "electron:build": "npm run clean && next build --webpack && node scripts/copy-wasm.js && node scripts/fetch-windows-ffmpeg.js && node scripts/stage-whisper-service.js && node scripts/stage-whisper-model.js && node scripts/stage-faster-whisper.js && electron-builder --win nsis --publish never"
+    "electron:build": "npm run clean && next build --webpack && node scripts/copy-wasm.js && node scripts/fetch-windows-ffmpeg.js && node scripts/stage-whisper-service.js && node scripts/stage-whisper-model.js && node scripts/stage-faster-whisper.js && node scripts/stage-faster-whisper-model.js && electron-builder --win nsis --publish never"
   },
   "trustedDependencies": [
     "electron",
@@ -36,6 +37,7 @@
     "ffmpeg-static": "^5.2.0",
     "lucide-react": "^0.525.0",
     "mp4-muxer": "^5.2.2",
+    "mp4box": "^2.4.1",
     "next": "^16.1.1",
     "onnxruntime-node": "1.14.0",
     "react": "^19.0.0",

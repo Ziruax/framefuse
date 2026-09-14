@@ -131,6 +131,116 @@ export function parseSrt(content: string): SubtitleCue[] {
   return cues;
 }
 
+// ---------------------------------------------------------------------------
+// Word-level cue grouping — turns per-word chunks (Whisper output OR a
+// word-by-word SRT import) into display cues that keep EXACT per-word
+// timings. (Pure, exported for the harness.)
+// ---------------------------------------------------------------------------
+
+const MAX_WORDS_PER_CUE = 7;
+const MAX_CUE_MS = 3500;
+const WORD_GAP_BREAK_MS = 700;
+
+export interface RawWord {
+  text: string;
+  startMs: number;
+  endMs: number;
+}
+
+/** Group raw aligned words into cues (sentence-ish windows). */
+export function groupWordsIntoCues(words: RawWord[]): SubtitleCue[] {
+  const cues: SubtitleCue[] = [];
+  let current: RawWord[] = [];
+
+  const flush = () => {
+    if (current.length === 0) return;
+    const startMs = current[0].startMs;
+    const endMs = current[current.length - 1].endMs;
+    const text = current.map((w) => w.text).join(" ");
+    cues.push({
+      id: cues.length + 1,
+      startMs,
+      endMs: Math.max(endMs, startMs + 200),
+      text,
+      words: current.map((w) => ({
+        text: w.text,
+        startMs: w.startMs,
+        endMs: w.endMs,
+      })),
+    });
+    current = [];
+  };
+
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    const prev = current[current.length - 1];
+
+    if (prev) {
+      const gap = w.startMs - prev.endMs;
+      const cueLen = w.endMs - current[0].startMs;
+      const endsSentence = /[.!?…。！？]$/.test(prev.text);
+      if (
+        current.length >= MAX_WORDS_PER_CUE ||
+        cueLen >= MAX_CUE_MS ||
+        gap > WORD_GAP_BREAK_MS ||
+        endsSentence
+      ) {
+        flush();
+      }
+    }
+    current.push(w);
+  }
+  flush();
+
+  cues.sort((a, b) => a.startMs - b.startMs);
+  cues.forEach((c, i) => (c.id = i + 1));
+  return cues;
+}
+
+/**
+ * Heuristic: does this parsed cue list look like a WORD-BY-WORD subtitle file
+ * (one — occasionally two — words per cue, very short cue durations)?
+ *
+ * v1.7 FIX: such files (e.g. exported from a word-level ASR tool or another
+ * app's "word SRT" export) previously loaded as hundreds of one-word cues,
+ * so every caption style showed a single flashing word instead of the styled
+ * phrase. Detection: ≥70% of cues carry ≤2 words (single line) AND the median
+ * cue duration is ≤900 ms AND there are at least 8 cues (enough signal).
+ */
+export function looksLikeWordLevelCues(cues: SubtitleCue[]): boolean {
+  if (cues.length < 8) return false;
+  let shortCues = 0;
+  const durations: number[] = [];
+  for (const c of cues) {
+    const wordCount = c.text.split(/\s+/).filter(Boolean).length;
+    if (wordCount <= 2 && !c.text.includes("\n")) shortCues++;
+    durations.push(Math.max(0, c.endMs - c.startMs));
+  }
+  durations.sort((a, b) => a - b);
+  const medianDur = durations[Math.floor(durations.length / 2)];
+  return shortCues / cues.length >= 0.7 && medianDur > 0 && medianDur <= 900;
+}
+
+/**
+ * Merge a word-by-word cue file into PHRASE cues that keep exact per-word
+ * timing (`words[]`), so the same caption styles used for Whisper output
+ * (phrase display, karaoke word highlight, word-only mode, kinetic
+ * typography) work on imported word-level SRTs.
+ *
+ * Non-word-level input passes through UNCHANGED (normal subtitle files
+ * render exactly as before).
+ */
+export function groupWordLevelCues(cues: SubtitleCue[]): SubtitleCue[] {
+  if (!looksLikeWordLevelCues(cues)) return cues;
+  const rawWords: RawWord[] = [];
+  for (const c of cues) {
+    const text = c.text.replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    rawWords.push({ text, startMs: c.startMs, endMs: c.endMs });
+  }
+  return groupWordsIntoCues(rawWords);
+}
+
 /**
  * Find the subtitle cue active at a given time (ms), or null.
  * Uses binary search over a sorted-by-startMs list for performance.

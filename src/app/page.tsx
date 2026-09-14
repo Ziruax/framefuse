@@ -34,7 +34,14 @@ import {
   type SfxItem,
 } from "@/lib/merger/sfx";
 import { exportNative, isElectron } from "@/lib/merger/native";
-import { parseSrt, serializeSrt, serializeVtt, serializeVttWords } from "@/lib/merger/subtitles";
+import {
+  groupWordLevelCues,
+  looksLikeWordLevelCues,
+  parseSrt,
+  serializeSrt,
+  serializeVtt,
+  serializeVttWords,
+} from "@/lib/merger/subtitles";
 import {
   detectBeats as detectBeatsInAudio,
   planBeatSnap,
@@ -291,6 +298,21 @@ export default function Page() {
   // settings swap in one frame later — the intentional one-shot sync with
   // the localStorage "external system".
    
+  // v8 GPU EXPORT HOOK — expose the WebCodecs pipeline (SourceDecoder →
+  // AudioMixer → ExportOrchestrator) as a lazy, globally reachable module
+  // promise so it (a) SHIPS in the packaged app as a code-split chunk
+  // instead of being tree-shaken away, and (b) can be exercised on demand —
+  // from the devtools console for field validation and from the Export tab
+  // once it becomes the default engine:
+  //   const gpu = await window.__framefuseGpuExport;
+  //   await gpu.runGpuExport({ ... });
+  // Zero cost when unused: the chunk only downloads on first access.
+  useEffect(() => {
+    (window as unknown as {
+      __framefuseGpuExport?: Promise<typeof import("@/lib/export")>;
+    }).__framefuseGpuExport = import("@/lib/export");
+  }, []);
+
   useEffect(() => {
     const p = loadPersisted();
     if (p.kenBurns) setKenBurns(p.kenBurns);
@@ -1516,14 +1538,22 @@ export default function Page() {
       const reader = new FileReader();
       reader.onload = () => {
         const rawText = String(reader.result || "");
-        const cues = parseSrt(rawText);
-        if (cues.length === 0) {
+        const parsed = parseSrt(rawText);
+        if (parsed.length === 0) {
           toast.error("No subtitle cues found", {
             description:
               "Make sure the .srt file has standard timecodes (00:00:01,000 --> 00:00:04,000).",
           });
           return;
         }
+        // v1.7 FIX: word-by-word SRTs (one word per cue — e.g. a word-level
+        // export from another tool) previously loaded as hundreds of
+        // one-word cues, so caption styles showed a single flashing word.
+        // Regroup them into PHRASE cues with exact per-word timing — the
+        // same data shape Whisper produces — so every style (phrase,
+        // karaoke highlight, word-only, kinetic) renders correctly.
+        const wordLevelFile = looksLikeWordLevelCues(parsed);
+        const cues = wordLevelFile ? groupWordLevelCues(parsed) : parsed;
         // Re-serialize from parsed cues so the FFmpeg-side SRT is always
         // well-formed (normalised line endings, 3-digit ms).
         const normalized = serializeSrt(cues);
@@ -1532,9 +1562,14 @@ export default function Page() {
           cues,
           rawText: normalized,
         });
-        toast.success(`Loaded ${cues.length} subtitle cue${cues.length === 1 ? "" : "s"}`, {
-          description: `${file.name} — turn on "Burn captions" in Settings → Captions to render them.`,
-        });
+        toast.success(
+          `Loaded ${cues.length} subtitle cue${cues.length === 1 ? "" : "s"}`,
+          {
+            description: wordLevelFile
+              ? `${file.name} — word-by-word timing detected: grouped into ${cues.length} phrase cue${cues.length === 1 ? "" : "s"} with exact word timing. All caption styles (incl. karaoke) now work.`
+              : `${file.name} — turn on "Burn captions" in Settings → Captions to render them.`,
+          },
+        );
         // v5.2: captions are OPT-IN — loading a subtitle file no longer
         // flips burn-in on automatically (features apply only when the user
         // asks for them). The toast above points at the toggle.

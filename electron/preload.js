@@ -75,6 +75,14 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // v4.1: export the full-timeline ASS subtitle sidecar.
   exportAssFile: (opts) => ipcRenderer.invoke("export-ass-file", opts),
 
+  // v8 GPU export streamer — WebCodecs renderer pipeline → disk (5 MB chunks).
+  // exportStart(filePath) truncates/creates the output file (mkdir -p parent),
+  // exportChunk(buffer) appends bytes, exportEnd() closes the handle. The
+  // muxed MP4 never has to fit in renderer RAM.
+  exportStart: (filePath) => ipcRenderer.send("export-start", filePath),
+  exportChunk: (buffer) => ipcRenderer.send("export-chunk", buffer),
+  exportEnd: () => ipcRenderer.send("export-end"),
+
   onExportProgress: (callback) => {
     const handler = (_event, data) => callback(data);
     ipcRenderer.on("export-progress", handler);

@@ -208,7 +208,7 @@ const Module = require("module");
 const electronStub = {
   app: {
     whenReady: () => Promise.resolve(), on: () => {}, getPath: () => "/tmp/ffstub",
-    getName: () => "FrameFuse", getVersion: () => "1.6.0", isReady: () => true, quit: () => {},
+    getName: () => "FrameFuse", getVersion: () => "1.7.0", isReady: () => true, quit: () => {},
   },
   BrowserWindow: class {
     constructor() { this.webContents = { setWindowOpenHandler: () => ({ action: "deny" }), on: () => {}, send: () => {} }; }

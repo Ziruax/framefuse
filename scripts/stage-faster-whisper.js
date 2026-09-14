@@ -33,6 +33,12 @@ const OUT = path.join(ROOT, "faster-whisper-runtime");
 const PY_OUT = path.join(OUT, "python");
 const SITE = path.join(PY_OUT, "Lib", "site-packages");
 const CACHE = path.join(ROOT, ".cache", "faster-whisper-runtime");
+// v1.7: the bundled CTranslate2 model lives at OUT/models (staged by
+// stage-faster-whisper-model.js). This script WIPES OUT on every run, so
+// the models dir moves aside here and back after the rebuild (the same
+// preserve pattern stage-whisper-service.js uses for ONNX models).
+const MODELS_DIR = path.join(OUT, "models");
+const MODELS_BACKUP = path.join(ROOT, ".cache", "fw-models-stash");
 
 const PYTHON_EMBED_URL =
   "https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip";
@@ -138,10 +144,24 @@ function findIncompatiblePyds(siteDir) {
 
 async function main() {
   console.log("[stage-faster-whisper] building the faster-whisper sidecar runtime…");
+  // v1.7: preserve the bundled CT2 model dir across the wipe.
+  let modelsPreserved = false;
+  try {
+    fs.rmSync(MODELS_BACKUP, { recursive: true, force: true });
+    if (fs.existsSync(MODELS_DIR)) {
+      fs.renameSync(MODELS_DIR, MODELS_BACKUP);
+      modelsPreserved = true;
+    }
+  } catch (_) { /* no models to preserve (fresh build) */ }
   rmrf(OUT);
   mkdirp(PY_OUT);
   mkdirp(SITE);
   mkdirp(CACHE);
+  if (modelsPreserved) {
+    try {
+      fs.renameSync(MODELS_BACKUP, MODELS_DIR);
+    } catch (_) { /* restore failed — stage-faster-whisper-model re-downloads */ }
+  }
 
   // 1. Windows embeddable CPython.
   const zipName = PYTHON_EMBED_URL.split("/").pop();
