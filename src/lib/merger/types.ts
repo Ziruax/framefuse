@@ -318,11 +318,15 @@ export interface ExportResult {
    * fallbacks omit them). encoder = the detected hardware/CPU encoder
    * label, elapsedSec = wall-clock export time, copiedClips/encodedClips
    * = how many clips took the stream-copy fast path vs a re-encode.
+   * v1.4.1: keyframeCuts = copied clips that entered the fast path via a
+   * keyframe-aligned head trim (requested cut within one frame of a
+   * source keyframe).
    */
   encoder?: string;
   elapsedSec?: number;
   copiedClips?: number;
   encodedClips?: number;
+  keyframeCuts?: number;
 }
 
 export interface CaptionSettings {

@@ -1119,6 +1119,7 @@ export default function Page() {
         elapsedSec: res.elapsedSec,
         copiedClips: res.copiedClips,
         encodedClips: res.encodedClips,
+        keyframeCuts: res.keyframeCuts,
       });
       // v1.1 TURBO: the success toast carries the performance story —
       // export time + encoder + stream-copy count — so a fast export is
@@ -1134,7 +1135,10 @@ export default function Page() {
       if (res.encoder) turboBits.push(res.encoder);
       if (res.copiedClips != null && res.copiedClips > 0) {
         turboBits.push(
-          `${res.copiedClips} clip${res.copiedClips === 1 ? "" : "s"} copied without re-encode`,
+          `${res.copiedClips} clip${res.copiedClips === 1 ? "" : "s"} copied without re-encode` +
+            (res.keyframeCuts != null && res.keyframeCuts > 0
+              ? ` (${res.keyframeCuts} keyframe-aligned cut${res.keyframeCuts === 1 ? "" : "s"})`
+              : ""),
         );
       }
       toast.success(`Exported ${fmtBytes(res.size)}`, {

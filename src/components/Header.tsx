@@ -28,6 +28,8 @@ export interface LastExport {
   elapsedSec?: number;
   copiedClips?: number;
   encodedClips?: number;
+  /** v1.4.1: copied clips that entered the fast path via a keyframe-aligned head trim. */
+  keyframeCuts?: number;
 }
 
 interface HeaderProps {
@@ -348,7 +350,10 @@ export function Header({
                   lastExport.encoder ? ` · ${lastExport.encoder}` : ""
                 }${
                   lastExport.copiedClips
-                    ? ` · ${lastExport.copiedClips} clip${lastExport.copiedClips === 1 ? "" : "s"} stream-copied (no re-encode)`
+                    ? ` · ${lastExport.copiedClips} clip${lastExport.copiedClips === 1 ? "" : "s"} stream-copied (no re-encode)` +
+                      (lastExport.keyframeCuts
+                        ? ` · ${lastExport.keyframeCuts} keyframe-aligned cut${lastExport.keyframeCuts === 1 ? "" : "s"}`
+                        : "")
                     : ""
                 }`
               : undefined
@@ -379,9 +384,15 @@ export function Header({
               <span
                 className="rounded px-1 py-px font-medium"
                 style={{ backgroundColor: "rgba(16, 185, 129, 0.12)", color: "#34d399" }}
-                title="Turbo export: these clips were remuxed without decoding or re-encoding"
+                title={
+                  "Turbo export: these clips were remuxed without decoding or re-encoding" +
+                  (lastExport.keyframeCuts
+                    ? ` — ${lastExport.keyframeCuts} via keyframe-aligned trim`
+                    : "")
+                }
               >
                 turbo ×{lastExport.copiedClips}
+                {lastExport.keyframeCuts ? ` · ${lastExport.keyframeCuts}kf` : ""}
               </span>
             </>
           )}

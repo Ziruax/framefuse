@@ -1282,6 +1282,86 @@ function probeMediaAsync(p) {
 }
 
 // ---------------------------------------------------------------------------
+// v1.4.1 KEYFRAME-ALIGNED STREAM-COPY TRIMS — the last big reason a
+// cuts-only clip still re-encoded was a head trim (`trimInMs > 0` forced
+// the encode path because `-c copy` can only cut ON keyframes). If the
+// requested cut point happens to have a source keyframe within ONE FRAME,
+// the copy path can start exactly at that keyframe and keep the fast path.
+// Probe = ffmpeg with `-skip_frame nokey` (decode ONLY keyframes — a few
+// frames per 5 s window, regardless of file length) + `showinfo` (prints
+// each decoded frame's pts_time) + `-copyts`/`-noaccurate_seek` so the
+// printed timestamps stay on the SOURCE clock and the read window starts
+// at the seek-landing keyframe. All flag placements verified against the
+// bundled ffmpeg 6.1.1: `-skip_frame nokey` MUST precede `-i` (a decoder
+// option placed after `-i` is applied to the encoder and rejected).
+// ---------------------------------------------------------------------------
+const kfAlignCache = new Map(); // `${path}|${trimMs}` → Promise<{ss,deltaMs}|null>
+
+/** Parse showinfo's `pts_time:<sec>` marks into {s: exactString, ms}. */
+function parseKeyframeSecs(out) {
+  const kfs = [];
+  const re = /pts_time:(\d+(?:\.\d+)?)/g;
+  const text = String(out || "");
+  let m;
+  while ((m = re.exec(text))) {
+    const v = parseFloat(m[1]);
+    if (Number.isFinite(v)) kfs.push({ s: m[1], ms: v * 1000 });
+  }
+  return kfs;
+}
+
+/**
+ * Nearest keyframe to `trimMs` within one frame duration (tolerance
+ * 1000/fps, clamped to 10–50 ms). Resolves { ss, deltaMs } — `ss` is the
+ * EXACT pts string, which buildStreamCopyArgs passes to `-ss` verbatim
+ * (µs precision — a rounded value 1 ms early makes the backward seek land
+ * on the previous GOP) — or null (not aligned / probe failure → the clip
+ * takes the re-encode path exactly as before).
+ */
+function findKeyframeAlignedStart(path, trimMs, fps) {
+  if (typeof path !== "string" || !path || !Number.isFinite(trimMs) || trimMs <= 0) {
+    return Promise.resolve(null);
+  }
+  const key = `${path}|${Math.round(trimMs)}`;
+  if (kfAlignCache.has(key)) return kfAlignCache.get(key);
+  const job = (async () => {
+    try {
+      const tolMs = Math.min(50, Math.max(10, Math.round(1000 / Math.max(1, Number(fps) || 30))));
+      // Window: [trim−2.5 s, trim+2.5 s] read from the seek-landing keyframe
+      // (−noaccurate_seek never discards pre-target packets, so the landing
+      // keyframe itself is included). A keyframe within tol ≤ 50 ms of trim
+      // is provably inside this window for ANY GOP size: the landing point
+      // is ≤ trim−2.5 s, and reading stops at original ts trim+2.5 s.
+      const ss = Math.max(0, (trimMs - 2500) / 1000).toFixed(3);
+      const r = await ffmpegCapture([
+        "-hide_banner", "-nostats",
+        "-copyts",
+        "-ss", ss, "-noaccurate_seek", "-t", "5",
+        "-skip_frame", "nokey",
+        "-i", path,
+        "-map", "0:v:0", "-vf", "showinfo",
+        "-f", "null", "-",
+      ], 20000);
+      const kfs = parseKeyframeSecs(r && r.out);
+      let best = null;
+      let bestD = Infinity;
+      for (const kf of kfs) {
+        const d = Math.abs(kf.ms - trimMs);
+        if (d < bestD) { bestD = d; best = kf; }
+      }
+      return best && bestD <= tolMs
+        ? { ss: best.s, deltaMs: Math.round(best.ms - trimMs) }
+        : null;
+    } catch (_) {
+      return null;
+    }
+  })();
+  kfAlignCache.set(key, job);
+  job.catch(() => {});
+  return job;
+}
+
+// ---------------------------------------------------------------------------
 // v5.0 PARALLEL step-1 pool — clips encode in a worker pool of
 // min(4, max(1, cpus − 2)) concurrent ffmpeg children (spawn, not exec).
 // Any failure fails the whole export (with the clip index in the message)
@@ -2140,6 +2220,9 @@ ipcMain.handle("export-native", async (event, opts) => {
     // audio graph should pad/mix to the ACTUAL video length).
     let copiedClips = 0;
     let encodedClips = 0;
+    // v1.4.1: how many of the copied clips took the keyframe-aligned
+    // head-trim path (result telemetry — surfaced in the export toast).
+    let keyframeCuts = 0;
 
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i];
@@ -2236,10 +2319,26 @@ ipcMain.handle("export-native", async (event, opts) => {
           const p = await probeMediaAsync(srcPath);
           srcDurMs = Number(p.durationMs) > 0 ? Number(p.durationMs) : 0;
         }
+        // v1.4.1 PER-OVERLAY FPS NORMALIZATION: a video overlay running
+        // FASTER than the project rate (e.g. 60 fps PiP over a 30 fps
+        // timeline) makes the whole composite graph evaluate at the
+        // overlay's rate — ~2× the scale/chroma/composite/encode work for
+        // zero visual gain (the base chain already normalizes the output
+        // to `fps`). `fps=<project>` at the head of the overlay chain
+        // drops the surplus frames before anything runs. Near-rate or
+        // slower overlays are left untouched (dup frames would only add
+        // work; the overlay filter's framesync already syncs by timestamp).
+        let normFps = null;
+        if (isVid) {
+          const ovProbe = await probeMediaAsync(srcPath);
+          const ovFps = Number(ovProbe.fps) || 0;
+          if (ovFps > fps + 0.5) normFps = fps;
+        }
         overlaySpecs.push({
           inputArgs: isVid
             ? G.buildOverlayVideoInputArgs({ ssMs: win.ssMs, durMs: win.overlapMs, path: srcPath, loop: ovLoop, srcDurMs })
             : G.buildOverlayImageInputArgs({ durMs: win.overlapMs, path: srcPath }),
+          fps: normFps,
           x,
           y,
           xExpr,
@@ -2264,18 +2363,57 @@ ipcMain.handle("export-native", async (event, opts) => {
       // "simple cut exports in seconds" technique every fast editor
       // uses. Eligibility has two halves:
       //   (a) timeline-side (pure): G.clipNeedsReEncode — no speed, no
-      //       head trim, no overlays in window, no captions/headlines,
-      //       no watermark, no transition fades at this boundary;
+      //       UNALIGNED head trim, no overlays in window, no captions/
+      //       headlines, no watermark, no transition fades at this
+      //       boundary;
       //   (b) source-side (probe): h264 + yuv420p + output dims + fps
       //       match + no rotation + the window covers the whole source
       //       (tail-only trim ≤ 300 ms — packet-granularity cut).
+      // v1.4.1 KEYFRAME-ALIGNED TRIMS: a head trim no longer disqualifies
+      // the clip when a source keyframe sits within ONE FRAME of the
+      // requested cut (findKeyframeAlignedStart). The copy then starts
+      // at that keyframe (`-ss <exactPts> -noaccurate_seek`), keeping the
+      // timeline duration exact and the content boundary within one
+      // frame. Anything further than one frame stays re-encode — the
+      // frame-accuracy tradeoff is deliberately one frame, no more.
       // Mixed projects are fine: copied and re-encoded parts share the
       // exact output stream spec (h264 yuv420p WxH fps), so the concat
       // demuxer + `-c copy` mux stay uniform.
+      const trimInMs = Number(seg.trimInMs) || 0;
+      let trimKeyAligned = false;
+      let trimSs = null;
+      if (trimInMs > 0) {
+        // Skip the keyframe probe when the clip is ALREADY re-encode-bound
+        // for other reasons (overlaps/captions/speed/fades/...) — patch
+        // trimInMs to 0 so clipNeedsReEncode reports those reasons alone.
+        const otherwiseCopyEligible = !G.clipNeedsReEncode({
+          i, seg: { ...seg, trimInMs: 0 }, segments, transition,
+          overlayCount: overlaySpecs.length,
+          assSuffix, wm,
+        });
+        if (otherwiseCopyEligible) {
+          const preProbe = await probeMediaAsync(seg.videoPath);
+          const preOk =
+            preProbe.codec === "h264" &&
+            preProbe.pixFmt === "yuv420p" &&
+            !preProbe.rotated &&
+            preProbe.width === width &&
+            preProbe.height === height &&
+            Math.abs((preProbe.fps || 0) - fps) < 0.06;
+          if (preOk) {
+            const kf = await findKeyframeAlignedStart(seg.videoPath, trimInMs, fps);
+            if (kf) {
+              trimKeyAligned = true;
+              trimSs = kf.ss;
+            }
+          }
+        }
+      }
       if (!G.clipNeedsReEncode({
           i, seg, segments, transition,
           overlayCount: overlaySpecs.length,
           assSuffix, wm,
+          trimKeyAligned,
         })) {
         const probe = await probeMediaAsync(seg.videoPath);
         const srcDur = Number(probe.durationMs) || 0;
@@ -2287,8 +2425,8 @@ ipcMain.handle("export-native", async (event, opts) => {
           probe.height === height &&
           Math.abs((probe.fps || 0) - fps) < 0.06 &&
           srcDur > 0 &&
-          (Number(seg.trimInMs) || 0) === 0 &&
-          seg.durationMs >= srcDur - 300;
+          (trimInMs === 0 || trimKeyAligned) &&
+          (trimInMs + seg.durationMs) >= srcDur - 300;
         if (formatOk) {
           jobs.push({
             idx: i,
@@ -2296,6 +2434,7 @@ ipcMain.handle("export-native", async (event, opts) => {
               path: seg.videoPath,
               durMs: seg.durationMs,
               clipPath,
+              ss: trimSs,
             }),
             durSec: seg.durationMs / 1000,
             durationMs: seg.durationMs,
@@ -2303,6 +2442,10 @@ ipcMain.handle("export-native", async (event, opts) => {
             copy: true,
           });
           copiedClips += 1;
+          // v1.4.1: count only copies that actually rode the keyframe-aligned
+          // trim path (an aligned find that still re-encodes for a source-
+          // format reason must not inflate the number).
+          if (trimKeyAligned) keyframeCuts += 1;
           cumulativeMs += seg.durationMs;
           if (segHasAudio) {
             // PCM extraction still rides the pool (audio is mixed in
@@ -2565,6 +2708,8 @@ ipcMain.handle("export-native", async (event, opts) => {
     try { size = fs.statSync(outputPath).size; } catch {}
     // v1.1 TURBO: the result carries the performance story so the UI can
     // show users WHY the export was fast (encoder + stream-copy counts).
+    // v1.4.1: keyframeCuts = copied clips that entered the fast path via a
+    // keyframe-aligned head trim (vs. trimIn=0 copies).
     return {
       path: outputPath,
       size,
@@ -2572,6 +2717,7 @@ ipcMain.handle("export-native", async (event, opts) => {
       elapsedSec: Math.round((Date.now() - startTime) / 1000),
       copiedClips,
       encodedClips,
+      keyframeCuts,
     };
 
   } catch (err) {

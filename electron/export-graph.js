@@ -106,7 +106,11 @@ function isLastSeg(i, segments) {
  * pix_fmt + full-window) is checked in main.js against the async probe —
  * this pure half covers the timeline-side reasons:
  *   - not a base-lane video segment, or a playback speed change
- *   - a head trim (stream copy cannot cut mid-GOP frame-accurately)
+ *   - a head trim that is NOT keyframe-aligned (stream copy cannot cut
+ *     mid-GOP frame-accurately). v1.4.1: a trim whose requested cut point
+ *     has a source keyframe within one frame (main.js's showinfo probe —
+ *     see findKeyframeAlignedStart) can copy from that keyframe, so it
+ *     passes `ctx.trimKeyAligned: true` and stays copy-eligible
  *   - ANY overlay intersecting the clip window
  *   - burned captions/headlines for this clip (assSuffix)
  *   - a watermark anywhere in the project
@@ -120,12 +124,12 @@ function isLastSeg(i, segments) {
 function clipNeedsReEncode(ctx) {
   const {
     i, seg, segments, transition,
-    overlayCount, assSuffix, wm,
+    overlayCount, assSuffix, wm, trimKeyAligned,
   } = ctx;
   const isVideo = !!(seg && seg.mediaType === "video" && seg.videoPath);
   if (!isVideo) return true;
   if (resolveSegSpeed(seg) !== 1) return true;
-  if ((Number(seg.trimInMs) || 0) > 0) return true;
+  if ((Number(seg.trimInMs) || 0) > 0 && trimKeyAligned !== true) return true;
   if (Number(overlayCount) > 0) return true;
   if (assSuffix) return true;
   if (wm) return true;
@@ -145,21 +149,39 @@ function clipNeedsReEncode(ctx) {
  * and remux the video packets UNTOUCHED (no decode, no filter graph, no
  * encode). Eligibility is decided upstream (clipNeedsReEncode + the probe
  * format checks in main.js); this builder only lays out the fast argv:
- *   -t <dur> -i <src> -c:v copy -an -avoid_negative_ts make_zero -y <out>
+ *   [-ss <sec> -noaccurate_seek] -t <dur> -i <src> -c:v copy -an
+ *   -avoid_negative_ts make_zero -y <out>
  * `-t` rides the INPUT side so demux stops early; `-an` keeps the clip
  * video-only (audio is mixed separately in step 2); make_zero normalizes
  * packet timestamps so the concat demuxer offsets cleanly.
+ * v1.4.1 KEYFRAME-ALIGNED TRIMS: `o.ss` is the EXACT pts string (µs
+ * precision, e.g. "2.033367") of a source keyframe that main.js's probe
+ * found within one frame of the requested trimInMs. Two hard-won details
+ * (verified against real ffmpeg 6.1.1):
+ *   • `-noaccurate_seek` makes the demuxer START output at the seek-LANDING
+ *     keyframe instead of discarding packets until the target — without it
+ *     the copy would begin on a mid-GOP frame (undecodable leading frames).
+ *   • the exact string matters: a target even 1 ms EARLY makes the backward
+ *     seek land on the PREVIOUS keyframe and pull a whole extra GOP of
+ *     content. Same-string round-trips land on the intended keyframe.
+ * `-t <dur>` is measured on ORIGINAL timestamps from the seek target, so
+ * the copied window is exactly [ss, ss + dur] — timeline length preserved.
  */
 function buildStreamCopyArgs(o) {
   const durMs = Math.max(0, Number(o && o.durMs) || 0);
-  return [
+  const ss =
+    o && typeof o.ss === "string" && /^\d+(?:\.\d+)?$/.test(o.ss) ? o.ss : null;
+  const argv = [];
+  if (ss) argv.push("-ss", ss, "-noaccurate_seek");
+  argv.push(
     "-t", fmt3(durMs),
     "-i", o && o.path,
     "-c:v", "copy",
     "-an",
     "-avoid_negative_ts", "make_zero",
     "-y", o && o.clipPath,
-  ];
+  );
+  return argv;
 }
 
 /**
@@ -706,7 +728,17 @@ function hexLuma(hex) {
 
 function buildOverlayChain(o) {
   const chroma = o && o.chroma ? o.chroma : null;
-  const parts = [`scale=${o.dw}:${o.dh}`];
+  const parts = [];
+  // v1.4.1: per-overlay FPS normalization — main.js only sets o.fps for a
+  // VIDEO overlay whose probed rate EXCEEDS the project rate (e.g. 60 fps
+  // PiP over a 30 fps timeline). Un-normalized, the surplus frames force
+  // every downstream stage (scale → chromakey → despill → format → the
+  // overlay composite itself → encode) to run at the overlay's rate ≈ 2×
+  // the work. `fps` FIRST in the chain drops them before anything else
+  // runs; near/slower overlays are left untouched (dup frames would only
+  // ADD downstream work, and framesync already syncs by timestamp).
+  if (o && o.fps) parts.push(`fps=${o.fps}`);
+  parts.push(`scale=${o.dw}:${o.dh}`);
   if (chroma) {
     const sim = clampNum(chroma.similarity, 0.01, 0.5, 0.32);
     const blend = clampNum(chroma.blend, 0, 1, 0.08);
@@ -1081,7 +1113,7 @@ function buildClipArgs(ctx) {
   function applyOverlays(state) {
     for (const ov of overlays) {
       const oi = state.inputIdx;
-      state.graph += `;${buildOverlayChain({ inputIdx: oi, dw: ov.dw, dh: ov.dh, chroma: ov.chroma, a: ov.a })}`;
+      state.graph += `;${buildOverlayChain({ inputIdx: oi, dw: ov.dw, dh: ov.dh, chroma: ov.chroma, a: ov.a, fps: ov.fps })}`;
       const out = `[o${oi}]`;
       state.graph += `;${buildOverlayFilter({ accLabel: state.label, inputIdx: oi, x: ov.x, y: ov.y, a: ov.a, b: ov.b, outLabel: out })}`;
       state.label = out;
@@ -1191,7 +1223,7 @@ function buildClipArgs(ctx) {
       let label = "[base]";
       let oi = 1;
       for (const ov of overlays) {
-        g += `;${buildOverlayChain({ inputIdx: oi, dw: ov.dw, dh: ov.dh, chroma: ov.chroma, a: ov.a })}`;
+        g += `;${buildOverlayChain({ inputIdx: oi, dw: ov.dw, dh: ov.dh, chroma: ov.chroma, a: ov.a, fps: ov.fps })}`;
         const out = `[o${oi}]`;
         g += `;${buildOverlayFilter({ accLabel: label, inputIdx: oi, x: ov.x, y: ov.y, a: ov.a, b: ov.b, outLabel: out })}`;
         label = out;
