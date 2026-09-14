@@ -557,3 +557,38 @@ UNRESOLVED ISSUES / RISKS + NEXT-PHASE PRIORITIES:
 - Open-GOP sources: a copy cut at an open-GOP I-frame can briefly reference across the cut (industry-wide caveat for ALL smart-render editors; tolerance is ≤1 frame and the format gate already demands exact codec/dims/fps match). Field telemetry (keyframeCuts in the toast) is the watch signal.
 - Dev server restarts require the EXACT double-fork form (trailing & inside the setsid bash -c); the wrong form dies within a minute.
 - Remaining candidates: simplified 16–24 px icon variant; render-at-rate export option (deliberately skipped); whisper pre-download for fw models is desktop-only and still untested in the field.
+
+---
+Task ID: 22 (v1.4.2 escalation round — faster-whisper field crash + 3.5 h export fix)
+Agent: main (Z.ai Code)
+Task: User escalation: (1) faster-whisper broken on Windows — "Importing the numpy C-extensions failed … _multiarray_umath.cp312-win_amd64.pyd … incompatible with python 'cpython-311'"; (2) export STILL 3 h 30 m for a 19-min video. Fix both, rebuild installer, push.
+
+STATUS ASSESSMENT (start of round):
+- Repo at ac16152 (v1.4.1, all pushed). Dev server healthy. A mid-round sandbox tool outage (MCP 429, ~50 retries) split the round in two — diagnosis was completed before the outage, implementation after.
+- faster-whisper root cause (deterministic): stage-faster-whisper.js bundles the Windows embeddable CPython 3.11.9 but pip resolved wheels WITHOUT --python-version/--abi flags → wheels for the BUILD HOST's Python 3.12 (cp312 .pyd) → cannot load on 3.11. Verified empirically: the pinned resolve yields numpy-2.4.6-cp311, ctranslate2-4.8.2-cp311, onnxruntime-1.30.0-cp311, av-18.1.0-cp311-abi3, tokenizers-0.23.2-cp310-abi3 — all load on 3.11.
+- SECOND latent bug found while fixing: faster-whisper 1.2.1 passes local_dir_use_symlinks=False to snapshot_download(); hub 1.x REMOVED that parameter (verified in hub 1.31.0 source) → TypeError on first model download. Pinned huggingface-hub>=0.21,<1.0 (0.36.2 still accepts it — verified in its source).
+- Export root cause (structural): the encoder probe/pool/stream-copy layers were all fine — the surviving bottleneck is that ONE long re-encode clip = ONE ffmpeg process, and the filter graph (libass subtitles, scale, overlay) is single-threaded → ~3 fps → multi-hour exports regardless of core count. Plus hw decode was unconditionally off (v1.1 WARP policy), hurting 4K/H.265 sources.
+
+GOALS / COMPLETED / VERIFICATION:
+1. FIX A — faster-whisper runtime (field crash):
+   - stage-faster-whisper.js: pip gains --python-version 3.11 --implementation cp --abi cp311 (+ huggingface-hub<1.0 pin) — wheels now resolve for the BUNDLED interpreter.
+   - NEW WHEEL-TAG GUARD (findIncompatiblePyds): scans every staged .pyd; hard-fails on non-abi3 tag ≠ cp311 or abi3 tag > cp311. The exact field failure is now impossible to ship silently. Ran inside the real electron:build pipeline: "all .pyd files load on cp311 ✓".
+   - VERIFIED in the shipped installer: dist/win-unpacked/resources/faster-whisper-runtime/.../numpy/_core/_multiarray_umath.cp311-win_amd64.pyd (was cp312 in the user's error).
+2. FIX B — CHUNKED PARALLEL ENCODE (the 19-min → 3.5 h fix):
+   - export-graph.js planChunkFrames: frame-aligned chunk plan (integer frame counts, frame-sum parity, boundaries exact on the output grid); chunks ≥ target/2, count = max(2, ceil(dur/60)) capped at pool width.
+   - buildClipArgs ctx.chunk: µs-precision seeks (ssSec — fmt3's ms truncation can straddle a 60 fps frame edge), chunk -t, speed-aware source windows (offset×speed), fade gating (head fades only on FIRST chunk, tail fades only on LAST with chunk-local st). No chunk → byte-identical legacy argv.
+   - main.js: per-chunk ASS documents (buildAssDocument already windows cues — a cue crossing a boundary renders partially in each chunk, same semantics as segment boundaries), per-chunk overlay specs (refactored to buildOverlaySpecsForWindow — playback position, motion clock, enable windows all re-windowed), chunk jobs ride the existing pool, concat stays -c copy; estVideoJobs makes the thread budget chunk-aware.
+   - VERIFIED: scripts/verify-chunked-encode.js — 36/36 against REAL ffmpeg: plan gating/parity; legacy argv byte-shape; chunk argv (fades/speed/µs seeks); REAL E2E single-vs-chunked (3000 frames = 3000 frames, duration parity < 1 frame, clean concat decode); REAL buildAssDocument chunk windowing (main.js loaded through an electron require-cache stub — cue at 40–60 s across the 50 s boundary: PSNR-verified caption presence at t=45 AND t=55, absence at t=70); verify-kf-trims.js still 22/22.
+3. FIX C — PROBE-GATED HARDWARE DECODE:
+   - probeHwDecode (main.js): decodes 72 real frames of the ACTUAL file twice (CPU vs -hwaccel auto), enables hw decode only when ≥ 1.3× faster; cached per path; any failure → CPU. Replaces v1.1's unconditional-off (the WARP hazard) with per-source evidence. The probe even ran on this Linux box (vdpau 49 ms vs CPU 65 ms → correctly gated).
+4. TELEMETRY: ExportResult/LastExport + toast + violet "⧉ N parallel" header chip (chunkedClips/totalChunks/hwDecodeClips) — a slow export is now diagnosable at a glance.
+5. GATES: tsc 0 · eslint 0 · both harnesses green (22 + 36) · agent-browser E2E: clean load (v1.4.2 title), 100 s test video upload (real duration), play → 00:00.0 → 00:03.2 real-time, 0 console errors.
+6. SHIPPED: commit 4061673 pushed to main; dist/FrameFuse Setup 1.4.2.exe (212.6 MB, rcedit-native "version 1.4.2.0, icon replaced") built FOREGROUND (clean → next build --webpack → copy-wasm → fetch-windows-ffmpeg → stage-whisper-service → stage-faster-whisper → electron-builder --win nsis — NO wine needed: Linux-native makensis + UninstallerReader + rcedit-native all verified in-place); packaged app.asar verified to contain planChunkFrames/probeHwDecode/CHUNK_TARGET_SEC; GitHub release v1.4.2 (id 388322912) with FrameFuse.Setup.1.4.2.exe + blockmap + latest.yml uploaded; dev server restarted double-fork (GET / 200).
+
+UNRESOLVED ISSUES / RISKS + NEXT-PHASE PRIORITIES:
+- Field validation needed on Windows: (a) faster-whisper import + first transcription with the pre-downloaded model; (b) a 19-min re-encode with subtitles — expect the toast to read "4 chunks encoded in parallel" and minutes, not hours. The telemetry now makes the next field report self-diagnosing.
+- Chunk boundary caveat: subtitles/overlays crossing a boundary render partially per chunk (identical to segment-boundary semantics — by design). Open-GOP sources at keyframe-aligned copy cuts remain the standing industry caveat.
+- Images are deliberately NOT chunked (zoompan frame indexing; slideshows are inherently many-clip). A long single-image clip with Ken Burns still encodes single-process — acceptable, noted.
+- GPU filter graphs stay DEFERRED (bundled Linux ffmpeg has no CUDA filters; needs a Windows GPU box + runtime availability probe + CPU fallback — evidence recorded in Task 21).
+- Remaining candidates: simplified 16–24 px icon variant; render-at-rate export (deliberately skipped); whisper fw pre-download field test.
+- Operational: the v1.4.2 build needed NO wine and NO wine-portable PATH (native makensis) — the recipe is now fully portable across environment resets.
