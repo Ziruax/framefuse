@@ -336,12 +336,19 @@ function planTimelineChunks(o) {
  * GLOBAL FRAME grid (k0/k1 clamped to each segment's span) — not timeline
  * ms — so the concatenated chunk frames are exactly the W=1 frames.
  *
- * VIDEO: source seek = trimIn + (k0 − S)/fps × speed at µs precision (the
- * v1.4.2 lesson: fmt3's ms truncation can straddle a 60 fps frame edge).
+ * VIDEO: the sub-seek snaps to the SOURCE-frame grid at the frame W=1's
+ * slot (k0 − S) DISPLAYS — the last source frame ≤ the slot's time bound
+ * (the fps filter's "last ≤" semantics). For rate-matched sources
+ * (srcFps == fps) this is bit-exact at ANY trim alignment (the grid shift
+ * quantizes to whole output frames); for rate-mismatched sources the
+ * sub-grid sits ε (< one source frame) earlier than W=1's — a documented
+ * ±1-source-frame jitter at the ε-straddling slots (sub-perceptual, no
+ * count/duration drift). `srcFpsPerSeg` (probed source rates) selects the
+ * grid; absent/unknown → the project fps (matched-rate behavior).
  * IMAGE: trimIn stays 0 (zoompan offset handles mid-animation cuts).
  * Returns [{ seg (windowed copy), origIdx, S, F, k0, k1, ssSec|null }].
  */
-function windowSegmentsForChunk(segments, spans, f0, f1, fps) {
+function windowSegmentsForChunk(segments, spans, f0, f1, fps, srcFpsPerSeg) {
   const out = [];
   for (let i = 0; i < segments.length; i++) {
     const span = spans && spans[i];
@@ -356,11 +363,32 @@ function windowSegmentsForChunk(segments, spans, f0, f1, fps) {
     let ssSec = null;
     if (isVideo) {
       const speed = G.resolveSegSpeed(seg);
-      const srcSeekMs =
-        (Number(seg.trimInMs) || 0) + ((k0 - span.S) / fps) * 1000 * speed;
-      copy.trimInMs = srcSeekMs;
-      copy.durationMs = durMs;
-      ssSec = (srcSeekMs / 1000).toFixed(6);
+      if (k0 === span.S) {
+        // The sub-window starts at the segment's OWN start (chunk 0, or a
+        // boundary exactly at a segment start): keep the EXACT W=1 seek —
+        // same phase, same trimIn, byte-identical head.
+        copy.durationMs = durMs;
+        // ssSec stays null → buildVideoInputArgs formats fmt3(trimInMs),
+        // exactly like the W=1 plan.
+      } else {
+        // SOURCE-time bound of W=1's slot (k0 − S): trimIn + offset×speed.
+        const boundSec =
+          ((Number(seg.trimInMs) || 0) + ((k0 - span.S) / fps) * 1000 * speed) / 1000;
+        // The frame W=1 displays there = the last source frame ≤ bound (CFR
+        // source grid). Seeking EXACTLY at that frame makes the sub-window's
+        // slot 0 show it — bit-identical to W=1's slot (k0 − S).
+        const g =
+          Array.isArray(srcFpsPerSeg) && Number(srcFpsPerSeg[i]) > 0
+            ? Number(srcFpsPerSeg[i])
+            : fps;
+        const kFrame = Math.floor(boundSec * g);
+        const seekSec = kFrame / g;
+        copy.trimInMs = seekSec * 1000;
+        copy.durationMs = durMs;
+        // µs formatting truncates ≤1 µs EARLY — the target frame is still the
+        // first decoded frame (truncation can never skip past it).
+        ssSec = seekSec.toFixed(6);
+      }
     } else {
       copy.durationMs = durMs;
     }
@@ -390,7 +418,15 @@ function padOverlayInputWindows(specs, durMs, padMs = 120) {
   for (const ov of Array.isArray(specs) ? specs : []) {
     if (!ov) continue;
     // Only windows clipped at the chunk end (the overlay continues past it).
-    if (!(Number(ov.b) > 0) || Math.abs(Number(ov.b) - durSec) > 0.001) continue;
+    // v6.5: `clippedEnd` comes from overlayWindow (the authoritative flag);
+    // the b≈durSec heuristic stays as the fallback for spec builders that
+    // predate the flag.
+    const clipped =
+      ov.clippedEnd === true ||
+      (ov.clippedEnd == null &&
+        Number(ov.b) > 0 &&
+        Math.abs(Number(ov.b) - durSec) <= 0.001);
+    if (!clipped) continue;
     const args = ov.inputArgs;
     if (!Array.isArray(args)) continue;
     const iIdx = args.indexOf("-i");
@@ -626,7 +662,19 @@ function buildSinglePassPlan(o) {
         // buildVideoInputArgs + output -t pair, verified by the harness).
         durMs: sourceWinMs,
       }));
-      graph.push(`${base}${G.buildVideoFilterChain({ width, height, fps, speed })}[s${i}]`);
+      // v6.5 PHASE NORMALIZER: `setpts=PTS-STARTPTS` pins the chain's output
+      // to pts 0. Without it, an input seek whose phase lands in the first
+      // half of a source frame interval (frac(trimIn×fps) ∈ (0, 0.5)) makes
+      // the fps filter emit its first frame at pts ≈ 1/fps — the concat
+      // filter then fills the leading sub-frame gap with a DUPLICATE (+1
+      // frame per affected segment; empirically isolated: concat n=1 with
+      // -ss 0.437 @30fps → 127 frames vs 126). The normalizer makes the
+      // emitted count EXACTLY ceil(dur×fps) — matching the two-step per-clip
+      // path and the chunk frame model. Aligned trims are a no-op (STARTPTS
+      // subtracts 0).
+      graph.push(
+        `${base}${G.buildVideoFilterChain({ width, height, fps, speed })},setpts=PTS-STARTPTS[s${i}]`,
+      );
       segLabels.push(`[s${i}]`);
       continue;
     }

@@ -64,11 +64,19 @@ function countFrames(p) {
   const ms = [...o.matchAll(/frame=\s*(\d+)/g)];
   return ms.length ? parseInt(ms[ms.length - 1][1], 10) : -1;
 }
-/** framemd5 of the decoded video stream (first stream only). */
+/** framemd5 HASHES of the decoded video stream (first stream only) — the
+ *  hash column only: the pts/dts columns differ across files even for
+ *  identical frame content (the neighbor-match comparator depends on this). */
 function frameMd5(p) {
   const r = spawnSync(FF, ["-hide_banner", "-loglevel", "error", "-i", p, "-map", "0:v:0", "-f", "framemd5", "-"], { encoding: "utf8", timeout: 180000 });
   if (r.status !== 0) throw new Error("framemd5 failed: " + (r.stderr || "").slice(-300));
-  return (r.stdout || "").split("\n").filter((l) => /^\d+,/.test(l.trim()));
+  return (r.stdout || "")
+    .split("\n")
+    .filter((l) => /^\d+,/.test(l.trim()))
+    .map((l) => {
+      const cols = l.split(",");
+      return cols.length > 5 ? cols[5].trim() : l;
+    });
 }
 /** Decoded RGB24 bytes of one frame (for tolerance analysis). NB: the
  *  select filter's frame counter RESETS at concat-demuxer chunk boundaries
@@ -83,8 +91,15 @@ function rawFrame(p, n, fps) {
 /** W=1 ⇄ chunked video equivalence: EXACT frame-MD5 equality, or — only
  *  for frames whose segments lost an xfade-head passthrough — the measured
  *  xfade chroma-resample rounding (max channel delta ≤ 4, ≤ 2 % of pixels;
- *  anything larger is a real windowing/seek/offset bug). */
-function videoEquivalent(fileA, fileB, fps) {
+ *  anything larger is a real windowing/seek/offset bug).
+ * `jitter` (rate-mismatched sources): additionally accept a frame that
+ *  MD5-matches a NEIGHBORING W=1 frame — the documented ±1-source-frame
+ *  phase jitter (a seek-based sub-window cannot bit-match the W=1 "last ≤
+ *  slot" frame choice when srcFps ≠ fps; the displayed SOURCE frames are
+ *  identical, only the dup-slot placement shifts). Returns the jitter stats
+ *  for reporting. */
+function videoEquivalent(fileA, fileB, fps, opts) {
+  const jitter = !!(opts && opts.jitter);
   const a = frameMd5(fileA);
   const b = frameMd5(fileB);
   if (a.length !== b.length) {
@@ -93,6 +108,24 @@ function videoEquivalent(fileA, fileB, fps) {
   const diffIdx = [];
   for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) diffIdx.push(i);
   if (diffIdx.length === 0) return { ok: true, exact: true, diffs: 0 };
+  let jitterMatches = 0;
+  if (jitter) {
+    // Documented rate-mismatch phase jitter: the frame content equals a
+    // NEIGHBORING W=1 frame (same source frame, shifted dup-slot).
+    const remaining = [];
+    for (const i of diffIdx) {
+      if ((i > 0 && b[i] === a[i - 1]) || (i < a.length - 1 && b[i] === a[i + 1])) {
+        jitterMatches++;
+      } else {
+        remaining.push(i);
+      }
+    }
+    if (remaining.length === 0) {
+      return { ok: true, exact: false, diffs: diffIdx.length, first: diffIdx[0], jitter: jitterMatches, total: a.length };
+    }
+    diffIdx.length = 0;
+    diffIdx.push(...remaining.slice(0, 32));
+  }
   for (const i of diffIdx.slice(0, 32)) {
     const ra = rawFrame(fileA, i, fps);
     const rb = rawFrame(fileB, i, fps);
@@ -180,6 +213,7 @@ function imageOverlaySpecsFor(overlays, width, height, winStartMs, winDurMs) {
       inputArgs: G.buildOverlayImageInputArgs({ durMs: win.overlapMs, path: ov.imagePath }),
       fps: null, x, y, xExpr, yExpr, dw: geo.dw, dh: geo.dh,
       chroma: ov.chroma || null, a: win.a, b: win.b,
+      clippedEnd: win.clippedEnd,
     });
   }
   return specs;
@@ -249,6 +283,23 @@ console.log("2) W=1 byte-differential vs git HEAD (regression guard)");
   }
   const HSP = require(path.join(headDir, "export-singlepass.js"));
 
+  /** v6.5: the W=1 video chains gained a deliberate `,setpts=PTS-STARTPTS`
+   *  phase normalizer (fixes the concat-filter +1-duplicate on unaligned
+   *  trims — frac(trimIn×fps) ∈ (0,0.5)). The differential applies the SAME
+   *  transformation to HEAD's script so it still catches every OTHER drift. */
+  const normalizeHeadScript = (script, segs) => {
+    const videoIdx = new Set(
+      (segs || []).map((s, i) => (s && s.mediaType === "video" && s.videoPath ? i : -1)).filter((i) => i >= 0),
+    );
+    return script.split(";").map((stmt) => {
+      const m = /^\[(\d+):v\](.*)\[s(\d+)\]$/.exec(stmt);
+      if (m && Number(m[1]) === Number(m[3]) && videoIdx.has(Number(m[1])) && !stmt.includes("zoompan")) {
+        return stmt.replace(/\[s\d+\]$/, ",setpts=PTS-STARTPTS[s" + m[3] + "]");
+      }
+      return stmt;
+    }).join(";");
+  };
+
   const fixBase = {
     fps: 30, width: 640, height: 360, totalMs: 12800,
     kbEnabled: true, zoomMax: 1.15, globalDir: "in",
@@ -301,7 +352,8 @@ console.log("2) W=1 byte-differential vs git HEAD (regression guard)");
     }
     const a = HSP.buildSinglePassPlan(o);
     const b = SP.buildSinglePassPlan(o);
-    const samePlan = JSON.stringify([a.inputs, a.script, a.hasAudioOut, a.videoOutLabel]) ===
+    const aScript = normalizeHeadScript(a.script, o.segments);
+    const samePlan = JSON.stringify([a.inputs, aScript, a.hasAudioOut, a.videoOutLabel]) ===
       JSON.stringify([b.inputs, b.script, b.hasAudioOut, b.videoOutLabel]);
     const aArgs = HSP.buildSinglePassArgs({ plan: a, scriptPath: "/tmp/g.txt", encArgs: ["-c:v", "libx264"], abr: "192k", fps: 30, outputPath: "/tmp/out.mp4", threads: 0, filterThreads: 4 });
     const bArgs = SP.buildSinglePassArgs({ plan: b, scriptPath: "/tmp/g.txt", encArgs: ["-c:v", "libx264"], abr: "192k", fps: 30, outputPath: "/tmp/out.mp4", threads: 0, filterThreads: 4 });
@@ -406,7 +458,7 @@ console.log("3) REAL E2E: W=1 lossless vs CHUNKED (videoOnly+audioOnly+mux)");
     const chunkFiles = [];
     for (let ci = 0; ci < KC; ci++) {
       const c = chunkPlan.chunks[ci];
-      const winSegs = SP.windowSegmentsForChunk(segments, chunkPlan.spans, c.f0, c.f1, fps);
+      const winSegs = SP.windowSegmentsForChunk(segments, chunkPlan.spans, c.f0, c.f1, fps, [30, 0, 30]);
       const segMeta = winSegs.map((w) => ({ origIdx: w.origIdx, S: w.S, F: w.F, k0: w.k0, k1: w.k1, ssSec: w.ssSec }));
       const ovSpecs = SP.padOverlayInputWindows(imageOverlaySpecsFor(overlays, width, height, c.t0Ms, c.durMs), c.durMs);
       const doc = M.buildAssDocument(subtitleCues, captionSettings, [], width, height, c.t0Ms, c.t0Ms + c.durMs, c.durMs);
@@ -560,6 +612,139 @@ console.log("4) REAL E2E: xfade heads + boundaries routed around head zones");
     ok(`xfade frame-count parity (${f1} vs ${f2}, model=${chunkPlan.totalFrames})`, f1 === f2 && f1 === chunkPlan.totalFrames);
     const eqv = videoEquivalent(path.join(TMP, "xw1.mp4"), outPath, FPS);
     ok("xfade video parity (heads + KB offsets exact or chroma-rounding)", eqv.ok, eqv.why || (eqv.exact ? "exact" : `${eqv.diffs} frames, first @${eqv.first}`));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+console.log("5) REAL E2E: UNALIGNED trims + mixed source rates + speed (the concat-dup regime)");
+// ═══════════════════════════════════════════════════════════════════════════
+{
+  const W = 640, H = 360, FPS = 30;
+  // Sources: a 25fps video WITH audio (rate mismatch), plus reuses of the
+  // 30fps fixture videos from section 3 (which carry sine audio).
+  run(["-y", "-hide_banner", "-loglevel", "error",
+    "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25",
+    "-f", "lavfi", "-i", "sine=frequency=660:sample_rate=48000",
+    "-t", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+    "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+    path.join(TMP, "r25.mp4")]);
+  const trims = [437, 574, 711, 848, 233, 966, 515];
+  const durs = [4200, 3900, 5100, 6300, 6100, 5900, 8500];
+  // The SPEED segment rides a rate-MATCHED (30fps) source so its parity is
+  // bit-exact; the 25fps sources exercise the documented ±1-source-frame
+  // jitter at speed 1 (MD5-matchable against neighboring W=1 frames).
+  // speed × rate-mismatch is a known residual: the sub-window shows a source
+  // frame W=1 never samples (imperceptible ±27 ms phase jitter at 1.5×, no
+  // drift) — documented in docs/EXPORT_PERF.md.
+  const paths = [
+    path.join(TMP, "v1.mp4"), path.join(TMP, "r25.mp4"), path.join(TMP, "v2.mp4"),
+    path.join(TMP, "r25.mp4"), path.join(TMP, "v1.mp4"), path.join(TMP, "v2.mp4"), path.join(TMP, "r25.mp4"),
+  ];
+  const speeds = [1, 1, 1, 1, 1, 1.5, 1];
+  const segments = trims.map((t, i) => ({
+    id: `u${i}`, mediaType: "video", videoPath: paths[i],
+    durationMs: durs[i], trimInMs: t, speed: speeds[i] > 1 ? speeds[i] : undefined,
+    startMs: durs.slice(0, i).reduce((a, b) => a + b, 0),
+  }));
+  const totalMs = durs.reduce((a, b) => a + b, 0);
+  const fps = FPS, width = W, height = H;
+  const transition = { style: "dip-black", durationMs: 400, fadeStartEnd: true };
+  const kb = { enabled: false, zoomMax: 1.15, globalDir: "in" };
+  const overlays = [{
+    imagePath: path.join(TMP, "ov.png"), mediaType: "image",
+    startMs: 15000, durationMs: 12000, trimInMs: 0,
+    sourceWidth: 320, sourceHeight: 180,
+    overlay: { x: 0.1, y: 0.1, scale: 0.35, motion: null },
+  }];
+  const audio = { normalize: false, musicVolume: 0.4, masterVolume: 1, musicStartMs: 0, fadeInMs: 300, fadeOutMs: 700, musicLoop: false };
+  const audioPath = path.join(TMP, "music.m4a");
+  const captionSettings = { enabled: true, fontSize: 0.05, textColor: "#FFFFFF", wordMode: "off", animation: "none", position: "bottom", fontWeight: 600 };
+  const subtitleCues = [
+    { startMs: 11000, endMs: 14000, text: "Unaligned boundary cue" },
+    { startMs: 30000, endMs: 34000, text: "Second boundary cue" },
+  ];
+  const fullFades = SP.buildGlobalFades({ segments, transition, totalMs });
+  const assDoc = M.buildAssDocument(subtitleCues, captionSettings, [], width, height, 0, totalMs, totalMs);
+  const assSuffix = assSuffixFor(assDoc, "ufull");
+  const globalOverlaySpecs = imageOverlaySpecsFor(overlays, width, height, 0, totalMs);
+  const clipAudioBranches = [
+    { inputIdx: 0, startMs: 0, volume: 1, atempo: [], durationMs: durs[0] },
+    { inputIdx: 5, startMs: durs.slice(0, 5).reduce((a, b) => a + b, 0), volume: 0.6, atempo: G.atempoFilters(1.5), durationMs: durs[5] },
+  ];
+
+  const w1Plan = SP.buildSinglePassPlan({
+    segments, fps, width, height, totalMs,
+    kbEnabled: kb.enabled, zoomMax: kb.zoomMax, globalDir: kb.globalDir,
+    transition, wm: null, assSuffix, overlaySpecs: globalOverlaySpecs,
+    audio, audioPath, sfx: [], clipAudio: clipAudioBranches,
+    loudnorm: null, masterLoudnorm: null, hwaccelPerSeg: [],
+  });
+  const w1Script = path.join(TMP, "uw1.txt");
+  fs.writeFileSync(w1Script, w1Plan.script, "utf-8");
+  run(SP.buildSinglePassArgs({
+    plan: w1Plan, scriptPath: w1Script, encArgs: LOSSLESS, abr: "192k",
+    fps, outputPath: path.join(TMP, "uw1.mp4"), threads: 1, filterThreads: 1,
+  }));
+
+  const chunkPlan = SP.planTimelineChunks({
+    segments, transition, kbEnabled: kb.enabled, globalDir: kb.globalDir,
+    fps, totalMs, fades: fullFades, workerCount: 3,
+  });
+  ok("unaligned fixture → chunk plan", !!chunkPlan && chunkPlan.chunks.length >= 2, JSON.stringify(chunkPlan && chunkPlan.chunks.map((c) => c.frames)));
+  if (chunkPlan && chunkPlan.chunks.length >= 2) {
+    const chunkFiles = [];
+    for (let ci = 0; ci < chunkPlan.chunks.length; ci++) {
+      const c = chunkPlan.chunks[ci];
+      const winSegs = SP.windowSegmentsForChunk(segments, chunkPlan.spans, c.f0, c.f1, fps, [30, 25, 30, 25, 30, 25, 30]);
+      const segMeta = winSegs.map((w) => ({ origIdx: w.origIdx, S: w.S, F: w.F, k0: w.k0, k1: w.k1, ssSec: w.ssSec }));
+      const ovSpecs = SP.padOverlayInputWindows(imageOverlaySpecsFor(overlays, width, height, c.t0Ms, c.durMs), c.durMs);
+      const doc = M.buildAssDocument(subtitleCues, captionSettings, [], width, height, c.t0Ms, c.t0Ms + c.durMs, c.durMs);
+      const cAss = doc ? assSuffixFor(doc, `uchunk${ci}`) : null;
+      const cPlan = SP.buildSinglePassPlan({
+        segments: winSegs.map((w) => w.seg), fullSegments: segments,
+        window: { t0Ms: c.t0Ms, durMs: c.durMs, segMeta },
+        videoOnly: true, fades: fullFades,
+        fps, width, height, totalMs,
+        kbEnabled: kb.enabled, zoomMax: kb.zoomMax, globalDir: kb.globalDir,
+        transition, wm: null, assSuffix: cAss, overlaySpecs: ovSpecs,
+        audio, audioPath: null, sfx: [], clipAudio: [],
+        loudnorm: null, masterLoudnorm: null, hwaccelPerSeg: [],
+      });
+      const cScript = path.join(TMP, `uc${ci}.txt`);
+      fs.writeFileSync(cScript, cPlan.script, "utf-8");
+      const cPath = path.join(TMP, `uc${ci}.mp4`);
+      chunkFiles.push(cPath);
+      run(SP.buildSinglePassArgs({
+        plan: cPlan, scriptPath: cScript, encArgs: LOSSLESS, abr: "192k",
+        fps, outputPath: cPath, threads: 1, filterThreads: 1,
+      }));
+    }
+    const aPlan = SP.buildSinglePassPlan({
+      segments, fps, width, height, totalMs, audioOnly: true,
+      audio, audioPath, sfx: [], clipAudio: clipAudioBranches,
+      loudnorm: null, masterLoudnorm: null,
+    });
+    const aScript = path.join(TMP, "ua.txt");
+    fs.writeFileSync(aScript, aPlan.script, "utf-8");
+    const aPath = path.join(TMP, "ua.m4a");
+    run(SP.buildAudioOnlyArgs({ plan: aPlan, scriptPath: aScript, abr: "192k", totalSec: chunkPlan.totalFrames / fps, outputPath: aPath }));
+    const listPath = path.join(TMP, "ulist.txt");
+    fs.writeFileSync(listPath, chunkFiles.map((p) => `file '${p}'`).join("\n"), "utf-8");
+    const outPath = path.join(TMP, "uchunked.mp4");
+    run(["-y", "-hide_banner", "-loglevel", "error",
+      "-f", "concat", "-safe", "0", "-i", listPath, "-i", aPath,
+      "-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-shortest", "-movflags", "+faststart", outPath]);
+
+    const f1 = countFrames(path.join(TMP, "uw1.mp4"));
+    const f2 = countFrames(outPath);
+    ok(`unaligned: W=1 emits EXACTLY the frame model (W1=${f1} model=${chunkPlan.totalFrames}) — the setpts normalizer killed the concat +1 dups`, f1 === chunkPlan.totalFrames, `${f1} vs ${chunkPlan.totalFrames}`);
+    ok(`unaligned: chunked frame-count parity (${f2})`, f2 === chunkPlan.totalFrames, `${f2} vs ${chunkPlan.totalFrames}`);
+    const eqv = videoEquivalent(path.join(TMP, "uw1.mp4"), outPath, FPS, { jitter: true });
+    ok("unaligned: video parity (exact, chroma rounding, or the documented rate-mismatch ±1-frame jitter)", eqv.ok,
+      eqv.why || (eqv.exact ? "exact" : eqv.jitter != null ? `${eqv.jitter}/${eqv.total} frames via ±1 jitter — rest exact` : `${eqv.diffs} frames, first @${eqv.first}`));
+    const p1 = pcmMd5(path.join(TMP, "uw1.mp4"), (totalMs / 1000) - 0.1);
+    const p2 = pcmMd5(outPath, (totalMs / 1000) - 0.1);
+    ok("unaligned: audio PCM parity", Buffer.compare(p1, p2) === 0, `sizes ${p1.length} vs ${p2.length}`);
   }
 }
 

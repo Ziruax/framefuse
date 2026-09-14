@@ -849,6 +849,13 @@ function buildVideoFilterChain(o) {
  *   a / b:     clip-local seconds of the visible window (enable= between)
  *   ssMs:      SOURCE seek point = trimIn + max(0, clipStart − ovStart)
  *              (the overlay's playback position at the clip start)
+ *   clippedEnd: v6.5 — true when the overlay's OWN end lies past the clip
+ *              window (it continues into the next clip/chunk). Consumers
+ *              that pad overlay INPUT windows past a chunk end need exactly
+ *              this case (framesync eof_action=pass would otherwise drop the
+ *              overlay from the chunk's last frame); overlays that END
+ *              inside the window must NOT be padded (the full render's own
+ *              EOF behavior is the reference).
  */
 function overlayWindow(ov, clipStartMs, clipDurMs) {
   if (!ov || !Number.isFinite(clipStartMs) || !Number.isFinite(clipDurMs)) return null;
@@ -865,6 +872,7 @@ function overlayWindow(ov, clipStartMs, clipDurMs) {
     a: (s - clipStartMs) / 1000,
     b: (e - clipStartMs) / 1000,
     ssMs: (Number(ov.trimInMs) || 0) + Math.max(0, clipStartMs - ovStart),
+    clippedEnd: ovEnd > clipEnd + 1e-9,
   };
 }
 

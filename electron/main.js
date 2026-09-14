@@ -2760,6 +2760,11 @@ ipcMain.handle("export-native", async (event, opts) => {
           chroma: ov.chroma || null,
           a: win.a,
           b: win.b,
+          // v6.5: the authoritative "overlay continues past this window" flag
+          // (padOverlayInputWindows pads exactly these inputs past a chunk
+          // end — framesync eof_action=pass would otherwise drop the overlay
+          // from the chunk's last frame).
+          clippedEnd: win.clippedEnd,
         });
       }
       return specs;
@@ -3324,7 +3329,18 @@ ipcMain.handle("export-native", async (event, opts) => {
           let chunkOverBudget = false;
           for (let ci = 0; ci < W && !chunkOverBudget; ci++) {
             const c = chunkPlan.chunks[ci];
-            const winSegs = SP.windowSegmentsForChunk(segments, chunkPlan.spans, c.f0, c.f1, fps);
+            // v6.5: per-segment SOURCE rates (probe cache is warm from the
+            // build loop) — the sub-seek snaps to each source's own frame
+            // grid so the sub-window's first frame is exactly the frame the
+            // W=1 render displays at the boundary (see windowSegmentsForChunk).
+            const srcFpsPerSeg = await Promise.all(
+              segments.map(async (s) =>
+                s && s.mediaType === "video" && s.videoPath
+                  ? Number((await probeMediaAsync(s.videoPath)).fps) || 0
+                  : 0,
+              ),
+            );
+            const winSegs = SP.windowSegmentsForChunk(segments, chunkPlan.spans, c.f0, c.f1, fps, srcFpsPerSeg);
             const segMeta = winSegs.map((w) => ({
               origIdx: w.origIdx, S: w.S, F: w.F, k0: w.k0, k1: w.k1, ssSec: w.ssSec,
             }));
@@ -3411,7 +3427,7 @@ ipcMain.handle("export-native", async (event, opts) => {
               lastEmit = now;
               let doneMs = 0;
               for (let k = 0; k < chunkJobs.length; k++) doneMs += chunkFrac[k] * chunkJobs[k].durationMs;
-              const frac = doneMs / Math.max(1, totalMs);
+              const frac = Math.min(1, doneMs / Math.max(1, totalMs));
               sendProgress(frac * 92, frac * totalSec, etaFor(frac));
             };
             try {
@@ -3426,7 +3442,11 @@ ipcMain.handle("export-native", async (event, opts) => {
                 },
               });
               // ── Audio bus: ONE full-timeline pass (no per-chunk AAC
-              //    boundary glitches, no windowed amix math).
+              //    boundary glitches, no windowed amix math). v6.5: bounded by
+              //    the VIDEO frame model (totalFrames/fps), and the final mux
+              //    carries -shortest — together this reproduces the W=1
+              //    render's -shortest-at-min(video,audio) tail exactly on
+              //    frame-inexact timelines.
               let spAudioPath = null;
               const hasAudioBus =
                 clipAudioBranches.length > 0 || !!audioPath || sfxList.length > 0;
@@ -3455,15 +3475,27 @@ ipcMain.handle("export-native", async (event, opts) => {
                     plan: aPlan,
                     scriptPath: aScriptPath,
                     abr: `${abr}k`,
-                    totalSec,
+                    totalSec: chunkPlan.totalFrames / fps,
                     outputPath: spAudioPath,
                   });
-                  await runFfmpeg(aArgs, totalSec, (sec) => {
-                    const frac = 0.92 + 0.04 * Math.min(1, sec / Math.max(0.01, totalSec));
-                    sendProgress(frac * 100, sec, etaFor(frac));
-                  });
+                  const audioStageStart = Date.now();
+                  try {
+                    await runFfmpeg(aArgs, totalSec, (sec) => {
+                      const frac = 0.92 + 0.04 * Math.min(1, sec / Math.max(0.01, totalSec));
+                      sendProgress(frac * 100, sec, etaFor(frac));
+                    });
+                  } catch (err) {
+                    if (err && err.message === "Export cancelled") throw err;
+                    if (Date.now() - audioStageStart < 4000) {
+                      console.warn("[framefuse] audio pass failed at init — falling back to the two-step pool:", err.message);
+                      spSkipW1 = true;
+                    } else {
+                      throw err;
+                    }
+                  }
                 }
               }
+              if (spSkipW1) { /* fall to the two-step pool below */ } else {
               // ── Concat the chunk videos + mux the audio (-c copy both).
               sendProgress(96.5, totalSec, etaFor(0.965));
               const spConcatPath = path.join(tempDir, `spconcat_${Date.now()}.txt`);
@@ -3480,13 +3512,30 @@ ipcMain.handle("export-native", async (event, opts) => {
                 "-map", "0:v:0",
                 ...(spAudioPath ? ["-map", "1:a:0"] : []),
                 "-c", "copy",
+                // v6.5: bound the container at the shorter stream, exactly like
+                // the W=1 render's encode-time -shortest (the audio pass is
+                // already bounded by the video frame model; this trims a
+                // longer music tail instead of shipping silent video frames).
+                ...(spAudioPath ? ["-shortest"] : []),
                 "-movflags", "+faststart",
                 outputPath,
               ];
-              await runFfmpeg(muxArgs, totalSec, (sec) => {
-                const frac = 0.965 + 0.035 * Math.min(1, sec / Math.max(0.01, totalSec));
-                sendProgress(frac * 100, sec, etaFor(frac));
-              });
+              const muxStageStart = Date.now();
+              try {
+                await runFfmpeg(muxArgs, totalSec, (sec) => {
+                  const frac = 0.965 + 0.035 * Math.min(1, sec / Math.max(0.01, totalSec));
+                  sendProgress(frac * 100, sec, etaFor(frac));
+                });
+              } catch (err) {
+                if (err && err.message === "Export cancelled") throw err;
+                if (Date.now() - muxStageStart < 4000) {
+                  console.warn("[framefuse] concat/mux failed at init — falling back to the two-step pool:", err.message);
+                  spSkipW1 = true;
+                } else {
+                  throw err;
+                }
+              }
+              } // end else (audio pass healthy → mux ran)
             } catch (err) {
               if (err && err.message === "Export cancelled") throw err;
               if (Date.now() - spStart < 4000) {
