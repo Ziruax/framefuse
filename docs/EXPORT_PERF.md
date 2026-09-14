@@ -59,6 +59,11 @@ sizes bounded.
    (full-frame per-frame resample vs zoompan's window resample), so zoompan
    stays; the scale+crop geometry math (self-correcting crop expressions) is
    preserved in `scripts/verify-kenburns-parity.js` as research.
+   *Overlay format*: the plan's `format=yuva420p` swap was also declined —
+   the rgba chain is byte-identical to HEAD (the parity differential), and
+   chromakey/despill operate in YUV before the conversion either way; the
+   win would be one pixel-format conversion per overlay frame against a
+   proven-compositing chain. Not worth the parity risk.
 4. **Global fades**: dip/bookend windows are emitted as
    `fade=…:enable='between(t,a,b)'` on the global stream AFTER the captions burn
    (the preview's `applyGlobalFade` order) — verified black-only-inside-window
