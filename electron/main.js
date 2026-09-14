@@ -26,6 +26,9 @@ const { spawn } = require("child_process");
 // transition tables + the v4.9 clip-argv builders (verbatim, moved here)
 // plus the new video / overlay / chroma / SFX / parallel-pool graph math.
 const G = require("./export-graph");
+// v6: the SINGLE-PASS whole-timeline graph builder (pure — shared with the
+// bun verification harness exactly like export-graph).
+const SP = require("./export-singlepass");
 
 // Resolve the FFmpeg binary path. On Windows we need ffmpeg.exe, on
 // Linux/macOS we need ffmpeg. When the app is packaged, the binary is
@@ -326,17 +329,18 @@ function leakGuard() {
   }
 }
 
-/** Async ffmpeg stdout/stderr capture — NEVER blocks the main process event
- *  loop (the v5.0 execSync/spawnSync probes froze the whole app). Resolves
- *  { code, out } with out = stdout+stderr concatenated; a timeout resolves
- *  code -1 with whatever was captured. */
-function ffmpegCapture(args, timeoutMs = 12000) {
+/** Async stdout/stderr capture for ANY binary — NEVER blocks the main
+ *  process event loop (the v5.0 execSync/spawnSync probes froze the whole
+ *  app). Resolves { code, out } with out = stdout+stderr concatenated; a
+ *  timeout resolves code -1 with whatever was captured. v6: generalized
+ *  from ffmpegCapture so ffprobe rides the same discipline. */
+function captureExec(bin, args, timeoutMs = 12000) {
   return new Promise((resolve) => {
     let done = false;
     let out = "";
     let proc;
     try {
-      proc = spawn(ffmpegPath, args, { windowsHide: true });
+      proc = spawn(bin, args, { windowsHide: true });
     } catch (err) {
       resolve({ code: -1, out, error: err.message });
       return;
@@ -364,6 +368,10 @@ function ffmpegCapture(args, timeoutMs = 12000) {
   });
 }
 
+function ffmpegCapture(args, timeoutMs = 12000) {
+  return captureExec(ffmpegPath, args, timeoutMs);
+}
+
 // ---------------------------------------------------------------------------
 // v1.2 2-PASS MEASURED LOUDNORM — pass 1 (measurement)
 // ---------------------------------------------------------------------------
@@ -374,12 +382,22 @@ function ffmpegCapture(args, timeoutMs = 12000) {
  * Resolves { i, lra, tp, thresh, offset } or null when nothing parseable
  * (missing file, silent input measuring as -inf, timeout) — the graph then
  * falls back to single-pass loudnorm for that branch.
+ * v6: `win` ({ ssMs, durMs }) measures a SEEKED SOURCE WINDOW (audio-only
+ * decode with -ss/-t) instead of the whole file — the single-pass path
+ * measures the base video inputs' own audio at their timeline windows
+ * without extracting PCM WAVs first. atempo preserves integrated loudness
+ * (energy per unit time is unchanged by time-stretch), so measuring the
+ * pre-atempo window is equivalent to the two-step's post-atempo WAV.
  */
-function measureLoudnessAsync(p) {
+function measureLoudnessAsync(p, win) {
   if (typeof p !== "string" || !p) return Promise.resolve(null);
+  const seekArgs = win && Number(win.durMs) > 0
+    ? ["-ss", (Math.max(0, Number(win.ssMs) || 0) / 1000).toFixed(3), "-t", (Number(win.durMs) / 1000).toFixed(3)]
+    : [];
   return ffmpegCapture(
     [
       "-hide_banner", "-nostats",
+      ...seekArgs,
       "-i", p,
       "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
       "-f", "null", "-",
@@ -1140,7 +1158,10 @@ async function detectGpuEncoderAsync() {
       let cpuFps = 0;
       let cpuMeasured = false;
       for (const cand of candidates) {
-        const fps = await probeEncoderAsync(cand.name);
+        // v6: probe with the REAL tier args (gpuProbeExtraArgs) so arg-shape
+        // failures (unsupported -multipass/-b_ref_mode on old drivers)
+        // disqualify the candidate here, never mid-export.
+        const fps = await probeEncoderAsync(cand.name, gpuProbeExtraArgs(cand.name));
         if (fps >= GPU_PROBE_MIN_FPS) {
           if (!cpuMeasured) {
             cpuFps = await probeEncoderAsync("libx264", ["-preset", "veryfast", "-crf", "20"]);
@@ -1219,10 +1240,21 @@ async function probeHwDecode(path) {
 /** Build encoder args for a quality-first, speed-optimized encode.
  * v4.5: the `quality` profile ("draft" | "social" | "cinema" | "custom")
  * drives CRF/cq + the encoder speed preset; `crf` is the explicit target
- * used when quality === "custom". "social" keeps the exact v4.4 behavior. */
+ * used when quality === "custom". "social" keeps the exact v4.4 behavior.
+ * v6 PHASE 1 (throughput pass — the quality LADDER is unchanged: same
+ * CRF/CQ targets per tier, same yuv420p uniform output):
+ *   - NVENC: the constrained-VBR pair (-maxrate/-bufsize) is GONE — at a
+ *     CQ target it only added a rate-control pass (~15-25% throughput)
+ *     without changing the CQ-driven quality decisions. -multipass qres
+ *     keeps quarter-resolution rate decisions at a fraction of the cost.
+ *     b_ref_mode=middle rides the quality tiers (B-frames as refs, Pascal+
+ *     feature — the runtime probe validates the exact arg shape before an
+ *     encoder is ever trusted with a real export).
+ *   - libx264: draft drops veryfast → ultrafast (draft is explicitly the
+ *     speed tier); social/cinema presets unchanged. */
 const QUALITY_ENCODER = {
-  draft:  { crf: 27, x264: "veryfast", nvencPreset: "p1", nvencCq: 27, qsvQ: 27, amfI: 26, amfP: 28 },
-  social: { crf: 20, x264: "veryfast", nvencPreset: "p4", nvencCq: 23, qsvQ: 23, amfI: 22, amfP: 24 },
+  draft:  { crf: 27, x264: "ultrafast", nvencPreset: "p1", nvencCq: 27, qsvQ: 27, amfI: 26, amfP: 28 },
+  social: { crf: 20, x264: "veryfast",  nvencPreset: "p4", nvencCq: 23, qsvQ: 23, amfI: 22, amfP: 24 },
   // v5.2 SPEED: cinema x264 preset medium → faster. Open-source editors
   // (Shotcut/Kdenlive) default to faster-class presets — ~2× faster than
   // medium at a visually indistinguishable CRF 17 master.
@@ -1233,19 +1265,37 @@ function encoderArgs(encoderName, bitrateMbps, width, height, quality, crf) {
   const q = QUALITY_ENCODER[quality] || QUALITY_ENCODER.social;
   const crfVal = quality === "custom" ? Math.max(14, Math.min(30, Number(crf) || 20)) : q.crf;
   switch (encoderName) {
-    case "h264_nvenc":
-      // Constant-quality mode: visually lossless-to-high quality, no wasted bits.
-      return ["-c:v", "h264_nvenc", "-preset", q.nvencPreset, "-tune", "hq", "-rc", "vbr", "-cq", String(quality === "custom" ? crfVal : q.nvencCq), "-b:v", "0", "-maxrate", `${Math.round((bitrateMbps || 8) * 1.5)}M`, "-bufsize", `${Math.round((bitrateMbps || 8) * 3)}M`, "-pix_fmt", "yuv420p"];
+    case "h264_nvenc": {
+      // v6: unconstrained constant-quality VBR — no maxrate/bufsize, CQ per
+      // tier, quarter-res multipass; B-frames-as-refs on the quality tiers.
+      const cq = quality === "custom" ? crfVal : q.nvencCq;
+      const args = ["-c:v", "h264_nvenc", "-preset", q.nvencPreset, "-rc", "vbr", "-cq", String(cq), "-b:v", "0", "-multipass", "qres"];
+      if (quality !== "draft") args.push("-tune", "hq", "-b_ref_mode", "middle");
+      args.push("-pix_fmt", "yuv420p");
+      return args;
+    }
     case "h264_qsv":
       return ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", String(quality === "custom" ? crfVal : q.qsvQ), "-look_ahead", "0", "-pix_fmt", "yuv420p"];
     case "h264_amf":
       return ["-c:v", "h264_amf", "-quality", quality === "cinema" ? "quality" : "balanced", "-rc", "vbr_peak", "-qp_i", String(quality === "custom" ? crfVal : q.amfI), "-qp_p", String((quality === "custom" ? crfVal : q.amfP) + 2), "-b:v", `${bitrateMbps || 8}M`, "-pix_fmt", "yuv420p"];
     default:
       // libx264: profile preset balances speed vs compression efficiency.
-      // "social"/"draft" = veryfast (2× ultrafast at much better quality per
-      // bit); "cinema" = medium for the maximum-quality master.
-      return ["-c:v", "libx264", "-preset", quality === "cinema" ? q.x264 : "veryfast", "-crf", String(crfVal), "-pix_fmt", "yuv420p"];
+      // "social" = veryfast (2× ultrafast at much better quality per bit);
+      // "cinema" = faster for the maximum-quality master; v6 "draft" rides
+      // ultrafast — the tier's whole point is speed.
+      return ["-c:v", "libx264", "-preset", quality === "cinema" ? q.x264 : (quality === "draft" ? "ultrafast" : "veryfast"), "-crf", String(crfVal), "-pix_fmt", "yuv420p"];
   }
+}
+
+/** v6: the extra argv the runtime encoder probe rides for GPU candidates —
+ * the EXACT tier args the real export would use, so a driver that rejects
+ * -multipass/-b_ref_mode fails the PROBE (and falls back to CPU) instead of
+ * failing a real export. */
+function gpuProbeExtraArgs(name) {
+  if (name === "h264_nvenc") {
+    return ["-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0", "-multipass", "qres", "-tune", "hq", "-b_ref_mode", "middle"];
+  }
+  return [];
 }
 
 // Helper: run ffmpeg and wait. `totalSec` enables real-time progress via
@@ -1285,11 +1335,139 @@ function runFfmpeg(args, totalSec, onTime) {
 }
 
 // ---------------------------------------------------------------------------
-// v5.0 media probing — `ffmpeg -i <path>` stderr parsed once per file
-// (audio-stream detection + effective display dimensions). Cached by path:
-// temp names are unique per export, so the cache is a session-wide memo.
+// v6 PHASE 0 — FAST PROBE: ffprobe JSON (when resolvable) with an
+// mtime+size keyed cache (memory + userData disk, 24h TTL), falling back
+// to the battle-tested async `ffmpeg -i` stderr parser. Every consumer of
+// the old path-keyed cache (stream-copy gates, overlay loop math, audio
+// detection, duration probes) keeps the exact same probe SHAPE, so argv
+// construction is unchanged — only acquisition got faster and persistent.
+// A cached source file is probed ONCE per 24h across exports AND app
+// restarts (the v5.1 scheme re-probed every export because temp names were
+// unique; user sources are the hot path here).
 // ---------------------------------------------------------------------------
-const probeCache = new Map();
+const probeCache = new Map();      // "path|mtime|size" → probe shape
+const probeInFlight = new Map();   // path → Promise (same-tick dedup)
+const PROBE_TTL_MS = 24 * 3600 * 1000;
+let probeDisk = null;              // { entries: { key: { t, info } } }
+let probeDiskDirty = false;
+let probeDiskTimer = null;
+let ffprobeBin = null;             // resolved binary | false (unavailable)
+let ffprobeChecked = false;
+
+function probeDiskPath() {
+  return path.join(app.getPath("userData"), "probe-cache-v6.json");
+}
+
+function loadProbeDisk() {
+  if (probeDisk) return;
+  try {
+    probeDisk = JSON.parse(fs.readFileSync(probeDiskPath(), "utf8"));
+    if (!probeDisk || typeof probeDisk !== "object" || !probeDisk.entries) {
+      probeDisk = { entries: {} };
+    }
+  } catch (_) {
+    probeDisk = { entries: {} };
+  }
+}
+
+function scheduleProbeDiskSave() {
+  if (probeDiskTimer) return;
+  probeDiskTimer = setTimeout(() => {
+    probeDiskTimer = null;
+    if (!probeDiskDirty) return;
+    try {
+      fs.writeFileSync(probeDiskPath(), JSON.stringify(probeDisk));
+      probeDiskDirty = false;
+    } catch (_) { /* best-effort persistence */ }
+  }, 2000);
+}
+
+/** Resolve the ffprobe binary ONCE (async, evidence-based: must print a
+ *  real version line). Resolution matrix mirrors ffmpeg's: packaged
+ *  extraResources → asar.unpacked → ffprobe-static npm → PATH. The
+ *  in-flight promise is MEMOIZED — the export handler's parallel probe
+ *  warm-up would otherwise race the first detection (ffprobeChecked flips
+ *  before ffprobeBin resolves) and every concurrent probe would silently
+ *  fall back to the slower ffmpeg -i parser. */
+let ffprobeDetecting = null;
+function ffprobeAvailable() {
+  if (ffprobeDetecting) return ffprobeDetecting;
+  if (ffprobeChecked) return Promise.resolve(ffprobeBin);
+  ffprobeDetecting = (async () => {
+    const candidates = [];
+    if (app.isPackaged) {
+      const exeName = process.platform === "win32" ? "ffprobe.exe" : "ffprobe";
+      const altName = process.platform === "win32" ? "ffprobe" : "ffprobe.exe";
+      candidates.push(
+        path.join(process.resourcesPath, "ffprobe-static", exeName),
+        path.join(process.resourcesPath, "ffprobe-static", altName),
+        path.join(process.resourcesPath, "app.asar.unpacked", "node_modules", "ffprobe-static", exeName),
+      );
+    }
+    try {
+      const s = require("ffprobe-static");
+      if (s && s.path) candidates.push(s.path);
+    } catch (_) { /* optional dependency */ }
+    candidates.push("ffprobe"); // system PATH (dev boxes / Linux installs)
+    for (const c of candidates) {
+      const r = await captureExec(c, ["-version"], 8000);
+      if (r && r.code === 0 && /ffprobe version/i.test(r.out)) {
+        ffprobeBin = c;
+        console.log("FFprobe path:", c);
+        break;
+      }
+    }
+    if (!ffprobeBin) console.log("FFprobe: not available — probes use the ffmpeg -i parser (cached)");
+    ffprobeChecked = true; // resolved — later callers take the cheap path
+    return ffprobeBin;
+  })();
+  return ffprobeDetecting;
+}
+
+/** ffprobe -show_streams/-show_format JSON → the EXACT probe shape
+ *  videoProbeParser produces (width/height pre-swapped for ±90/±270
+ *  displaymatrix rotation, codec/pixFmt lowercase, fps from
+ *  avg_frame_rate with r_frame_rate fallback, durationMs from the
+ *  container format). Returns null on anything unparseable → the caller
+ *  falls back to the ffmpeg -i parser. */
+function parseFfprobeJson(text) {
+  let j = null;
+  try { j = JSON.parse(text); } catch (_) { return null; }
+  const streams = Array.isArray(j.streams) ? j.streams : [];
+  const out = {
+    hasAudio: false, width: 0, height: 0, durationMs: 0,
+    codec: "", pixFmt: "", fps: 0, rotated: false,
+  };
+  out.hasAudio = streams.some((s) => s && s.codec_type === "audio");
+  const v = streams.find((s) => s && s.codec_type === "video") || null;
+  if (v) {
+    out.codec = String(v.codec_name || "").toLowerCase();
+    out.pixFmt = String(v.pix_fmt || "").toLowerCase();
+    out.width = Number(v.width) || 0;
+    out.height = Number(v.height) || 0;
+    const parseRate = (r) => {
+      const m = /^(\d+)\/(\d+)$/.exec(String(r || ""));
+      if (m && Number(m[2]) > 0) return Number(m[1]) / Number(m[2]);
+      const n = Number(r);
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    };
+    out.fps = parseRate(v.avg_frame_rate) || parseRate(v.r_frame_rate);
+    const rotations = (Array.isArray(v.side_data_list) ? v.side_data_list : [])
+      .map((sd) => Number(sd && sd.rotation))
+      .filter((r) => Number.isFinite(r));
+    if (rotations.length > 0) {
+      const a = Math.abs(rotations[0]) % 360;
+      if (Math.abs(a - 90) < 0.01 || Math.abs(a - 270) < 0.01) {
+        const t = out.width; out.width = out.height; out.height = t;
+        out.rotated = true;
+      }
+    }
+  }
+  if (j.format && Number(j.format.duration) > 0) {
+    out.durationMs = Math.round(Number(j.format.duration) * 1000);
+  }
+  return out;
+}
 
 /** v1.1: the full probe shape — every field the export handler consults
  * (stream-copy eligibility + overlay loop math + audio detection). */
@@ -1300,31 +1478,113 @@ function emptyProbe() {
   };
 }
 
-/** v5.1: ASYNC media probe (`ffmpeg -i <path>` stderr parsed once per file,
- * cached). The v5.0 spawnSync version blocked the ENTIRE main process for
- * up to 15 s per file, sequentially — with a handful of imported videos the
- * app visibly froze before the first encode. All probes are now warmed in
- * PARALLEL before the job loop (see export-native).
- * NOTE: `ffmpeg -i` alone exits 1 ("at least one output file") — the probe
- * data lives on stderr, which ffmpegCapture concatenates into `out`, so the
- * parser runs regardless of the exit code.
- * v1.1: the cache carries the FULL parsed probe (codec/pixFmt/fps/rotated/
- * durationMs) — the stream-copy eligibility gate reads them. */
+async function fastProbeUncached(p) {
+  const bin = await ffprobeAvailable();
+  if (bin) {
+    const r = await captureExec(
+      bin,
+      ["-v", "quiet", "-print_format", "json", "-show_streams", "-show_format", "-i", p],
+      15000,
+    );
+    if (r && r.code === 0 && r.out) {
+      const info = parseFfprobeJson(r.out);
+      if (info) return info;
+    }
+  }
+  // Fallback: the async ffmpeg -i stderr parser (pre-v6 behavior).
+  try {
+    const r = await ffmpegCapture(["-hide_banner", "-i", p], 15000);
+    return G.videoProbeParser(r.out);
+  } catch (_) {
+    return emptyProbe(); // unreadable source → silent/unknown dims
+  }
+}
+
+/** v5.1-compatible entry point (same name, same promise-dedup semantics,
+ * same probe shape) — now backed by ffprobe + the persistent cache. */
 function probeMediaAsync(p) {
   if (typeof p !== "string" || !p) {
     return Promise.resolve(emptyProbe());
   }
-  if (probeCache.has(p)) return Promise.resolve(probeCache.get(p));
+  if (probeInFlight.has(p)) return probeInFlight.get(p);
   const job = (async () => {
-    let info = emptyProbe();
+    let key = p;
+    let statOk = false;
     try {
-      const r = await ffmpegCapture(["-hide_banner", "-i", p], 15000);
-      info = G.videoProbeParser(r.out);
-    } catch (_) { /* unreadable source → treated as silent/unknown dims */ }
-    probeCache.set(p, info);
+      const st = fs.statSync(p);
+      key = `${p}|${Math.round(st.mtimeMs)}|${st.size}`;
+      statOk = true;
+    } catch (_) { /* unreadable now — probe will report the empty shape */ }
+    if (probeCache.has(key)) return probeCache.get(key);
+    if (statOk) {
+      loadProbeDisk();
+      const e = probeDisk.entries[key];
+      if (e && Date.now() - e.t < PROBE_TTL_MS && e.info) {
+        probeCache.set(key, e.info);
+        return e.info;
+      }
+    }
+    const info = await fastProbeUncached(p);
+    probeCache.set(key, info);
+    if (statOk) {
+      probeDisk.entries[key] = { t: Date.now(), info };
+      probeDiskDirty = true;
+      scheduleProbeDiskSave();
+    }
     return info;
   })();
-  // On failure cache the fallback synchronously so retries don't re-probe.
+  probeInFlight.set(p, job);
+  job.catch(() => {});
+  job.finally(() => { probeInFlight.delete(p); });
+  return job;
+}
+
+// ---------------------------------------------------------------------------
+// v6 PHASE 3 — SMART TURBO keyframe scan: ffprobe with -skip_frame nokey
+// over a -read_intervals window (decodes ONLY keyframes — a handful per
+// GOP, regardless of file length). Cached per path+window. Returns
+// [{ s: "<exact pts string>", ms }] or null (ffprobe unavailable / probe
+// failure → the caller falls back to the legacy ffmpeg showinfo scan or
+// plain re-encode).
+// ---------------------------------------------------------------------------
+const kfWindowCache = new Map();
+
+async function probeKeyframesNear(p, fromSec, durSec) {
+  const bin = await ffprobeAvailable();
+  if (!bin) return null;
+  const key = `${p}|${Math.max(0, fromSec).toFixed(3)}|${durSec.toFixed(3)}`;
+  if (kfWindowCache.has(key)) return kfWindowCache.get(key);
+  const job = (async () => {
+    try {
+      const r = await captureExec(
+        bin,
+        [
+          "-v", "quiet", "-print_format", "json",
+          "-select_streams", "v:0",
+          "-show_entries", "frame=pts_time",
+          "-skip_frame", "nokey",
+          "-read_intervals", `${Math.max(0, fromSec).toFixed(3)}%+${durSec.toFixed(3)}`,
+          "-i", p,
+        ],
+        20000,
+      );
+      if (!r || r.code !== 0 || !r.out) return null;
+      let j = null;
+      try { j = JSON.parse(r.out); } catch (_) { return null; }
+      const frames = Array.isArray(j.frames) ? j.frames : [];
+      const kfs = [];
+      for (const f of frames) {
+        const s = f && f.pts_time != null ? String(f.pts_time) : (f && f.pkt_pts_time != null ? String(f.pkt_pts_time) : null);
+        const ms = s != null ? parseFloat(s) * 1000 : NaN;
+        if (s != null && Number.isFinite(ms)) kfs.push({ s, ms });
+      }
+      kfs.sort((a, b) => a.ms - b.ms);
+      return kfs;
+    } catch (_) {
+      return null;
+    }
+  })();
+  kfWindowCache.set(key, job);
   job.catch(() => {});
   return job;
 }
@@ -2233,6 +2493,9 @@ ipcMain.handle("export-native", async (event, opts) => {
     const jobs = [];
     const clipPaths = [];
     const clipAudioJobs = [];
+    // v6: per-segment facts collected during the build loop — the single-pass
+    // route consumes them (audio branch list + probe-gated hw decode).
+    const segInfo = [];
     let cumulativeMs = 0;
     const encArgs = encoderArgs(encoder.name, bitrateMbps, width, height, quality, crf);
     // v5.2: thread budget — divide the cores across the parallel pool so N
@@ -2243,10 +2506,16 @@ ipcMain.handle("export-native", async (event, opts) => {
     // concurrent sessions), so a GPU export runs a TIGHTER pool with
     // per-process threads freed for the CPU filter graphs; the CPU pool
     // keeps the v5.2 core-division scheme.
+    // v6 PHASE 1: GPU pool 3 → 1 (one NVENC/QSV/AMF session saturates the
+    // GPU; 3 concurrent sessions mostly fought each other), CPU pool
+    // min(4,cpus−2) → min(2, floor(cpus/4)) (x264 scales with THREADS far
+    // better than with processes; >2 workers only added seek/GOP re-decode
+    // overhead). The thread-budget division below is unchanged — a single
+    // job still gets every core.
     const isGpuEncoder = encoder.name !== "libx264";
     const poolN = isGpuEncoder
-      ? Math.min(3, Math.max(1, os.cpus().length - 1))
-      : Math.min(4, Math.max(1, os.cpus().length - 2));
+      ? 1
+      : Math.max(1, Math.min(2, Math.floor(os.cpus().length / 4)));
     // v1.4.2 CHUNKED PARALLEL ENCODE: long re-encode clips split into
     // frame-aligned ~60 s chunks (capped at the pool width — more chunks
     // than workers only adds seek overhead, fewer wastes the pool). This is
@@ -2439,6 +2708,14 @@ ipcMain.handle("export-native", async (event, opts) => {
         seg.videoPath &&
         (await probeMediaAsync(seg.videoPath)).hasAudio
       );
+      // v6: collect for the single-pass route (hw decode is probed lazily
+      // there — probeHwDecode results are cached per path).
+      segInfo[i] = {
+        segStartMs,
+        segHasAudio,
+        speed: G.resolveSegSpeed(seg),
+        trimInMs: Number(seg.trimInMs) || 0,
+      };
 
       // ── v1.1 TURBO: STREAM-COPY fast path ──────────────────────
       // Cuts-only clips whose source already matches the output spec
@@ -2465,6 +2742,7 @@ ipcMain.handle("export-native", async (event, opts) => {
       const trimInMs = Number(seg.trimInMs) || 0;
       let trimKeyAligned = false;
       let trimSs = null;
+      let sandwichPlan = null;
       if (trimInMs > 0) {
         // Skip the keyframe probe when the clip is ALREADY re-encode-bound
         // for other reasons (overlaps/captions/speed/fades/...) — patch
@@ -2488,6 +2766,25 @@ ipcMain.handle("export-native", async (event, opts) => {
             if (kf) {
               trimKeyAligned = true;
               trimSs = kf.ss;
+            } else {
+              // v6 PHASE 3 SMART TURBO: no keyframe within one frame — try
+              // the SANDWICH (re-encode the two ≤2s edges, stream-copy the
+              // ≥4s middle between keyframes). Frame-accurate at the trim
+              // boundaries AND mostly copy — the trimmed-clip TURBO hit
+              // rate jumps from the ~5% exact-alignment case to any clip
+              // whose GOPs straddle the trim.
+              const kfs = await probeKeyframesNear(
+                seg.videoPath,
+                Math.max(0, (trimInMs - 2500) / 1000),
+                (Number(seg.durationMs) || 0) / 1000 + 5,
+              );
+              if (kfs && kfs.length > 0) {
+                sandwichPlan = G.planSandwichCopy({
+                  trimMs: trimInMs,
+                  durMs: Number(seg.durationMs) || 0,
+                  keyframes: kfs,
+                });
+              }
             }
           }
         }
@@ -2496,20 +2793,26 @@ ipcMain.handle("export-native", async (event, opts) => {
           i, seg, segments, transition,
           overlayCount: overlaySpecs.length,
           assSuffix, wm,
-          trimKeyAligned,
+          trimKeyAligned: trimKeyAligned || !!sandwichPlan,
         })) {
         const probe = await probeMediaAsync(seg.videoPath);
         const srcDur = Number(probe.durationMs) || 0;
-        const formatOk =
+        const specOk =
           probe.codec === "h264" &&
           probe.pixFmt === "yuv420p" &&
           !probe.rotated &&
           probe.width === width &&
           probe.height === height &&
           Math.abs((probe.fps || 0) - fps) < 0.06 &&
-          srcDur > 0 &&
+          srcDur > 0;
+        // v1.1 legacy single-copy: untrimmed or keyframe-aligned head + the
+        // window covers the source tail (packet-granularity cut).
+        const formatOk = specOk &&
           (trimInMs === 0 || trimKeyAligned) &&
           (trimInMs + seg.durationMs) >= srcDur - 300;
+        // v6 sandwich: any trim depth — the edges re-encode to the exact
+        // boundaries, the middle copies between keyframes.
+        const sandwichOk = !!sandwichPlan && specOk;
         if (formatOk) {
           tempFiles.push(clipPath);
           clipPaths.push(clipPath);
@@ -2535,11 +2838,17 @@ ipcMain.handle("export-native", async (event, opts) => {
           if (segHasAudio) {
             // PCM extraction still rides the pool (audio is mixed in
             // step 2 regardless of how the video got there).
+            // v6 FIX: the extraction now SEEKS to trimInMs — the v5.2 argv
+            // read from the file START, so a trimmed clip's audio came from
+            // the wrong window (the video rode -ss, the audio did not).
             const wavPath = path.join(tempDir, `audio_${String(i).padStart(4, "0")}_${Date.now()}.wav`);
             tempFiles.push(wavPath);
             clipAudioJobs.push({
               idx: jobs.length + clipAudioJobs.length,
-              args: ["-i", seg.videoPath, "-vn", "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le", "-y", wavPath],
+              args: [
+                ...(trimInMs > 0 ? ["-ss", G.fmt3(trimInMs)] : []),
+                "-i", seg.videoPath, "-vn", "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le", "-y", wavPath,
+              ],
               wavPath,
               startMs: segStartMs,
               volume: G.normalizeVolume(seg.volume),
@@ -2549,6 +2858,83 @@ ipcMain.handle("export-native", async (event, opts) => {
             });
           }
           continue; // skip the encode path entirely
+        }
+        if (sandwichOk) {
+          // v6 SMART TURBO sandwich: head edge encode → middle stream copy
+          // → tail edge encode, all to the uniform output spec so the
+          // concat demuxer stays -c copy. Frame-accurate at BOTH trim
+          // boundaries; the ≥4s middle rides zero-decode copy.
+          const emitEdge = (edge, tag) => {
+            const edgePath = path.join(tempDir, `clip_${String(i).padStart(4, "0")}_${tag}.mp4`);
+            tempFiles.push(edgePath);
+            clipPaths.push(edgePath);
+            const built = G.buildClipArgs({
+              i,
+              seg: { ...seg, trimInMs: edge.trimMs, durationMs: edge.durMs },
+              segments,
+              fps,
+              width,
+              height,
+              kbEnabled: enabled,
+              zoomMax,
+              globalDir,
+              transition,
+              wm,
+              assSuffix,
+              clipPath: edgePath,
+              encArgs,
+              anyAudio: false,
+              segHasAudio: false,
+              overlaySpecs,
+              hwaccel: false,
+              threads: threadBudget,
+            });
+            jobs.push({
+              idx: i,
+              args: built.args,
+              durSec: edge.durMs / 1000,
+              durationMs: edge.durMs,
+              segId: seg.id,
+            });
+          };
+          if (sandwichPlan.head) emitEdge(sandwichPlan.head, "sh");
+          const midPath = path.join(tempDir, `clip_${String(i).padStart(4, "0")}_sm.mp4`);
+          tempFiles.push(midPath);
+          clipPaths.push(midPath);
+          jobs.push({
+            idx: i,
+            args: G.buildStreamCopyArgs({
+              path: seg.videoPath,
+              durMs: sandwichPlan.middle.durMs,
+              clipPath: midPath,
+              ss: sandwichPlan.middle.ss,
+            }),
+            durSec: sandwichPlan.middle.durMs / 1000,
+            durationMs: sandwichPlan.middle.durMs,
+            segId: seg.id,
+            copy: true,
+          });
+          if (sandwichPlan.tail) emitEdge(sandwichPlan.tail, "st");
+          copiedClips += 1; // the middle rode copy — the TURBO telemetry counts it
+          cumulativeMs += seg.durationMs;
+          if (segHasAudio) {
+            const wavPath = path.join(tempDir, `audio_${String(i).padStart(4, "0")}_${Date.now()}.wav`);
+            tempFiles.push(wavPath);
+            clipAudioJobs.push({
+              idx: jobs.length + clipAudioJobs.length,
+              args: [
+                ...(trimInMs > 0 ? ["-ss", G.fmt3(trimInMs)] : []),
+                "-i", seg.videoPath, "-vn", "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le", "-y", wavPath,
+              ],
+              wavPath,
+              startMs: segStartMs,
+              volume: G.normalizeVolume(seg.volume),
+              durSec: seg.durationMs / 1000,
+              durationMs: seg.durationMs,
+              segId: seg.id,
+            });
+          }
+          continue; // sandwiched — skip the whole-clip encode path
         }
       }
       encodedClips += 1;
@@ -2675,6 +3061,8 @@ ipcMain.handle("export-native", async (event, opts) => {
 
       // v5.2: parallel PCM extraction for the clip's own audio (speed
       // applied here via atempo; volume stays in the step-2 mix graph).
+      // v6 FIX: -ss trimInMs — the extraction window now matches the video
+      // arm (the v5.2 argv read the audio from the file START).
       if (segHasAudio) {
         const wavPath = path.join(tempDir, `audio_${String(i).padStart(4, "0")}_${Date.now()}.wav`);
         tempFiles.push(wavPath);
@@ -2684,6 +3072,7 @@ ipcMain.handle("export-native", async (event, opts) => {
         clipAudioJobs.push({
           idx: jobs.length + clipAudioJobs.length,
           args: [
+            ...(trimInMs > 0 ? ["-ss", G.fmt3(trimInMs)] : []),
             ...(sourceWinMs > 0 ? ["-t", (sourceWinMs / 1000).toFixed(3)] : []),
             "-i", seg.videoPath,
             "-vn",
@@ -2701,6 +3090,205 @@ ipcMain.handle("export-native", async (event, opts) => {
         });
       }
       cumulativeMs += seg.durationMs;
+    }
+
+    // ─── v6 SINGLE-PASS ROUTE ─────────────────────────────────────────
+    // When the build loop produced ANY re-encode job (i.e. NOT a pure TURBO
+    // all-copy export — those run the pool below and finish in seconds) and
+    // the project fits the single-pass envelope, the WHOLE timeline renders
+    // in ONE ffmpeg process via -filter_complex_script:
+    //   • every segment decoded once, composited once, encoded once — no
+    //     per-clip temp files, no N encoder inits, no concat demuxer round
+    //     trip;
+    //   • clip audio mixes from the base inputs' OWN [i:a] streams — the
+    //     PCM-extraction pool jobs (and their WAV temp files) vanish;
+    //   • captions burn ONCE on the concatenated stream (libass still runs
+    //     single-threaded — long captioned projects keep the chunked pool
+    //     via the eligibility ceiling);
+    //   • the audio bus collapses to 1 pass (normalize OFF) or 2 passes
+    //     (ON: parallel source-window measurement → estimated master gain,
+    //     no mix WAV render, no re-measure).
+    // A graph that exceeds the script budget or a process that dies at INIT
+    // (<4s — graph parse/codec-open failures) falls back to the two-step
+    // pool below automatically; anything later rethrows.
+    const anyEncodeJob = jobs.length > 0 && jobs.some((j) => !j.copy);
+    // v6 routing gate: single-pass re-encodes the WHOLE timeline, so it only
+    // wins when the re-encode work is the DOMINANT cost. A mostly-copy
+    // project (11 clean copies + one 1.2 s sandwich edge) must keep the TURBO
+    // pool — re-encoding 24 s to save a 1.2 s edge would be a regression.
+    const encodeWorkMs = jobs.reduce((a, j) => a + (j && !j.copy ? (j.durationMs || 0) : 0), 0);
+    const encodeDominant = encodeWorkMs >= 8000 || encodeWorkMs >= totalMs * 0.3;
+    if (anyEncodeJob && encodeDominant) {
+      const eligibility = SP.singlePassEligible({
+        segments,
+        overlayCount: overlaySegs.length,
+        totalSec,
+        captionsBurned: captionsEnabled || headlinesEnabled,
+      });
+      if (eligibility.ok) {
+        // GLOBAL-window overlay specs — one continuous read per overlay
+        // instead of the per-clip re-seek the two-step pays (probes warm).
+        const globalOverlaySpecs = await buildOverlaySpecsForWindow(0, totalMs);
+        // Full-timeline ASS document — the SAME builder, window [0, total].
+        let globalAssSuffix = null;
+        if (captionsEnabled || headlinesEnabled) {
+          const doc = buildAssDocument(
+            captionsEnabled ? subtitleCues : [],
+            captionsEnabled ? captionSettings : null,
+            headlinesEnabled ? headlines : null,
+            width, height, 0, totalMs, totalMs,
+          );
+          globalAssSuffix = doc ? writeAssFile(doc, "full") : null;
+        }
+        // Audio branches from the collected segInfo (video segs with audio).
+        const clipAudioBranches = [];
+        for (let b = 0; b < segments.length; b++) {
+          const info = segInfo[b];
+          if (info && info.segHasAudio) {
+            clipAudioBranches.push({
+              inputIdx: b,
+              startMs: info.segStartMs,
+              volume: G.normalizeVolume(segments[b].volume),
+              atempo: G.atempoFilters(info.speed),
+              durationMs: Number(segments[b].durationMs) || 0,
+            });
+          }
+        }
+        // v6 AUDIO BUS: normalize ON → measure each SOURCE at its timeline
+        // window (bounded 8-parallel, audio-only, seeked — no WAV extraction)
+        // and estimate the summed-mix master gain (energy sum) — the v1.3
+        // render-mix-to-WAV + re-measure + remux round trip is GONE. OFF →
+        // zero measurement passes, straight into the graph.
+        let spLoudnorm = null;
+        let spMasterLoudnorm = null;
+        if (audio && audio.normalize && (clipAudioBranches.length > 0 || audioPath)) {
+          const measures = { clip: new Array(clipAudioBranches.length).fill(null), music: null };
+          const tasks = clipAudioBranches.map((c, k) => ({
+            kind: "clip", k,
+            p: segments[c.inputIdx].videoPath,
+            win: {
+              ssMs: segInfo[c.inputIdx].trimInMs,
+              durMs: (Number(segments[c.inputIdx].durationMs) || 0) * (segInfo[c.inputIdx].speed !== 1 ? segInfo[c.inputIdx].speed : 1),
+            },
+          }));
+          if (audioPath) tasks.push({ kind: "music", p: audioPath, win: null });
+          for (let t = 0; t < tasks.length; t += 8) {
+            const chunkT = tasks.slice(t, t + 8);
+            const res = await Promise.all(chunkT.map((task) => measureLoudnessAsync(task.p, task.win)));
+            chunkT.forEach((task, r) => {
+              if (task.kind === "clip") measures.clip[task.k] = res[r];
+              else measures.music = res[r];
+            });
+          }
+          spLoudnorm = measures;
+          spMasterLoudnorm = G.estimateMixLoudnorm({
+            totalSec,
+            audio,
+            clipAudio: clipAudioBranches.map((c, k) => ({
+              measure: measures.clip[k],
+              volume: c.volume,
+              durationMs: c.durationMs,
+            })),
+            music: measures.music,
+          });
+        }
+        // Probe-gated hw decode per ≥20s source (cached from the build loop
+        // when it already probed this path).
+        const hwaccelPerSeg = [];
+        let spHwCount = 0;
+        for (let b = 0; b < segments.length; b++) {
+          const s = segments[b];
+          const use = !!(s && s.mediaType === "video" && s.videoPath &&
+            (Number(s.durationMs) || 0) >= 20000 && await probeHwDecode(s.videoPath));
+          hwaccelPerSeg.push(use);
+          if (use) spHwCount += 1;
+        }
+
+        const spPlan = SP.buildSinglePassPlan({
+          segments,
+          fps,
+          width,
+          height,
+          totalMs,
+          kbEnabled: enabled,
+          zoomMax,
+          globalDir,
+          transition,
+          wm,
+          assSuffix: globalAssSuffix,
+          overlaySpecs: globalOverlaySpecs,
+          audio,
+          audioPath,
+          sfx: sfxList,
+          clipAudio: clipAudioBranches,
+          loudnorm: spLoudnorm,
+          masterLoudnorm: spMasterLoudnorm,
+          hwaccelPerSeg,
+        });
+
+        if (spPlan.scriptBytes > SP.SINGLEPASS_MAX_SCRIPT_BYTES) {
+          console.warn(`[framefuse] single-pass skipped: graph ${spPlan.scriptBytes}B > ${SP.SINGLEPASS_MAX_SCRIPT_BYTES}B budget → two-step pool`);
+        } else {
+          const scriptPath = path.join(tempDir, `graph_${Date.now()}.txt`);
+          fs.writeFileSync(scriptPath, spPlan.script, "utf-8");
+          tempFiles.push(scriptPath);
+          const spArgs = SP.buildSinglePassArgs({
+            plan: spPlan,
+            scriptPath,
+            encArgs,
+            abr: `${abr}k`,
+            fps,
+            outputPath,
+            // ONE process: the encoder may use every core; filters get a
+            // slice-thread budget so scale/overlay parallelize.
+            threads: 0, // 0 = auto (all cores) — mirrors a single-job pool
+            filterThreads: Math.max(2, Math.min(8, os.cpus().length)),
+          });
+          const spStart = Date.now();
+          let spFastFail = false;
+          try {
+            await runFfmpeg(spArgs, totalSec, (sec) => {
+              const frac = Math.min(1, sec / Math.max(0.01, totalSec));
+              sendProgress(frac * 100, sec, etaFor(frac));
+            });
+          } catch (err) {
+            if (err && err.message === "Export cancelled") throw err;
+            if (Date.now() - spStart < 4000) {
+              // Init-class failure (graph parse / codec open / input read):
+              // fall back to the battle-tested two-step pool instead of
+              // failing the export outright.
+              console.warn("[framefuse] single-pass failed at init — falling back to the two-step pool:", err.message);
+              spFastFail = true;
+            } else {
+              throw err;
+            }
+          }
+          if (!spFastFail) {
+            sendProgress(100, totalSec, 0);
+            for (const f of tempFiles) { try { fs.unlinkSync(f); } catch (_) {} }
+            let size = 0;
+            try { size = fs.statSync(outputPath).size; } catch {}
+            return {
+              path: outputPath,
+              size,
+              encoder: encoder.label,
+              elapsedSec: Math.round((Date.now() - startTime) / 1000),
+              copiedClips: 0,
+              encodedClips: segments.length,
+              keyframeCuts: 0,
+              chunkedClips: 0,
+              totalChunks: 0,
+              hwDecodeClips: spHwCount,
+              singlePass: true,
+              mode: "single-pass",
+            };
+          }
+        }
+      } else {
+        console.log(`[framefuse] single-pass skipped: ${eligibility.reason} → two-step pool`);
+      }
+    } else if (anyEncodeJob) {
+      console.log(`[framefuse] single-pass skipped: encode work ${(encodeWorkMs / 1000).toFixed(1)}s of ${(totalMs / 1000).toFixed(1)}s timeline is not dominant → TURBO pool`);
     }
 
     // ─── STEP 1 (run): PARALLEL encode + audio-extraction pool ────
@@ -2889,6 +3477,8 @@ ipcMain.handle("export-native", async (event, opts) => {
       chunkedClips,
       totalChunks,
       hwDecodeClips,
+      singlePass: false,
+      mode: "two-step",
     };
 
   } catch (err) {

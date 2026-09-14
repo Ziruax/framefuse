@@ -47,3 +47,6 @@ faster-whisper-runtime/
 # QA round artifacts (synthetic test media + programmatic upload fixtures)
 test-media/
 public/qa/
+
+# v6 bench: staged pre-v6 pipeline for the differential benchmark
+.bench-old/

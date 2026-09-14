@@ -1,0 +1,59 @@
+{
+  "box": "2× Intel(R) Xeon(R) Processor",
+  "fixtures": {
+    "F1": {
+      "name": "kpi-shaped (12 clips + 2 chroma overlays + captions + music + xfade/dip)",
+      "runs": [
+        {
+          "label": "old-two-step",
+          "ms": 6603,
+          "spawns": 41,
+          "duration": 24,
+          "sizeKb": 2958416,
+          "copied": 0,
+          "encoded": 12,
+          "mode": "two-step",
+          "progressEvents": 35
+        },
+        {
+          "label": "old+normalize",
+          "ms": 8407,
+          "spawns": 28,
+          "duration": 24,
+          "sizeKb": 2960941,
+          "copied": 0,
+          "encoded": 12,
+          "mode": "two-step",
+          "progressEvents": 34
+        },
+        {
+          "label": "v6",
+          "ms": 5355,
+          "spawns": 1,
+          "duration": 24,
+          "sizeKb": 2937514,
+          "copied": 0,
+          "encoded": 12,
+          "mode": "single-pass",
+          "progressEvents": 11
+        },
+        {
+          "label": "v6+normalize",
+          "ms": 7301,
+          "spawns": 8,
+          "duration": 24,
+          "sizeKb": 2939223,
+          "copied": 0,
+          "encoded": 12,
+          "mode": "single-pass",
+          "progressEvents": 12
+        }
+      ]
+    }
+  },
+  "cancellation": {
+    "error": "Export cancelled",
+    "strays": 0,
+    "pass": true
+  }
+}

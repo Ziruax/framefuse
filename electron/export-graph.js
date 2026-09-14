@@ -22,6 +22,82 @@
 //   - buildConcatArgs: step-2 concat/mux argv (v4.9 verbatim + v5 audio).
 "use strict";
 
+/**
+ * v6 SINGLE-PASS: the zoompan z/x/y expression builder, EXTRACTED VERBATIM
+ * from buildClipArgs so the two-step per-clip path and the single-pass
+ * whole-timeline path render Ken Burns from the SAME expression source
+ * (structural parity — the harness snapshot-diffs buildClipArgs argv).
+ *   o = { segFrames, dir, zoomMax, kbEnabled }
+ * dir arrives PRE-RESOLVED (enabled ? seg.direction || globalDir : "none").
+ * Returns { zExpr, xExpr, yExpr } — zoompan-expression strings over `on`.
+ */
+function kenBurnsZoompanExprs(o) {
+  const enabled = !!(o && o.kbEnabled);
+  const dir = enabled ? (o && o.dir) || "none" : "none";
+  const zoomMax = Number(o && o.zoomMax) || 1;
+  const segFrames = Math.max(2, Number(o && o.segFrames) || 2);
+  if (!enabled || dir === "none") {
+    return { zExpr: "1.1", xExpr: "iw/2-(iw/zoom/2)", yExpr: "ih/2-(ih/zoom/2)" };
+  }
+  const tExpr = `on/${Math.max(1, segFrames - 1)}`;
+  const easeExpr = `-((cos(PI*${tExpr})-1)/2)`; // easeInOutSine (same as canvas)
+  const zBase = 1.1;
+  const zMaxEff = (1.1 * zoomMax).toFixed(6);
+  const spanEff = (1.1 * zoomMax - 1.1).toFixed(6);
+  const maxX = "(iw-iw/zoom)";
+  const maxY = "(ih-ih/zoom)";
+  if (dir === "in") {
+    return {
+      zExpr: `${zBase.toFixed(6)}+(${easeExpr})*${spanEff}`,
+      xExpr: "iw/2-(iw/zoom/2)", yExpr: "ih/2-(ih/zoom/2)",
+    };
+  }
+  if (dir === "out") {
+    return {
+      zExpr: `${zMaxEff}-(${easeExpr})*${spanEff}`,
+      xExpr: "iw/2-(iw/zoom/2)", yExpr: "ih/2-(ih/zoom/2)",
+    };
+  }
+  // Pan modes: constant zoom, window slides center → edge.
+  if (dir === "right") {
+    return { zExpr: zMaxEff, xExpr: `${maxX}/2*(1+(${easeExpr}))`, yExpr: `${maxY}/2` };
+  }
+  if (dir === "left") {
+    return { zExpr: zMaxEff, xExpr: `${maxX}/2*(1-(${easeExpr}))`, yExpr: `${maxY}/2` };
+  }
+  if (dir === "down") {
+    return { zExpr: zMaxEff, xExpr: `${maxX}/2`, yExpr: `${maxY}/2*(1+(${easeExpr}))` };
+  }
+  if (dir === "up") {
+    return { zExpr: zMaxEff, xExpr: `${maxX}/2`, yExpr: `${maxY}/2*(1-(${easeExpr}))` };
+  }
+  return { zExpr: zMaxEff, xExpr: `${maxX}/2`, yExpr: `${maxY}/2` };
+}
+
+/**
+ * v6 SINGLE-PASS: Ken Burns zoompan chain for one IMAGE segment — the exact
+ * per-clip chain from buildClipArgs (supersample → zoompan → sar/format),
+ * reusable against a single-frame image input (-i img, NO -loop: zoompan
+ * consumes exactly one frame and emits segFrames — verified byte-identical
+ * to the two-step's `-loop 1 + -t` output, scripts/verify-kenburns-parity.js).
+ */
+function kenBurnsImageChain(o) {
+  const { zExpr, xExpr, yExpr } = kenBurnsZoompanExprs(o);
+  const width = Number(o && o.width) || 0;
+  const height = Number(o && o.height) || 0;
+  const fps = Number(o && o.fps) || 30;
+  const segFrames = Math.max(2, Number(o && o.segFrames) || 2);
+  const scaleW = Math.round(width * 1.1);
+  const scaleH = Math.round(height * 1.1);
+  return [
+    `scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase:flags=lanczos`,
+    `crop=${scaleW}:${scaleH}`,
+    `zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${segFrames}:s=${width}x${height}:fps=${fps}`,
+    `setsar=1`,
+    `format=yuv420p`,
+  ].join(",");
+}
+
 // ---------------------------------------------------------------------------
 // v4.3/v4.9 transition tables + helpers (moved verbatim from main.js)
 // ---------------------------------------------------------------------------
@@ -142,6 +218,53 @@ function clipNeedsReEncode(ctx) {
     return true;
   }
   return false;
+}
+
+/**
+ * v6 PHASE 3 — SMART TURBO "sandwich" copy plan for a MID-GOP trim:
+ * frame-accurate output where only the two EDGES re-encode and the whole
+ * middle rides `-c copy` between keyframes:
+ *   [trim ─── k1) = HEAD edge (re-encode, ≤ maxEdgeMs)
+ *   [k1 ────── k2) = MIDDLE (stream copy from the k1 keyframe)
+ *   [k2 ─── trim+dur] = TAIL edge (re-encode, ≤ maxEdgeMs)
+ * The plan's keyframe window MUST cover [trim−2.5s, trim+dur+2.5s]
+ * (probeKeyframesNear semantics). Unlike widening the keyframe tolerance
+ * (which would shift content up to the tolerance vs the preview), the
+ * sandwich keeps the frame-accurate boundaries the v1.4.1 copy path is
+ * trusted for, and lifts the TURBO hit rate on trimmed clips from
+ * "keyframe lands within one frame" (≈5%) to "GOPs straddle the trim"
+ * (typical ≥60% for ≥4s clips at any GOP size).
+ * o = { trimMs, durMs, keyframes: [{ s, ms }…], maxEdgeMs?=2000,
+ *       minMiddleMs?=4000 }
+ * Returns { head: {trimMs,durMs}|null, middle: { ss, durMs },
+ *          tail: {trimMs,durMs}|null } | null (not sandwichable).
+ */
+function planSandwichCopy(o) {
+  const trimMs = Math.max(0, Number(o && o.trimMs) || 0);
+  const durMs = Math.max(0, Number(o && o.durMs) || 0);
+  const kfs = (Array.isArray(o && o.keyframes) ? o.keyframes : [])
+    .filter((k) => k && Number.isFinite(Number(k.ms)))
+    .map((k) => ({ s: String(k.s), ms: Number(k.ms) }))
+    .sort((a, b) => a.ms - b.ms);
+  const maxEdgeMs = Number.isFinite(Number(o && o.maxEdgeMs)) ? Number(o.maxEdgeMs) : 2000;
+  const minMiddleMs = Number.isFinite(Number(o && o.minMiddleMs)) ? Number(o.minMiddleMs) : 4000;
+  if (durMs <= 0 || kfs.length === 0) return null;
+  const endMs = trimMs + durMs;
+  let k1 = null;
+  for (const k of kfs) { if (k.ms >= trimMs - 1) { k1 = k; break; } }
+  let k2 = null;
+  for (const k of kfs) { if (k.ms <= endMs + 1) k2 = k; }
+  if (!k1 || !k2) return null;
+  if (k2.ms - k1.ms < minMiddleMs) return null;
+  const headDur = Math.max(0, k1.ms - trimMs);
+  const tailDur = Math.max(0, endMs - k2.ms);
+  if (headDur > maxEdgeMs || tailDur > maxEdgeMs) return null;
+  if (headDur <= 1 && tailDur <= 1) return null; // fully aligned → the legacy single copy owns it
+  return {
+    head: headDur > 1 ? { trimMs, durMs: Math.round(headDur) } : null,
+    middle: { ss: k1.s, durMs: Math.round(k2.ms - k1.ms) },
+    tail: tailDur > 1 ? { trimMs: Math.round(k2.ms), durMs: Math.round(tailDur) } : null,
+  };
 }
 
 /**
@@ -881,6 +1004,12 @@ function buildAudioMixGraph(o) {
     const d = Math.max(0, Math.round(Number(c && c.startMs) || 0));
     const label = `[ca${k}]`;
     const parts = [];
+    // v6 SINGLE-PASS: clip-audio branches can reference the BASE VIDEO inputs'
+    // own [i:a] streams — playback speed retiming (atempo) then rides the
+    // branch head exactly where the two-step's WAV extraction applied it.
+    // Absent (the two-step path) → argv byte-identical to v5.2.
+    const tempo = Array.isArray(c && c.atempo) ? c.atempo.filter(Boolean) : [];
+    if (tempo.length > 0) parts.push(tempo.join(","));
     if (audio.normalize) {
       const ln = measuredLoudnormFilter(loudnorm && Array.isArray(loudnorm.clip) ? loudnorm.clip[k] : null);
       if (ln) parts.push(ln);
@@ -962,8 +1091,78 @@ function buildAudioMixGraph(o) {
   // v5.2 master bus: amix with normalize=0 lets branches SUM above 0 dBFS
   // (music + clip + SFX) — a limiter right before the pad keeps int16 output
   // from hard-clipping (the standard master-chain practice in Shotcut et al).
-  parts.push(`${last}${masterChain}alimiter=limit=0.97:level=false,apad=whole_dur=${totalSec.toFixed(3)}[aout]`);
+  // v6: an ESTIMATED master loudnorm (energy-sum of the per-branch measured
+  // levels — see estimateMixLoudnorm) rides between master volume and the
+  // limiter, replacing the v1.3 render-mix-to-WAV-remeasure round trip.
+  const masterLn = (o && o.masterLoudnorm) || null;
+  parts.push(
+    `${last}${masterChain}${masterLn ? `${masterLn},` : ""}` +
+      `alimiter=limit=0.97:level=false,apad=whole_dur=${totalSec.toFixed(3)}[aout]`,
+  );
   return { graph: parts.join(";"), outLabel: "[aout]" };
+}
+
+/**
+ * v6 AUDIO BUS: estimate the summed mix's loudnorm measurement WITHOUT
+ * rendering it — the loudness of a sum of uncorrelated sources is the
+ * energy sum of their loudnesses (10·log10(Σ 10^(I_k/10))). Each branch's
+ * effective level = its measured I (already landed at −16 by the per-branch
+ * measured gain) + the branch volume in dB; the master volume scales the
+ * whole sum. Branches are weighted by their ACTIVE fraction of the timeline
+ * (integrated loudness is a time-average). TP is estimated conservatively
+ * (hottest branch + 3 dB sum headroom) so linear-mode gain never under-
+ * protects peaks. Returns a measured-loudnorm filter string (linear=true,
+ * static gain) or null when no branch has a usable measurement (the graph
+ * then keeps the v1.2 per-branch-only shape).
+ */
+function estimateMixLoudnorm(o) {
+  const totalSec = Number(o && o.totalSec) || 0;
+  if (totalSec <= 0) return null;
+  const audio = (o && o.audio) || {};
+  const masterVol = clampNum(audio.masterVolume, 0, 2, 1);
+  if (masterVol <= 0.001) return null; // silent master — nothing to normalize
+  let energy = 0;
+  let anyMeasured = false;
+  let maxTp = -99;
+  let maxLra = 0;
+  let measuredBranches = 0;
+  const addBranch = (m, vol, activeSec) => {
+    const v = clampNum(vol, 0, 2, 1);
+    const frac = Math.max(0, Math.min(1, activeSec / totalSec));
+    if (frac <= 0 || v <= 0.001) return;
+    if (m && Number.isFinite(m.i) && m.i > -70 && Number.isFinite(m.lra)
+        && Number.isFinite(m.tp) && Number.isFinite(m.thresh)) {
+      anyMeasured = true;
+      measuredBranches += 1;
+      // Post per-branch-gain level: the v1.2 measured gain lands the SOURCE
+      // at −16; the volume knob rides on top.
+      const levelDb = -16 + 20 * Math.log10(Math.max(0.001, v));
+      energy += frac * Math.pow(10, levelDb / 10);
+      if (Number.isFinite(m.tp)) maxTp = Math.max(maxTp, m.tp + 20 * Math.log10(Math.max(0.001, v)));
+      if (Number.isFinite(m.lra)) maxLra = Math.max(maxLra, m.lra);
+    } else {
+      // Unmeasured branch keeps its natural level — assume at-target
+      // contribution so it is not ignored in the energy sum.
+      energy += frac * Math.pow(10, (-16 + 20 * Math.log10(Math.max(0.001, v))) / 10);
+    }
+  };
+  const clipAudio = Array.isArray(o && o.clipAudio) ? o.clipAudio : [];
+  clipAudio.forEach((c) => {
+    addBranch(c && c.measure, c && c.volume, (Number(c && c.durationMs) || 0) / 1000);
+  });
+  if (o && o.music) addBranch(o.music, audio.musicVolume, totalSec);
+  // The SFX are deliberately NOT normalized (synthesized at designed
+  // levels) — excluded from the estimate, exactly as the v1.2/v1.3 buses.
+  if (!anyMeasured || measuredBranches < 2) return null; // single branch is already at −16
+  const mixI = 10 * Math.log10(Math.max(1e-12, energy)) + 20 * Math.log10(Math.max(0.001, masterVol));
+  if (!Number.isFinite(mixI) || mixI <= -70 || mixI >= 0) return null;
+  const estTp = (maxTp > -99 ? maxTp : -1.5) + 3;
+  const estLra = maxLra > 0 ? maxLra : 11;
+  return (
+    `loudnorm=I=-16:TP=-1.5:LRA=11` +
+    `:measured_I=${mixI.toFixed(2)}:measured_LRA=${Math.min(20, estLra).toFixed(2)}` +
+    `:measured_TP=${Math.min(-0.5, estTp).toFixed(2)}:measured_thresh=-70:linear=true`
+  );
 }
 
 /**
@@ -1096,39 +1295,18 @@ function buildClipArgs(ctx) {
 
   // ── Build zoompan expressions — EXACT canvas parity (images only; video
   //    clips never get Ken Burns — their own motion is the content).
+  //    v6: the expression math lives in kenBurnsZoompanExprs (shared with the
+  //    single-pass builder) — outputs are byte-identical to the inline v4.9
+  //    code (harness snapshot-diff).
   const segDurSec = seg.durationMs / 1000;
   const segFrames = Math.max(2, Math.round(segDurSec * fps));
   const enabled = kbEnabled;
   const dir = enabled ? seg.direction || globalDir : "none";
   const isLast = i === segments.length - 1;
 
-  let zExpr, xExpr, yExpr;
-  if (!enabled || dir === "none") {
-    zExpr = "1.1"; xExpr = "iw/2-(iw/zoom/2)"; yExpr = "ih/2-(ih/zoom/2)";
-  } else {
-    const tExpr = `on/${Math.max(1, segFrames - 1)}`;
-    const easeExpr = `-((cos(PI*${tExpr})-1)/2)`; // easeInOutSine (same as canvas)
-    const zBase = 1.1;
-    const zMaxEff = (1.1 * zoomMax).toFixed(6);
-    const spanEff = (1.1 * zoomMax - 1.1).toFixed(6);
-    const maxX = "(iw-iw/zoom)";
-    const maxY = "(ih-ih/zoom)";
-    if (dir === "in") {
-      zExpr = `${zBase.toFixed(6)}+(${easeExpr})*${spanEff}`;
-      xExpr = "iw/2-(iw/zoom/2)"; yExpr = "ih/2-(ih/zoom/2)";
-    } else if (dir === "out") {
-      zExpr = `${zMaxEff}-(${easeExpr})*${spanEff}`;
-      xExpr = "iw/2-(iw/zoom/2)"; yExpr = "ih/2-(ih/zoom/2)";
-    } else {
-      // Pan modes: constant zoom, window slides center → edge.
-      zExpr = zMaxEff;
-      if (dir === "right") { xExpr = `${maxX}/2*(1+(${easeExpr}))`; yExpr = `${maxY}/2`; }
-      else if (dir === "left") { xExpr = `${maxX}/2*(1-(${easeExpr}))`; yExpr = `${maxY}/2`; }
-      else if (dir === "down") { xExpr = `${maxX}/2`; yExpr = `${maxY}/2*(1+(${easeExpr}))`; }
-      else if (dir === "up") { xExpr = `${maxX}/2`; yExpr = `${maxY}/2*(1-(${easeExpr}))`; }
-      else { xExpr = `${maxX}/2`; yExpr = `${maxY}/2`; }
-    }
-  }
+  const { zExpr, xExpr, yExpr } = kenBurnsZoompanExprs({
+    segFrames, kbEnabled: enabled, dir, zoomMax,
+  });
 
   const scaleW = Math.round(width * 1.1);
   const scaleH = Math.round(height * 1.1);
@@ -1597,6 +1775,9 @@ module.exports = {
   TRANSITION_MAX_FRACTION,
   clampTrMs,
   frozenZoompanExpr,
+  // v6 single-pass Ken Burns chain (shared expression source)
+  kenBurnsZoompanExprs,
+  kenBurnsImageChain,
   // v5 renderer.ts mirrors
   overlayGeometryMirror,
   isXfadeStyleMirror,
@@ -1621,6 +1802,8 @@ module.exports = {
   planBoundaryFades,
   clipNeedsReEncode,
   buildStreamCopyArgs,
+  // v6 smart-turbo sandwich copy
+  planSandwichCopy,
   // v1.4.2 chunked parallel encode
   planChunkFrames,
   // base video clip builders
@@ -1636,6 +1819,7 @@ module.exports = {
   buildAudioMixGraph,
   buildAudioMixRenderArgs,
   measuredLoudnormFilter,
+  estimateMixLoudnorm,
   AFORMAT,
   // full argv builders
   buildClipArgs,
