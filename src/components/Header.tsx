@@ -161,9 +161,9 @@ export function Header({
                 backgroundColor: "#18181b",
                 color: "#a1a1aa",
               }}
-              title="FrameFuse v1.5.0 — multi-track video studio · CPU-first parallel single-pass export"
+              title="FrameFuse v1.6.0 — multi-track video studio · hybrid smart-render export: chunked parallel single-pass + stream-copy TURBO + iGPU (QSV/AMF/NVENC) when available"
             >
-              v1.5.0
+              v1.6.0
             </span>
             {/* v5.1: on-disk project file chip (native save/open sessions). */}
             {projectName && (

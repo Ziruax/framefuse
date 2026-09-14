@@ -100,8 +100,19 @@ function ensureTempDir() {
 }
 
 function createWindow() {
-  let iconPath = path.join(__dirname, "..", "build", "icon.ico");
-  try { if (!fs.existsSync(iconPath)) iconPath = undefined; } catch (_) { iconPath = undefined; }
+  // v7 FIX B: window icon resolution — dev uses build/icon.ico; packaged
+  // prefers <resources>/icon.ico (extraResources, a REAL file) and falls
+  // back to the asar copy (Electron reads asar paths transparently).
+  const iconCandidates = app.isPackaged
+    ? [
+        path.join(process.resourcesPath, "icon.ico"),
+        path.join(__dirname, "..", "build", "icon.ico"),
+      ]
+    : [path.join(__dirname, "..", "build", "icon.ico")];
+  let iconPath = iconCandidates.find((p) => {
+    try { return fs.existsSync(p); } catch (_) { return false; }
+  });
+  if (!iconPath) iconPath = undefined;
 
   mainWindow = new BrowserWindow({
     width: 1400, height: 900, minWidth: 1100, minHeight: 720,
@@ -616,6 +627,12 @@ function onWhisperChildMessage(msg) {
   if (typeof msg.runId !== "number") return;
   const run = whisperRuns.get(msg.runId);
   if (!run) return; // stale (cancelled) — discard
+  // v7 FIX A: activity + phase tracking for the ENGINE 2 watchdog (the
+  // utilityProcess can hang inside a stalled model download with no further
+  // messages — the run bookkeeping now records when it was last heard from).
+  run.lastMsgAt = Date.now();
+  if (msg.type === "progress" && msg.stage === "transcribe") run.phase = "infer";
+  else if (msg.type === "progress") run.phase = "load";
   switch (msg.type) {
     case "progress": {
       const raw = msg.stage === "download" ? msg.percent : msg.progress;
@@ -736,10 +753,32 @@ function fasterWhisperCacheDir() {
  * Progress mapping mirrors the existing UI curve: load 10–25 %, transcribe
  * 25–80 %, align 80+ stays in the renderer. Returns the raw result payload
  * ({ chunks, language, wordLevel, durationMs }) — chunk shape is the SAME
- * contract the onnxruntime child returns. */
+ * contract the onnxruntime child returns.
+ *
+ * v7 FIX A — WATCHDOG (the "working for hours" hang): WhisperModel() can
+ * sit forever inside huggingface_hub's model download — a stalled socket
+ * with NO read timeout and NO stdout output — which used to leave the
+ * transcription promise pending forever (the UI showed "Working…" for
+ * hours with nothing happening). Three guards now bound the sidecar:
+ *   • STALL: no stdout JSON line for 120 s → the process is dead/hung →
+ *     kill + reject → the engine chain falls through to onnxruntime;
+ *   • LOAD CAP: the load phase (model download included) gets 300 s total —
+ *     a healthy connection downloads whisper-tiny in well under that; a
+ *     trickling one is not worth waiting for when the BUNDLED onnx model
+ *     is the next engine;
+ *   • TOTAL CAP: 30 min hard ceiling (long-video transcription included).
+ * The spawn env also sets HF_HUB_DOWNLOAD_TIMEOUT=30 so huggingface_hub's
+ * own requests fail fast on dead connections instead of hanging reads. */
+const FW_STALL_TIMEOUT_MS = 120000;
+const FW_LOAD_TIMEOUT_MS = 300000;
+const FW_TOTAL_TIMEOUT_MS = 30 * 60000;
+
 function transcribeWithFasterWhisper(runId, { inputPath, language, model }) {
   return new Promise((resolve, reject) => {
     let settled = false;
+    const t0 = Date.now();
+    let lastActivity = Date.now();
+    let phase = "load"; // load → transcribe
     const args = [
       fasterWhisperTranscriberPath(),
       "--audio", inputPath,
@@ -750,16 +789,47 @@ function transcribeWithFasterWhisper(runId, { inputPath, language, model }) {
     ];
     const child = spawn(fasterWhisperPython(), args, {
       windowsHide: true,
-      env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+      env: {
+        ...process.env,
+        PYTHONIOENCODING: "utf-8",
+        // v7 FIX A: bounded network ops inside the sidecar.
+        HF_HUB_DOWNLOAD_TIMEOUT: "30",
+        HF_HUB_DISABLE_PROGRESS_BARS: "1",
+      },
     });
     const run = whisperRuns.get(runId);
     if (run) run.python = child;
 
     let stdoutBuf = "";
     let stderrTail = "";
+    const watchdog = setInterval(() => {
+      if (settled) { clearInterval(watchdog); return; }
+      const now = Date.now();
+      const idle = now - lastActivity;
+      if (idle > FW_STALL_TIMEOUT_MS) {
+        try { child.kill(); } catch (_) {}
+        finish(new Error(
+          `faster-whisper produced no output for ${Math.round(idle / 1000)}s — the sidecar hung and was killed`,
+        ));
+        return;
+      }
+      if (phase === "load" && now - t0 > FW_LOAD_TIMEOUT_MS) {
+        try { child.kill(); } catch (_) {}
+        finish(new Error(
+          "faster-whisper model load exceeded 5 minutes (slow or stalled download) — falling back to the bundled Whisper engine",
+        ));
+        return;
+      }
+      if (now - t0 > FW_TOTAL_TIMEOUT_MS) {
+        try { child.kill(); } catch (_) {}
+        finish(new Error("faster-whisper exceeded the 30-minute ceiling and was killed"));
+      }
+    }, 5000);
+
     const finish = (err, result) => {
       if (settled) return;
       settled = true;
+      clearInterval(watchdog);
       const r = whisperRuns.get(runId);
       if (r) r.python = null;
       if (err) reject(err);
@@ -767,6 +837,7 @@ function transcribeWithFasterWhisper(runId, { inputPath, language, model }) {
     };
 
     child.stdout.on("data", (d) => {
+      lastActivity = Date.now();
       stdoutBuf += d.toString("utf8");
       let nl;
       while ((nl = stdoutBuf.indexOf("\n")) >= 0) {
@@ -781,9 +852,11 @@ function transcribeWithFasterWhisper(runId, { inputPath, language, model }) {
             sendWhisperProgress(runId, 10, "Loading faster-whisper model…");
             break;
           case "info":
+            phase = "transcribe";
             sendWhisperProgress(runId, 25, `Transcribing (model ready, ${(Math.round((msg.durationMs || 0) / 60000))} min audio)…`);
             break;
           case "progress": {
+            phase = "transcribe";
             const p = Number(msg.progress);
             if (Number.isFinite(p)) {
               sendWhisperProgress(runId, Math.min(80, 25 + Math.round(p * 0.55)), "Transcribing…");
@@ -808,7 +881,10 @@ function transcribeWithFasterWhisper(runId, { inputPath, language, model }) {
         }
       }
     });
-    child.stderr.on("data", (d) => { stderrTail = (stderrTail + d.toString()).slice(-1500); });
+    child.stderr.on("data", (d) => {
+      lastActivity = Date.now(); // stderr chatter (tqdm, warnings) = alive
+      stderrTail = (stderrTail + d.toString()).slice(-1500);
+    });
     child.on("error", (err) => finish(new Error(`Could not start faster-whisper: ${err.message}`)));
     child.on("exit", (code, signal) => {
       if (settled) return;
@@ -882,8 +958,42 @@ ipcMain.handle("whisper:transcribe", async (event, payload) => {
     sendWhisperProgress(runId, 10, "Loading Whisper-tiny model…");
 
     const child = getWhisperChild();
+    // v7 FIX A — ENGINE 2 watchdog: a stalled model download (or a hung
+    // utilityProcess) used to leave this await pending FOREVER. Guards:
+    //   • LOAD phase: no child message for 240 s → kill the service, reject
+    //     with an actionable message (the child normally emits frequent
+    //     model/download progress; the bundled-model load is silent but
+    //     finishes in seconds).
+    //   • TOTAL: 10 min + 45× the audio duration — generous for slow-CPU
+    //     inference of long videos, but bounded (whisper-tiny at worst runs
+    //     ~0.5× real time on one core).
+    const ONNX_LOAD_STALL_MS = 240000;
+    const onnxTotalCapMs = 600000 + 45 * durationMs;
+    const onnxWatchdog = setInterval(() => {
+      const run = whisperRuns.get(runId);
+      if (!run) { clearInterval(onnxWatchdog); return; }
+      const idle = Date.now() - (run.lastMsgAt || Date.now());
+      if (idle > ONNX_LOAD_STALL_MS && run.phase !== "infer") {
+        clearInterval(onnxWatchdog);
+        try { if (whisperChild.proc) whisperChild.proc.kill(); } catch (_) {}
+        whisperRuns.delete(runId);
+        run.reject(new Error(
+          "The Whisper service stopped responding while loading the model (no progress for 4 minutes). It was restarted — please try again.",
+        ));
+        return;
+      }
+      if (Date.now() - onnxE0 > onnxTotalCapMs) {
+        clearInterval(onnxWatchdog);
+        try { if (whisperChild.proc) whisperChild.proc.kill(); } catch (_) {}
+        whisperRuns.delete(runId);
+        run.reject(new Error(
+          `Whisper transcription exceeded ${Math.round(onnxTotalCapMs / 60000)} minutes and was stopped — try a shorter clip or check CPU load.`,
+        ));
+      }
+    }, 5000);
+    const onnxE0 = Date.now();
     const result = await new Promise((resolve, reject) => {
-      whisperRuns.set(runId, { resolve, reject, sender: event.sender, clientRunId });
+      whisperRuns.set(runId, { resolve, reject, sender: event.sender, clientRunId, lastMsgAt: Date.now(), phase: "load" });
       try {
         // v1 fix: Electron's utilityProcess.postMessage accepts ONLY
         // MessagePortMain objects in its transfer list — transferring the PCM
@@ -906,6 +1016,8 @@ ipcMain.handle("whisper:transcribe", async (event, payload) => {
         whisperRuns.delete(runId);
         reject(new Error(`Could not reach the Whisper service: ${err.message}`));
       }
+    }).finally(() => {
+      clearInterval(onnxWatchdog);
     });
     sendWhisperProgress(runId, 80, "Aligning word timestamps…");
     return { ...result, durationMs, engine: "onnxruntime" };
@@ -918,8 +1030,24 @@ ipcMain.handle("whisper:transcribe", async (event, payload) => {
 ipcMain.handle("whisper:preload", async (event) => {
   const runId = ++whisperRunSeq;
   const child = getWhisperChild();
+  // v7 FIX A: preload watchdog — the model download can stall silently; no
+  // child message for 4 minutes kills the service and rejects (the next
+  // call respawns it). The bundled-model preload is local + instant.
+  const t0 = Date.now();
+  const watchdog = setInterval(() => {
+    const run = whisperRuns.get(runId);
+    if (!run) { clearInterval(watchdog); return; }
+    if (Date.now() - (run.lastMsgAt || t0) > 240000) {
+      clearInterval(watchdog);
+      try { if (whisperChild.proc) whisperChild.proc.kill(); } catch (_) {}
+      whisperRuns.delete(runId);
+      run.reject(new Error(
+        "The Whisper model download stopped responding (no progress for 4 minutes) and was cancelled. Check your connection and try again.",
+      ));
+    }
+  }, 5000);
   return await new Promise((resolve, reject) => {
-    whisperRuns.set(runId, { resolve: () => resolve({ ok: true }), reject, sender: event.sender });
+    whisperRuns.set(runId, { resolve: () => resolve({ ok: true }), reject, sender: event.sender, lastMsgAt: Date.now(), phase: "load" });
     try {
       child.postMessage({
         type: "preload",
@@ -929,8 +1057,11 @@ ipcMain.handle("whisper:preload", async (event) => {
       });
     } catch (err) {
       whisperRuns.delete(runId);
+      clearInterval(watchdog);
       reject(new Error(`Could not reach the Whisper service: ${err.message}`));
     }
+  }).finally(() => {
+    clearInterval(watchdog);
   });
 });
 
@@ -959,20 +1090,46 @@ ipcMain.handle("whisper:fw-preload", async (event, payload) => {
     ];
     const child = spawn(fasterWhisperPython(), args, {
       windowsHide: true,
-      env: { ...process.env, PYTHONIOENCODING: "utf-8" },
+      env: {
+        ...process.env,
+        PYTHONIOENCODING: "utf-8",
+        // v7 FIX A: bounded hub downloads + clean stderr (no tqdm noise).
+        HF_HUB_DOWNLOAD_TIMEOUT: "30",
+        HF_HUB_DISABLE_PROGRESS_BARS: "1",
+      },
     });
     const run = { resolve: () => { if (!settled) { settled = true; resolve({ ok: true, model }); } }, reject, sender: event.sender, python: child };
     whisperRuns.set(runId, run);
     let stderrTail = "";
+    // v7 FIX A: preload watchdog — stall (no stdout activity for 2 min) or a
+    // 15-minute total cap kills the sidecar and rejects with a clear message
+    // (previously a dead download left the pre-download UI spinning forever).
+    const t0 = Date.now();
+    let lastActivity = Date.now();
+    const watchdog = setInterval(() => {
+      if (settled) { clearInterval(watchdog); return; }
+      const now = Date.now();
+      if (now - lastActivity > 120000 || now - t0 > 15 * 60000) {
+        try { child.kill(); } catch (_) {}
+        finish(
+          (e) => reject(new Error(String(e))),
+          now - lastActivity > 120000
+            ? `faster-whisper pre-download produced no output for ${Math.round((now - lastActivity) / 1000)}s — killed`
+            : "faster-whisper pre-download exceeded 15 minutes — killed",
+        );
+      }
+    }, 5000);
     const finish = (fn, arg) => {
       if (settled) return;
       settled = true;
+      clearInterval(watchdog);
       const r = whisperRuns.get(runId);
       if (r) r.python = null;
       whisperRuns.delete(runId);
       fn(arg);
     };
     child.stdout.on("data", (d) => {
+      lastActivity = Date.now();
       for (const line of d.toString("utf8").split("\n")) {
         const t = line.trim();
         if (!t) continue;
@@ -989,7 +1146,10 @@ ipcMain.handle("whisper:fw-preload", async (event, payload) => {
         }
       }
     });
-    child.stderr.on("data", (d) => { stderrTail = (stderrTail + d.toString()).slice(-1200); });
+    child.stderr.on("data", (d) => {
+      lastActivity = Date.now(); // stderr chatter = process alive
+      stderrTail = (stderrTail + d.toString()).slice(-1200);
+    });
     child.on("error", (err) => finish((e) => reject(new Error(String(e))), `Could not start faster-whisper: ${err.message}`));
     child.on("exit", (code, signal) => {
       if (settled) return;
@@ -1179,8 +1339,8 @@ async function listEncodersAsync() {
   const out = r.out;
   const order = [
     { name: "h264_nvenc", label: "NVIDIA NVENC" },
+    { name: "h264_qsv", label: "Intel Quick Sync (QSV)" },
     { name: "h264_amf", label: "AMD AMF" },
-    { name: "h264_qsv", label: "Intel QSV" },
   ];
   return order.filter((e) => out.includes(e.name));
 }
@@ -1192,12 +1352,17 @@ async function listEncodersAsync() {
  * paths finish in < 1 s; broken ones blow the 12 s timeout or the fps
  * floor. Returns the measured fps (0 when rejected). v1.3: `extraArgs`
  * lets the libx264 baseline probe match the real export preset
- * (veryfast + crf 20) so the GPU-vs-CPU comparison is apples-to-apples. */
-async function probeEncoderAsync(name, extraArgs = []) {
+ * (veryfast + crf 20) so the GPU-vs-CPU comparison is apples-to-apples.
+ * v7 Step 1: `preInputArgs` carries ffmpeg GLOBAL options that must ride
+ * BEFORE the input — Intel QSV on Windows needs an explicitly derived
+ * d3d11va→qsv device session or the encoder init can silently fail (the
+ * exact iGPU machines this pass targets). */
+async function probeEncoderAsync(name, extraArgs = [], preInputArgs = []) {
   const FRAMES = 48;
   const t0 = Date.now();
   const r = await ffmpegCapture([
     "-hide_banner", "-loglevel", "error",
+    ...preInputArgs,
     "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30",
     "-frames:v", String(FRAMES),
     "-c:v", name, ...extraArgs, "-pix_fmt", "yuv420p",
@@ -1232,10 +1397,16 @@ async function detectGpuEncoderAsync() {
       let cpuFps = 0;
       let cpuMeasured = false;
       for (const cand of candidates) {
-        // v6: probe with the REAL tier args (gpuProbeExtraArgs) so arg-shape
+        // v6: probe with the REAL tier args (gpuProbeSpec) so arg-shape
         // failures (unsupported -multipass/-b_ref_mode on old drivers)
         // disqualify the candidate here, never mid-export.
-        const fps = await probeEncoderAsync(cand.name, gpuProbeExtraArgs(cand.name));
+        // v7 Step 1: QSV probes through an EXPLICIT d3d11va→qsv device
+        // derivation — without it, Quick Sync encoder init can silently
+        // fail on Windows iGPU driver stacks and the probe falls back to
+        // CPU even though the hardware encodes at 120+ fps. AMF needs no
+        // explicit device (it creates its own context); NVENC neither.
+        const spec = gpuProbeSpec(cand.name);
+        const fps = await probeEncoderAsync(cand.name, spec.enc, spec.pre);
         if (fps >= GPU_PROBE_MIN_FPS) {
           if (!cpuMeasured) {
             cpuFps = await probeEncoderAsync("libx264", ["-preset", "veryfast", "-crf", "20"]);
@@ -1325,7 +1496,13 @@ async function probeHwDecode(path) {
  *     feature — the runtime probe validates the exact arg shape before an
  *     encoder is ever trusted with a real export).
  *   - libx264: draft drops veryfast → ultrafast (draft is explicitly the
- *     speed tier); social/cinema presets unchanged. */
+ *     speed tier); social/cinema presets unchanged.
+ * v7 Step 5 (low-end CPU fallback): on 4-or-fewer-core machines with no
+ * usable iGPU/dGPU (libx264 fallback), the preset ladder drops to
+ * superfast/ultrafast and `-tune fastdecode` rides along (no CABAC-side
+ * deblocking overhead, simpler features — measurably friendlier to the
+ * small L2/L3 caches of Atom/Celeron-class quads). Thread caps per worker
+ * live in the routing code (-threads 2 / -filter_threads 2). */
 const QUALITY_ENCODER = {
   draft:  { crf: 27, x264: "ultrafast", nvencPreset: "p1", nvencCq: 27, qsvQ: 27, amfI: 26, amfP: 28 },
   social: { crf: 20, x264: "veryfast",  nvencPreset: "p4", nvencCq: 23, qsvQ: 23, amfI: 22, amfP: 24 },
@@ -1335,9 +1512,10 @@ const QUALITY_ENCODER = {
   cinema: { crf: 17, x264: "faster",  nvencPreset: "p6", nvencCq: 19, qsvQ: 19, amfI: 19, amfP: 21 },
 };
 
-function encoderArgs(encoderName, bitrateMbps, width, height, quality, crf) {
+function encoderArgs(encoderName, bitrateMbps, width, height, quality, crf, lowEndCpu) {
   const q = QUALITY_ENCODER[quality] || QUALITY_ENCODER.social;
   const crfVal = quality === "custom" ? Math.max(14, Math.min(30, Number(crf) || 20)) : q.crf;
+  const lowEnd = lowEndCpu === true;
   switch (encoderName) {
     case "h264_nvenc": {
       // v6: unconstrained constant-quality VBR — no maxrate/bufsize, CQ per
@@ -1352,22 +1530,64 @@ function encoderArgs(encoderName, bitrateMbps, width, height, quality, crf) {
       return ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", String(quality === "custom" ? crfVal : q.qsvQ), "-look_ahead", "0", "-pix_fmt", "yuv420p"];
     case "h264_amf":
       return ["-c:v", "h264_amf", "-quality", quality === "cinema" ? "quality" : "balanced", "-rc", "vbr_peak", "-qp_i", String(quality === "custom" ? crfVal : q.amfI), "-qp_p", String((quality === "custom" ? crfVal : q.amfP) + 2), "-b:v", `${bitrateMbps || 8}M`, "-pix_fmt", "yuv420p"];
-    default:
+    default: {
       // libx264: profile preset balances speed vs compression efficiency.
       // "social" = veryfast (2× ultrafast at much better quality per bit);
       // "cinema" = faster for the maximum-quality master; v6 "draft" rides
       // ultrafast — the tier's whole point is speed.
-      return ["-c:v", "libx264", "-preset", quality === "cinema" ? q.x264 : (quality === "draft" ? "ultrafast" : "veryfast"), "-crf", String(crfVal), "-pix_fmt", "yuv420p"];
+      // v7 Step 5: low-end CPU fallback (no usable hardware encoder) drops
+      // the ladder to superfast/ultrafast + -tune fastdecode — veryfast's
+      // CABAC + finer motion estimation thrashes the small caches of
+      // Atom/Celeron-class quads, which is exactly the "1.5 fps" pathology.
+      let preset;
+      if (lowEnd) {
+        preset = quality === "draft" ? "ultrafast" : "superfast";
+      } else {
+        preset = quality === "cinema" ? q.x264 : (quality === "draft" ? "ultrafast" : "veryfast");
+      }
+      const args = ["-c:v", "libx264", "-preset", preset, "-crf", String(crfVal)];
+      if (lowEnd) args.push("-tune", "fastdecode");
+      args.push("-pix_fmt", "yuv420p");
+      return args;
+    }
   }
 }
 
-/** v6: the extra argv the runtime encoder probe rides for GPU candidates —
- * the EXACT tier args the real export would use, so a driver that rejects
- * -multipass/-b_ref_mode fails the PROBE (and falls back to CPU) instead of
- * failing a real export. */
-function gpuProbeExtraArgs(name) {
+/** v6/v7: the exact probe argv for a GPU candidate — `pre` (ffmpeg GLOBAL
+ * options before the input: the Intel QSV d3d11va→qsv device derivation
+ * that Windows iGPU stacks need) + `enc` (the REAL tier encoder args so an
+ * arg-shape failure disqualifies the candidate at probe time, never
+ * mid-export). h264_amf needs no explicit device init — its encoder context
+ * is self-contained on Windows. */
+function gpuProbeSpec(name) {
   if (name === "h264_nvenc") {
-    return ["-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0", "-multipass", "qres", "-tune", "hq", "-b_ref_mode", "middle"];
+    return {
+      pre: [],
+      enc: ["-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0", "-multipass", "qres", "-tune", "hq", "-b_ref_mode", "middle"],
+    };
+  }
+  if (name === "h264_qsv") {
+    return {
+      // v7 Step 1 (the exact flags): derive a QSV session from an explicit
+      // d3d11va device. Without this, QSV probing on Windows silently
+      // crashes and the iGPU falls back to CPU.
+      pre: ["-init_hw_device", "d3d11va=dx", "-init_hw_device", "qsv=qsv@dx"],
+      // The REAL export tier args (veryfast + global_quality) — probing the
+      // exact shape the export will run, same philosophy as the NVENC arm.
+      enc: ["-preset", "veryfast", "-global_quality", "23", "-look_ahead", "0"],
+    };
+  }
+  return { pre: [], enc: [] }; // h264_amf — self-contained encoder context
+}
+
+/** v7 Step 1: encoder-level ffmpeg GLOBAL options for the REAL export argv.
+ * QSV is selected only after the probe above SUCCEEDED with these exact
+ * device-init flags — so threading the same flags into every real encode
+ * (single-pass, chunked, two-step clip argv) guarantees the export runs in
+ * the environment that was measured. Every other encoder gets []. */
+function encoderGlobalArgs(encoderName) {
+  if (encoderName === "h264_qsv" && process.platform === "win32") {
+    return ["-init_hw_device", "d3d11va=dx", "-init_hw_device", "qsv=qsv@dx"];
   }
   return [];
 }
@@ -2582,7 +2802,21 @@ ipcMain.handle("export-native", async (event, opts) => {
     // route consumes them (audio branch list + probe-gated hw decode).
     const segInfo = [];
     let cumulativeMs = 0;
-    const encArgs = encoderArgs(encoder.name, bitrateMbps, width, height, quality, crf);
+    // v7 Step 5: low-end CPU detection — 4-or-fewer cores on the libx264
+    // fallback (no usable iGPU/dGPU) switches the preset ladder to
+    // superfast/ultrafast + -tune fastdecode and caps per-worker threads.
+    const cpuCount = os.cpus().length;
+    const lowEndCpu = cpuCount <= 4;
+    const lowEndX264 = lowEndCpu && encoder.name === "libx264";
+    const encArgs = encoderArgs(encoder.name, bitrateMbps, width, height, quality, crf, lowEndX264);
+    // v7 Step 1: QSV's d3d11va→qsv device-init globals ride at the head of
+    // every real encode argv (the probe validated the exact environment).
+    const encGlobalArgs = encoderGlobalArgs(encoder.name);
+    // v7 Step 4: per-segment TURBO plan recorded during the build loop — the
+    // HYBRID chunked single-pass replays the clean segments as stream
+    // copies (zero decode/filter/encode) while the dirty intervals render
+    // through the windowed graph.
+    const turboPlan = new Array(segments.length).fill(null);
     // v5.2: thread budget — divide the cores across the parallel pool so N
     // concurrent encoders never oversubscribe the CPU (the v5.1 scheme gave
     // EVERY child `-threads 0` = all cores → 4× oversubscription thrash).
@@ -2634,7 +2868,12 @@ ipcMain.handle("export-native", async (event, opts) => {
     const activeJobs = Math.max(1, Math.min(poolN, estVideoJobs || segments.length));
     const threadBudget = isGpuEncoder
       ? Math.max(2, os.cpus().length)
-      : Math.max(1, Math.floor(os.cpus().length / activeJobs));
+      : lowEndX264
+        // v7 Step 5: cap each pool worker at 2 threads on ≤4-core libx264
+        // boxes (W×threads stays within the physical core budget — no
+        // cache-thrashing oversubscription).
+        ? Math.max(1, Math.min(2, Math.floor(cpuCount / activeJobs)))
+        : Math.max(1, Math.floor(cpuCount / activeJobs));
 
     // v1.1 TURBO: stream-copy counters for the result payload + a shared
     // actual-duration accumulator (post-step-1 probe of each clip file —
@@ -2919,6 +3158,10 @@ ipcMain.handle("export-native", async (event, opts) => {
             segId: seg.id,
             copy: true,
           });
+          // v7 Step 4: record the TURBO plan so the HYBRID chunked single-pass
+          // can replay this segment as a stream-copy piece (with the same
+          // keyframe-aligned seek) instead of re-encoding it through the graph.
+          turboPlan[i] = { kind: "copy", ss: trimSs };
           copiedClips += 1;
           // v1.4.1: count only copies that actually rode the keyframe-aligned
           // trim path (an aligned find that still re-encodes for a source-
@@ -2954,6 +3197,10 @@ ipcMain.handle("export-native", async (event, opts) => {
           // → tail edge encode, all to the uniform output spec so the
           // concat demuxer stays -c copy. Frame-accurate at BOTH trim
           // boundaries; the ≥4s middle rides zero-decode copy.
+          // v7 Step 4: recorded for the HYBRID replay (edges re-encode + the
+          // middle copies — the plan is replayed with the hybrid's per-worker
+          // thread budget instead of the two-step pool's).
+          turboPlan[i] = { kind: "sandwich", plan: sandwichPlan };
           const emitEdge = (edge, tag) => {
             const edgePath = path.join(tempDir, `clip_${String(i).padStart(4, "0")}_${tag}.mp4`);
             tempFiles.push(edgePath);
@@ -2973,6 +3220,7 @@ ipcMain.handle("export-native", async (event, opts) => {
               assSuffix,
               clipPath: edgePath,
               encArgs,
+              globalArgs: encGlobalArgs,
               anyAudio: false,
               segHasAudio: false,
               overlaySpecs,
@@ -3091,6 +3339,7 @@ ipcMain.handle("export-native", async (event, opts) => {
             assSuffix: chunkAssSuffix,
             clipPath: chunkPath,
             encArgs,
+            globalArgs: encGlobalArgs,
             anyAudio: false,
             segHasAudio: false,
             overlaySpecs: chunkOverlaySpecs,
@@ -3129,6 +3378,7 @@ ipcMain.handle("export-native", async (event, opts) => {
           assSuffix,
           clipPath,
           encArgs,
+          globalArgs: encGlobalArgs,
           anyAudio: false,
           segHasAudio: false,
           overlaySpecs,
@@ -3233,6 +3483,13 @@ ipcMain.handle("export-native", async (event, opts) => {
       const fullFades = SP.buildGlobalFades({ segments, transition, totalMs });
       let chunkPlan = null;
       if (spWorkers >= 2) {
+        // v7 Step 4: segClean = per-segment TURBO copy-eligibility recorded
+        // during the build loop. planTimelineChunks uses it to align chunk
+        // boundaries to the clean↔dirty run edges — clean chunks replay as
+        // stream copies, dirty chunks as windowed single-pass graphs (the
+        // 60 % TURBO hybrid). All-clean/all-dirty (or an unalignable edge)
+        // keeps the plain full-timeline chunk plan, byte-identical to v6.5.
+        const segClean = turboPlan.map((t) => !!t);
         chunkPlan = SP.planTimelineChunks({
           segments,
           transition,
@@ -3242,6 +3499,7 @@ ipcMain.handle("export-native", async (event, opts) => {
           totalMs,
           fades: fullFades,
           workerCount: spWorkers,
+          segClean,
         });
         if (!chunkPlan || chunkPlan.chunks.length < 2) chunkPlan = null;
       }
@@ -3322,13 +3580,114 @@ ipcMain.handle("export-native", async (event, opts) => {
         let spSkipW1 = false;
         if (chunkPlan) {
           const W = chunkPlan.chunks.length;
-          const threadsPer = Math.max(1, Math.round(cpuCount / W));
-          const filterThreadsPer = Math.max(2, Math.min(8, Math.floor(cpuCount / W)));
+          const isHybrid = !!chunkPlan.hybrid;
+          // v7 Step 4: pool width = the worker budget (hybrid mixes graph
+          // chunks + TURBO replay jobs in ONE pool); plain keeps W (= chunk
+          // count ≤ spWorkers, same as v6.5).
+          const poolWidth = Math.max(1, Math.min(isHybrid ? spWorkers : W, Math.max(1, spWorkers)));
+          let threadsPer = Math.max(1, Math.round(cpuCount / poolWidth));
+          let filterThreadsPer = Math.max(2, Math.min(8, Math.floor(cpuCount / poolWidth)));
+          if (lowEndX264) {
+            // v7 Step 5: hardcap per-worker threads on ≤4-core libx264 boxes.
+            threadsPer = Math.max(1, Math.min(2, threadsPer));
+            filterThreadsPer = Math.max(1, Math.min(2, filterThreadsPer));
+          }
           const chunkJobs = [];
           const chunkFiles = [];
+          const turboJobs = [];
+          let turboCopied = 0;
           let chunkOverBudget = false;
           for (let ci = 0; ci < W && !chunkOverBudget; ci++) {
             const c = chunkPlan.chunks[ci];
+            // ── v7 Step 4: CLEAN chunk — every covered segment is copy-eligible.
+            // Replay the recorded TURBO plans (stream copy / keyframe-aligned
+            // trim / sandwich) instead of a filter graph: ZERO decode, zero
+            // filters, zero encode for this whole interval.
+            if (c.clean && isHybrid) {
+              for (let i = 0; i < segments.length; i++) {
+                const span = chunkPlan.spans[i];
+                if (!span || span.F <= 0) continue;
+                if (Math.min(span.S + span.F, c.f1) - Math.max(span.S, c.f0) <= 0) continue;
+                const tp = turboPlan[i];
+                if (!tp) continue; // defensive: planner marked the chunk clean
+                const seg = segments[i];
+                if (tp.kind === "copy") {
+                  const copyPath = path.join(tempDir, `hyb_${String(i).padStart(4, "0")}.mp4`);
+                  tempFiles.push(copyPath);
+                  chunkFiles.push(copyPath);
+                  turboJobs.push({
+                    idx: i,
+                    args: G.buildStreamCopyArgs({
+                      path: seg.videoPath,
+                      durMs: seg.durationMs,
+                      clipPath: copyPath,
+                      ss: tp.ss,
+                    }),
+                    durSec: seg.durationMs / 1000,
+                    durationMs: seg.durationMs,
+                    segId: seg.id,
+                    copy: true,
+                  });
+                  turboCopied += 1;
+                } else if (tp.kind === "sandwich" && tp.plan) {
+                  const sw = tp.plan;
+                  const emitEdge = (edge, tag) => {
+                    const edgePath = path.join(tempDir, `hyb_${String(i).padStart(4, "0")}_${tag}.mp4`);
+                    tempFiles.push(edgePath);
+                    chunkFiles.push(edgePath);
+                    const built = G.buildClipArgs({
+                      i,
+                      seg: { ...seg, trimInMs: edge.trimMs, durationMs: edge.durMs },
+                      segments,
+                      fps,
+                      width,
+                      height,
+                      kbEnabled: enabled,
+                      zoomMax,
+                      globalDir,
+                      transition,
+                      wm: null,        // sandwich-eligible ⇒ no watermark
+                      assSuffix: null, // ⇒ no captions
+                      clipPath: edgePath,
+                      encArgs,
+                      globalArgs: encGlobalArgs,
+                      anyAudio: false,
+                      segHasAudio: false,
+                      overlaySpecs: [], // ⇒ no overlays in window
+                      hwaccel: false,
+                      threads: threadsPer,
+                    });
+                    turboJobs.push({
+                      idx: i,
+                      args: built.args,
+                      durSec: edge.durMs / 1000,
+                      durationMs: edge.durMs,
+                      segId: seg.id,
+                    });
+                  };
+                  if (sw.head) emitEdge(sw.head, "sh");
+                  const midPath = path.join(tempDir, `hyb_${String(i).padStart(4, "0")}_sm.mp4`);
+                  tempFiles.push(midPath);
+                  chunkFiles.push(midPath);
+                  turboJobs.push({
+                    idx: i,
+                    args: G.buildStreamCopyArgs({
+                      path: seg.videoPath,
+                      durMs: sw.middle.durMs,
+                      clipPath: midPath,
+                      ss: sw.middle.ss,
+                    }),
+                    durSec: sw.middle.durMs / 1000,
+                    durationMs: sw.middle.durMs,
+                    segId: seg.id,
+                    copy: true,
+                  });
+                  if (sw.tail) emitEdge(sw.tail, "st");
+                  turboCopied += 1;
+                }
+              }
+              continue; // clean chunk fully handled by TURBO replay
+            }
             // v6.5: per-segment SOURCE rates (probe cache is warm from the
             // build loop) — the sub-seek snaps to each source's own frame
             // grid so the sub-window's first frame is exactly the frame the
@@ -3409,6 +3768,8 @@ ipcMain.handle("export-native", async (event, opts) => {
                 outputPath: chunkPath,
                 threads: threadsPer,
                 filterThreads: filterThreadsPer,
+                // v7 Step 1: QSV device-init globals at the argv head.
+                globalArgs: encGlobalArgs,
               }),
               durSec: c.durMs / 1000,
               durationMs: c.durMs,
@@ -3416,24 +3777,32 @@ ipcMain.handle("export-native", async (event, opts) => {
             });
           }
           if (!chunkOverBudget) {
-            console.log(`[framefuse] chunked single-pass: ${W} parallel windows over ${(totalMs / 1000).toFixed(1)}s (${Math.round(cpuCount)} cores)`);
+            const dirtyChunks = chunkJobs.length;
+            console.log(
+              isHybrid
+                ? `[framefuse] HYBRID smart render: ${dirtyChunks} re-encode windows + ${turboCopied} TURBO stream-copy segments over ${(totalMs / 1000).toFixed(1)}s (${Math.round(cpuCount)} cores)`
+                : `[framefuse] chunked single-pass: ${W} parallel windows over ${(totalMs / 1000).toFixed(1)}s (${Math.round(cpuCount)} cores)`,
+            );
             const spStart = Date.now();
-            // Pool progress weighted by chunk duration (0 → 92 %).
-            const chunkFrac = chunkJobs.map(() => 0);
+            // v7 Step 4: ONE pool over the graph chunks + the TURBO replay jobs
+            // (copies are near-instant and fill idle slots). Progress weighted
+            // by each job's timeline duration (0 → 92 %).
+            const poolJobs = [...chunkJobs, ...turboJobs];
+            const chunkFrac = poolJobs.map(() => 0);
             let lastEmit = 0;
             const emitChunkProgress = (force) => {
               const now = Date.now();
               if (!force && now - lastEmit < 100) return;
               lastEmit = now;
               let doneMs = 0;
-              for (let k = 0; k < chunkJobs.length; k++) doneMs += chunkFrac[k] * chunkJobs[k].durationMs;
+              for (let k = 0; k < poolJobs.length; k++) doneMs += chunkFrac[k] * poolJobs[k].durationMs;
               const frac = Math.min(1, doneMs / Math.max(1, totalMs));
               sendProgress(frac * 92, frac * totalSec, etaFor(frac));
             };
             try {
-              await runPool(chunkJobs, W, {
+              await runPool(poolJobs, poolWidth, {
                 onTime: (idx, sec) => {
-                  chunkFrac[idx] = Math.min(1, sec / Math.max(0.01, chunkJobs[idx].durSec));
+                  chunkFrac[idx] = Math.min(1, sec / Math.max(0.01, poolJobs[idx].durSec));
                   emitChunkProgress(false);
                 },
                 onDone: (idx) => {
@@ -3555,15 +3924,20 @@ ipcMain.handle("export-native", async (event, opts) => {
                 size,
                 encoder: encoder.label,
                 elapsedSec: Math.round((Date.now() - startTime) / 1000),
-                copiedClips: 0,
-                encodedClips: segments.length,
+                // v7 Step 4: hybrid telemetry — copiedClips = the TURBO
+                // stream-copy segments, encodedClips = the graph-re-encoded
+                // (dirty) segments.
+                copiedClips: isHybrid ? turboCopied : 0,
+                encodedClips: isHybrid
+                  ? segments.length - turboCopied
+                  : segments.length,
                 keyframeCuts: 0,
                 chunkedClips: 0,
-                totalChunks: W,
-                parallelChunks: W,
+                totalChunks: isHybrid ? dirtyChunks : W,
+                parallelChunks: isHybrid ? dirtyChunks : W,
                 hwDecodeClips: spHwCount,
                 singlePass: true,
-                mode: "parallel-pass",
+                mode: isHybrid ? "hybrid-pass" : "parallel-pass",
               };
             }
           } else {
@@ -3625,8 +3999,13 @@ ipcMain.handle("export-native", async (event, opts) => {
             outputPath,
             // ONE process: the encoder may use every core; filters get a
             // slice-thread budget so scale/overlay parallelize.
-            threads: 0, // 0 = auto (all cores) — mirrors a single-job pool
-            filterThreads: Math.max(2, Math.min(8, os.cpus().length)),
+            // v7 Step 5: low-end libx264 caps threads at 2 (cache thrashing).
+            threads: lowEndX264 ? Math.min(2, cpuCount) : 0, // 0 = auto (all cores)
+            filterThreads: lowEndX264
+              ? 2
+              : Math.max(2, Math.min(8, os.cpus().length)),
+            // v7 Step 1: QSV device-init globals at the argv head.
+            globalArgs: encGlobalArgs,
           });
           const spStart = Date.now();
           let spFastFail = false;

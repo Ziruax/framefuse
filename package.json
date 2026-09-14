@@ -1,8 +1,8 @@
 {
   "name": "framefuse",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "private": true,
-  "description": "FrameFuse v1 \u2014 Multi-track video studio: video clips, green/white/black screen chroma key with on-canvas PiP, overlay lane, background music with volume/loop, synthesized SFX, native Whisper captions (model bundled with the installer), CPU-first parallel single-pass FFmpeg export with GPU acceleration when available, native project files.",
+  "description": "FrameFuse v1 — Multi-track video studio: video clips, green/white/black screen chroma key with on-canvas PiP, overlay lane, background music with volume/loop, synthesized SFX, native Whisper captions (model bundled with the installer), CPU-first parallel single-pass FFmpeg export with GPU acceleration when available, native project files.",
   "main": "electron/main.js",
   "author": "FrameFuse",
   "license": "MIT",
@@ -96,6 +96,10 @@
       {
         "from": "resources/ffmpeg",
         "to": "ffmpeg"
+      },
+      {
+        "from": "build/icon.ico",
+        "to": "icon.ico"
       }
     ],
     "asarUnpack": [],

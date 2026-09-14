@@ -45,6 +45,13 @@ def main():
     ap.add_argument("--preload", action="store_true")
     args = ap.parse_args()
 
+    # v7 FIX A: bound huggingface_hub's network calls (its requests have NO
+    # read timeout by default — a stalled socket hangs the whole sidecar and
+    # the host UI shows "Working…" forever) + silence tqdm progress noise.
+    import os
+    os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
     if not args.preload and not args.audio:
         emit({"type": "error", "message": "--audio is required (or pass --preload)"})
         return 1
@@ -58,6 +65,21 @@ def main():
     lang = None if args.language in ("auto", "", None) else args.language
 
     emit({"type": "stage", "stage": "load"})
+    # v7 FIX A: heartbeat while loading. WhisperModel() includes the FIRST-RUN
+    # model download, which can take minutes with no other output — the
+    # heartbeats tell the host's watchdog the sidecar is alive (a hard hang
+    # stops them and the watchdog kills + falls back to the bundled engine).
+    # The main thread is blocked inside WhisperModel() during the heartbeat
+    # window, so emit() never runs concurrently from two threads.
+    import threading
+    stop_beat = threading.Event()
+
+    def heartbeat():
+        while not stop_beat.wait(5.0):
+            emit({"type": "stage", "stage": "load"})
+
+    beat = threading.Thread(target=heartbeat, daemon=True)
+    beat.start()
     try:
         kwargs = {"device": "cpu", "compute_type": "int8"}
         if args.cache:
@@ -68,6 +90,8 @@ def main():
     except Exception as e:  # noqa: BLE001
         emit({"type": "error", "message": f"Model load failed: {e}"})
         return 1
+    finally:
+        stop_beat.set()
 
     if args.preload:
         # The model constructor above already downloaded + cached the files;

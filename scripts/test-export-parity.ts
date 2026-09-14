@@ -517,7 +517,10 @@ console.log("── 6. single-pass plan structural invariants ──────
   // eligibility envelope
   ok("eligibility: 70 segments ok", SP.singlePassEligible({ segments: new Array(70), overlayCount: 0, totalSec: 30, captionsBurned: false }).ok);
   ok("eligibility: 71 segments rejected", !SP.singlePassEligible({ segments: new Array(71), overlayCount: 0, totalSec: 30, captionsBurned: false }).ok);
-  ok("eligibility: captioned 601s rejected", !SP.singlePassEligible({ segments: new Array(2), overlayCount: 0, totalSec: 601, captionsBurned: true }).ok);
+  // v7 Step 2: the captioned-time ceiling is REMOVED — long captioned
+  // projects ride the chunked single-pass (W parallel libass burns). The
+  // old "captioned 601s rejected" gate is now intentionally inverted.
+  ok("eligibility: captioned 601s ok (v7: ceiling removed)", SP.singlePassEligible({ segments: new Array(2), overlayCount: 0, totalSec: 601, captionsBurned: true }).ok);
   ok("eligibility: uncaptioned 601s ok", SP.singlePassEligible({ segments: new Array(2), overlayCount: 0, totalSec: 601, captionsBurned: false }).ok);
   ok("eligibility: >40 overlays rejected", !SP.singlePassEligible({ segments: new Array(2), overlayCount: 41, totalSec: 30, captionsBurned: false }).ok);
 }

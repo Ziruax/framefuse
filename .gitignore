@@ -30,6 +30,8 @@ next-env.d.ts
 dev.log
 
 # build artifacts
+__pycache__/
+*.pyc
 /download/*.zip
 /download/*.png
 /resources/ffmpeg/

@@ -38,17 +38,24 @@ const G = require("./export-graph");
 /** Single-pass eligibility ceilings (the plan's fallback envelope). */
 const SINGLEPASS_MAX_SEGMENTS = 70;
 const SINGLEPASS_MAX_OVERLAYS = 40;
-/** Captioned projects longer than this keep the chunked two-step pool — the
- *  v1.4.2 fix for "one long video with subtitles exports for hours" relies on
- *  chunk parallelism for the single-threaded libass burn. */
-const SINGLEPASS_CAPTIONED_MAX_SEC = 600;
+/** v7 Step 2: the captioned-time ceilings are GONE (Infinity). Long
+ *  captioned projects now ride the CHUNKED single-pass: every chunk window
+ *  runs its OWN subtitles= filter over a window-clamped ASS document, so the
+ *  single-threaded libass rasterization parallelizes across the W workers
+ *  (each burns ~1/W of the cue stream). The old 600 s W=1 / 3600 s chunked
+ *  gates pushed exactly these projects onto the two-step pool, whose
+ *  per-clip chunks ALSO burn libass single-threaded per process (poolN=1 on
+ *  low-core boxes — no parallelism win there, plus temp files and a double
+ *  concat). The segment/overlay/script-byte ceilings stay: they bound ONE
+ *  process's graph size, which chunking already divides by W. */
+const SINGLEPASS_CAPTIONED_MAX_SEC = Infinity;
 /** v6.5 CHUNKED ceilings (W>1 parallel single-pass): every chunk runs its own
  *  graph (~1/W the segments/overlaps) and its own libass burn, so the W=1
  *  ceilings — which exist to bound ONE process's graph size and ONE
  *  single-threaded subtitle burn — can widen. */
 const CHUNKED_MAX_SEGMENTS = 240;
 const CHUNKED_MAX_OVERLAYS = 120;
-const CHUNKED_CAPTIONED_MAX_SEC = 3600;
+const CHUNKED_CAPTIONED_MAX_SEC = Infinity;
 /** Fallback threshold applied by main.js AFTER building (bytes of graph). */
 const SINGLEPASS_MAX_SCRIPT_BYTES = 25000;
 /** v6.5 chunk planner knobs. */
@@ -72,15 +79,13 @@ function singlePassEligible(o) {
   // the libass burn parallelizes per chunk.
   const maxSeg = o && o.chunked ? CHUNKED_MAX_SEGMENTS : SINGLEPASS_MAX_SEGMENTS;
   const maxOvl = o && o.chunked ? CHUNKED_MAX_OVERLAYS : SINGLEPASS_MAX_OVERLAYS;
-  const maxCap = o && o.chunked ? CHUNKED_CAPTIONED_MAX_SEC : SINGLEPASS_CAPTIONED_MAX_SEC;
+  // v7 Step 2: the captioned-time gate is removed (ceiling = Infinity) —
+  // captions burn per-chunk in W parallel libass processes now.
   if (segments.length > maxSeg) {
     return { ok: false, reason: `segments>${maxSeg}` };
   }
   if (Number(o && o.overlayCount) > maxOvl) {
     return { ok: false, reason: `overlays>${maxOvl}` };
-  }
-  if (o && o.captionsBurned && Number(o && o.totalSec) > maxCap) {
-    return { ok: false, reason: `captioned>${Math.round(maxCap)}s (chunked pool)` };
   }
   return { ok: true, reason: null };
 }
@@ -228,11 +233,23 @@ function segmentFrameSpans(o) {
 /**
  * Plan the parallel timeline chunks. o = { segments, transition, kbEnabled,
  * globalDir, fps, totalMs, fades (buildGlobalFades strings), workerCount,
- * targetSec? }.
+ * targetSec?, segClean? }.
  *
- * Returns { chunks: [{ f0, f1, frames, t0Ms, durMs, first, last }],
- * spans, totalFrames } or null when chunking doesn't apply (W<2, short
- * timeline, or the forbidden zones leave no valid split).
+ * Returns { chunks: [{ f0, f1, frames, t0Ms, durMs, first, last, clean }],
+ * spans, totalFrames, hybrid } or null when chunking doesn't apply (W<2,
+ * short timeline, or the forbidden zones leave no valid split).
+ *
+ * v7 Step 4 — HYBRID SMART RENDERING: when `o.segClean` (a boolean per
+ * segment, from main.js's TURBO copy-eligibility) marks a MIX of clean
+ * (stream-copyable, matching output spec) and dirty (needs the filter
+ * graph) segments, the plan adds MANDATORY chunk boundaries at every
+ * clean↔dirty run edge — no chunk ever straddles the two — and spends the
+ * ideal split points ONLY inside dirty ranges. Chunks whose covered
+ * segments are all clean carry `clean: true`; main.js renders those as
+ * TURBO stream copies (-c:v copy, zero decode/filter/encode) and the dirty
+ * ones as windowed single-pass graphs, then glues the pieces with the
+ * concat demuxer (-c copy). A 19-minute timeline with 4 minutes of edits
+ * re-encodes exactly those 4 minutes.
  */
 function planTimelineChunks(o) {
   const segments = Array.isArray(o && o.segments) ? o.segments : [];
@@ -272,6 +289,171 @@ function planTimelineChunks(o) {
     }
   }
   const forbidden = (f) => zones.some((z) => f >= z[0] && f <= z[1]);
+
+  // ── v7 Step 4: HYBRID clean/dirty run planning ──────────────────────────
+  const segCleanIn =
+    Array.isArray(o && o.segClean) && o.segClean.length === segments.length
+      ? o.segClean.map(Boolean)
+      : null;
+  let hybridSegClean = null;
+  let mandatoryEdges = [];
+  if (segCleanIn && segCleanIn.some((v) => v) && segCleanIn.some((v) => !v)) {
+    // Absorb clean runs too short to stand alone (< 2 chunk minimums) into
+    // the neighboring dirty ranges — correctness is unchanged (those frames
+    // re-encode through the graph), and the piece list stays chunk-shaped.
+    const c = segCleanIn.slice();
+    for (let pass = 0; pass < 4; pass++) {
+      let changed = false;
+      let i = 0;
+      while (i < c.length) {
+        let j = i;
+        while (j < c.length && c[j] === c[i]) j++;
+        if (c[i] && j < c.length) {
+          const frames = spans[j - 1].S + spans[j - 1].F - spans[i].S;
+          if (frames < 2 * minFrames) {
+            for (let k = i; k < j; k++) c[k] = false;
+            changed = true;
+          }
+        }
+        i = j;
+      }
+      if (!changed) break;
+    }
+    if (c.some((v) => v) && c.some((v) => !v)) {
+      // Mandatory edges at run switches. Invariant: a fade window or xfade
+      // head covering an edge would make one of the edge segments DIRTY
+      // (fades/heads disqualify copy eligibility), so a legit clean↔dirty
+      // edge is never inside a zone — but stay conservative: ANY forbidden
+      // edge cancels the hybrid and falls back to the plain full-timeline
+      // chunk plan (re-encode everything, the v6.5 behavior).
+      const mand = [];
+      for (let i = 1; i < c.length; i++) {
+        if (c[i] !== c[i - 1]) mand.push(spans[i].S);
+      }
+      if (mand.length > 0 && mand.every((f) => !forbidden(f))) {
+        hybridSegClean = c;
+        mandatoryEdges = mand;
+      }
+    }
+  }
+
+  if (hybridSegClean) {
+    // Dirty ranges as global frame spans [a, b).
+    const ranges = [];
+    {
+      let i = 0;
+      while (i < hybridSegClean.length) {
+        if (hybridSegClean[i]) { i++; continue; }
+        let j = i;
+        while (j < hybridSegClean.length && !hybridSegClean[j]) j++;
+        ranges.push({ a: spans[i].S, b: spans[j - 1].S + spans[j - 1].F });
+        i = j;
+      }
+    }
+    const dirtyFrames = ranges.reduce((s, r) => s + (r.b - r.a), 0);
+    const dirtySec = dirtyFrames / fps;
+    if (dirtyFrames > 0 && ranges.length > 0) {
+      // Chunk count over the DIRTY time only — clean time costs ~nothing
+      // (stream copies), so the workers all go to the re-encode windows.
+      let n = Math.min(
+        workerCount,
+        Math.max(2, Math.ceil(dirtySec / Math.max(5, targetSec / 2))),
+      );
+      n = Math.max(1, Math.min(n, Math.floor(dirtyFrames / minFrames) || 1));
+      // Ideal splits distributed proportionally over the dirty frames,
+      // mapped back to global frame positions, nudged right — then left —
+      // INSIDE their dirty range, out of forbidden zones, keeping every
+      // chunk ≥ minFrames from the previous bound.
+      const bounds = [];
+      let prev = 0;
+      for (let k = 1; k < n; k++) {
+        const target = Math.round((dirtyFrames * k) / n);
+        let acc = 0;
+        let gf = -1;
+        for (const r of ranges) {
+          const len = r.b - r.a;
+          if (acc + len > target) { gf = r.a + (target - acc); break; }
+          acc += len;
+        }
+        if (gf < 0) gf = ranges[ranges.length - 1].b - 1;
+        const splittable = (f) =>
+          ranges.some(
+            (r) => f >= r.a + minFrames && f <= r.b - minFrames,
+          );
+        let b = -1;
+        for (let c2 = gf; c2 <= totalFrames - minFrames; c2++) {
+          if (splittable(c2) && !forbidden(c2) && c2 - prev >= minFrames) { b = c2; break; }
+        }
+        if (b < 0) {
+          for (let c2 = gf; c2 > prev + minFrames; c2--) {
+            if (splittable(c2) && !forbidden(c2)) { b = c2; break; }
+          }
+        }
+        if (b < 0) break;
+        bounds.push(b);
+        prev = b;
+      }
+      const allBounds = Array.from(
+        new Set([...bounds, ...mandatoryEdges]),
+      ).sort((x, y) => x - y);
+      // A too-small last DIRTY chunk merges into the previous (clean chunks
+      // of any size are fine — they are just copy pieces).
+      while (
+        allBounds.length > 0 &&
+        totalFrames - allBounds[allBounds.length - 1] < minFrames
+      ) {
+        const popped = allBounds.pop();
+        // Never merge across a mandatory edge by popping it — a trailing
+        // clean run shorter than minFrames is a perfectly good copy piece.
+        if (mandatoryEdges.includes(popped)) {
+          allBounds.push(popped);
+          break;
+        }
+      }
+      const chunks = [];
+      let f0 = 0;
+      for (const b of [...allBounds, totalFrames]) {
+        const frames = b - f0;
+        if (frames <= 0) { f0 = b; continue; }
+        let clean = true;
+        for (let i = 0; i < segments.length; i++) {
+          const sp = spans[i];
+          if (!sp || sp.F <= 0) continue;
+          if (
+            Math.min(sp.S + sp.F, b) - Math.max(sp.S, f0) > 0 &&
+            !hybridSegClean[i]
+          ) {
+            clean = false;
+            break;
+          }
+        }
+        chunks.push({
+          f0,
+          f1: b,
+          frames,
+          t0Ms: (f0 / fps) * 1000,
+          durMs: (frames / fps) * 1000,
+          first: f0 === 0,
+          last: b === totalFrames,
+          clean,
+        });
+        f0 = b;
+      }
+      if (chunks.length < 2) return null;
+      // Integrity: exact coverage of the output frame grid.
+      const covered = chunks.reduce((a, c) => a + c.frames, 0);
+      if (covered !== totalFrames) return null;
+      return {
+        chunks,
+        spans,
+        totalFrames,
+        fps,
+        hybrid: true,
+        segClean: hybridSegClean,
+        dirtyFrames,
+      };
+    }
+  }
 
   // Chunk count: enough windows to keep every worker busy — half-target
   // granularity (90 s on 4 workers → 4×22.5 s, not 2×45 s), capped at the
@@ -328,7 +510,7 @@ function planTimelineChunks(o) {
   // Integrity: exact coverage of the output frame grid.
   const covered = chunks.reduce((a, c) => a + c.frames, 0);
   if (covered !== totalFrames) return null;
-  return { chunks, spans, totalFrames, fps };
+  return { chunks, spans, totalFrames, fps, hybrid: false };
 }
 
 /**
@@ -851,11 +1033,17 @@ function buildSinglePassPlan(o) {
 /**
  * Final ffmpeg argv for the single-pass export. o = { plan (from
  * buildSinglePassPlan), scriptPath, encArgs, abr, fps, outputPath, threads,
- * filterThreads }.
+ * filterThreads, globalArgs? }.
+ * v7 Step 1: `globalArgs` (encoder-level ffmpeg GLOBAL options, e.g. the
+ * Intel QSV d3d11va→qsv device derivation) ride immediately after -y and
+ * BEFORE every input — exactly where -init_hw_device must sit.
  */
 function buildSinglePassArgs(o) {
   const plan = o.plan;
   const args = ["-y"];
+  if (Array.isArray(o.globalArgs) && o.globalArgs.length > 0) {
+    args.push(...o.globalArgs);
+  }
   const filterThreads = Number(o.filterThreads);
   if (Number.isFinite(filterThreads) && filterThreads > 0) {
     args.push("-filter_threads", String(Math.round(filterThreads)));

@@ -1279,6 +1279,10 @@ function buildClipArgs(ctx) {
     kbEnabled, zoomMax, globalDir,
     transition, wm, assSuffix, clipPath, encArgs,
     anyAudio, segHasAudio, overlaySpecs, hwaccel,
+    // v7 Step 1: encoder-level ffmpeg GLOBAL options (Intel QSV's
+    // d3d11va→qsv device derivation) — prepended BEFORE every input arg so
+    // `-init_hw_device` sits at the argv head. Absent → byte-identical argv.
+    globalArgs,
     // v5.2: per-process encoder thread budget (0 = auto/legacy). The main
     // process divides the cores across the parallel pool so concurrent
     // encoders never oversubscribe the CPU.
@@ -1289,6 +1293,7 @@ function buildClipArgs(ctx) {
     // legacy whole-clip behavior, byte-identical argv.
     chunk,
   } = ctx;
+  const globals = Array.isArray(globalArgs) && globalArgs.length > 0 ? globalArgs : [];
 
   const overlays = Array.isArray(overlaySpecs) ? overlaySpecs : [];
   const isVideo = !!(seg && seg.mediaType === "video" && seg.videoPath);
@@ -1441,6 +1446,7 @@ function buildClipArgs(ctx) {
     }
     return {
       args: [
+        ...globals,
         ...state.inputs,
         "-t", segDurSec.toFixed(3),
         "-filter_complex", state.graph,
@@ -1529,6 +1535,7 @@ function buildClipArgs(ctx) {
       if (audioGraph) g += `;${audioGraph}`;
       return {
         args: [
+          ...globals,
           ...inputs,
           "-t", effDurSec.toFixed(3),
           "-filter_complex", g,
@@ -1544,6 +1551,7 @@ function buildClipArgs(ctx) {
     if (assSuffix) vfParts.push(assSuffix);
     vfParts.push(...postFades);
     const args = [
+      ...globals,
       ...inputs,
       "-t", effDurSec.toFixed(3),
       "-vf", vfParts.join(","),
