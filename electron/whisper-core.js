@@ -370,13 +370,13 @@ async function buildPipeline(o) {
     }
 
     // ── REMOTE sequence (v5.2 host retry) ────────────────────────────────
-    // Reset the env from any local-first attempt before going remote.
+    // Reset the env from any local-first attempt before going remote
+    // (unconditional — a stale localModelPath must not leak into the remote
+    // build even when cacheDir is absent).
     env.allowRemoteModels = true;
     env.allowLocalModels = false;
-    if (cacheDir) {
-      env.cacheDir = cacheDir;
-      env.localModelPath = cacheDir;
-    }
+    if (cacheDir) env.cacheDir = cacheDir;
+    env.localModelPath = cacheDir || env.cacheDir || "";
     installFetchTracking();
 
     let lastError = null;

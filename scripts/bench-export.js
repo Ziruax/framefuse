@@ -295,8 +295,10 @@ async function benchOne(key) {
     const F4 = {
       name: "parallel-pass (8-core mask, 10 clips + captions + overlay + music, 40s)",
       segments: [
+        // solo.mp4 is an 8 s source — every 4 s window fits inside (a shorter
+        // source would EOF early and shorten the timeline: degenerate case).
         ...Array.from({ length: 5 }, (_, k) => ({
-          id: `pv${k}`, mediaType: "video", videoPath: `${TMP}/v${k}.mp4`,
+          id: `pv${k}`, mediaType: "video", videoPath: `${TMP}/solo.mp4`,
           durationMs: 4000, trimInMs: 0, volume: 1, startMs: k * 8000, endMs: k * 8000 + 4000,
         })),
         ...Array.from({ length: 5 }, (_, k) => ({

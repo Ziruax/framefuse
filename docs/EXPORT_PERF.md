@@ -51,10 +51,24 @@ GPU; the <40 s KPI target does not need chunking).
   the unpadded EOF to reproduce the W=1 render's exact end behavior.
 - **Boundary plans read the ORIGINAL segments** (`fullSegments` + `origIdx`)
   — a windowed duration must never re-clamp a transition duration.
-- The residual W=1↔chunked difference is the measured **xfade chroma-resample
-  rounding** (≤4/255 on ≤2 % of pixels, sub-perceptual ≈50 dB PSNR) on
-  frames whose segments lost the head-composite passthrough — the chunked
-  render is arguably MORE accurate (pure passthrough).
+- **Phase normalization**: every single-pass video chain ends with
+  `,setpts=PTS-STARTPTS`. Without it, an input seek whose phase lands in the
+  first half of a source frame interval (frac(trimIn×fps) ∈ (0,0.5)) makes
+  the fps filter emit its first frame one slot late, and the concat filter
+  fills the leading sub-frame gap with a DUPLICATE (+1 frame per affected
+  segment — a v6 W=1 bug found by independent review, now fixed and guarded
+  by the "W=1 emits EXACTLY the frame model" assertion).
+- The residual W=1↔chunked differences, all bounded and drift-free:
+  (a) the measured **xfade chroma-resample rounding** (≤4/255 on ≤2 % of
+  pixels, sub-perceptual) on frames whose segments lost the head-composite
+  passthrough — the chunked render is arguably MORE accurate; and (b) a
+  **±1-SOURCE-FRAME phase jitter** for segments cut mid-way with speed ≠ 1
+  or srcFps ≠ fps (a seek-based sub-window resets the fps filter's
+  fractional phase; W=1 accumulates it from the segment start). The jitter
+  is ≤ one source frame (~22–40 ms), never accumulates (frame counts, the
+  boundary frame, chunk 0, and the audio bus all stay bit-exact), and the
+  sub-seek law `F(j0) = ceil(trimIn×g) + floor(j0·g·speed/fps)` makes
+  speed-1 rate-matched cuts bit-exact at ANY trim alignment.
 - `node scripts/verify-timeline-chunks.js` (30 assertions) proves all of it
   with **lossless (-qp 0) frame-MD5 parity** between the full W=1 render and
   the chunked render, plus decoded-PCM parity for the audio bus, plus a

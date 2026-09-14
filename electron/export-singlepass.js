@@ -371,17 +371,28 @@ function windowSegmentsForChunk(segments, spans, f0, f1, fps, srcFpsPerSeg) {
         // ssSec stays null → buildVideoInputArgs formats fmt3(trimInMs),
         // exactly like the W=1 plan.
       } else {
-        // SOURCE-time bound of W=1's slot (k0 − S): trimIn + offset×speed.
-        const boundSec =
-          ((Number(seg.trimInMs) || 0) + ((k0 - span.S) / fps) * 1000 * speed) / 1000;
-        // The frame W=1 displays there = the last source frame ≤ bound (CFR
-        // source grid). Seeking EXACTLY at that frame makes the sub-window's
-        // slot 0 show it — bit-identical to W=1's slot (k0 − S).
+        // Mid-segment cut. W=1's slot j0 = (k0 − S) displays source frame
+        //   F(j0) = F0 + floor(j0 · g · speed / fps),
+        // where F0 = ceil(trimIn × g) is the first frame the input seek
+        // decodes (the first frame with pts ≥ trimIn) — measured empirically
+        // at speed 1 (trims 233/437 ms @30 fps → F0 7/14, slot 15 → 22/29)
+        // and at speed 1.5 (trim 966 ms → F0 29, slot 15 → 51).
+        // Seeking EXACTLY to F(j0)/g makes the sub-window's slot 0 display
+        // it. speed = 1 + rate-matched ⇒ every subsequent slot advances the
+        // same whole frame ⇒ BIT-EXACT. speed ≠ 1 or rate mismatch ⇒ the
+        // sub-window's fractional phase resets at the seek (W=1 accumulates
+        // it from the segment start), leaving a ±1-SOURCE-FRAME jitter at
+        // the carry slots — bounded, sub-perceptual (≤ one source frame ≈
+        // 22–40 ms), and DRIFT-FREE (verified: frame counts, boundary frame,
+        // and audio stay bit-exact). Documented in docs/EXPORT_PERF.md.
         const g =
           Array.isArray(srcFpsPerSeg) && Number(srcFpsPerSeg[i]) > 0
             ? Number(srcFpsPerSeg[i])
             : fps;
-        const kFrame = Math.floor(boundSec * g);
+        const trimInMs = Math.max(0, Number(seg.trimInMs) || 0);
+        const F0 = Math.ceil((trimInMs / 1000) * g - 1e-9);
+        const j0 = k0 - span.S;
+        const kFrame = F0 + Math.floor((j0 * g * speed) / fps);
         const seekSec = kFrame / g;
         copy.trimInMs = seekSec * 1000;
         copy.durationMs = durMs;
