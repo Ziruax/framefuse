@@ -308,6 +308,18 @@ export interface ExportProgress {
   fps?: number;
   eta?: number;
   timemark?: string;
+  /**
+   * v1.8.2 (GPU engine): coarse phase for slow-start visibility — long
+   * timelines spend seconds in decoder/source setup BEFORE the first frame
+   * encodes, and an integer-percent bar showed a frozen "0%" the whole time.
+   */
+  stage?: "preparing" | "encoding" | "finalizing";
+  /** v1.8.2 (GPU engine): frames encoded so far (0 until the loop starts). */
+  framesEncoded?: number;
+  /** v1.8.2 (GPU engine): total frames the export will encode. */
+  totalFrames?: number;
+  /** v1.8.2 (GPU engine): wall-clock seconds since the export began. */
+  elapsedSec?: number;
 }
 
 export interface ExportResult {

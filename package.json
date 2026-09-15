@@ -1,11 +1,30 @@
 {
   "name": "framefuse",
-  "version": "1.8.1",
+  "version": "1.8.2",
   "private": true,
   "description": "FrameFuse v1 — Multi-track video studio: video clips, green/white/black screen chroma key with on-canvas PiP, overlay lane, background music with volume/loop, synthesized SFX, native Whisper captions (model bundled with the installer), CPU-first parallel single-pass FFmpeg export with GPU acceleration when available, native project files.",
   "main": "electron/main.js",
   "author": "FrameFuse",
   "license": "MIT",
+  "scripts": {
+    "dev": "next dev -p 3000 2>&1 | tee dev.log",
+    "clean": "node scripts/clean.js",
+    "build": "npm run clean && next build --webpack && node scripts/copy-wasm.js",
+    "start": "next start",
+    "lint": "eslint .",
+    "test:export-parity": "bun scripts/test-export-parity.ts",
+    "bench:export": "node scripts/bench-export.js",
+    "verify:kenburns": "node scripts/verify-kenburns-parity.js",
+    "electron": "electron electron/main.js",
+    "electron:dev": "concurrently -k \"npm run dev\" \"wait-on http://localhost:3000 && electron electron/main.js\"",
+    "fetch:ffmpeg": "node scripts/fetch-windows-ffmpeg.js",
+    "stage:whisper": "node scripts/stage-whisper-service.js",
+    "stage:whisper-model": "node scripts/stage-whisper-model.js",
+    "stage:faster-whisper": "node scripts/stage-faster-whisper.js",
+    "stage:faster-whisper-model": "node scripts/stage-faster-whisper-model.js",
+    "postinstall": "node scripts/patch-transformers.js && node scripts/patch-electron-builder.js",
+    "electron:build": "npm run clean && next build --webpack && node scripts/copy-wasm.js && node scripts/fetch-windows-ffmpeg.js && node scripts/stage-whisper-service.js && node scripts/stage-whisper-model.js && node scripts/stage-faster-whisper.js && node scripts/stage-faster-whisper-model.js && electron-builder --win nsis --publish never"
+  },
   "trustedDependencies": [
     "electron",
     "ffmpeg-static",
@@ -24,5 +43,85 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "tailwind-merge": "^3.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "concurrently": "^9.1.2",
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8",
+    "eslint": "^9",
+    "eslint-config-next": "^16.1.1",
+    "tailwindcss": "^4",
+    "typescript": "^5",
+    "wait-on": "^8.0.3"
+  },
+  "build": {
+    "appId": "com.framefuse.app",
+    "productName": "FrameFuse",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "out/**/*",
+      "electron/**/*",
+      "build/**/*",
+      "package.json",
+      "!node_modules"
+    ],
+    "extraResources": [
+      {
+        "from": "whisper-service",
+        "to": "whisper-service"
+      },
+      {
+        "from": "faster-whisper-runtime",
+        "to": "faster-whisper-runtime"
+      },
+      {
+        "from": "node_modules/@xenova/transformers/dist",
+        "to": "transformers-wasm",
+        "filter": [
+          "**/*.{wasm,mjs}"
+        ]
+      },
+      {
+        "from": "node_modules/ffmpeg-static",
+        "to": "ffmpeg-static",
+        "filter": [
+          "ffmpeg.exe",
+          "ffmpeg.LICENSE",
+          "ffmpeg.README"
+        ]
+      },
+      {
+        "from": "resources/ffmpeg",
+        "to": "ffmpeg"
+      },
+      {
+        "from": "build/icon.ico",
+        "to": "icon.ico"
+      }
+    ],
+    "asarUnpack": [],
+    "win": {
+      "target": "nsis",
+      "icon": "build/icon.ico",
+      "signtoolOptions": null,
+      "signAndEditExecutable": true,
+      "forceCodeSigning": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "FrameFuse",
+      "perMachine": false,
+      "uninstallDisplayName": "FrameFuse v1",
+      "deleteAppDataOnUninstall": false
+    },
+    "npmRebuild": false
   }
 }

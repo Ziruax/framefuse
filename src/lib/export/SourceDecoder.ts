@@ -49,9 +49,14 @@ interface AvcCBoxView {
 const SAMPLES_PER_BATCH = 64;
 /** Decode feeding pauses above this many pending decode() calls. */
 const MAX_DECODE_QUEUE = 8;
-/** A wake with no progress for this many consecutive cycles = stalled decoder. */
-const WAKE_TIMEOUT_MS = 30_000;
-const MAX_STALLED_WAKES = 10;
+/**
+ * A wake with no progress for this many consecutive cycles = stalled decoder.
+ * v1.8.2: tightened from 30s×10 (5 full minutes of a 0% export bar before the
+ * error!) to 15s×4 — a healthy decoder emits frames/dequeue events constantly,
+ * so 60s of TOTAL silence means the hardware decode session is wedged.
+ */
+const WAKE_TIMEOUT_MS = 15_000;
+const MAX_STALLED_WAKES = 4;
 
 function errMessage(e: unknown): string {
   if (e instanceof Error) return e.message;

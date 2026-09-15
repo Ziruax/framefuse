@@ -140,6 +140,10 @@ export class AudioMixer {
    * is awaited internally (`startRendering`), and encode chunks flow out via
    * the callback while the caller keeps driving video frames.
    *
+   * v1.8.2 `signal`: aborted between tracks / between encode chunks so a
+   * restarted encode pass (hardware→software retry) doesn't leave a zombie
+   * AAC encode burning CPU into a dead muxer.
+   *
    * `loop` semantics: the source is scheduled with `loop = true` and NO
    * duration limit; playback begins at `offsetSec` and loops from there to
    * the end of the buffer, repeatedly. The OfflineAudioContext truncates
@@ -147,7 +151,11 @@ export class AudioMixer {
    * the timeline (this is the "background music pinned to the whole video"
    * case). Non-looping tracks play `durationSec` starting at `startSec`.
    */
-  async renderAudio(timelineSec: number, tracks: AudioTrackData[]): Promise<AudioMixerResult> {
+  async renderAudio(
+    timelineSec: number,
+    tracks: AudioTrackData[],
+    signal?: AbortSignal,
+  ): Promise<AudioMixerResult> {
     if (timelineSec <= 0) throw new AudioMixerError("audio timeline length must be positive");
     if (tracks.length === 0) {
       throw new AudioMixerError("no audio tracks to render — construct the mixer only for non-empty track lists");
@@ -183,6 +191,7 @@ export class AudioMixer {
     limiter.connect(context.destination);
 
     for (const track of tracks) {
+      if (signal?.aborted) throw new AudioMixerError("audio render aborted");
       await this.scheduleTrack(context, limiter, track);
     }
 
@@ -226,6 +235,9 @@ export class AudioMixer {
 
       for (let offset = 0; offset < totalFrames; offset += AUDIO_CHUNK_FRAMES) {
         if (encodeFatal) break;
+        if (signal?.aborted) {
+          throw new AudioMixerError("audio render aborted");
+        }
         if (encoder.encodeQueueSize > MAX_ENCODE_QUEUE) {
           // Soft backpressure: yield a tick so the encoder drains before we
           // queue more 21 ms chunks (hard bounded — encode is much faster

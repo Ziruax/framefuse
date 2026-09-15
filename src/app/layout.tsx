@@ -2,7 +2,7 @@ import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "FrameFuse v1.8.1 — Video Studio",
+  title: "FrameFuse v1.8.2 — Video Studio",
   description:
     "Multi-track desktop video studio: video clips, green-screen chroma key with on-canvas PiP, background music with volume & loop, SFX, native Whisper captions, and fast parallel FFmpeg export.",
   applicationName: "FrameFuse",

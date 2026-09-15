@@ -40,6 +40,7 @@
 import { Muxer, StreamTarget } from "mp4-muxer";
 import type {
   ExportNativeOptions,
+  ExportProgress,
   ExportResult,
   MediaSegment,
   OverlayTransform,
@@ -83,6 +84,9 @@ import {
  * null/undefined and the muxed bytes are delivered as a download instead. */
 export interface GpuTimelineExportOptions extends ExportNativeOptions {
   outputPath?: string | null;
+  /** v1.8.2: skip the prefer-hardware encoder rung (Export-tab diagnostics
+   * toggle — mirrors the FFmpeg force-encoder bypass for driver stalls). */
+  forceSoftware?: boolean;
 }
 
 /** Result of a GPU-engine export — the ExportResult the UI already renders,
@@ -93,6 +97,10 @@ export interface GpuTimelineExportResult extends ExportResult {
    * completed VIDEO-ONLY so the UI can toast a warning. */
   audioSkipped?: boolean;
   framesEncoded: number;
+  /** v1.8.2: true when the HARDWARE encoder accepted the stream but produced
+   * no output (driver stall) and the engine automatically restarted the whole
+   * pass on the software rung — the UI explains instead of failing. */
+  softwareFallback?: boolean;
 }
 
 /** Overlay-lane items without an explicit geometry render centered at 60%
@@ -106,6 +114,32 @@ const DEFAULT_OVERLAY_TRANSFORM: OverlayTransform = {
 
 /** Encoder backpressure: pause the paint loop above this many queued frames. */
 const MAX_ENCODE_QUEUE = 30;
+
+/**
+ * v1.8.2 — encoder-output watchdog: a hardware VideoEncoder that ACCEPTS
+ * frames but never emits chunks (broken iGPU driver — exactly what the forced
+ * GPU flags can expose on old Intel boxes) used to spin the backpressure loop
+ * at 0% FOREVER with no error. If the encoder produces no output for this
+ * long while frames are queued, the pass fails — and at frame 0 the engine
+ * retries once on the software rung before giving up.
+ */
+const ENCODER_STALL_MS = 12_000;
+
+/**
+ * v1.8.2 — internal: an encode-pass failure carrying the context the retry
+ * rule needs (which rung was active, whether anything was already muxed —
+ * a restart is only lossless while ZERO frames reached the muxer).
+ */
+class GpuEncodePassError extends GpuExportError {
+  constructor(
+    message: string,
+    readonly hardware: boolean,
+    readonly framesEncoded: number,
+  ) {
+    super(message);
+    this.name = "GpuEncodePassError";
+  }
+}
 
 function delay(ms: number): Promise<void> {
   return new Promise<void>((resolve) => {
@@ -371,14 +405,14 @@ export async function exportTimelineViaGpu(
   );
 
   // ── Output sink: IPC stream (Electron + outputPath) or in-memory. ──────
+  // v1.8.2: the sink (and its exportStart/exportEnd session) is PER ENCODE
+  // PASS — the hardware→software retry re-runs bridge.exportStart, and the
+  // main-process handler truncates + reopens the file, so a failed pass's
+  // partial bytes never leak into the final output.
   const bridge = getExportStreamer();
   const outputPath =
     typeof opts.outputPath === "string" && opts.outputPath.length > 0 ? opts.outputPath : null;
   const useIpc = bridge !== null && outputPath !== null;
-  const sink = new ChunkSink(useIpc ? bridge : null);
-  if (useIpc && bridge && outputPath) {
-    bridge.exportStart(outputPath);
-  }
 
   // ── Source decoders — TWO maps so concurrent consumers never interleave
   // requests on ONE SourceDecoder (v1.8.1): the base lane and an overlay
@@ -400,7 +434,19 @@ export async function exportTimelineViaGpu(
   };
   const createDecoder = async (seg: MediaSegment): Promise<SourceDecoder> => {
     const url = videoSourceUrl(seg, imageUrls);
-    if (url != null) return SourceDecoder.fromUrl(url);
+    // v1.8.2: a URL that EXISTS but can't be fetched (a revoked object URL —
+    // dev-server HMR remounts do exactly this) falls back to the item's File
+    // instead of failing the whole export.
+    if (url != null) {
+      try {
+        return await SourceDecoder.fromUrl(url);
+      } catch (e) {
+        if (!seg.file) throw e;
+        console.warn(
+          `[framefuse] GPU export: source URL unfetchable (${errMessage(e)}) — decoding "${seg.fileName || seg.id}" from its File instead`,
+        );
+      }
+    }
     if (seg.file) return SourceDecoder.fromBuffer(await (seg.file as File).arrayBuffer());
     throw new GpuExportError(
       `video segment "${seg.fileName || seg.id}" has no readable source (no URL and no File)`,
@@ -431,27 +477,6 @@ export async function exportTimelineViaGpu(
     [...segments].reverse().find((s) => (s.track ?? 0) === 0 && s.mediaType === "video") ?? null;
   const lastBaseKey = lastBaseSeg ? sourceKeyOf(lastBaseSeg) : null;
 
-  // ── Muxer (the PROVEN streamable config from ExportOrchestrator). ──────
-  // fastStart:"fragmented" (NOT false): mp4-muxer's finalize() backward-
-  // patches the mdat size with fastStart:false — un-streamable over the
-  // append-only IPC file stream. Fragmented MP4 is strictly append-only.
-  const muxer = new Muxer({
-    target: new StreamTarget({
-      // ⚠ mp4-muxer 5.2.2 arity-validates onData — it MUST declare BOTH
-      // (data, position) parameters or the constructor throws a TypeError.
-      onData: (data: Uint8Array, position: number): void => {
-        sink.push(data, position);
-      },
-    }),
-    video: { codec: "avc", width: dims.w, height: dims.h, frameRate: fps },
-    audio:
-      activeAudioTracks.length > 0
-        ? { codec: "aac", numberOfChannels: 2, sampleRate: 48000 }
-        : undefined,
-    fastStart: "fragmented",
-    minFragmentDuration: 1,
-  });
-
   // ── Encoder: the shared hardware→software ladder, full-res codec string. ──
   const bitrate = Math.round(browserQualityBitrate(settings));
   // H.264 profile for the resolution — the browser path's logic WITHOUT the
@@ -461,46 +486,45 @@ export async function exportTimelineViaGpu(
   // runtimes correctly refuse it; 640028 is the level-correct choice).
   const videoCodec = dims.w * dims.h < 1280 * 720 ? "avc1.42E01E" : "avc1.640028";
 
-  let encoderFatal: unknown = null;
-  let videoEncoder: VideoEncoder | null = null;
-  let encoderClosed = false;
-  let audioPromise: Promise<unknown> | null = null;
-  let framesEncoded = 0;
   // v1.8.1: ONE shared WebGL chroma keyer for the whole export (the
   // preview's pattern — composite() reconfigures its offscreen canvas to
   // the dest rect per call). Disposed in the finally below.
   const keyer = new ChromaKeyer();
 
-  try {
-    const { encoder, hardware } = await configureVideoEncoder(
-      { width: dims.w, height: dims.h, fps, videoBitrate: bitrate, videoCodec },
-      (chunk, meta) => {
-        muxer.addVideoChunk(chunk, meta);
-      },
-      (e) => {
-        encoderFatal = e;
-      },
-    );
-    videoEncoder = encoder;
+  // ── v1.8.2 progress plumbing: stage-aware heartbeat. ────────────────────
+  // A 19-minute timeline spends real seconds BEFORE the first frame encodes
+  // (source fetch + demux + first-frame decode, encoder setup) — an
+  // integer-percent bar showed a frozen "0%" the whole time, which read as
+  // "not working". The heartbeat re-emits at ~1.4 Hz whenever the frame loop
+  // goes quiet, carrying the coarse stage + frame counter + elapsed so the
+  // UI can always show life (and the header now shows decimals below 10%).
+  let stage: ExportProgress["stage"] = "preparing";
+  let framesEncoded = 0;
+  let lastEmitAt = 0;
+  const emitProgress = (force = false): void => {
+    const now = performance.now();
+    if (!force && now - lastEmitAt < 200) return;
+    lastEmitAt = now;
+    const elapsedSec = Math.max(0.001, (now - startedAt) / 1000);
+    onProgress?.({
+      progress: Math.min(100, (framesEncoded / totalFrames) * 100),
+      ...(framesEncoded > 0 ? { fps: Math.round(framesEncoded / elapsedSec) } : {}),
+      stage,
+      framesEncoded,
+      totalFrames,
+      elapsedSec: Math.round(elapsedSec * 10) / 10,
+    });
+  };
+  const heartbeat = setInterval(() => {
+    if (performance.now() - lastEmitAt > 650) emitProgress(true);
+  }, 700);
 
-    // Audio renders CONCURRENTLY with the frame loop (runGpuExport's proven
-    // pattern): chunks flow straight into the muxer, the promise is awaited
-    // after the loop, before flush.
-    if (activeAudioTracks.length > 0) {
-      const mixer = new AudioMixer((chunk, meta) => {
-        muxer.addAudioChunk(chunk, meta);
-      });
-      const p = mixer.renderAudio(totalSec, activeAudioTracks);
-      // Swallow-side handler: if the video loop aborts/errors BEFORE this
-      // promise is awaited, its eventual rejection would otherwise surface
-      // as an unhandled rejection. Attaching a catch does not consume the
-      // rejection — the success path's `await` still sees and rethrows it.
-      p.catch(() => {
-        /* surfaced by the awaiting path, or the export already failed */
-      });
-      audioPromise = p;
-    }
-
+  const cleanupDecoders = (): void => {
+    for (const decoder of baseDecoders.values()) decoder.cleanup();
+    baseDecoders.clear();
+    for (const decoder of overlayDecoders.values()) decoder.cleanup();
+    overlayDecoders.clear();
+  };
     // Scratch canvas for the transition composite + global fades (the
     // browser path's twin).
     const scratch = document.createElement("canvas");
@@ -531,10 +555,117 @@ export async function exportTimelineViaGpu(
     const wmImage = opts.watermark?.imageUrl ? await loadImageElement(opts.watermark.imageUrl) : null;
     const wmSettings = opts.watermark?.settings ?? null;
 
+    /**
+     * v1.8.2 — ONE complete encode pass: sink → muxer → encoder ladder →
+     * concurrent audio → frame loop → flush → finalize. Called up to twice:
+     * pass 1 rides the ladder's hardware rung (unless `forceSoftware`), and
+     * when the HARDWARE encoder stalls or fatals while ZERO frames have been
+     * muxed, the engine retries the whole pass on the software rung — a
+     * lossless restart (nothing reached the output; bridge.exportStart
+     * truncates + reopens the file on disk).
+     */
+    const runEncodePass = async (
+      passForceSoftware: boolean,
+    ): Promise<{ hardware: boolean; byteCount: number; resultPath: string }> => {
+    const sink = new ChunkSink(useIpc ? bridge : null);
+    if (useIpc && bridge && outputPath) {
+      bridge.exportStart(outputPath);
+    }
+
+    // ── Muxer (the PROVEN streamable config from ExportOrchestrator). ──────
+    // fastStart:"fragmented" (NOT false): mp4-muxer's finalize() backward-
+    // patches the mdat size with fastStart:false — un-streamable over the
+    // append-only IPC file stream. Fragmented MP4 is strictly append-only.
+    const muxer = new Muxer({
+      target: new StreamTarget({
+        // ⚠ mp4-muxer 5.2.2 arity-validates onData — it MUST declare BOTH
+        // (data, position) parameters or the constructor throws a TypeError.
+        onData: (data: Uint8Array, position: number): void => {
+          sink.push(data, position);
+        },
+      }),
+      video: { codec: "avc", width: dims.w, height: dims.h, frameRate: fps },
+      audio:
+        activeAudioTracks.length > 0
+          ? { codec: "aac", numberOfChannels: 2, sampleRate: 48000 }
+          : undefined,
+      fastStart: "fragmented",
+      minFragmentDuration: 1,
+    });
+
+    let encoderFatal: unknown = null;
+    let videoEncoder: VideoEncoder | null = null;
+    let encoderClosed = false;
+    let audioPromise: Promise<unknown> | null = null;
+    let audioCompleted = false;
+    const audioCtl = new AbortController();
+    // v1.8.2 watchdog state — refreshed on EVERY encoder output chunk. A
+    // hardware encoder that accepts frames but never emits (broken iGPU
+    // driver) is indistinguishable from a slow one WITHOUT this counter.
+    let outputCount = 0;
+    let lastOutputAt = performance.now();
+    const passStartedAt = lastOutputAt;
+
+    try {
+      const { encoder, hardware } = await configureVideoEncoder(
+        { width: dims.w, height: dims.h, fps, videoBitrate: bitrate, videoCodec, forceSoftware: passForceSoftware },
+        (chunk, meta) => {
+          muxer.addVideoChunk(chunk, meta);
+          outputCount++;
+          lastOutputAt = performance.now();
+        },
+        (e) => {
+          encoderFatal = e;
+        },
+      );
+      videoEncoder = encoder;
+
+      // Audio renders CONCURRENTLY with the frame loop (runGpuExport's proven
+      // pattern): chunks flow straight into the muxer, the promise is awaited
+      // after the loop, before flush. v1.8.2: the per-pass AbortSignal lets a
+      // retried pass stop this one's AAC encode instead of zombie-ing it.
+      if (activeAudioTracks.length > 0) {
+        const mixer = new AudioMixer((chunk, meta) => {
+          muxer.addAudioChunk(chunk, meta);
+        });
+        const p = mixer.renderAudio(totalSec, activeAudioTracks, audioCtl.signal);
+        // Swallow-side handler: if the video loop aborts/errors BEFORE this
+        // promise is awaited, its eventual rejection would otherwise surface
+        // as an unhandled rejection. Attaching a catch does not consume the
+        // rejection — the success path's `await` still sees and rethrows it.
+        p.catch(() => {
+          /* surfaced by the awaiting path, or the pass already failed */
+        });
+        audioPromise = p;
+      }
+
+      stage = "encoding";
+      emitProgress(true);
+
     for (let i = 0; i < totalFrames; i++) {
       if (signal?.aborted) throw new ExportAbortedError();
       if (encoderFatal) {
-        throw new GpuExportError(`video encoder failed: ${errMessage(encoderFatal)}`);
+        throw new GpuEncodePassError(
+          `video encoder failed: ${errMessage(encoderFatal)}`,
+          hardware,
+          framesEncoded,
+        );
+      }
+      // v1.8.2 watchdog (case 1): frames are flowing into the encoder but
+      // NOTHING has come out since the pass began — a wedged hardware
+      // encoder. Only armed once a few frames are queued so a slow FIRST
+      // decode (deep trims) can't false-positive it.
+      if (
+        outputCount === 0 &&
+        framesEncoded >= 8 &&
+        performance.now() - passStartedAt > ENCODER_STALL_MS
+      ) {
+        throw new GpuEncodePassError(
+          `the ${hardware ? "hardware" : "software"} video encoder accepted frames but produced no output for ${Math.round(ENCODER_STALL_MS / 1000)}s` +
+            (hardware ? " (GPU driver stall)" : ""),
+          hardware,
+          framesEncoded,
+        );
       }
 
       const currentMs = (i / fps) * 1000;
@@ -543,7 +674,22 @@ export async function exportTimelineViaGpu(
       while (videoEncoder.encodeQueueSize > MAX_ENCODE_QUEUE) {
         if (signal?.aborted) throw new ExportAbortedError();
         if (encoderFatal) {
-          throw new GpuExportError(`video encoder failed: ${errMessage(encoderFatal)}`);
+          throw new GpuEncodePassError(
+            `video encoder failed: ${errMessage(encoderFatal)}`,
+            hardware,
+            framesEncoded,
+          );
+        }
+        // v1.8.2 watchdog (case 2): the queue is full AND the encoder
+        // hasn't emitted a chunk in ENCODER_STALL_MS — without this check
+        // a wedged driver spun here FOREVER at 0% with no error.
+        if (performance.now() - lastOutputAt > ENCODER_STALL_MS) {
+          throw new GpuEncodePassError(
+            `the ${hardware ? "hardware" : "software"} video encoder stalled — no output for ${Math.round(ENCODER_STALL_MS / 1000)}s while ${videoEncoder.encodeQueueSize} frames were queued` +
+              (hardware ? " (GPU driver stall)" : ""),
+            hardware,
+            framesEncoded,
+          );
         }
         await delay(10);
       }
@@ -723,24 +869,31 @@ export async function exportTimelineViaGpu(
       } finally {
         outFrame.close(); // ⚠ immediately after last use — no path leaks it
       }
-      framesEncoded++;
-
-      const elapsedSec = Math.max(0.001, (performance.now() - startedAt) / 1000);
-      onProgress?.({
-        progress: ((i + 1) / totalFrames) * 100,
-        fps: Math.round((i + 1) / elapsedSec),
-      });
+      framesEncoded = i + 1;
+      emitProgress();
     }
 
+    stage = "finalizing";
+    emitProgress(true);
+
     // Audio finish first (its chunks must all reach the muxer), then video.
+    audioCompleted = true;
     if (audioPromise) await audioPromise;
     if (encoderFatal) {
-      throw new GpuExportError(`video encoder failed: ${errMessage(encoderFatal)}`);
+      throw new GpuEncodePassError(
+        `video encoder failed: ${errMessage(encoderFatal)}`,
+        hardware,
+        framesEncoded,
+      );
     }
     try {
       await videoEncoder.flush();
     } catch (e) {
-      throw new GpuExportError(`video encoder flush failed: ${errMessage(e)}`);
+      throw new GpuEncodePassError(
+        `video encoder flush failed: ${errMessage(e)}`,
+        hardware,
+        framesEncoded,
+      );
     }
     videoEncoder.close();
     encoderClosed = true;
@@ -763,41 +916,78 @@ export async function exportTimelineViaGpu(
       setTimeout(() => URL.revokeObjectURL(downloadUrl), 60000);
       resultPath = "(browser download) framefuse.mp4";
     }
-
-    const elapsedSec = Math.max(0.001, (performance.now() - startedAt) / 1000);
-    return {
-      path: resultPath,
-      size: sink.byteCount,
-      encoder: hardware ? "WebCodecs H.264 · hardware" : "WebCodecs H.264 · software",
-      elapsedSec,
-      mode: "gpu-webcodecs",
-      ...(audioSkipped ? { audioSkipped: true } : {}),
-      framesEncoded,
-    };
-  } finally {
-    // Cleanup on EVERY path — success, error, and abort.
-    for (const decoder of baseDecoders.values()) decoder.cleanup();
-    baseDecoders.clear();
-    for (const decoder of overlayDecoders.values()) decoder.cleanup();
-    overlayDecoders.clear();
-    keyer.dispose(); // drop the export's WebGL context + textures
-    for (const url of sfxBlobUrls) URL.revokeObjectURL(url); // SFX WAV blobs
-    if (videoEncoder && !encoderClosed) {
-      // Abort/error mid-encode: close() to release encoder-held GPU frames
-      // (try/catch — the encoder may already be in a failed state).
-      try {
-        videoEncoder.close();
-      } catch {
-        /* encoder already closed or fatally reset */
+    return { hardware, byteCount: sink.byteCount, resultPath };
+    } finally {
+      // Per-pass cleanup on EVERY path — success, error, and abort.
+      if (!audioCompleted) audioCtl.abort(); // stop a zombie AAC render
+      if (videoEncoder && !encoderClosed) {
+        // Abort/error mid-encode: close() to release encoder-held GPU frames
+        // (try/catch — the encoder may already be in a failed state).
+        try {
+          videoEncoder.close();
+        } catch {
+          /* encoder already closed or fatally reset */
+        }
+        encoderClosed = true;
       }
-      encoderClosed = true;
+      // Still call exportEnd so a streamed file on disk is closed cleanly
+      // (partial file, moov missing — documented abort semantics).
+      try {
+        await sink.finalize();
+      } catch {
+        /* the sink never throws, but never block cleanup */
+      }
     }
-    // Still call exportEnd so a streamed file on disk is closed cleanly
-    // (partial file, moov missing — documented abort semantics).
+    };
+
+    // ── v1.8.2: run the pass, retrying ONCE on the software rung when the
+    // hardware encoder wedged before ANY frame was muxed (lossless restart).
+    let softwareFallback = false;
+    let passResult: { hardware: boolean; byteCount: number; resultPath: string };
     try {
-      await sink.finalize();
-    } catch {
-      /* the sink never throws, but never block cleanup */
+      emitProgress(true);
+      try {
+        passResult = await runEncodePass(opts.forceSoftware === true);
+      } catch (e) {
+        if (
+          e instanceof GpuEncodePassError &&
+          e.hardware &&
+          e.framesEncoded === 0 &&
+          opts.forceSoftware !== true
+        ) {
+          softwareFallback = true;
+          console.warn(
+            `[framefuse] GPU export: ${e.message} — restarting the export on the software encoder rung`,
+          );
+          cleanupDecoders(); // pass 2 re-creates them lazily from the same sources
+          framesEncoded = 0;
+          stage = "preparing";
+          emitProgress(true);
+          passResult = await runEncodePass(true);
+        } else {
+          throw e;
+        }
+      }
+
+      const elapsedSec = Math.max(0.001, (performance.now() - startedAt) / 1000);
+      return {
+        path: passResult.resultPath,
+        size: passResult.byteCount,
+        encoder:
+          passResult.hardware && !softwareFallback
+            ? "WebCodecs H.264 · hardware"
+            : "WebCodecs H.264 · software",
+        elapsedSec,
+        mode: "gpu-webcodecs",
+        ...(audioSkipped ? { audioSkipped: true } : {}),
+        framesEncoded,
+        ...(softwareFallback ? { softwareFallback: true } : {}),
+      };
+    } finally {
+      // Export-level cleanup on EVERY path — success, error, and abort.
+      clearInterval(heartbeat);
+      cleanupDecoders();
+      keyer.dispose(); // drop the export's WebGL context + textures
+      for (const url of sfxBlobUrls) URL.revokeObjectURL(url); // SFX WAV blobs
     }
-  }
 }

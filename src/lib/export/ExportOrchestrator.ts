@@ -397,6 +397,9 @@ export interface VideoEncoderSetup {
   videoBitrate: number;
   /** VideoEncoder codec string (default "avc1.640028" — H.264 High 4:2:0 L4.0). */
   videoCodec?: string;
+  /** v1.8.2: skip the prefer-hardware rung entirely (diagnostics toggle /
+   * the engine's automatic stall retry — the ladder then starts at software). */
+  forceSoftware?: boolean;
 }
 
 /** Which rung of the hardware→software ladder configured the encoder. */
@@ -449,7 +452,7 @@ export async function configureVideoEncoder(
     { ...common },
   ];
 
-  for (let rung = 0; rung < configs.length; rung++) {
+  for (let rung = opts.forceSoftware === true ? 1 : 0; rung < configs.length; rung++) {
     const config = configs[rung];
     let supported = false;
     try {

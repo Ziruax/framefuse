@@ -116,6 +116,19 @@ export function Header({
   projectName,
 }: HeaderProps) {
   const pct = exportProgress?.progress ?? 0;
+  // v1.8.2: sub-10% shows ONE DECIMAL — a 19-minute export spends its first
+  // minutes below 1% and an integer "0%" read as "stuck / not working".
+  const pctLabel = pct < 10 && pct > 0 ? pct.toFixed(1) : pct.toFixed(0);
+  const stageLabel =
+    exportProgress?.stage === "preparing"
+      ? "Preparing"
+      : exportProgress?.stage === "finalizing"
+        ? "Finalizing"
+        : null;
+  const frameLabel =
+    exportProgress?.totalFrames != null && exportProgress.totalFrames > 0
+      ? `${(exportProgress.framesEncoded ?? 0).toLocaleString()} / ${exportProgress.totalFrames.toLocaleString()} frames`
+      : null;
   // v4.5 export estimate: bitrate × duration / 8 → MB cap (CRF encodes
   // usually come out smaller; NVENC maxrate caps near this).
   const estMb = settings ? (settings.bitrateMbps * (totalMs / 1000)) / 8 : 0;
@@ -163,9 +176,9 @@ export function Header({
                 backgroundColor: "#18181b",
                 color: "#a1a1aa",
               }}
-              title="FrameFuse v1.8.1 — multi-track video studio · dual-engine export: FFmpeg Smart (hybrid chunked single-pass + iGPU) and the GPU (WebCodecs) full multi-track compositor with forced GPU acceleration"
+              title="FrameFuse v1.8.2 — multi-track video studio · dual-engine export: FFmpeg Smart (hybrid chunked single-pass + iGPU) and the GPU (WebCodecs) full multi-track compositor with forced GPU acceleration"
             >
-              v1.8.1
+              v1.8.2
             </span>
             {/* v5.1: on-disk project file chip (native save/open sessions). */}
             {projectName && (
@@ -298,8 +311,25 @@ export function Header({
               className="font-mono tabular-nums"
               style={{ color: "#e4e4e7" }}
             >
-              {pct.toFixed(0)}%
+              {pctLabel}%
             </span>
+            {stageLabel ? (
+              <span
+                className="animate-pulse"
+                style={{ color: "#a78bfa" }}
+                title="The GPU engine spends the first seconds loading sources and setting up the encoder — the frame counter below starts moving as soon as the first frame encodes"
+              >
+                {stageLabel}…
+              </span>
+            ) : frameLabel ? (
+              <span
+                className="hidden lg:inline"
+                style={{ color: "#71717a" }}
+                title="Frames encoded so far / total — the frame counter moves even when the rounded percentage stays at 0%"
+              >
+                {frameLabel}
+              </span>
+            ) : null}
             {exportProgress?.fps ? (
               <span style={{ color: "#71717a" }}>
                 {exportProgress.fps.toFixed(0)} fps

@@ -165,6 +165,11 @@ interface SettingsPanelProps {
    *  "gpu" (WebCodecs + Canvas, beta). Drives handleExport's branch. */
   engine: "ffmpeg" | "gpu";
   onEngineChange: (e: "ffmpeg" | "gpu") => void;
+  /** v1.8.2: GPU-engine diagnostics — skip the prefer-hardware encoder rung
+   *  (the WebCodecs twin of the FFmpeg force-encoder bypass). When a GPU
+   *  driver accepts the stream but never encodes, this unblocks the export. */
+  gpuForceSoftware: boolean;
+  onGpuForceSoftwareChange: (v: boolean) => void;
   /** v5.1: assign a random transition mix to every boundary (page owns the
    *  base-lane boundary list; one commit = one undo step). */
   onRandomMix?: () => void;
@@ -505,6 +510,9 @@ export function SettingsPanel(props: SettingsPanelProps) {
     // v8 (Task 27-a): export engine selector (Export tab).
     engine,
     onEngineChange,
+    // v1.8.2: GPU-engine force-software diagnostics toggle.
+    gpuForceSoftware,
+    onGpuForceSoftwareChange,
     // v1 Chroma tab target + edit pipeline (page.tsx computes).
     chromaTarget,
     onSetItemEdit,
@@ -1240,6 +1248,41 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 )}
               </button>
             </div>
+            {/* v1.8.2 — GPU-engine diagnostics: skip the hardware encoder
+                rung. Mirrors the FFmpeg force-encoder bypass above: when a
+                GPU driver accepts the encode stream but never produces
+                output (the export bar frozen at 0%), forcing software
+                confirms the driver as the culprit AND unblocks the export. */}
+            {webCodecsAvailable && engine === "gpu" && (
+              <label
+                className="mt-2 flex cursor-pointer items-start gap-2 rounded-lg border p-2 transition-colors"
+                style={{
+                  borderColor: gpuForceSoftware ? "rgba(251, 191, 36, 0.5)" : "#27272a",
+                  backgroundColor: gpuForceSoftware ? "rgba(251, 191, 36, 0.08)" : "#141416",
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={gpuForceSoftware}
+                  onChange={(e) => onGpuForceSoftwareChange(e.target.checked)}
+                  className="mt-0.5 size-3.5 shrink-0 cursor-pointer accent-amber-400"
+                />
+                <span className="flex flex-col gap-0.5">
+                  <span
+                    className="text-[10px] font-bold"
+                    style={{ color: gpuForceSoftware ? "#fbbf24" : "#a1a1aa" }}
+                  >
+                    Force software encode
+                  </span>
+                  <span className="text-[9px] leading-relaxed" style={{ color: "#71717a" }}>
+                    Bypass the hardware encoder rung — if the progress bar
+                    freezes at 0% with the GPU badge showing hardware, a
+                    stalled driver is the culprit; this finishes the export
+                    on the CPU encoder instead.
+                  </span>
+                </span>
+              </label>
+            )}
             <p className="mt-1.5 text-[9px] leading-relaxed" style={{ color: "#52525b" }}>
               A/B test the engines to diagnose slow exports: FFmpeg Smart is
               the battle-tested default; the GPU engine renders the FULL

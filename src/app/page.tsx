@@ -426,6 +426,27 @@ export default function Page() {
     }
   }, [engine]);
 
+  // ---- v1.8.2: GPU-engine FORCE-SOFTWARE diagnostics toggle — skips the
+  // prefer-hardware encoder rung (the WebCodecs twin of the FFmpeg
+  // force-encoder bypass). Persisted like the engine choice so a driver
+  // workaround survives restarts. ----
+  const [gpuForceSoftware, setGpuForceSoftware] = useState(false);
+  useEffect(() => {
+    try {
+      setGpuForceSoftware(window.localStorage.getItem("ff-gpu-force-software") === "1");
+    } catch {
+      /* storage unavailable — keep the default */
+    }
+  }, []);
+  const handleGpuForceSoftwareChange = useCallback((v: boolean) => {
+    setGpuForceSoftware(v);
+    try {
+      window.localStorage.setItem("ff-gpu-force-software", v ? "1" : "0");
+    } catch {
+      /* ignore write failures */
+    }
+  }, []);
+
   // ---- v1.2: keyboard shortcuts overlay (`?`) -----------------------------
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const shortcutsOpenRef = useRef(false);
@@ -1182,6 +1203,7 @@ export default function Page() {
           onProgress: (p) => setExportProgress(p),
           signal: ac.signal,
           outputPath,
+          forceSoftware: gpuForceSoftware,
         });
         setLastExport({
           path: res.path,
@@ -1215,6 +1237,16 @@ export default function Page() {
           toast.info("Exported without audio", {
             description:
               "This runtime cannot encode AAC (mp4a.40.2) — the GPU engine exported video-only. The FFmpeg Smart engine always includes audio.",
+          });
+        }
+        // v1.8.2: the hardware encoder wedged before frame 0 and the engine
+        // auto-restarted on the software rung — tell the user WHY this
+        // export is slower than a healthy GPU one (and what to update).
+        if (res.softwareFallback) {
+          toast.info("Hardware encoder stalled — used software instead", {
+            description:
+              "The GPU accepted the export stream but produced no output (a GPU-driver stall). The export restarted on the CPU encoder and completed. Updating your GPU driver may fix hardware encoding; the \"Force software encode\" toggle in the Export tab pins this behavior.",
+            duration: 9000,
           });
         }
         return;
@@ -1328,6 +1360,7 @@ export default function Page() {
     inElectron,
     sfxItems,
     engine,
+    gpuForceSoftware,
   ]);
 
   // Keep exportRef in sync so menu accelerators call the latest version
@@ -4233,6 +4266,8 @@ const handleRandomTransitionMix = useCallback(() => {
             // ---- v8 (Task 27-a): export engine selector (Export tab) ----
             engine={engine}
             onEngineChange={setEngine}
+            gpuForceSoftware={gpuForceSoftware}
+            onGpuForceSoftwareChange={handleGpuForceSoftwareChange}
             // ---- v1 Chroma tab ----
             chromaTarget={chromaTarget}
             onSetItemEdit={handleSetItemEdit}
