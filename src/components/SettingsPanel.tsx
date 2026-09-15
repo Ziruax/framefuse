@@ -1221,8 +1221,9 @@ export function SettingsPanel(props: SettingsPanelProps) {
                   </span>
                 </span>
                 <span className="text-[9px] leading-relaxed" style={{ color: "#71717a" }}>
-                  Zero-FFmpeg render: hardware decode → canvas → hardware
-                  encode, streamed to disk in 5 MB chunks
+                  Zero-FFmpeg multi-track render: hardware decode → canvas
+                  compositor (overlays · chroma key · PIP audio · SFX) →
+                  hardware encode, streamed to disk in 5 MB chunks
                 </span>
                 {/* Plain-browser note: unlike the legacy browser fallback
                     (720p in-memory), the GPU engine exports at FULL res. */}
@@ -1241,9 +1242,9 @@ export function SettingsPanel(props: SettingsPanelProps) {
             </div>
             <p className="mt-1.5 text-[9px] leading-relaxed" style={{ color: "#52525b" }}>
               A/B test the engines to diagnose slow exports: FFmpeg Smart is
-              the battle-tested default; the GPU beta renders the timeline
-              without FFmpeg (overlay clips, chroma key and SFX still need the
-              FFmpeg engine).
+              the battle-tested default; the GPU engine renders the FULL
+              multi-track timeline — overlays, chroma key, PIP audio and SFX —
+              natively on the GPU, zero FFmpeg.
             </p>
           </Section>
 

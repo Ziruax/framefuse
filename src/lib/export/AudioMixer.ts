@@ -1,8 +1,30 @@
 // src/lib/export/AudioMixer.ts — offline audio mixdown + AAC encode (WebCodecs)
-// Renders all audio tracks onto one 48 kHz stereo timeline with
+// Renders ALL audio lanes onto one 48 kHz stereo timeline with
 // OfflineAudioContext, then encodes the result through AudioEncoder in
 // 1024-frame f32-planar AudioData chunks so a 19-minute timeline never has
 // to exist as one giant AudioData (which would be ~438 MB of planar floats).
+//
+// v1.8.1 (Task 28-a) — FULL multi-lane mixdown (the WebCodecs engine's
+// audio parity round). One AudioBufferSourceNode + GainNode per placement:
+//   • music (with music-local fade-in / fade-out automation),
+//   • every BASE-lane video clip's audio (trim offset + per-clip volume ×
+//     master, speed≠1 clips time-compressed via playbackRate),
+//   • every OVERLAY-lane (PIP) video clip's audio — a GPU-engine superset:
+//     the FFmpeg graph maps overlay inputs video-only, so the GPU engine is
+//     the FIRST engine to mix PIP audio,
+//   • every SFX placement (pre-rendered WAV blob URLs from sfx.ts — the
+//     exact bytes the FFmpeg path uploads as temp files).
+// All branches sum into ONE master DynamicsCompressor limiter (the Web Audio
+// twin of the FFmpeg amix normalize=0 → master volume → limiter chain) so a
+// summed mix past 0 dBFS is brick-walled instead of hard-clipped by the AAC
+// encode.
+//
+// Documented deviations from the FFmpeg audio bus (kept honest in code):
+//   • normalize/loudnorm (2-pass measured) is not part of the offline graph;
+//   • speed≠1 uses playbackRate (sync-correct, pitch-shifts) where FFmpeg's
+//     atempo preserves pitch;
+//   • looping audio wraps [trimIn, end) in buffer time where a looped
+//     overlay VIDEO wraps [0, duration) — identical for un-trimmed clips.
 
 /** Typed error for every AudioMixer failure (fetch/decode/encode). */
 export class AudioMixerError extends Error {
@@ -17,9 +39,19 @@ export class AudioMixerError extends Error {
  * - `url` — fetchable source (http(s)/blob/file URL).
  * - `startSec` — when the track starts on the export timeline.
  * - `offsetSec` — where inside the SOURCE playback begins.
- * - `durationSec` — how much of the timeline this track plays.
- * - `volume` — linear gain 0..1.
- * - `loop` — loop the source to fill `durationSec` (see renderAudio note).
+ * - `durationSec` — how many SOURCE seconds this track plays (the timeline
+ *   span it occupies is `durationSec / playbackRate`).
+ * - `volume` — linear gain 0..2 (sums >1 are limited, not clipped).
+ * - `loop` — loop the source to fill the rest of the timeline.
+ * - `playbackRate` — source-time rate (clip speed). 1 = real time; 2× plays
+ *   the source window in half the timeline span (atempo's sync twin).
+ * - `optional` — true for VIDEO-CLIP audio branches: a fetch/decode failure
+ *   (e.g. the MP4 has no audio track at all) skips that placement with a
+ *   console warn instead of failing the export. Music/SFX stay required.
+ * - `fadeInSec` — gain automation 0 → volume over this many seconds from
+ *   `startSec` (music-local fade-in).
+ * - `fadeOut` — absolute timeline window ramping volume → 0 (the music
+ *   fade-out, which always ENDS at the video end — FFmpeg parity).
  */
 export interface AudioTrackData {
   url: string;
@@ -28,6 +60,10 @@ export interface AudioTrackData {
   durationSec: number;
   volume: number;
   loop?: boolean;
+  playbackRate?: number;
+  optional?: boolean;
+  fadeInSec?: number;
+  fadeOut?: { startSec: number; endSec: number };
 }
 
 /** Result metadata for a completed mixdown. */
@@ -55,6 +91,10 @@ function delay(ms: number): Promise<void> {
   return new Promise<void>((resolve) => {
     setTimeout(resolve, ms);
   });
+}
+
+function clamp(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
 }
 
 /**
@@ -126,8 +166,24 @@ export class AudioMixer {
       sampleRate: SAMPLE_RATE,
     });
 
+    // ── Master limiter (FFmpeg parity: amix normalize=0 → master volume →
+    // limiter). Every branch sums into ONE DynamicsCompressor configured as
+    // a brick wall (threshold −1 dBFS, ratio 20:1, no knee). Linear gains
+    // are applied per-branch by GainNodes (mathematically identical to
+    // FFmpeg's per-branch volume + post-mix master multiplication); the
+    // limiter only acts on peaks the SUM pushes past −1 dBFS, which would
+    // otherwise hard-clip inside the AAC encode. All branches share the one
+    // node, so its ~6 ms lookahead delays everything equally — sync intact.
+    const limiter = context.createDynamicsCompressor();
+    limiter.threshold.value = -1;
+    limiter.knee.value = 0;
+    limiter.ratio.value = 20;
+    limiter.attack.value = 0.002;
+    limiter.release.value = 0.1;
+    limiter.connect(context.destination);
+
     for (const track of tracks) {
-      await this.scheduleTrack(context, track);
+      await this.scheduleTrack(context, limiter, track);
     }
 
     let rendered: AudioBuffer;
@@ -225,8 +281,19 @@ export class AudioMixer {
     };
   }
 
-  /** Fetch + decode one track and schedule it on the offline graph. */
-  private async scheduleTrack(context: OfflineAudioContext, track: AudioTrackData): Promise<void> {
+  /**
+   * Fetch + decode one track and schedule it on the offline graph:
+   * BufferSource → GainNode (volume, optional fade automation) → limiter.
+   *
+   * `optional` tracks (video-clip audio) swallow fetch/decode failures with
+   * a console warn — an MP4/WebM with no audio track must skip, not fail,
+   * the export (the FFmpeg path probe-gates the same case).
+   */
+  private async scheduleTrack(
+    context: OfflineAudioContext,
+    destination: AudioNode,
+    track: AudioTrackData,
+  ): Promise<void> {
     let bytes: ArrayBuffer;
     try {
       const res = await fetch(track.url);
@@ -235,7 +302,17 @@ export class AudioMixer {
       }
       bytes = await res.arrayBuffer();
     } catch (e) {
-      if (e instanceof AudioMixerError) throw e;
+      if (e instanceof AudioMixerError) {
+        if (track.optional) {
+          console.warn(`[framefuse] GPU audio: skipping optional track (${e.message})`);
+          return;
+        }
+        throw e;
+      }
+      if (track.optional) {
+        console.warn(`[framefuse] GPU audio: skipping optional track — fetch failed: ${errMessage(e)}`);
+        return;
+      }
       throw new AudioMixerError(`fetch failed for audio track: ${errMessage(e)}`);
     }
     // decodeAudioData resamples to the context rate (48 kHz).
@@ -243,18 +320,56 @@ export class AudioMixer {
     try {
       buffer = await context.decodeAudioData(bytes);
     } catch (e) {
+      // A video container with NO audio track lands here — optional
+      // (video-clip) branches skip; required ones (music/SFX) fail loudly.
+      if (track.optional) {
+        console.warn(
+          `[framefuse] GPU audio: clip has no decodable audio track — skipping (${errMessage(e)})`,
+        );
+        return;
+      }
       throw new AudioMixerError(`decodeAudioData failed for ${track.url}: ${errMessage(e)}`);
     }
 
     const source = context.createBufferSource();
     source.buffer = buffer;
+    // Clip speed (base-lane videos): source time advances at `speed`× real
+    // time, so the clip's SOURCE window lands inside its (shorter) timeline
+    // window — sync-correct with the video arm. Pitch shifts where FFmpeg's
+    // atempo preserves it (documented deviation; speed 1 is unaffected).
+    const rate = Number.isFinite(track.playbackRate) && (track.playbackRate as number) > 0
+      ? (track.playbackRate as number)
+      : 1;
+    if (rate !== 1) source.playbackRate.value = rate;
+
     const gain = context.createGain();
-    gain.gain.value = Math.min(1, Math.max(0, track.volume));
+    // 0..2 per branch (the limiter guards the summed result past 0 dBFS).
+    gain.gain.value = clamp(track.volume, 0, 2);
     source.connect(gain);
-    gain.connect(context.destination);
+    gain.connect(destination);
 
     const startSec = Math.max(0, track.startSec);
     const offsetSec = Math.min(Math.max(0, track.offsetSec), Math.max(0, buffer.duration - 0.001));
+
+    // Music-local fade automation (FFmpeg's afade twins). The fade-out
+    // window is absolute and ends at the VIDEO end — the caller computes it
+    // from the timeline length, exactly like the adelay-relative math in
+    // buildAudioMixGraph.
+    if (Number.isFinite(track.fadeInSec) && (track.fadeInSec as number) > 0) {
+      const fi = track.fadeInSec as number;
+      gain.gain.setValueAtTime(0, startSec);
+      gain.gain.linearRampToValueAtTime(clamp(track.volume, 0, 2), startSec + fi);
+    }
+    if (
+      track.fadeOut &&
+      Number.isFinite(track.fadeOut.startSec) &&
+      Number.isFinite(track.fadeOut.endSec) &&
+      track.fadeOut.endSec > track.fadeOut.startSec
+    ) {
+      gain.gain.setValueAtTime(clamp(track.volume, 0, 2), Math.max(0, track.fadeOut.startSec));
+      gain.gain.linearRampToValueAtTime(0, track.fadeOut.endSec);
+    }
+
     if (track.loop) {
       source.loop = true;
       source.loopStart = offsetSec;

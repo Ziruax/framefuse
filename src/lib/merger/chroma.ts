@@ -294,13 +294,20 @@ interface GlUniforms {
   aPos: number;
 }
 
-/** Intrinsic size of a TexImageSource (video/image/canvas duck-typing). */
+/** Intrinsic size of a TexImageSource (video/image/canvas/VideoFrame
+ * duck-typing). displayWidth/Height FIRST — a WebCodecs VideoFrame exposes
+ * its VISIBLE (aspect-corrected) size there (the GPU export engine keys
+ * decoded VideoFrames directly; codedWidth may carry alignment padding). */
 function sourceDims(s: TexImageSource): { w: number; h: number } {
   const v = s as {
+    displayWidth?: number; displayHeight?: number;
     videoWidth?: number; videoHeight?: number;
     naturalWidth?: number; naturalHeight?: number;
     width?: number; height?: number;
   };
+  if (typeof v.displayWidth === "number" && v.displayWidth > 0) {
+    return { w: v.displayWidth, h: v.displayHeight ?? 0 };
+  }
   if (typeof v.videoWidth === "number" && v.videoWidth > 0) {
     return { w: v.videoWidth, h: v.videoHeight ?? 0 };
   }

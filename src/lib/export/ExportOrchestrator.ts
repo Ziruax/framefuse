@@ -409,8 +409,10 @@ export interface ConfiguredVideoEncoder {
 /**
  * Configure the export VideoEncoder with a hardware→software fallback ladder:
  * 1. prefer-hardware + quality latency (the GPU path this module exists for),
- * 2. same codec without hardwareAcceleration (software encode),
- * 3. unsupported codec → GpuExportError carrying the platform's
+ * 2. same codec, software, still quality latency,
+ * 3. same codec, PLAIN config (no latencyMode — the native.ts-proven shape
+ *    some runtimes require near level-boundary frame budgets),
+ * 4. unsupported codec → GpuExportError carrying the platform's
  *    DOMException message (harvested from a real configure() attempt).
  *
  * v8: exported (the timeline adapter reuses the identical ladder) and now
@@ -431,12 +433,20 @@ export async function configureVideoEncoder(
     height: opts.height,
     bitrate: opts.videoBitrate,
     framerate: opts.fps,
-    latencyMode: "quality" as const,
     ...(codec.startsWith("avc1") ? { avc: { format: "avc" as const } } : {}),
   };
   const configs: VideoEncoderConfig[] = [
-    { ...common, hardwareAcceleration: "prefer-hardware" },
-    { ...common }, // software / no preference
+    // Rung 1: the GPU path this module exists for.
+    { ...common, latencyMode: "quality" as const, hardwareAcceleration: "prefer-hardware" },
+    // Rung 2: software encode, still quality latency.
+    { ...common, latencyMode: "quality" as const },
+    // Rung 3 (v1.8.1): the native.ts-proven PLAIN shape (no latencyMode).
+    // Empirically required: some runtimes reject latencyMode:"quality" for
+    // codecs whose H.264 level sits exactly at the frame-size/fps budget
+    // (e.g. Constrained Baseline L3.0 at 1280x720@30 — headless Chromium
+    // reports isConfigSupported:false there while the plain config works,
+    // which is how the legacy browser path always encoded 720p).
+    { ...common },
   ];
 
   for (let rung = 0; rung < configs.length; rung++) {

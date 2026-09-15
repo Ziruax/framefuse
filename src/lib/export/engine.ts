@@ -4,21 +4,33 @@
 // engine so "FFmpeg Smart" vs "GPU (WebCodecs)" can be A/B tested from the
 // Export tab.
 //
+// v1.8.1 (Task 28-c) — FULL multi-track compositor: the overlay/SFX/chroma
+// FFmpeg fallback is GONE. The engine now renders every timeline feature
+// natively in the GPU Canvas loop, exactly mirroring PreviewPanel's paint
+// order (base → overlay lanes → watermark → headlines → captions → global
+// fades):
+//   • overlay-lane clips (video through per-segment SourceDecoder streams,
+//     images through the shared cache) at the overlayGeometry rect, with
+//     motion-keyframe sampling and overlayLoop source-time wrapping;
+//   • chroma keying through the SAME WebGL ChromaKeyer the preview uses
+//     (VideoFrames feed texImage2D directly — zero-copy on the GPU);
+//   • SFX + overlay (PIP) audio in the AudioMixer multi-lane mixdown.
+//
 // This adapter takes the SAME ExportNativeOptions-shaped input exportNative
 // takes and renders the FULL timeline exactly like the proven browser path in
 // native.ts (exportViaWebCodecs): Ken Burns images + cover-fit videos with
-// the same transition/fade treatment → watermark → headlines → captions (all
-// word modes + kinetic animations, via the SAME drawCaption) → global fades.
-// Differences from the browser path, by design:
+// the same transition/fade treatment → overlays → watermark → headlines →
+// captions (all word modes + kinetic animations, via the SAME drawCaption) →
+// global fades. Differences from the browser path, by design:
 //   • FULL output resolution (no 720p cap — that cap is browser-legacy),
-//   • VIDEO base-lane segments decode through SourceDecoder (mp4box →
-//     VideoDecoder) instead of being rejected,
+//   • VIDEO segments decode through SourceDecoder (mp4box → VideoDecoder)
+//     instead of HTMLVideoElement replay,
 //   • muxed bytes stream to disk in ~5 MB IPC chunks in Electron (ChunkSink +
 //     StreamTarget + fastStart:"fragmented" — the proven append-only contract)
 //     instead of an in-memory ArrayBufferTarget,
-//   • audio (music + clip audio) mixes through AudioMixer when AAC encode is
-//     available; otherwise the export degrades to video-only with
-//     audioSkipped:true so the UI can warn.
+//   • audio (music + clip audio + PIP audio + SFX) mixes through AudioMixer
+//     when AAC encode is available; otherwise the export degrades to
+//     video-only with audioSkipped:true so the UI can warn.
 //
 // VRAM RULE (user-mandated, same as the other v8 modules): every VideoFrame
 // created, cloned, or received is .close()d immediately after its last use on
@@ -30,6 +42,7 @@ import type {
   ExportNativeOptions,
   ExportResult,
   MediaSegment,
+  OverlayTransform,
 } from "@/lib/merger/types";
 import {
   applyGlobalFade,
@@ -38,7 +51,10 @@ import {
   drawFrameWithTransition,
   drawVideoFrame,
   drawWatermark,
+  overlayGeometry,
+  paintSourceSize,
   resolveDimensions,
+  sampleOverlayMotion,
   type VideoFrameSource,
 } from "@/lib/merger/renderer";
 import {
@@ -49,6 +65,9 @@ import {
   type CanvasCaptionCtx,
 } from "@/lib/merger/native";
 import { cueAt } from "@/lib/merger/subtitles";
+import { segmentAtTime, overlaySegmentsAt } from "@/lib/merger/timeline";
+import { ChromaKeyer } from "@/lib/merger/chroma";
+import { renderSfxWav, sfxDurationMs } from "@/lib/merger/sfx";
 import { SourceDecoder } from "./SourceDecoder";
 import { AudioMixer, isAudioEncoderSupported, type AudioTrackData } from "./AudioMixer";
 import {
@@ -76,17 +95,14 @@ export interface GpuTimelineExportResult extends ExportResult {
   framesEncoded: number;
 }
 
-/**
- * Typed, actionable error for timeline features the GPU engine does not
- * render (yet). The message always tells the user to switch the engine
- * selector back to "FFmpeg Smart" — the FFmpeg engine supports everything.
- */
-export class GpuExportUnsupportedError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "GpuExportUnsupportedError";
-  }
-}
+/** Overlay-lane items without an explicit geometry render centered at 60%
+ * output width — MUST stay in lockstep with PreviewPanel's and page.tsx's
+ * DEFAULT_OVERLAY_TRANSFORM (page writes it into the item's edit on every
+ * lane switch, so the exported composite matches by construction). */
+const DEFAULT_OVERLAY_TRANSFORM: OverlayTransform = {
+  scalePercent: 60,
+  position: "center",
+};
 
 /** Encoder backpressure: pause the paint loop above this many queued frames. */
 const MAX_ENCODE_QUEUE = 30;
@@ -107,6 +123,10 @@ function clampNum(v: number | undefined, lo: number, hi: number, fallback: numbe
   return Math.max(lo, Math.min(hi, n));
 }
 
+function clamp01(v: number): number {
+  return Math.max(0, Math.min(1, v));
+}
+
 /** Load an image for drawing (same contract as native.ts's helper). */
 function loadImageElement(url: string): Promise<HTMLImageElement | null> {
   return new Promise((resolve) => {
@@ -115,28 +135,6 @@ function loadImageElement(url: string): Promise<HTMLImageElement | null> {
     img.onerror = () => resolve(null);
     img.src = url;
   });
-}
-
-/**
- * v5 timeline features the GPU engine cannot render yet → typed error.
- * Supported on purpose: Ken Burns, transitions (incl. the video-boundary
- * hard-cut rule), watermark, headlines, captions with every word mode +
- * kinetic animation, global fades, base-lane video (decode + clip audio).
- */
-function assertGpuTimelineSupport(opts: GpuTimelineExportOptions): void {
-  const unsupported: string[] = [];
-  const overlayCount = (opts.segments || []).filter((s) => (s.track ?? 0) >= 1).length;
-  if (overlayCount > 0) unsupported.push(`overlay-lane clips (${overlayCount})`);
-  const chromaCount = (opts.segments || []).filter((s) => s.chroma != null).length;
-  if (chromaCount > 0) unsupported.push(`chroma-keyed clips (${chromaCount})`);
-  if (opts.sfx && opts.sfx.length > 0) unsupported.push(`SFX placements (${opts.sfx.length})`);
-  if (unsupported.length > 0) {
-    throw new GpuExportUnsupportedError(
-      `GPU (WebCodecs) engine beta doesn't support ${unsupported.join(", ")} yet. ` +
-        `Switch the engine selector in the Export tab back to "FFmpeg Smart" — ` +
-        `the FFmpeg engine renders every feature.`,
-    );
-  }
 }
 
 /** The fetchable source URL of a VIDEO segment (page.tsx maps every item's
@@ -149,22 +147,34 @@ function videoSourceUrl(seg: MediaSegment, imageUrls: Record<string, string>): s
 }
 
 /**
- * Build the AudioMixer track list from the timeline model:
+ * Build the AudioMixer track list from the timeline model — EVERY audio
+ * lane (Task 28-a):
  *  (a) the music track — pinned at musicStartMs (v5.2 placement), looping
  *      when the user enabled musicLoop OR the track is shorter than the
- *      timeline (the "background music pinned to the whole video" case —
- *      the same fill-the-timeline intent as the FFmpeg path's
- *      `-stream_loop -1` + apad graph); volume = master × music.
- *  (b) every base-lane VIDEO segment's audio at its timeline position with
- *      its trim offset and per-clip volume (scaled by master volume).
+ *      timeline; volume = master × music; music-local fade-in/fade-out
+ *      automation (the fade-out always ENDS at the video end — FFmpeg
+ *      buildAudioMixGraph parity);
+ *  (b) every BASE-lane video segment's audio at its timeline position with
+ *      its trim offset and per-clip volume (scaled by master); speed≠1
+ *      clips time-compress via playbackRate (sync-correct twin of atempo);
+ *  (c) every OVERLAY-lane (PIP) video segment's audio — a GPU-engine
+ *      SUPERSET: the FFmpeg graph maps overlay inputs video-only, so this
+ *      is the only engine that mixes PIP audio. overlayLoop wraps audio
+ *      identically to the video arm;
+ *  (d) the pre-rendered SFX placements (`sfxTracks` — synthesized WAV blob
+ *      URLs, the exact bytes the FFmpeg path uploads as temp files).
  *
- * Known beta limitations vs the FFmpeg audio bus (documented trade-offs):
- * normalize/loudnorm, music-local fades and per-clip speed time-compression
- * (atempo) are not part of the offline graph; volumes >1 are clamped to 1 by
- * the mixer (no limiter needed).
+ * Video-clip branches are `optional`: an MP4 with no audio track skips with
+ * a warn instead of failing the export (the FFmpeg path probe-gates the
+ * same case). Known deviations vs the FFmpeg audio bus (documented):
+ * normalize/loudnorm is not part of the offline graph; playbackRate
+ * pitch-shifts where atempo preserves pitch.
  */
-function buildAudioTracks(opts: GpuTimelineExportOptions): AudioTrackData[] {
-  const tracks: AudioTrackData[] = [];
+function buildAudioTracks(
+  opts: GpuTimelineExportOptions,
+  sfxTracks: AudioTrackData[],
+): AudioTrackData[] {
+  const tracks: AudioTrackData[] = [...sfxTracks];
   const totalSec = opts.totalMs / 1000;
   const masterVolume = clampNum(opts.audio?.masterVolume, 0, 2, 1);
 
@@ -172,37 +182,117 @@ function buildAudioTracks(opts: GpuTimelineExportOptions): AudioTrackData[] {
     const startSec = Math.max(0, clampNum(opts.audio?.musicStartMs, 0, Infinity, 0) / 1000);
     const trackShorter =
       opts.audioTrack.durationMs != null && opts.audioTrack.durationMs < opts.totalMs;
+    const musicVolume = masterVolume * clampNum(opts.audio?.musicVolume, 0, 2, 1);
+    const fadeInMs = Math.max(0, clampNum(opts.audio?.fadeInMs, 0, Infinity, 0));
+    const fadeOutMs = Math.max(0, clampNum(opts.audio?.fadeOutMs, 0, Infinity, 0));
     tracks.push({
       url: opts.audioTrack.url,
       startSec,
       offsetSec: 0,
       durationSec: Math.max(0.01, totalSec - startSec),
-      volume: masterVolume * clampNum(opts.audio?.musicVolume, 0, 2, 1),
+      volume: musicVolume,
       loop: opts.audio?.musicLoop === true || trackShorter,
+      // Music-local fades — the fade-out window is absolute and ends at the
+      // VIDEO end (the adelay-relative math in buildAudioMixGraph's twin).
+      ...(fadeInMs > 0 ? { fadeInSec: fadeInMs / 1000 } : {}),
+      ...(fadeOutMs > 0
+        ? { fadeOut: { startSec: Math.max(0, totalSec - fadeOutMs / 1000), endSec: totalSec } }
+        : {}),
     });
   }
 
   for (const seg of opts.segments) {
-    if (seg.mediaType !== "video" || (seg.track ?? 0) >= 1) continue;
+    if (seg.mediaType !== "video") continue;
     if (seg.volume <= 0) continue;
     const url = videoSourceUrl(seg, opts.imageUrls);
     if (!url) continue; // File-only sources are decodable but not fetchable
+    if ((seg.track ?? 0) >= 1) {
+      // (c) PIP/overlay clip audio — speed-1 by design (the export overlay
+      // graph is speed-1), looped when the overlay loops.
+      tracks.push({
+        url,
+        startSec: seg.startMs / 1000,
+        offsetSec: (seg.trimInMs || 0) / 1000,
+        durationSec: seg.durationMs / 1000,
+        volume: masterVolume * seg.volume,
+        loop: seg.overlayLoop === true,
+        optional: true, // no audio track in the container → skip, not fail
+      });
+      continue;
+    }
+    // (b) base-lane clip audio — the source window consumed is
+    // durationMs × speed buffer-seconds, played back at `speed` so it lands
+    // inside the (shorter) timeline window.
+    const speed = seg.speed || 1;
     tracks.push({
       url,
       startSec: seg.startMs / 1000,
       offsetSec: (seg.trimInMs || 0) / 1000,
-      // Spec: the source-seconds span the clip consumes (speed 1 = the
-      // timeline window; speed≠1 audio is NOT time-compressed in the beta).
-      durationSec: (seg.durationMs / 1000) * (seg.speed || 1),
+      durationSec: (seg.durationMs / 1000) * speed,
       volume: masterVolume * seg.volume,
+      playbackRate: speed,
+      optional: true,
     });
   }
   return tracks;
 }
 
 /**
- * exportTimelineViaGpu — render the whole FrameFuse timeline through the
- * WebCodecs + Canvas pipeline and mux an H.264 MP4.
+ * Pre-render every SFX placement to a WAV blob URL (Task 28-a) — native.ts
+ * IPC parity: one render per unique (sfxId, durMs), cached; failures skip
+ * the placement with a console warn instead of failing the export. The
+ * caller owns the blob URLs and revokes them when the export finishes.
+ */
+async function renderSfxTracks(
+  opts: GpuTimelineExportOptions,
+  masterVolume: number,
+  blobUrls: string[],
+): Promise<AudioTrackData[]> {
+  const tracks: AudioTrackData[] = [];
+  if (!opts.sfx || opts.sfx.length === 0) return tracks;
+  const wavCache = new Map<string, { url: string; durationSec: number } | null>();
+  for (const item of opts.sfx) {
+    if (!item || !item.id || !item.sfxId) continue;
+    const itemDurMs = sfxDurationMs(item);
+    const cacheKey = `${item.sfxId}:${itemDurMs}`;
+    if (!wavCache.has(cacheKey)) {
+      let entry: { url: string; durationSec: number } | null = null;
+      try {
+        const rendered = await renderSfxWav(item.sfxId, itemDurMs);
+        if (rendered) {
+          const url = URL.createObjectURL(rendered.blob);
+          blobUrls.push(url);
+          entry = { url, durationSec: rendered.durationMs / 1000 };
+        } else {
+          console.warn(
+            `[framefuse] SFX "${item.sfxId}" could not be rendered (Web Audio unavailable?) — skipping placement ${item.id}`,
+          );
+        }
+      } catch (e) {
+        console.warn(`[framefuse] SFX "${item.sfxId}" render failed — skipping placement ${item.id}`, e);
+      }
+      wavCache.set(cacheKey, entry);
+    }
+    const cached = wavCache.get(cacheKey);
+    if (cached) {
+      tracks.push({
+        url: cached.url,
+        startSec: Math.max(0, item.startMs) / 1000,
+        offsetSec: 0,
+        durationSec: cached.durationSec,
+        // FFmpeg parity: the SFX branch rides clamp(volume, 0, 1) with the
+        // master volume applied at the mix bus (linearly identical).
+        volume: masterVolume * clampNum(item.volume, 0, 1, 1),
+      });
+    }
+  }
+  return tracks;
+}
+
+/**
+ * exportTimelineViaGpu — render the whole FrameFuse timeline (base lane +
+ * overlay lanes + chroma + SFX) through the WebCodecs + Canvas pipeline and
+ * mux an H.264 MP4. Never falls back to FFmpeg.
  */
 export async function exportTimelineViaGpu(
   opts: GpuTimelineExportOptions,
@@ -229,7 +319,6 @@ export async function exportTimelineViaGpu(
   if (!segments || segments.length === 0) {
     throw new GpuExportError("GPU export needs at least one segment");
   }
-  assertGpuTimelineSupport(opts);
 
   // FULL output resolution — no 720p cap (that cap is browser-legacy).
   const dims = resolveDimensions(settings.aspect, settings.resolution);
@@ -249,14 +338,19 @@ export async function exportTimelineViaGpu(
   // ── Audio gate: build the track list, then check AAC support BEFORE the
   // muxer is constructed (an mp4 with a declared-but-empty audio track would
   // be unplayable). Sandbox Chromium has no AAC → video-only + audioSkipped.
-  const audioTracks = buildAudioTracks(opts);
+  // v1.8.1: the list now includes SFX + PIP (overlay) clip audio too.
+  const masterVolume = clampNum(opts.audio?.masterVolume, 0, 2, 1);
+  const sfxBlobUrls: string[] = [];
+  const sfxTracks = await renderSfxTracks(opts, masterVolume, sfxBlobUrls);
+  const audioTracks = buildAudioTracks(opts, sfxTracks);
   const audioSupported = audioTracks.length > 0 ? await isAudioEncoderSupported() : false;
   const audioSkipped = audioTracks.length > 0 && !audioSupported;
   const activeAudioTracks = audioSupported ? audioTracks : [];
 
   // ── Image preload (imgCache pattern from the browser path). Generalized
   // to VideoFrameSource so the same cache could hold any paint source —
-  // here it only ever holds decoded HTMLImageElements.
+  // here it only ever holds decoded HTMLImageElements (base AND overlay
+  // lanes — overlay images resolve through the same map).
   const imgCache = new Map<string, VideoFrameSource>();
   await Promise.all(
     segments
@@ -286,37 +380,56 @@ export async function exportTimelineViaGpu(
     bridge.exportStart(outputPath);
   }
 
-  // One SourceDecoder per UNIQUE video URL (per the v8 architecture doc) —
-  // created lazily on first use, released eagerly once no remaining segment
-  // needs the source (the loop walks time monotonically; a re-used source
-  // simply re-inits through the decoder's rewind path).
-  const decoders = new Map<string, SourceDecoder>();
-  const decoderKey = (seg: MediaSegment): string | null => {
+  // ── Source decoders — TWO maps so concurrent consumers never interleave
+  // requests on ONE SourceDecoder (v1.8.1): the base lane and an overlay
+  // lane are active at the SAME timestamp, and interleaved non-monotonic
+  // requests would rewind-storm a shared decoder (rewind = full re-decode).
+  //   • base: shared per unique source URL/File — base windows are
+  //     sequential, so exactly one consumer is active at a time; a re-used
+  //     source rewinds ONCE on re-entry (the documented SourceDecoder path);
+  //   • overlays: one decoder per SEGMENT — stacked overlay lanes of the
+  //     same source each get their own monotonic decode stream.
+  // Both are created lazily on first use and released eagerly once no
+  // remaining segment window needs them (the loop walks time monotonically).
+  const baseDecoders = new Map<string, SourceDecoder>();
+  const overlayDecoders = new Map<string, SourceDecoder>();
+  const sourceKeyOf = (seg: MediaSegment): string | null => {
     const url = videoSourceUrl(seg, imageUrls);
     if (url) return url;
     return seg.file ? `file:${seg.id}` : null;
   };
-  const getDecoder = async (seg: MediaSegment): Promise<SourceDecoder> => {
-    const key = decoderKey(seg);
-    if (!key) {
-      throw new GpuExportError(
-        `video segment "${seg.fileName || seg.id}" has no readable source (no URL and no File)`,
-      );
-    }
-    const existing = decoders.get(key);
+  const createDecoder = async (seg: MediaSegment): Promise<SourceDecoder> => {
+    const url = videoSourceUrl(seg, imageUrls);
+    if (url != null) return SourceDecoder.fromUrl(url);
+    if (seg.file) return SourceDecoder.fromBuffer(await (seg.file as File).arrayBuffer());
+    throw new GpuExportError(
+      `video segment "${seg.fileName || seg.id}" has no readable source (no URL and no File)`,
+    );
+  };
+  const getBaseDecoder = async (seg: MediaSegment): Promise<SourceDecoder> => {
+    const key = sourceKeyOf(seg);
+    if (!key) return createDecoder(seg); // error path (no source) — throws above
+    const existing = baseDecoders.get(key);
     if (existing) return existing;
-    const created =
-      videoSourceUrl(seg, imageUrls) != null
-        ? await SourceDecoder.fromUrl(videoSourceUrl(seg, imageUrls) as string)
-        : await SourceDecoder.fromBuffer(await (seg.file as File).arrayBuffer());
-    decoders.set(key, created);
+    const created = await createDecoder(seg);
+    baseDecoders.set(key, created);
     return created;
   };
-  // The LAST segment stays eligible past its end (the browser path's tail
-  // fallback freezes on it when totalMs exceeds the last endMs) — its
+  const getOverlayDecoder = async (seg: MediaSegment): Promise<SourceDecoder> => {
+    const key = `ov:${seg.id}`;
+    const existing = overlayDecoders.get(key);
+    if (existing) return existing;
+    const created = await createDecoder(seg);
+    overlayDecoders.set(key, created);
+    return created;
+  };
+  // The LAST BASE segment stays eligible past its end (segmentAtTime's tail
+  // fallback freezes on it when totalMs exceeds the last base endMs — totalMs
+  // spans ALL lanes, so overlay windows can extend past the base end) — its
   // decoder must never be eagerly released.
-  const lastSeg = segments[segments.length - 1] ?? null;
-  const lastSegKey = lastSeg && lastSeg.mediaType === "video" ? decoderKey(lastSeg) : null;
+  const lastBaseSeg =
+    [...segments].reverse().find((s) => (s.track ?? 0) === 0 && s.mediaType === "video") ?? null;
+  const lastBaseKey = lastBaseSeg ? sourceKeyOf(lastBaseSeg) : null;
 
   // ── Muxer (the PROVEN streamable config from ExportOrchestrator). ──────
   // fastStart:"fragmented" (NOT false): mp4-muxer's finalize() backward-
@@ -342,15 +455,21 @@ export async function exportTimelineViaGpu(
   // ── Encoder: the shared hardware→software ladder, full-res codec string. ──
   const bitrate = Math.round(browserQualityBitrate(settings));
   // H.264 profile for the resolution — the browser path's logic WITHOUT the
-  // 720p constraint: Constrained Baseline for small frames, High L4.0 above
-  // (the codec ExportOrchestrator proved supported in Chromium).
-  const videoCodec = dims.w * dims.h <= 1280 * 720 ? "avc1.42E01E" : "avc1.640028";
+  // 720p constraint: Constrained Baseline (L3.0) for frames STRICTLY below
+  // 720p, High L4.0 at 720p and above (v1.8.1 fix: exactly-1280x720@30
+  // exceeds L3.0's macroblock budget — 42E01E there is out-of-spec and some
+  // runtimes correctly refuse it; 640028 is the level-correct choice).
+  const videoCodec = dims.w * dims.h < 1280 * 720 ? "avc1.42E01E" : "avc1.640028";
 
   let encoderFatal: unknown = null;
   let videoEncoder: VideoEncoder | null = null;
   let encoderClosed = false;
   let audioPromise: Promise<unknown> | null = null;
   let framesEncoded = 0;
+  // v1.8.1: ONE shared WebGL chroma keyer for the whole export (the
+  // preview's pattern — composite() reconfigures its offscreen canvas to
+  // the dest rect per call). Disposed in the finally below.
+  const keyer = new ChromaKeyer();
 
   try {
     const { encoder, hardware } = await configureVideoEncoder(
@@ -429,12 +548,11 @@ export async function exportTimelineViaGpu(
         await delay(10);
       }
 
-      // Active base segment — the browser path's exact resolution (fallback
-      // to the last segment in the tail past every end).
-      const segIdx = segments.findIndex(
-        (s) => currentMs >= s.startMs && currentMs < s.endMs,
-      );
-      const seg = segIdx >= 0 ? segments[segIdx] : lastSeg;
+      // Active BASE segment — the preview's exact track-aware resolution
+      // (segmentAtTime: base lane only, tail fallback to the last base
+      // segment — overlays never leak into the base paint).
+      const seg = segmentAtTime(segments, currentMs);
+      const segIdx = seg ? Math.max(0, segments.findIndex((s) => s.id === seg.id)) : -1;
 
       if (seg) {
         if (seg.mediaType === "video") {
@@ -443,14 +561,14 @@ export async function exportTimelineViaGpu(
           // The v5 VIDEO RULE makes xfade heads hard cuts at video
           // boundaries, so only dip heads can be active — composited here
           // manually exactly like PreviewPanel's video-base branch.
-          const decoder = await getDecoder(seg);
+          const decoder = await getBaseDecoder(seg);
           const sourceTimeMs =
             (currentMs - seg.startMs) * (seg.speed || 1) + (seg.trimInMs || 0);
           // Caller-owned CLONE — closed immediately after ALL draws for this
           // frame are done (⚠ VRAM rule; finally covers the draw throws).
           const frame = await decoder.getFrameForTimestamp(sourceTimeMs);
           try {
-            const fx = computeTransitionFx(segments, Math.max(0, segIdx), currentMs, transition);
+            const fx = computeTransitionFx(segments, segIdx, currentMs, transition);
             if (fx.kind === "dip-head" && sctx) {
               drawVideoFrame(sctx, frame, dims.w, dims.h, "cover");
               ctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -475,7 +593,7 @@ export async function exportTimelineViaGpu(
             ctx,
             scratch,
             seg,
-            Math.max(0, segIdx),
+            segIdx,
             segments,
             img,
             imgCache,
@@ -486,10 +604,75 @@ export async function exportTimelineViaGpu(
             transition,
           );
         }
+      } else {
+        // No base segment at this time (an all-overlay timeline, or a base
+        // gap before the first beat) — the preview's dark-gray backdrop.
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.fillStyle = "#0a0a0a";
+        ctx.fillRect(0, 0, dims.w, dims.h);
       }
 
-      // Paint order mirrors the browser path exactly: base → watermark →
-      // headlines → captions → global fades.
+      // ── OVERLAY lanes (v1.8.1) — the preview's exact z-order: every
+      // active overlay paints on top of the base in track→start order.
+      // Video overlays decode through their own per-segment SourceDecoder
+      // stream (concurrent with the base decoder); image overlays come from
+      // imgCache. Motion keyframes animate the rect; overlayLoop wraps
+      // source time modulo the source duration (the -stream_loop -1 twin).
+      // Chroma-keyed clips run through the SAME WebGL keyer the preview
+      // uses (VideoFrame feeds texImage2D directly); composite() false →
+      // plain drawImage fallback. Every decoded frame is closed in the
+      // finally below on EVERY path (⚠ VRAM rule).
+      const activeOverlays = overlaySegmentsAt(segments, currentMs);
+      for (const ov of activeOverlays) {
+        let owned: VideoFrame | null = null;
+        try {
+          // Paint source union: every member satisfies BOTH CanvasImageSource
+          // (drawImage) and TexImageSource (the keyer's texImage2D).
+          let src: VideoFrame | HTMLImageElement | null = null;
+          if (ov.mediaType === "video") {
+            const decoder = await getOverlayDecoder(ov);
+            const speed = ov.speed || 1; // overlays resolve speed 1 by design
+            let localMs = (ov.trimInMs || 0) + (currentMs - ov.startMs) * speed;
+            if (ov.overlayLoop && ov.sourceDurationMs && ov.sourceDurationMs > 0) {
+              const dur = ov.sourceDurationMs;
+              localMs = ((localMs % dur) + dur) % dur;
+            }
+            owned = await decoder.getFrameForTimestamp(Math.max(0, localMs));
+            src = owned;
+          } else {
+            // imgCache only ever holds HTMLImageElements here (built from
+            // new Image() above) — the cast is honest and keeps the union
+            // narrow for the keyer's TexImageSource parameter.
+            src = (imgCache.get(ov.id) as HTMLImageElement | undefined) ?? null;
+          }
+          if (!src) continue; // image not decoded / video frame unavailable
+          const sd = paintSourceSize(src);
+          if (sd.w <= 0 || sd.h <= 0) continue;
+          const base: OverlayTransform = ov.overlay ?? DEFAULT_OVERLAY_TRANSFORM;
+          // Motion keyframes interpolate the rect through the window
+          // (hold-first / hold-last) — the preview's exact sampling.
+          const sample = sampleOverlayMotion(base, currentMs - ov.startMs);
+          const transform: OverlayTransform = sample
+            ? { ...base, x: clamp01(sample.x), y: clamp01(sample.y) }
+            : base;
+          const g = overlayGeometry(dims.w, dims.h, sd.w, sd.h, transform);
+          if (g.dw <= 0 || g.dh <= 0) continue;
+          const keyed =
+            ov.chroma != null &&
+            keyer.composite(ctx, src, ov.chroma, g.dx, g.dy, g.dw, g.dh);
+          if (!keyed) {
+            ctx.setTransform(1, 0, 0, 1, 0, 0);
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = "high";
+            ctx.drawImage(src, g.dx, g.dy, g.dw, g.dh);
+          }
+        } finally {
+          owned?.close(); // ⚠ immediately after last use — draw, key, or skip
+        }
+      }
+
+      // Paint order mirrors the preview exactly: base → overlays →
+      // watermark → headlines → captions → global fades.
       if (wmImage && wmSettings) {
         drawWatermark(ctx, wmImage, dims.w, dims.h, wmSettings);
       }
@@ -499,27 +682,34 @@ export async function exportTimelineViaGpu(
         applyGlobalFade(
           ctx,
           scratch,
-          computeGlobalFade(
-            segments,
-            Math.max(0, segments.indexOf(seg)),
-            currentMs,
-            transition,
-          ),
+          computeGlobalFade(segments, segIdx, currentMs, transition),
         );
       }
 
-      // Eager decoder release: a source whose every segment window has
-      // passed can only be needed again by the tail fallback (lastSeg) —
-      // free it now so a 19-min export never holds every source at once.
+      // Eager decoder release: sources whose every segment window has
+      // passed can only be needed again by the base tail fallback (lastSeg)
+      // — free them now so a 19-min export never holds every source at once.
       if (i % 30 === 0) {
-        for (const [key, dec] of decoders) {
-          if (key === lastSegKey) continue;
+        for (const [key, dec] of baseDecoders) {
+          if (key === lastBaseKey) continue;
           const stillNeeded = segments.some(
-            (s) => s.mediaType === "video" && decoderKey(s) === key && s.endMs > currentMs,
+            (s) =>
+              (s.track ?? 0) === 0 &&
+              s.mediaType === "video" &&
+              sourceKeyOf(s) === key &&
+              s.endMs > currentMs,
           );
           if (!stillNeeded) {
             dec.cleanup();
-            decoders.delete(key);
+            baseDecoders.delete(key);
+          }
+        }
+        for (const [ovKey, dec] of overlayDecoders) {
+          const segId = ovKey.slice(3);
+          const s = segments.find((x) => x.id === segId);
+          if (!s || s.endMs <= currentMs) {
+            dec.cleanup();
+            overlayDecoders.delete(ovKey);
           }
         }
       }
@@ -586,8 +776,12 @@ export async function exportTimelineViaGpu(
     };
   } finally {
     // Cleanup on EVERY path — success, error, and abort.
-    for (const decoder of decoders.values()) decoder.cleanup();
-    decoders.clear();
+    for (const decoder of baseDecoders.values()) decoder.cleanup();
+    baseDecoders.clear();
+    for (const decoder of overlayDecoders.values()) decoder.cleanup();
+    overlayDecoders.clear();
+    keyer.dispose(); // drop the export's WebGL context + textures
+    for (const url of sfxBlobUrls) URL.revokeObjectURL(url); // SFX WAV blobs
     if (videoEncoder && !encoderClosed) {
       // Abort/error mid-encode: close() to release encoder-held GPU frames
       // (try/catch — the encoder may already be in a failed state).

@@ -29,9 +29,10 @@ export {
 export { runGpuExportSmokeTest, type GpuSmokeTestOptions, type GpuSmokeTestResult } from "./gpu-export-demo";
 // v8.1 (Task 27-a): the Export-tab engine adapter — the full-timeline
 // WebCodecs renderer behind the "GPU (WebCodecs)" engine selector.
+// v1.8.1 (Task 28): full multi-track compositor — overlays, chroma key and
+// SFX render natively; the FFmpeg fallback is gone.
 export {
   exportTimelineViaGpu,
-  GpuExportUnsupportedError,
   type GpuTimelineExportOptions,
   type GpuTimelineExportResult,
 } from "./engine";

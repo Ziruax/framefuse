@@ -163,9 +163,9 @@ export function Header({
                 backgroundColor: "#18181b",
                 color: "#a1a1aa",
               }}
-              title="FrameFuse v1.8.0 — multi-track video studio · dual-engine export: FFmpeg Smart (hybrid chunked single-pass + iGPU) and the GPU (WebCodecs) beta with forced GPU acceleration"
+              title="FrameFuse v1.8.1 — multi-track video studio · dual-engine export: FFmpeg Smart (hybrid chunked single-pass + iGPU) and the GPU (WebCodecs) full multi-track compositor with forced GPU acceleration"
             >
-              v1.8.0
+              v1.8.1
             </span>
             {/* v5.1: on-disk project file chip (native save/open sessions). */}
             {projectName && (
