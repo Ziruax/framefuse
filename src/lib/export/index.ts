@@ -15,9 +15,23 @@ export {
   runGpuExport,
   GpuExportError,
   ExportAbortedError,
+  configureVideoEncoder,
+  getExportStreamer,
+  ChunkSink,
   type GpuVideoClip,
   type GpuCaptionOptions,
   type GpuExportOptions,
   type GpuExportResult,
+  type VideoEncoderSetup,
+  type ConfiguredVideoEncoder,
+  type ExportStreamerBridge,
 } from "./ExportOrchestrator";
 export { runGpuExportSmokeTest, type GpuSmokeTestOptions, type GpuSmokeTestResult } from "./gpu-export-demo";
+// v8.1 (Task 27-a): the Export-tab engine adapter — the full-timeline
+// WebCodecs renderer behind the "GPU (WebCodecs)" engine selector.
+export {
+  exportTimelineViaGpu,
+  GpuExportUnsupportedError,
+  type GpuTimelineExportOptions,
+  type GpuTimelineExportResult,
+} from "./engine";

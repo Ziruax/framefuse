@@ -30,6 +30,28 @@ const G = require("./export-graph");
 // bun verification harness exactly like export-graph).
 const SP = require("./export-singlepass");
 
+// ── v8.1: FORCE GPU hardware acceleration (WebCodecs export engine) ────────
+// Electron silently falls back to SwiftShader (pure-CPU rendering) when the
+// GPU blocklist matches — old drivers, virtual displays, RDP sessions, or
+// background/offscreen windows. A WebCodecs VideoEncoder on SwiftShader
+// encodes at software speeds (the exact 1.5 FPS pathology), while the same
+// call inside a real GPU context rides the hardware encoder at 100+ fps.
+// These switches MUST be appended BEFORE app.whenReady() fires:
+//   ignore-gpu-blocklist      — use the GPU even when the driver version
+//                               matches Chromium's blocklist (the big one for
+//                               older Intel/AMD iGPU drivers on low-end quads)
+//   enable-gpu-rasterization — rasterize via the GPU (canvas paint path)
+//   enable-zero-copy          — avoid the GPU→CPU readback copy on frames
+//   disable-software-rasterizer — refuse SwiftShader instead of crawling
+// Field-debug escape hatch: FRAMEFUSE_NO_GPU_FLAGS=1 restores stock behavior
+// (e.g. a driver that hard-crashes on zero-copy).
+if (!process.env.FRAMEFUSE_NO_GPU_FLAGS) {
+  app.commandLine.appendSwitch("ignore-gpu-blocklist");
+  app.commandLine.appendSwitch("enable-gpu-rasterization");
+  app.commandLine.appendSwitch("enable-zero-copy");
+  app.commandLine.appendSwitch("disable-software-rasterizer");
+}
+
 // Resolve the FFmpeg binary path. v1.5: a FULL bundled build (staged by
 // scripts/fetch-windows-ffmpeg.js into resources/ffmpeg/<plat>/) is PREFERRED
 // over ffmpeg-static — it carries ffprobe.exe (fastProbe) plus the hardware
@@ -210,9 +232,58 @@ ipcMain.handle("ffmpeg-status", async () => {
 });
 
 // v5.1: encoder badge for the export UI (result of the async GPU probe).
+// v8.1: carries the forced flag so the badge can say "probe bypassed".
 ipcMain.handle("export-info", async () => {
   const enc = await detectGpuEncoderAsync();
-  return { encoder: enc.label, encoderName: enc.name };
+  return { encoder: enc.label, encoderName: enc.name, forced: !!forcedEncoderKey };
+});
+
+// v8.1: GPU acceleration status for the Export tab diagnostics — the in-app
+// equivalent of the Task Manager "Video Encode" graph check. Reports
+// Chromium's GPU feature status (compositing / webgl / rasterization) plus
+// the active adapter, so "GPU: disabled (software)" is visible without
+// opening Task Manager. WebCodecs hardware encoding requires this pipeline
+// to be live; SwiftShader here = the 1.5 FPS pathology.
+ipcMain.handle("gpu-status", async () => {
+  const base = {
+    ok: true,
+    featureStatus: null,
+    adapters: [],
+    switches: process.env.FRAMEFUSE_NO_GPU_FLAGS
+      ? "stock (FRAMEFUSE_NO_GPU_FLAGS set)"
+      : "forced-on (ignore-gpu-blocklist · gpu-rasterization · zero-copy · no-software-rasterizer)",
+    platform: process.platform,
+  };
+  try {
+    base.featureStatus = app.getGPUFeatureStatus();
+  } catch (e) {
+    base.featureStatus = null;
+  }
+  try {
+    const info = await app.getGPUInfo("basic");
+    const devices = info && info.gpu && Array.isArray(info.gpu.devices) ? info.gpu.devices : [];
+    base.adapters = devices.map((d) => ({
+      vendor: d.vendorString || "",
+      device: d.deviceString || "",
+      driver: d.driverVersion || "",
+    }));
+  } catch (_) { /* optional — status alone is enough */ }
+  return base;
+});
+
+// v8.1: force-encoder override (Export tab diagnostics). key ∈
+// {null, "nvenc", "qsv", "amf", "x264"} — null restores the v7 auto-probe.
+// Changing the key invalidates the session cache immediately and returns the
+// re-resolved encoder so the badge updates in one round trip.
+ipcMain.handle("export:set-force-encoder", async (_evt, key) => {
+  if (key !== null && !Object.prototype.hasOwnProperty.call(FORCE_ENCODER_MAP, key)) {
+    return { ok: false, error: `Unknown encoder key: ${String(key)}` };
+  }
+  forcedEncoderKey = key;
+  detectedEncoder = null;
+  encoderDetecting = null;
+  const enc = await detectGpuEncoderAsync();
+  return { ok: true, forced: key, encoder: enc.label, encoderName: enc.name };
 });
 
 ipcMain.handle("save-temp-image", async (_evt, { name, bytes }) => {
@@ -1418,6 +1489,22 @@ ipcMain.handle("whisper:status", async () => {
 let detectedEncoder = null;      // resolved value (session cache)
 let encoderDetecting = null;     // in-flight promise
 
+// v8.1 FORCE-ENCODER BYPASS (diagnostic field tool). When set, the runtime
+// GPU probe is SKIPPED entirely and the named encoder is used verbatim —
+// the "is it the probe or the driver?" test. The only guard left is a
+// compile-time existence check of the encoder in the bundled FFmpeg build
+// (an instant -encoders grep): a not-in-build answer is actionable on its
+// own ("this binary cannot test the driver"), while a driver-level failure
+// surfaces as the real ffmpeg error in the export toast — exactly what
+// diagnosis needs. "x264" forces the CPU baseline; null restores auto-probe.
+let forcedEncoderKey = null;
+const FORCE_ENCODER_MAP = {
+  nvenc: { name: "h264_nvenc", label: "NVIDIA NVENC (forced)" },
+  qsv: { name: "h264_qsv", label: "Intel Quick Sync (forced)" },
+  amf: { name: "h264_amf", label: "AMD AMF (forced)" },
+  x264: { name: "libx264", label: "CPU libx264 (forced)" },
+};
+
 // v5.1: ALL detection is ASYNC (spawn, never execSync). The v5.0 code ran
 // execSync listEncoders + probeEncoder inside the export handler — up to
 // 25 s of a COMPLETELY FROZEN main process (no window events, no IPC) before
@@ -1478,6 +1565,28 @@ const GPU_PROBE_MIN_FPS = 24;
 const GPU_VS_CPU_RATIO = 1.2;
 
 async function detectGpuEncoderAsync() {
+  // v8.1: forced encoder bypasses the throughput probe entirely. If the
+  // binary lacks the encoder we still return the forced pick — the export
+  // then fails with ffmpeg's real stderr (the diagnostic signal), and the
+  // log below states the build-level fact separately.
+  if (forcedEncoderKey) {
+    const spec = FORCE_ENCODER_MAP[forcedEncoderKey];
+    if (spec.name !== "libx264") {
+      try {
+        const build = await listEncodersAsync();
+        if (!build.some((e) => e.name === spec.name)) {
+          console.error(
+            `Export encoder: FORCED ${spec.name} is NOT compiled into this FFmpeg build — ` +
+            `the driver cannot be tested with this binary; the export will fail with ffmpeg's error`,
+          );
+        }
+      } catch (_) { /* best-effort build check */ }
+    }
+    console.log(`Export encoder: ${spec.label} — probe BYPASSED (forced via Export tab)`);
+    detectedEncoder = spec;
+    encoderDetecting = null;
+    return spec;
+  }
   if (detectedEncoder) return detectedEncoder;
   if (encoderDetecting) return encoderDetecting;
   encoderDetecting = (async () => {

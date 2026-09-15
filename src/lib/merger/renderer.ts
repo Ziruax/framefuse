@@ -251,7 +251,7 @@ function clamp(v: number, lo: number, hi: number): number {
  */
 export function drawFrame(
   ctx: CanvasRenderingContext2D,
-  img: HTMLImageElement | HTMLCanvasElement | null,
+  img: VideoFrameSource | null,
   seg: MediaSegment,
   currentMs: number,
   cw: number,
@@ -264,12 +264,9 @@ export function drawFrame(
 
   if (!img) return;
 
-  const iw =
-    (img as HTMLImageElement).naturalWidth ||
-    (img as HTMLCanvasElement).width;
-  const ih =
-    (img as HTMLImageElement).naturalHeight ||
-    (img as HTMLCanvasElement).height;
+  // v8: one shared dimension read — images (naturalWidth), canvases
+  // (width) and WebCodecs VideoFrames (displayWidth) all resolve here.
+  const { w: iw, h: ih } = paintSourceSize(img);
   if (!iw || !ih) return;
 
   const dur = Math.max(1, seg.durationMs);
@@ -583,8 +580,8 @@ export function drawFrameWithTransition(
   seg: MediaSegment,
   segIdx: number,
   segments: MediaSegment[],
-  img: HTMLImageElement | HTMLCanvasElement | null,
-  images: Record<string, HTMLImageElement> | Map<string, HTMLImageElement>,
+  img: VideoFrameSource | null,
+  images: Record<string, VideoFrameSource> | Map<string, VideoFrameSource>,
   currentMs: number,
   cw: number,
   ch: number,
@@ -787,9 +784,14 @@ export function drawWatermark(
 // ---------------------------------------------------------------------------
 
 /** Anything drawImage accepts that exposes intrinsic dimensions — real
- *  video elements (videoWidth/videoHeight), images (naturalWidth/Height)
- *  and canvases/bitmaps (width/height) all satisfy this shape. */
+ *  video elements (videoWidth/videoHeight), images (naturalWidth/Height),
+ *  canvases/bitmaps (width/height) and WebCodecs VideoFrames
+ *  (displayWidth/displayHeight — the VISIBLE, aspect-corrected size, as
+ *  opposed to codedWidth which may include alignment padding) all satisfy
+ *  this shape. */
 export type VideoFrameSource = CanvasImageSource & {
+  displayWidth?: number;
+  displayHeight?: number;
   videoWidth?: number;
   videoHeight?: number;
   naturalWidth?: number;
@@ -797,6 +799,24 @@ export type VideoFrameSource = CanvasImageSource & {
   width?: number;
   height?: number;
 };
+
+/**
+ * Intrinsic (visible) size of any {@link VideoFrameSource} — the ONE
+ * dimension read shared by every paint path so HTMLImageElement
+ * (naturalWidth), HTMLVideoElement (videoWidth), canvas (width) and
+ * WebCodecs VideoFrame (displayWidth) all resolve through the same helper.
+ * Unreadable/missing metadata resolves to 0 so callers can skip the draw.
+ */
+export function paintSourceSize(src: VideoFrameSource): { w: number; h: number } {
+  const w =
+    src.displayWidth ?? src.videoWidth ?? src.naturalWidth ?? src.width;
+  const h =
+    src.displayHeight ?? src.videoHeight ?? src.naturalHeight ?? src.height;
+  return {
+    w: typeof w === "number" && Number.isFinite(w) ? w : 0,
+    h: typeof h === "number" && Number.isFinite(h) ? h : 0,
+  };
+}
 
 /**
  * v5.0: destination rect for an overlay item on a videoW×videoH frame.
@@ -883,10 +903,9 @@ export function drawVideoFrame(
   ctx.fillRect(0, 0, cw, ch);
   if (!source) return;
 
-  const sw = source.videoWidth ?? source.naturalWidth ?? source.width;
-  const sh = source.videoHeight ?? source.naturalHeight ?? source.height;
-  const iw = typeof sw === "number" && Number.isFinite(sw) ? sw : 0;
-  const ih = typeof sh === "number" && Number.isFinite(sh) ? sh : 0;
+  // v8: displayWidth first — WebCodecs VideoFrames expose the VISIBLE
+  // (aspect-corrected) size there; every other source kind is unchanged.
+  const { w: iw, h: ih } = paintSourceSize(source);
   if (!iw || !ih) return;
 
   // object-fit: cover / contain base scale.

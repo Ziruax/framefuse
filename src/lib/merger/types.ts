@@ -338,11 +338,17 @@ export interface ExportResult {
    *  CPU-first chunked single-pass (W timeline windows rendered
    *  concurrently + one audio pass + concat/mux); "single-pass" = one
    *  process for the whole timeline (GPU boxes / short timelines);
-   *  "two-step" = the per-clip pool fallback. */
-  mode?: "single-pass" | "parallel-pass" | "two-step";
+   *  "two-step" = the per-clip pool fallback; "gpu-webcodecs" = the v8
+   *  WebCodecs + Canvas engine (Export-tab engine selector). */
+  mode?: "single-pass" | "parallel-pass" | "two-step" | "gpu-webcodecs";
   /** v1.5: W — the number of parallel single-pass windows (parallel-pass
    *  only; aliases totalChunks for that mode). */
   parallelChunks?: number;
+  /** v8 (Task 27-a): true when the GPU (WebCodecs) engine exported
+   *  VIDEO-ONLY because AAC (mp4a.40.2) encode is unavailable in the
+   *  runtime (e.g. the open-source Chromium sandbox build) — the UI toasts
+   *  a warning so the missing audio is never a surprise. */
+  audioSkipped?: boolean;
 }
 
 export interface CaptionSettings {
@@ -751,6 +757,12 @@ declare global {
         hasLibass?: boolean;
       }>;
       exportNative: (opts: unknown) => Promise<ExportResult>;
+      /** v8 GPU export streamer — WebCodecs renderer pipeline → disk (5 MB
+       *  chunks). exportStart truncates/creates the output, exportChunk
+       *  appends bytes, exportEnd closes the handle. */
+      exportStart?: (filePath: string) => void;
+      exportChunk?: (buffer: Uint8Array) => void;
+      exportEnd?: () => void;
       saveTempImage: (p: { name: string; bytes: ArrayBuffer }) => Promise<string>;
       saveTempAudio: (p: { name: string; bytes: ArrayBuffer }) => Promise<string>;
       /** v5.0: video sources for the multi-track timeline (same shape as
@@ -762,8 +774,34 @@ declare global {
       cancelExport: () => Promise<boolean>;
       onExportProgress: (cb: (d: ExportProgress) => void) => () => void;
       onMenu: (channel: string, cb: (d?: unknown) => void) => () => void;
-      /** v5.1: result of the async GPU-encoder probe (export-tab badge). */
-      getExportInfo: () => Promise<{ encoder: string; encoderName: string }>;
+      /** v5.1: result of the async GPU-encoder probe (export-tab badge).
+       *  v8.1 (Task 27-b): `forced` is true when a force-encoder override
+       *  bypassed the probe (Export-tab diagnostics dropdown). */
+      getExportInfo: () => Promise<{
+        encoder: string;
+        encoderName: string;
+        forced?: boolean;
+      }>;
+      /** v8.1 (Task 27-b): GPU acceleration status — the in-app Task Manager
+       *  check. featureStatus maps feature names (gpu_compositing, webgl,
+       *  rasterization, …) to "enabled" | "software" | "disabled". */
+      getGpuStatus?: () => Promise<{
+        ok: boolean;
+        featureStatus: Record<string, string> | null;
+        adapters: Array<{ vendor: string; device: string; driver: string }>;
+        switches: string;
+        platform: string;
+      }>;
+      /** v8.1 (Task 27-b): force-encoder probe bypass (diagnostics).
+       *  key ∈ null | "nvenc" | "qsv" | "amf" | "x264"; null restores the
+       *  auto-probe. Returns the re-resolved encoder for one round trip. */
+      setForceEncoder?: (key: string | null) => Promise<{
+        ok: boolean;
+        forced: string | null;
+        encoder: string;
+        encoderName: string;
+        error?: string;
+      }>;
       /** ── v5.1 Native Whisper (utilityProcess service) ──
        * transcribe: main decodes via ffmpeg + runs onnxruntime-node; progress
        * streams via onWhisperProgress. v1.3: `sourcePath` (zero-copy local

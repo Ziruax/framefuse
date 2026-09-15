@@ -106,7 +106,7 @@ export interface GpuExportResult {
 }
 
 /** The preload-bridge surface the renderer uses for streamed exports. */
-interface ExportStreamerBridge {
+export interface ExportStreamerBridge {
   exportStart: (filePath: string) => void;
   exportChunk: (buffer: Uint8Array) => void;
   exportEnd: () => void;
@@ -132,8 +132,10 @@ function delay(ms: number): Promise<void> {
   });
 }
 
-/** Read the optional Electron export-streamer bridge (browser-safe). */
-function getExportStreamer(): ExportStreamerBridge | null {
+/** Read the optional Electron export-streamer bridge (browser-safe).
+ *  Exported since v8: the timeline adapter (src/lib/export/engine.ts) uses
+ *  the same bridge detection for its streamed-to-disk mode. */
+export function getExportStreamer(): ExportStreamerBridge | null {
   if (typeof window === "undefined") return null;
   const w = window as Window & {
     electronAPI?: {
@@ -163,8 +165,12 @@ function getExportStreamer(): ExportStreamerBridge | null {
  *
  * Memory mode (browser/dev): chunks accumulate for `getBytes()` — the whole
  * output in RAM, acceptable for tests and short previews only.
+ *
+ * Exported since v8: the timeline adapter (engine.ts) reuses this exact sink
+ * for its mp4-muxer StreamTarget — one implementation of the proven
+ * append-only IPC contract.
  */
-class ChunkSink {
+export class ChunkSink {
   private readonly bridge: ExportStreamerBridge | null;
   private readonly memoryChunks: Uint8Array[] = [];
   private pending: Uint8Array[] = [];
@@ -382,33 +388,59 @@ function drawGpuCaptions(
   }
 }
 
+/** The encoder-setup request shared by runGpuExport and the v8 timeline
+ * adapter — GpuExportOptions satisfies it structurally. */
+export interface VideoEncoderSetup {
+  width: number;
+  height: number;
+  fps: number;
+  videoBitrate: number;
+  /** VideoEncoder codec string (default "avc1.640028" — H.264 High 4:2:0 L4.0). */
+  videoCodec?: string;
+}
+
+/** Which rung of the hardware→software ladder configured the encoder. */
+export interface ConfiguredVideoEncoder {
+  encoder: VideoEncoder;
+  /** True = the prefer-hardware rung; false = the software fallback. */
+  hardware: boolean;
+}
+
 /**
  * Configure the export VideoEncoder with a hardware→software fallback ladder:
  * 1. prefer-hardware + quality latency (the GPU path this module exists for),
  * 2. same codec without hardwareAcceleration (software encode),
  * 3. unsupported codec → GpuExportError carrying the platform's
  *    DOMException message (harvested from a real configure() attempt).
+ *
+ * v8: exported (the timeline adapter reuses the identical ladder) and now
+ * reports which rung won via `hardware`, so callers can label the export
+ * "hardware" vs "software" truthfully. H.264 codecs additionally pin
+ * `avc: { format: "avc" }` (the AVCC box format mp4-muxer expects — the
+ * WebCodecs default, now explicit like the browser path in native.ts).
  */
-async function configureVideoEncoder(
-  opts: GpuExportOptions,
+export async function configureVideoEncoder(
+  opts: VideoEncoderSetup,
   onChunk: (chunk: EncodedVideoChunk, meta: EncodedVideoChunkMetadata | undefined) => void,
   onError: (e: DOMException) => void,
-): Promise<VideoEncoder> {
+): Promise<ConfiguredVideoEncoder> {
   const codec = opts.videoCodec ?? "avc1.640028";
-  const common = {
+  const common: VideoEncoderConfig = {
     codec,
     width: opts.width,
     height: opts.height,
     bitrate: opts.videoBitrate,
     framerate: opts.fps,
     latencyMode: "quality" as const,
+    ...(codec.startsWith("avc1") ? { avc: { format: "avc" as const } } : {}),
   };
   const configs: VideoEncoderConfig[] = [
     { ...common, hardwareAcceleration: "prefer-hardware" },
     { ...common }, // software / no preference
   ];
 
-  for (const config of configs) {
+  for (let rung = 0; rung < configs.length; rung++) {
+    const config = configs[rung];
     let supported = false;
     try {
       const support = await VideoEncoder.isConfigSupported(config);
@@ -420,12 +452,12 @@ async function configureVideoEncoder(
     const encoder = new VideoEncoder({ output: onChunk, error: onError });
     try {
       encoder.configure(config);
-    } catch (e) {
+    } catch {
       // configure() rejected despite isConfigSupported — try the next rung.
       try { encoder.close(); } catch { /* already closed by the throw */ }
       continue;
     }
-    return encoder;
+    return { encoder, hardware: rung === 0 };
   }
 
   // No config worked — harvest the platform's own DOMException message via a
@@ -567,15 +599,17 @@ export async function runGpuExport(opts: GpuExportOptions): Promise<GpuExportRes
     });
 
     let encoderFatal: unknown = null;
-    videoEncoder = await configureVideoEncoder(
-      opts,
-      (chunk, meta) => {
-        muxer.addVideoChunk(chunk, meta);
-      },
-      (e) => {
-        encoderFatal = e;
-      },
-    );
+    videoEncoder = (
+      await configureVideoEncoder(
+        opts,
+        (chunk, meta) => {
+          muxer.addVideoChunk(chunk, meta);
+        },
+        (e) => {
+          encoderFatal = e;
+        },
+      )
+    ).encoder;
 
     // Audio renders concurrently with the frame loop — chunks flow straight
     // into the muxer; the promise is awaited after the loop, before flush.

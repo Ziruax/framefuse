@@ -10,8 +10,17 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   // v5.1: result of the async GPU-encoder probe (for the export badge).
   // { encoder: "NVIDIA NVENC" | "Intel QSV" | "AMD AMF" | "CPU (libx264)",
-  //   encoderName: "h264_nvenc" | … | "libx264" }
+  //   encoderName: "h264_nvenc" | … | "libx264", forced: boolean }
   getExportInfo: () => ipcRenderer.invoke("export-info"),
+
+  // v8.1: GPU acceleration status (in-app Task Manager check).
+  // { ok, featureStatus: {gpu_compositing, webgl, rasterization, …},
+  //   adapters: [{vendor, device, driver}], switches, platform }
+  getGpuStatus: () => ipcRenderer.invoke("gpu-status"),
+
+  // v8.1: force-encoder probe bypass (diagnostics). key ∈
+  // {null,"nvenc","qsv","amf","x264"} → { ok, forced, encoder, encoderName }.
+  setForceEncoder: (key) => ipcRenderer.invoke("export:set-force-encoder", key),
 
   exportNative: (opts) => ipcRenderer.invoke("export-native", opts),
 

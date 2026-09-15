@@ -36,7 +36,9 @@ export interface LastExport {
   hwDecodeClips?: number;
   /** v1.5: parallel single-pass windows (CPU-first chunked export). */
   parallelChunks?: number;
-  mode?: "single-pass" | "parallel-pass" | "two-step";
+  mode?: "single-pass" | "parallel-pass" | "two-step" | "gpu-webcodecs";
+  /** v8 (Task 27-a): GPU (WebCodecs) engine exported video-only (no AAC). */
+  audioSkipped?: boolean;
 }
 
 interface HeaderProps {
@@ -161,9 +163,9 @@ export function Header({
                 backgroundColor: "#18181b",
                 color: "#a1a1aa",
               }}
-              title="FrameFuse v1.7.0 — multi-track video studio · hybrid smart-render export: chunked parallel single-pass + stream-copy TURBO + iGPU (QSV/AMF/NVENC) when available"
+              title="FrameFuse v1.8.0 — multi-track video studio · dual-engine export: FFmpeg Smart (hybrid chunked single-pass + iGPU) and the GPU (WebCodecs) beta with forced GPU acceleration"
             >
-              v1.7.0
+              v1.8.0
             </span>
             {/* v5.1: on-disk project file chip (native save/open sessions). */}
             {projectName && (

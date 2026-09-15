@@ -133,6 +133,11 @@ const LS_KEY = "framefuse.settings.v50";
 const LS_LEGACY_KEYS = ["framefuse.settings.v49", "framefuse.settings.v41"];
 const LS_VERSION = 50;
 
+/** v8 (Task 27-a): which export engine the Export button drives. */
+type ExportEngine = "ffmpeg" | "gpu";
+/** Its own localStorage key (validated on load, "ffmpeg" fallback). */
+const ENGINE_LS_KEY = "ff-export-engine";
+
 interface PersistedSettings {
   kenBurns: KenBurnsConfig;
   settings: VideoSettings;
@@ -397,6 +402,29 @@ export default function Page() {
   const [lastExport, setLastExport] = useState<LastExport | null>(null);
   const [inElectron, setInElectron] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+
+  // ---- v8 (Task 27-a): export ENGINE selector — "FFmpeg Smart" (the v7
+  // hybrid chunked single-pass + iGPU probe) vs "GPU (WebCodecs)" (the v8
+  // zero-FFmpeg hardware pipeline). Persisted under its own localStorage key
+  // so it survives restarts independently of the v50 settings blob; validated
+  // on load with a "ffmpeg" fallback so a corrupted value can never wedge
+  // the Export button. ----
+  const [engine, setEngine] = useState<ExportEngine>("ffmpeg");
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(ENGINE_LS_KEY);
+      if (stored === "gpu" || stored === "ffmpeg") setEngine(stored);
+    } catch {
+      /* storage unavailable (private mode) — keep the default */
+    }
+  }, []);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(ENGINE_LS_KEY, engine);
+    } catch {
+      /* ignore write failures */
+    }
+  }, [engine]);
 
   // ---- v1.2: keyboard shortcuts overlay (`?`) -----------------------------
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -1109,6 +1137,88 @@ export default function Page() {
       if (it) imageUrls[seg.id] = it.url;
     }
     try {
+      // ── v8 (Task 27-a): GPU (WebCodecs) engine branch ── the full-res
+      // WebCodecs + Canvas render, streamed to disk in 5 MB IPC chunks in
+      // Electron / downloaded in the browser. Shares the SAME abort
+      // controller, isExporting/exportProgress UI and error handling as the
+      // FFmpeg path — no separate progress plumbing.
+      if (engine === "gpu") {
+        const W = window as Window & { VideoEncoder?: unknown; VideoFrame?: unknown };
+        if (typeof W.VideoEncoder === "undefined" || typeof W.VideoFrame === "undefined") {
+          toast.error("GPU (WebCodecs) engine unavailable", {
+            description:
+              "This browser lacks the WebCodecs API — use a Chromium-based browser or the FrameFuse desktop app, or switch the engine back to FFmpeg Smart.",
+          });
+          return;
+        }
+        // Electron parity with the FFmpeg path: the save dialog opens
+        // FIRST (before any media prep). Cancelling aborts silently.
+        let outputPath: string | null = null;
+        if (inElectron) {
+          const api = window.electronAPI;
+          if (!api) return; // no bridge — nothing to export through
+          outputPath = await api.chooseOutput();
+          if (!outputPath) return; // cancelled — no toast error
+        }
+        // LAZY import: keeps mp4box + the muxer out of the main bundle
+        // (the devtools hook window.__framefuseGpuExport loads the same chunk).
+        const { exportTimelineViaGpu } = await import("@/lib/export/engine");
+        const res = await exportTimelineViaGpu({
+          segments: timeline.segments,
+          imageUrls,
+          audioTrack,
+          settings,
+          kenBurns,
+          audio: audioSettings,
+          totalMs: timeline.totalMs,
+          subtitles,
+          captionSettings,
+          headlines: headlineItems.length ? headlineItems : null,
+          transition: transitionSettings,
+          watermark: watermarkImage
+            ? { imageUrl: watermarkImage.url, settings: watermarkSettings }
+            : null,
+          sfx: sfxItems.length > 0 ? sfxItems : undefined,
+          onProgress: (p) => setExportProgress(p),
+          signal: ac.signal,
+          outputPath,
+        });
+        setLastExport({
+          path: res.path,
+          size: res.size,
+          method: "GPU WebCodecs",
+          at: Date.now(),
+          encoder: res.encoder,
+          elapsedSec: res.elapsedSec,
+          mode: res.mode,
+          audioSkipped: res.audioSkipped,
+        });
+        const gpuBits: string[] = [];
+        if (res.elapsedSec != null && res.elapsedSec >= 1) {
+          gpuBits.push(
+            res.elapsedSec < 60
+              ? `${res.elapsedSec}s`
+              : `${Math.floor(res.elapsedSec / 60)}m ${String(Math.floor(res.elapsedSec % 60)).padStart(2, "0")}s`,
+          );
+        }
+        if (res.encoder) gpuBits.push(res.encoder); // hardware/software ladder rung
+        toast.success(`Exported ${fmtBytes(res.size)}`, {
+          description: inElectron
+            ? gpuBits.length > 0
+              ? `${gpuBits.join(" · ")}\n${res.path}`
+              : res.path
+            : "Saved to your downloads",
+        });
+        // Sandbox/Chromium-oss builds lack AAC encode — the engine exported
+        // video-only (audioSkipped) and that must never be a silent surprise.
+        if (res.audioSkipped) {
+          toast.info("Exported without audio", {
+            description:
+              "This runtime cannot encode AAC (mp4a.40.2) — the GPU engine exported video-only. The FFmpeg Smart engine always includes audio.",
+          });
+        }
+        return;
+      }
       const res = await exportNative({
         segments: timeline.segments,
         imageUrls,
@@ -1217,6 +1327,7 @@ export default function Page() {
     watermarkSettings,
     inElectron,
     sfxItems,
+    engine,
   ]);
 
   // Keep exportRef in sync so menu accelerators call the latest version
@@ -4119,6 +4230,9 @@ const handleRandomTransitionMix = useCallback(() => {
             onRandomMix={handleRandomTransitionMix}
             boundaryCount={boundaryCount}
             debug={debug}
+            // ---- v8 (Task 27-a): export engine selector (Export tab) ----
+            engine={engine}
+            onEngineChange={setEngine}
             // ---- v1 Chroma tab ----
             chromaTarget={chromaTarget}
             onSetItemEdit={handleSetItemEdit}

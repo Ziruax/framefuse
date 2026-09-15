@@ -295,8 +295,9 @@ export function buildCaptionFfmpegStyle(opts: {
  * Browser-fallback bitrate (bits/sec) with the v4.5 quality profile applied.
  * The FFmpeg path uses CRF/cq (per-profile); the browser encoders can't, so
  * profiles scale the bitrate instead: draft ≈ 55%, social 100%, cinema 160%.
+ * Exported since v8: the GPU (WebCodecs) engine applies the same convention.
  */
-function browserQualityBitrate(settings: VideoSettings): number {
+export function browserQualityBitrate(settings: VideoSettings): number {
   const base = (settings.bitrateMbps || 8) * 1_000_000;
   switch (settings.quality) {
     case "draft":
@@ -1046,7 +1047,10 @@ function pickMime(): string {
   return "video/webm";
 }
 
-function triggerDownload(url: string, filename: string): void {
+/** Trigger a browser download of `url` as `filename` (no native save
+ * dialog). Exported since v8: the GPU (WebCodecs) engine reuses the exact
+ * same browser-download flow for its in-memory exports. */
+export function triggerDownload(url: string, filename: string): void {
   const a = document.createElement("a");
   a.href = url;
   a.download = filename;
@@ -1087,6 +1091,11 @@ interface CanvasCaptionCtx {
   /** Absolute endMs of the current cue (for whole-cue animation fallback). */
   cueEndMs?: number;
 }
+
+// v8: the caption-render context shape is shared with the GPU (WebCodecs)
+// export engine (src/lib/export/engine.ts builds the same capCtx objects
+// the browser path builds) — exported as a TYPE-only alias.
+export type { CanvasCaptionCtx };
 
 /**
  * Draw a caption text onto a 2D canvas context using the active preset.
