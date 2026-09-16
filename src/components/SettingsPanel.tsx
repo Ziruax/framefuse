@@ -28,19 +28,14 @@ import {
   Dices,
   Images,
   Download,
-  Palette,
-  Layers,
-  MousePointerClick,
+  Check,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import { ChromaSection } from "@/components/ChromaSection";
 import type {
   AudioSettings,
   CaptionSettings,
   HeadlineItem,
-  ItemEdit,
   KenBurnsConfig,
-  MediaSegment,
   SubtitleFile,
   TransitionSettings,
   TransitionStyle,
@@ -175,22 +170,8 @@ interface SettingsPanelProps {
     activeSegment: string | null;
     inElectron: boolean;
   };
-  /** v1 CHROMA TAB: the clip the tab edits — the ACTIVE timeline segment
-   *  with its resolved edit context (page.tsx computes the same fields the
-   *  media panel's per-item expander uses). null when nothing is active. */
-  chromaTarget: {
-    seg: MediaSegment;
-    edit: ItemEdit | undefined;
-    trimInMs: number;
-    overlayOn: boolean;
-    isVideo: boolean;
-  } | null;
-  /** v1: commits chroma/track edits for the chromaTarget (the same
-   *  handleSetItemEdit the media panel uses — one undo step per patch). */
-  onSetItemEdit: (id: string, patch: Partial<ItemEdit>) => void;
-  /** v1: move the chromaTarget to the overlay lane (needed before keying —
-   *  the keyer only composites overlays). */
-  onMoveToOverlayTrack: (id: string) => void;
+  // (v1.11: the Chroma tab props were removed with the tab — the per-clip
+  // keyer + track switch live in the media panel's clip settings.)
 }
 
 // ---------------------------------------------------------------------------
@@ -362,10 +343,11 @@ function Toggle({
 
 // ---------------------------------------------------------------------------
 // v5.0 tabs — Media | Captions | Effects | Audio | Export
+// (v1.11: Chroma tab REMOVED — its keyer + track switch already live in the
+// media panel's per-clip settings, one place, no duplicate surface.)
 // ---------------------------------------------------------------------------
 const SETTINGS_TAB_IDS = [
   "media",
-  "chroma",
   "captions",
   "effects",
   "audio",
@@ -402,13 +384,6 @@ const SETTINGS_TABS: {
     glow: "rgba(52, 211, 153, 0.55)",
   },
   {
-    id: "chroma",
-    label: "Chroma",
-    icon: Palette,
-    accent: "#6ee7b7",
-    glow: "rgba(110, 231, 183, 0.55)",
-  },
-  {
     id: "captions",
     label: "Captions",
     icon: Captions,
@@ -441,6 +416,8 @@ const SETTINGS_TABS: {
 // Tab-panel mount transition — pure CSS (no animation deps in this app).
 // The class is re-applied each time a panel becomes visible, so every tab
 // switch replays the short fade/slide-in; prefers-reduced-motion kills it.
+// v1.11: container queries — inside narrow contexts (small-screen drawers)
+// the tab labels collapse to icon-only so the 6-way rail never overflows.
 const TAB_PANEL_CSS = `
 @keyframes ff-tab-in {
   from { opacity: 0; transform: translateY(6px); }
@@ -449,6 +426,12 @@ const TAB_PANEL_CSS = `
 .ff-tab-panel-in { animation: ff-tab-in 220ms cubic-bezier(0.21, 0.61, 0.35, 1); }
 @media (prefers-reduced-motion: reduce) {
   .ff-tab-panel-in { animation: none; }
+}
+.ff-settings-tabs { container-type: inline-size; }
+@container (max-width: 380px) {
+  .ff-tab-label { display: none; }
+  .ff-settings-tabs button[role="tab"] { padding-top: 10px; padding-bottom: 10px; }
+  .ff-settings-tabs button[role="tab"] svg { width: 17px; height: 17px; }
 }
 `;
 
@@ -498,10 +481,6 @@ export function SettingsPanel(props: SettingsPanelProps) {
     onRandomMix,
     boundaryCount,
     debug,
-    // v1 Chroma tab target + edit pipeline (page.tsx computes).
-    chromaTarget,
-    onSetItemEdit,
-    onMoveToOverlayTrack,
   } = props;
 
   const zoomMax = 1.06 + (kenBurns.intensity / 100) * 0.18;
@@ -672,7 +651,6 @@ export function SettingsPanel(props: SettingsPanelProps) {
   const [tabsHydrated, setTabsHydrated] = useState(false);
   const tabRefs = useRef<Record<SettingsTabId, HTMLButtonElement | null>>({
     media: null,
-    chroma: null,
     captions: null,
     effects: null,
     audio: null,
@@ -739,16 +717,6 @@ export function SettingsPanel(props: SettingsPanelProps) {
 
   return (
     <div className="flex h-full flex-col">
-      <div
-        className="flex items-center gap-2 border-b px-4 py-3"
-        style={{ borderColor: "#27272a" }}
-      >
-        <Wand2 size={14} className="text-zinc-500" />
-        <span className="text-xs font-semibold uppercase tracking-wider text-zinc-300">
-          Settings
-        </span>
-      </div>
-
       <div className="min-h-0 flex-1 overflow-y-auto">
         <style dangerouslySetInnerHTML={{ __html: TAB_PANEL_CSS }} />
 
@@ -758,7 +726,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
           role="tablist"
           aria-label="Settings sections"
           onKeyDown={handleTablistKeyDown}
-          className="sticky top-0 z-30 grid grid-cols-6 border-b"
+          className="ff-settings-tabs sticky top-0 z-30 grid grid-cols-5 border-b"
           style={{ borderColor: "#27272a", backgroundColor: "#121214" }}
         >
           {SETTINGS_TABS.map((t) => {
@@ -811,9 +779,9 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 </span>
                 <span
                   className={cn(
-                    "text-[9px] font-semibold uppercase tracking-widest transition-colors duration-150",
+                    "ff-tab-label text-[10px] font-semibold uppercase tracking-wider transition-colors duration-150",
                     active
-                      ? "text-zinc-200"
+                      ? "text-zinc-100"
                       : "text-zinc-500 group-hover:text-zinc-400",
                   )}
                 >
@@ -935,103 +903,6 @@ export function SettingsPanel(props: SettingsPanelProps) {
             </Field>
           </Section>
         </div>
-
-        {/* ─── v1 Chroma tab — green/white/black screen keying for the
-            SELECTED clip. A proper dedicated tab (the buried per-item
-            expander in the media panel was hard to find); same ChromaSection
-            component, same edit pipeline, one undo step per change. ─── */}
-        <div
-          id="ff-settings-tabpanel-chroma"
-          role="tabpanel"
-          aria-labelledby="ff-settings-tab-chroma"
-          tabIndex={tab === "chroma" ? 0 : -1}
-          className={cn("pb-2 pt-2", tab === "chroma" ? "ff-tab-panel-in" : "hidden")}
-        >
-          <Section
-            icon={<Palette size={13} />}
-            title="Chroma / Green Screen"
-            defaultOpen
-          >
-            {chromaTarget == null ? (
-              <div
-                className="flex flex-col items-center gap-2 rounded-lg border border-dashed px-4 py-8 text-center"
-                style={{ borderColor: "#3f3f46" }}
-              >
-                <MousePointerClick className="size-5" style={{ color: "#52525b" }} aria-hidden />
-                <p className="text-[11px] font-semibold" style={{ color: "#a1a1aa" }}>
-                  Select a clip to key
-                </p>
-                <p className="max-w-[220px] text-[10px] leading-relaxed" style={{ color: "#71717a" }}>
-                  Click any clip on the timeline (or in the media panel) — its
-                  key settings appear here. Overlay clips show the full keyer.
-                </p>
-              </div>
-            ) : (
-              <div className="space-y-2">
-                {/* Target banner — which clip the tab edits. */}
-                <div
-                  className="flex items-center gap-2 rounded-md border px-2 py-1.5"
-                  style={{
-                    borderColor: chromaTarget.overlayOn
-                      ? "rgba(110, 231, 183, 0.35)"
-                      : "rgba(251, 191, 36, 0.35)",
-                    backgroundColor: chromaTarget.overlayOn
-                      ? "rgba(6, 78, 59, 0.15)"
-                      : "rgba(120, 53, 15, 0.12)",
-                  }}
-                  title={chromaTarget.seg.fileName}
-                >
-                  <Layers
-                    className="size-3.5 shrink-0"
-                    style={{ color: chromaTarget.overlayOn ? "#6ee7b7" : "#fbbf24" }}
-                    aria-hidden
-                  />
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-[10px] font-semibold" style={{ color: "#e4e4e7" }}>
-                      {chromaTarget.seg.fileName}
-                    </p>
-                    <p className="text-[9px]" style={{ color: "#71717a" }}>
-                      {chromaTarget.overlayOn
-                        ? "Overlay lane — keying active"
-                        : "Base video track — move to overlay to key"}
-                    </p>
-                  </div>
-                </div>
-
-                {!chromaTarget.overlayOn && (
-                  <button
-                    type="button"
-                    onClick={() => onMoveToOverlayTrack(chromaTarget.seg.id)}
-                    className="flex w-full items-center justify-center gap-1.5 rounded-md border px-2 py-1.5 text-[10px] font-semibold transition-all duration-150 active:scale-[0.98]"
-                    style={{
-                      borderColor: "rgba(110, 231, 183, 0.4)",
-                      backgroundColor: "rgba(16, 185, 129, 0.12)",
-                      color: "#6ee7b7",
-                    }}
-                    title="Green-screen keying composites OVER the base track — this moves the clip to the overlay lane (undo-able)"
-                  >
-                    <Layers className="size-3.5" /> Move to Overlay track
-                  </button>
-                )}
-
-                <ChromaSection
-                  seg={chromaTarget.seg}
-                  edit={chromaTarget.edit}
-                  onSetItemEdit={onSetItemEdit}
-                  isVideo={chromaTarget.isVideo}
-                  trimInMs={chromaTarget.trimInMs}
-                  overlayOn={chromaTarget.overlayOn}
-                />
-
-                <p className="px-0.5 text-[9px] leading-relaxed" style={{ color: "#52525b" }}>
-                  Same keyer as the media panel&apos;s clip settings — edits here and
-                  there stay in sync. Preview and export use one geometry.
-                </p>
-              </div>
-            )}
-          </Section>
-        </div>
-
         {/* ─── Export tab — Video + Debug ────────────────────────────── */}
         <div
           id="ff-settings-tabpanel-export"
@@ -1047,35 +918,36 @@ export function SettingsPanel(props: SettingsPanelProps) {
               export engine (the WebCodecs engine was removed: it saturated
               integrated-GPU memory buses on low-end boxes). The card is a
               status surface, not a selector — it carries the encoder probe
-              badge + the smart-render story. ───────────────────────────── */}
+              badge + the smart-render story. v1.11: copy compacted to two
+              friendly lines (the full architecture story lives in the
+              tooltip + docs/EXPORT_PERF.md). ────────────────────────── */}
           <Section icon={<Zap size={13} />} title="Engine" defaultOpen>
             <div
               className="flex flex-col items-start gap-1 rounded-lg border p-2.5 text-left"
               style={{
-                borderColor: "rgba(167, 139, 250, 0.65)",
-                backgroundColor: "rgba(139, 92, 246, 0.12)",
+                borderColor: "rgba(14, 116, 144, 0.5)",
+                backgroundColor: "rgba(8, 51, 68, 0.18)",
               }}
             >
               <span className="flex w-full items-center justify-between gap-2">
-                <span className="text-[11px] font-bold" style={{ color: "#c4b5fd" }}>
-                  FFmpeg Smart Render
+                <span className="text-[11px] font-bold" style={{ color: "#a5f3fc" }}>
+                  Smart Render
                 </span>
                 <span
                   className="rounded px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wide"
                   style={{
-                    backgroundColor: "rgba(167, 139, 250, 0.18)",
-                    color: "#a78bfa",
+                    backgroundColor: "rgba(34, 211, 238, 0.16)",
+                    color: "#67e8f9",
                   }}
                 >
                   active
                 </span>
               </span>
-              <span className="text-[9px] leading-relaxed" style={{ color: "#71717a" }}>
-                True Smart Rendering: clean ranges stream-copied, only the
-                edited windows re-encoded — and when ≥70&nbsp;% of the timeline
-                is dirty (full-timeline subtitles, watermarks, framerate
-                resamples) it splits into 2–4 parallel render passes with
-                hardware decode · iGPU encoders (QSV/AMF/NVENC) when available
+              <span className="text-[9px] leading-relaxed" style={{ color: "#8b8b94" }}
+                title="True Smart Rendering: untouched ranges are stream-copied at original quality; only your edits are re-encoded. Heavily-edited timelines (≥70% dirty — full-length subtitles, watermarks, framerate resamples) split into 2–4 parallel render passes with hardware decode, and iGPU encoders (QSV/AMF/NVENC) are used when available."
+              >
+                Untouched footage is copied at full quality — only your edits
+                are re-encoded, in parallel when needed.
               </span>
               {/* v5.1: encoder badge — bordered chip, Zap (GPU) / Cpu
                   (software) icon + label. Describes the encoder probe result
@@ -1238,10 +1110,17 @@ export function SettingsPanel(props: SettingsPanelProps) {
                       }
                     >
                       <span
-                        className="text-[11px] font-bold"
-                        style={{ color: active ? "#a7f3d0" : "#d4d4d8" }}
+                        className="flex items-center gap-1 text-[11px] font-bold"
+                        style={{ color: active ? "#a5f3fc" : "#d4d4d8" }}
                       >
                         {p.label}
+                        {active && (
+                          <Check
+                            className="size-3 shrink-0"
+                            style={{ color: "#22d3ee" }}
+                            aria-hidden
+                          />
+                        )}
                       </span>
                       <span
                         className="text-[8px] tabular-nums"
@@ -1259,7 +1138,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                               backgroundColor:
                                 d <= p.speed
                                   ? active
-                                    ? "#34d399"
+                                    ? "#22d3ee"
                                     : "#3f3f46"
                                   : "#1f1f22",
                             }}

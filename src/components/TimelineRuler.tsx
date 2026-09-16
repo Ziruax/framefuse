@@ -3432,10 +3432,11 @@ export function TimelineRuler({
 
       {empty ? (
         <div
-          className="flex h-14 items-center justify-center rounded-lg border border-dashed text-[11px]"
-          style={{ borderColor: "#27272a", color: "#52525b" }}
+          className="flex h-14 items-center justify-center gap-2 rounded-lg border border-dashed text-[11px]"
+          style={{ borderColor: "#27272a", color: "#71717a" }}
         >
-          Timeline appears once images are added
+          <Clapperboard className="size-3.5" style={{ color: "#3f3f46" }} aria-hidden />
+          Import media above — your timeline builds here
         </div>
       ) : isV5 ? (
         /* ---------------------------------------------------------------
@@ -3608,7 +3609,7 @@ export function TimelineRuler({
               backgroundColor: LANE_BG_B,
             }}
           >
-            <LaneLabel icon={Layers} text="OVL" accent="#a78bfa" sticky />
+            <LaneLabel icon={Layers} text="Overlay" accent="#67e8f9" sticky />
             <div
               ref={overlayAxisRef}
               className="relative min-w-0 shrink-0 transition-colors hover:bg-white/[0.02]"

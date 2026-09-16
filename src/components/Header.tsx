@@ -4,7 +4,6 @@ import {
   Film,
   Download,
   X,
-  Cpu,
   Clock,
   FileJson,
   ImageIcon,
@@ -13,6 +12,8 @@ import {
   Redo2,
   Gauge,
   Keyboard,
+  ListVideo,
+  Rows3,
 } from "lucide-react";
 import type { TimelineMode, ExportProgress, VideoSettings } from "@/lib/merger/types";
 import { fmtBytes, fmtTimecode } from "@/lib/merger/timeline";
@@ -136,7 +137,7 @@ export function Header({
 
   return (
     <header
-      className="no-select flex h-14 shrink-0 items-center gap-4 border-b px-5"
+      className="no-select flex h-14 shrink-0 items-center gap-2 border-b px-3 sm:gap-4 sm:px-5"
       style={{
         borderColor: "#27272a",
         background:
@@ -144,36 +145,38 @@ export function Header({
         boxShadow: "0 1px 0 rgba(255,255,255,0.03) inset, 0 8px 24px rgba(0,0,0,0.35)",
       }}
     >
-      {/* Brand — v5.1 CapCut: compact 8px-rounded gradient mark. */}
+      {/* Brand — v1.11: friendly, jargon-free ("Multi-Track Video Studio ·
+          Native FFmpeg" told a TikTok editor nothing). */}
       <div className="flex items-center gap-3">
         <div
           className="flex size-8 shrink-0 items-center justify-center rounded-[8px] transition-transform duration-200 hover:scale-105"
           style={{
-            backgroundImage: "linear-gradient(135deg, #8b5cf6 0%, #7c3aed 40%, #c026d3 100%)",
-            boxShadow: "0 4px 14px rgba(124, 58, 237, 0.4)",
+            backgroundImage: "linear-gradient(135deg, #22d3ee 0%, #06b6d4 45%, #0891b2 100%",
+            boxShadow: "0 4px 14px rgba(6, 182, 212, 0.35)",
           }}
         >
-          <Film className="size-4" style={{ color: "#ffffff" }} />
+          <Film className="size-4" style={{ color: "#04222b" }} />
         </div>
         <div className="leading-tight">
           <div className="flex items-center gap-2">
             <span
               className="text-[15px] font-semibold tracking-tight"
-              style={{ color: "#e4e4e7" }}
+              style={{ color: "#f4f4f5" }}
             >
               FrameFuse
             </span>
-            {/* v1.2: quiet mono version chip (was a violet gradient badge). */}
+            {/* v1.2: quiet mono version chip (was a violet gradient badge).
+                v1.11: hidden below md (tight headers on small screens). */}
             <span
-              className="whitespace-nowrap rounded border px-1.5 py-0.5 font-mono text-[10px] font-medium"
+              className="hidden whitespace-nowrap rounded border px-1.5 py-0.5 font-mono text-[10px] font-medium md:inline"
               style={{
                 borderColor: "#27272a",
                 backgroundColor: "#18181b",
                 color: "#a1a1aa",
               }}
-              title="FrameFuse v1.10.0 — multi-track video studio · True Smart Rendering FFmpeg export (clean ranges stream-copied, dirty timelines split into 2–4 parallel render passes with hardware decode)"
+              title="FrameFuse v1.11.0 — friendly studio UI · smart FFmpeg export (clean ranges stream-copied, heavily-edited timelines split into 2–4 parallel render passes)"
             >
-              v1.10.0
+              v1.11.0
             </span>
             {/* v5.1: on-disk project file chip (native save/open sessions). */}
             {projectName && (
@@ -191,17 +194,19 @@ export function Header({
               </span>
             )}
           </div>
-          <div className="text-[11px]" style={{ color: "#71717a" }}>
-            Multi-Track Video Studio · Native FFmpeg
+          <div className="hidden text-[11px] sm:block" style={{ color: "#8b8b94" }}>
+            Video Studio
           </div>
         </div>
       </div>
 
-      {/* Mode badge */}
-      <div className="ml-2 flex items-center gap-2">
+      {/* Mode badge — v1.11: plain-language labels + tooltips ("SEQUENTIAL"
+          read as a processing term, not a timeline layout). Hidden below sm
+          (the mode is visible in the timeline toolbar too). */}
+      <div className="ml-2 hidden items-center gap-2 sm:flex">
         {mode ? (
           <span
-            className="rounded-md border px-2.5 py-1 text-[11px] font-semibold tracking-wide"
+            className="flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-[11px] font-semibold"
             style={
               mode === "absolute"
                 ? {
@@ -210,13 +215,23 @@ export function Header({
                     color: "#67e8f9",
                   }
                 : {
-                    borderColor: "rgba(109, 40, 217, 0.55)",
-                    backgroundColor: "rgba(76, 29, 149, 0.3)",
-                    color: "#c4b5fd",
+                    borderColor: "rgba(14, 116, 144, 0.55)",
+                    backgroundColor: "rgba(8, 51, 68, 0.35)",
+                    color: "#67e8f9",
                   }
             }
+            title={
+              mode === "absolute"
+                ? "Free placement — clips sit exactly where you drag them on the timeline"
+                : "One after another — clips play back-to-back automatically"
+            }
           >
-            {mode === "absolute" ? "ABSOLUTE" : "SEQUENTIAL"}
+            {mode === "absolute" ? (
+              <ListVideo className="size-3" aria-hidden />
+            ) : (
+              <Rows3 className="size-3" aria-hidden />
+            )}
+            {mode === "absolute" ? "Free placement" : "Back-to-back"}
           </span>
         ) : (
           <span
@@ -226,8 +241,9 @@ export function Header({
               backgroundColor: "#18181b",
               color: "#71717a",
             }}
+            title="Import a few clips to build your first timeline"
           >
-            NO TIMELINE
+            Getting started
           </span>
         )}
         <span
@@ -237,16 +253,20 @@ export function Header({
             backgroundColor: "#18181b",
             color: "#a1a1aa",
           }}
+          title={`${imageCount} clip${imageCount === 1 ? "" : "s"} in the project`}
         >
-          <ImageIcon className="size-3" />
-          {imageCount}
+          <ImageIcon className="size-3" aria-hidden />
+          {imageCount} {imageCount === 1 ? "clip" : "clips"}
         </span>
       </div>
 
       <div className="flex-1" />
 
-      {/* Undo / Redo (v4.3) — v5.1: 28px icon-only buttons. */}
-      <div className="flex items-center gap-1 rounded-lg border p-0.5" style={{ borderColor: "#27272a", backgroundColor: "#131316" }}>
+      {/* Undo / Redo (v4.3) — v5.1: 28px icon-only buttons. v1.11: hidden
+          below sm (keyboard-oriented controls — phones have no Ctrl+Z;
+          this also un-crowds the header so the Export button never
+          truncates). */}
+      <div className="hidden items-center gap-1 rounded-lg border p-0.5 sm:flex" style={{ borderColor: "#27272a", backgroundColor: "#131316" }}>
         <button
           type="button"
           onClick={onUndo}
@@ -291,16 +311,17 @@ export function Header({
         </button>
       </div>
 
-      {/* Export progress (when exporting) */}
+      {/* Export progress (when exporting) — v1.11: percent always visible;
+          fps/timemark/ETA and the wider bar join at sm. */}
       {isExporting && (
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2 sm:gap-3">
           <div
             className="flex items-center gap-2 text-[11px]"
             style={{ color: "#a1a1aa" }}
           >
             <Timer
               className="size-3.5 animate-pulse"
-              style={{ color: "#a78bfa" }}
+              style={{ color: "#22d3ee" }}
             />
             <span
               className="font-mono tabular-nums"
@@ -309,23 +330,23 @@ export function Header({
               {pctLabel}%
             </span>
             {exportProgress?.fps ? (
-              <span style={{ color: "#71717a" }}>
+              <span className="hidden sm:inline" style={{ color: "#71717a" }}>
                 {exportProgress.fps.toFixed(0)} fps
               </span>
             ) : null}
             {exportProgress?.timemark ? (
-              <span style={{ color: "#71717a" }}>
+              <span className="hidden sm:inline" style={{ color: "#71717a" }}>
                 @ {fmtTimecode(parseTimemark(exportProgress.timemark))}
               </span>
             ) : null}
             {exportProgress?.eta ? (
-              <span style={{ color: "#71717a" }}>
+              <span className="hidden sm:inline" style={{ color: "#71717a" }}>
                 ETA {fmtElapsed(exportProgress.eta)}
               </span>
             ) : null}
           </div>
           <div
-            className="h-1.5 w-40 overflow-hidden rounded-full"
+            className="h-1.5 w-24 overflow-hidden rounded-full sm:w-40"
             style={{ backgroundColor: "#27272a" }}
           >
             <div
@@ -333,7 +354,7 @@ export function Header({
               style={{
                 width: `${pct}%`,
                 backgroundImage:
-                  "linear-gradient(to right, #8b5cf6, #d946ef)",
+                  "linear-gradient(to right, #22d3ee, #06b6d4)",
               }}
             />
           </div>
@@ -352,10 +373,11 @@ export function Header({
         </div>
       )}
 
-      {/* Last export summary */}
+      {/* Last export summary — v1.11: hidden below md (badge soup on
+          narrow headers; the export toast already reports the result). */}
       {!isExporting && lastExport && (
         <div
-          className="flex shrink-0 items-center gap-2 whitespace-nowrap rounded-md border px-2.5 py-1 text-[11px]"
+          className="hidden shrink-0 items-center gap-2 whitespace-nowrap rounded-md border px-2.5 py-1 text-[11px] md:flex"
           style={{
             borderColor: "#27272a",
             backgroundColor: "rgba(24, 24, 27, 0.6)",
@@ -408,7 +430,7 @@ export function Header({
               <span style={{ color: "#52525b" }}>·</span>
               <span
                 className="rounded px-1 py-px font-medium"
-                style={{ backgroundColor: "rgba(139, 92, 246, 0.12)", color: "#a78bfa" }}
+                style={{ backgroundColor: "rgba(6, 182, 212, 0.12)", color: "#67e8f9" }}
                 title={
                   lastExport.mode === "smart-render"
                     ? `Smart render: the timeline was sliced into clean (stream-copied, no re-encode) and dirty (re-encoded) time-ranges, keyframe-aligned so the pieces stitch losslessly — ${(lastExport.smartCleanSec ?? 0).toFixed(0)}s copied · ${(lastExport.smartDirtySec ?? 0).toFixed(0)}s re-encoded`
@@ -464,8 +486,10 @@ export function Header({
         </div>
       )}
 
-      {/* Export button — v5.1 CapCut: cyan→emerald gradient primary action
-          (hover brightness, desaturated while disabled). */}
+      {/* Export button — v5.1 CapCut: cyan gradient primary action
+          (hover brightness, desaturated while disabled). v1.11: the method
+          (native FFmpeg vs browser preview) rides the button tooltip — the
+          trailing CPU badge was removed (header badge-soup). */}
       {!isExporting && (
         <button
           type="button"
@@ -476,39 +500,16 @@ export function Header({
             "active:scale-[0.97] active:brightness-90",
             imageCount === 0 && "cursor-not-allowed opacity-50 grayscale",
           )}
+          title={
+            inElectron
+              ? "Export an MP4 with smart FFmpeg rendering — untouched video is stream-copied at full quality, only your edits are re-encoded"
+              : "Export a video (browser preview mode — run the desktop app for MP4 exports)"
+          }
         >
           <Download className="size-4" />
-          Export MP4
+          Export
         </button>
       )}
-
-      {/* Method badge (v4.9: icon-only — the text duplicated the subtitle
-          and contributed to header "badge soup"; the tooltip carries the
-          full explanation). */}
-      <span
-        className="flex size-8 items-center justify-center rounded-md border"
-        style={
-          inElectron
-            ? {
-                borderColor: "rgba(14, 116, 144, 0.6)",
-                backgroundColor: "rgba(8, 51, 68, 0.3)",
-                color: "#67e8f9",
-              }
-            : {
-                borderColor: "#27272a",
-                backgroundColor: "#18181b",
-                color: "#71717a",
-              }
-        }
-        title={
-          inElectron
-            ? "Native FFmpeg encoding (GPU-accelerated when available) — export matches the preview"
-            : "Browser preview mode — MediaRecorder fallback"
-        }
-        aria-label={inElectron ? "Native FFmpeg export" : "Browser export"}
-      >
-        <Cpu className="size-4" />
-      </span>
     </header>
   );
 }

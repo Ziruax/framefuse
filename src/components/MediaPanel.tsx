@@ -422,25 +422,25 @@ export function MediaPanelBase({
       className="flex h-full flex-col overflow-hidden"
       style={{ backgroundColor: "#111113" }}
     >
-      {/* Toolbar */}
+      {/* Toolbar — v1.11: one quiet style for every import action (the
+          green/cyan per-kind borders read as a rainbow; the + icons carry
+          the add affordance now). Wraps on narrow drawers. */}
       <div
-        className="flex items-center gap-1.5 border-b px-3 py-2.5"
+        className="flex flex-wrap items-center gap-1.5 border-b px-3 py-2.5"
         style={{ borderColor: "#27272a" }}
       >
         <button
           type="button"
           onClick={openImagePicker}
-          className="ff-btn-ghost flex items-center gap-1.5 rounded-md border-emerald-600/50 px-2.5 py-1.5 text-[12px] font-semibold"
-          style={{ color: "#a7f3d0" }}
+          className="ff-btn-ghost flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[12px] font-semibold"
           title="Add images — PNG/JPG/WebP/GIF (or drop ANY media on this panel)"
         >
-          <Plus className="size-4" /> Add Images
+          <Plus className="size-4" /> Image
         </button>
         <button
           type="button"
           onClick={openVideoPicker}
-          className="ff-btn-ghost flex items-center gap-1.5 rounded-md border-cyan-600/40 px-2.5 py-1.5 text-[12px] font-semibold"
-          style={{ color: "#a5f3fc" }}
+          className="ff-btn-ghost flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[12px] font-semibold"
           title="Add video clips — MP4/WebM/MOV/MKV (or drop ANY media on this panel)"
         >
           <Video className="size-3.5" /> Video
@@ -489,7 +489,7 @@ export function MediaPanelBase({
             className={cn(
               "flex items-center justify-center rounded-[4px] p-1.5 transition-all duration-150",
               mediaView === "list"
-                ? "bg-violet-500/25 text-violet-200 shadow-[inset_0_0_0_1px_rgba(167,139,250,0.4)]"
+                ? "bg-cyan-500/20 text-cyan-200 shadow-[inset_0_0_0_1px_rgba(34,211,238,0.4)]"
                 : "text-zinc-500 hover:bg-white/5 hover:text-zinc-300",
             )}
           >
@@ -504,7 +504,7 @@ export function MediaPanelBase({
             className={cn(
               "flex items-center justify-center rounded-[4px] p-1.5 transition-all duration-150",
               mediaView === "grid"
-                ? "bg-violet-500/25 text-violet-200 shadow-[inset_0_0_0_1px_rgba(167,139,250,0.4)]"
+                ? "bg-cyan-500/20 text-cyan-200 shadow-[inset_0_0_0_1px_rgba(34,211,238,0.4)]"
                 : "text-zinc-500 hover:bg-white/5 hover:text-zinc-300",
             )}
           >
@@ -540,7 +540,7 @@ export function MediaPanelBase({
           v1.3.1 styling: per-tab icon glyph + the library SEARCH row (media
           tabs with content) — "n of m" result count while a query is active. */}
       <div
-        className="flex items-center gap-1 border-b px-2.5 py-1.5"
+        className="flex flex-wrap items-center gap-1 border-b px-2.5 py-1.5"
         style={{ borderColor: "#27272a", backgroundColor: "#0e0e10" }}
         role="tablist"
         aria-label="Media library tabs"
@@ -566,7 +566,7 @@ export function MediaPanelBase({
               className={cn(
                 "flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-semibold transition-all duration-150",
                 active
-                  ? "bg-violet-500/20 text-violet-200 shadow-[inset_0_0_0_1px_rgba(167,139,250,0.35)]"
+                  ? "bg-cyan-500/20 text-cyan-100 shadow-[inset_0_0_0_1px_rgba(34,211,238,0.35)]"
                   : "text-zinc-500 hover:bg-white/5 hover:text-zinc-300",
               )}
               title={`${label} library${tab === "all" ? " — every clip in the project" : ""}`}
@@ -574,7 +574,7 @@ export function MediaPanelBase({
               <Icon
                 className={cn(
                   "size-3 transition-colors",
-                  active ? "text-violet-300" : "text-zinc-600 group-hover:text-zinc-400",
+                  active ? "text-cyan-300" : "text-zinc-600 group-hover:text-zinc-400",
                 )}
               />
               {label}
@@ -582,7 +582,7 @@ export function MediaPanelBase({
                 className={cn(
                   "rounded-full px-1.5 py-0.5 text-[9px] font-bold tabular-nums transition-colors",
                   active
-                    ? "bg-violet-500/30 text-violet-100"
+                    ? "bg-cyan-500/30 text-cyan-50"
                     : empty
                       ? "bg-zinc-800 text-zinc-600"
                       : "bg-zinc-800 text-zinc-400",
@@ -602,13 +602,13 @@ export function MediaPanelBase({
           style={{ borderColor: "#27272a" }}
         >
           <div
-            className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md border px-2 py-1 transition-colors focus-within:border-violet-500/50"
+            className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md border px-2 py-1 transition-colors focus-within:border-cyan-500/50"
             style={{ borderColor: "#27272a", backgroundColor: "#131316" }}
           >
             <Search
               className={cn(
                 "size-3 shrink-0 transition-colors",
-                queryActive ? "text-violet-300" : "text-zinc-600",
+                queryActive ? "text-cyan-300" : "text-zinc-600",
               )}
             />
             <input
@@ -657,8 +657,9 @@ export function MediaPanelBase({
               onDrop={handleDrop}
               onClick={mediaTab === "videos" ? openVideoPicker : openImagePicker}
               data-dragging={dragOver ? "true" : undefined}
-              className="ff-dropzone ff-grid-bg flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-[#3f3f46] px-6 py-12 text-center transition-all duration-200 hover:border-cyan-500/60 hover:bg-cyan-950/20"
+              className="ff-dropzone ff-grid-bg flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-10 text-center transition-all duration-200 hover:border-cyan-500/60 hover:bg-cyan-950/20"
               style={{
+                borderColor: "#333338",
                 ...(dragOver
                   ? {
                       borderColor: "#06b6d4",
@@ -671,7 +672,7 @@ export function MediaPanelBase({
               <div
                 className="mb-3 flex size-12 items-center justify-center rounded-full transition-transform duration-200"
                 style={{
-                  backgroundColor: dragOver ? "rgba(6, 182, 212, 0.22)" : "#27272a",
+                  backgroundColor: dragOver ? "rgba(6, 182, 212, 0.22)" : "#232327",
                   transform: dragOver ? "scale(1.08)" : "scale(1)",
                 }}
               >
@@ -681,19 +682,20 @@ export function MediaPanelBase({
                 />
               </div>
               <p
-                className="text-[13px] font-medium"
+                className="text-[13px] font-semibold"
                 style={{ color: "#e4e4e7" }}
               >
                 {mediaTab === "videos"
-                  ? "Drop video clips or click to browse"
+                  ? "Drop video clips here"
                   : v5MediaReady
-                    ? "Drop images or videos or click to browse"
-                    : "Drop images or click to browse"}
+                    ? "Drop files here to import"
+                    : "Drop images here to import"}
               </p>
-              <p className="mt-1 text-[11px]" style={{ color: "#71717a" }}>
+              <p className="mt-1 text-[11px]" style={{ color: "#8b8b94" }}>
+                or <span style={{ color: "#22d3ee", textDecoration: "underline", textUnderlineOffset: 2 }}>click to browse</span>
                 {v5MediaReady
-                  ? "Images · videos · audio · .srt · projects"
-                  : "Images · audio · .srt · .framefuse.json projects"}
+                  ? " — images · videos · audio · subtitles · projects"
+                  : " — images · audio · subtitles · projects"}
               </p>
             </div>
             <button
@@ -701,7 +703,7 @@ export function MediaPanelBase({
               onClick={onLoadSamples}
               className="ff-btn-sample mt-3 flex w-full items-center justify-center gap-1.5 rounded-lg border py-2 text-[12px] font-medium transition-all duration-200"
             >
-              <Sparkles className="size-3.5" /> Load sample storyboard (9 beats)
+              <Sparkles className="size-3.5" aria-hidden /> New here? Try the sample storyboard
             </button>
             {onAddSfx != null && mediaTab === "all" && (
               <div className="mt-3">
@@ -2633,21 +2635,21 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
   return (
     <div
       className="ff-fade-up rounded-lg border p-2.5"
-      style={{ borderColor: "rgba(245, 158, 11, 0.3)", backgroundColor: "rgba(120, 53, 15, 0.12)" }}
+      style={{ borderColor: "#27272a", backgroundColor: "rgba(24, 24, 27, 0.45)" }}
     >
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
-        className="flex w-full items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.12em] transition-colors hover:text-amber-200"
-        style={{ color: "#fcd34d" }}
+        className="flex w-full items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.12em] transition-colors hover:text-cyan-200"
+        style={{ color: "#a1a1aa" }}
       >
         <AudioLines className="size-3.5 shrink-0" />
         Sound effects
         {sfxItems != null && sfxItems.length > 0 && (
           <span
             className="rounded-full px-1.5 py-0.5 text-[8px] font-bold"
-            style={{ backgroundColor: "rgba(245, 158, 11, 0.18)", color: "#fcd34d" }}
+            style={{ backgroundColor: "rgba(34, 211, 238, 0.16)", color: "#a5f3fc" }}
           >
             {sfxItems.length}
           </span>

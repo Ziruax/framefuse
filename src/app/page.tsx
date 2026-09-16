@@ -9,7 +9,8 @@ import {
   type ChangeEvent,
 } from "react";
 import { toast } from "@/lib/toast";
-import { ChevronLeft, ChevronRight } from "lucide-react";
+import { ChevronLeft, ChevronRight, X } from "lucide-react";
+import { cn } from "@/lib/utils";
 import { Header, type LastExport } from "@/components/Header";
 import { ShortcutsOverlay } from "@/components/ShortcutsOverlay";
 import { MediaPanel } from "@/components/MediaPanel";
@@ -399,9 +400,14 @@ export default function Page() {
   const imageInputRef = useRef<HTMLInputElement>(null);
   const videoInputRef = useRef<HTMLInputElement>(null);
   const audioInputRef = useRef<HTMLInputElement>(null);
+  // v1.11: all-media picker (the welcome hero's "Import media" card — one
+  // dialog, images AND videos; the per-kind buttons stay in the media panel).
+  const mediaInputRef = useRef<HTMLInputElement>(null);
   const subtitleInputRef = useRef<HTMLInputElement>(null);
   const openImagePicker = useCallback(() => imageInputRef.current?.click(), []);
   const openVideoPicker = useCallback(() => videoInputRef.current?.click(), []);
+  // v1.11: welcome hero — images + videos in one picker.
+  const openMediaPicker = useCallback(() => mediaInputRef.current?.click(), []);
   const openAudioPicker = useCallback(() => audioInputRef.current?.click(), []);
   const openSubtitlePicker = useCallback(
     () => subtitleInputRef.current?.click(),
@@ -480,25 +486,8 @@ export default function Page() {
     [timeline.segments, currentMs],
   );
 
-  // v1 CHROMA TAB target: the timeline's SELECTED clip (click/Ctrl-click on
-  // any lane), falling back to the clip under the playhead. Selection first
-  // so clicking an OVERLAY clip on the timeline keys exactly that clip —
-  // the playhead alone can only ever resolve base-lane segments.
-  const chromaTarget = useMemo(() => {
-    const resolve = (seg: MediaSegment | null | undefined) => {
-      if (seg == null) return null;
-      const edit = itemEdits[seg.id];
-      const overlayOn = (edit?.track ?? 0) >= 1;
-      const trimInMs = Math.max(0, Math.round(edit?.trimInMs ?? seg.trimInMs ?? 0));
-      const isVideo =
-        seg.mediaType === "video" || (videoDurations?.[seg.id] ?? 0) > 0;
-      return { seg, edit, trimInMs, overlayOn, isVideo };
-    };
-    const selected = selectedIds.length
-      ? timeline.segments.find((s) => selectedIds.includes(s.id))
-      : null;
-    return resolve(selected ?? activeSegment);
-  }, [selectedIds, timeline.segments, activeSegment, itemEdits, videoDurations]);
+  // (v1.11: the chromaTarget memo was removed with the Chroma tab — the
+  // per-clip keyer lives in the media panel's clip settings.)
 
   // v5.4: latest-value ref sync for the global keydown listener (runs after
   // every render — the listener itself never re-binds).
@@ -2703,16 +2692,6 @@ const handleRandomTransitionMix = useCallback(() => {
     [requestHistoryPush, applyItemEdit, translateItemEdit],
   );
 
-  /** v1: the Chroma tab's "Move to Overlay track" — the same edit the
-   *  timeline context menu commits (track 1 keeps the clip's start). */
-  const handleMoveToOverlayTrack = useCallback(
-    (id: string) => {
-      const seg = timeline.segments.find((s) => s.id === id);
-      handleTimelineEdit(id, { track: 1, startMs: seg ? seg.startMs : 0 });
-    },
-    [timeline.segments, handleTimelineEdit],
-  );
-
   /**
    * v5.5: commit a coordinated GROUP MOVE (TimelineRuler multi-select drag)
    * — one delta for every member, ONE undo step. Clip patches go through
@@ -3733,6 +3712,23 @@ const handleRandomTransitionMix = useCallback(() => {
     return parts.join(" ");
   }, [layout, mediaCollapsed, settingsCollapsed]);
 
+  // ---- v1.11 SMALL-SCREEN LAYOUT: below 1024px the side panels become
+  // slide-over DRAWERS over a full-width center (the old compact fallback
+  // squeezed 300px + 320px columns and starved the preview). Entering
+  // compact auto-collapses both drawers once per transition so the
+  // preview + timeline own the screen; the floating edge toggles (and the
+  // drawer headers' close buttons) bring them back. Desktop is unchanged.
+  const compactEnteredRef = useRef(false);
+  useEffect(() => {
+    if (layout.compact && !compactEnteredRef.current) {
+      compactEnteredRef.current = true;
+      setMediaCollapsed(true);
+      setSettingsCollapsed(true);
+    } else if (!layout.compact) {
+      compactEnteredRef.current = false;
+    }
+  }, [layout.compact]);
+
   // ---- v1 BIG-TIMELINE MODE: one click swaps the timeline between the
   // working height and the 65% viewport cap (the row splitter still
   // fine-tunes; the remembered height restores on toggle-off).
@@ -3786,27 +3782,68 @@ const handleRandomTransitionMix = useCallback(() => {
       />
 
       {/* 3-column grid — v5.2 (task 3-b): columns resizable via splitters
-          (6px gutters), persisted in framefuse.layout.v52. Below 1024px the
-          hook reports compact → fixed 300px | 1fr | 320px, splitters hidden.
-          v1 FOCUS MODE: each side collapses to nothing (floating edge
-          buttons toggle) — gridCols drops the column + its splitter. */}
+          (6px gutters), persisted in framefuse.layout.v52. v1.11 SMALL
+          SCREENS: below 1024px the grid is replaced by a full-width center
+          (preview + timeline) with the side panels as slide-over drawers
+          (scrim + close buttons); entering compact auto-collapses them. */}
       <main
-        className="grid min-h-0 flex-1 overflow-hidden"
+        className={cn(
+          "min-h-0 flex-1 overflow-hidden",
+          layout.compact ? "relative flex" : "grid",
+        )}
         style={{
-          gridTemplateColumns: gridCols,
+          ...(layout.compact ? {} : { gridTemplateColumns: gridCols }),
           backgroundColor: "#0a0a0a",
         }}
       >
-        {/* Left column — Media Panel (collapsible: v1 focus mode) */}
+        {/* v1.11: drawer scrim — tap anywhere outside to close. */}
+        {layout.compact && (!mediaCollapsed || !settingsCollapsed) && (
+          <div
+            className="absolute inset-0 z-30 bg-black/55"
+            onClick={() => {
+              setMediaCollapsed(true);
+              setSettingsCollapsed(true);
+            }}
+            aria-hidden
+          />
+        )}
+
+        {/* Left column — Media Panel. Desktop: resizable grid column;
+            compact: left slide-over drawer. */}
         {!mediaCollapsed && (
         <section
-          className="min-h-0 overflow-y-auto overflow-x-hidden border-r"
+          className={cn(
+            "min-h-0 overflow-y-auto overflow-x-hidden border-r",
+            layout.compact &&
+              "absolute inset-y-0 left-0 z-40 flex w-[86vw] max-w-[350px] flex-col",
+          )}
           style={{
             borderColor: "#27272a",
             backgroundColor: "#121214",
-            boxShadow: "inset 1px 0 0 rgba(255,255,255,0.02)",
+            boxShadow: layout.compact
+              ? "8px 0 40px rgba(0, 0, 0, 0.6)"
+              : "inset 1px 0 0 rgba(255,255,255,0.02)",
           }}
         >
+          {layout.compact && (
+            <div
+              className="flex shrink-0 items-center justify-between border-b px-3 py-2"
+              style={{ borderColor: "#27272a", backgroundColor: "#121214" }}
+            >
+              <span className="text-xs font-semibold text-zinc-300">Media library</span>
+              <button
+                type="button"
+                onClick={() => setMediaCollapsed(true)}
+                aria-label="Close media panel"
+                title="Close"
+                className="flex size-8 items-center justify-center rounded-md border text-zinc-400 transition-colors hover:bg-white/10 hover:text-white active:scale-90"
+                style={{ borderColor: "#3f3f46" }}
+              >
+                <X className="size-4" />
+              </button>
+            </div>
+          )}
+          <div className="min-h-0 flex-1">
           <MediaPanel
             segments={timeline.segments}
             mode={timeline.mode}
@@ -3862,6 +3899,7 @@ const handleRandomTransitionMix = useCallback(() => {
             onRemoveSfx={handleRemoveSfx}
             currentMs={currentMs}
           />
+          </div>
         </section>
         )}
 
@@ -3871,17 +3909,25 @@ const handleRandomTransitionMix = useCallback(() => {
 
         {/* Center column — Preview (flex-1) + resizable Timeline.
             v1 FOCUS MODE: relative so the floating panel-collapse buttons
-            can pin to its edges. */}
+            can pin to its edges. v1.11: owns the full width on compact. */}
         <section
-          className="relative flex min-h-0 flex-col overflow-hidden"
+          className={cn(
+            "relative flex min-h-0 flex-col overflow-hidden",
+            layout.compact && "min-w-0 flex-1",
+          )}
           style={{ backgroundColor: "#0a0a0a" }}
         >
           {/* v1: floating collapse toggles pinned to the center column's
               edges — hide either side panel for a full-width timeline
-              workspace; the same button brings it back. */}
+              workspace; the same button brings it back. v1.11 compact:
+              opening one drawer closes the other (one at a time on small
+              screens). */}
           <button
             type="button"
-            onClick={() => setMediaCollapsed((v) => !v)}
+            onClick={() => {
+              if (layout.compact && mediaCollapsed) setSettingsCollapsed(true);
+              setMediaCollapsed((v) => !v);
+            }}
             aria-label={mediaCollapsed ? "Show media panel" : "Hide media panel"}
             title={
               mediaCollapsed
@@ -3895,7 +3941,10 @@ const handleRandomTransitionMix = useCallback(() => {
           </button>
           <button
             type="button"
-            onClick={() => setSettingsCollapsed((v) => !v)}
+            onClick={() => {
+              if (layout.compact && settingsCollapsed) setMediaCollapsed(true);
+              setSettingsCollapsed((v) => !v);
+            }}
             aria-label={settingsCollapsed ? "Show settings panel" : "Hide settings panel"}
             title={
               settingsCollapsed
@@ -3955,6 +4004,10 @@ const handleRandomTransitionMix = useCallback(() => {
               masterVolume={audioSettings.masterVolume ?? 1}
               previewRate={previewRate}
               onPreviewRateChange={setPreviewRate}
+              // ---- v1.11 welcome hero (empty-canvas quick starts) ----
+              onImportMedia={openMediaPicker}
+              onLoadSample={loadSamples}
+              onOpenProject={handleOpenProject}
             />
           </div>
           {/* v5.2 (task 3-b): row splitter — drag to resize the timeline
@@ -3964,16 +4017,22 @@ const handleRandomTransitionMix = useCallback(() => {
 
           {/* v5 4-lane timeline: explicit resizable height + custom scrollbar
               so tall lane stacks scroll (timelineIsV5 mirrors TimelineRuler's
-              internal v5 gate — page.tsx always passes the v5 props). Compact
-              or legacy v4.9 single-track keeps the auto/fixed height. */}
+              internal v5 gate — page.tsx always passes the v5 props). v1.11:
+              compact gets a viewport-proportional height (the legacy auto
+              height could swallow the whole screen); desktop keeps the
+              splitter-tuned px. */}
           <div
             className={
               "min-h-0 shrink-0" +
-              (!layout.compact && timelineIsV5 ? " ff-timeline-scroll" : "")
+              (timelineIsV5 ? " ff-timeline-scroll" : "")
             }
             style={
-              !layout.compact && timelineIsV5
-                ? { height: `${layout.timelineH}px` }
+              timelineIsV5
+                ? {
+                    height: layout.compact
+                      ? "min(42vh, 320px)"
+                      : `${layout.timelineH}px`,
+                  }
                 : undefined
             }
           >
@@ -4071,17 +4130,42 @@ const handleRandomTransitionMix = useCallback(() => {
             (hidden while the panel is collapsed: v1 focus mode). */}
         {!layout.compact && !settingsCollapsed && <Splitter {...layout.settings} />}
 
-        {/* Right column — Settings Panel (resizable, default 320px;
-            collapsible: v1 focus mode) */}
+        {/* Right column — Settings Panel. Desktop: resizable grid column
+            (default 320px); compact: right slide-over drawer. */}
         {!settingsCollapsed && (
         <section
-          className="min-h-0 overflow-y-auto overflow-x-hidden border-l"
+          className={cn(
+            "min-h-0 overflow-y-auto overflow-x-hidden border-l",
+            layout.compact &&
+              "absolute inset-y-0 right-0 z-40 flex w-[86vw] max-w-[350px] flex-col",
+          )}
           style={{
             borderColor: "#27272a",
             backgroundColor: "#121214",
-            boxShadow: "inset -1px 0 0 rgba(255,255,255,0.02)",
+            boxShadow: layout.compact
+              ? "-8px 0 40px rgba(0, 0, 0, 0.6)"
+              : "inset -1px 0 0 rgba(255,255,255,0.02)",
           }}
         >
+          {layout.compact && (
+            <div
+              className="flex shrink-0 items-center justify-between border-b px-3 py-2"
+              style={{ borderColor: "#27272a", backgroundColor: "#121214" }}
+            >
+              <span className="text-xs font-semibold text-zinc-300">Edit &amp; export</span>
+              <button
+                type="button"
+                onClick={() => setSettingsCollapsed(true)}
+                aria-label="Close settings panel"
+                title="Close"
+                className="flex size-8 items-center justify-center rounded-md border text-zinc-400 transition-colors hover:bg-white/10 hover:text-white active:scale-90"
+                style={{ borderColor: "#3f3f46" }}
+              >
+                <X className="size-4" />
+              </button>
+            </div>
+          )}
+          <div className="min-h-0 flex-1">
           <SettingsPanel
             kenBurns={kenBurns}
             settings={settings}
@@ -4130,11 +4214,8 @@ const handleRandomTransitionMix = useCallback(() => {
             onRandomMix={handleRandomTransitionMix}
             boundaryCount={boundaryCount}
             debug={debug}
-            // ---- v1 Chroma tab ----
-            chromaTarget={chromaTarget}
-            onSetItemEdit={handleSetItemEdit}
-            onMoveToOverlayTrack={handleMoveToOverlayTrack}
           />
+          </div>
         </section>
         )}
       </main>
@@ -4142,7 +4223,26 @@ const handleRandomTransitionMix = useCallback(() => {
       {/* Hidden file inputs (inline style, not className hidden). v1: each
           button opens a FILTERED picker — Images shows images only, Video
           shows video only, Audio audio, Subs .srt — while DRAG & DROP keeps
-          accepting every media kind (MediaPanel.handleDrop routes by type). */}
+          accepting every media kind (MediaPanel.handleDrop routes by type).
+          v1.11: the all-media input backs the welcome hero's "Import media"
+          card (one dialog, images + videos). */}
+      <input
+        ref={mediaInputRef}
+        type="file"
+        accept="image/png,image/jpeg,image/webp,image/gif,image/avif,image/bmp,video/mp4,video/webm,video/quicktime,video/x-matroska,video/x-msvideo,.png,.jpg,.jpeg,.webp,.gif,.avif,.bmp,.mp4,.webm,.mov,.mkv,.m4v,.avi"
+        multiple
+        style={{
+          position: "absolute",
+          opacity: 0,
+          width: 1,
+          height: 1,
+          pointerEvents: "none",
+        }}
+        onChange={(e: ChangeEvent<HTMLInputElement>) => {
+          if (e.target.files) addFiles(Array.from(e.target.files));
+          e.target.value = "";
+        }}
+      />
       <input
         ref={imageInputRef}
         type="file"

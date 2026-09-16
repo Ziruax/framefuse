@@ -14,7 +14,7 @@ import {
   Pause,
   SkipBack,
   SkipForward,
-  ImageOff,
+  Film,
   Type,
   ArrowLeftRight,
   BadgeCheck,
@@ -29,6 +29,9 @@ import {
   ChevronRight,
   Eraser,
   Gauge,
+  FolderOpen,
+  Sparkles,
+  Upload,
 } from "lucide-react";
 import type {
   AspectRatio,
@@ -261,6 +264,14 @@ interface PreviewPanelProps {
   previewRate?: number;
   /** v1.4: fired when the user picks a new speed from the transport chip. */
   onPreviewRateChange?: (rate: number) => void;
+  // ---- v1.11 welcome hero (center-canvas empty state) ----
+  /** "Import media" quick-start card — opens the all-media picker
+   *  (images + videos in one dialog). */
+  onImportMedia?: () => void;
+  /** "Try the sample" card — loads the 9-beat sample storyboard. */
+  onLoadSample?: () => void;
+  /** "Open a project" card — picks a saved .framefuse.json. */
+  onOpenProject?: () => void;
 }
 
 /** v4.8: which concrete motion does a click at (nx, ny) ∈ [0,1]² aim at?
@@ -322,6 +333,9 @@ export function PreviewPanel({
   masterVolume = 1,
   previewRate = 1,
   onPreviewRateChange,
+  onImportMedia,
+  onLoadSample,
+  onOpenProject,
 }: PreviewPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const chromeRef = useRef<HTMLCanvasElement | null>(null);
@@ -1486,17 +1500,115 @@ export function PreviewPanel({
         }}
       >
         {segments.length === 0 ? (
-          <div
-            className="ff-grid-bg flex h-full w-full flex-col items-center justify-center rounded-xl border text-center transition-colors"
-            style={{ borderColor: "#27272a" }}
-          >
-            <ImageOff className="mb-3 size-8" style={{ color: "#3f3f46" }} />
-            <p className="text-[13px] font-medium" style={{ color: "#a1a1aa" }}>
-              No images yet
+          /* v1.11 WELCOME HERO — the empty canvas is the app's biggest
+             teaching surface. Instead of a faint "No images yet", greet the
+             user, offer the three real first actions as equal-height cards,
+             and show the 1-2-3 of the workflow. Cards degrade to plain
+             copy (no dead buttons) when a callback isn't wired. */
+          <div className="ff-grid-bg flex h-full w-full flex-col items-center justify-center overflow-y-auto rounded-xl border px-6 py-8 text-center">
+            <div
+              className="mb-4 flex size-14 items-center justify-center rounded-2xl"
+              style={{
+                backgroundImage:
+                  "linear-gradient(135deg, #22d3ee 0%, #06b6d4 55%, #0891b2 100%)",
+                boxShadow: "0 8px 24px rgba(6, 182, 212, 0.3)",
+              }}
+            >
+              <Film className="size-7" style={{ color: "#04222b" }} aria-hidden />
+            </div>
+            <h1
+              className="text-[22px] font-semibold tracking-tight"
+              style={{ color: "#f4f4f5" }}
+            >
+              Let&rsquo;s make a video
+            </h1>
+            <p className="mt-1.5 max-w-md text-[13px] leading-relaxed" style={{ color: "#8b8b94" }}>
+              Import your clips, arrange them on the timeline below, and export —
+              untouched footage keeps its original quality.
             </p>
-            <p className="mt-1 text-[11px]" style={{ color: "#52525b" }}>
-              Add images from the left panel to begin
-            </p>
+
+            {/* Quick-start cards */}
+            <div className="mt-7 grid w-full max-w-2xl gap-3 sm:grid-cols-3">
+              {onImportMedia && (
+                <button
+                  type="button"
+                  onClick={onImportMedia}
+                  className="ff-hero-card group flex flex-col items-center gap-2 px-4 py-5 text-left"
+                >
+                  <span
+                    className="flex size-10 items-center justify-center rounded-xl transition-transform duration-150 group-hover:scale-105"
+                    style={{ backgroundColor: "rgba(6, 182, 212, 0.16)" }}
+                  >
+                    <Upload className="size-5" style={{ color: "#22d3ee" }} aria-hidden />
+                  </span>
+                  <span className="text-[13px] font-semibold" style={{ color: "#e4e4e7" }}>
+                    Import media
+                  </span>
+                  <span className="text-[11px] leading-snug" style={{ color: "#71717a" }}>
+                    Videos and images from your computer
+                  </span>
+                </button>
+              )}
+              {onLoadSample && (
+                <button
+                  type="button"
+                  onClick={onLoadSample}
+                  className="ff-hero-card group flex flex-col items-center gap-2 px-4 py-5 text-left"
+                >
+                  <span
+                    className="flex size-10 items-center justify-center rounded-xl transition-transform duration-150 group-hover:scale-105"
+                    style={{ backgroundColor: "rgba(6, 182, 212, 0.16)" }}
+                  >
+                    <Sparkles className="size-5" style={{ color: "#22d3ee" }} aria-hidden />
+                  </span>
+                  <span className="text-[13px] font-semibold" style={{ color: "#e4e4e7" }}>
+                    Try the sample
+                  </span>
+                  <span className="text-[11px] leading-snug" style={{ color: "#71717a" }}>
+                    A 9-beat storyboard to explore the editor
+                  </span>
+                </button>
+              )}
+              {onOpenProject && (
+                <button
+                  type="button"
+                  onClick={onOpenProject}
+                  className="ff-hero-card group flex flex-col items-center gap-2 px-4 py-5 text-left"
+                >
+                  <span
+                    className="flex size-10 items-center justify-center rounded-xl transition-transform duration-150 group-hover:scale-105"
+                    style={{ backgroundColor: "rgba(6, 182, 212, 0.16)" }}
+                  >
+                    <FolderOpen className="size-5" style={{ color: "#22d3ee" }} aria-hidden />
+                  </span>
+                  <span className="text-[13px] font-semibold" style={{ color: "#e4e4e7" }}>
+                    Open a project
+                  </span>
+                  <span className="text-[11px] leading-snug" style={{ color: "#71717a" }}>
+                    Continue a saved .framefuse.json session
+                  </span>
+                </button>
+              )}
+            </div>
+
+            {/* 1-2-3 step strip */}
+            <div
+              className="mt-8 flex flex-wrap items-center justify-center gap-x-2 gap-y-1 text-[11px]"
+              style={{ color: "#71717a" }}
+            >
+              {[
+                "1 · Import",
+                "2 · Arrange & edit",
+                "3 · Export",
+              ].map((step, i) => (
+                <span key={step} className="flex items-center gap-2">
+                  {i > 0 && <ChevronRight className="size-3" style={{ color: "#3f3f46" }} aria-hidden />}
+                  <span className="rounded-full border px-2.5 py-1 font-medium" style={{ borderColor: "#27272a" }}>
+                    {step}
+                  </span>
+                </span>
+              ))}
+            </div>
           </div>
         ) : (
           <div

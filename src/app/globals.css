@@ -161,20 +161,25 @@ summary::-webkit-details-marker {
 
 /* ===== v4.2 UI component classes (shared button/panel styling) ===== */
 
-/* Primary action — violet gradient, glow shadow, hover lift. */
+/* v1.11 — ONE ACCENT: cyan is the app's single interactive accent
+   (violet was demoted along with the rainbow button borders — the UI now
+   reads structure-first, accent-for-action). */
+
+/* Primary action — cyan gradient, glow shadow, hover lift. */
 .ff-btn-primary {
-  background-image: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 55%, #6d28d9 100%);
-  color: #ffffff;
+  background-image: linear-gradient(135deg, #22d3ee 0%, #06b6d4 55%, #0891b2 100%);
+  color: #062a33;
+  font-weight: 600;
   box-shadow:
     0 1px 2px rgba(0, 0, 0, 0.4),
-    0 4px 14px rgba(124, 58, 237, 0.35);
+    0 4px 14px rgba(6, 182, 212, 0.3);
   transition: all 160ms ease;
 }
 .ff-btn-primary:hover {
-  filter: brightness(1.12);
+  filter: brightness(1.1);
   box-shadow:
     0 2px 4px rgba(0, 0, 0, 0.4),
-    0 6px 20px rgba(124, 58, 237, 0.5);
+    0 6px 20px rgba(6, 182, 212, 0.45);
   transform: translateY(-1px);
 }
 .ff-btn-primary:active {
@@ -182,7 +187,7 @@ summary::-webkit-details-marker {
   filter: brightness(0.96);
 }
 
-/* Ghost/secondary — quiet outline that fills on hover. */
+/* Ghost/secondary — quiet outline that fills cyan on hover. */
 .ff-btn-ghost {
   border: 1px solid #3f3f46;
   background-color: rgba(39, 39, 42, 0.6);
@@ -190,25 +195,26 @@ summary::-webkit-details-marker {
   transition: all 150ms ease;
 }
 .ff-btn-ghost:hover {
-  border-color: #7c3aed;
-  background-color: rgba(124, 58, 237, 0.16);
-  color: #ede9fe;
+  border-color: rgba(34, 211, 238, 0.55);
+  background-color: rgba(8, 51, 68, 0.35);
+  color: #cffafe;
 }
 .ff-btn-ghost:active {
   transform: translateY(0.5px);
 }
 
-/* Sample button — violet-tinted invite. */
+/* v1.11: sample button — quiet secondary invite (was a violet-filled
+   block that fought the dropzone for attention). Cyan on hover only. */
 .ff-btn-sample {
-  border-color: rgba(109, 40, 217, 0.6);
-  background-color: rgba(76, 29, 149, 0.25);
-  color: #c4b5fd;
+  border-color: #3f3f46;
+  background-color: rgba(39, 39, 42, 0.45);
+  color: #a1a1aa;
 }
 .ff-btn-sample:hover {
-  border-color: #7c3aed;
-  background-color: rgba(124, 58, 237, 0.3);
-  color: #ddd6fe;
-  box-shadow: 0 4px 18px rgba(124, 58, 237, 0.25);
+  border-color: rgba(34, 211, 238, 0.55);
+  background-color: rgba(8, 51, 68, 0.3);
+  color: #a5f3fc;
+  box-shadow: 0 4px 18px rgba(6, 182, 212, 0.18);
   transform: translateY(-1px);
 }
 
@@ -507,14 +513,14 @@ summary:focus-visible,
   cursor: pointer;
 }
 .ff-profile-active {
-  border-color: rgba(52, 211, 153, 0.55) !important;
-  background: linear-gradient(160deg, rgba(16, 185, 129, 0.16), rgba(6, 78, 59, 0.28)) !important;
+  border-color: rgba(34, 211, 238, 0.6) !important;
+  background: linear-gradient(160deg, rgba(6, 182, 212, 0.16), rgba(8, 51, 68, 0.3)) !important;
   box-shadow:
-    0 0 14px rgba(52, 211, 153, 0.22),
-    inset 0 1px 0 rgba(167, 243, 208, 0.18);
+    0 0 14px rgba(34, 211, 238, 0.2),
+    inset 0 1px 0 rgba(165, 243, 252, 0.18);
 }
 .ff-profile-card:not(.ff-profile-active):hover {
-  border-color: rgba(139, 92, 246, 0.45) !important;
+  border-color: rgba(34, 211, 238, 0.4) !important;
 }
 
 /* ===== v4.5 — Boundary style picker popover ===== */
@@ -775,10 +781,12 @@ summary:focus-visible,
   background-color: rgba(8, 51, 68, 0.2) !important;
 }
 
-/* v5.1 — primary export action (Header): cyan→emerald gradient. */
+/* v5.1 — primary export action (Header): cyan gradient (v1.11: pure cyan
+   family — the emerald tail read as a second accent). */
 .ff-btn-export {
-  background-image: linear-gradient(135deg, #06b6d4 0%, #0891b2 48%, #059669 100%);
-  color: #ffffff;
+  background-image: linear-gradient(135deg, #22d3ee 0%, #06b6d4 52%, #0e7490 100%);
+  color: #04222b;
+  font-weight: 700;
   box-shadow:
     0 1px 2px rgba(0, 0, 0, 0.4),
     0 4px 16px rgba(6, 182, 212, 0.3);
@@ -788,11 +796,47 @@ summary:focus-visible,
   filter: brightness(1.1);
   box-shadow:
     0 2px 4px rgba(0, 0, 0, 0.4),
-    0 6px 22px rgba(16, 185, 129, 0.38);
+    0 6px 22px rgba(6, 182, 212, 0.42);
 }
 .ff-btn-export:active:not(:disabled) {
   transform: translateY(0.5px);
   filter: brightness(0.95);
+}
+
+/* ===== v1.11 — WELCOME HERO (center canvas empty state) =====
+   Friendly first-run surface: greeting + three quick-start action cards
+   + a 1-2-3 step strip. One accent (cyan), generous targets, keyboard
+   focusable. */
+.ff-hero-card {
+  border: 1px solid #27272a;
+  background-color: rgba(24, 24, 27, 0.55);
+  border-radius: 14px;
+  transition:
+    border-color 150ms ease,
+    background-color 150ms ease,
+    transform 150ms ease,
+    box-shadow 150ms ease;
+}
+.ff-hero-card:hover,
+.ff-hero-card:focus-visible {
+  border-color: rgba(34, 211, 238, 0.55);
+  background-color: rgba(8, 51, 68, 0.28);
+  transform: translateY(-2px);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(34, 211, 238, 0.18);
+}
+.ff-hero-card:focus-visible {
+  outline: 2px solid rgba(34, 211, 238, 0.7);
+  outline-offset: 2px;
+}
+.ff-hero-card:active {
+  transform: translateY(0);
+}
+@media (prefers-reduced-motion: reduce) {
+  .ff-hero-card,
+  .ff-hero-card:hover {
+    transform: none;
+    transition: none;
+  }
 }
 
 /* ===== Resizable panel splitters — v5.2 task 3-b =====
