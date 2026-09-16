@@ -412,8 +412,25 @@ export default function Page() {
   const [engine, setEngine] = useState<ExportEngine>("ffmpeg");
   useEffect(() => {
     try {
+      // v9: the FFmpeg Native pipeline is the PERMANENT default on low-end
+      // CPUs — the WebCodecs engine saturates integrated-GPU memory buses
+      // on those boxes (5–10 h exports + glitches in the field). A stored
+      // "gpu" preference is ignored on ≤4 logical cores; users can still
+      // pick the GPU engine per-session, but low-end machines never start
+      // on it.
+      const lowEndCpu =
+        typeof navigator !== "undefined" &&
+        Number(navigator.hardwareConcurrency) > 0 &&
+        navigator.hardwareConcurrency <= 4;
       const stored = window.localStorage.getItem(ENGINE_LS_KEY);
-      if (stored === "gpu" || stored === "ffmpeg") setEngine(stored);
+      if (stored === "gpu" || stored === "ffmpeg") {
+        if (stored === "gpu" && lowEndCpu) {
+          setEngine("ffmpeg");
+          try { window.localStorage.setItem(ENGINE_LS_KEY, "ffmpeg"); } catch {}
+        } else {
+          setEngine(stored);
+        }
+      }
     } catch {
       /* storage unavailable (private mode) — keep the default */
     }
@@ -1289,6 +1306,8 @@ export default function Page() {
         hwDecodeClips: res.hwDecodeClips,
         mode: res.mode,
         parallelChunks: res.parallelChunks,
+        smartCleanSec: res.smartCleanSec,
+        smartDirtySec: res.smartDirtySec,
       });
       // v1.1 TURBO: the success toast carries the performance story —
       // export time + encoder + stream-copy count — so a fast export is
@@ -1302,6 +1321,23 @@ export default function Page() {
         );
       }
       if (res.encoder) turboBits.push(res.encoder);
+      // v9: the smart-render story — "15.4 min stream-copied · 3.2 min
+      // re-encoded" explains why a 19-minute timeline with edits finished
+      // in minutes: only the dirty time-ranges paid the encode tax.
+      const fmtSmartSec = (s?: number) =>
+        s == null || !Number.isFinite(s) || s <= 0
+          ? null
+          : s < 60
+            ? `${s.toFixed(0)}s`
+            : `${Math.floor(s / 60)}m ${String(Math.floor(s % 60)).padStart(2, "0")}s`;
+      if (res.mode === "smart-render") {
+        const cleanTxt = fmtSmartSec(res.smartCleanSec);
+        const dirtyTxt = fmtSmartSec(res.smartDirtySec);
+        turboBits.push(
+          `smart render: ${cleanTxt ? `${cleanTxt} stream-copied` : "no clean ranges"}` +
+            (dirtyTxt ? ` · ${dirtyTxt} re-encoded` : ""),
+        );
+      }
       // v1.4.2: the parallel-chunk story — "4 chunks in parallel" explains
       // WHY a 19-minute re-encode finished in minutes instead of hours.
       // v1.5: parallel-pass = the CPU-first chunked single-pass (W timeline

@@ -28,9 +28,11 @@ const electronStub = {
     on: () => {},
     getPath: () => "/tmp/ffstub",
     getName: () => "FrameFuse",
-    getVersion: () => "1.4.2",
+    getVersion: () => "1.9.0",
     isReady: () => true,
     quit: () => {},
+    // v1.8.0+ main.js appends force-GPU switches at require time.
+    commandLine: { appendSwitch: () => {} },
   },
   BrowserWindow: class {
     constructor() {

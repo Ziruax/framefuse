@@ -245,3 +245,69 @@ decode passes (normalize ON) or 7 → 1 (OFF). On the KPI-class machines the
 * **Two-step fallback keeps the v1.3 master-bus WAV** when normalize is ON —
   exact measurement for the rare non-single-pass path; the default
   single-pass path uses the validated estimate instead.
+
+## v9 — TRUE SMART RENDERING (the permanent default for low-end CPUs)
+
+**The problem**: the FFmpeg pipeline took 1.5 h for a 19-minute video because
+the v6 routing re-encoded the ENTIRE timeline through one
+`-filter_complex_script` whenever `encodeWorkMs ≥ 8 s or ≥ 30 %` of the
+timeline — one 10-second text overlay made all 19 minutes "dirty". The v7
+hybrid only aligned chunk boundaries at SEGMENT edges, so a single long
+segment with sparse edits was still 100 % re-encode.
+
+**The architecture** (4 phases, in `main.js` + `export-singlepass.js`):
+
+1. **The monolithic 30 % routing is deleted.** A timeline is never evaluated
+   as one block because a percentage of it is dirty. Any export with dirty
+   time goes through `planSmartRenderingPipeline()`; pure-copy projects keep
+   the TURBO pool (nothing to segment); every smart-plan failure (probe,
+   script budget, init-class error < 4 s) falls back to the two-step pool.
+2. **`planSmartSegments(timeline)`** (export-singlepass.js, pure) maps
+   `[0, totalMs)` and marks DIRTY time-ranges: transitions/fades (parsed back
+   from the exact `buildGlobalFades` strings that ship), caption cues,
+   headline windows, overlay/PIP windows, Ken Burns images, `speed ≠ 1`,
+   watermark, format-mismatched sources, and trim heads that are not
+   keyframe-aligned. Overlapping ranges MERGE (text 1:00–1:10 + PIP
+   1:05–1:15 → 1:00–1:15). **Keyframe snapping**: every dirty↔clean boundary
+   maps through the segment frame law (`slot s displays source frame
+   F0 + (s − S_i)`, `F0 = ceil(trimIn · g)`) onto the SOURCE keyframe grid —
+   a keyframe within one frame aligns the copy (v1.4.1 semantics), anything
+   further expands the dirty range OUTWARD to the next keyframe so the clean
+   piece starts exactly on it (zero content shift, ≤ 1 GOP extra encode).
+   The scans ride `probeKeyframesNear` / `findKeyframeAlignedStart` (the
+   Sandwich-copy lineage); without ffprobe the planner degrades
+   conservatively (no clean piece ever starts at an unverified position).
+3. **The execution pool** renders the pieces: CLEAN pieces through
+   `buildStreamCopyArgs` (`-ss <exact_pts> -t <dur> -i <src> -c:v copy
+   -avoid_negative_ts make_zero` — seconds), DIRTY pieces through the
+   windowed single-pass graph bounded to their exact `[f0, f1)` frames
+   (sub-split across workers on ≥ 4-core CPUs, fades kept whole). **The
+   concat contract**: dirty encodes write the same
+   `-video_track_timescale` (probed from the first clean source), the same
+   resolution/SAR/fps/`yuv420p` (the graph chains), and the audio bus is
+   ONE full-timeline pass at `-ar 48000` — the demuxer stitches losslessly.
+4. **Final assembly**: `concat.txt` (pieces in timeline order) →
+   `ffmpeg -f concat -safe 0 -i concat.txt -c copy -movflags +faststart`
+   + the audio map — instantaneous — then aggressive cleanup deletes every
+   chunk/graph/ASS temp (plus a pre-flight sweep of orphaned `chunk_*.mp4`
+   from crashed exports).
+
+**Telemetry**: `mode: "smart-render"` + `smartCleanSec`/`smartDirtySec` —
+the success toast reads "smart render: 15m 24s stream-copied · 3m 06s
+re-encoded", the Header chips show the turbo/parallel counts, and the main
+log line lists the dirty-zone reasons.
+
+**Expected field outcome** (the user's low-end quad): a 19-minute timeline
+with ~4 minutes of text/PIP/transitions re-encodes ~4 minutes + ≤ 1 GOP per
+boundary instead of 19 minutes — minutes, not hours, on libx264
+`-preset superfast -tune fastdecode` (the v7 Step 5 low-end ladder, which
+the detected-encoder route selects automatically on boxes without a usable
+iGPU encoder).
+
+**Standing caveats** (unchanged from the shipped smart-copy lineage): open-GOP
+sources can briefly reference across a copy cut (industry-wide for all
+smart-render editors; the ≤ 1-frame tolerance branch and the backward dirty
+expansion bound the exposure); ± 1-source-frame jitter at boundaries on
+rate-mismatched sources (|srcFps − fps| < 0.06 spec gate); subtitle cues
+crossing a dirty-window boundary render partially per window (identical to
+the shipped chunk-boundary semantics).

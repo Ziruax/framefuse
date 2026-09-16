@@ -36,7 +36,11 @@ export interface LastExport {
   hwDecodeClips?: number;
   /** v1.5: parallel single-pass windows (CPU-first chunked export). */
   parallelChunks?: number;
-  mode?: "single-pass" | "parallel-pass" | "two-step" | "gpu-webcodecs";
+  mode?: "single-pass" | "parallel-pass" | "two-step" | "smart-render" | "gpu-webcodecs";
+  /** v9: True Smart Rendering — clean seconds copied vs dirty seconds
+   *  re-encoded. */
+  smartCleanSec?: number;
+  smartDirtySec?: number;
   /** v8 (Task 27-a): GPU (WebCodecs) engine exported video-only (no AAC). */
   audioSkipped?: boolean;
 }
@@ -176,9 +180,9 @@ export function Header({
                 backgroundColor: "#18181b",
                 color: "#a1a1aa",
               }}
-              title="FrameFuse v1.8.2 — multi-track video studio · dual-engine export: FFmpeg Smart (hybrid chunked single-pass + iGPU) and the GPU (WebCodecs) full multi-track compositor with forced GPU acceleration"
+              title="FrameFuse v1.9.0 — multi-track video studio · True Smart Rendering export (clean ranges stream-copied, only dirty windows re-encoded) + dual-engine: FFmpeg Smart and the GPU (WebCodecs) full multi-track compositor"
             >
-              v1.8.2
+              v1.9.0
             </span>
             {/* v5.1: on-disk project file chip (native save/open sessions). */}
             {projectName && (
@@ -432,7 +436,9 @@ export function Header({
                 className="rounded px-1 py-px font-medium"
                 style={{ backgroundColor: "rgba(139, 92, 246, 0.12)", color: "#a78bfa" }}
                 title={
-                  lastExport.mode === "parallel-pass"
+                  lastExport.mode === "smart-render"
+                    ? `Smart render: the timeline was sliced into clean (stream-copied, no re-encode) and dirty (re-encoded) time-ranges, keyframe-aligned so the pieces stitch losslessly — ${(lastExport.smartCleanSec ?? 0).toFixed(0)}s copied · ${(lastExport.smartDirtySec ?? 0).toFixed(0)}s re-encoded`
+                    : lastExport.mode === "parallel-pass"
                     ? `Parallel single-pass: the timeline was split into ${lastExport.totalChunks} frame-aligned windows, each rendered by its own ffmpeg process (CPU-first), plus one audio pass — concatenated losslessly`
                     : "Parallel chunks: long re-encode clips were split into frame-aligned chunks and encoded concurrently" +
                       (lastExport.hwDecodeClips

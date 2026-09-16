@@ -1103,9 +1103,9 @@ export function SettingsPanel(props: SettingsPanelProps) {
           )}
         >
           {/* ─── v8 (Task 27-a): ENGINE selector — which pipeline the Export
-              button drives. FFmpeg Smart (default: every feature, the v7
-              hybrid) vs GPU (WebCodecs) beta (the v8 zero-FFmpeg hardware
-              pipeline) so users can A/B test the two engines. ───────────── */}
+              button drives. FFmpeg Smart (default: every feature, v9 True
+              Smart Rendering) vs GPU (WebCodecs) beta (the v8 zero-FFmpeg
+              hardware pipeline) so users can A/B test the two engines. ───────────── */}
           <Section icon={<Zap size={13} />} title="Engine" defaultOpen>
             <div
               role="radiogroup"
@@ -1159,8 +1159,9 @@ export function SettingsPanel(props: SettingsPanelProps) {
                   )}
                 </span>
                 <span className="text-[9px] leading-relaxed" style={{ color: "#71717a" }}>
-                  Chunked parallel single-pass + stream-copy TURBO + iGPU
-                  (QSV/AMF/NVENC) when available
+                  True Smart Rendering: clean ranges stream-copied, only the
+                  edited windows re-encoded · iGPU (QSV/AMF/NVENC) when
+                  available
                 </span>
                 {/* v5.1: encoder badge — bordered chip, Zap (GPU) / Cpu
                     (software) icon + label. Lives INSIDE the FFmpeg card
@@ -1285,9 +1286,12 @@ export function SettingsPanel(props: SettingsPanelProps) {
             )}
             <p className="mt-1.5 text-[9px] leading-relaxed" style={{ color: "#52525b" }}>
               A/B test the engines to diagnose slow exports: FFmpeg Smart is
-              the battle-tested default; the GPU engine renders the FULL
-              multi-track timeline — overlays, chroma key, PIP audio and SFX —
-              natively on the GPU, zero FFmpeg.
+              the battle-tested default (v9 True Smart Rendering — it copies
+              what you didn't edit and re-encodes only what you did); the GPU
+              engine renders the FULL multi-track timeline — overlays, chroma
+              key, PIP audio and SFX — natively on the GPU, zero FFmpeg. On
+              low-end CPUs (≤4 cores) the FFmpeg engine is the permanent
+              default.
             </p>
           </Section>
 

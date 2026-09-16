@@ -659,6 +659,504 @@ function windowGlobalFades(fadeStrings, t0Sec, durSec) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// v9 TRUE SMART RENDERING — timeline segmentation planner.
+//
+// The monolithic "re-encode the whole timeline through one filter graph"
+// routing is GONE. This planner slices [0, totalMs) into CLEAN time-ranges
+// (untouched video — stream-copied at TURBO speed via buildStreamCopyArgs)
+// and DIRTY time-ranges (anything that changes pixels), then KEYFRAME-SNAPS
+// every dirty↔clean boundary onto the SOURCE keyframe grid so the concat
+// demuxer never starts a copied piece mid-GOP (the grey-frame corruption).
+// Only the dirty ranges pay the encode tax: a 19-minute timeline with 4
+// minutes of text/PIP/transitions re-encodes exactly those 4 minutes plus
+// ≤1 GOP per boundary.
+//
+// DIRTY detection (timeline-side, pure — main.js resolves the async
+// source-side facts into `srcFacts`):
+//   - a watermark anywhere → the whole timeline is dirty;
+//   - captionsEnabled → every cue window [startMs, endMs] (word-level cues
+//     live inside their cue's bounds);
+//   - headlinesEnabled → every headline window;
+//   - every overlay/PIP window [startMs, startMs + durationMs];
+//   - per segment: NOT copy-capable (image / Ken Burns / speed ≠ 1 /
+//     source format mismatch — a clean piece must be a stream copy of a
+//     matching-spec h264 source), dip heads/tails + bookend fades (parsed
+//     back from the EXACT buildGlobalFades strings the renderer ships, so
+//     the planner's zones are the fades that actually run), xfade heads
+//     (image↔image boundaries), and head trims that are NOT
+//     keyframe-aligned (a copy cannot start mid-GOP).
+//
+// MERGING: ranges are sorted and merged when they overlap OR sit within
+// `mergeGapMs` of each other (text at 1:00–1:10 + PIP at 1:05–1:15 → one
+// dirty range 1:00–1:15); tiny gaps between dense cues never explode the
+// piece count. Clean gaps shorter than `minCleanMs` absorb into the
+// neighboring dirty range (a sub-second copy piece costs more in concat
+// overhead than it saves).
+//
+// KEYFRAME SNAPPING (the Sandwich-copy lineage): a CLEAN piece must START
+// on a source keyframe. The boundary maps through the segment frame law
+//   slot s of segment i displays source frame  F0 + (s − S_i),
+//   F0 = ceil(trimIn · g),  g = source fps
+// — the SAME law windowSegmentsForChunk's sub-seek uses, so the dirty
+// window's last frame and the clean copy's first frame are exactly the
+// frames the W=1 render would display at those slots (no gap, no dup). A
+// keyframe within ONE FRAME of the target aligns the copy (v1.4.1
+// semantics — ≤1-frame accepted shift, exact timeline duration); anything
+// further and the dirty range extends FORWARD to the next keyframe: the
+// extra ≤1 GOP re-encodes and the clean piece starts exactly on the
+// keyframe with ZERO content shift. Dirty STARTs expand BACKWARD to the
+// previous keyframe (bounded by maxSnapMs) as conservative margin. When
+// the keyframe scan is unavailable (no ffprobe / scan edge), boundaries
+// degrade conservatively: dirty ranges extend to the segment end — a
+// clean piece never starts at an unverified position.
+//
+// SUB-SPLITTING: large dirty ranges split into workerCount-sized windows
+// on the global output frame grid (v6.5 lineage — the CPU-first
+// parallelism), with every boundary kept OUT of the fade/xfade forbidden
+// extents so each fade stays whole inside one piece (fade rejects
+// negative st) and every xfade head renders with its segment start.
+//
+// o = { segments, overlays, transition, fps, totalMs, kbEnabled, globalDir,
+//       wm, captionsEnabled, subtitleCues, headlinesEnabled, headlines,
+//       srcFacts: [{ copyCapable, keyframes: [{s,ms}]|null,
+//                    trimAligned: {ss,deltaMs}|null, srcFps }],
+//       workerCount?, targetSec?, maxSnapMs?, minCleanMs?, mergeGapMs? }
+// Returns { pieces, spans, totalFrames, fps, dirtyFrames, cleanFrames,
+//           cleanMs, dirtyMs, allClean, allDirty, keyframeCuts, zones } or
+// null when the plan is unusable (callers fall back to the two-step pool).
+// ---------------------------------------------------------------------------
+function planSmartSegments(o) {
+  const segments = Array.isArray(o && o.segments) ? o.segments : [];
+  if (segments.length === 0) return null;
+  const fps = Math.max(1, Number(o && o.fps) || 30);
+  const overlays = Array.isArray(o && o.overlays) ? o.overlays : [];
+  const transition = o && o.transition;
+  const kbEnabled = !!(o && o.kbEnabled);
+  const globalDir = (o && o.globalDir) || "in";
+  const wm = o && o.wm;
+  const srcFacts = Array.isArray(o && o.srcFacts) ? o.srcFacts : [];
+  const workerCount = Math.max(1, Number(o && o.workerCount) || 1);
+  const targetSec = Math.max(10, Number(o && o.targetSec) || CHUNK_TARGET_SEC);
+  const maxSnapMs = Number.isFinite(Number(o && o.maxSnapMs)) ? Number(o.maxSnapMs) : 3000;
+  const minCleanMs = Number.isFinite(Number(o && o.minCleanMs)) ? Number(o.minCleanMs) : 750;
+  const mergeGapMs = Number.isFinite(Number(o && o.mergeGapMs)) ? Number(o.mergeGapMs) : 400;
+  const captionsEnabled = !!(o && o.captionsEnabled);
+  const headlinesEnabled = !!(o && o.headlinesEnabled);
+  const subtitleCues = Array.isArray(o && o.subtitleCues) ? o.subtitleCues : [];
+  const headlines = Array.isArray(o && o.headlines) ? o.headlines : [];
+
+  const totalMs =
+    Number(o && o.totalMs) ||
+    segments.reduce((a, s) => a + (Math.max(0, Number(s && s.durationMs) || 0)), 0);
+  if (!(totalMs > 0)) return null;
+
+  const { spans, totalFrames } = segmentFrameSpans(o);
+  if (!(totalFrames > 0)) return null;
+
+  const fact = (i) => {
+    const f = srcFacts[i];
+    return f || { copyCapable: false, keyframes: null, trimAligned: null, srcFps: 0 };
+  };
+  // Packed-clock ms of a global slot — the clock windowSegmentsForChunk,
+  // buildOverlaySpecsForWindow and the chunk planner all live on.
+  const msOfFrame = (f) => (f / fps) * 1000;
+
+  // ── 1. DIRTY time ranges (timeline ms, half-open [s, e)) ───────────────
+  const raw = [];
+  const addRange = (s, e, why) => {
+    s = Number(s);
+    e = Number(e);
+    if (!Number.isFinite(s) || !Number.isFinite(e) || !(e > s)) return;
+    if (s < 0) s = 0;
+    if (e > totalMs) e = totalMs;
+    if (e <= s) return;
+    raw.push({ s, e, why });
+  };
+
+  if (wm) addRange(0, totalMs, "watermark");
+
+  // Burned text windows — captions burn per-cue, headlines per-headline.
+  if (captionsEnabled) {
+    for (const cue of subtitleCues) {
+      if (!cue) continue;
+      addRange(Number(cue.startMs), Number(cue.endMs), "captions");
+    }
+  }
+  if (headlinesEnabled) {
+    for (const h of headlines) {
+      if (!h || !h.text) continue;
+      addRange(Number(h.startMs), Number(h.endMs), "headlines");
+    }
+  }
+
+  // Overlay / PIP windows (track ≥ 1 composite over the base lane).
+  for (const ov of overlays) {
+    if (!ov) continue;
+    const s = Number(ov.startMs);
+    const d = Number(ov.durationMs);
+    if (!Number.isFinite(s) || !Number.isFinite(d) || d <= 0) continue;
+    addRange(s, s + d, "overlay");
+  }
+
+  // Per-segment reasons. Everything that makes the segment's frames differ
+  // from its source (or makes a copy impossible) marks its time dirty.
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (!seg) continue;
+    const sp = spans[i];
+    if (!sp || sp.F <= 0) continue;
+    const segStartMs = msOfFrame(sp.S);
+    const segEndMs = msOfFrame(sp.S + sp.F);
+    const f = fact(i);
+    const isVideo = !!(seg.mediaType === "video" && seg.videoPath);
+    if (!isVideo || !f.copyCapable) {
+      // Images (Ken Burns or static), speed changes, format-mismatched
+      // sources: the graph must render every frame of this segment.
+      addRange(segStartMs, segEndMs, isVideo ? "source-format" : "image");
+      continue;
+    }
+    // Copy-capable video: the remaining hazards are the trim head (a copy
+    // cannot cut mid-GOP) — fades/xfade heads are added globally below.
+    const trimInMs = Math.max(0, Number(seg.trimInMs) || 0);
+    if (trimInMs > 0 && !(f.trimAligned && f.trimAligned.ss)) {
+      const kfs = Array.isArray(f.keyframes) ? f.keyframes : [];
+      let k1 = null;
+      for (const k of kfs) {
+        if (k.ms >= trimInMs - 1) { k1 = k; break; }
+      }
+      if (!k1 || k1.ms - trimInMs >= segEndMs - segStartMs) {
+        // No keyframe at/after the trim inside this segment (or the scan
+        // is unavailable) — the whole segment re-encodes.
+        addRange(segStartMs, segEndMs, "unalignable trim");
+      } else {
+        // Dirty head edge [segStart, slot of k1). Constructed in FRAME
+        // space so the zone END is exactly k1's slot — the generic END
+        // snap below then finds k1 within tolerance and records its exact
+        // pts string for the clean piece's -ss.
+        const g = f.srcFps > 0 ? f.srcFps : fps;
+        const F0 = Math.ceil((trimInMs / 1000) * g - 1e-9);
+        const kIdx1 = Math.round((k1.ms / 1000) * g);
+        const b = Math.min(sp.S + sp.F, Math.max(sp.S + 1, sp.S + (kIdx1 - F0)));
+        addRange(segStartMs, msOfFrame(b), "trim head");
+      }
+    }
+  }
+
+  // Fades: parse back the EXACT strings the renderer ships (buildGlobalFades
+  // → windowGlobalFades) so the zones cover precisely the fades that run.
+  // Their frame extents double as the sub-split FORBIDDEN zones.
+  const forbidden = [];
+  for (const w of parseGlobalFadeWindows(buildGlobalFades({ segments, transition, totalMs }))) {
+    forbidden.push([Math.floor(w.aSec * fps), Math.ceil(w.bSec * fps)]);
+    addRange(w.aSec * 1000, w.bSec * 1000, "fade");
+  }
+  // xfade heads (image↔image boundaries): the composite needs the headed
+  // segment's START inside the window with its previous segment's chain.
+  for (let i = 1; i < segments.length; i++) {
+    const plan = G.planBoundaryFades(i, segments[i], segments, transition);
+    if (plan.xfadeName && plan.headMs > 0 && !G.videoAtBoundaryMirror(segments, i)) {
+      const headFrames = Math.ceil((plan.headMs / 1000) * fps) + 1;
+      forbidden.push([spans[i].S, spans[i].S + headFrames]);
+      addRange(msOfFrame(spans[i].S), msOfFrame(spans[i].S + headFrames), "xfade head");
+    }
+  }
+
+  // ── 2. MERGE overlapping dirty ranges (with a small gap tolerance) ─────
+  raw.sort((a, b) => a.s - b.s || a.e - b.e);
+  const merged = [];
+  for (const r of raw) {
+    const last = merged[merged.length - 1];
+    if (last && r.s <= last.e + mergeGapMs) {
+      if (r.e > last.e) last.e = r.e;
+      last.why.push(r.why);
+    } else {
+      merged.push({ s: r.s, e: r.e, why: [r.why] });
+    }
+  }
+
+  // ── 3. Frame zones (expand outward to whole output frames), merged ─────
+  const zones = [];
+  for (const m of merged) {
+    const a = Math.max(0, Math.floor((m.s / 1000) * fps));
+    const b = Math.min(totalFrames, Math.ceil((m.e / 1000) * fps));
+    if (b > a) zones.push({ a, b, why: m.why });
+  }
+  const mergeZones = () => {
+    for (let i = 1; i < zones.length; ) {
+      if (zones[i].a <= zones[i - 1].b) {
+        zones[i - 1].b = Math.max(zones[i - 1].b, zones[i].b);
+        zones[i - 1].why.push(...zones[i].why);
+        zones.splice(i, 1);
+      } else i++;
+    }
+  };
+  mergeZones();
+
+  // ── 4. KEYFRAME SNAPPING ───────────────────────────────────────────────
+  const segIdxAtSlot = (f) => {
+    for (let i = 0; i < segments.length; i++) {
+      const sp = spans[i];
+      if (sp && sp.F > 0 && f >= sp.S && f < sp.S + sp.F) return i;
+    }
+    return -1;
+  };
+  // The source-frame law (windowSegmentsForChunk's seek law, rate-matched):
+  // slot s of segment i displays source frame F0 + (s − S_i).
+  const segFrameLaw = (i) => {
+    const f = fact(i);
+    const g = f.srcFps > 0 ? f.srcFps : fps;
+    const trimInMs = Math.max(0, Number(segments[i] && segments[i].trimInMs) || 0);
+    const F0 = Math.ceil((trimInMs / 1000) * g - 1e-9);
+    return { g, F0, S: spans[i].S, E: spans[i].S + spans[i].F };
+  };
+  // Final zone-END frame → the exact keyframe pts string a following clean
+  // piece must pass to -ss (buildStreamCopyArgs round-trips it verbatim).
+  const startSS = new Map();
+
+  for (const z of zones) {
+    // END: a clean piece starts at z.b → it MUST start on a source keyframe.
+    if (z.b < totalFrames) {
+      const i = segIdxAtSlot(z.b);
+      if (i >= 0 && fact(i).copyCapable) {
+        const { g, F0, S, E } = segFrameLaw(i);
+        const kIdx = F0 + (z.b - S);
+        const targetMs = (kIdx / g) * 1000;
+        const tolMs = Math.min(50, Math.max(10, Math.round(1000 / Math.max(1, g))));
+        const kfs = Array.isArray(fact(i).keyframes) ? fact(i).keyframes : [];
+        let best = null;
+        let bestD = Infinity;
+        let next = null;
+        for (const k of kfs) {
+          const d = Math.abs(k.ms - targetMs);
+          if (d < bestD) { bestD = d; best = k; }
+          if (!next && k.ms > targetMs + tolMs) next = k;
+        }
+        if (best && bestD <= tolMs) {
+          // Aligned within one frame (v1.4.1 semantics): the copy starts at
+          // `best`, the ≤1-frame shift is the accepted tradeoff.
+          startSS.set(z.b, best.s);
+        } else if (next) {
+          // Expand OUTWARD (forward) to the next keyframe's slot — the extra
+          // ≤1 GOP re-encodes, the clean piece starts with ZERO content shift.
+          const kNext = Math.round((next.ms / 1000) * g);
+          const newB = S + (kNext - F0);
+          if (newB > z.b && newB <= E) {
+            z.b = newB;
+            startSS.set(newB, next.s);
+          } else if (newB > E) {
+            // Keyframe past this segment — its remaining frames re-encode.
+            z.b = E;
+          }
+        } else {
+          // No keyframe ahead (scan edge / probe unavailable) — conservative.
+          z.b = E;
+        }
+      }
+    }
+    // START: expand BACKWARD to the previous keyframe (bounded margin — the
+    // dirty piece re-encodes, so its start needs no alignment; this only
+    // buys open-GOP safety and costs ≤ maxSnapMs of extra encode).
+    if (z.a > 0) {
+      const i = segIdxAtSlot(z.a - 1);
+      if (i >= 0 && fact(i).copyCapable) {
+        const { g, F0, S } = segFrameLaw(i);
+        const kIdx = F0 + (z.a - 1 - S);
+        const targetMs = (kIdx / g) * 1000;
+        const kfs = Array.isArray(fact(i).keyframes) ? fact(i).keyframes : [];
+        let prev = null;
+        for (const k of kfs) {
+          if (k.ms <= targetMs && targetMs - k.ms <= maxSnapMs) prev = k;
+        }
+        if (prev) {
+          const kPrev = Math.round((prev.ms / 1000) * g);
+          if (kPrev >= F0) {
+            const newA = S + (kPrev - F0);
+            if (newA < z.a) z.a = newA;
+          }
+        }
+      }
+    }
+  }
+  mergeZones(); // expansion can overlap neighbors
+
+  // ── 5. ABSORB clean gaps too short to be worth a copy piece ────────────
+  const minCleanFrames = Math.max(1, Math.round((minCleanMs / 1000) * fps));
+  if (zones.length > 0 && zones[0].a > 0 && zones[0].a < minCleanFrames) zones[0].a = 0;
+  for (let i = 1; i < zones.length; i++) {
+    const gap = zones[i].a - zones[i - 1].b;
+    if (gap > 0 && gap < minCleanFrames) {
+      // Extend the larger neighbor over the gap (fewer, bigger pieces).
+      if (zones[i - 1].b - zones[i - 1].a >= zones[i].b - zones[i].a) zones[i - 1].b = zones[i].a;
+      else zones[i].a = zones[i - 1].b;
+    }
+  }
+  if (zones.length > 0) {
+    const tail = totalFrames - zones[zones.length - 1].b;
+    if (tail > 0 && tail < minCleanFrames) zones[zones.length - 1].b = totalFrames;
+  }
+  mergeZones();
+
+  // ── 6. SUB-SPLIT large dirty ranges for pool parallelism (v6.5) ───────
+  const minFrames = Math.max(8, Math.round(fps * 2));
+  const forbiddenHit = (f) => forbidden.some((z) => f >= z[0] && f <= z[1]);
+  let dirtyRanges = zones.map((z) => ({ a: z.a, b: z.b }));
+  const dirtyFrames0 = dirtyRanges.reduce((s, r) => s + (r.b - r.a), 0);
+  if (workerCount >= 2 && dirtyFrames0 >= minFrames * 2) {
+    const dirtySec = dirtyFrames0 / fps;
+    let n = Math.min(workerCount, Math.max(2, Math.ceil(dirtySec / Math.max(5, targetSec / 2))));
+    n = Math.max(1, Math.min(n, Math.floor(dirtyFrames0 / minFrames) || 1));
+    if (n >= 2) {
+      // Ideal splits distributed proportionally over the DIRTY frames,
+      // mapped back to global positions, nudged right — then left — out of
+      // the forbidden extents, keeping every piece ≥ minFrames.
+      const bounds = [];
+      let prev = 0;
+      for (let k = 1; k < n; k++) {
+        const target = Math.round((dirtyFrames0 * k) / n);
+        let acc = 0;
+        let gf = -1;
+        for (const r of dirtyRanges) {
+          const len = r.b - r.a;
+          if (acc + len > target) { gf = r.a + (target - acc); break; }
+          acc += len;
+        }
+        if (gf < 0) gf = dirtyRanges[dirtyRanges.length - 1].b - 1;
+        const splittable = (f) =>
+          dirtyRanges.some((r) => f >= r.a + minFrames && f <= r.b - minFrames);
+        let b = -1;
+        for (let c = gf; c <= totalFrames - minFrames; c++) {
+          if (splittable(c) && !forbiddenHit(c) && c - prev >= minFrames) { b = c; break; }
+        }
+        if (b < 0) {
+          for (let c = gf; c > prev + minFrames; c--) {
+            if (splittable(c) && !forbiddenHit(c)) { b = c; break; }
+          }
+        }
+        if (b < 0) break;
+        bounds.push(b);
+        prev = b;
+      }
+      if (bounds.length > 0) {
+        const out = [];
+        for (const r of dirtyRanges) {
+          let a = r.a;
+          for (const b of bounds) {
+            if (b > a && b < r.b) { out.push({ a, b }); a = b; }
+          }
+          out.push({ a, b: r.b });
+        }
+        dirtyRanges = out;
+      }
+    }
+  }
+
+  // ── 7. BUILD the piece list (must tile [0, totalFrames) exactly) ───────
+  const pieces = [];
+  let keyframeCuts = 0;
+  const pushClean = (a, b) => {
+    for (let i = 0; i < segments.length; i++) {
+      const sp = spans[i];
+      if (!sp || sp.F <= 0) continue;
+      const f0 = Math.max(a, sp.S);
+      const f1 = Math.min(b, sp.S + sp.F);
+      if (f1 <= f0) continue;
+      let ss = null;
+      if (f0 > sp.S) {
+        // Mid-segment start — the snapping pass recorded the keyframe.
+        ss = startSS.get(f0) || null;
+        if (!ss) return false; // unresolvable clean start → invalid plan
+      } else {
+        // Segment start: trimIn 0 copies from the file's first frame (an
+        // IDR); a trimmed start uses the keyframe-aligned probe result.
+        const trimInMs = Math.max(0, Number(segments[i].trimInMs) || 0);
+        if (trimInMs > 0) {
+          const ta = fact(i).trimAligned;
+          if (!ta || !ta.ss) return false; // defensive: zones covered this
+          ss = ta.ss;
+        }
+      }
+      if (ss) keyframeCuts += 1;
+      const durMs = msOfFrame(f1) - msOfFrame(f0);
+      // v9 B-FRAME REORDER CORRECTION: the demuxer bounds input `-t` on
+      // DTS, which lag PTS by the codec's reorder depth (has_b_frames) —
+      // an uncorrected mid-file tail drags `b` EXTRA frames into the
+      // chunk (duplicate content at the dirty seam + non-monotonic DTS in
+      // the concat). Subtract b source-frames from -t so the copy stops
+      // at the exact display frame; the following dirty piece renders
+      // those frames through the graph instead. NOT applied when the
+      // piece runs to the SOURCE's end (EOF clamps the read to exactly
+      // the remaining frames — subtracting there would DROP the tail).
+      const ff = fact(i);
+      const g = ff.srcFps > 0 ? ff.srcFps : fps;
+      const bF = Math.max(0, Math.min(16, Math.round(Number(ff.bFrames) || 0)));
+      const trimInMs = Math.max(0, Number(segments[i].trimInMs) || 0);
+      const tailSrcLeftMs =
+        Number(ff.srcDurMs) > 0
+          ? ff.srcDurMs - (trimInMs + ((f1 - sp.S) / g) * 1000)
+          : Infinity;
+      const srcContinues = tailSrcLeftMs > ((bF + 1) * 1000) / g + 50;
+      const copyDurMs = srcContinues && bF > 0
+        ? Math.max(1, durMs - (bF * 1000) / g)
+        : durMs;
+      pieces.push({
+        kind: "clean",
+        segIdx: i,
+        f0,
+        f1,
+        frames: f1 - f0,
+        t0Ms: msOfFrame(f0),
+        durMs,
+        copyDurMs,
+        ss,
+      });
+    }
+    return true;
+  };
+  let cursor = 0;
+  for (const r of dirtyRanges) {
+    if (r.a > cursor && !pushClean(cursor, r.a)) return null;
+    pieces.push({
+      kind: "dirty",
+      f0: r.a,
+      f1: r.b,
+      frames: r.b - r.a,
+      t0Ms: msOfFrame(r.a),
+      durMs: msOfFrame(r.b) - msOfFrame(r.a),
+    });
+    cursor = r.b;
+  }
+  if (cursor < totalFrames && !pushClean(cursor, totalFrames)) return null;
+
+  // Integrity: exact tiling of the output frame grid, in order.
+  if (pieces.length === 0) return null;
+  for (let p = 0; p < pieces.length; p++) {
+    if (pieces[p].f0 !== (p === 0 ? 0 : pieces[p - 1].f1)) return null;
+    if (pieces[p].f1 <= pieces[p].f0) return null;
+  }
+  const covered = pieces.reduce((a, p) => a + p.frames, 0);
+  if (covered !== totalFrames) return null;
+
+  const dirtyFrames = pieces
+    .filter((p) => p.kind === "dirty")
+    .reduce((s, p) => s + p.frames, 0);
+  const cleanFrames = totalFrames - dirtyFrames;
+  return {
+    pieces,
+    spans,
+    totalFrames,
+    fps,
+    dirtyFrames,
+    cleanFrames,
+    cleanMs: msOfFrame(cleanFrames),
+    dirtyMs: msOfFrame(dirtyFrames),
+    allClean: zones.length === 0,
+    allDirty: cleanFrames === 0,
+    keyframeCuts,
+    zones: zones.map((z) => ({ a: z.a, b: z.b, why: Array.from(new Set(z.why)) })),
+  };
+}
+
 /**
  * Build the complete single-pass plan: input argv (in strict index order) +
  * the full filter_complex script text. PURE — no fs, no side effects.
@@ -1059,9 +1557,30 @@ function buildSinglePassArgs(o) {
   if (plan.hasAudioOut) {
     args.push("-c:a", "aac", "-b:a", o.abr || "192k", "-ar", "48000", "-shortest");
   }
+  // v9 SMART RENDER — the concat contract: a re-encoded piece that will be
+  // concatenated (-c copy) against stream-copied pieces from a source whose
+  // mp4 video track runs on timescale T must WRITE the same T, so the
+  // demuxer's offset math is exact (the source's ffprobe time_base
+  // denominator, probed by main.js). Absent → ffmpeg's default (callers
+  // without clean neighbours keep their legacy argv byte-identical).
+  const ts = Number(o.videoTimescale);
+  if (Number.isFinite(ts) && ts > 0) {
+    args.push("-video_track_timescale", String(Math.round(ts)));
+  }
   const threads = Number(o.threads);
   if (Number.isFinite(threads) && threads > 0) {
     args.push("-threads", String(Math.round(threads)));
+  }
+  // v9 SMART RENDER: hard frame cap — a dirty window must emit EXACTLY its
+  // slot count. The input -t rides ms-rounded seconds (fmt3) whose rounding
+  // can over-grab one source frame; the graph then emits N+1 frames and
+  // every subsequent concat piece shifts a slot late. -frames:v bounds the
+  // MUXER — B-frame reordering and filter over-production cannot leak past
+  // it. (The v6.5 chunked path never hit this because its sibling pieces
+  // rounded identically; smart pieces butt against EXACT stream copies.)
+  const frameCap = Number(o.frameCap);
+  if (Number.isFinite(frameCap) && frameCap > 0) {
+    args.push("-frames:v", String(Math.round(frameCap)));
   }
   args.push("-movflags", "+faststart", o.outputPath);
   return args;
@@ -1104,6 +1623,7 @@ module.exports = {
   parseGlobalFadeWindows,
   segmentFrameSpans,
   planTimelineChunks,
+  planSmartSegments,
   windowSegmentsForChunk,
   windowGlobalFades,
   padOverlayInputWindows,

@@ -50,6 +50,8 @@ const electronStub = {
     isReady: () => true,
     isPackaged: false,
     quit: () => {},
+    // v1.8.0+ main.js appends force-GPU switches at require time.
+    commandLine: { appendSwitch: () => {} },
   },
   BrowserWindow: class {
     constructor() {
@@ -326,7 +328,12 @@ async function benchOne(key) {
         expectedDuration: 40,
         progressEvents: run.progressEvents,
       };
-      const pass = f4.mode === "parallel-pass" && f4.parallelChunks >= 2 && Math.abs(dur - 40) <= 0.4;
+      // v9: the routing now rides planSmartRenderingPipeline — the 8-core
+      // emulation should slice clean copies + ≥2 parallel dirty windows.
+      const pass =
+        (f4.mode === "smart-render" || f4.mode === "parallel-pass") &&
+        f4.parallelChunks >= 2 &&
+        Math.abs(dur - 40) <= 0.4;
       console.log(`  mode=${f4.mode} W=${f4.parallelChunks} ffmpeg-spawns=${f4.spawns} (${(f4.ms / 1000).toFixed(1)}s) out=${dur.toFixed(2)}s → ${pass ? "PASS" : "FAIL"}`);
       f4.pass = pass;
     } catch (e) {

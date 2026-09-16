@@ -1850,7 +1850,7 @@ let ffprobeBin = null;             // resolved binary | false (unavailable)
 let ffprobeChecked = false;
 
 function probeDiskPath() {
-  return path.join(app.getPath("userData"), "probe-cache-v6.json");
+  return path.join(app.getPath("userData"), "probe-cache-v9.json");
 }
 
 function loadProbeDisk() {
@@ -1943,6 +1943,12 @@ function parseFfprobeJson(text) {
   const out = {
     hasAudio: false, width: 0, height: 0, durationMs: 0,
     codec: "", pixFmt: "", fps: 0, rotated: false,
+    // v9 TRUE SMART RENDER: the codec's reorder depth — a stream-copy tail
+    // cut must subtract it from -t (the demuxer bounds on DTS, which lag
+    // PTS by b frames; uncorrected, every mid-file clean piece would drag
+    // b extra frames into the concat seam — duplicate content + DTS
+    // collisions). 0 = unknown/no B-frames (progressive).
+    bFrames: 0,
   };
   out.hasAudio = streams.some((s) => s && s.codec_type === "audio");
   const v = streams.find((s) => s && s.codec_type === "video") || null;
@@ -1958,6 +1964,7 @@ function parseFfprobeJson(text) {
       return Number.isFinite(n) && n > 0 ? n : 0;
     };
     out.fps = parseRate(v.avg_frame_rate) || parseRate(v.r_frame_rate);
+    out.bFrames = Math.max(0, Math.min(16, Math.round(Number(v.has_b_frames) || 0)));
     const rotations = (Array.isArray(v.side_data_list) ? v.side_data_list : [])
       .map((sd) => Number(sd && sd.rotation))
       .filter((r) => Number.isFinite(r));
@@ -1981,6 +1988,7 @@ function emptyProbe() {
   return {
     hasAudio: false, width: 0, height: 0, durationMs: 0,
     codec: "", pixFmt: "", fps: 0, rotated: false,
+    bFrames: 0,
   };
 }
 
@@ -2171,6 +2179,54 @@ function findKeyframeAlignedStart(path, trimMs, fps) {
     }
   })();
   kfAlignCache.set(key, job);
+  job.catch(() => {});
+  return job;
+}
+
+// ---------------------------------------------------------------------------
+// v9 TRUE SMART RENDER — video track timescale probe. The concat contract:
+// DIRTY pieces re-encode through the graph while CLEAN pieces stream-copy
+// source packets; for the concat demuxer's timestamp math to stay exact the
+// encoded pieces must write the SAME mp4 video track timescale the copied
+// pieces carry. ffprobe's stream time_base ("1/15360" etc.) IS the source
+// track's clock — its denominator feeds -video_track_timescale on the dirty
+// encodes. Cached per path; any failure → null (caller omits the flag and
+// ffmpeg's muxer default applies — the concat demuxer still rescales, this
+// is belt-and-braces exactness, not a correctness gate).
+// ---------------------------------------------------------------------------
+const videoTsCache = new Map(); // path → Promise<number|null>
+
+function probeVideoTimescale(p) {
+  if (typeof p !== "string" || !p) return Promise.resolve(null);
+  if (videoTsCache.has(p)) return videoTsCache.get(p);
+  const job = (async () => {
+    try {
+      const bin = await ffprobeAvailable();
+      if (!bin) return null;
+      const r = await captureExec(
+        bin,
+        [
+          "-v", "quiet", "-print_format", "json",
+          "-select_streams", "v:0",
+          "-show_entries", "stream=time_base",
+          "-i", p,
+        ],
+        15000,
+      );
+      if (!r || r.code !== 0 || !r.out) return null;
+      const j = JSON.parse(r.out);
+      const tb = j && j.streams && j.streams[0] && j.streams[0].time_base;
+      const m = /^(\d+)\/(\d+)$/.exec(String(tb || ""));
+      if (!m) return null;
+      const num = parseInt(m[1], 10);
+      const den = parseInt(m[2], 10);
+      if (!Number.isFinite(den) || den <= 0 || num !== 1) return null;
+      return den;
+    } catch (_) {
+      return null;
+    }
+  })();
+  videoTsCache.set(p, job);
   job.catch(() => {});
   return job;
 }
@@ -3633,86 +3689,142 @@ ipcMain.handle("export-native", async (event, opts) => {
       cumulativeMs += seg.durationMs;
     }
 
-    // ─── v6 SINGLE-PASS ROUTE ─────────────────────────────────────────
-    // When the build loop produced ANY re-encode job (i.e. NOT a pure TURBO
-    // all-copy export — those run the pool below and finish in seconds) and
-    // the project fits the single-pass envelope, the WHOLE timeline renders
-    // in ONE ffmpeg process via -filter_complex_script:
-    //   • every segment decoded once, composited once, encoded once — no
-    //     per-clip temp files, no N encoder inits, no concat demuxer round
-    //     trip;
-    //   • clip audio mixes from the base inputs' OWN [i:a] streams — the
-    //     PCM-extraction pool jobs (and their WAV temp files) vanish;
-    //   • captions burn ONCE on the concatenated stream (libass still runs
-    //     single-threaded — long captioned projects keep the chunked pool
-    //     via the eligibility ceiling);
-    //   • the audio bus collapses to 1 pass (normalize OFF) or 2 passes
-    //     (ON: parallel source-window measurement → estimated master gain,
-    //     no mix WAV render, no re-measure).
-    // A graph that exceeds the script budget or a process that dies at INIT
-    // (<4s — graph parse/codec-open failures) falls back to the two-step
-    // pool below automatically; anything later rethrows.
+    // ─── v9 TRUE SMART RENDERING ─────────────────────────────────────────
+    // PHASE 1 of the smart-render refactor: the monolithic routing —
+    // "encodeWorkMs ≥ 8 s or ≥ 30 % of totalMs → re-encode the WHOLE
+    // timeline through one -filter_complex_script" — is DELETED. A timeline
+    // is never evaluated as a single block just because a percentage of it
+    // is dirty. Every export that has ANY dirty time now goes through
+    // planSmartRenderingPipeline() (below):
+    //   • PHASE 2 — SP.planSmartSegments slices [0, totalMs) into CLEAN
+    //     time-ranges (untouched video) and DIRTY ones (text, PIP, Ken
+    //     Burns, transitions, speed, unalignable trims), merges overlaps,
+    //     and keyframe-snaps every dirty↔clean boundary onto the SOURCE
+    //     keyframe grid (the Sandwich-copy lineage: probeKeyframesNear +
+    //     findKeyframeAlignedStart) so a copied piece never starts mid-GOP;
+    //   • PHASE 3 — ONE worker pool renders the pieces: CLEAN pieces ride
+    //     buildStreamCopyArgs (-c:v copy, zero decode/filter/encode —
+    //     seconds), DIRTY pieces ride the windowed single-pass graph
+    //     bounded to their exact [f0, f1) frames (sub-split across the
+    //     workers on multi-core boxes, fades kept whole), with the encoder
+    //     writing the SAME -video_track_timescale / resolution / SAR /
+    //     fps / yuv420p as the copied pieces (the concat contract) —
+    //     audio rides ONE full-timeline bus pass at -ar 48000;
+    //   • PHASE 4 — the finished chunks stitch through the concat demuxer
+    //     (-f concat -safe 0 -c copy -movflags +faststart) in timeline
+    //     order, then every temp chunk/graph/ASS file is deleted.
+    // A 19-minute timeline with 4 minutes of edits re-encodes exactly those
+    // 4 minutes (+ ≤1 GOP per boundary) — the 1.5 h monolithic export
+    // becomes minutes. Pure-copy projects keep the TURBO pool below (they
+    // have nothing to segment); any smart-plan failure (probe, eligibility,
+    // script budget, init-class error < 4 s) falls back to the
+    // battle-tested two-step pool with zero user impact.
     const anyEncodeJob = jobs.length > 0 && jobs.some((j) => !j.copy);
-    // v6 routing gate: single-pass re-encodes the WHOLE timeline, so it only
-    // wins when the re-encode work is the DOMINANT cost. A mostly-copy
-    // project (11 clean copies + one 1.2 s sandwich edge) must keep the TURBO
-    // pool — re-encoding 24 s to save a 1.2 s edge would be a regression.
-    const encodeWorkMs = jobs.reduce((a, j) => a + (j && !j.copy ? (j.durationMs || 0) : 0), 0);
-    const encodeDominant = encodeWorkMs >= 8000 || encodeWorkMs >= totalMs * 0.3;
-    if (anyEncodeJob && encodeDominant) {
-      // ── v6.5 CPU-FIRST: CHUNKED SINGLE-PASS ──────────────────────────────
-      // W parallel processes each render one timeline WINDOW through its own
-      // single-pass graph (decode + filters + x264 encode), the audio bus
-      // renders ONCE as its own process, and a final concat+mux glues video
-      // + audio with -c copy. A single process cannot use a many-core CPU
-      // when the filter graph (libass, overlay, zoompan) is the bottleneck —
-      // W processes each get cores/W encoder threads. GPU boxes keep W=1 (a
-      // single NVENC session saturates the GPU; the <40 s target doesn't
-      // need chunking). Fallback ladder: any init-class failure (<4 s) or a
-      // per-chunk graph over budget → the battle-tested two-step pool.
-      const isGpuEncoder = encoder.name !== "libx264";
-      const cpuCount = os.cpus().length;
-      const spWorkers = isGpuEncoder
-        ? 1
-        : cpuCount >= 4
-          ? Math.max(2, Math.min(4, Math.floor(cpuCount / 3)))
-          : 1;
-      // Full-timeline fade strings — the chunk planner's forbidden zones are
-      // derived from these (fade rejects negative st; xfade heads need the
-      // previous segment's input in-process), so boundaries never split a
-      // fade ramp or a head composite.
-      const fullFades = SP.buildGlobalFades({ segments, transition, totalMs });
-      let chunkPlan = null;
-      if (spWorkers >= 2) {
-        // v7 Step 4: segClean = per-segment TURBO copy-eligibility recorded
-        // during the build loop. planTimelineChunks uses it to align chunk
-        // boundaries to the clean↔dirty run edges — clean chunks replay as
-        // stream copies, dirty chunks as windowed single-pass graphs (the
-        // 60 % TURBO hybrid). All-clean/all-dirty (or an unalignable edge)
-        // keeps the plain full-timeline chunk plan, byte-identical to v6.5.
-        const segClean = turboPlan.map((t) => !!t);
-        chunkPlan = SP.planTimelineChunks({
+
+    const planSmartRenderingPipeline = async () => {
+      const smartStart = Date.now();
+      // Aggressive hygiene: sweep orphaned smart-chunk files a previous
+      // crashed/killed export may have left behind (this export's own temp
+      // files are tracked in tempFiles and cleaned by the outer handlers).
+      try {
+        for (const f of fs.readdirSync(tempDir)) {
+          if (/^chunk_\d{3,}\.mp4$/.test(f)) {
+            try { fs.unlinkSync(path.join(tempDir, f)); } catch (_) {}
+          }
+        }
+      } catch (_) {}
+      try {
+        // ── Source facts: per-segment copy capability + keyframe maps ──
+        // (format probes are warm from the build loop; the keyframe window
+        // scans ride the cached probeKeyframesNear).
+        const srcFacts = [];
+        for (let i = 0; i < segments.length; i++) {
+          const seg = segments[i];
+          const isVideo = !!(seg && seg.mediaType === "video" && seg.videoPath);
+          if (!isVideo || G.resolveSegSpeed(seg) !== 1) {
+            srcFacts.push({ copyCapable: false, keyframes: null, trimAligned: null, srcFps: 0 });
+            continue;
+          }
+          const probe = await probeMediaAsync(seg.videoPath);
+          const srcDurMs = Number(probe.durationMs) || 0;
+          const specOk =
+            probe.codec === "h264" &&
+            probe.pixFmt === "yuv420p" &&
+            !probe.rotated &&
+            probe.width === width &&
+            probe.height === height &&
+            Math.abs((probe.fps || 0) - fps) < 0.06 &&
+            srcDurMs > 0;
+          if (!specOk) {
+            srcFacts.push({ copyCapable: false, keyframes: null, trimAligned: null, srcFps: Number(probe.fps) || 0, bFrames: 0, srcDurMs: 0 });
+            continue;
+          }
+          const trimInMs = Number(seg.trimInMs) || 0;
+          const trimAligned = trimInMs > 0
+            ? await findKeyframeAlignedStart(seg.videoPath, trimInMs, fps)
+            : null;
+          // One keyframe window covers the whole segment (+ slack for the
+          // planner's forward/backward snapping): [trimIn−3.5 s,
+          // trimIn+dur+12 s]. -skip_frame nokey decodes only keyframes —
+          // a handful per GOP regardless of file length.
+          const kfs = await probeKeyframesNear(
+            seg.videoPath,
+            Math.max(0, (trimInMs - 3500) / 1000),
+            (Number(seg.durationMs) || 0) / 1000 + 12,
+          );
+          srcFacts.push({
+            copyCapable: true,
+            keyframes: kfs,
+            trimAligned,
+            srcFps: Number(probe.fps) || 0,
+            // v9: the codec reorder depth (DTS lags PTS by b frames) + the
+            // source length — planSmartSegments subtracts b/g from a clean
+            // piece's -t so the copy tail lands on the exact display frame
+            // (uncorrected, mid-file copies drag b extra frames into the
+            // concat seam: duplicate content + DTS collisions).
+            bFrames: Math.max(0, Math.min(16, Math.round(Number(probe.bFrames) || 0))),
+            srcDurMs,
+          });
+        }
+
+        // ── Pool width + thread budgets (v7 Step 5 low-end caps) ─────────
+        const isGpuEncoder = encoder.name !== "libx264";
+        const spWorkers = isGpuEncoder
+          ? 1
+          : cpuCount >= 4
+            ? Math.max(2, Math.min(4, Math.floor(cpuCount / 3)))
+            : 1;
+        const poolWidth = Math.max(1, spWorkers);
+        let threadsPer = Math.max(1, Math.round(cpuCount / poolWidth));
+        let filterThreadsPer = Math.max(2, Math.min(8, Math.floor(cpuCount / poolWidth)));
+        if (lowEndX264) {
+          threadsPer = Math.max(1, Math.min(2, threadsPer));
+          filterThreadsPer = Math.max(1, Math.min(2, filterThreadsPer));
+        }
+
+        // ── The plan (pure) ──────────────────────────────────────────────
+        const plan = SP.planSmartSegments({
           segments,
+          overlays: overlaySegs,
           transition,
-          kbEnabled: enabled,
-          globalDir,
           fps,
           totalMs,
-          fades: fullFades,
+          kbEnabled: enabled,
+          globalDir,
+          wm,
+          captionsEnabled,
+          subtitleCues,
+          headlinesEnabled,
+          headlines,
+          srcFacts,
           workerCount: spWorkers,
-          segClean,
         });
-        if (!chunkPlan || chunkPlan.chunks.length < 2) chunkPlan = null;
-      }
-      const eligibility = SP.singlePassEligible({
-        segments,
-        overlayCount: overlaySegs.length,
-        totalSec,
-        captionsBurned: captionsEnabled || headlinesEnabled,
-        chunked: !!chunkPlan,
-      });
-      if (eligibility.ok) {
-        // Audio branches from the collected segInfo (video segs with audio).
+        if (!plan) {
+          console.log("[framefuse] smart render skipped: planner returned no plan → two-step pool");
+          return null;
+        }
+
+        // ── Audio branches + loudnorm (identical to the retired routes) ──
         const clipAudioBranches = [];
         for (let b = 0; b < segments.length; b++) {
           const info = segInfo[b];
@@ -3726,11 +3838,6 @@ ipcMain.handle("export-native", async (event, opts) => {
             });
           }
         }
-        // v6 AUDIO BUS: normalize ON → measure each SOURCE at its timeline
-        // window (bounded 8-parallel, audio-only, seeked — no WAV extraction)
-        // and estimate the summed-mix master gain (energy sum) — the v1.3
-        // render-mix-to-WAV + re-measure + remux round trip is GONE. OFF →
-        // zero measurement passes, straight into the graph.
         let spLoudnorm = null;
         let spMasterLoudnorm = null;
         if (audio && audio.normalize && (clipAudioBranches.length > 0 || audioPath)) {
@@ -3764,8 +3871,8 @@ ipcMain.handle("export-native", async (event, opts) => {
             music: measures.music,
           });
         }
-        // Probe-gated hw decode per ≥20s source (cached from the build loop
-        // when it already probed this path).
+
+        // ── Probe-gated hw decode per ≥20 s source (cached per path) ─────
         const hwaccelPerSeg = [];
         let spHwCount = 0;
         for (let b = 0; b < segments.length; b++) {
@@ -3776,484 +3883,298 @@ ipcMain.handle("export-native", async (event, opts) => {
           if (use) spHwCount += 1;
         }
 
-        // v6.5 chunked single-pass: either RETURNS (success) or clears for
-        // the W=1 route / the two-step pool.
-        let spSkipW1 = false;
-        if (chunkPlan) {
-          const W = chunkPlan.chunks.length;
-          const isHybrid = !!chunkPlan.hybrid;
-          // v7 Step 4: pool width = the worker budget (hybrid mixes graph
-          // chunks + TURBO replay jobs in ONE pool); plain keeps W (= chunk
-          // count ≤ spWorkers, same as v6.5).
-          const poolWidth = Math.max(1, Math.min(isHybrid ? spWorkers : W, Math.max(1, spWorkers)));
-          let threadsPer = Math.max(1, Math.round(cpuCount / poolWidth));
-          let filterThreadsPer = Math.max(2, Math.min(8, Math.floor(cpuCount / poolWidth)));
-          if (lowEndX264) {
-            // v7 Step 5: hardcap per-worker threads on ≤4-core libx264 boxes.
-            threadsPer = Math.max(1, Math.min(2, threadsPer));
-            filterThreadsPer = Math.max(1, Math.min(2, filterThreadsPer));
-          }
-          const chunkJobs = [];
-          const chunkFiles = [];
-          const turboJobs = [];
-          let turboCopied = 0;
-          let chunkOverBudget = false;
-          for (let ci = 0; ci < W && !chunkOverBudget; ci++) {
-            const c = chunkPlan.chunks[ci];
-            // ── v7 Step 4: CLEAN chunk — every covered segment is copy-eligible.
-            // Replay the recorded TURBO plans (stream copy / keyframe-aligned
-            // trim / sandwich) instead of a filter graph: ZERO decode, zero
-            // filters, zero encode for this whole interval.
-            if (c.clean && isHybrid) {
-              for (let i = 0; i < segments.length; i++) {
-                const span = chunkPlan.spans[i];
-                if (!span || span.F <= 0) continue;
-                if (Math.min(span.S + span.F, c.f1) - Math.max(span.S, c.f0) <= 0) continue;
-                const tp = turboPlan[i];
-                if (!tp) continue; // defensive: planner marked the chunk clean
-                const seg = segments[i];
-                if (tp.kind === "copy") {
-                  const copyPath = path.join(tempDir, `hyb_${String(i).padStart(4, "0")}.mp4`);
-                  tempFiles.push(copyPath);
-                  chunkFiles.push(copyPath);
-                  turboJobs.push({
-                    idx: i,
-                    args: G.buildStreamCopyArgs({
-                      path: seg.videoPath,
-                      durMs: seg.durationMs,
-                      clipPath: copyPath,
-                      ss: tp.ss,
-                    }),
-                    durSec: seg.durationMs / 1000,
-                    durationMs: seg.durationMs,
-                    segId: seg.id,
-                    copy: true,
-                  });
-                  turboCopied += 1;
-                } else if (tp.kind === "sandwich" && tp.plan) {
-                  const sw = tp.plan;
-                  const emitEdge = (edge, tag) => {
-                    const edgePath = path.join(tempDir, `hyb_${String(i).padStart(4, "0")}_${tag}.mp4`);
-                    tempFiles.push(edgePath);
-                    chunkFiles.push(edgePath);
-                    const built = G.buildClipArgs({
-                      i,
-                      seg: { ...seg, trimInMs: edge.trimMs, durationMs: edge.durMs },
-                      segments,
-                      fps,
-                      width,
-                      height,
-                      kbEnabled: enabled,
-                      zoomMax,
-                      globalDir,
-                      transition,
-                      wm: null,        // sandwich-eligible ⇒ no watermark
-                      assSuffix: null, // ⇒ no captions
-                      clipPath: edgePath,
-                      encArgs,
-                      globalArgs: encGlobalArgs,
-                      anyAudio: false,
-                      segHasAudio: false,
-                      overlaySpecs: [], // ⇒ no overlays in window
-                      hwaccel: false,
-                      threads: threadsPer,
-                    });
-                    turboJobs.push({
-                      idx: i,
-                      args: built.args,
-                      durSec: edge.durMs / 1000,
-                      durationMs: edge.durMs,
-                      segId: seg.id,
-                    });
-                  };
-                  if (sw.head) emitEdge(sw.head, "sh");
-                  const midPath = path.join(tempDir, `hyb_${String(i).padStart(4, "0")}_sm.mp4`);
-                  tempFiles.push(midPath);
-                  chunkFiles.push(midPath);
-                  turboJobs.push({
-                    idx: i,
-                    args: G.buildStreamCopyArgs({
-                      path: seg.videoPath,
-                      durMs: sw.middle.durMs,
-                      clipPath: midPath,
-                      ss: sw.middle.ss,
-                    }),
-                    durSec: sw.middle.durMs / 1000,
-                    durationMs: sw.middle.durMs,
-                    segId: seg.id,
-                    copy: true,
-                  });
-                  if (sw.tail) emitEdge(sw.tail, "st");
-                  turboCopied += 1;
-                }
-              }
-              continue; // clean chunk fully handled by TURBO replay
-            }
-            // v6.5: per-segment SOURCE rates (probe cache is warm from the
-            // build loop) — the sub-seek snaps to each source's own frame
-            // grid so the sub-window's first frame is exactly the frame the
-            // W=1 render displays at the boundary (see windowSegmentsForChunk).
-            const srcFpsPerSeg = await Promise.all(
-              segments.map(async (s) =>
-                s && s.mediaType === "video" && s.videoPath
-                  ? Number((await probeMediaAsync(s.videoPath)).fps) || 0
-                  : 0,
-              ),
-            );
-            const winSegs = SP.windowSegmentsForChunk(segments, chunkPlan.spans, c.f0, c.f1, fps, srcFpsPerSeg);
-            const segMeta = winSegs.map((w) => ({
-              origIdx: w.origIdx, S: w.S, F: w.F, k0: w.k0, k1: w.k1, ssSec: w.ssSec,
-            }));
-            // Per-chunk overlay specs + ASS window (the v1.4.2 windowing
-            // semantics: specs/cues are chunk-LOCAL, windows clamped). The
-            // overlay INPUT windows are padded ~120 ms past the chunk end so
-            // framesync (eof_action=pass) composites the chunk's LAST frame —
-            // an unpadded input EOFs one base-frame early and drops it.
-            const ovSpecs = SP.padOverlayInputWindows(
-              await buildOverlaySpecsForWindow(c.t0Ms, c.durMs),
-              c.durMs,
-            );
-            let chunkAssSuffix = null;
-            if (captionsEnabled || headlinesEnabled) {
-              const doc = buildAssDocument(
-                captionsEnabled ? subtitleCues : [],
-                captionsEnabled ? captionSettings : null,
-                headlinesEnabled ? headlines : null,
-                width, height, c.t0Ms, c.t0Ms + c.durMs, c.durMs,
-              );
-              chunkAssSuffix = doc ? writeAssFile(doc, `sp${String(ci).padStart(2, "0")}`) : null;
-            }
-            const cPlan = SP.buildSinglePassPlan({
-              segments: winSegs.map((w) => w.seg),
-              fullSegments: segments,
-              window: { t0Ms: c.t0Ms, durMs: c.durMs, segMeta },
-              videoOnly: true,
-              fades: fullFades,
-              fps,
-              width,
-              height,
-              totalMs,
-              kbEnabled: enabled,
-              zoomMax,
-              globalDir,
-              transition,
-              wm,
-              assSuffix: chunkAssSuffix,
-              overlaySpecs: ovSpecs,
-              audio,
-              audioPath: null,
-              sfx: [],
-              clipAudio: [],
-              loudnorm: null,
-              masterLoudnorm: null,
-              hwaccelPerSeg,
-            });
-            if (cPlan.scriptBytes > SP.SINGLEPASS_MAX_SCRIPT_BYTES) {
-              console.warn(`[framefuse] chunked single-pass skipped: chunk ${ci + 1}/${W} graph ${cPlan.scriptBytes}B > ${SP.SINGLEPASS_MAX_SCRIPT_BYTES}B budget → two-step pool`);
-              chunkOverBudget = true;
-              break;
-            }
-            const scriptPath = path.join(tempDir, `graph_sp${ci}_${Date.now()}.txt`);
-            fs.writeFileSync(scriptPath, cPlan.script, "utf-8");
-            tempFiles.push(scriptPath);
-            const chunkPath = path.join(tempDir, `spchunk_${String(ci).padStart(3, "0")}_${Date.now()}.mp4`);
-            tempFiles.push(chunkPath);
-            chunkFiles.push(chunkPath);
-            chunkJobs.push({
-              args: SP.buildSinglePassArgs({
-                plan: cPlan,
-                scriptPath,
-                encArgs,
-                abr: `${abr}k`,
-                fps,
-                outputPath: chunkPath,
-                threads: threadsPer,
-                filterThreads: filterThreadsPer,
-                // v7 Step 1: QSV device-init globals at the argv head.
-                globalArgs: encGlobalArgs,
+        // ── Full-timeline fades + per-segment source rates ───────────────
+        const fullFades = SP.buildGlobalFades({ segments, transition, totalMs });
+        const srcFpsPerSeg = await Promise.all(
+          segments.map(async (s) =>
+            s && s.mediaType === "video" && s.videoPath
+              ? Number((await probeMediaAsync(s.videoPath)).fps) || 0
+              : 0,
+          ),
+        );
+
+        // ── The CONCAT CONTRACT reference timescale: the first clean ──────
+        // piece's source track clock (dirty encodes write the same one).
+        let videoTimescale = null;
+        const firstClean = plan.pieces.find((p) => p.kind === "clean");
+        if (firstClean) {
+          videoTimescale = await probeVideoTimescale(segments[firstClean.segIdx].videoPath);
+        }
+
+        // ── PHASE 3: build the pool jobs over the pieces ─────────────────
+        const poolJobs = [];
+        const chunkFiles = [];
+        let dirtyWindows = 0;
+        let cleanCopies = 0;
+        let overBudget = false;
+        const dirtyTotal = plan.pieces.filter((p) => p.kind === "dirty").length;
+        for (let pi = 0; pi < plan.pieces.length && !overBudget; pi++) {
+          const piece = plan.pieces[pi];
+          const chunkPath = path.join(tempDir, `chunk_${String(chunkFiles.length + 1).padStart(3, "0")}.mp4`);
+          tempFiles.push(chunkPath);
+          chunkFiles.push(chunkPath);
+          if (piece.kind === "clean") {
+            const seg = segments[piece.segIdx];
+            poolJobs.push({
+              args: G.buildStreamCopyArgs({
+                path: seg.videoPath,
+                // v9: copyDurMs carries the B-frame reorder correction —
+                // the demuxer bounds -t on DTS, which lag PTS by b frames.
+                durMs: piece.copyDurMs != null ? piece.copyDurMs : piece.durMs,
+                clipPath: chunkPath,
+                ss: piece.ss,
               }),
-              durSec: c.durMs / 1000,
-              durationMs: c.durMs,
-              segId: `parallel window ${ci + 1}/${W}`,
+              durSec: piece.durMs / 1000,
+              durationMs: piece.durMs,
+              segId: seg.id,
+              copy: true,
             });
+            cleanCopies += 1;
+            continue;
           }
-          if (!chunkOverBudget) {
-            const dirtyChunks = chunkJobs.length;
-            console.log(
-              isHybrid
-                ? `[framefuse] HYBRID smart render: ${dirtyChunks} re-encode windows + ${turboCopied} TURBO stream-copy segments over ${(totalMs / 1000).toFixed(1)}s (${Math.round(cpuCount)} cores)`
-                : `[framefuse] chunked single-pass: ${W} parallel windows over ${(totalMs / 1000).toFixed(1)}s (${Math.round(cpuCount)} cores)`,
+          // DIRTY piece: the windowed single-pass graph bounded to the
+          // piece's exact [f0, f1) frames. windowSegmentsForChunk derives
+          // the per-segment sub-seeks from the SAME frame law the planner
+          // snapped boundaries with, so the encoded piece's first/last
+          // frames are the frames the full-timeline render would emit at
+          // those slots.
+          dirtyWindows += 1;
+          const winSegs = SP.windowSegmentsForChunk(segments, plan.spans, piece.f0, piece.f1, fps, srcFpsPerSeg);
+          const segMeta = winSegs.map((w) => ({
+            origIdx: w.origIdx, S: w.S, F: w.F, k0: w.k0, k1: w.k1, ssSec: w.ssSec,
+          }));
+          const ovSpecs = SP.padOverlayInputWindows(
+            await buildOverlaySpecsForWindow(piece.t0Ms, piece.durMs),
+            piece.durMs,
+          );
+          let pieceAssSuffix = null;
+          if (captionsEnabled || headlinesEnabled) {
+            const doc = buildAssDocument(
+              captionsEnabled ? subtitleCues : [],
+              captionsEnabled ? captionSettings : null,
+              headlinesEnabled ? headlines : null,
+              width, height, piece.t0Ms, piece.t0Ms + piece.durMs, piece.durMs,
             );
-            const spStart = Date.now();
-            // v7 Step 4: ONE pool over the graph chunks + the TURBO replay jobs
-            // (copies are near-instant and fill idle slots). Progress weighted
-            // by each job's timeline duration (0 → 92 %).
-            const poolJobs = [...chunkJobs, ...turboJobs];
-            const chunkFrac = poolJobs.map(() => 0);
-            let lastEmit = 0;
-            const emitChunkProgress = (force) => {
-              const now = Date.now();
-              if (!force && now - lastEmit < 100) return;
-              lastEmit = now;
-              let doneMs = 0;
-              for (let k = 0; k < poolJobs.length; k++) doneMs += chunkFrac[k] * poolJobs[k].durationMs;
-              const frac = Math.min(1, doneMs / Math.max(1, totalMs));
-              sendProgress(frac * 92, frac * totalSec, etaFor(frac));
-            };
+            pieceAssSuffix = doc ? writeAssFile(doc, `sm${String(pi).padStart(3, "0")}`) : null;
+          }
+          const cPlan = SP.buildSinglePassPlan({
+            segments: winSegs.map((w) => w.seg),
+            fullSegments: segments,
+            window: { t0Ms: piece.t0Ms, durMs: piece.durMs, segMeta },
+            videoOnly: true,
+            fades: fullFades,
+            fps,
+            width,
+            height,
+            totalMs,
+            kbEnabled: enabled,
+            zoomMax,
+            globalDir,
+            transition,
+            wm,
+            assSuffix: pieceAssSuffix,
+            overlaySpecs: ovSpecs,
+            audio,
+            audioPath: null,
+            sfx: [],
+            clipAudio: [],
+            loudnorm: null,
+            masterLoudnorm: null,
+            hwaccelPerSeg,
+          });
+          if (cPlan.scriptBytes > SP.SINGLEPASS_MAX_SCRIPT_BYTES) {
+            console.warn(`[framefuse] smart render skipped: piece ${pi + 1}/${plan.pieces.length} graph ${cPlan.scriptBytes}B > ${SP.SINGLEPASS_MAX_SCRIPT_BYTES}B budget → two-step pool`);
+            overBudget = true;
+            break;
+          }
+          const scriptPath = path.join(tempDir, `graph_sm${pi}_${Date.now()}.txt`);
+          fs.writeFileSync(scriptPath, cPlan.script, "utf-8");
+          tempFiles.push(scriptPath);
+          poolJobs.push({
+            args: SP.buildSinglePassArgs({
+              plan: cPlan,
+              scriptPath,
+              encArgs,
+              abr: `${abr}k`,
+              fps,
+              outputPath: chunkPath,
+              threads: threadsPer,
+              filterThreads: filterThreadsPer,
+              globalArgs: encGlobalArgs,
+              videoTimescale,
+              // Exact slot count — the concat tiling depends on it.
+              frameCap: piece.frames,
+            }),
+            durSec: piece.durMs / 1000,
+            durationMs: piece.durMs,
+            segId: `smart window ${dirtyWindows}/${dirtyTotal}`,
+          });
+        }
+        if (overBudget) return null;
+
+        console.log(
+          `[framefuse] SMART RENDER: ${cleanCopies} clean stream-copy piece(s) (${(plan.cleanMs / 1000).toFixed(1)}s) + ${dirtyWindows} dirty window(s) (${(plan.dirtyMs / 1000).toFixed(1)}s) over ${(totalMs / 1000).toFixed(1)}s — ${plan.zones.map((z) => z.why.join("+")).join(", ") || "no zones"}`,
+        );
+
+        // ── PHASE 3 (run): ONE pool over copies + dirty windows ───────────
+        const chunkFrac = poolJobs.map(() => 0);
+        const poolStart = Date.now();
+        let lastEmit = 0;
+        const emitChunkProgress = (force) => {
+          const now = Date.now();
+          if (!force && now - lastEmit < 100) return;
+          lastEmit = now;
+          let doneMs = 0;
+          for (let k = 0; k < poolJobs.length; k++) doneMs += chunkFrac[k] * poolJobs[k].durationMs;
+          const frac = Math.min(1, doneMs / Math.max(1, totalMs));
+          sendProgress(frac * 92, frac * totalSec, etaFor(frac));
+        };
+        try {
+          await runPool(poolJobs, poolWidth, {
+            onTime: (idx, sec) => {
+              chunkFrac[idx] = Math.min(1, sec / Math.max(0.01, poolJobs[idx].durSec));
+              emitChunkProgress(false);
+            },
+            onDone: (idx) => {
+              chunkFrac[idx] = 1;
+              emitChunkProgress(true);
+            },
+          });
+        } catch (err) {
+          if (err && err.message === "Export cancelled") throw err;
+          if (Date.now() - poolStart < 4000) {
+            console.warn("[framefuse] smart render pool failed at init — falling back to the two-step pool:", err.message);
+            return null;
+          }
+          throw err;
+        }
+
+        // ── Audio bus: ONE full-timeline pass (no per-chunk AAC boundary ──
+        // glitches, no windowed amix math), bounded by the VIDEO frame
+        // model; the final mux carries -shortest.
+        let spAudioPath = null;
+        const hasAudioBus =
+          clipAudioBranches.length > 0 || !!audioPath || sfxList.length > 0;
+        if (hasAudioBus) {
+          const aPlan = SP.buildSinglePassPlan({
+            segments,
+            audioOnly: true,
+            fps,
+            width,
+            height,
+            totalMs,
+            audio,
+            audioPath,
+            sfx: sfxList,
+            clipAudio: clipAudioBranches,
+            loudnorm: spLoudnorm,
+            masterLoudnorm: spMasterLoudnorm,
+          });
+          if (aPlan.hasAudioOut) {
+            const aScriptPath = path.join(tempDir, `graph_sma_${Date.now()}.txt`);
+            fs.writeFileSync(aScriptPath, aPlan.script, "utf-8");
+            tempFiles.push(aScriptPath);
+            spAudioPath = path.join(tempDir, `spaudio_${Date.now()}.m4a`);
+            tempFiles.push(spAudioPath);
+            const aArgs = SP.buildAudioOnlyArgs({
+              plan: aPlan,
+              scriptPath: aScriptPath,
+              abr: `${abr}k`,
+              totalSec: plan.totalFrames / fps,
+              outputPath: spAudioPath,
+            });
+            const audioStageStart = Date.now();
             try {
-              await runPool(poolJobs, poolWidth, {
-                onTime: (idx, sec) => {
-                  chunkFrac[idx] = Math.min(1, sec / Math.max(0.01, poolJobs[idx].durSec));
-                  emitChunkProgress(false);
-                },
-                onDone: (idx) => {
-                  chunkFrac[idx] = 1;
-                  emitChunkProgress(true);
-                },
+              await runFfmpeg(aArgs, totalSec, (sec) => {
+                const frac = 0.92 + 0.04 * Math.min(1, sec / Math.max(0.01, totalSec));
+                sendProgress(frac * 100, sec, etaFor(frac));
               });
-              // ── Audio bus: ONE full-timeline pass (no per-chunk AAC
-              //    boundary glitches, no windowed amix math). v6.5: bounded by
-              //    the VIDEO frame model (totalFrames/fps), and the final mux
-              //    carries -shortest — together this reproduces the W=1
-              //    render's -shortest-at-min(video,audio) tail exactly on
-              //    frame-inexact timelines.
-              let spAudioPath = null;
-              const hasAudioBus =
-                clipAudioBranches.length > 0 || !!audioPath || sfxList.length > 0;
-              if (hasAudioBus) {
-                const aPlan = SP.buildSinglePassPlan({
-                  segments,
-                  audioOnly: true,
-                  fps,
-                  width,
-                  height,
-                  totalMs,
-                  audio,
-                  audioPath,
-                  sfx: sfxList,
-                  clipAudio: clipAudioBranches,
-                  loudnorm: spLoudnorm,
-                  masterLoudnorm: spMasterLoudnorm,
-                });
-                if (aPlan.hasAudioOut) {
-                  const aScriptPath = path.join(tempDir, `graph_spa_${Date.now()}.txt`);
-                  fs.writeFileSync(aScriptPath, aPlan.script, "utf-8");
-                  tempFiles.push(aScriptPath);
-                  spAudioPath = path.join(tempDir, `spaudio_${Date.now()}.m4a`);
-                  tempFiles.push(spAudioPath);
-                  const aArgs = SP.buildAudioOnlyArgs({
-                    plan: aPlan,
-                    scriptPath: aScriptPath,
-                    abr: `${abr}k`,
-                    totalSec: chunkPlan.totalFrames / fps,
-                    outputPath: spAudioPath,
-                  });
-                  const audioStageStart = Date.now();
-                  try {
-                    await runFfmpeg(aArgs, totalSec, (sec) => {
-                      const frac = 0.92 + 0.04 * Math.min(1, sec / Math.max(0.01, totalSec));
-                      sendProgress(frac * 100, sec, etaFor(frac));
-                    });
-                  } catch (err) {
-                    if (err && err.message === "Export cancelled") throw err;
-                    if (Date.now() - audioStageStart < 4000) {
-                      console.warn("[framefuse] audio pass failed at init — falling back to the two-step pool:", err.message);
-                      spSkipW1 = true;
-                    } else {
-                      throw err;
-                    }
-                  }
-                }
-              }
-              if (spSkipW1) { /* fall to the two-step pool below */ } else {
-              // ── Concat the chunk videos + mux the audio (-c copy both).
-              sendProgress(96.5, totalSec, etaFor(0.965));
-              const spConcatPath = path.join(tempDir, `spconcat_${Date.now()}.txt`);
-              tempFiles.push(spConcatPath);
-              fs.writeFileSync(
-                spConcatPath,
-                chunkFiles.map((p) => `file '${p.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`).join("\n"),
-                "utf-8",
-              );
-              const muxArgs = [
-                "-y",
-                "-f", "concat", "-safe", "0", "-i", spConcatPath,
-                ...(spAudioPath ? ["-i", spAudioPath] : []),
-                "-map", "0:v:0",
-                ...(spAudioPath ? ["-map", "1:a:0"] : []),
-                "-c", "copy",
-                // v6.5: bound the container at the shorter stream, exactly like
-                // the W=1 render's encode-time -shortest (the audio pass is
-                // already bounded by the video frame model; this trims a
-                // longer music tail instead of shipping silent video frames).
-                ...(spAudioPath ? ["-shortest"] : []),
-                "-movflags", "+faststart",
-                outputPath,
-              ];
-              const muxStageStart = Date.now();
-              try {
-                await runFfmpeg(muxArgs, totalSec, (sec) => {
-                  const frac = 0.965 + 0.035 * Math.min(1, sec / Math.max(0.01, totalSec));
-                  sendProgress(frac * 100, sec, etaFor(frac));
-                });
-              } catch (err) {
-                if (err && err.message === "Export cancelled") throw err;
-                if (Date.now() - muxStageStart < 4000) {
-                  console.warn("[framefuse] concat/mux failed at init — falling back to the two-step pool:", err.message);
-                  spSkipW1 = true;
-                } else {
-                  throw err;
-                }
-              }
-              } // end else (audio pass healthy → mux ran)
             } catch (err) {
               if (err && err.message === "Export cancelled") throw err;
-              if (Date.now() - spStart < 4000) {
-                console.warn("[framefuse] chunked single-pass failed at init — falling back to the two-step pool:", err.message);
-                spSkipW1 = true;
-              } else {
-                throw err;
+              if (Date.now() - audioStageStart < 4000) {
+                console.warn("[framefuse] smart render audio pass failed at init — falling back to the two-step pool:", err.message);
+                return null;
               }
-            }
-            if (!spSkipW1) {
-              sendProgress(100, totalSec, 0);
-              for (const f of tempFiles) { try { fs.unlinkSync(f); } catch (_) {} }
-              let size = 0;
-              try { size = fs.statSync(outputPath).size; } catch {}
-              return {
-                path: outputPath,
-                size,
-                encoder: encoder.label,
-                elapsedSec: Math.round((Date.now() - startTime) / 1000),
-                // v7 Step 4: hybrid telemetry — copiedClips = the TURBO
-                // stream-copy segments, encodedClips = the graph-re-encoded
-                // (dirty) segments.
-                copiedClips: isHybrid ? turboCopied : 0,
-                encodedClips: isHybrid
-                  ? segments.length - turboCopied
-                  : segments.length,
-                keyframeCuts: 0,
-                chunkedClips: 0,
-                totalChunks: isHybrid ? dirtyChunks : W,
-                parallelChunks: isHybrid ? dirtyChunks : W,
-                hwDecodeClips: spHwCount,
-                singlePass: true,
-                mode: isHybrid ? "hybrid-pass" : "parallel-pass",
-              };
-            }
-          } else {
-            spSkipW1 = true; // per-chunk graph over budget → two-step pool
-          }
-        }
-
-        if (!spSkipW1) {
-        // ── W=1 single-pass (GPU boxes, short timelines, <4-core CPUs) ────
-        // GLOBAL-window overlay specs — one continuous read per overlay
-        // instead of the per-clip re-seek the two-step pays (probes warm).
-        const globalOverlaySpecs = await buildOverlaySpecsForWindow(0, totalMs);
-        // Full-timeline ASS document — the SAME builder, window [0, total].
-        let globalAssSuffix = null;
-        if (captionsEnabled || headlinesEnabled) {
-          const doc = buildAssDocument(
-            captionsEnabled ? subtitleCues : [],
-            captionsEnabled ? captionSettings : null,
-            headlinesEnabled ? headlines : null,
-            width, height, 0, totalMs, totalMs,
-          );
-          globalAssSuffix = doc ? writeAssFile(doc, "full") : null;
-        }
-
-        const spPlan = SP.buildSinglePassPlan({
-          segments,
-          fps,
-          width,
-          height,
-          totalMs,
-          kbEnabled: enabled,
-          zoomMax,
-          globalDir,
-          transition,
-          wm,
-          assSuffix: globalAssSuffix,
-          overlaySpecs: globalOverlaySpecs,
-          audio,
-          audioPath,
-          sfx: sfxList,
-          clipAudio: clipAudioBranches,
-          loudnorm: spLoudnorm,
-          masterLoudnorm: spMasterLoudnorm,
-          hwaccelPerSeg,
-        });
-
-        if (spPlan.scriptBytes > SP.SINGLEPASS_MAX_SCRIPT_BYTES) {
-          console.warn(`[framefuse] single-pass skipped: graph ${spPlan.scriptBytes}B > ${SP.SINGLEPASS_MAX_SCRIPT_BYTES}B budget → two-step pool`);
-        } else {
-          const scriptPath = path.join(tempDir, `graph_${Date.now()}.txt`);
-          fs.writeFileSync(scriptPath, spPlan.script, "utf-8");
-          tempFiles.push(scriptPath);
-          const spArgs = SP.buildSinglePassArgs({
-            plan: spPlan,
-            scriptPath,
-            encArgs,
-            abr: `${abr}k`,
-            fps,
-            outputPath,
-            // ONE process: the encoder may use every core; filters get a
-            // slice-thread budget so scale/overlay parallelize.
-            // v7 Step 5: low-end libx264 caps threads at 2 (cache thrashing).
-            threads: lowEndX264 ? Math.min(2, cpuCount) : 0, // 0 = auto (all cores)
-            filterThreads: lowEndX264
-              ? 2
-              : Math.max(2, Math.min(8, os.cpus().length)),
-            // v7 Step 1: QSV device-init globals at the argv head.
-            globalArgs: encGlobalArgs,
-          });
-          const spStart = Date.now();
-          let spFastFail = false;
-          try {
-            await runFfmpeg(spArgs, totalSec, (sec) => {
-              const frac = Math.min(1, sec / Math.max(0.01, totalSec));
-              sendProgress(frac * 100, sec, etaFor(frac));
-            });
-          } catch (err) {
-            if (err && err.message === "Export cancelled") throw err;
-            if (Date.now() - spStart < 4000) {
-              // Init-class failure (graph parse / codec open / input read):
-              // fall back to the battle-tested two-step pool instead of
-              // failing the export outright.
-              console.warn("[framefuse] single-pass failed at init — falling back to the two-step pool:", err.message);
-              spFastFail = true;
-            } else {
               throw err;
             }
           }
-          if (!spFastFail) {
-            sendProgress(100, totalSec, 0);
-            for (const f of tempFiles) { try { fs.unlinkSync(f); } catch (_) {} }
-            let size = 0;
-            try { size = fs.statSync(outputPath).size; } catch {}
-            return {
-              path: outputPath,
-              size,
-              encoder: encoder.label,
-              elapsedSec: Math.round((Date.now() - startTime) / 1000),
-              copiedClips: 0,
-              encodedClips: segments.length,
-              keyframeCuts: 0,
-              chunkedClips: 0,
-              totalChunks: 0,
-              hwDecodeClips: spHwCount,
-              singlePass: true,
-              mode: "single-pass",
-            };
+        }
+
+        // ── PHASE 4: concat demuxer stitch + mux (instant, -c copy) ───────
+        sendProgress(96.5, totalSec, etaFor(0.965));
+        const spConcatPath = path.join(tempDir, `concat_${Date.now()}.txt`);
+        tempFiles.push(spConcatPath);
+        fs.writeFileSync(
+          spConcatPath,
+          chunkFiles.map((p) => `file '${p.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`).join("\n"),
+          "utf-8",
+        );
+        const muxArgs = [
+          "-y",
+          "-f", "concat", "-safe", "0", "-i", spConcatPath,
+          ...(spAudioPath ? ["-i", spAudioPath] : []),
+          "-map", "0:v:0",
+          ...(spAudioPath ? ["-map", "1:a:0"] : []),
+          "-c", "copy",
+          ...(spAudioPath ? ["-shortest"] : []),
+          "-movflags", "+faststart",
+          outputPath,
+        ];
+        const muxStageStart = Date.now();
+        try {
+          await runFfmpeg(muxArgs, totalSec, (sec) => {
+            const frac = 0.965 + 0.035 * Math.min(1, sec / Math.max(0.01, totalSec));
+            sendProgress(frac * 100, sec, etaFor(frac));
+          });
+        } catch (err) {
+          if (err && err.message === "Export cancelled") throw err;
+          if (Date.now() - muxStageStart < 4000) {
+            console.warn("[framefuse] smart render concat/mux failed at init — falling back to the two-step pool:", err.message);
+            return null;
           }
+          throw err;
         }
+
+        // ── Aggressive cleanup + the result payload ──────────────────────
+        sendProgress(100, totalSec, 0);
+        for (const f of tempFiles) { try { fs.unlinkSync(f); } catch (_) {} }
+        let size = 0;
+        try { size = fs.statSync(outputPath).size; } catch {}
+        return {
+          path: outputPath,
+          size,
+          encoder: encoder.label,
+          elapsedSec: Math.round((Date.now() - startTime) / 1000),
+          // v9 telemetry: copiedClips = clean stream-copy pieces,
+          // encodedClips = dirty graph windows, keyframeCuts = clean pieces
+          // that entered via a keyframe-aligned start (trim or snapped).
+          copiedClips: cleanCopies,
+          encodedClips: dirtyWindows,
+          keyframeCuts: plan.keyframeCuts,
+          chunkedClips: 0,
+          totalChunks: dirtyWindows,
+          parallelChunks: dirtyWindows,
+          hwDecodeClips: spHwCount,
+          singlePass: false,
+          mode: "smart-render",
+          smartCleanSec: plan.cleanMs / 1000,
+          smartDirtySec: plan.dirtyMs / 1000,
+        };
+      } catch (err) {
+        if (err && err.message === "Export cancelled") throw err;
+        if (Date.now() - smartStart < 4000) {
+          console.warn("[framefuse] smart render failed at init — falling back to the two-step pool:", err.message);
+          return null;
         }
-      } else {
-        console.log(`[framefuse] single-pass skipped: ${eligibility.reason} → two-step pool`);
+        throw err;
       }
-    } else if (anyEncodeJob) {
-      console.log(`[framefuse] single-pass skipped: encode work ${(encodeWorkMs / 1000).toFixed(1)}s of ${(totalMs / 1000).toFixed(1)}s timeline is not dominant → TURBO pool`);
+    };
+
+    if (anyEncodeJob) {
+      const smartResult = await planSmartRenderingPipeline();
+      if (smartResult) return smartResult;
+      // (the pipeline logged why it fell back — the two-step pool below
+      // takes over with its per-clip jobs + concat + amix)
     }
 
     // ─── STEP 1 (run): PARALLEL encode + audio-extraction pool ────

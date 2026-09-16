@@ -350,9 +350,16 @@ export interface ExportResult {
    *  CPU-first chunked single-pass (W timeline windows rendered
    *  concurrently + one audio pass + concat/mux); "single-pass" = one
    *  process for the whole timeline (GPU boxes / short timelines);
-   *  "two-step" = the per-clip pool fallback; "gpu-webcodecs" = the v8
-   *  WebCodecs + Canvas engine (Export-tab engine selector). */
-  mode?: "single-pass" | "parallel-pass" | "two-step" | "gpu-webcodecs";
+   *  "two-step" = the per-clip pool fallback; "smart-render" = v9 True
+   *  Smart Rendering (clean time-ranges stream-copied at TURBO speed,
+   *  only the dirty windows re-encoded, stitched via the concat demuxer);
+   *  "gpu-webcodecs" = the v8 WebCodecs + Canvas engine (Export-tab
+   *  engine selector). */
+  mode?: "single-pass" | "parallel-pass" | "two-step" | "smart-render" | "gpu-webcodecs";
+  /** v9: True Smart Rendering telemetry — seconds of the timeline that
+   *  rode the stream-copy fast path vs the re-encode windows. */
+  smartCleanSec?: number;
+  smartDirtySec?: number;
   /** v1.5: W — the number of parallel single-pass windows (parallel-pass
    *  only; aliases totalChunks for that mode). */
   parallelChunks?: number;

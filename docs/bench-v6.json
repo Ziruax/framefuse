@@ -1,14 +1,162 @@
 {
   "box": "2× Intel(R) Xeon(R) Processor",
-  "fixtures": {},
+  "fixtures": {
+    "F1": {
+      "name": "kpi-shaped (12 clips + 2 chroma overlays + captions + music + xfade/dip)",
+      "runs": [
+        {
+          "label": "old-two-step",
+          "ms": 4620,
+          "spawns": 5,
+          "duration": 24,
+          "sizeKb": 5587859,
+          "copied": 0,
+          "encoded": 12,
+          "mode": "single-pass",
+          "progressEvents": 10
+        },
+        {
+          "label": "old+normalize",
+          "ms": 6460,
+          "spawns": 8,
+          "duration": 24,
+          "sizeKb": 5589786,
+          "copied": 0,
+          "encoded": 12,
+          "mode": "single-pass",
+          "progressEvents": 12
+        },
+        {
+          "label": "v6",
+          "ms": 5367,
+          "spawns": 5,
+          "duration": 24,
+          "sizeKb": 5588015,
+          "copied": 0,
+          "encoded": 1,
+          "mode": "smart-render",
+          "progressEvents": 14
+        },
+        {
+          "label": "v6+normalize",
+          "ms": 6122,
+          "spawns": 10,
+          "duration": 24,
+          "sizeKb": 5589942,
+          "copied": 0,
+          "encoded": 1,
+          "mode": "smart-render",
+          "progressEvents": 16
+        }
+      ]
+    },
+    "F2": {
+      "name": "turbo (1 clip, no effects — stream-copy fast path)",
+      "runs": [
+        {
+          "label": "old-two-step",
+          "ms": 350,
+          "spawns": 3,
+          "duration": 8,
+          "sizeKb": 1164915,
+          "copied": 1,
+          "encoded": 0,
+          "mode": "two-step",
+          "progressEvents": 6
+        },
+        {
+          "label": "old+normalize",
+          "ms": 653,
+          "spawns": 4,
+          "duration": 8,
+          "sizeKb": 1165090,
+          "copied": 1,
+          "encoded": 0,
+          "mode": "two-step",
+          "progressEvents": 6
+        },
+        {
+          "label": "v6",
+          "ms": 345,
+          "spawns": 3,
+          "duration": 8,
+          "sizeKb": 1164915,
+          "copied": 1,
+          "encoded": 0,
+          "mode": "two-step",
+          "progressEvents": 6
+        },
+        {
+          "label": "v6+normalize",
+          "ms": 755,
+          "spawns": 4,
+          "duration": 8,
+          "sizeKb": 1165090,
+          "copied": 1,
+          "encoded": 0,
+          "mode": "two-step",
+          "progressEvents": 6
+        }
+      ]
+    },
+    "F3": {
+      "name": "single-pass (10 clips + captions + 1 overlay)",
+      "runs": [
+        {
+          "label": "old-two-step",
+          "ms": 3433,
+          "spawns": 1,
+          "duration": 25,
+          "sizeKb": 6140317,
+          "copied": 0,
+          "encoded": 10,
+          "mode": "single-pass",
+          "progressEvents": 8
+        },
+        {
+          "label": "old+normalize",
+          "ms": 5493,
+          "spawns": 7,
+          "duration": 25,
+          "sizeKb": 6141519,
+          "copied": 0,
+          "encoded": 10,
+          "mode": "single-pass",
+          "progressEvents": 10
+        },
+        {
+          "label": "v6",
+          "ms": 3433,
+          "spawns": 3,
+          "duration": 25,
+          "sizeKb": 6140811,
+          "copied": 0,
+          "encoded": 1,
+          "mode": "smart-render",
+          "progressEvents": 11
+        },
+        {
+          "label": "v6+normalize",
+          "ms": 5083,
+          "spawns": 9,
+          "duration": 25,
+          "sizeKb": 6142426,
+          "copied": 0,
+          "encoded": 1,
+          "mode": "smart-render",
+          "progressEvents": 13
+        }
+      ]
+    }
+  },
   "f4ParallelPass": {
-    "mode": "parallel-pass",
-    "parallelChunks": 2,
+    "mode": "smart-render",
+    "parallelChunks": 4,
     "spawns": 8,
-    "ms": 6492,
+    "ms": 6287,
     "duration": 40,
     "expectedDuration": 40,
-    "progressEvents": 18,
+    "progressEvents": 24,
     "pass": true
   },
   "cancellation": {
