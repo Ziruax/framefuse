@@ -311,3 +311,69 @@ expansion bound the exposure); ± 1-source-frame jitter at boundaries on
 rate-mismatched sources (|srcFps − fps| < 0.06 spec gate); subtitle cues
 crossing a dirty-window boundary render partially per window (identical to
 the shipped chunk-boundary semantics).
+
+---
+
+## v1.10 — WebCodecs removed · dirty-reason telemetry · parallel temporal chunking
+
+**Architecture decision (permanent)**: the WebCodecs export engine is
+DELETED — `src/lib/export/{engine,SourceDecoder,ExportOrchestrator,AudioMixer,
+gpu-export-demo,index}.ts`, the `mp4-muxer`/`mp4box` dependencies, the
+Export-tab engine selector, the GPU status badge, the force-software toggle
+and every `gpu`/WebCodecs telemetry surface. Field data showed integrated-
+GPU memory-bus saturation (5–10 h exports, visual glitches) on exactly the
+low-end boxes the engine was meant to help. One FFmpeg codebase remains;
+the browser preview fallback is MediaRecorder (WebM) only.
+
+### Task 2 — smart-render diagnostic telemetry
+
+`planSmartSegments()` records WHY every dirty range is dirty and aggregates
+per cause (merged-within-cause ms, count, first→last span): "continuous
+subtitles from 0:00 to 19:00", "watermark over the full timeline",
+"framerate resample 29.97 -> 30fps", "resolution 1920x1080 -> 1280x720",
+"speed-changed clips", "mid-GOP trim heads", … The largest-share label
+ships as `smartDirtyReason` in the export result; when **0 % was copied**
+the completion toast reads "Full re-encode required: [reason]".
+
+### Task 3 — parallel temporal chunking for mostly-dirty timelines
+
+When the clean (stream-copyable) coverage falls **below 30 %** —
+continuous subtitles, a full-length watermark or a framerate resample made
+≥ 70 % of the timeline dirty — the irregular clean/dirty tiling buys too
+little to matter. The planner instead splits the timeline into
+**W = max(2, min(4, cpus)) equal temporal windows** (shrunk toward 2 for
+short timelines; boundaries nudged out of the fade/xfade forbidden extents
+so every transition stays whole inside ONE window):
+
+* each window renders through the SAME windowed single-pass graph the
+  dirty pieces use — the ASS subtitle events are **sliced to the window
+  with timestamps shifted relative to its start** (a crossing cue clamps
+  to the window edge), overlays/fades/xfade heads are windowed, and
+  `-frames:v` pins the exact slot count;
+* workers are **video-only** (`-an` by map selection — no AAC boundary
+  padding, no audio clicks), run **concurrently** in the pool with
+  `-threads floor(cores/W) -filter_threads floor(cores/W)` (1 each on the
+  4-core low-end target — the recipe; the single-threaded libass/overlay
+  filters stop stalling each other);
+* **hardware decode**: `-hwaccel d3d11va` (Windows; `auto` elsewhere) is
+  injected before `-i` on the re-encode inputs, gated by the existing
+  empirical probe (`probeHwDecode` measures the ACTUAL file CPU-vs-hw and
+  enables only when ≥ 1.3× faster — a broken driver stack stays on CPU
+  decode and the export never depends on the hwaccel engaging);
+* **the concat contract**: no clean pieces exist in this mode, so every
+  chunk pins `-video_track_timescale 90000` — the demuxer's offset math is
+  exact across all W workers;
+* **one global audio pass** renders the full-timeline bus (`-c:a aac
+  -ar 48000`) and the final stitch is the zero-transcode concat:
+  `ffmpeg -f concat -safe 0 -i concat.txt -i full_audio.m4a -c copy
+  -movflags +faststart final.mp4`, then every chunk/graph/ASS/audio temp
+  is deleted (plus the pre-flight orphan sweep).
+
+**Telemetry**: `mode: "parallel-pass"` + `parallelChunks` + the shared
+`smartDirtyReason` — the toast reads "4 parallel render passes · hardware
+decode · full re-encode: subtitles from 0:00 to 19:00".
+
+**Expected field outcome** (19-minute mostly-dirty timeline on a 4-core
+iGPU box): 4 concurrent single-threaded encode workers ≈ 4× the filter
+throughput of the monolith + 30–40 % CPU freed by d3d11va decode — the
+1.5 h export lands in the ~12–15 min range.

@@ -30,28 +30,6 @@ const G = require("./export-graph");
 // bun verification harness exactly like export-graph).
 const SP = require("./export-singlepass");
 
-// ── v8.1: FORCE GPU hardware acceleration (WebCodecs export engine) ────────
-// Electron silently falls back to SwiftShader (pure-CPU rendering) when the
-// GPU blocklist matches — old drivers, virtual displays, RDP sessions, or
-// background/offscreen windows. A WebCodecs VideoEncoder on SwiftShader
-// encodes at software speeds (the exact 1.5 FPS pathology), while the same
-// call inside a real GPU context rides the hardware encoder at 100+ fps.
-// These switches MUST be appended BEFORE app.whenReady() fires:
-//   ignore-gpu-blocklist      — use the GPU even when the driver version
-//                               matches Chromium's blocklist (the big one for
-//                               older Intel/AMD iGPU drivers on low-end quads)
-//   enable-gpu-rasterization — rasterize via the GPU (canvas paint path)
-//   enable-zero-copy          — avoid the GPU→CPU readback copy on frames
-//   disable-software-rasterizer — refuse SwiftShader instead of crawling
-// Field-debug escape hatch: FRAMEFUSE_NO_GPU_FLAGS=1 restores stock behavior
-// (e.g. a driver that hard-crashes on zero-copy).
-if (!process.env.FRAMEFUSE_NO_GPU_FLAGS) {
-  app.commandLine.appendSwitch("ignore-gpu-blocklist");
-  app.commandLine.appendSwitch("enable-gpu-rasterization");
-  app.commandLine.appendSwitch("enable-zero-copy");
-  app.commandLine.appendSwitch("disable-software-rasterizer");
-}
-
 // Resolve the FFmpeg binary path. v1.5: a FULL bundled build (staged by
 // scripts/fetch-windows-ffmpeg.js into resources/ffmpeg/<plat>/) is PREFERRED
 // over ffmpeg-static — it carries ffprobe.exe (fastProbe) plus the hardware
@@ -238,39 +216,6 @@ ipcMain.handle("export-info", async () => {
   return { encoder: enc.label, encoderName: enc.name, forced: !!forcedEncoderKey };
 });
 
-// v8.1: GPU acceleration status for the Export tab diagnostics — the in-app
-// equivalent of the Task Manager "Video Encode" graph check. Reports
-// Chromium's GPU feature status (compositing / webgl / rasterization) plus
-// the active adapter, so "GPU: disabled (software)" is visible without
-// opening Task Manager. WebCodecs hardware encoding requires this pipeline
-// to be live; SwiftShader here = the 1.5 FPS pathology.
-ipcMain.handle("gpu-status", async () => {
-  const base = {
-    ok: true,
-    featureStatus: null,
-    adapters: [],
-    switches: process.env.FRAMEFUSE_NO_GPU_FLAGS
-      ? "stock (FRAMEFUSE_NO_GPU_FLAGS set)"
-      : "forced-on (ignore-gpu-blocklist · gpu-rasterization · zero-copy · no-software-rasterizer)",
-    platform: process.platform,
-  };
-  try {
-    base.featureStatus = app.getGPUFeatureStatus();
-  } catch (e) {
-    base.featureStatus = null;
-  }
-  try {
-    const info = await app.getGPUInfo("basic");
-    const devices = info && info.gpu && Array.isArray(info.gpu.devices) ? info.gpu.devices : [];
-    base.adapters = devices.map((d) => ({
-      vendor: d.vendorString || "",
-      device: d.deviceString || "",
-      driver: d.driverVersion || "",
-    }));
-  } catch (_) { /* optional — status alone is enough */ }
-  return base;
-});
-
 // v8.1: force-encoder override (Export tab diagnostics). key ∈
 // {null, "nvenc", "qsv", "amf", "x264"} — null restores the v7 auto-probe.
 // Changing the key invalidates the session cache immediately and returns the
@@ -330,74 +275,6 @@ ipcMain.handle("choose-output", async () => {
   return res.filePath;
 });
 
-// ── v8 GPU (WebCodecs) export file streamer ────────────────────────────────
-// The renderer's WebCodecs pipeline muxes MP4 bytes and streams them to disk
-// in ~5 MB chunks so a 19-minute 1080p render never has to fit in RAM (the
-// v5.x browser fallback held the whole muxed file in an ArrayBufferTarget).
-// Fire-and-forget channels (ipcMain.on, not handle): the renderer drives the
-// whole export and reports its own progress/errors.
-let exportStream = null;
-
-// Begin a streamed export: end any previous stream, mkdir -p the parent
-// directory (absolute paths only), then open a truncating write stream.
-// Write errors are logged and the stream is dropped — never thrown — so a
-// failing disk can't crash the main process; the renderer's export-end
-// still runs and the caller surfaces the truncated file.
-ipcMain.on("export-start", (event, filePath) => {
-  try {
-    if (typeof filePath !== "string" || !filePath.trim() || !path.isAbsolute(filePath)) {
-      console.warn("[export-stream] export-start ignored: filePath must be a non-empty absolute path");
-      return;
-    }
-    if (exportStream) {
-      // A previous export never called export-end — close it cleanly so the
-      // file handle isn't left dangling on disk.
-      try { exportStream.end(); } catch (_) { /* already ended */ }
-      exportStream = null;
-    }
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-    const stream = fs.createWriteStream(filePath, { flags: "w" });
-    exportStream = stream;
-    stream.on("error", (err) => {
-      console.error("[export-stream] write failed:", err && err.message ? err.message : err);
-      // Drop the broken stream so a retried export-start opens a fresh one —
-      // but only if a retry hasn't already replaced it (compare identities).
-      try { stream.destroy(); } catch (_) { /* already destroyed */ }
-      if (exportStream === stream) exportStream = null;
-    });
-  } catch (e) {
-    console.error("[export-stream] export-start failed:", e && e.message ? e.message : e);
-  }
-});
-
-// Append one ~5 MB muxed chunk. No open stream (or a broken one) → warn and
-// ignore; whatever was already written stays on disk for export-end to close.
-ipcMain.on("export-chunk", (event, buffer) => {
-  if (!exportStream) {
-    console.warn("[export-stream] export-chunk ignored: no open export stream");
-    return;
-  }
-  try {
-    // Buffer.from copies the IPC-serialized bytes into a Node buffer the
-    // stream can own (input may arrive as Uint8Array or Buffer).
-    exportStream.write(Buffer.from(buffer));
-  } catch (e) {
-    console.error("[export-stream] chunk write failed:", e && e.message ? e.message : e);
-  }
-});
-
-// Finish the streamed export: end() flushes pending writes to disk, then the
-// handle is released. Safe to call with no open stream (idempotent no-op).
-ipcMain.on("export-end", () => {
-  if (!exportStream) return;
-  const stream = exportStream;
-  exportStream = null;
-  try {
-    stream.end();
-  } catch (e) {
-    console.error("[export-stream] export-end failed:", e && e.message ? e.message : e);
-  }
-});
 
 // ---------------------------------------------------------------------------
 // v5.1 NATIVE PROJECT FILES — save/open dialogs + recents (userData).
@@ -1642,12 +1519,18 @@ async function detectGpuEncoderAsync() {
 // land on a WARP/broken-driver path decoding 1080p at ~1 fps). But CPU
 // decode of 4K/H.265 sources is a real bottleneck on the re-encode path —
 // so instead of a blanket flag, we now MEASURE: decode 72 real frames of
-// the ACTUAL file twice (CPU vs -hwaccel auto) and enable hw decode only
+// the ACTUAL file twice (CPU vs -hwaccel <TOKEN>) and enable hw decode only
 // when it is ≥ 1.3× faster. Broken driver stacks lose the probe and stay
 // on CPU — the same evidence-over-assumption philosophy as the encoder
 // probe above. Both arms include the frame download (the null muxer forces
 // system-memory frames), which is the exact cost our software filter graph
 // pays. Cached per path; any error → CPU (never a failed export).
+//
+// v1.10 (Task 3): the token is the SAME one buildVideoInputArgs injects
+// (G.HWACCEL_TOKEN — d3d11va on Windows, auto elsewhere), so the probe
+// measures exactly what the real encode will run. A machine whose d3d11va
+// block init-fails (or decodes slower than CPU) simply stays on software
+// decode — the export never depends on the hwaccel engaging.
 // ---------------------------------------------------------------------------
 const hwDecodeCache = new Map();
 
@@ -1658,7 +1541,7 @@ async function probeHwDecode(path) {
     const FRAMES = 72;
     const arm = (hw) => [
       "-hide_banner", "-loglevel", "error",
-      ...(hw ? ["-hwaccel", "auto"] : []),
+      ...(hw ? ["-hwaccel", G.HWACCEL_TOKEN] : []),
       "-i", path,
       "-map", "0:v:0",
       "-frames:v", String(FRAMES),
@@ -3742,7 +3625,7 @@ ipcMain.handle("export-native", async (event, opts) => {
           const seg = segments[i];
           const isVideo = !!(seg && seg.mediaType === "video" && seg.videoPath);
           if (!isVideo || G.resolveSegSpeed(seg) !== 1) {
-            srcFacts.push({ copyCapable: false, keyframes: null, trimAligned: null, srcFps: 0 });
+            srcFacts.push({ copyCapable: false, keyframes: null, trimAligned: null, srcFps: 0, mismatch: null });
             continue;
           }
           const probe = await probeMediaAsync(seg.videoPath);
@@ -3756,7 +3639,26 @@ ipcMain.handle("export-native", async (event, opts) => {
             Math.abs((probe.fps || 0) - fps) < 0.06 &&
             srcDurMs > 0;
           if (!specOk) {
-            srcFacts.push({ copyCapable: false, keyframes: null, trimAligned: null, srcFps: Number(probe.fps) || 0, bFrames: 0, srcDurMs: 0 });
+            // v1.10 (Task 2): the human-readable WHY this source cannot ride
+            // -c copy — planSmartSegments surfaces it in the export telemetry
+            // ("framerate resample 29.97 -> 30fps", "resolution …").
+            const fpsOff = Math.abs((probe.fps || 0) - fps) >= 0.06;
+            const resOff = probe.width !== width || probe.height !== height;
+            let mismatch;
+            if (fpsOff && !resOff && probe.codec === "h264" && probe.pixFmt === "yuv420p" && !probe.rotated) {
+              mismatch = `framerate resample ${(Number(probe.fps) || 0).toFixed(2)} -> ${fps}fps`;
+            } else if (resOff) {
+              mismatch = `resolution ${probe.width}x${probe.height} -> ${width}x${height}`;
+            } else if (probe.codec !== "h264") {
+              mismatch = `codec ${probe.codec || "unknown"} (needs re-encode)`;
+            } else if (probe.rotated) {
+              mismatch = "rotated source metadata";
+            } else if (srcDurMs <= 0) {
+              mismatch = "unreadable source duration";
+            } else {
+              mismatch = `pixel format ${probe.pixFmt || "unknown"} (needs re-encode)`;
+            }
+            srcFacts.push({ copyCapable: false, keyframes: null, trimAligned: null, srcFps: Number(probe.fps) || 0, bFrames: 0, srcDurMs: 0, mismatch });
             continue;
           }
           const trimInMs = Number(seg.trimInMs) || 0;
@@ -3787,20 +3689,20 @@ ipcMain.handle("export-native", async (event, opts) => {
           });
         }
 
-        // ── Pool width + thread budgets (v7 Step 5 low-end caps) ─────────
+        // ── Pool width + thread budgets ──────────────────────────────────
+        // spWorkers bounds the SUB-SPLIT width of the smart path (the v7
+        // core-division scheme; GPU encoders serialize in one process). The
+        // v1.10 parallel-pass mode overrides the pool budget BELOW — it runs
+        // W = max(2, min(4, cpus)) equal temporal windows with ONE encode
+        // thread each (the recipe: W single-threaded workers share the cores
+        // without oversubscription — the single-threaded libass/overlay
+        // filters stop stalling each other).
         const isGpuEncoder = encoder.name !== "libx264";
         const spWorkers = isGpuEncoder
           ? 1
           : cpuCount >= 4
             ? Math.max(2, Math.min(4, Math.floor(cpuCount / 3)))
             : 1;
-        const poolWidth = Math.max(1, spWorkers);
-        let threadsPer = Math.max(1, Math.round(cpuCount / poolWidth));
-        let filterThreadsPer = Math.max(2, Math.min(8, Math.floor(cpuCount / poolWidth)));
-        if (lowEndX264) {
-          threadsPer = Math.max(1, Math.min(2, threadsPer));
-          filterThreadsPer = Math.max(1, Math.min(2, filterThreadsPer));
-        }
 
         // ── The plan (pure) ──────────────────────────────────────────────
         const plan = SP.planSmartSegments({
@@ -3818,10 +3720,35 @@ ipcMain.handle("export-native", async (event, opts) => {
           headlines,
           srcFacts,
           workerCount: spWorkers,
+          // v1.10 (Task 3): the equal-window parallel budget + the clean-
+          // coverage ratio that triggers it (<30 % copied → mostly dirty).
+          parallelWorkers: Math.max(2, Math.min(4, cpuCount)),
+          equalWindowRatio: 0.3,
         });
         if (!plan) {
           console.log("[framefuse] smart render skipped: planner returned no plan → two-step pool");
           return null;
+        }
+
+        // ── Mode-aware pool budget ───────────────────────────────────────
+        // Parallel-pass: W workers × floor(cores/W) encode threads (1 each
+        // on the 4-core low-end target — exactly the recipe; bigger boxes
+        // still fill every core). Smart path: the v7 division + low-end caps.
+        let poolWidth;
+        let threadsPer;
+        let filterThreadsPer;
+        if (plan.parallelMode) {
+          poolWidth = Math.max(1, plan.workerCount);
+          threadsPer = Math.max(1, Math.floor(cpuCount / poolWidth));
+          filterThreadsPer = threadsPer;
+        } else {
+          poolWidth = Math.max(1, spWorkers);
+          threadsPer = Math.max(1, Math.round(cpuCount / poolWidth));
+          filterThreadsPer = Math.max(2, Math.min(8, Math.floor(cpuCount / poolWidth)));
+          if (lowEndX264) {
+            threadsPer = Math.max(1, Math.min(2, threadsPer));
+            filterThreadsPer = Math.max(1, Math.min(2, filterThreadsPer));
+          }
         }
 
         // ── Audio branches + loudnorm (identical to the retired routes) ──
@@ -3895,10 +3822,15 @@ ipcMain.handle("export-native", async (event, opts) => {
 
         // ── The CONCAT CONTRACT reference timescale: the first clean ──────
         // piece's source track clock (dirty encodes write the same one).
+        // v1.10 (Task 3): the parallel-pass mode has NO clean pieces — every
+        // chunk is an encode, so they all pin the recipe's 90000 clock and
+        // the concat demuxer's offset math stays exact across all W workers.
         let videoTimescale = null;
         const firstClean = plan.pieces.find((p) => p.kind === "clean");
         if (firstClean) {
           videoTimescale = await probeVideoTimescale(segments[firstClean.segIdx].videoPath);
+        } else if (plan.parallelMode) {
+          videoTimescale = 90000;
         }
 
         // ── PHASE 3: build the pool jobs over the pieces ─────────────────
@@ -4007,13 +3939,18 @@ ipcMain.handle("export-native", async (event, opts) => {
             }),
             durSec: piece.durMs / 1000,
             durationMs: piece.durMs,
-            segId: `smart window ${dirtyWindows}/${dirtyTotal}`,
+            segId: plan.parallelMode
+              ? `parallel window ${dirtyWindows}/${dirtyTotal}`
+              : `smart window ${dirtyWindows}/${dirtyTotal}`,
           });
         }
         if (overBudget) return null;
 
         console.log(
-          `[framefuse] SMART RENDER: ${cleanCopies} clean stream-copy piece(s) (${(plan.cleanMs / 1000).toFixed(1)}s) + ${dirtyWindows} dirty window(s) (${(plan.dirtyMs / 1000).toFixed(1)}s) over ${(totalMs / 1000).toFixed(1)}s — ${plan.zones.map((z) => z.why.join("+")).join(", ") || "no zones"}`,
+          `[framefuse] ${plan.parallelMode ? "PARALLEL PASS" : "SMART RENDER"}: ${cleanCopies} clean stream-copy piece(s) (${(plan.cleanMs / 1000).toFixed(1)}s) + ${dirtyWindows} dirty window(s) (${(plan.dirtyMs / 1000).toFixed(1)}s) over ${(totalMs / 1000).toFixed(1)}s — ${plan.zones.map((z) => z.why.join("+")).join(", ") || "no zones"}` +
+            (plan.reasons && plan.reasons.length
+              ? ` · reasons: ${plan.reasons.map((r) => `${r.label} (${Math.round(r.share * 100)}%)`).join("; ")}`
+              : ""),
         );
 
         // ── PHASE 3 (run): ONE pool over copies + dirty windows ───────────
@@ -4156,9 +4093,17 @@ ipcMain.handle("export-native", async (event, opts) => {
           parallelChunks: dirtyWindows,
           hwDecodeClips: spHwCount,
           singlePass: false,
-          mode: "smart-render",
+          // v1.10: the parallel-pass mode (≥70 % dirty → W equal temporal
+          // windows, 1 encode thread each) reports as "parallel-pass" so the
+          // toast carries the multi-worker story; mixed timelines keep
+          // "smart-render".
+          mode: plan.parallelMode ? "parallel-pass" : "smart-render",
           smartCleanSec: plan.cleanMs / 1000,
           smartDirtySec: plan.dirtyMs / 1000,
+          // v1.10 (Task 2): the primary human-readable dirty reason — the
+          // toast shows "Full re-encode required: [reason]" when 0 % was
+          // copied.
+          smartDirtyReason: plan.primaryReason || undefined,
         };
       } catch (err) {
         if (err && err.message === "Export cancelled") throw err;

@@ -1,8 +1,9 @@
 // src/lib/merger/native.ts — export orchestration
-// Primary: native FFmpeg (Electron). Browser preview fallbacks:
-//   1. WebCodecs + mp4-muxer (fast MP4)
-//   2. MediaRecorder (real-time WebM)
-import { Muxer, ArrayBufferTarget } from "mp4-muxer";
+// Primary: native FFmpeg (Electron). Browser preview fallback:
+//   MediaRecorder (real-time WebM)
+// v1.10: the WebCodecs + mp4-muxer browser exporter was REMOVED together
+//   with the desktop WebCodecs engine — one FFmpeg architecture, zero
+//   mp4-muxer dependency. Browser preview exports ride MediaRecorder.
 import type {
   AudioSettings,
   ChromaKeySettings,
@@ -672,205 +673,7 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
 }
 
 // ---------------------------------------------------------------------------
-// Browser fallback 1: WebCodecs + mp4-muxer (fast MP4)
-// ---------------------------------------------------------------------------
-async function exportViaWebCodecs(
-  opts: ExportNativeOptions,
-): Promise<ExportResult> {
-  const {
-    segments,
-    imageUrls,
-    settings,
-    kenBurns,
-    totalMs,
-    onProgress,
-    signal,
-    subtitles,
-    captionSettings,
-  } = opts;
-
-  // v5.0 media features (video sources / overlay lanes / chroma key / SFX)
-  // are desktop-app only — fail with a clear typed error before any work.
-  assertBrowserExportSupport(opts);
-
-  const W = typeof window !== "undefined" ? (window as any) : null;
-  const VideoEncoderCtor = W?.VideoEncoder;
-  const VideoFrameCtor = W?.VideoFrame;
-  if (!VideoEncoderCtor || !VideoFrameCtor) {
-    throw new Error("NO_WEBCODECS");
-  }
-
-  // Cap browser export at 720p for performance.
-  const dims = resolveDimensions(settings.aspect, "720p");
-  const fps = settings.fps;
-  const totalFrames = Math.max(1, Math.round((totalMs / 1000) * fps));
-
-  const canvas = document.createElement("canvas");
-  canvas.width = dims.w;
-  canvas.height = dims.h;
-  const ctx = canvas.getContext("2d", { alpha: false })!;
-
-  // Preload all images.
-  const imgCache = new Map<string, HTMLImageElement>();
-  await Promise.all(
-    segments.map(
-      (seg) =>
-        new Promise<void>((resolve) => {
-          const url = imageUrls[seg.id] || seg.thumbnailUrl;
-          const img = new Image();
-          img.onload = () => {
-            imgCache.set(seg.id, img);
-            resolve();
-          };
-          img.onerror = () => resolve();
-          img.src = url;
-        }),
-    ),
-  );
-
-  const muxer = new Muxer({
-    target: new ArrayBufferTarget(),
-    video: { codec: "avc", width: dims.w, height: dims.h },
-    fastStart: "in-memory",
-  });
-
-  const bitrate = Math.round(browserQualityBitrate(settings));
-  // Pick an H.264 codec string appropriate for the resolution.
-  const codec =
-    dims.w * dims.h <= 1280 * 720 ? "avc1.42E01E" : "avc1.4D4028";
-
-  let encodeError: any = null;
-  const encoder = new VideoEncoderCtor({
-    output: (chunk: any, meta: any) => muxer.addVideoChunk(chunk, meta),
-    error: (e: any) => {
-      encodeError = e;
-    },
-  });
-
-  encoder.configure({
-    codec,
-    width: dims.w,
-    height: dims.h,
-    bitrate,
-    framerate: fps,
-    avc: { format: "avc" },
-  });
-
-  const frameDurationUs = Math.round(1_000_000 / fps);
-
-  // Precompute caption drawing options once.
-  const drawCaptions =
-    captionSettings?.enabled && subtitles && subtitles.cues.length > 0
-      ? (currentMsLocal: number) => {
-          const cue = cueAt(subtitles.cues, currentMsLocal);
-          if (!cue) return;
-          // Pass per-word timestamps + current time + cue window +
-          // animation so the word-mode presets and kinetic typography
-          // animations render identically to the preview.
-          const capCtx = {
-            ...captionSettings,
-            words: cue.words,
-            currentMs: currentMsLocal,
-            cueStartMs: cue.startMs,
-            cueEndMs: cue.endMs,
-          };
-          drawCaption(ctx, cue.text, capCtx, dims.w, dims.h);
-        }
-      : null;
-
-  // Headline overlay items (v4.2) — drawn under captions.
-  const headlineItems =
-    opts.headlines && opts.headlines.length > 0 ? opts.headlines : null;
-
-  // v4.3 transitions — scratch canvas for the head composite + global fades.
-  const transition = opts.transition ?? null;
-  const scratch = document.createElement("canvas");
-  scratch.width = dims.w;
-  scratch.height = dims.h;
-
-  // v4.4 watermark — drawn UNDER headlines + captions (same as the export).
-  const wmImage =
-    opts.watermark?.imageUrl
-      ? await loadImageElement(opts.watermark.imageUrl)
-      : null;
-  const wmSettings = opts.watermark?.settings ?? null;
-
-  for (let i = 0; i < totalFrames; i++) {
-    if (signal?.aborted) {
-      try {
-        encoder.close();
-      } catch {
-        /* noop */
-      }
-      throw new Error("Export cancelled");
-    }
-    if (encodeError) throw encodeError;
-
-    const currentMs = (i / fps) * 1000;
-    const segIdx = segments.findIndex(
-      (s) => currentMs >= s.startMs && currentMs < s.endMs,
-    );
-    const seg =
-      segIdx >= 0 ? segments[segIdx] : segments[segments.length - 1];
-    const img = seg ? imgCache.get(seg.id) : null;
-    if (seg) {
-      drawFrameWithTransition(
-        ctx, scratch, seg, Math.max(0, segIdx), segments, img ?? null,
-        imgCache, currentMs, dims.w, dims.h, kenBurns, transition,
-      );
-    }
-    if (wmImage && wmSettings) {
-      drawWatermark(ctx, wmImage, dims.w, dims.h, wmSettings);
-    }
-    if (headlineItems) drawHeadline(ctx, headlineItems, currentMs, dims.w, dims.h);
-    if (drawCaptions) drawCaptions(currentMs);
-    // Global fades AFTER captions (mirrors fade-after-subtitles in FFmpeg).
-    if (seg) {
-      applyGlobalFade(
-        ctx, scratch,
-        computeGlobalFade(
-          segments, Math.max(0, segments.indexOf(seg)), currentMs, transition,
-        ),
-      );
-    }
-
-    const frame = new VideoFrameCtor(canvas, {
-      timestamp: i * frameDurationUs,
-      duration: frameDurationUs,
-    });
-    encoder.encode(frame, { keyFrame: i % (fps * 2) === 0 });
-    frame.close();
-
-    // Backpressure: don't queue too many frames.
-    if (encoder.encodeQueueSize > 8) {
-      await new Promise((r) => setTimeout(r, 4));
-    }
-
-    onProgress?.({
-      progress: ((i + 1) / totalFrames) * 100,
-      fps: 0,
-      timemark: undefined,
-    });
-  }
-
-  await encoder.flush();
-  if (encodeError) throw encodeError;
-  muxer.finalize();
-  encoder.close();
-
-  const { buffer } = muxer.target as ArrayBufferTarget;
-  const blob = new Blob([buffer], { type: "video/mp4" });
-
-  // Trigger a browser download (no native save dialog).
-  const downloadUrl = URL.createObjectURL(blob);
-  triggerDownload(downloadUrl, `framefuse_${Date.now()}.mp4`);
-  setTimeout(() => URL.revokeObjectURL(downloadUrl), 60000);
-
-  return { path: "(browser download) framefuse.mp4", size: blob.size };
-}
-
-// ---------------------------------------------------------------------------
-// Browser fallback 2: MediaRecorder (real-time WebM)
+// Browser fallback: MediaRecorder (real-time WebM)
 // ---------------------------------------------------------------------------
 async function exportViaMediaRecorder(
   opts: ExportNativeOptions,
@@ -1092,9 +895,8 @@ interface CanvasCaptionCtx {
   cueEndMs?: number;
 }
 
-// v8: the caption-render context shape is shared with the GPU (WebCodecs)
-// export engine (src/lib/export/engine.ts builds the same capCtx objects
-// the browser path builds) — exported as a TYPE-only alias.
+// The caption-render context shape is shared by the browser export path and
+// the preview — exported as a TYPE-only alias.
 export type { CanvasCaptionCtx };
 
 /**
@@ -2439,8 +2241,9 @@ function drawRoundedRect(
 
 /**
  * Export the timeline to video.
- * - Inside Electron: native FFmpeg (MP4).
- * - In a browser: WebCodecs MP4 (fast), falling back to MediaRecorder WebM.
+ * - Inside Electron: native FFmpeg (MP4) — the ONLY export engine (v1.10:
+ *   the WebCodecs engine was removed; one reliable FFmpeg codebase).
+ * - In a browser: MediaRecorder WebM (preview convenience).
  */
 export async function exportNative(
   opts: ExportNativeOptions,
@@ -2448,25 +2251,7 @@ export async function exportNative(
   if (isElectron()) {
     return exportViaFFmpeg(opts);
   }
-  try {
-    return await exportViaWebCodecs(opts);
-  } catch (err: any) {
-    if (err?.message === "Export cancelled") throw err;
-    // v5.0: desktop-only media features — surface the clear error as-is
-    // (do NOT fall through to MediaRecorder, which cannot render them).
-    if (err?.message === DESKTOP_ONLY_EXPORT_MSG) throw err;
-    if (err?.message === "NO_WEBCODECS") {
-      return exportViaMediaRecorder(opts);
-    }
-    // WebCodecs encoding failure → fall back to MediaRecorder.
-    try {
-      return await exportViaMediaRecorder(opts);
-    } catch (err2: any) {
-      throw new Error(
-        `Export failed: ${err2?.message || err2}. WebCodecs error: ${err?.message || err}`,
-      );
-    }
-  }
+  return exportViaMediaRecorder(opts);
 }
 
 /** Convenience: find the active segment for a time (re-exported helper). */

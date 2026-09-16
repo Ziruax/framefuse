@@ -13,11 +13,6 @@ contextBridge.exposeInMainWorld("electronAPI", {
   //   encoderName: "h264_nvenc" | … | "libx264", forced: boolean }
   getExportInfo: () => ipcRenderer.invoke("export-info"),
 
-  // v8.1: GPU acceleration status (in-app Task Manager check).
-  // { ok, featureStatus: {gpu_compositing, webgl, rasterization, …},
-  //   adapters: [{vendor, device, driver}], switches, platform }
-  getGpuStatus: () => ipcRenderer.invoke("gpu-status"),
-
   // v8.1: force-encoder probe bypass (diagnostics). key ∈
   // {null,"nvenc","qsv","amf","x264"} → { ok, forced, encoder, encoderName }.
   setForceEncoder: (key) => ipcRenderer.invoke("export:set-force-encoder", key),
@@ -83,14 +78,6 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   // v4.1: export the full-timeline ASS subtitle sidecar.
   exportAssFile: (opts) => ipcRenderer.invoke("export-ass-file", opts),
-
-  // v8 GPU export streamer — WebCodecs renderer pipeline → disk (5 MB chunks).
-  // exportStart(filePath) truncates/creates the output file (mkdir -p parent),
-  // exportChunk(buffer) appends bytes, exportEnd() closes the handle. The
-  // muxed MP4 never has to fit in renderer RAM.
-  exportStart: (filePath) => ipcRenderer.send("export-start", filePath),
-  exportChunk: (buffer) => ipcRenderer.send("export-chunk", buffer),
-  exportEnd: () => ipcRenderer.send("export-end"),
 
   onExportProgress: (callback) => {
     const handler = (_event, data) => callback(data);

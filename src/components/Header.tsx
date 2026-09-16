@@ -36,13 +36,14 @@ export interface LastExport {
   hwDecodeClips?: number;
   /** v1.5: parallel single-pass windows (CPU-first chunked export). */
   parallelChunks?: number;
-  mode?: "single-pass" | "parallel-pass" | "two-step" | "smart-render" | "gpu-webcodecs";
+  mode?: "single-pass" | "parallel-pass" | "two-step" | "smart-render";
   /** v9: True Smart Rendering — clean seconds copied vs dirty seconds
    *  re-encoded. */
   smartCleanSec?: number;
   smartDirtySec?: number;
-  /** v8 (Task 27-a): GPU (WebCodecs) engine exported video-only (no AAC). */
-  audioSkipped?: boolean;
+  /** v1.10: the primary dirty reason ("subtitles from 0:00 to 19:00"…) —
+   *  shown by the completion toast when nothing could be stream-copied. */
+  smartDirtyReason?: string;
 }
 
 interface HeaderProps {
@@ -123,16 +124,6 @@ export function Header({
   // v1.8.2: sub-10% shows ONE DECIMAL — a 19-minute export spends its first
   // minutes below 1% and an integer "0%" read as "stuck / not working".
   const pctLabel = pct < 10 && pct > 0 ? pct.toFixed(1) : pct.toFixed(0);
-  const stageLabel =
-    exportProgress?.stage === "preparing"
-      ? "Preparing"
-      : exportProgress?.stage === "finalizing"
-        ? "Finalizing"
-        : null;
-  const frameLabel =
-    exportProgress?.totalFrames != null && exportProgress.totalFrames > 0
-      ? `${(exportProgress.framesEncoded ?? 0).toLocaleString()} / ${exportProgress.totalFrames.toLocaleString()} frames`
-      : null;
   // v4.5 export estimate: bitrate × duration / 8 → MB cap (CRF encodes
   // usually come out smaller; NVENC maxrate caps near this).
   const estMb = settings ? (settings.bitrateMbps * (totalMs / 1000)) / 8 : 0;
@@ -180,9 +171,9 @@ export function Header({
                 backgroundColor: "#18181b",
                 color: "#a1a1aa",
               }}
-              title="FrameFuse v1.9.0 — multi-track video studio · True Smart Rendering export (clean ranges stream-copied, only dirty windows re-encoded) + dual-engine: FFmpeg Smart and the GPU (WebCodecs) full multi-track compositor"
+              title="FrameFuse v1.10.0 — multi-track video studio · True Smart Rendering FFmpeg export (clean ranges stream-copied, dirty timelines split into 2–4 parallel render passes with hardware decode)"
             >
-              v1.9.0
+              v1.10.0
             </span>
             {/* v5.1: on-disk project file chip (native save/open sessions). */}
             {projectName && (
@@ -317,23 +308,6 @@ export function Header({
             >
               {pctLabel}%
             </span>
-            {stageLabel ? (
-              <span
-                className="animate-pulse"
-                style={{ color: "#a78bfa" }}
-                title="The GPU engine spends the first seconds loading sources and setting up the encoder — the frame counter below starts moving as soon as the first frame encodes"
-              >
-                {stageLabel}…
-              </span>
-            ) : frameLabel ? (
-              <span
-                className="hidden lg:inline"
-                style={{ color: "#71717a" }}
-                title="Frames encoded so far / total — the frame counter moves even when the rounded percentage stays at 0%"
-              >
-                {frameLabel}
-              </span>
-            ) : null}
             {exportProgress?.fps ? (
               <span style={{ color: "#71717a" }}>
                 {exportProgress.fps.toFixed(0)} fps
@@ -529,7 +503,7 @@ export function Header({
         title={
           inElectron
             ? "Native FFmpeg encoding (GPU-accelerated when available) — export matches the preview"
-            : "Browser preview mode — WebCodecs/MediaRecorder fallback"
+            : "Browser preview mode — MediaRecorder fallback"
         }
         aria-label={inElectron ? "Native FFmpeg export" : "Browser export"}
       >

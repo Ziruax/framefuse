@@ -693,14 +693,30 @@ function chromaDespillType(color) {
 // ---------------------------------------------------------------------------
 
 /**
- * Input args for a base-lane video segment: `[-hwaccel auto]? -ss <trimIn/1000>
+ * v1.10 (Task 3): the hardware-DECODE token injected before -i on the
+ * re-encode paths. Windows uses the dedicated d3d11va block (present on
+ * every Intel/AMD integrated chip — it frees 30–40 % of the CPU cycles a
+ * software decode would burn); other platforms use `auto` (vaapi on Linux,
+ * videotoolbox on macOS) with its silent software fallback. WITHOUT
+ * -hwaccel_output_format the decoded frames are downloaded to system
+ * memory, so the software filter graphs (subtitles/overlay/scale) and the
+ * libx264 encoder keep working unchanged — argv validity never depends on
+ * the hwaccel actually engaging. The empirical probe in main.js
+ * (probeHwDecode) measures THIS token on the actual file before any
+ * injection, so a broken driver stack simply stays on CPU decode.
+ */
+const HWACCEL_TOKEN = process.platform === "win32" ? "d3d11va" : "auto";
+
+/**
+ * Input args for a base-lane video segment: `[-hwaccel TOKEN]? -ss <trimIn/1000>
  * [-t <sourceWindow/1000>]? -i <path>`.
  * (The clip-duration `-t` is an OUTPUT option appended by buildClipArgs —
  * identical semantics to the v4.9 `-loop 1 -i img … -t dur` layout.)
- * v5.1: `o.hwaccel` prepends `-hwaccel auto` — hardware DECODE (d3d11va on
- * Windows) with silent software fallback. Frames still cross to system
- * memory for the CPU filter graph, so argv validity never changes; the flag
- * is absent by default, keeping every pre-v5.1 call byte-identical.
+ * v5.1: `o.hwaccel` prepends the hardware-decode token — hardware DECODE
+ * (d3d11va on Windows, v1.10) with the probe gate in main.js. Frames still
+ * cross to system memory for the CPU filter graph, so argv validity never
+ * changes; the flag is absent by default, keeping every pre-v5.1 call
+ * byte-identical.
  * v5.1: `o.durMs` (SOURCE window, ms) adds the input `-t` so a sped-up clip
  * demuxes exactly the window setpts will retime. Absent (speed 1) → no `-t`,
  * byte-identical to the pre-v5.1 argv.
@@ -714,7 +730,7 @@ function buildVideoInputArgs(o) {
     o && o.ssSec != null
       ? o.ssSec
       : fmt3(Math.max(0, Number(o && o.trimInMs) || 0));
-  const hw = o && o.hwaccel ? ["-hwaccel", "auto"] : [];
+  const hw = o && o.hwaccel ? ["-hwaccel", HWACCEL_TOKEN] : [];
   const durMs = Number(o && o.durMs);
   const t =
     o && Number.isFinite(durMs) && durMs > 0
@@ -1840,6 +1856,8 @@ module.exports = {
   // base video clip builders
   buildVideoInputArgs,
   buildVideoFilterChain,
+  // v1.10 (Task 3): the platform hardware-decode token (d3d11va on Windows)
+  HWACCEL_TOKEN,
   // overlay builders
   overlayWindow,
   buildOverlayVideoInputArgs,

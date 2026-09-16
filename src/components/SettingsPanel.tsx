@@ -161,15 +161,6 @@ interface SettingsPanelProps {
   onRemoveHeadline: (id: string) => void;
   /** Master timeline duration (for headline default windows). */
   totalMs: number;
-  /** v8 (Task 27-a): export engine — "ffmpeg" (FFmpeg Smart, default) vs
-   *  "gpu" (WebCodecs + Canvas, beta). Drives handleExport's branch. */
-  engine: "ffmpeg" | "gpu";
-  onEngineChange: (e: "ffmpeg" | "gpu") => void;
-  /** v1.8.2: GPU-engine diagnostics — skip the prefer-hardware encoder rung
-   *  (the WebCodecs twin of the FFmpeg force-encoder bypass). When a GPU
-   *  driver accepts the stream but never encodes, this unblocks the export. */
-  gpuForceSoftware: boolean;
-  onGpuForceSoftwareChange: (v: boolean) => void;
   /** v5.1: assign a random transition mix to every boundary (page owns the
    *  base-lane boundary list; one commit = one undo step). */
   onRandomMix?: () => void;
@@ -507,12 +498,6 @@ export function SettingsPanel(props: SettingsPanelProps) {
     onRandomMix,
     boundaryCount,
     debug,
-    // v8 (Task 27-a): export engine selector (Export tab).
-    engine,
-    onEngineChange,
-    // v1.8.2: GPU-engine force-software diagnostics toggle.
-    gpuForceSoftware,
-    onGpuForceSoftwareChange,
     // v1 Chroma tab target + edit pipeline (page.tsx computes).
     chromaTarget,
     onSetItemEdit,
@@ -580,58 +565,14 @@ export function SettingsPanel(props: SettingsPanelProps) {
     };
   }, [inElectron]);
 
-  // ── v8 (Task 27-a): WebCodecs availability for the GPU engine card.
-  // Computed AFTER mount (a render-time typeof check would mismatch the
-  // SSR'd markup — the server has no VideoEncoder, a Chromium client does).
-  const [webCodecsAvailable, setWebCodecsAvailable] = useState(true);
-  useEffect(() => {
-    // One-shot capability sync with the browser "external system" (SSR has
-    // no VideoEncoder; a Chromium client does — a render-time check would
-    // mismatch the server markup).
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setWebCodecsAvailable(
-      typeof window !== "undefined" &&
-        typeof (window as Window & { VideoEncoder?: unknown }).VideoEncoder !== "undefined" &&
-        typeof (window as Window & { VideoFrame?: unknown }).VideoFrame !== "undefined",
-    );
-  }, []);
-
-  // ── v8.1 (Task 27-b): GPU acceleration status — the in-app equivalent of
-  // the Task Manager "Video Encode" graph check. Electron only, feature-
-  // detected (older shells simply don't render the chip).
-  const [gpuStatus, setGpuStatus] = useState<{
-    ok: boolean;
-    featureStatus: Record<string, string> | null;
-    adapters: Array<{ vendor: string; device: string; driver: string }>;
-    switches: string;
-    platform: string;
-  } | null>(null);
-  useEffect(() => {
-    if (!inElectron) return;
-    const api = window.electronAPI;
-    if (typeof api?.getGpuStatus !== "function") return;
-    let cancelled = false;
-    api
-      .getGpuStatus()
-      .then((status) => {
-        if (!cancelled && status && status.ok) setGpuStatus(status);
-      })
-      .catch(() => {
-        /* diagnostics only — the badge stays hidden */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [inElectron]);
-
-  // v8.1 (Task 27-b): force-encoder probe bypass — capability flag (render-
+  // ── v8.1 (Task 27-b): force-encoder probe bypass — capability flag (render-
   // safe: window is only touched inside the effect) + the change handler.
   const [canForceEncoder, setCanForceEncoder] = useState(false);
   useEffect(() => {
     if (!inElectron) return;
     const api = window.electronAPI;
-    // One-shot capability sync with the preload bridge (see the
-    // webCodecsAvailable note above for why this is effect-gated).
+    // One-shot capability sync with the preload bridge (computed AFTER mount
+    // so the SSR'd markup — which has no window — never mismatches).
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setCanForceEncoder(typeof api?.setForceEncoder === "function");
   }, [inElectron]);
@@ -1102,250 +1043,65 @@ export function SettingsPanel(props: SettingsPanelProps) {
             tab === "export" ? "ff-tab-panel-in" : "hidden",
           )}
         >
-          {/* ─── v8 (Task 27-a): ENGINE selector — which pipeline the Export
-              button drives. FFmpeg Smart (default: every feature, v9 True
-              Smart Rendering) vs GPU (WebCodecs) beta (the v8 zero-FFmpeg
-              hardware pipeline) so users can A/B test the two engines. ───────────── */}
+          {/* ─── v1.10: ENGINE — the FFmpeg pipeline is the one and only
+              export engine (the WebCodecs engine was removed: it saturated
+              integrated-GPU memory buses on low-end boxes). The card is a
+              status surface, not a selector — it carries the encoder probe
+              badge + the smart-render story. ───────────────────────────── */}
           <Section icon={<Zap size={13} />} title="Engine" defaultOpen>
             <div
-              role="radiogroup"
-              aria-label="Export engine"
-              className="grid gap-1.5"
-              onKeyDown={(e) => {
-                if (
-                  e.key !== "ArrowDown" &&
-                  e.key !== "ArrowUp" &&
-                  e.key !== "ArrowLeft" &&
-                  e.key !== "ArrowRight"
-                )
-                  return;
-                e.preventDefault();
-                if (webCodecsAvailable) onEngineChange(engine === "ffmpeg" ? "gpu" : "ffmpeg");
+              className="flex flex-col items-start gap-1 rounded-lg border p-2.5 text-left"
+              style={{
+                borderColor: "rgba(167, 139, 250, 0.65)",
+                backgroundColor: "rgba(139, 92, 246, 0.12)",
               }}
             >
-              {/* ── FFmpeg Smart (default engine) ─────────────────────────── */}
-              <button
-                type="button"
-                role="radio"
-                aria-checked={engine === "ffmpeg"}
-                onClick={() => onEngineChange("ffmpeg")}
-                className="flex flex-col items-start gap-1 rounded-lg border p-2.5 text-left transition-all duration-200"
-                style={
-                  engine === "ffmpeg"
-                    ? {
-                        borderColor: "rgba(167, 139, 250, 0.65)",
-                        backgroundColor: "rgba(139, 92, 246, 0.12)",
-                      }
-                    : { borderColor: "#27272a", backgroundColor: "#141416" }
-                }
-              >
-                <span className="flex w-full items-center justify-between gap-2">
-                  <span
-                    className="text-[11px] font-bold"
-                    style={{ color: engine === "ffmpeg" ? "#c4b5fd" : "#d4d4d8" }}
-                  >
-                    FFmpeg Smart
-                  </span>
-                  {engine === "ffmpeg" && (
-                    <span
-                      className="rounded px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wide"
-                      style={{
-                        backgroundColor: "rgba(167, 139, 250, 0.18)",
-                        color: "#a78bfa",
-                      }}
-                    >
-                      active
-                    </span>
-                  )}
+              <span className="flex w-full items-center justify-between gap-2">
+                <span className="text-[11px] font-bold" style={{ color: "#c4b5fd" }}>
+                  FFmpeg Smart Render
                 </span>
-                <span className="text-[9px] leading-relaxed" style={{ color: "#71717a" }}>
-                  True Smart Rendering: clean ranges stream-copied, only the
-                  edited windows re-encoded · iGPU (QSV/AMF/NVENC) when
-                  available
-                </span>
-                {/* v5.1: encoder badge — bordered chip, Zap (GPU) / Cpu
-                    (software) icon + label. Lives INSIDE the FFmpeg card
-                    because it describes this engine's probe result
-                    (Electron only; hidden in the browser). v8.1: shows the
-                    forced state when the probe was bypassed. */}
-                {exportInfo && (
-                  <span
-                    className="mt-1 flex w-full flex-wrap items-center gap-x-1.5 gap-y-0.5 rounded border px-1.5 py-1 text-[9px] font-medium"
-                    style={{
-                      borderColor: "rgba(14, 116, 144, 0.55)",
-                      backgroundColor: "rgba(8, 51, 68, 0.25)",
-                      color: "#67e8f9",
-                    }}
-                    title={`Exports encode with ${exportInfo.encoderName} (${exportInfo.encoder})`}
-                  >
-                    {/nvenc|qsv|amf|videotoolbox|hw/i.test(exportInfo.encoder) ? (
-                      <Zap size={11} aria-hidden />
-                    ) : (
-                      <Cpu size={11} aria-hidden />
-                    )}
-                    Video encoder: {exportInfo.encoderName}
-                    {exportInfo.forced ? " (forced, probe bypassed)" : ""}
-                  </span>
-                )}
-              </button>
-
-              {/* ── GPU (WebCodecs) · beta ────────────────────────────────── */}
-              <button
-                type="button"
-                role="radio"
-                aria-checked={engine === "gpu"}
-                aria-disabled={!webCodecsAvailable}
-                onClick={() => webCodecsAvailable && onEngineChange("gpu")}
-                disabled={!webCodecsAvailable}
-                title={
-                  webCodecsAvailable
-                    ? "Zero-FFmpeg render: hardware decode → canvas → hardware encode, streamed to disk in 5 MB chunks"
-                    : "Unavailable — this browser lacks the WebCodecs API. Use a Chromium-based browser or the FrameFuse desktop app."
-                }
-                className="flex flex-col items-start gap-1 rounded-lg border p-2.5 text-left transition-all duration-200 disabled:cursor-not-allowed disabled:opacity-60"
-                style={
-                  engine === "gpu" && webCodecsAvailable
-                    ? {
-                        borderColor: "rgba(167, 139, 250, 0.65)",
-                        backgroundColor: "rgba(139, 92, 246, 0.12)",
-                      }
-                    : { borderColor: "#27272a", backgroundColor: "#141416" }
-                }
-              >
-                <span className="flex w-full items-center justify-between gap-2">
-                  <span
-                    className="text-[11px] font-bold"
-                    style={{ color: engine === "gpu" ? "#c4b5fd" : "#d4d4d8" }}
-                  >
-                    GPU (WebCodecs)
-                  </span>
-                  <span
-                    className="rounded px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wide"
-                    style={{
-                      backgroundColor: "rgba(167, 139, 250, 0.18)",
-                      color: "#a78bfa",
-                    }}
-                  >
-                    beta
-                  </span>
-                </span>
-                <span className="text-[9px] leading-relaxed" style={{ color: "#71717a" }}>
-                  Zero-FFmpeg multi-track render: hardware decode → canvas
-                  compositor (overlays · chroma key · PIP audio · SFX) →
-                  hardware encode, streamed to disk in 5 MB chunks
-                </span>
-                {/* Plain-browser note: unlike the legacy browser fallback
-                    (720p in-memory), the GPU engine exports at FULL res. */}
-                {!inElectron && webCodecsAvailable && (
-                  <span className="text-[9px]" style={{ color: "#8b7cb0" }}>
-                    Browser preview exports at full resolution — no 720p cap.
-                  </span>
-                )}
-                {!webCodecsAvailable && (
-                  <span className="text-[9px]" style={{ color: "#fca5a5" }}>
-                    Unavailable — this browser lacks the WebCodecs API (needs a
-                    Chromium-based browser or the desktop app).
-                  </span>
-                )}
-              </button>
-            </div>
-            {/* v1.8.2 — GPU-engine diagnostics: skip the hardware encoder
-                rung. Mirrors the FFmpeg force-encoder bypass above: when a
-                GPU driver accepts the encode stream but never produces
-                output (the export bar frozen at 0%), forcing software
-                confirms the driver as the culprit AND unblocks the export. */}
-            {webCodecsAvailable && engine === "gpu" && (
-              <label
-                className="mt-2 flex cursor-pointer items-start gap-2 rounded-lg border p-2 transition-colors"
-                style={{
-                  borderColor: gpuForceSoftware ? "rgba(251, 191, 36, 0.5)" : "#27272a",
-                  backgroundColor: gpuForceSoftware ? "rgba(251, 191, 36, 0.08)" : "#141416",
-                }}
-              >
-                <input
-                  type="checkbox"
-                  checked={gpuForceSoftware}
-                  onChange={(e) => onGpuForceSoftwareChange(e.target.checked)}
-                  className="mt-0.5 size-3.5 shrink-0 cursor-pointer accent-amber-400"
-                />
-                <span className="flex flex-col gap-0.5">
-                  <span
-                    className="text-[10px] font-bold"
-                    style={{ color: gpuForceSoftware ? "#fbbf24" : "#a1a1aa" }}
-                  >
-                    Force software encode
-                  </span>
-                  <span className="text-[9px] leading-relaxed" style={{ color: "#71717a" }}>
-                    Bypass the hardware encoder rung — if the progress bar
-                    freezes at 0% with the GPU badge showing hardware, a
-                    stalled driver is the culprit; this finishes the export
-                    on the CPU encoder instead.
-                  </span>
-                </span>
-              </label>
-            )}
-            <p className="mt-1.5 text-[9px] leading-relaxed" style={{ color: "#52525b" }}>
-              A/B test the engines to diagnose slow exports: FFmpeg Smart is
-              the battle-tested default (v9 True Smart Rendering — it copies
-              what you didn't edit and re-encodes only what you did); the GPU
-              engine renders the FULL multi-track timeline — overlays, chroma
-              key, PIP audio and SFX — natively on the GPU, zero FFmpeg. On
-              low-end CPUs (≤4 cores) the FFmpeg engine is the permanent
-              default.
-            </p>
-          </Section>
-
-          {/* ─── v8.1 (Task 27-b): GPU status badge — the in-app equivalent
-              of the Task Manager "Video Encode" check. Electron only. ───── */}
-          {inElectron && gpuStatus && (
-            (() => {
-              const compositing = gpuStatus.featureStatus?.gpu_compositing;
-              const hw = compositing === "enabled";
-              const sw = compositing === "software";
-              const adapterText =
-                gpuStatus.adapters.length > 0
-                  ? gpuStatus.adapters
-                      .map((a) =>
-                        [a.vendor, a.device, a.driver].filter(Boolean).join(" · "),
-                      )
-                      .join("\n")
-                  : "no adapter reported";
-              const tooltip = `${adapterText}\nGPU switches: ${gpuStatus.switches}\nPlatform: ${gpuStatus.platform}`;
-              return (
-                <div
-                  className="ff-fade-up mb-2 flex items-center gap-2 rounded-lg border px-2.5 py-1.5 text-[10px] font-medium"
-                  style={
-                    hw
-                      ? {
-                          borderColor: "rgba(22, 163, 74, 0.5)",
-                          backgroundColor: "rgba(20, 83, 45, 0.2)",
-                          color: "#86efac",
-                        }
-                      : sw
-                        ? {
-                            borderColor: "rgba(217, 119, 6, 0.5)",
-                            backgroundColor: "rgba(120, 53, 15, 0.2)",
-                            color: "#fcd34d",
-                          }
-                        : {
-                            borderColor: "rgba(220, 38, 38, 0.5)",
-                            backgroundColor: "rgba(127, 29, 29, 0.2)",
-                            color: "#fca5a5",
-                          }
-                  }
-                  title={tooltip}
+                <span
+                  className="rounded px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wide"
+                  style={{
+                    backgroundColor: "rgba(167, 139, 250, 0.18)",
+                    color: "#a78bfa",
+                  }}
                 >
-                  {hw ? <Zap size={12} aria-hidden /> : <Cpu size={12} aria-hidden />}
-                  {hw ? "GPU: hardware" : sw ? "GPU: software (SwiftShader)" : "GPU: disabled"}
-                  <span className="ml-auto truncate text-[9px] opacity-70">
-                    {gpuStatus.featureStatus?.webgl
-                      ? `webgl: ${gpuStatus.featureStatus.webgl}`
-                      : ""}
-                  </span>
-                </div>
-              );
-            })()
-          )}
+                  active
+                </span>
+              </span>
+              <span className="text-[9px] leading-relaxed" style={{ color: "#71717a" }}>
+                True Smart Rendering: clean ranges stream-copied, only the
+                edited windows re-encoded — and when ≥70&nbsp;% of the timeline
+                is dirty (full-timeline subtitles, watermarks, framerate
+                resamples) it splits into 2–4 parallel render passes with
+                hardware decode · iGPU encoders (QSV/AMF/NVENC) when available
+              </span>
+              {/* v5.1: encoder badge — bordered chip, Zap (GPU) / Cpu
+                  (software) icon + label. Describes the encoder probe result
+                  (Electron only; hidden in the browser). v8.1: shows the
+                  forced state when the probe was bypassed. */}
+              {exportInfo && (
+                <span
+                  className="mt-1 flex w-full flex-wrap items-center gap-x-1.5 gap-y-0.5 rounded border px-1.5 py-1 text-[9px] font-medium"
+                  style={{
+                    borderColor: "rgba(14, 116, 144, 0.55)",
+                    backgroundColor: "rgba(8, 51, 68, 0.25)",
+                    color: "#67e8f9",
+                  }}
+                  title={`Exports encode with ${exportInfo.encoderName} (${exportInfo.encoder})`}
+                >
+                  {/nvenc|qsv|amf|videotoolbox|hw/i.test(exportInfo.encoder) ? (
+                    <Zap size={11} aria-hidden />
+                  ) : (
+                    <Cpu size={11} aria-hidden />
+                  )}
+                  Video encoder: {exportInfo.encoderName}
+                  {exportInfo.forced ? " (forced, probe bypassed)" : ""}
+                </span>
+              )}
+            </div>
+          </Section>
 
           {/* ─── v8.1 (Task 27-b): force-encoder dropdown — bypass the FFmpeg
               probe for driver diagnosis (Electron only). ─────────────────── */}

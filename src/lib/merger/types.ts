@@ -308,18 +308,6 @@ export interface ExportProgress {
   fps?: number;
   eta?: number;
   timemark?: string;
-  /**
-   * v1.8.2 (GPU engine): coarse phase for slow-start visibility — long
-   * timelines spend seconds in decoder/source setup BEFORE the first frame
-   * encodes, and an integer-percent bar showed a frozen "0%" the whole time.
-   */
-  stage?: "preparing" | "encoding" | "finalizing";
-  /** v1.8.2 (GPU engine): frames encoded so far (0 until the loop starts). */
-  framesEncoded?: number;
-  /** v1.8.2 (GPU engine): total frames the export will encode. */
-  totalFrames?: number;
-  /** v1.8.2 (GPU engine): wall-clock seconds since the export began. */
-  elapsedSec?: number;
 }
 
 export interface ExportResult {
@@ -347,27 +335,29 @@ export interface ExportResult {
   totalChunks?: number;
   hwDecodeClips?: number;
   /** v1.5: the export pipeline that actually ran. "parallel-pass" = the
-   *  CPU-first chunked single-pass (W timeline windows rendered
-   *  concurrently + one audio pass + concat/mux); "single-pass" = one
-   *  process for the whole timeline (GPU boxes / short timelines);
-   *  "two-step" = the per-clip pool fallback; "smart-render" = v9 True
-   *  Smart Rendering (clean time-ranges stream-copied at TURBO speed,
-   *  only the dirty windows re-encoded, stitched via the concat demuxer);
-   *  "gpu-webcodecs" = the v8 WebCodecs + Canvas engine (Export-tab
-   *  engine selector). */
-  mode?: "single-pass" | "parallel-pass" | "two-step" | "smart-render" | "gpu-webcodecs";
+   *  v1.10 high-accuracy multi-process chunking (a ≥70 %-dirty timeline
+   *  split into W equal temporal windows rendered CONCURRENTLY — each a
+   *  video-only single-pass graph with hardware decode, 1 encode thread —
+   *  plus ONE full-timeline audio pass, stitched losslessly via the concat
+   *  demuxer); "single-pass" = one process for the whole timeline (GPU
+   *  boxes / short timelines); "two-step" = the per-clip pool fallback;
+   *  "smart-render" = v9 True Smart Rendering (clean time-ranges
+   *  stream-copied at TURBO speed, only the dirty windows re-encoded,
+   *  stitched via the concat demuxer). */
+  mode?: "single-pass" | "parallel-pass" | "two-step" | "smart-render";
   /** v9: True Smart Rendering telemetry — seconds of the timeline that
    *  rode the stream-copy fast path vs the re-encode windows. */
   smartCleanSec?: number;
   smartDirtySec?: number;
+  /** v1.10: WHY the timeline was dirty — the primary human-readable reason
+   *  (largest dirty-time share), e.g. "subtitles from 0:00 to 19:00",
+   *  "watermark over the full timeline", "framerate resample 29.97 -> 30fps".
+   *  When the copy ratio is 0 % the completion toast surfaces it as
+   *  "Full re-encode required: [reason]". */
+  smartDirtyReason?: string;
   /** v1.5: W — the number of parallel single-pass windows (parallel-pass
    *  only; aliases totalChunks for that mode). */
   parallelChunks?: number;
-  /** v8 (Task 27-a): true when the GPU (WebCodecs) engine exported
-   *  VIDEO-ONLY because AAC (mp4a.40.2) encode is unavailable in the
-   *  runtime (e.g. the open-source Chromium sandbox build) — the UI toasts
-   *  a warning so the missing audio is never a surprise. */
-  audioSkipped?: boolean;
 }
 
 export interface CaptionSettings {
@@ -776,12 +766,6 @@ declare global {
         hasLibass?: boolean;
       }>;
       exportNative: (opts: unknown) => Promise<ExportResult>;
-      /** v8 GPU export streamer — WebCodecs renderer pipeline → disk (5 MB
-       *  chunks). exportStart truncates/creates the output, exportChunk
-       *  appends bytes, exportEnd closes the handle. */
-      exportStart?: (filePath: string) => void;
-      exportChunk?: (buffer: Uint8Array) => void;
-      exportEnd?: () => void;
       saveTempImage: (p: { name: string; bytes: ArrayBuffer }) => Promise<string>;
       saveTempAudio: (p: { name: string; bytes: ArrayBuffer }) => Promise<string>;
       /** v5.0: video sources for the multi-track timeline (same shape as
@@ -800,16 +784,6 @@ declare global {
         encoder: string;
         encoderName: string;
         forced?: boolean;
-      }>;
-      /** v8.1 (Task 27-b): GPU acceleration status — the in-app Task Manager
-       *  check. featureStatus maps feature names (gpu_compositing, webgl,
-       *  rasterization, …) to "enabled" | "software" | "disabled". */
-      getGpuStatus?: () => Promise<{
-        ok: boolean;
-        featureStatus: Record<string, string> | null;
-        adapters: Array<{ vendor: string; device: string; driver: string }>;
-        switches: string;
-        platform: string;
       }>;
       /** v8.1 (Task 27-b): force-encoder probe bypass (diagnostics).
        *  key ∈ null | "nvenc" | "qsv" | "amf" | "x264"; null restores the

@@ -133,11 +133,6 @@ const LS_KEY = "framefuse.settings.v50";
 const LS_LEGACY_KEYS = ["framefuse.settings.v49", "framefuse.settings.v41"];
 const LS_VERSION = 50;
 
-/** v8 (Task 27-a): which export engine the Export button drives. */
-type ExportEngine = "ffmpeg" | "gpu";
-/** Its own localStorage key (validated on load, "ffmpeg" fallback). */
-const ENGINE_LS_KEY = "ff-export-engine";
-
 interface PersistedSettings {
   kenBurns: KenBurnsConfig;
   settings: VideoSettings;
@@ -302,21 +297,6 @@ export default function Page() {
   // were saved on a previous run. Defaults render first, then the saved
   // settings swap in one frame later — the intentional one-shot sync with
   // the localStorage "external system".
-   
-  // v8 GPU EXPORT HOOK — expose the WebCodecs pipeline (SourceDecoder →
-  // AudioMixer → ExportOrchestrator) as a lazy, globally reachable module
-  // promise so it (a) SHIPS in the packaged app as a code-split chunk
-  // instead of being tree-shaken away, and (b) can be exercised on demand —
-  // from the devtools console for field validation and from the Export tab
-  // once it becomes the default engine:
-  //   const gpu = await window.__framefuseGpuExport;
-  //   await gpu.runGpuExport({ ... });
-  // Zero cost when unused: the chunk only downloads on first access.
-  useEffect(() => {
-    (window as unknown as {
-      __framefuseGpuExport?: Promise<typeof import("@/lib/export")>;
-    }).__framefuseGpuExport = import("@/lib/export");
-  }, []);
 
   useEffect(() => {
     const p = loadPersisted();
@@ -402,67 +382,6 @@ export default function Page() {
   const [lastExport, setLastExport] = useState<LastExport | null>(null);
   const [inElectron, setInElectron] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
-
-  // ---- v8 (Task 27-a): export ENGINE selector — "FFmpeg Smart" (the v7
-  // hybrid chunked single-pass + iGPU probe) vs "GPU (WebCodecs)" (the v8
-  // zero-FFmpeg hardware pipeline). Persisted under its own localStorage key
-  // so it survives restarts independently of the v50 settings blob; validated
-  // on load with a "ffmpeg" fallback so a corrupted value can never wedge
-  // the Export button. ----
-  const [engine, setEngine] = useState<ExportEngine>("ffmpeg");
-  useEffect(() => {
-    try {
-      // v9: the FFmpeg Native pipeline is the PERMANENT default on low-end
-      // CPUs — the WebCodecs engine saturates integrated-GPU memory buses
-      // on those boxes (5–10 h exports + glitches in the field). A stored
-      // "gpu" preference is ignored on ≤4 logical cores; users can still
-      // pick the GPU engine per-session, but low-end machines never start
-      // on it.
-      const lowEndCpu =
-        typeof navigator !== "undefined" &&
-        Number(navigator.hardwareConcurrency) > 0 &&
-        navigator.hardwareConcurrency <= 4;
-      const stored = window.localStorage.getItem(ENGINE_LS_KEY);
-      if (stored === "gpu" || stored === "ffmpeg") {
-        if (stored === "gpu" && lowEndCpu) {
-          setEngine("ffmpeg");
-          try { window.localStorage.setItem(ENGINE_LS_KEY, "ffmpeg"); } catch {}
-        } else {
-          setEngine(stored);
-        }
-      }
-    } catch {
-      /* storage unavailable (private mode) — keep the default */
-    }
-  }, []);
-  useEffect(() => {
-    try {
-      window.localStorage.setItem(ENGINE_LS_KEY, engine);
-    } catch {
-      /* ignore write failures */
-    }
-  }, [engine]);
-
-  // ---- v1.8.2: GPU-engine FORCE-SOFTWARE diagnostics toggle — skips the
-  // prefer-hardware encoder rung (the WebCodecs twin of the FFmpeg
-  // force-encoder bypass). Persisted like the engine choice so a driver
-  // workaround survives restarts. ----
-  const [gpuForceSoftware, setGpuForceSoftware] = useState(false);
-  useEffect(() => {
-    try {
-      setGpuForceSoftware(window.localStorage.getItem("ff-gpu-force-software") === "1");
-    } catch {
-      /* storage unavailable — keep the default */
-    }
-  }, []);
-  const handleGpuForceSoftwareChange = useCallback((v: boolean) => {
-    setGpuForceSoftware(v);
-    try {
-      window.localStorage.setItem("ff-gpu-force-software", v ? "1" : "0");
-    } catch {
-      /* ignore write failures */
-    }
-  }, []);
 
   // ---- v1.2: keyboard shortcuts overlay (`?`) -----------------------------
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
@@ -1175,99 +1094,6 @@ export default function Page() {
       if (it) imageUrls[seg.id] = it.url;
     }
     try {
-      // ── v8 (Task 27-a): GPU (WebCodecs) engine branch ── the full-res
-      // WebCodecs + Canvas render, streamed to disk in 5 MB IPC chunks in
-      // Electron / downloaded in the browser. Shares the SAME abort
-      // controller, isExporting/exportProgress UI and error handling as the
-      // FFmpeg path — no separate progress plumbing.
-      if (engine === "gpu") {
-        const W = window as Window & { VideoEncoder?: unknown; VideoFrame?: unknown };
-        if (typeof W.VideoEncoder === "undefined" || typeof W.VideoFrame === "undefined") {
-          toast.error("GPU (WebCodecs) engine unavailable", {
-            description:
-              "This browser lacks the WebCodecs API — use a Chromium-based browser or the FrameFuse desktop app, or switch the engine back to FFmpeg Smart.",
-          });
-          return;
-        }
-        // Electron parity with the FFmpeg path: the save dialog opens
-        // FIRST (before any media prep). Cancelling aborts silently.
-        let outputPath: string | null = null;
-        if (inElectron) {
-          const api = window.electronAPI;
-          if (!api) return; // no bridge — nothing to export through
-          outputPath = await api.chooseOutput();
-          if (!outputPath) return; // cancelled — no toast error
-        }
-        // LAZY import: keeps mp4box + the muxer out of the main bundle
-        // (the devtools hook window.__framefuseGpuExport loads the same chunk).
-        const { exportTimelineViaGpu } = await import("@/lib/export/engine");
-        const res = await exportTimelineViaGpu({
-          segments: timeline.segments,
-          imageUrls,
-          audioTrack,
-          settings,
-          kenBurns,
-          audio: audioSettings,
-          totalMs: timeline.totalMs,
-          subtitles,
-          captionSettings,
-          headlines: headlineItems.length ? headlineItems : null,
-          transition: transitionSettings,
-          watermark: watermarkImage
-            ? { imageUrl: watermarkImage.url, settings: watermarkSettings }
-            : null,
-          sfx: sfxItems.length > 0 ? sfxItems : undefined,
-          onProgress: (p) => setExportProgress(p),
-          signal: ac.signal,
-          outputPath,
-          forceSoftware: gpuForceSoftware,
-        });
-        setLastExport({
-          path: res.path,
-          size: res.size,
-          method: "GPU WebCodecs",
-          at: Date.now(),
-          encoder: res.encoder,
-          elapsedSec: res.elapsedSec,
-          mode: res.mode,
-          audioSkipped: res.audioSkipped,
-        });
-        const gpuBits: string[] = [];
-        if (res.elapsedSec != null && res.elapsedSec >= 1) {
-          gpuBits.push(
-            res.elapsedSec < 60
-              ? `${res.elapsedSec}s`
-              : `${Math.floor(res.elapsedSec / 60)}m ${String(Math.floor(res.elapsedSec % 60)).padStart(2, "0")}s`,
-          );
-        }
-        if (res.encoder) gpuBits.push(res.encoder); // hardware/software ladder rung
-        toast.success(`Exported ${fmtBytes(res.size)}`, {
-          description: inElectron
-            ? gpuBits.length > 0
-              ? `${gpuBits.join(" · ")}\n${res.path}`
-              : res.path
-            : "Saved to your downloads",
-        });
-        // Sandbox/Chromium-oss builds lack AAC encode — the engine exported
-        // video-only (audioSkipped) and that must never be a silent surprise.
-        if (res.audioSkipped) {
-          toast.info("Exported without audio", {
-            description:
-              "This runtime cannot encode AAC (mp4a.40.2) — the GPU engine exported video-only. The FFmpeg Smart engine always includes audio.",
-          });
-        }
-        // v1.8.2: the hardware encoder wedged before frame 0 and the engine
-        // auto-restarted on the software rung — tell the user WHY this
-        // export is slower than a healthy GPU one (and what to update).
-        if (res.softwareFallback) {
-          toast.info("Hardware encoder stalled — used software instead", {
-            description:
-              "The GPU accepted the export stream but produced no output (a GPU-driver stall). The export restarted on the CPU encoder and completed. Updating your GPU driver may fix hardware encoding; the \"Force software encode\" toggle in the Export tab pins this behavior.",
-            duration: 9000,
-          });
-        }
-        return;
-      }
       const res = await exportNative({
         segments: timeline.segments,
         imageUrls,
@@ -1293,7 +1119,7 @@ export default function Page() {
       setLastExport({
         path: res.path,
         size: res.size,
-        method: inElectron ? "Native FFmpeg" : "WebCodecs",
+        method: inElectron ? "Native FFmpeg" : "MediaRecorder",
         at: Date.now(),
         // v1.1 TURBO telemetry (desktop only — browser exports omit these).
         encoder: res.encoder,
@@ -1337,16 +1163,23 @@ export default function Page() {
           `smart render: ${cleanTxt ? `${cleanTxt} stream-copied` : "no clean ranges"}` +
             (dirtyTxt ? ` · ${dirtyTxt} re-encoded` : ""),
         );
+        // v1.10 (Task 2): 0 % copied → surface WHY the whole timeline had to
+        // re-encode ("Full re-encode required: subtitles from 0:00 to 19:00").
+        if (res.smartDirtyReason && !(res.copiedClips != null && res.copiedClips > 0)) {
+          turboBits.push(`full re-encode required: ${res.smartDirtyReason}`);
+        }
       }
-      // v1.4.2: the parallel-chunk story — "4 chunks in parallel" explains
-      // WHY a 19-minute re-encode finished in minutes instead of hours.
-      // v1.5: parallel-pass = the CPU-first chunked single-pass (W timeline
-      // windows, one audio pass, lossless concat).
+      // v1.10 (Task 3): the ≥70 %-dirty route — W equal temporal windows
+      // rendered CONCURRENTLY (1 encode thread each) + one audio pass,
+      // stitched losslessly. Explain WHY it was needed.
       if (res.mode === "parallel-pass" && res.parallelChunks != null && res.parallelChunks > 1) {
         turboBits.push(
           `${res.parallelChunks} parallel render passes` +
             (res.hwDecodeClips != null && res.hwDecodeClips > 0 ? " · hardware decode" : ""),
         );
+        if (res.smartDirtyReason) {
+          turboBits.push(`full re-encode: ${res.smartDirtyReason}`);
+        }
       } else if (res.totalChunks != null && res.totalChunks > 1) {
         turboBits.push(
           `${res.totalChunks} chunks encoded in parallel` +
@@ -1395,8 +1228,6 @@ export default function Page() {
     watermarkSettings,
     inElectron,
     sfxItems,
-    engine,
-    gpuForceSoftware,
   ]);
 
   // Keep exportRef in sync so menu accelerators call the latest version
@@ -4299,11 +4130,6 @@ const handleRandomTransitionMix = useCallback(() => {
             onRandomMix={handleRandomTransitionMix}
             boundaryCount={boundaryCount}
             debug={debug}
-            // ---- v8 (Task 27-a): export engine selector (Export tab) ----
-            engine={engine}
-            onEngineChange={setEngine}
-            gpuForceSoftware={gpuForceSoftware}
-            onGpuForceSoftwareChange={handleGpuForceSoftwareChange}
             // ---- v1 Chroma tab ----
             chromaTarget={chromaTarget}
             onSetItemEdit={handleSetItemEdit}

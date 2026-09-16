@@ -720,11 +720,34 @@ function windowGlobalFades(fadeStrings, t0Sec, durSec) {
 // o = { segments, overlays, transition, fps, totalMs, kbEnabled, globalDir,
 //       wm, captionsEnabled, subtitleCues, headlinesEnabled, headlines,
 //       srcFacts: [{ copyCapable, keyframes: [{s,ms}]|null,
-//                    trimAligned: {ss,deltaMs}|null, srcFps }],
-//       workerCount?, targetSec?, maxSnapMs?, minCleanMs?, mergeGapMs? }
+//                    trimAligned: {ss,deltaMs}|null, srcFps,
+//                    mismatch?: string (v1.10 — human-readable why) }],
+//       workerCount?, targetSec?, maxSnapMs?, minCleanMs?, mergeGapMs?,
+//       parallelWorkers?, equalWindowRatio? }
 // Returns { pieces, spans, totalFrames, fps, dirtyFrames, cleanFrames,
-//           cleanMs, dirtyMs, allClean, allDirty, keyframeCuts, zones } or
+//           cleanMs, dirtyMs, allClean, allDirty, keyframeCuts, zones,
+//           reasons, primaryReason, parallelMode, workerCount } or
 // null when the plan is unusable (callers fall back to the two-step pool).
+//
+// v1.10 (Task 2) — DIAGNOSTIC TELEMETRY: every DIRTY range records WHY it
+// is dirty ("captions", "watermark", "framerate resample 29.97 -> 30fps",
+// …); the plan aggregates them into `reasons` (per-cause ms share, count,
+// first/last timestamp) and `primaryReason` (the largest-share label). When
+// 0 % of the timeline could be stream-copied the export toast surfaces it
+// as "Full re-encode required: [primaryReason]".
+//
+// v1.10 (Task 3) — PARALLEL TEMPORAL CHUNKING: when the stream-copy
+// coverage is BELOW `equalWindowRatio` (default 30 % — continuous
+// subtitles, watermarks or framerate resamples made the timeline mostly
+// dirty), the planner abandons the irregular clean/dirty tiling and splits
+// the timeline into W ≈ equal temporal windows (W = `parallelWorkers`,
+// 2–4). Each window becomes one all-graph worker: video-only, hardware
+// decode, 1 encode thread (main.js budgets), the ASS subtitle events
+// sliced to the window with timestamps shifted relative to its start
+// (buildAssDocument's window params — the existing per-piece path), the
+// overlay/fade/xfade windows bounded the same way, and `-frames:v` pinning
+// the exact slot count. The equal boundaries nudge out of the fade/xfade
+// forbidden extents so every transition stays whole inside one window.
 // ---------------------------------------------------------------------------
 function planSmartSegments(o) {
   const segments = Array.isArray(o && o.segments) ? o.segments : [];
@@ -737,6 +760,13 @@ function planSmartSegments(o) {
   const wm = o && o.wm;
   const srcFacts = Array.isArray(o && o.srcFacts) ? o.srcFacts : [];
   const workerCount = Math.max(1, Number(o && o.workerCount) || 1);
+  // v1.10 (Task 3): the equal-window parallel budget (2–4 workers) + the
+  // clean-coverage ratio below which the parallel-pass mode takes over.
+  const parallelWorkers = Math.max(0, Math.round(Number(o && o.parallelWorkers) || 0));
+  const equalWindowRatio =
+    Number.isFinite(Number(o && o.equalWindowRatio)) && o.equalWindowRatio > 0 && o.equalWindowRatio < 1
+      ? Number(o.equalWindowRatio)
+      : 0.3;
   const targetSec = Math.max(10, Number(o && o.targetSec) || CHUNK_TARGET_SEC);
   const maxSnapMs = Number.isFinite(Number(o && o.maxSnapMs)) ? Number(o.maxSnapMs) : 3000;
   const minCleanMs = Number.isFinite(Number(o && o.minCleanMs)) ? Number(o.minCleanMs) : 750;
@@ -813,7 +843,14 @@ function planSmartSegments(o) {
     if (!isVideo || !f.copyCapable) {
       // Images (Ken Burns or static), speed changes, format-mismatched
       // sources: the graph must render every frame of this segment.
-      addRange(segStartMs, segEndMs, isVideo ? "source-format" : "image");
+      // v1.10 (Task 2): the WHY is specific — "speed change", the probed
+      // mismatch ("framerate resample 29.97 -> 30fps", "resolution …")
+      // or "image" — so the telemetry reads like the user thinks.
+      let why;
+      if (!isVideo) why = "image";
+      else if (G.resolveSegSpeed(seg) !== 1) why = "speed change";
+      else why = f.mismatch || "source format";
+      addRange(segStartMs, segEndMs, why);
       continue;
     }
     // Copy-capable video: the remaining hazards are the trim head (a copy
@@ -874,6 +911,88 @@ function planSmartSegments(o) {
       merged.push({ s: r.s, e: r.e, why: [r.why] });
     }
   }
+
+  // ── 2.5 v1.10 (Task 2): DIAGNOSTIC TELEMETRY — aggregate the WHY ────────
+  // Per cause: merged-within-cause time (ms), cue/window count, and the
+  // first→last span. The labels are the strings the export toast and the
+  // main-process log carry ("continuous subtitles from 0:00 to 19:00",
+  // "watermark over the full timeline", "framerate resample 29.97 -> 30fps").
+  const fmtClock = (ms) => {
+    const s = Math.max(0, Math.round(ms / 1000));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const ss = s % 60;
+    const mm = String(m).padStart(2, "0");
+    const s2 = String(ss).padStart(2, "0");
+    return h > 0 ? `${h}:${mm}:${s2}` : `${m}:${s2}`;
+  };
+  const reasonStats = new Map();
+  for (const r of raw) {
+    if (!r.why) continue;
+    let st = reasonStats.get(r.why);
+    if (!st) { st = { count: 0, ranges: [] }; reasonStats.set(r.why, st); }
+    st.count += 1;
+    st.ranges.push([r.s, r.e]);
+  }
+  const reasons = [];
+  for (const [why, st] of reasonStats) {
+    st.ranges.sort((a, b) => a[0] - b[0]);
+    const mr = [];
+    let ms = 0;
+    for (const [s, e] of st.ranges) {
+      const last = mr[mr.length - 1];
+      if (last && s <= last[1]) {
+        if (e > last[1]) { ms += e - last[1]; last[1] = e; }
+      } else { mr.push([s, e]); ms += e - s; }
+    }
+    reasons.push({
+      key: why,
+      count: st.count,
+      ms,
+      firstMs: mr[0][0],
+      lastMs: mr[mr.length - 1][1],
+      spanMs: mr[mr.length - 1][1] - mr[0][0],
+    });
+  }
+  reasons.sort((a, b) => b.ms - a.ms);
+  for (const r of reasons) {
+    const n = r.count;
+    if (r.key === "captions") {
+      r.label = n === 1
+        ? `subtitle at ${fmtClock(r.firstMs)}–${fmtClock(r.lastMs)}`
+        : r.ms >= r.spanMs * 0.95
+          ? `continuous subtitles from ${fmtClock(r.firstMs)} to ${fmtClock(r.lastMs)}`
+          : `subtitles from ${fmtClock(r.firstMs)} to ${fmtClock(r.lastMs)} (${n} cues)`;
+    } else if (r.key === "watermark") {
+      r.label = "watermark over the full timeline";
+    } else if (r.key === "headlines") {
+      r.label = n === 1
+        ? `headline at ${fmtClock(r.firstMs)}–${fmtClock(r.lastMs)}`
+        : `headline text (${n} items)`;
+    } else if (r.key === "overlay") {
+      r.label = n === 1
+        ? `overlay/PIP at ${fmtClock(r.firstMs)}–${fmtClock(r.lastMs)}`
+        : `overlays/PIP (${n} windows)`;
+    } else if (r.key === "image") {
+      r.label = n === 1 ? "image segment (Ken Burns/static)" : `image segments (${n})`;
+    } else if (r.key === "speed change") {
+      r.label = n === 1 ? "speed-changed clip" : `speed-changed clips (${n})`;
+    } else if (r.key === "unalignable trim") {
+      r.label = n === 1 ? "trimmed cut not on a keyframe" : `trimmed cuts not on keyframes (${n} clips)`;
+    } else if (r.key === "trim head") {
+      r.label = n === 1 ? "mid-GOP trim head" : `mid-GOP trim heads (${n})`;
+    } else if (r.key === "fade") {
+      r.label = n === 1 ? "timeline fade" : `timeline fades (${n})`;
+    } else if (r.key === "xfade head") {
+      r.label = n === 1 ? "transition" : `transitions (${n})`;
+    } else {
+      // "framerate resample 29.97 -> 30fps", "resolution 1920x1080 ->
+      // 1280x720", "codec hevc …" — already human (srcFacts.mismatch).
+      r.label = r.key;
+    }
+    r.share = totalMs > 0 ? r.ms / totalMs : 0;
+  }
+  const primaryReason = reasons.length > 0 ? reasons[0].label : null;
 
   // ── 3. Frame zones (expand outward to whole output frames), merged ─────
   const zones = [];
@@ -996,6 +1115,91 @@ function planSmartSegments(o) {
     if (tail > 0 && tail < minCleanFrames) zones[zones.length - 1].b = totalFrames;
   }
   mergeZones();
+
+  // ── 5.5 v1.10 (Task 3): PARALLEL TEMPORAL CHUNKING for mostly-dirty ────
+  // timelines. When the clean (stream-copyable) coverage falls BELOW
+  // equalWindowRatio (default 30 % — continuous subtitles, a full-length
+  // watermark or a framerate resample made the timeline ≥70 % dirty), the
+  // clean/dirty tiling buys less than a third of the runtime — equal
+  // temporal windows are simpler, perfectly load-balanced across the
+  // workers, and every window rides the SAME windowed-graph machinery the
+  // dirty pieces use (ASS subtitle events sliced to the window with
+  // timestamps shifted relative to its start, overlay/fade windows, the
+  // -frames:v exact slot cap). The boundaries nudge out of the forbidden
+  // extents so every fade/xfade head stays whole inside ONE window.
+  {
+    const coveredFrames = zones.reduce((a, z) => a + (z.b - z.a), 0);
+    const cleanFramesNow = Math.max(0, totalFrames - coveredFrames);
+    const totalSecNow = totalFrames / fps;
+    if (
+      parallelWorkers >= 2 &&
+      cleanFramesNow < totalFrames * equalWindowRatio &&
+      totalSecNow >= 15
+    ) {
+      // W = 2–4 (main.js passes max(2, min(4, cpus))); shrink toward 2 when
+      // the timeline is too short to feed every worker a meaningful window.
+      let W = Math.min(parallelWorkers, 4);
+      const minWindowSec = 8;
+      while (W > 2 && totalSecNow / W < minWindowSec) W -= 1;
+      if (totalSecNow / W >= minWindowSec * 0.75) {
+        const hitForbidden = (f) => forbidden.some((z) => f >= z[0] && f <= z[1]);
+        const minWinFrames = Math.max(8, Math.round(fps * 2));
+        const bounds = [];
+        let prev = 0;
+        for (let k = 1; k < W; k++) {
+          // Ideal equal boundary, nudged right — then left — out of the
+          // forbidden extents (identical dance to the sub-split below).
+          const target = Math.round((totalFrames * k) / W);
+          let b = -1;
+          for (let c = target; c <= totalFrames - minWinFrames; c++) {
+            if (!hitForbidden(c) && c - prev >= minWinFrames) { b = c; break; }
+          }
+          if (b < 0) {
+            for (let c = target; c > prev + minWinFrames; c--) {
+              if (!hitForbidden(c)) { b = c; break; }
+            }
+          }
+          if (b < 0) break;
+          bounds.push(b);
+          prev = b;
+        }
+        if (bounds.length >= 1) {
+          const win = [];
+          let a0 = 0;
+          for (const b of bounds) { win.push({ a: a0, b }); a0 = b; }
+          win.push({ a: a0, b: totalFrames });
+          console.log(
+            `[framefuse] PARALLEL PASS: clean coverage ${((cleanFramesNow / totalFrames) * 100).toFixed(1)}% < ${(equalWindowRatio * 100).toFixed(0)}% → ${win.length} equal temporal windows (~${(totalSecNow / win.length).toFixed(1)}s each) — reason: ${primaryReason || "n/a"}`,
+          );
+          return {
+            pieces: win.map((w) => ({
+              kind: "dirty",
+              f0: w.a,
+              f1: w.b,
+              frames: w.b - w.a,
+              t0Ms: msOfFrame(w.a),
+              durMs: msOfFrame(w.b) - msOfFrame(w.a),
+            })),
+            spans,
+            totalFrames,
+            fps,
+            dirtyFrames: totalFrames,
+            cleanFrames: 0,
+            cleanMs: 0,
+            dirtyMs: msOfFrame(totalFrames),
+            allClean: false,
+            allDirty: true,
+            keyframeCuts: 0,
+            zones: zones.map((z) => ({ a: z.a, b: z.b, why: Array.from(new Set(z.why)) })),
+            reasons,
+            primaryReason,
+            parallelMode: true,
+            workerCount: win.length,
+          };
+        }
+      }
+    }
+  }
 
   // ── 6. SUB-SPLIT large dirty ranges for pool parallelism (v6.5) ───────
   const minFrames = Math.max(8, Math.round(fps * 2));
@@ -1154,6 +1358,12 @@ function planSmartSegments(o) {
     allDirty: cleanFrames === 0,
     keyframeCuts,
     zones: zones.map((z) => ({ a: z.a, b: z.b, why: Array.from(new Set(z.why)) })),
+    // v1.10 (Task 2): the WHY telemetry (sorted by dirty-time share).
+    reasons,
+    primaryReason,
+    // v1.10 (Task 3): false on this path — the equal-window mode returned
+    // above when the clean coverage fell under the ratio.
+    parallelMode: false,
   };
 }
 
