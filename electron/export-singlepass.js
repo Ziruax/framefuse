@@ -807,9 +807,15 @@ function planSmartSegments(o) {
   if (wm) addRange(0, totalMs, "watermark");
 
   // Burned text windows — captions burn per-cue, headlines per-headline.
+  // v1.12 (user directive): a cue with NO visible text (empty string and
+  // no word timings carrying text) burns nothing — an empty caption track
+  // must never mark video time DIRTY. Same law as headlines' !h.text.
   if (captionsEnabled) {
     for (const cue of subtitleCues) {
       if (!cue) continue;
+      const hasWordText =
+        Array.isArray(cue.words) && cue.words.some((w) => w && String(w.text || "").trim());
+      if (!hasWordText && !String(cue.text || "").trim()) continue;
       addRange(Number(cue.startMs), Number(cue.endMs), "captions");
     }
   }
@@ -1136,10 +1142,11 @@ function planSmartSegments(o) {
       cleanFramesNow < totalFrames * equalWindowRatio &&
       totalSecNow >= 15
     ) {
-      // W = 2–4 (main.js passes max(2, min(4, cpus))); shrink toward 2 when
-      // the timeline is too short to feed every worker a meaningful window.
+      // W = 2–4 (main.js passes 4 on any ≥4-core CPU — v1.12 user
+      // directive, no conservatism); shrink below 4 only when the timeline
+      // is too short to feed every worker a meaningful window (< 4 s each).
       let W = Math.min(parallelWorkers, 4);
-      const minWindowSec = 8;
+      const minWindowSec = 4;
       while (W > 2 && totalSecNow / W < minWindowSec) W -= 1;
       if (totalSecNow / W >= minWindowSec * 0.75) {
         const hitForbidden = (f) => forbidden.some((z) => f >= z[0] && f <= z[1]);
@@ -1388,7 +1395,8 @@ function planSmartSegments(o) {
  *                    //    atempo: ["atempo=…"], durationMs }]
  *   loudnorm,        // { clip: [measure|null…], music: measure|null } | null
  *   masterLoudnorm,  // estimated measured-loudnorm filter string | null
- *   hwaccelPerSeg,   // [bool] probe-gated per-source hw decode
+ *   hwaccelPerSeg,   // ["d3d11va"-token bool | "auto" | false] per-source
+ *                    // hw decode (v1.12 tri-state — see probeHwDecode)
  * }
  *
  * Returns { inputs, script, hasAudioOut, videoOutLabel, warnings }.
@@ -1555,8 +1563,10 @@ function buildSinglePassPlan(o) {
         // truncation can straddle a 60 fps frame edge).
         ssSec: meta && meta[i].ssSec != null ? meta[i].ssSec : undefined,
         path: seg.videoPath,
+        // v1.12: tri-state per-source token — true (→ the platform token,
+        // d3d11va on Windows), "auto" (graceful fallback), false (CPU).
         hwaccel: hwaccelPerSeg
-          ? !!hwaccelPerSeg[meta ? meta[i].origIdx : i]
+          ? hwaccelPerSeg[meta ? meta[i].origIdx : i]
           : false,
         // v6: the shared graph has no per-stream output -t, so the input is
         // bounded here (same seek/window semantics as the two-step's

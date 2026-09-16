@@ -321,11 +321,14 @@ console.log("4) REAL buildAssDocument — cue crossing a chunk boundary");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-console.log("5) probeHwDecode — safe boolean on this box");
+console.log("5) probeHwDecode — safe tri-state on this box");
 // ═══════════════════════════════════════════════════════════════════════
 {
+  // v1.12: the probe is tri-state — true (ride the platform token),
+  // "auto" (d3d11va init-failed → graceful auto fallback), false (CPU —
+  // the hw path measured catastrophically slower, WARP-like).
   const r = await M.probeHwDecode(SRC);
-  ok("probe returns a boolean without throwing", typeof r === "boolean", String(r));
+  ok("probe returns boolean or 'auto' without throwing", typeof r === "boolean" || r === "auto", String(r));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

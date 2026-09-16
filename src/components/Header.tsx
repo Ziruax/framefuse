@@ -174,9 +174,9 @@ export function Header({
                 backgroundColor: "#18181b",
                 color: "#a1a1aa",
               }}
-              title="FrameFuse v1.11.0 — friendly studio UI · smart FFmpeg export (clean ranges stream-copied, heavily-edited timelines split into 2–4 parallel render passes)"
+              title="FrameFuse v1.12.0 — export throughput pass · 4 strict 1-thread parallel workers on ≥4-core CPUs, d3d11va decode with auto fallback, superfast + fastdecode + CRF 22 speed tiers, audio never marks video dirty"
             >
-              v1.11.0
+              v1.12.0
             </span>
             {/* v5.1: on-disk project file chip (native save/open sessions). */}
             {projectName && (

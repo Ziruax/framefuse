@@ -377,3 +377,60 @@ decode · full re-encode: subtitles from 0:00 to 19:00".
 iGPU box): 4 concurrent single-threaded encode workers ≈ 4× the filter
 throughput of the monolith + 30–40 % CPU freed by d3d11va decode — the
 1.5 h export lands in the ~12–15 min range.
+
+---
+
+## v1.12 — the 46-minute → sub-15-minute push (field-directed tuning)
+
+v1.10's parallel pass measured **46 min for a 19-min 100 %-dirty timeline
+(~12.4 FPS aggregate)** in the field. Four bottlenecks were identified and
+fixed (all verified by real-ffmpeg harness, 49 checks + 5 regression
+suites):
+
+1. **Strictly 4 workers on ≥4-core CPUs.** The planner's worker budget was
+   conservative in two places: the smart-mode sub-split width used
+   `floor(cores/3)` (2 on a 4-core) and the equal-window shrink
+   (`minWindowSec 8`) reduced a 30 s timeline to 3 windows. Now any
+   `os.cpus().length >= 4` spawns **exactly 4** chunk processes (sub-split
+   AND parallel windows; shrink only below 16 s), and every parallel-pass
+   worker is hard-pinned to **`-threads 1 -filter_threads 1`** (was
+   `floor(cores/W)` — 2 on an 8-core). Windows schedules 4 separate
+   1-thread processes far better than fewer processes with fatter thread
+   pools: motion-estimation/CABAC contexts stay inside one core's L1/L2
+   instead of fighting over shared cache lines.
+
+2. **`-hwaccel d3d11va` on every worker input, with a graceful `-hwaccel
+   auto` fallback.** The old probe required d3d11va to measure **≥ 1.3×
+   faster** on a 72-frame snippet — but that gate measured the wrong thing
+   for a saturated quad: moving decode onto the iGPU's dedicated ASIC
+   frees ~35 % of the CPU cycles for libx264 + libass *even when raw
+   decode throughput is merely equal* (the per-frame system-memory
+   download hides in the encode wait). The probe is now tri-state:
+   d3d11va arm runs clean and is not ≥ 1.5× slower → ride the explicit
+   token; the arm **init-fails** (broken driver) → `-hwaccel auto`
+   (ffmpeg walks the remaining methods, software decode internally if
+   none hook up); ≥ 1.5× slower (the WARP pathology) → pure CPU. Sources
+   shorter than 20 s skip the probe cost and ride `auto` directly.
+
+3. **`-preset superfast -tune fastdecode -crf 22`** for the libx264 speed
+   tiers (social + custom; draft keeps ultrafast, cinema keeps its
+   faster/crf-17 master). superfast disables the heavy motion-estimation
+   refinement whose loss is invisible after platform re-encoding and
+   roughly doubles throughput on budget CPUs; `fastdecode` also makes the
+   exported file cheaper to play back on them. The GPU-vs-CPU encoder
+   probe baseline matches the new tier (apples-to-apples).
+
+4. **Audio never marks video DIRTY.** Verified end-to-end: a full audio
+   stack (background music + per-clip volume + loudness normalization +
+   SFX) over clean cuts exports with **zero** re-encoded windows — the
+   video rides stream copies (byte-identical regions) and only the audio
+   bus renders. A caption cue with no visible text (empty string, no word
+   timings) now marks nothing dirty either — matching the ASS builder,
+   which was already skipping such cues. Visual elements (text, PIP,
+   chroma, Ken Burns, transitions, watermark, speed, format mismatch,
+   mid-GOP trims) remain the only dirty causes.
+
+**Expected field outcome**: 4 × 1-thread superfast workers + d3d11va
+decode ≈ 3–4× the v1.10 field throughput → the 19-min case lands in the
+**~12–15 min** band, and cut-heavy timelines (≥70 % clean) stay in
+stream-copy territory (minutes, not tens of minutes).

@@ -58,7 +58,9 @@ export const QUALITY_PROFILES: QualityProfile[] = [
     resolution: "1080p",
     fps: 30,
     bitrateMbps: 8,
-    crf: 20,
+    // v1.12: matches the backend's social tier (superfast + fastdecode +
+    // crf 22) — the throughput push for budget CPUs.
+    crf: 22,
     speed: 2,
     hint: "The sweet spot for Shorts / Reels / TikTok — sharp at upload bitrates.",
   },

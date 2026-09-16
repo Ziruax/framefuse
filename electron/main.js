@@ -1487,7 +1487,10 @@ async function detectGpuEncoderAsync() {
         const fps = await probeEncoderAsync(cand.name, spec.enc, spec.pre);
         if (fps >= GPU_PROBE_MIN_FPS) {
           if (!cpuMeasured) {
-            cpuFps = await probeEncoderAsync("libx264", ["-preset", "veryfast", "-crf", "20"]);
+            // v1.12: the baseline matches the REAL social-tier export args
+            // (superfast + fastdecode + crf 22) so the GPU-vs-CPU
+            // comparison stays apples-to-apples with what ships.
+            cpuFps = await probeEncoderAsync("libx264", ["-preset", "superfast", "-tune", "fastdecode", "-crf", "22"]);
             cpuMeasured = true;
           }
           if (fps >= Math.max(GPU_PROBE_MIN_FPS, cpuFps * GPU_VS_CPU_RATIO)) {
@@ -1518,25 +1521,35 @@ async function detectGpuEncoderAsync() {
 // v1.1 shipped hw decode UNCONDITIONALLY OFF (-hwaccel auto could silently
 // land on a WARP/broken-driver path decoding 1080p at ~1 fps). But CPU
 // decode of 4K/H.265 sources is a real bottleneck on the re-encode path —
-// so instead of a blanket flag, we now MEASURE: decode 72 real frames of
-// the ACTUAL file twice (CPU vs -hwaccel <TOKEN>) and enable hw decode only
-// when it is ≥ 1.3× faster. Broken driver stacks lose the probe and stay
-// on CPU — the same evidence-over-assumption philosophy as the encoder
-// probe above. Both arms include the frame download (the null muxer forces
-// system-memory frames), which is the exact cost our software filter graph
-// pays. Cached per path; any error → CPU (never a failed export).
+// so instead of a blanket flag, we MEASURE: decode 72 real frames of
+// the ACTUAL file twice (CPU vs -hwaccel <TOKEN>). Cached per path; any
+// error → never a failed export.
 //
-// v1.10 (Task 3): the token is the SAME one buildVideoInputArgs injects
-// (G.HWACCEL_TOKEN — d3d11va on Windows, auto elsewhere), so the probe
-// measures exactly what the real encode will run. A machine whose d3d11va
-// block init-fails (or decodes slower than CPU) simply stays on software
-// decode — the export never depends on the hwaccel engaging.
+// v1.12 (user directive) — TRI-STATE verdict, d3d11va-first with a
+// graceful `-hwaccel auto` fallback:
+//   • d3d11va arm runs clean (exit 0) and is not catastrophically slower
+//     (< 1.5× the CPU arm) → ride the explicit token. The old "must be
+//     ≥ 1.3× FASTER" gate is GONE: in the 4-worker × 1-thread parallel
+//     pool, moving decode onto the iGPU's dedicated ASIC frees ~35 % of
+//     the CPU cycles for libx264 + libass EVEN WHEN raw decode
+//     throughput is merely equal (the per-frame system-memory download
+//     hides in the encode wait) — the throughput gate measured the wrong
+//     thing for a saturated quad.
+//   • d3d11va arm FAILS to run (non-zero exit — broken driver / missing
+//     D3D11) → fall back to `-hwaccel auto`: ffmpeg walks the remaining
+//     hwaccel methods and lands on software decode internally if none
+//     initialize. The export never depends on the hwaccel engaging.
+//   • d3d11va runs but ≥ 1.5× SLOWER than CPU (the WARP pathology — a
+//     software D3D11 adapter as the default device) → stay on pure CPU
+//     decode; "auto" would select the same broken path again.
 // ---------------------------------------------------------------------------
 const hwDecodeCache = new Map();
 
 async function probeHwDecode(path) {
   if (hwDecodeCache.has(path)) return hwDecodeCache.get(path);
-  let use = false;
+  // Tri-state: true → the explicit platform token (d3d11va on Windows);
+  // "auto" → d3d11va init-failed, graceful auto fallback; false → CPU.
+  let verdict = false;
   try {
     const FRAMES = 72;
     const arm = (hw) => [
@@ -1553,17 +1566,24 @@ async function probeHwDecode(path) {
       const cpuMs = Math.max(1, Date.now() - t0);
       const t1 = Date.now();
       const gpu = await ffmpegCapture(arm(true), 20000);
-      if (gpu.code === 0) {
+      if (gpu.code !== 0) {
+        // D3D11VA init failed on this machine — the graceful auto fallback.
+        verdict = "auto";
+        console.log(`hw-decode probe ${path}: d3d11va init FAILED → -hwaccel auto fallback`);
+      } else {
         const gpuMs = Math.max(1, Date.now() - t1);
-        use = gpuMs * 1.3 < cpuMs; // ≥30% faster or stay on CPU
-        console.log(
-          `hw-decode probe ${path}: cpu ${cpuMs}ms vs hw ${gpuMs}ms → ${use ? "ENABLED" : "cpu (not ≥1.3× faster)"}`,
-        );
+        if (gpuMs < cpuMs * 1.5) {
+          verdict = true;
+          console.log(`hw-decode probe ${path}: cpu ${cpuMs}ms vs hw ${gpuMs}ms → ENABLED (not ≥1.5× slower)`);
+        } else {
+          verdict = false;
+          console.log(`hw-decode probe ${path}: cpu ${cpuMs}ms vs hw ${gpuMs}ms → cpu (≥1.5× slower — WARP-like path, auto would pick it again)`);
+        }
       }
     }
-  } catch (_) { use = false; }
-  hwDecodeCache.set(path, use);
-  return use;
+  } catch (_) { verdict = false; }
+  hwDecodeCache.set(path, verdict);
+  return verdict;
 }
 
 /** Build encoder args for a quality-first, speed-optimized encode.
@@ -1581,15 +1601,19 @@ async function probeHwDecode(path) {
  *     encoder is ever trusted with a real export).
  *   - libx264: draft drops veryfast → ultrafast (draft is explicitly the
  *     speed tier); social/cinema presets unchanged.
- * v7 Step 5 (low-end CPU fallback): on 4-or-fewer-core machines with no
- * usable iGPU/dGPU (libx264 fallback), the preset ladder drops to
- * superfast/ultrafast and `-tune fastdecode` rides along (no CABAC-side
- * deblocking overhead, simpler features — measurably friendlier to the
- * small L2/L3 caches of Atom/Celeron-class quads). Thread caps per worker
- * live in the routing code (-threads 2 / -filter_threads 2). */
+ * v1.12 (user directive): the libx264 speed tiers drop veryfast →
+ *   superfast + `-tune fastdecode` + crf 22 everywhere (not just the
+ *   ≤4-core low-end fallback). superfast disables the heavy motion-
+ *   estimation search patterns whose quality difference is negligible on
+ *   streaming platforms, roughly doubling encode throughput on budget
+ *   CPUs; fastdecode drops CABAC-side work that also slows the PREVIEW
+ *   decode of the exported file. cinema keeps its faster/crf 17 master
+ *   tier and draft keeps ultrafast — the speed tier stays the speed tier. */
 const QUALITY_ENCODER = {
   draft:  { crf: 27, x264: "ultrafast", nvencPreset: "p1", nvencCq: 27, qsvQ: 27, amfI: 26, amfP: 28 },
-  social: { crf: 20, x264: "veryfast",  nvencPreset: "p4", nvencCq: 23, qsvQ: 23, amfI: 22, amfP: 24 },
+  // v1.12: social veryfast/crf20 → superfast/crf22 + -tune fastdecode (see
+  // encoderArgs) — the 46-min → sub-15-min push on the 4-core target.
+  social: { crf: 22, x264: "superfast", nvencPreset: "p4", nvencCq: 23, qsvQ: 23, amfI: 22, amfP: 24 },
   // v5.2 SPEED: cinema x264 preset medium → faster. Open-source editors
   // (Shotcut/Kdenlive) default to faster-class presets — ~2× faster than
   // medium at a visually indistinguishable CRF 17 master.
@@ -1615,22 +1639,24 @@ function encoderArgs(encoderName, bitrateMbps, width, height, quality, crf, lowE
     case "h264_amf":
       return ["-c:v", "h264_amf", "-quality", quality === "cinema" ? "quality" : "balanced", "-rc", "vbr_peak", "-qp_i", String(quality === "custom" ? crfVal : q.amfI), "-qp_p", String((quality === "custom" ? crfVal : q.amfP) + 2), "-b:v", `${bitrateMbps || 8}M`, "-pix_fmt", "yuv420p"];
     default: {
-      // libx264: profile preset balances speed vs compression efficiency.
-      // "social" = veryfast (2× ultrafast at much better quality per bit);
-      // "cinema" = faster for the maximum-quality master; v6 "draft" rides
-      // ultrafast — the tier's whole point is speed.
-      // v7 Step 5: low-end CPU fallback (no usable hardware encoder) drops
-      // the ladder to superfast/ultrafast + -tune fastdecode — veryfast's
-      // CABAC + finer motion estimation thrashes the small caches of
-      // Atom/Celeron-class quads, which is exactly the "1.5 fps" pathology.
+      // libx264: v1.12 — the speed tiers (social/custom → superfast,
+      // draft → ultrafast) ALL ride `-tune fastdecode`; cinema keeps the
+      // faster-preset crf-17 master WITHOUT it (quality tier). superfast
+      // skips the expensive motion-estimation refinement passes whose
+      // loss is invisible after platform re-encoding, and doubles encode
+      // throughput on budget CPUs; fastdecode disables CABAC-side work
+      // (friendlier to the small L2/L3 caches of Atom/Celeron-class
+      // quads AND to playback on them).
       let preset;
       if (lowEnd) {
         preset = quality === "draft" ? "ultrafast" : "superfast";
       } else {
-        preset = quality === "cinema" ? q.x264 : (quality === "draft" ? "ultrafast" : "veryfast");
+        preset = quality === "cinema" ? q.x264 : (quality === "draft" ? "ultrafast" : q.x264);
       }
       const args = ["-c:v", "libx264", "-preset", preset, "-crf", String(crfVal)];
-      if (lowEnd) args.push("-tune", "fastdecode");
+      if (preset === "superfast" || preset === "ultrafast") {
+        args.push("-tune", "fastdecode");
+      }
       args.push("-pix_fmt", "yuv420p");
       return args;
     }
@@ -3429,12 +3455,14 @@ ipcMain.handle("export-native", async (event, opts) => {
       const chunkPlan = segIsVideo
         ? G.planChunkFrames(Number(seg.durationMs) || 0, fps, CHUNK_TARGET_SEC, maxChunks)
         : null;
-      // v1.4.2: hw decode only after the PROBE proves it ≥ 1.3× faster on
-      // THIS file (≥ 20 s sources only — shorter clips don't pay back the
-      // two probe arms). Replaces the v1.1 unconditional-off policy with
-      // evidence per source; failures stay on CPU silently.
-      const hw = segIsVideo && (Number(seg.durationMs) || 0) >= 20000
-        ? await probeHwDecode(seg.videoPath)
+      // v1.4.2→v1.12: hw decode is per-source, probe-gated tri-state
+      // (d3d11va | "auto" fallback | false) — ≥ 20 s sources pay the two
+      // probe arms; shorter video sources ride `-hwaccel auto` directly
+      // (the graceful fallback costs nothing when d3d11va is healthy).
+      const hw = segIsVideo
+        ? ((Number(seg.durationMs) || 0) >= 20000
+            ? await probeHwDecode(seg.videoPath)
+            : "auto")
         : false;
       if (hw) hwDecodeClips += 1;
 
@@ -3698,10 +3726,14 @@ ipcMain.handle("export-native", async (event, opts) => {
         // without oversubscription — the single-threaded libass/overlay
         // filters stop stalling each other).
         const isGpuEncoder = encoder.name !== "libx264";
+        // v1.12 (user directive): ≥4-core CPUs STRICTLY spawn 4 chunk
+        // workers — Windows schedules 4 separate 1-thread ffmpeg processes
+        // far better than fewer processes with fatter thread pools (the old
+        // floor(cpu/3) division capped the 4-core target at 2 — conservative).
         const spWorkers = isGpuEncoder
           ? 1
           : cpuCount >= 4
-            ? Math.max(2, Math.min(4, Math.floor(cpuCount / 3)))
+            ? 4
             : 1;
 
         // ── The plan (pure) ──────────────────────────────────────────────
@@ -3722,7 +3754,8 @@ ipcMain.handle("export-native", async (event, opts) => {
           workerCount: spWorkers,
           // v1.10 (Task 3): the equal-window parallel budget + the clean-
           // coverage ratio that triggers it (<30 % copied → mostly dirty).
-          parallelWorkers: Math.max(2, Math.min(4, cpuCount)),
+          // v1.12: ≥4 cores → STRICTLY 4 (user directive — no conservatism).
+          parallelWorkers: cpuCount >= 4 ? 4 : Math.max(2, Math.min(4, cpuCount)),
           equalWindowRatio: 0.3,
         });
         if (!plan) {
@@ -3731,16 +3764,19 @@ ipcMain.handle("export-native", async (event, opts) => {
         }
 
         // ── Mode-aware pool budget ───────────────────────────────────────
-        // Parallel-pass: W workers × floor(cores/W) encode threads (1 each
-        // on the 4-core low-end target — exactly the recipe; bigger boxes
-        // still fill every core). Smart path: the v7 division + low-end caps.
+        // v1.12 (user directive): parallel-pass workers are HARD-PINNED to
+        // `-threads 1 -filter_threads 1` — 4 separate 1-thread processes
+        // never fight over the same CPU cache lines (motion estimation and
+        // CABAC contexts stay inside one core's L1/L2), and the leftover
+        // cores absorb the concurrent audio-bus pass + libass. Smart path
+        // keeps the v7 division + low-end caps.
         let poolWidth;
         let threadsPer;
         let filterThreadsPer;
         if (plan.parallelMode) {
           poolWidth = Math.max(1, plan.workerCount);
-          threadsPer = Math.max(1, Math.floor(cpuCount / poolWidth));
-          filterThreadsPer = threadsPer;
+          threadsPer = 1;
+          filterThreadsPer = 1;
         } else {
           poolWidth = Math.max(1, spWorkers);
           threadsPer = Math.max(1, Math.round(cpuCount / poolWidth));
@@ -3799,15 +3835,26 @@ ipcMain.handle("export-native", async (event, opts) => {
           });
         }
 
-        // ── Probe-gated hw decode per ≥20 s source (cached per path) ─────
+        // ── Hw decode per source (probe-gated, cached per path) ───────────
+        // v1.12 (user directive): EVERY worker video input rides hardware
+        // decode — d3d11va where the probe approves (the ≥1.3×-faster gate
+        // is gone; not-catastrophically-slower now qualifies because the
+        // parallel pool wins on freed CPU cycles), `-hwaccel auto` when the
+        // d3d11va arm init-fails (graceful fallback), `auto` WITHOUT a probe
+        // for short sources (< 20 s — the two probe arms cost more than the
+        // clip's whole decode). Images stay on the plain input.
         const hwaccelPerSeg = [];
         let spHwCount = 0;
         for (let b = 0; b < segments.length; b++) {
           const s = segments[b];
-          const use = !!(s && s.mediaType === "video" && s.videoPath &&
-            (Number(s.durationMs) || 0) >= 20000 && await probeHwDecode(s.videoPath));
-          hwaccelPerSeg.push(use);
-          if (use) spHwCount += 1;
+          const isVid = !!(s && s.mediaType === "video" && s.videoPath);
+          const tok = !isVid
+            ? false
+            : (Number(s.durationMs) || 0) >= 20000
+              ? await probeHwDecode(s.videoPath)
+              : "auto";
+          hwaccelPerSeg.push(tok);
+          if (tok) spHwCount += 1;
         }
 
         // ── Full-timeline fades + per-segment source rates ───────────────

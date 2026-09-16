@@ -713,10 +713,13 @@ const HWACCEL_TOKEN = process.platform === "win32" ? "d3d11va" : "auto";
  * (The clip-duration `-t` is an OUTPUT option appended by buildClipArgs —
  * identical semantics to the v4.9 `-loop 1 -i img … -t dur` layout.)
  * v5.1: `o.hwaccel` prepends the hardware-decode token — hardware DECODE
- * (d3d11va on Windows, v1.10) with the probe gate in main.js. Frames still
- * cross to system memory for the CPU filter graph, so argv validity never
- * changes; the flag is absent by default, keeping every pre-v5.1 call
- * byte-identical.
+ * with the probe gate in main.js. Frames still cross to system memory for
+ * the CPU filter graph, so argv validity never changes.
+ * v1.12: `o.hwaccel` is TRI-STATE — `true` → the platform token (d3d11va
+ * on Windows), the string `"auto"` → the graceful fallback (d3d11va
+ * init-failed on this machine; ffmpeg walks the remaining methods and
+ * lands on software decode internally if none hook up), `false`/absent →
+ * plain software input (pre-v5.1 byte-identical).
  * v5.1: `o.durMs` (SOURCE window, ms) adds the input `-t` so a sped-up clip
  * demuxes exactly the window setpts will retime. Absent (speed 1) → no `-t`,
  * byte-identical to the pre-v5.1 argv.
@@ -730,7 +733,13 @@ function buildVideoInputArgs(o) {
     o && o.ssSec != null
       ? o.ssSec
       : fmt3(Math.max(0, Number(o && o.trimInMs) || 0));
-  const hw = o && o.hwaccel ? ["-hwaccel", HWACCEL_TOKEN] : [];
+  const hwTok =
+    o && o.hwaccel === true
+      ? HWACCEL_TOKEN
+      : o && typeof o.hwaccel === "string" && o.hwaccel
+        ? o.hwaccel
+        : null;
+  const hw = hwTok ? ["-hwaccel", hwTok] : [];
   const durMs = Number(o && o.durMs);
   const t =
     o && Number.isFinite(durMs) && durMs > 0
