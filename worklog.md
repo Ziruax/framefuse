@@ -937,3 +937,22 @@ Stage Summary:
 - VERIFIED (agent-browser, live dev): desktop 1600px — hero renders with 3 cards + steps, 5 settings tabs (Media/Captions/Effects/Audio/Export), 5 media tabs; sample loads from the HERO card (9 clips, timeline builds, hero replaced by canvas); full EXPORT via the real button — progress %, bar, cancel, completes 32.2 MB with LastExport chip + toast, 0 console/page errors all session. Tablet 900px — drawer layout active (center 900px full-width), media drawer 350px with scrim + close btn, settings drawer opens exclusively. Phone 390px — no horizontal overflow, media drawer 335px, Export button fits after the ≥sm header fix. eslint 0; tsc only the 3 pre-existing bun-only harness errors.
 - v1.11.0: ONE cyan accent, welcome hero teaching the workflow, jargon gone, drawers on small screens, Chroma tab removed, fresh cyan installer icon.
 - Next: push, Windows installer, GitHub release v1.11.0 (this round).
+
+---
+Task ID: 33 (ship round v1.11.0)
+Agent: main (Z.ai Code)
+
+Task: User supplied a fresh GitHub token (previous one exposed in chat history) — configure remote, push commit 8f73d9f (v1.11.0 Friendly Studio UI), build the Windows installer, create the GitHub Release v1.11.0.
+
+Work Log:
+- Remote re-credentialed with the new token; fetch OK; confirmed local HEAD 8f73d9f (v1.11.0, all UI work complete + verified per Task 32) was UNPUSHED — remote sat at 84ef771 (v1.10.0 worklog record).
+- PUSHED 8f73d9f → main (84ef771..8f73d9f).
+- Build pipeline (foreground steps, no wine): killed dev server → npm run clean → next build --webpack (12.2s compile; /, /icon.ico, /apple-icon.png emitted) → copy-wasm (4 files) → fetch-windows-ffmpeg (cached full build skip) → stage-whisper-service (42MB preserved) → stage-whisper-model (0 dl, 7 reused) → stage-faster-whisper (cp311 guard ✓) → stage-faster-whisper-model (0 dl, 4 reused) → electron-builder --win nsis → dist/FrameFuse Setup 1.11.0.exe (377,226,792 B) + .blockmap (394,580) + latest.yml (350). rcedit-native: "version 1.11.0.0, 6 strings, icon replaced".
+- ASAR VERIFIED (node @electron/asar, careful extract-file basename cleanup — used node API directly, no CWD shadowing): package.json 1.11.0 ✓, out/index.html title v1.11.0 ✓, hero copy "Let's make a video" ✓, drawer classes w-[86vw] ×2 + max-w-[350px] + bg-black/55 scrim ✓ (local identifiers like compactEnteredRef are minified away — checked string/class literals instead).
+- Dev server restarted (background, port 3000): GET / 200, title v1.11.0.
+- Browser ship-check (agent-browser): desktop 1600×900 title "FrameFuse v1.11.0 — Video Studio" 0 errors; tablet 900×700 drawer layout active, overflowX=false, 0 errors; phone 390×844 scrollWidth=390 exact (no overflow), 0 errors. Screenshots agent-ctx/ship-v1.11.0-{desktop,tablet,phone}.png.
+- GitHub release v1.11.0 created (id 390307403, "Friendly Studio UI") — 3 assets state=uploaded: FrameFuse-Setup-1.11.0.exe (377,226,792 — dash-named to match latest.yml url, autoupdate-safe), .exe.blockmap (394,580), latest.yml (350). Release notes: friendly hero, plain-language labels, one cyan accent, small-screen drawers, icon fix.
+
+Stage Summary:
+- v1.11.0 SHIPPED: commit 8f73d9f pushed, installer built + asar-verified, release live at https://github.com/Ziruax/framefuse/releases/tag/v1.11.0, dev server healthy.
+- SECURITY NOTE: the token in this conversation (ghp_fVze…) is exposed in chat history — user should rotate it after this release round (same advice as the previous token).
