@@ -979,3 +979,21 @@ Stage Summary:
 - v1.12.0: 4 strict 1-thread workers on ≥4-core CPUs (both smart sub-split and parallel windows), d3d11va decode on every worker input with a graceful auto fallback (probe gate now "not catastrophically slower" instead of "≥1.3× faster"), superfast+fastdecode+crf22 speed tiers, audio/empty-cues never mark video dirty. Expect the 19-min field case in the ~12–15 min band.
 - Files: electron/{main,export-singlepass,export-graph}.js, src/lib/merger/types.ts, src/components/Header.tsx, src/app/layout.tsx, scripts/{verify-chunked-encode,verify-timeline-chunks}.js, docs/EXPORT_PERF.md, package.json.
 - Next: Windows installer + GitHub release v1.12.0 (this round).
+
+---
+Task ID: 35 (ship round v1.12.0)
+Agent: main (Z.ai Code)
+
+Task: Push commit 9d3e0ea (v1.12.0 export throughput pass), build the Windows installer, create the GitHub Release v1.12.0.
+
+Work Log:
+- PUSHED 9d3e0ea → main (bfb8ab2..9d3e0ea).
+- Build pipeline (foreground, no wine): dev server stopped → clean → next build --webpack → copy-wasm (4) → fetch-windows-ffmpeg (cached) → stage-whisper-service (42 MB preserved) → stage-whisper-model (0 dl / 7 reused) → stage-faster-whisper (cp311 ✓) → stage-faster-whisper-model (0 dl / 4 reused) → electron-builder --win nsis → dist/FrameFuse Setup 1.12.0.exe (377,234,001 B) + .blockmap (394,619) + latest.yml (350, dash-named url — autoupdate-safe).
+- ASAR VERIFIED: package.json 1.12.0 ✓; electron/main.js inside the package carries the strict-4 worker code, the tri-state probe (verdict "auto" fallback), and superfast ✓; renderer chunks carry the superfast+fastdecode copy (Header tooltip) ✓.
+- Dev server restarted (background): GET / 200.
+- GitHub release v1.12.0 created (id 390330962, "Export Throughput Pass") — 3 assets state=uploaded: FrameFuse-Setup-1.12.0.exe (377,234,001), .exe.blockmap (394,619), latest.yml (350).
+
+Stage Summary:
+- v1.12.0 SHIPPED: pushed, installer built + asar-verified, release live at https://github.com/Ziruax/framefuse/releases/tag/v1.12.0, dev server healthy.
+- Field validation pending on the user's 4-core: expect the 19-min mostly-dirty case in the ~12–15 min band (4 × 1-thread superfast workers + d3d11va), and the hw-decode probe log line "ENABLED (not ≥1.5× slower)".
+- SECURITY: the token remains exposed in chat history — rotate after this round.
