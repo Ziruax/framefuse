@@ -4,6 +4,12 @@ const { contextBridge, ipcRenderer, webUtils } = require("electron");
 contextBridge.exposeInMainWorld("electronAPI", {
   isElectron: () => ipcRenderer.invoke("is-electron"),
 
+  // v1.12.1: the REAL running-exe facts (app.getVersion() reads the
+  // rcedit-stamped version resource) — the honest "am I on the new build?"
+  // check + the CPU count that decides the parallel-pool width.
+  // { version, electron, node, platform, cpus }
+  appInfo: () => ipcRenderer.invoke("app-info"),
+
   // Diagnostics — verify FFmpeg is reachable. Returns
   // { ok, path, version, error }.
   ffmpegStatus: () => ipcRenderer.invoke("ffmpeg-status"),

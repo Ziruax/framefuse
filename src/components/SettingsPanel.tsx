@@ -29,6 +29,7 @@ import {
   Images,
   Download,
   Check,
+  TriangleAlert,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type {
@@ -538,6 +539,37 @@ export function SettingsPanel(props: SettingsPanelProps) {
       })
       .catch(() => {
         /* probe failed — no badge */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [inElectron]);
+
+  // v1.12.1: the REAL running-exe facts (app.getVersion() via app-info IPC)
+  // — powers the "About this build" strip at the bottom of the Export tab:
+  // the honest version check (a stale/hybrid install flags amber), the CPU
+  // core count, and the parallel-pool width this machine will use.
+  const [appInfo, setAppInfo] = useState<{
+    version: string;
+    electron?: string;
+    node?: string;
+    platform?: string;
+    cpus?: number;
+  } | null>(null);
+  useEffect(() => {
+    if (!inElectron) return;
+    const api = window.electronAPI;
+    if (!api?.appInfo) return;
+    let cancelled = false;
+    api
+      .appInfo()
+      .then((info) => {
+        if (!cancelled && info && typeof info.version === "string") {
+          setAppInfo(info);
+        }
+      })
+      .catch(() => {
+        /* diagnostics only */
       });
     return () => {
       cancelled = true;
@@ -1329,6 +1361,61 @@ export function SettingsPanel(props: SettingsPanelProps) {
               <div>env: {debug.inElectron ? "electron" : "browser"}</div>
             </div>
           </Section>
+
+          {/* ─── v1.12.1: ABOUT THIS BUILD — the honest version check at the
+              bottom of Settings → Export. The version shown is the REAL exe
+              version (app.getVersion(), the rcedit-stamped resource), not a
+              renderer constant: a stale install (old shell + new interface or
+              vice versa) turns the strip amber and says so. Also carries the
+              CPU core count and the parallel-pool width exports will use on
+              THIS machine — the "how many ffmpeg.exe should Task Manager
+              show?" number, before you even start an export. ─────────── */}
+          {inElectron && appInfo && (
+            <div
+              className="ff-fade-up mb-2 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border px-2.5 py-1.5 text-[10px]"
+              style={{
+                borderColor: "rgba(24, 24, 27, 0.9)",
+                backgroundColor: "rgba(24, 24, 27, 0.35)",
+                color: "#a1a1aa",
+              }}
+              title={
+                `The app shell reports v${appInfo.version}` +
+                (appInfo.electron ? ` · Electron ${appInfo.electron}` : "") +
+                (appInfo.platform ? ` · ${appInfo.platform}` : "")
+              }
+            >
+              {appInfo.version !== "1.12.1" ? (
+                <span
+                  className="flex items-center gap-1 rounded px-1.5 py-0.5 font-bold"
+                  style={{ backgroundColor: "rgba(245, 158, 11, 0.14)", color: "#fbbf24" }}
+                  title={`This install reports v${appInfo.version} — the current build is v1.12.1. Reinstall FrameFuse v1.12.1 (an old cached executable is running).`}
+                >
+                  <TriangleAlert size={11} aria-hidden />
+                  App v{appInfo.version} — update to v1.12.1
+                </span>
+              ) : (
+                <span
+                  className="rounded px-1.5 py-0.5 font-bold"
+                  style={{ backgroundColor: "rgba(16, 185, 129, 0.14)", color: "#34d399" }}
+                  title="The running executable matches the current build."
+                >
+                  App v{appInfo.version}
+                </span>
+              )}
+              {appInfo.cpus != null && appInfo.cpus > 0 && (
+                <span
+                  title={
+                    appInfo.cpus >= 4
+                      ? "≥4 cores: exports run STRICTLY 4 parallel 1-thread ffmpeg workers (check Task Manager → Details during an export)"
+                      : "<4 cores: exports run the conservative pool for this machine"
+                  }
+                >
+                  {appInfo.cpus} CPU cores · {appInfo.cpus >= 4 ? "4" : Math.max(1, Math.min(2, Math.floor(appInfo.cpus / 4)))}× ffmpeg workers
+                </span>
+              )}
+              {appInfo.electron && <span>Electron {appInfo.electron}</span>}
+            </div>
+          )}
         </div>
 
         {/* ─── Effects tab — Transitions + Watermark + Titles ────────── */}

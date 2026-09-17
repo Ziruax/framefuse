@@ -434,3 +434,54 @@ suites):
 decode ≈ 3–4× the v1.10 field throughput → the 19-min case lands in the
 **~12–15 min** band, and cut-heavy timelines (≥70 % clean) stay in
 stream-copy territory (minutes, not tens of minutes).
+
+## v1.12.1 — closing the hidden single-process path + honest telemetry
+
+The v1.12 field directive ("if speed has not budged, the code is not
+executing on your machine") prompted a full audit of every export spawn
+path. Two real gaps were found and fixed:
+
+1. **The two-step fallback pool ran ONE ffmpeg process on a 4-core CPU.**
+   The v6 formula `poolN = min(2, floor(cores/4))` evaluated to **1** on
+   the exact 4-core machines v1.12 targets. The smart/parallel paths got
+   the strict-4 recipe, but ANY smart-pipeline init fallback (planner bail,
+   a piece graph over the 25 KB script budget, a <4 s init-class error)
+   silently degraded the export to a single-process pipeline — one
+   `ffmpeg.exe` in Task Manager and the old ~46-min wall time, with
+   **nothing in the UI contradicting it**. The fallback pool now rides the
+   same directive: `poolN = 4` on any ≥4-core CPU (GPU encoders keep pool
+   1 — consumer GPU sessions serialize internally). Verified by harness:
+   a forced planner bail on a stubbed 4-core box spawned **4 concurrent
+   1-thread superfast workers** (150 s source → 3 chunks, all running at
+   once), output decoding clean (14/14 checks).
+
+2. **Telemetry could claim parallelism that did not run.** The completion
+   toast said "N chunks encoded in parallel" even when `poolN = 1` ran
+   them sequentially — the exact Task-Manager contradiction the field
+   check exposes. The result payload now carries **`poolWorkers`** (the
+   actual max-concurrent ffmpeg processes during the encode stage) and
+   **`cpus`**, and every surface speaks them: the toast ("N chunks across
+   M ffmpeg processes"), the LastExport chip ("⧉ N chunks · M proc",
+   amber when M = 1), and the main-process log (`TWO-STEP POOL: 3 job(s)
+   · 4 concurrent ffmpeg process(es) · encoder libx264 · 4 CPU core(s)`).
+
+3. **The honest version check.** The header chip was a renderer constant
+   — it could not detect a stale Electron shell running a new renderer or
+   vice versa. A new `app-info` IPC surfaces `app.getVersion()` (the
+   rcedit-stamped version resource of the actual executable); the chip now
+   shows the REAL exe version and turns **amber with a warning icon** on
+   any mismatch with the renderer's build constant. The bottom of
+   Settings → Export gains an "About this build" strip: real app version
+   (green when current, amber + "update to v1.12.1" when stale), CPU core
+   count, and the ffmpeg-worker count this machine will spawn — the
+   "how many `ffmpeg.exe` should Task Manager show?" answer **before**
+   starting an export. The Help → About dialog (stuck at "v5.1" since the
+   v5 era) now reads `app.getVersion()` too.
+
+**Field diagnosis with v1.12.1** (all three checks answerable in-app):
+Task Manager process count → the Export tab strip states the expected
+worker count up front, and the post-export toast/chip states what ACTUALLY
+ran; app version → the header chip and the Export tab strip both read the
+real exe resource and flag mismatches; pipeline mode → the toast names the
+mode ("smart render", "N parallel render passes (M ffmpeg processes)",
+"two-step") with the dirty reason when nothing could be copied.

@@ -1123,6 +1123,11 @@ export default function Page() {
         parallelChunks: res.parallelChunks,
         smartCleanSec: res.smartCleanSec,
         smartDirtySec: res.smartDirtySec,
+        // v1.12.1: the honest pool telemetry — the ACTUAL concurrent ffmpeg
+        // process count (Task-Manager-check number) + the machine's cores.
+        poolWorkers: res.poolWorkers,
+        cpus: res.cpus,
+        smartDirtyReason: res.smartDirtyReason,
       });
       // v1.1 TURBO: the success toast carries the performance story —
       // export time + encoder + stream-copy count — so a fast export is
@@ -1164,16 +1169,36 @@ export default function Page() {
       if (res.mode === "parallel-pass" && res.parallelChunks != null && res.parallelChunks > 1) {
         turboBits.push(
           `${res.parallelChunks} parallel render passes` +
+            (res.poolWorkers != null && res.poolWorkers > 0
+              ? ` (${res.poolWorkers} ffmpeg processes)`
+              : "") +
             (res.hwDecodeClips != null && res.hwDecodeClips > 0 ? " · hardware decode" : ""),
         );
         if (res.smartDirtyReason) {
           turboBits.push(`full re-encode: ${res.smartDirtyReason}`);
         }
       } else if (res.totalChunks != null && res.totalChunks > 1) {
-        turboBits.push(
-          `${res.totalChunks} chunks encoded in parallel` +
-            (res.hwDecodeClips != null && res.hwDecodeClips > 0 ? " · hardware decode" : ""),
-        );
+        // v1.12.1: HONEST chunk telemetry — the old label claimed "encoded
+        // in parallel" even when the pool ran a single process (the exact
+        // Task-Manager contradiction the user was told to check). State the
+        // chunk count AND the process count that actually ran.
+        const procTxt =
+          res.poolWorkers != null && res.poolWorkers > 0
+            ? `${res.poolWorkers} ffmpeg process${res.poolWorkers === 1 ? "" : "es"}`
+            : null;
+        if (procTxt) {
+          const parts = [`${res.totalChunks} chunks across ${procTxt}`];
+          if (res.hwDecodeClips != null && res.hwDecodeClips > 0) parts.push("hardware decode");
+          if (procTxt === "1 ffmpeg process" && res.cpus != null && res.cpus >= 4) {
+            parts.push("single-process GPU session");
+          }
+          turboBits.push(parts.join(" · "));
+        } else {
+          turboBits.push(
+            `${res.totalChunks} chunks encoded in parallel` +
+              (res.hwDecodeClips != null && res.hwDecodeClips > 0 ? " · hardware decode" : ""),
+          );
+        }
       } else if (res.hwDecodeClips != null && res.hwDecodeClips > 0) {
         turboBits.push("hardware decode");
       }

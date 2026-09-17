@@ -347,6 +347,13 @@ export interface ExportResult {
    *  stream-copied at TURBO speed, only the dirty windows re-encoded,
    *  stitched via the concat demuxer). */
   mode?: "single-pass" | "parallel-pass" | "two-step" | "smart-render";
+  /** v1.12.1: the ACTUAL max-concurrent ffmpeg processes during the encode
+   *  stage — the Task-Manager-check number. Telemetry can never claim
+   *  parallelism that did not run (a 1-process fallback shows as 1). */
+  poolWorkers?: number;
+  /** v1.12.1: the machine's CPU core count (the pool-width input) — lets
+   *  the UI flag a single-process run on a ≥4-core box. */
+  cpus?: number;
   /** v9: True Smart Rendering telemetry — seconds of the timeline that
    *  rode the stream-copy fast path vs the re-encode windows. */
   smartCleanSec?: number;
@@ -752,6 +759,17 @@ declare global {
   interface Window {
     electronAPI?: {
       isElectron: () => Promise<boolean>;
+      /** v1.12.1: the REAL running-exe facts — app.getVersion() reads the
+       *  rcedit-stamped version resource of the actual executable (stale
+       *  installs disagree with the renderer's build constant) + the CPU
+       *  count that decides the parallel-pool width. */
+      appInfo: () => Promise<{
+        version: string;
+        electron?: string;
+        node?: string;
+        platform?: string;
+        cpus?: number;
+      }>;
       ffmpegStatus: () => Promise<{
         ok: boolean;
         path: string;

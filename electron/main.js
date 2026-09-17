@@ -160,7 +160,7 @@ function buildApplicationMenu() {
     { label: "View", submenu: [{ role: "reload" }, { role: "forceReload" }, { role: "toggleDevTools" }, { type: "separator" }, { role: "resetZoom" }, { role: "zoomIn" }, { role: "zoomOut" }, { type: "separator" }, { role: "togglefullscreen" }] },
     { label: "Window", submenu: [{ role: "minimize" }, { role: "zoom" }] },
     { label: "Help", submenu: [
-      { label: "About", click: () => { dialog.showMessageBox(mainWindow, { type: "info", title: "About", message: "FrameFuse v5.1", detail: "Multi-track video studio — video clips, chroma key, native Whisper captions, GPU-accelerated FFmpeg export.", buttons: ["OK"] }); } },
+      { label: "About", click: () => { dialog.showMessageBox(mainWindow, { type: "info", title: "About", message: `FrameFuse v${app.getVersion()}`, detail: "Multi-track video studio — video clips, chroma key, native Whisper captions, GPU-accelerated FFmpeg export.", buttons: ["OK"] }); } },
       { label: "Naming Guide", click: () => mainWindow && mainWindow.webContents.send("menu:naming-guide") },
     ]},
   ]));
@@ -168,6 +168,20 @@ function buildApplicationMenu() {
 
 // IPC helpers
 ipcMain.handle("is-electron", () => true);
+
+// v1.12.1: the REAL running-exe facts for the "am I on the new build?"
+// check. app.getVersion() reads the rcedit-stamped version resource of the
+// ACTUAL executable — if the renderer's build constant disagrees, the
+// install is stale/hybrid and the UI flags it. Also carries the CPU count
+// (the fact that decides the parallel-pool width) for the Export-tab
+// diagnostics strip.
+ipcMain.handle("app-info", () => ({
+  version: app.getVersion(),
+  electron: process.versions.electron,
+  node: process.versions.node,
+  platform: process.platform,
+  cpus: os.cpus().length,
+}));
 
 // Diagnostics — lets the renderer verify ffmpeg is reachable (v5.1: async —
 // the old execSync blocked the main process up to 10 s on slow disks).
@@ -2998,9 +3012,21 @@ ipcMain.handle("export-native", async (event, opts) => {
     // overhead). The thread-budget division below is unchanged — a single
     // job still gets every core.
     const isGpuEncoder = encoder.name !== "libx264";
+    // v1.12.1 (user directive, follow-up): the two-step FALLBACK pool rides
+    // the same strict-4 recipe as the smart/parallel paths. The v6 formula
+    // min(2, floor(cpus/4)) ran exactly ONE ffmpeg process on a 4-core CPU —
+    // any smart-render init fallback (planner bail, graph over the 25 KB
+    // script budget, <4 s init error) silently degraded the export to the
+    // single-process pipeline the user saw in Task Manager (1 ffmpeg.exe,
+    // ~46 min for a 19-min video). ≥4 cores → STRICTLY 4 concurrent workers;
+    // the thread-budget division below pins each to 1 thread when the pool
+    // is full (the cache-line recipe). GPU encoders keep pool 1 — consumer
+    // GPU sessions serialize internally, more processes only add contention.
     const poolN = isGpuEncoder
       ? 1
-      : Math.max(1, Math.min(2, Math.floor(os.cpus().length / 4)));
+      : cpuCount >= 4
+        ? 4
+        : Math.max(1, Math.min(2, Math.floor(os.cpus().length / 4)));
     // v1.4.2 CHUNKED PARALLEL ENCODE: long re-encode clips split into
     // frame-aligned ~60 s chunks (capped at the pool width — more chunks
     // than workers only adds seek overhead, fewer wastes the pool). This is
@@ -4139,6 +4165,11 @@ ipcMain.handle("export-native", async (event, opts) => {
           totalChunks: dirtyWindows,
           parallelChunks: dirtyWindows,
           hwDecodeClips: spHwCount,
+          // v1.12.1: the ACTUAL max-concurrent ffmpeg processes during the
+          // encode stage — the Task-Manager-check number, surfaced so the
+          // toast/chip can never claim parallelism that did not run.
+          poolWorkers: poolWidth,
+          cpus: cpuCount,
           singlePass: false,
           // v1.10: the parallel-pass mode (≥70 % dirty → W equal temporal
           // windows, 1 encode thread each) reports as "parallel-pass" so the
@@ -4170,6 +4201,12 @@ ipcMain.handle("export-native", async (event, opts) => {
     }
 
     // ─── STEP 1 (run): PARALLEL encode + audio-extraction pool ────
+    // v1.12.1: this fallback only runs when the smart pipeline bailed —
+    // LOG the pool shape so the main-process log (and the result payload's
+    // poolWorkers) state exactly how many ffmpeg processes ran.
+    console.log(
+      `[framefuse] TWO-STEP POOL: ${jobs.length + clipAudioJobs.length} job(s) · ${poolN} concurrent ffmpeg process(es) · encoder ${encoder.name} · ${cpuCount} CPU core(s)`,
+    );
     // N = min(4, max(1, os.cpus() − 2)) concurrent ffmpeg children
     // (child_process.spawn). Per-clip "time=" marks aggregate into the
     // SAME export-progress channel + payload shape the UI already
@@ -4355,6 +4392,9 @@ ipcMain.handle("export-native", async (event, opts) => {
       chunkedClips,
       totalChunks,
       hwDecodeClips,
+      // v1.12.1: the ACTUAL pool width (see the smart-path payload above).
+      poolWorkers: poolN,
+      cpus: cpuCount,
       singlePass: false,
       mode: "two-step",
     };

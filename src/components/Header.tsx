@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import {
   Film,
   Download,
@@ -14,10 +15,16 @@ import {
   Keyboard,
   ListVideo,
   Rows3,
+  TriangleAlert,
 } from "lucide-react";
 import type { TimelineMode, ExportProgress, VideoSettings } from "@/lib/merger/types";
 import { fmtBytes, fmtTimecode } from "@/lib/merger/timeline";
 import { cn } from "@/lib/utils";
+
+/** v1.12.1: the renderer's build constant — compared against the REAL exe
+ *  version (app.getVersion()) so a stale/hybrid install is impossible to
+ *  miss. Keep in sync with package.json on every release. */
+const BUILD_VERSION = "1.12.1";
 
 export interface LastExport {
   path: string;
@@ -45,6 +52,10 @@ export interface LastExport {
   /** v1.10: the primary dirty reason ("subtitles from 0:00 to 19:00"…) —
    *  shown by the completion toast when nothing could be stream-copied. */
   smartDirtyReason?: string;
+  /** v1.12.1: the ACTUAL max-concurrent ffmpeg processes during the encode
+   *  stage (the Task-Manager-check number) + the machine's core count. */
+  poolWorkers?: number;
+  cpus?: number;
 }
 
 interface HeaderProps {
@@ -135,6 +146,39 @@ export function Header({
       ? settings.quality.charAt(0).toUpperCase() + settings.quality.slice(1)
       : "Custom";
 
+  // v1.12.1: the HONEST version check. In Electron the chip shows the REAL
+  // exe version (app.getVersion() — the rcedit-stamped resource); if it
+  // disagrees with this renderer's build constant the install is stale or
+  // hybrid (old shell + new renderer or vice versa) and the chip turns
+  // amber with a warning tooltip — the "am I actually running the new
+  // build?" question answered without guessing.
+  const [exeVersion, setExeVersion] = useState<string | null>(null);
+  useEffect(() => {
+    if (!inElectron) return;
+    let cancelled = false;
+    try {
+      const api = window.electronAPI;
+      if (!api || typeof api.appInfo !== "function") return;
+      api
+        .appInfo()
+        .then((info) => {
+          if (!cancelled && info && typeof info.version === "string") {
+            setExeVersion(info.version);
+          }
+        })
+        .catch(() => {});
+    } catch {
+      /* browser or old shell without the IPC — chip keeps the constant */
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [inElectron]);
+  const versionStale =
+    exeVersion != null && exeVersion.trim() !== "" && exeVersion !== BUILD_VERSION;
+  const shownVersion =
+    exeVersion && exeVersion.trim() !== "" ? exeVersion : BUILD_VERSION;
+
   return (
     <header
       className="no-select flex h-14 shrink-0 items-center gap-2 border-b px-3 sm:gap-4 sm:px-5"
@@ -166,17 +210,27 @@ export function Header({
               FrameFuse
             </span>
             {/* v1.2: quiet mono version chip (was a violet gradient badge).
-                v1.11: hidden below md (tight headers on small screens). */}
+                v1.11: hidden below md (tight headers on small screens).
+                v1.12.1: shows the REAL exe version inside Electron
+                (app.getVersion()) — amber + warning icon when it disagrees
+                with this renderer's build constant (stale/hybrid install). */}
             <span
-              className="hidden whitespace-nowrap rounded border px-1.5 py-0.5 font-mono text-[10px] font-medium md:inline"
+              className={cn(
+                "hidden items-center gap-1 whitespace-nowrap rounded border px-1.5 py-0.5 font-mono text-[10px] font-medium md:inline-flex",
+              )}
               style={{
-                borderColor: "#27272a",
-                backgroundColor: "#18181b",
-                color: "#a1a1aa",
+                borderColor: versionStale ? "rgba(245, 158, 11, 0.55)" : "#27272a",
+                backgroundColor: versionStale ? "rgba(245, 158, 11, 0.10)" : "#18181b",
+                color: versionStale ? "#fbbf24" : "#a1a1aa",
               }}
-              title="FrameFuse v1.12.0 — export throughput pass · 4 strict 1-thread parallel workers on ≥4-core CPUs, d3d11va decode with auto fallback, superfast + fastdecode + CRF 22 speed tiers, audio never marks video dirty"
+              title={
+                versionStale
+                  ? `Version mismatch — the app shell reports v${exeVersion} but this interface is build v${BUILD_VERSION}. The install is stale or mixed: reinstall FrameFuse ${BUILD_VERSION} and check "Add/Remove Programs" for an older copy.`
+                  : `FrameFuse v${shownVersion} — export throughput pass · 4 strict 1-thread parallel workers on ≥4-core CPUs (incl. the two-step fallback pool), d3d11va decode with auto fallback, superfast + fastdecode + CRF 22 speed tiers, honest pool telemetry`
+              }
             >
-              v1.12.0
+              {versionStale && <TriangleAlert className="size-3" aria-hidden />}
+              v{shownVersion}
             </span>
             {/* v5.1: on-disk project file chip (native save/open sessions). */}
             {projectName && (
@@ -389,7 +443,11 @@ export function Header({
                   lastExport.encoder ? ` · ${lastExport.encoder}` : ""
                 }${
                   lastExport.totalChunks && lastExport.totalChunks > 1
-                    ? ` · ${lastExport.totalChunks} chunks encoded in parallel`
+                    ? ` · ${lastExport.totalChunks} chunks across ${
+                        lastExport.poolWorkers != null && lastExport.poolWorkers > 0
+                          ? `${lastExport.poolWorkers} ffmpeg process${lastExport.poolWorkers === 1 ? "" : "es"}`
+                          : "the worker pool"
+                      }`
                     : ""
                 }${
                   lastExport.hwDecodeClips
@@ -430,19 +488,31 @@ export function Header({
               <span style={{ color: "#52525b" }}>·</span>
               <span
                 className="rounded px-1 py-px font-medium"
-                style={{ backgroundColor: "rgba(6, 182, 212, 0.12)", color: "#67e8f9" }}
+                style={{
+                  backgroundColor:
+                    lastExport.poolWorkers != null && lastExport.poolWorkers > 1
+                      ? "rgba(6, 182, 212, 0.12)"
+                      : "rgba(245, 158, 11, 0.12)",
+                  color: lastExport.poolWorkers != null && lastExport.poolWorkers > 1 ? "#67e8f9" : "#fbbf24",
+                }}
                 title={
                   lastExport.mode === "smart-render"
                     ? `Smart render: the timeline was sliced into clean (stream-copied, no re-encode) and dirty (re-encoded) time-ranges, keyframe-aligned so the pieces stitch losslessly — ${(lastExport.smartCleanSec ?? 0).toFixed(0)}s copied · ${(lastExport.smartDirtySec ?? 0).toFixed(0)}s re-encoded`
                     : lastExport.mode === "parallel-pass"
                     ? `Parallel single-pass: the timeline was split into ${lastExport.totalChunks} frame-aligned windows, each rendered by its own ffmpeg process (CPU-first), plus one audio pass — concatenated losslessly`
-                    : "Parallel chunks: long re-encode clips were split into frame-aligned chunks and encoded concurrently" +
+                    : `Parallel chunks: long re-encode clips were split into frame-aligned chunks — ${
+                        lastExport.poolWorkers != null
+                          ? `${lastExport.poolWorkers} ffmpeg process${lastExport.poolWorkers === 1 ? "" : "es"} ran concurrently`
+                          : "encoded across the worker pool"
+                      }` +
                       (lastExport.hwDecodeClips
                         ? ` · ${lastExport.hwDecodeClips} source${lastExport.hwDecodeClips === 1 ? "" : "s"} decoded in hardware (probe-gated)`
                         : "")
                 }
               >
-                ⧉ {lastExport.totalChunks} parallel
+                {lastExport.poolWorkers != null
+                  ? `⧉ ${lastExport.totalChunks} chunks · ${lastExport.poolWorkers} proc`
+                  : `⧉ ${lastExport.totalChunks} parallel`}
               </span>
             </>
           )}
