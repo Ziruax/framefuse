@@ -997,3 +997,21 @@ Stage Summary:
 - v1.12.0 SHIPPED: pushed, installer built + asar-verified, release live at https://github.com/Ziruax/framefuse/releases/tag/v1.12.0, dev server healthy.
 - Field validation pending on the user's 4-core: expect the 19-min mostly-dirty case in the ~12–15 min band (4 × 1-thread superfast workers + d3d11va), and the hw-decode probe log line "ENABLED (not ≥1.5× slower)".
 - SECURITY: the token remains exposed in chat history — rotate after this round.
+
+---
+Task ID: 36 (post-ship housekeeping — divergence cleanup + lockfile hygiene + re-verification)
+Agent: main (Z.ai Code)
+
+Task: Continuation round after the v1.12.0 ship (Tasks 34–35). Confirmed all 4 export-throughput optimizations are present in the pushed code, resolved a local/remote git divergence left by the previous session, fixed stale lockfile entries, restarted the dev server, and re-ran browser self-verification.
+
+Work Log:
+- CONFIRMED the 4 user directives in shipped code (commit 9d3e0ea, tag v1.12.0): (1) main.js ~L3729-3788 — spWorkers = cpuCount >= 4 ? 4 : 1, parallelWorkers: cpuCount >= 4 ? 4 : max(2,min(4,cpus)), parallel-mode pool budget HARD-PINNED threadsPer = filterThreadsPer = 1; (2) probeHwDecode tri-state (~L1528-1572) — d3d11va-first, "auto" graceful fallback on init failure, false only when ≥1.5× slower (WARP pathology); hwaccel rides every worker video input; (3) QUALITY_ENCODER.social = superfast/crf22 (L1616) with -tune fastdecode on every superfast/ultrafast pick (L1652-1658); (4) export-singlepass.js L810-818 — cues with no visible text (empty string AND no word timings carrying text) mark NOTHING dirty; music/volume/SFX/normalize never enter planSmartSegments (audio bus only).
+- GIT DIVERGENCE: local main sat [ahead 1, behind 1] — local 4b268ec vs remote ba7c468, BOTH titled "docs(worklog): Task 34-35 ship record". Forensics: identical worklog.md trees; the only real deltas in 4b268ec were (a) bun.lock content cleanup (−10 stale lines), (b) ~30 binary files with mode-only 755↔644 flips (no content changes), (c) 3 new v1.12 screenshots. The remote ba7c468 was the clean worklog-only record → reset local main to origin/main (4b268ec discarded; v1.12 screenshots preserved on disk).
+- LOCKFILE HYGIENE: remote bun.lock still carried mp4-muxer ^5.2.2 / mp4box ^2.4.1 / @types/dom-webcodecs / @types/wicg-file-system-access entries removed from package.json by the v1.10 WebCodecs excision (frozen-lockfile installs would fail). Regenerated via `bun install --lockfile-only` (804 packages) — exactly the 10 stale lines dropped, mode normalized 755→644. Committed 160aabd + pushed (ba7c468..160aabd). Local == remote, working tree clean.
+- DEV SERVER: restarted (background bun run dev, port 3000) — Ready in 333ms, GET / 200 (5.6s first compile, then sub-300ms).
+- BROWSER SELF-VERIFICATION (agent-browser, live dev): title "FrameFuse v1.12.0 — Video Studio" ✓; welcome hero renders ("Let's make a video" + Import/Try the sample/Open a project cards) ✓; sample storyboard loads from the hero card (9 beats, timeline builds, Export button enables) ✓; Export settings tab shows the Smart Render card ("Untouched footage is copied at full quality — only your edits are re-encoded, in parallel when needed.") + quality profiles + CRF ✓; 0 console errors, 0 page errors all session ✓; phone 390×844 — scrollWidth exactly 390, overflow=false ✓. Screenshots: agent-ctx/v1.12-verify-{phone,desktop}.png. dev.log clean.
+
+Stage Summary:
+- v1.12.0 export-throughput work is fully shipped and re-verified end-to-end; repo state is now canonical (local == origin/main at 160aabd, clean tree, healthy dev server, lockfile consistent with package.json).
+- No code changes this round — code was already correct per Tasks 34–35; this round was divergence cleanup + hygiene + confirmation.
+- Field validation remains pending on the user's 4-core machine: 19-min mostly-dirty timeline expected in the ~12–15 min band; cut-heavy timelines expected < 4 min (stream-copy dominant).
