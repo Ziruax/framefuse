@@ -1040,3 +1040,22 @@ Stage Summary:
 - v1.12.1: the two-step fallback can no longer silently run single-process on ≥4-core CPUs (strict 4 × 1-thread superfast workers everywhere libx264 runs); export telemetry states the ACTUAL concurrent ffmpeg process count on every surface (toast, LastExport chip, main log, result payload); the version shown is the REAL exe resource (header chip + Settings strip + About dialog) with stale-install flagging.
 - Files: electron/{main,preload}.js, src/lib/merger/types.ts, src/components/{Header,SettingsPanel}.tsx, src/app/page.tsx, src/app/layout.tsx, scripts/verify-timeline-chunks.js (stub), docs/EXPORT_PERF.md, package.json.
 - Next: push + Windows installer + GitHub release v1.12.1 (this round), then field validation with the in-app diagnostics (Export tab strip → expected worker count; toast → what actually ran).
+
+---
+Task ID: 38 (ship round v1.12.1)
+Agent: main (Z.ai Code)
+
+Task: Push commit 55c2638 (v1.12.1 — hidden single-process fix + honest telemetry), build the Windows installer, create the GitHub Release v1.12.1.
+
+Work Log:
+- PUSHED 55c2638 → main (feafacd..55c2638).
+- Build pipeline (foreground, no wine): dev server stopped → npm run clean → next build --webpack (/, /icon.ico, /apple-icon.png emitted) → node scripts/copy-wasm.js (4 files) → npm run fetch:ffmpeg (186 MB fresh download — btbn-master-gpl staged) → stage:whisper (42 MB preserved) → stage:whisper-model (7 dl) → stage:faster-whisper (cp311 wheel-tag guard ✓) → stage:faster-whisper-model (4 dl, 75 MB) → electron-builder --win nsis → dist/FrameFuse Setup 1.12.1.exe (377,232,429 B) + .blockmap (394,089) + latest.yml (350, dash-named url — autoupdate-safe).
+- ASAR VERIFIED (@electron/asar): package.json 1.12.1 ✓; electron/main.js carries the strict-4 fallback pool (poolN = cpuCount >= 4 ? 4), the app-info handler, FrameFuse v${app.getVersion()} in About, the TWO-STEP POOL log line, and poolWorkers telemetry on BOTH result payloads ✓; preload exposes appInfo ✓; renderer chunks carry "update to v1.12.1" (stale-install strip), "ffmpeg process" (honest toast), "ffmpeg workers" (about strip) ✓.
+- Dev server restarted (background, port 3000): GET / 200.
+- GitHub release v1.12.1 created (id 390505807, "v1.12.1 — Hidden Single-Process Fix + Honest Export Telemetry") — 3 assets state=uploaded: FrameFuse-Setup-1.12.1.exe (377,232,429), .exe.blockmap (394,089), latest.yml (350). Tag v1.12.1 → 55c2638 on both local and remote.
+- Note: initial release curl failed with "Bad credentials" — the token-extraction sed grabbed "user:token" from the https://user:token@host remote; corrected to capture the password part only (auth verified as Ziruax before the release POST).
+
+Stage Summary:
+- v1.12.1 SHIPPED: pushed, installer built + asar-verified, release live at https://github.com/Ziruax/framefuse/releases/tag/v1.12.1, dev server healthy.
+- Field playbook for the user: install v1.12.1 → check the Export tab strip says "4 CPU cores · 4× ffmpeg workers" and the header chip shows v1.12.1 (green) → export the 19-min timeline → Task Manager should show 4 ffmpeg.exe and the toast should say "N parallel render passes (4 ffmpeg processes)" or "N chunks across 4 ffmpeg processes". Any amber chip or "1 ffmpeg process" reading is now a labeled, self-explaining signal instead of a silent failure.
+- SECURITY: the token remains exposed in chat history — rotate after this round.
