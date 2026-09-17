@@ -59,6 +59,7 @@ import {
 } from "lucide-react";
 import { splitMiddle } from "@/lib/merger/text";
 import type {
+  DisclaimerClip,
   MediaSegment,
   TimelineMode,
   AudioTrack,
@@ -69,7 +70,11 @@ import type {
   KenBurnsDirection,
   ItemEdit,
 } from "@/lib/merger/types";
-import { TRANSITION_STYLE_INFO, boundaryStyle } from "@/lib/merger/types";
+import {
+  DISCLAIMER_PRESETS_MS,
+  TRANSITION_STYLE_INFO,
+  boundaryStyle,
+} from "@/lib/merger/types";
 import { fmtTimecode } from "@/lib/merger/timeline";
 import { ChromaKeyer } from "@/lib/merger/chroma";
 // v1: the chroma-key editor + frame helpers now live in the shared
@@ -87,6 +92,7 @@ import {
 } from "@/lib/merger/sfx";
 import type { BeatInfo } from "@/lib/merger/beatDetect";
 import { cn } from "@/lib/utils";
+import { ShieldAlert } from "lucide-react";
 
 interface MediaPanelProps {
   segments: MediaSegment[];
@@ -166,6 +172,16 @@ interface MediaPanelProps {
   onRemoveSfx?: (id: string) => void;
   /** v5: playhead position for "add at playhead" timecode display. */
   currentMs?: number;
+  /** v1.14: the disclaimer / intro lead-in clip (null = none). */
+  disclaimer?: DisclaimerClip | null;
+  /** v1.14: the effective lead-in offset (display-time shift). */
+  disclaimerOffsetMs?: number;
+  /** v1.14: open the disclaimer picker (images AND videos, any name). */
+  openDisclaimerPicker?: () => void;
+  /** v1.14: change the hold duration (preset ms, or "full" for videos). */
+  onSetDisclaimerDuration?: (choice: number | "full") => void;
+  /** v1.14: remove the disclaimer lead-in. */
+  onRemoveDisclaimer?: () => void;
 }
 
 const KIND_STYLES: Record<
@@ -245,6 +261,11 @@ export function MediaPanelBase({
   onUpdateSfx,
   onRemoveSfx,
   currentMs,
+  disclaimer,
+  disclaimerOffsetMs,
+  openDisclaimerPicker,
+  onSetDisclaimerDuration,
+  onRemoveDisclaimer,
 }: MediaPanelProps) {
   const [dragOver, setDragOver] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -1704,6 +1725,214 @@ export function MediaPanelBase({
               );
             })}</>
             ))}
+
+            {/* v1.14: Disclaimer / intro lead-in card — the FIRST thing the
+                video shows. Any filename (naming rules never apply); images
+                hold for the picked duration, videos play their length. */}
+            {mediaTab === "all" && openDisclaimerPicker && (
+              disclaimer ? (
+                <div
+                  className="rounded-lg border p-2.5"
+                  style={{
+                    borderColor: "rgba(217, 119, 6, 0.45)",
+                    backgroundColor: "rgba(41, 24, 6, 0.22)",
+                  }}
+                >
+                  <div className="flex items-center gap-2">
+                    <div
+                      className="relative flex size-10 shrink-0 items-center justify-center overflow-hidden rounded-lg"
+                      style={{
+                        backgroundColor: "rgba(217, 119, 6, 0.22)",
+                        boxShadow: "0 0 12px rgba(251, 146, 60, 0.14)",
+                      }}
+                      title="Plays first — everything else shifts after it"
+                    >
+                      {disclaimer.kind === "image" ? (
+                        <img
+                          src={disclaimer.url}
+                          alt=""
+                          className="size-full object-cover"
+                          loading="lazy"
+                        />
+                      ) : disclaimer.thumbUrl ? (
+                        <img
+                          src={disclaimer.thumbUrl}
+                          alt=""
+                          className="size-full object-cover"
+                          loading="lazy"
+                        />
+                      ) : (
+                        <Video className="size-4" style={{ color: "#fdba74" }} />
+                      )}
+                      <span
+                        className="absolute inset-x-0 bottom-0 flex items-center justify-center bg-black/70 py-[1px] text-[7px] font-bold uppercase tracking-wide"
+                        style={{ color: "#fdba74" }}
+                      >
+                        1st
+                      </span>
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div
+                        className="flex items-center gap-1.5 truncate text-[11px] font-medium"
+                        style={{ color: "#e7e5e4" }}
+                        title={disclaimer.fileName}
+                      >
+                        <ShieldAlert className="size-3 shrink-0" style={{ color: "#fb923c" }} />
+                        <span className="truncate">{disclaimer.fileName}</span>
+                      </div>
+                      <div className="text-[9px]" style={{ color: "#a8a29e" }}>
+                        {disclaimer.kind === "video" ? "disclaimer video" : "disclaimer image"}
+                        {disclaimerOffsetMs
+                          ? ` · plays first for ${fmtTimecode(disclaimerOffsetMs)}`
+                          : ""}
+                        {disclaimer.kind === "video" && disclaimer.sourceDurationMs
+                          ? ` · source ${fmtTimecode(disclaimer.sourceDurationMs)}`
+                          : ""}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => openDisclaimerPicker()}
+                      className="shrink-0 rounded p-1 transition-colors hover:bg-white/10"
+                      style={{ color: "#a8a29e" }}
+                      title="Replace the disclaimer file"
+                    >
+                      <Pencil className="size-3.5" />
+                    </button>
+                    {onRemoveDisclaimer && (
+                      <button
+                        type="button"
+                        onClick={onRemoveDisclaimer}
+                        className="shrink-0 rounded p-1 transition-colors hover:bg-red-500/15"
+                        style={{ color: "#a8a29e" }}
+                        title="Remove the disclaimer — the video starts at your first clip again"
+                      >
+                        <Trash2 className="size-3.5" />
+                      </button>
+                    )}
+                  </div>
+                  {/* Hold duration: 1s / 2s / 3s / 5s / 10s (+ Full video). */}
+                  {onSetDisclaimerDuration && (
+                    <div className="mt-2 flex items-center gap-1.5">
+                      <span
+                        className="text-[9px] font-medium"
+                        style={{ color: "#fdba74" }}
+                        title={
+                          disclaimer.kind === "video"
+                            ? "How long the disclaimer plays before your content (videos trim to the first Ns; Full plays the whole source)"
+                            : "How long the disclaimer image is held before your content"
+                        }
+                      >
+                        Duration
+                      </span>
+                      <div
+                        className="flex flex-1 items-center rounded-md border p-0.5"
+                        role="radiogroup"
+                        aria-label="Disclaimer duration"
+                        style={{
+                          borderColor: "rgba(217, 119, 6, 0.3)",
+                          backgroundColor: "rgba(9, 9, 11, 0.5)",
+                        }}
+                      >
+                        {DISCLAIMER_PRESETS_MS.map((ms) => {
+                          const active =
+                            !disclaimer.videoFull && disclaimer.durationMs === ms;
+                          return (
+                            <button
+                              key={ms}
+                              type="button"
+                              role="radio"
+                              aria-checked={active}
+                              onClick={() => onSetDisclaimerDuration(ms)}
+                              className={cn(
+                                "flex-1 rounded px-1 py-1 text-[9px] font-semibold tabular-nums transition-all",
+                                active
+                                  ? "hover:brightness-110"
+                                  : "text-zinc-500 hover:text-zinc-300",
+                              )}
+                              style={
+                                active
+                                  ? {
+                                      backgroundColor: "rgba(251, 146, 60, 0.22)",
+                                      color: "#fdba74",
+                                      boxShadow: "inset 0 0 0 1px rgba(251, 146, 60, 0.4)",
+                                    }
+                                  : undefined
+                              }
+                            >
+                              {ms / 1000}s
+                            </button>
+                          );
+                        })}
+                        {disclaimer.kind === "video" && (
+                          <button
+                            type="button"
+                            role="radio"
+                            aria-checked={disclaimer.videoFull === true}
+                            onClick={() => onSetDisclaimerDuration("full")}
+                            className={cn(
+                              "flex-1 rounded px-1 py-1 text-[9px] font-semibold transition-all",
+                              disclaimer.videoFull === true
+                                ? "hover:brightness-110"
+                                : "text-zinc-500 hover:text-zinc-300",
+                            )}
+                            style={
+                              disclaimer.videoFull === true
+                                ? {
+                                    backgroundColor: "rgba(251, 146, 60, 0.22)",
+                                    color: "#fdba74",
+                                    boxShadow: "inset 0 0 0 1px rgba(251, 146, 60, 0.4)",
+                                  }
+                                : undefined
+                            }
+                            title={`Play the full source video (${fmtTimecode(
+                              disclaimer.sourceDurationMs ?? disclaimer.durationMs,
+                            )})`}
+                          >
+                            Full
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                  <p className="mt-1 px-0.5 text-[9px]" style={{ color: "#78716c" }}>
+                    No link to your audio — clips, music and captions all shift back
+                    together, in perfect sync.
+                  </p>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={openDisclaimerPicker}
+                  className="flex w-full cursor-pointer items-center gap-2.5 rounded-lg border border-dashed p-2.5 text-left transition-all hover:-translate-y-px hover:brightness-125"
+                  style={{
+                    borderColor: "rgba(217, 119, 6, 0.4)",
+                    backgroundColor: "rgba(41, 24, 6, 0.12)",
+                  }}
+                  title="Add a disclaimer or intro image/video that plays BEFORE everything — any filename works"
+                >
+                  <span
+                    className="flex size-8 shrink-0 items-center justify-center rounded-lg"
+                    style={{
+                      backgroundColor: "rgba(217, 119, 6, 0.16)",
+                    }}
+                  >
+                    <Plus className="size-4" style={{ color: "#fb923c" }} />
+                  </span>
+                  <span className="min-w-0">
+                    <span
+                      className="block text-[11px] font-semibold"
+                      style={{ color: "#fdba74" }}
+                    >
+                      Disclaimer / intro card
+                    </span>
+                    <span className="block text-[9px]" style={{ color: "#a8a29e" }}>
+                      Plays first (1–10s) — clips + audio shift back in sync
+                    </span>
+                  </span>
+                </button>
+              )
+            )}
 
             {/* Audio track chip — v1.3: lives on All + Audio tabs. */}
             {audioTrack && (mediaTab === "all" || mediaTab === "audio") && (

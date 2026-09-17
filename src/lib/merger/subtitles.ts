@@ -265,6 +265,34 @@ export function cueAt(cues: SubtitleCue[], tMs: number): SubtitleCue | null {
 }
 
 /**
+ * v1.14 (disclaimer lead-in): translate every cue (and its per-word
+ * timestamps) forward by offsetMs, keeping the sort order intact. Used by the
+ * preview + export payload so burned-in captions stay locked to the audio
+ * when a disclaimer card shifts the whole timeline back. Returns the input
+ * array unchanged when offsetMs is 0 (no allocation).
+ */
+export function shiftCues(
+  cues: SubtitleCue[],
+  offsetMs: number,
+): SubtitleCue[] {
+  if (!cues.length || !(offsetMs > 0)) return cues;
+  return cues.map((c) => ({
+    ...c,
+    startMs: c.startMs + offsetMs,
+    endMs: c.endMs + offsetMs,
+    ...(c.words
+      ? {
+          words: c.words.map((w) => ({
+            ...w,
+            startMs: w.startMs + offsetMs,
+            endMs: w.endMs + offsetMs,
+          })),
+        }
+      : {}),
+  }));
+}
+
+/**
  * Serialize cues back to an SRT string (used to write a temp .srt file
  * for FFmpeg burn-in). Always emits standard SRT with 3-digit ms and
  * comma separator.

@@ -74,6 +74,16 @@ export interface ProjectAudioEntry {
   dataUrl: string;
 }
 
+export interface ProjectDisclaimerEntry {
+  name: string;
+  type: string;
+  dataUrl: string;
+  /** Saved hold duration (ms). For videos: the effective duration at save
+   *  time; videoFull says it tracked the full source length. */
+  durationMs: number;
+  videoFull?: boolean;
+}
+
 export interface ProjectFile {
   app: string;
   version: number;
@@ -102,6 +112,9 @@ export interface ProjectFile {
     image: ProjectImageEntry | null;
     settings: WatermarkSettings;
   } | null;
+  /** v1.14: disclaimer / intro lead-in card (any filename, never parsed by
+   *  the placement naming rules). Absent on ≤1.13 files → no lead-in. */
+  disclaimer?: ProjectDisclaimerEntry | null;
   settings: {
     kenBurns: KenBurnsConfig;
     video: VideoSettings;
@@ -132,6 +145,12 @@ export interface SaveProjectInput {
   sfxItems?: SfxItem[];
   /** v5.0: known video source durations (id → ms). */
   videoDurations?: Record<string, number>;
+  /** v1.14: disclaimer / intro lead-in card. */
+  disclaimer?: {
+    file: File;
+    durationMs: number;
+    videoFull: boolean;
+  } | null;
   settings: ProjectFile["settings"];
 }
 
@@ -200,6 +219,25 @@ export async function buildProjectFile(
     };
   }
 
+  // v1.14: disclaimer / intro card. Videos above MAX_VIDEO_MB are dropped
+  // (same cap as media entries — a data URL would bloat the file by ~1.37×).
+  let disclaimer: ProjectDisclaimerEntry | null = null;
+  if (input.disclaimer) {
+    const d = input.disclaimer;
+    const isVideo =
+      (d.file.type && d.file.type.startsWith("video/")) ||
+      /\.(mp4|webm|mov|mkv|m4v|avi)$/i.test(d.file.name);
+    if (!isVideo || d.file.size <= MAX_VIDEO_MB * 1024 * 1024) {
+      disclaimer = {
+        name: d.file.name,
+        type: d.file.type || (isVideo ? "video/mp4" : "image/jpeg"),
+        dataUrl: await fileToDataUrl(d.file),
+        durationMs: Math.max(200, Math.round(d.durationMs) || 2000),
+        ...(d.videoFull ? { videoFull: true } : {}),
+      };
+    }
+  }
+
   return {
     app: PROJECT_APP,
     version: PROJECT_VERSION,
@@ -219,6 +257,7 @@ export async function buildProjectFile(
     sfxItems: sanitizeSfxItems(input.sfxItems),
     videoDurations: sanitizeVideoDurations(input.videoDurations),
     watermark,
+    disclaimer,
     settings: input.settings,
   };
 }
@@ -392,6 +431,8 @@ export interface LoadedProject {
   audioFile: File | null;
   /** Watermark image File (v4.4) or null. */
   watermarkFile: { id: string; file: File } | null;
+  /** v1.14: disclaimer / intro card (File + saved duration facts) or null. */
+  disclaimerFile: { file: File; durationMs: number; videoFull: boolean } | null;
   /** Re-serialized SRT text (for the FFmpeg temp file). */
   srtText: string | null;
   audioSkipped: boolean;
@@ -503,6 +544,30 @@ export async function parseProjectDoc(doc: unknown): Promise<LoadedProject> {
     }
   }
 
+  // v1.14: disclaimer / intro card.
+  let disclaimerFile: {
+    file: File;
+    durationMs: number;
+    videoFull: boolean;
+  } | null = null;
+  if (project.disclaimer?.dataUrl) {
+    try {
+      const dur = Number(project.disclaimer.durationMs);
+      disclaimerFile = {
+        file: await dataUrlToFile(
+          project.disclaimer.dataUrl,
+          project.disclaimer.name,
+          project.disclaimer.type,
+        ),
+        durationMs:
+          Number.isFinite(dur) && dur > 0 ? Math.round(dur) : 2000,
+        videoFull: project.disclaimer.videoFull === true,
+      };
+    } catch {
+      disclaimerFile = null;
+    }
+  }
+
   const cues = project.subtitles?.cues;
   const validCues = Array.isArray(cues) && cues.length > 0;
 
@@ -511,6 +576,7 @@ export async function parseProjectDoc(doc: unknown): Promise<LoadedProject> {
     imageFiles,
     audioFile,
     watermarkFile,
+    disclaimerFile,
     srtText: validCues ? serializeSrt(cues) : null,
     audioSkipped: !!project.audio && !audioFile,
     videoSkipped,

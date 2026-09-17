@@ -1422,14 +1422,14 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 (appInfo.platform ? ` · ${appInfo.platform}` : "")
               }
             >
-              {appInfo.version !== "1.13.0" ? (
+              {appInfo.version !== "1.14.0" ? (
                 <span
                   className="flex items-center gap-1 rounded px-1.5 py-0.5 font-bold"
                   style={{ backgroundColor: "rgba(245, 158, 11, 0.14)", color: "#fbbf24" }}
-                  title={`This install reports v${appInfo.version} — the current build is v1.13.0. Reinstall FrameFuse v1.13.0 (an old cached executable is running).`}
+                  title={`This install reports v${appInfo.version} — the current build is v1.14.0. Reinstall FrameFuse v1.14.0 (an old cached executable is running).`}
                 >
                   <TriangleAlert size={11} aria-hidden />
-                  App v{appInfo.version} — update to v1.13.0
+                  App v{appInfo.version} — update to v1.14.0
                 </span>
               ) : (
                 <span

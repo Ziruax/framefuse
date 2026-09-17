@@ -43,6 +43,7 @@ import {
   Play,
   Repeat,
   Scissors,
+  ShieldAlert,
   Timer,
   Trash2,
   Volume2,
@@ -65,7 +66,7 @@ import type {
   TransitionSettings,
   TransitionStyle,
 } from "@/lib/merger/types";
-import { boundaryStyle } from "@/lib/merger/types";
+import { DISCLAIMER_ID, boundaryStyle } from "@/lib/merger/types";
 import { fmtTimecode } from "@/lib/merger/timeline";
 import {
   applyMotionKeyframe,
@@ -156,6 +157,15 @@ interface TimelineRulerProps {
   /** v1: one-click BIG-TIMELINE toggle — swaps between the working height
    *  and the 65% cap (the row splitter still fine-tunes either way). */
   onToggleTimelineBig?: () => void;
+  /** v1.14: disclaimer / intro lead-in — rendered as a fixed, non-draggable
+   *  amber block at [0, durationMs) on the base lane. The content segments
+   *  arrive already SHIFTED by the parent (display time). */
+  disclaimer?: {
+    durationMs: number;
+    fileName: string;
+    kind: "image" | "video";
+    thumbnailUrl: string | null;
+  } | null;
 }
 
 /** v5.5: sentinel id of the singleton background-music clip inside the
@@ -1426,6 +1436,81 @@ function EmptyHint({ children }: { children: ReactNode }) {
   );
 }
 
+/**
+ * v1.14 DISCLAIMER LEAD-IN BLOCK — the fixed amber tile at [0, N) on the
+ * base lane. Non-draggable / non-trimmable by design (the duration comes
+ * from the media-panel selector, not a timeline gesture); clicking rewinds
+ * into the lead-in. The content clips start at N (the parent already
+ * shifted them into display time).
+ */
+function DisclaimerBar({
+  disclaimer,
+  totalMs,
+  layout,
+  isActive,
+  onSeek,
+}: {
+  disclaimer: NonNullable<TimelineRulerProps["disclaimer"]>;
+  totalMs: number;
+  layout?: TimelinePxLayout;
+  isActive: boolean;
+  onSeek: (ms: number) => void;
+}) {
+  const durMs = Math.max(200, disclaimer.durationMs);
+  const posStyle =
+    layout != null
+      ? {
+          left: layout.pxOf(0),
+          width: Math.max(14, layout.pxOf(durMs) - layout.pxOf(0)),
+        }
+      : {
+          left: "0%",
+          width: `${totalMs > 0 ? Math.max(1, (durMs / totalMs) * 100) : 2}%`,
+        };
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      aria-label={`${disclaimer.fileName}, disclaimer lead-in, 0 to ${fmtTimecode(durMs)}`}
+      onClick={(e) => {
+        e.stopPropagation();
+        onSeek(0);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          e.stopPropagation();
+          onSeek(0);
+        }
+      }}
+      className={cn(
+        "ff-clip group absolute top-0 cursor-pointer overflow-hidden rounded-md text-[8px] font-semibold tabular-nums transition-all duration-150",
+        "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-orange-300/70",
+        isActive && "ff-clip-active",
+      )}
+      style={{
+        ...posStyle,
+        height: "100%",
+        backgroundImage: disclaimer.thumbnailUrl
+          ? `linear-gradient(180deg, rgba(255,255,255,0.08) 0%, rgba(0,0,0,0.26) 100%), linear-gradient(180deg, rgba(251, 146, 60, 0.24) 0%, rgba(120, 53, 15, 0.52) 100%), url(${disclaimer.thumbnailUrl})`
+          : "linear-gradient(180deg, rgba(251, 146, 60, 0.24) 0%, rgba(120, 53, 15, 0.52) 100%)",
+        backgroundSize: "cover",
+        backgroundPosition: "center",
+        boxShadow: isActive ? "inset 0 0 0 2px rgba(251, 146, 60, 0.8)" : "inset 0 0 0 1px rgba(251, 146, 60, 0.45)",
+      }}
+      title={`${disclaimer.fileName} · DISCLAIMER · 0:00–${fmtTimecode(durMs)} (${(durMs / 1000).toFixed(1)}s)\nplays before everything — clips, music and captions shift after it\nclick to rewind to the very start`}
+    >
+      <span className="pointer-events-none absolute inset-y-0 left-0 flex w-full items-center justify-center gap-1 bg-black/35 px-1 text-center text-[8px] font-bold uppercase tracking-[0.14em] text-orange-200/95">
+        <ShieldAlert className="size-2.5 shrink-0" aria-hidden />
+        <span className="truncate">Disclaimer</span>
+      </span>
+      <span className="pointer-events-none absolute bottom-0 right-0.5 rounded-sm bg-black/60 px-0.5 text-[7px] tabular-nums text-orange-200/90">
+        {(durMs / 1000).toFixed(1)}s
+      </span>
+    </div>
+  );
+}
+
 /** v5.1: MM:SS.d — sub-second precision for the ruler readout chip. */
 function fmtTcTenths(ms: number): string {
   const s = Math.max(0, ms) / 1000;
@@ -1477,6 +1562,7 @@ export function TimelineRuler({
   clipboardCount = 0,
   timelineBig = false,
   onToggleTimelineBig,
+  disclaimer,
 }: TimelineRulerProps) {
   const trackRef = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
@@ -3509,6 +3595,21 @@ export function TimelineRuler({
               onContextMenu={openLaneMenu}
               {...laneMarqueeHandlers}
             >
+              {/* v1.14: the fixed disclaimer lead-in block at [0, N). */}
+              {disclaimer && (
+                <div
+                  className="absolute left-0 right-0"
+                  style={{ top: 12, bottom: 4 }}
+                >
+                  <DisclaimerBar
+                    disclaimer={disclaimer}
+                    totalMs={totalMs}
+                    layout={layout}
+                    isActive={activeId === DISCLAIMER_ID}
+                    onSeek={onSeek}
+                  />
+                </div>
+              )}
               {baseSegs.length === 0 ? (
                 <EmptyHint>No base clips — media stacks here</EmptyHint>
               ) : (

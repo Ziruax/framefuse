@@ -42,6 +42,7 @@ import {
   serializeSrt,
   serializeVtt,
   serializeVttWords,
+  shiftCues,
 } from "@/lib/merger/subtitles";
 import {
   detectBeats as detectBeatsInAudio,
@@ -61,9 +62,11 @@ import {
   defaultTransitionSettings,
   defaultWatermarkSettings,
   makeHeadlineItem,
+  DISCLAIMER_ID,
   type AudioSettings,
   type AudioTrack,
   type CaptionSettings,
+  type DisclaimerClip,
   type ExportProgress,
   type HeadlineItem,
   type ItemEdit,
@@ -121,6 +124,75 @@ let _idCounter = 0;
 function genId(): string {
   _idCounter += 1;
   return `f${Date.now().toString(36)}_${_idCounter.toString(36)}`;
+}
+
+// ---------------------------------------------------------------------------
+// v1.14 DISCLAIMER / INTRO LEAD-IN — the display/export time-shift layer.
+//
+// The disclaimer clip (any filename — NEVER parsed by the placement rules)
+// occupies [0, N) of the OUTPUT. Every render/playback consumer below works
+// in DISPLAY time (base timeline + N); every EDIT write goes through a
+// display→base translation so the stored project state stays in base time
+// (0 = first real clip). Removing the disclaimer collapses the shift with
+// zero stored-state changes — that is the whole point of the layer.
+// ---------------------------------------------------------------------------
+
+/** Default image hold duration (a "light" disclaimer — 2s). */
+const DISCLAIMER_DEFAULT_MS = 2000;
+
+/** Effective lead-in duration of a disclaimer clip (ms, min 200). */
+function disclaimerDurationOf(d: DisclaimerClip | null): number {
+  if (!d) return 0;
+  const ms = Number(d.durationMs);
+  return Number.isFinite(ms) && ms >= 200 ? Math.round(ms) : 0;
+}
+
+/**
+ * The virtual MediaSegment the preview + export prepend at [0, N). It flows
+ * through the EXISTING image/video pipelines (canvas draw, hidden <video>,
+ * FFmpeg clip graphs, clip-audio adelay) unchanged — kind "duration" so no
+ * filename timing is ever consulted.
+ */
+function makeDisclaimerSegment(d: DisclaimerClip, durMs: number): MediaSegment {
+  return {
+    id: DISCLAIMER_ID,
+    fileName: d.fileName,
+    file: d.file,
+    kind: "duration",
+    startMs: 0,
+    endMs: durMs,
+    durationMs: durMs,
+    rawStartMs: null,
+    rawEndMs: null,
+    rawDurationMs: durMs,
+    // Ken Burns: a subtle zoom-in reads as intentional on a title card and
+    // matches the global setting's look (zoompan only runs when enabled).
+    direction: "in",
+    thumbnailUrl: d.thumbUrl || d.url,
+    order: -1,
+    mediaType: d.kind,
+    track: 0,
+    volume: 1,
+    trimInMs: 0,
+    sourceDurationMs: d.sourceDurationMs ?? null,
+    speed: 1,
+    overlayLoop: false,
+    chroma: null,
+    overlay: null,
+  };
+}
+
+/** Shift every base segment forward by the lead-in (display space). */
+function shiftSegments(
+  segs: MediaSegment[],
+  offsetMs: number,
+): MediaSegment[] {
+  if (!(offsetMs > 0) || segs.length === 0) return segs;
+  return segs.map((s) => ({
+    ...s,
+    startMs: s.startMs + offsetMs,
+    endMs: s.endMs + offsetMs,
+  }));
 }
 
 // ---- Settings persistence (production-ready: survive restarts) ----------
@@ -184,6 +256,8 @@ export default function Page() {
   const [audioTrack, setAudioTrack] = useState<AudioTrack | null>(null);
   const [subtitles, setSubtitles] = useState<SubtitleFile | null>(null);
   const [overrides, setOverrides] = useState<Record<string, number>>({});
+  // v1.14: disclaimer / intro lead-in clip (image or video, ANY filename).
+  const [disclaimer, setDisclaimer] = useState<DisclaimerClip | null>(null);
 
   // ---- Audio playback (synced with preview) -------------------------------
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -404,6 +478,9 @@ export default function Page() {
   // dialog, images AND videos; the per-kind buttons stay in the media panel).
   const mediaInputRef = useRef<HTMLInputElement>(null);
   const subtitleInputRef = useRef<HTMLInputElement>(null);
+  // v1.14: disclaimer picker — images AND videos, ANY filename (the placement
+  // naming rules never apply to it).
+  const disclaimerInputRef = useRef<HTMLInputElement>(null);
   const openImagePicker = useCallback(() => imageInputRef.current?.click(), []);
   const openVideoPicker = useCallback(() => videoInputRef.current?.click(), []);
   // v1.11: welcome hero — images + videos in one picker.
@@ -411,6 +488,10 @@ export default function Page() {
   const openAudioPicker = useCallback(() => audioInputRef.current?.click(), []);
   const openSubtitlePicker = useCallback(
     () => subtitleInputRef.current?.click(),
+    [],
+  );
+  const openDisclaimerPicker = useCallback(
+    () => disclaimerInputRef.current?.click(),
     [],
   );
 
@@ -478,12 +559,73 @@ export default function Page() {
     [entries, overrides, kenBurns, motionOverrides, itemEdits, videoDurations],
   );
 
+  // ---- v1.14: DISPLAY timeline (base + disclaimer lead-in offset) ----------
+  // `timeline` stays in BASE time (0 = first real clip) — it is the EDITING
+  // source of truth (state, project files, beat/fit planners). Everything
+  // that RENDERS or PLAYS BACK consumes the shifted memos below so the
+  // disclaimer shows at [0, N) and the main content — clips, music, SFX,
+  // captions, headlines — moves back TOGETHER (image↔audio sync preserved
+  // by construction; the disclaimer has no link to the audio track).
+  const disclaimerOffsetMs = disclaimerDurationOf(disclaimer);
+  const disclaimerOffsetRef = useRef(0);
+  useEffect(() => {
+    disclaimerOffsetRef.current = disclaimerOffsetMs;
+  }, [disclaimerOffsetMs]);
+
+  /** Base segments shifted forward by the lead-in (display space). */
+  const displaySegments = useMemo(
+    () => shiftSegments(timeline.segments, disclaimerOffsetMs),
+    [timeline.segments, disclaimerOffsetMs],
+  );
+  const displayTotalMs = timeline.totalMs + disclaimerOffsetMs;
+  /** Display segments + the virtual disclaimer clip at [0, N) — the preview
+   *  (canvas draw, hidden video sync, stepSegment) and the export payload. */
+  const previewSegments = useMemo(
+    () =>
+      disclaimer && disclaimerOffsetMs > 0
+        ? [makeDisclaimerSegment(disclaimer, disclaimerOffsetMs), ...displaySegments]
+        : displaySegments,
+    [disclaimer, disclaimerOffsetMs, displaySegments],
+  );
+  /** SFX placements shifted for the timeline strip + export payload. */
+  const displaySfxItems = useMemo(
+    () =>
+      disclaimerOffsetMs > 0 && sfxItems.length
+        ? sfxItems.map((s) => ({ ...s, startMs: s.startMs + disclaimerOffsetMs }))
+        : sfxItems,
+    [sfxItems, disclaimerOffsetMs],
+  );
+  /** Headline items shifted for the strip + export payload. */
+  const displayHeadlines = useMemo(
+    () =>
+      disclaimerOffsetMs > 0 && headlineItems.length
+        ? headlineItems.map((h) => ({
+            ...h,
+            startMs: h.startMs + disclaimerOffsetMs,
+            endMs: h.endMs + disclaimerOffsetMs,
+          }))
+        : headlineItems,
+    [headlineItems, disclaimerOffsetMs],
+  );
+  /** Subtitle file with shifted cues (+ word timings) for preview + export. */
+  const displaySubtitles = useMemo(() => {
+    if (disclaimerOffsetMs <= 0 || !subtitles || !subtitles.cues.length) {
+      return subtitles;
+    }
+    return {
+      ...subtitles,
+      cues: shiftCues(subtitles.cues, disclaimerOffsetMs),
+    };
+  }, [subtitles, disclaimerOffsetMs]);
+  /** Music start in display space (strip clip + waveform origin). */
+  const displayMusicStartMs = audioSettings.musicStartMs + disclaimerOffsetMs;
+
   const activeSegment = useMemo(
     () =>
-      timeline.segments.length
-        ? segmentAtTime(timeline.segments, currentMs)
+      previewSegments.length
+        ? segmentAtTime(previewSegments, currentMs)
         : null,
-    [timeline.segments, currentMs],
+    [previewSegments, currentMs],
   );
 
   // (v1.11: the chromaTarget memo was removed with the Chroma tab — the
@@ -532,14 +674,16 @@ export default function Page() {
   }, [timeline.segments]);
 
   /** v5.0: object URLs for VIDEO media items (id → url) — PreviewPanel's
-   *  paint sources and the export's video bytes channel. */
+   *  paint sources and the export's video bytes channel. v1.14: the
+   *  disclaimer video rides the same channel under DISCLAIMER_ID. */
   const videoUrls = useMemo(() => {
     const map: Record<string, string> = {};
     for (const it of items) {
       if (it.mediaType === "video") map[it.id] = it.url;
     }
+    if (disclaimer?.kind === "video") map[DISCLAIMER_ID] = disclaimer.url;
     return map;
-  }, [items]);
+  }, [items, disclaimer]);
 
   // ---- Undo / Redo (v4.3) — snapshot history of the editable session ------
   // Object URLs are NEVER revoked mid-session (only on unmount) so a removed
@@ -565,6 +709,8 @@ export default function Page() {
     itemEdits: Record<string, ItemEdit>;
     sfxItems: SfxItem[];
     videoDurations: Record<string, number>;
+    /** v1.14: disclaimer / intro lead-in clip (null = none). */
+    disclaimer: DisclaimerClip | null;
   }
 
   const HISTORY_MAX = 80;
@@ -607,6 +753,7 @@ export default function Page() {
       itemEdits,
       sfxItems,
       videoDurations,
+      disclaimer,
     };
     isPlayingRef.current = isPlaying;
   });
@@ -690,6 +837,8 @@ export default function Page() {
     setItemEdits(snap.itemEdits);
     setSfxItems(snap.sfxItems);
     setVideoDurations(snap.videoDurations);
+    // v1.14: restore the disclaimer lead-in.
+    setDisclaimer(snap.disclaimer ?? null);
     setIsPlaying(false);
   }, []);
 
@@ -767,6 +916,9 @@ export default function Page() {
   }, [watermarkImage]);
 
   // ---- Load images when items change --------------------------------------
+  // v1.14: the disclaimer image joins the same id→element map under its
+  // virtual DISCLAIMER_ID (the preview canvas + browser export draw it like
+  // any other image segment); removing it drops the entry.
   useEffect(() => {
     const created = imagesRef.current;
     items.forEach((it) => {
@@ -781,12 +933,27 @@ export default function Page() {
         img.src = it.url;
       }
     });
-    const ids = new Set(items.map((i) => i.id));
+    if (disclaimer?.kind === "image" && !created[DISCLAIMER_ID]) {
+      const img = new Image();
+      created[DISCLAIMER_ID] = img;
+      img.onload = () =>
+        setImages((prev) =>
+          prev[DISCLAIMER_ID] ? prev : { ...prev, [DISCLAIMER_ID]: img },
+        );
+      img.onerror = () => {
+        /* ignore */
+      };
+      img.src = disclaimer.url;
+    }
+    const ids = new Set([...items.map((i) => i.id), DISCLAIMER_ID]);
+    const wantDisclaimer = disclaimer?.kind === "image";
     setImages((prev) => {
       let changed = false;
       const next = { ...prev };
       for (const k of Object.keys(next)) {
-        if (!ids.has(k)) {
+        const keep =
+          (k === DISCLAIMER_ID ? wantDisclaimer : ids.has(k));
+        if (!keep) {
           delete next[k];
           delete created[k];
           changed = true;
@@ -794,16 +961,22 @@ export default function Page() {
       }
       return changed ? next : prev;
     });
-  }, [items]);
+    if (!wantDisclaimer && created[DISCLAIMER_ID]) {
+      delete created[DISCLAIMER_ID];
+    }
+  }, [items, disclaimer]);
 
   // ---- Keep refs in sync for the playback loop ----------------------------
-  const totalMsRef = useRef(timeline.totalMs);
-  const segmentsRef = useRef(timeline.segments);
+  // v1.14: display values — the master clock runs in display time (the
+  // disclaimer occupies [0, N)); stepSegment + the end-of-timeline logic
+  // consume the virtual-clip list too.
+  const totalMsRef = useRef(displayTotalMs);
+  const segmentsRef = useRef(previewSegments);
 
   useEffect(() => {
-    totalMsRef.current = timeline.totalMs;
-    segmentsRef.current = timeline.segments;
-  }, [timeline.totalMs, timeline.segments]);
+    totalMsRef.current = displayTotalMs;
+    segmentsRef.current = previewSegments;
+  }, [displayTotalMs, previewSegments]);
 
   // ---- v5.0 SFX preview audio ----------------------------------------------
   // A page-level (lazy) AudioContext + per-sfxId AudioBuffer cache schedules
@@ -872,11 +1045,14 @@ export default function Page() {
       if (ctx.state === "suspended") ctx.resume().catch(() => {});
       const items = stateRef.current?.sfxItems ?? [];
       if (items.length === 0) return;
+      // v1.14: display→base — the playhead runs in display time (the SFX
+      // placements live in base time, shifted only at render/export).
+      const baseFromMs = Math.max(0, fromMs - disclaimerOffsetRef.current);
       const token = sfxSchedTokenRef.current;
       const baseTime = ctx.currentTime;
       for (const item of items) {
         // Loop-boundary rule: never reschedule items that already passed.
-        if (item.startMs < fromMs) continue;
+        if (item.startMs < baseFromMs) continue;
         const buf = await getSfxBuffer(item.sfxId, sfxDurationMs(item));
         if (token !== sfxSchedTokenRef.current) return; // superseded
         if (!buf) continue; // unrenderable effect — skip silently
@@ -898,7 +1074,7 @@ export default function Page() {
         src.connect(gain);
         gain.connect(ctx.destination);
         try {
-          const delaySec = Math.max(0, (item.startMs - fromMs) / 1000 / rate);
+          const delaySec = Math.max(0, (item.startMs - baseFromMs) / 1000 / rate);
           src.start(baseTime + delaySec);
           sfxSourcesRef.current.add(src);
           src.onended = () => {
@@ -940,7 +1116,11 @@ export default function Page() {
     (timelineMs: number): number | null => {
       if (!audioTrack) return null;
       const durMs = audioTrack.durationMs ?? 0;
-      const rel = timelineMs - audioSettings.musicStartMs;
+      // v1.14: display→base — the music stays silent through the disclaimer
+      // lead-in (it has no link to the audio track) and starts exactly N ms
+      // later, in lockstep with the shifted clips.
+      const rel =
+        timelineMs - disclaimerOffsetRef.current - audioSettings.musicStartMs;
       if (rel < 0) return null;
       if (durMs > 0) {
         if (audioSettings.musicLoop) return (rel % durMs) / 1000;
@@ -1077,23 +1257,39 @@ export default function Page() {
     abortRef.current = ac;
     setIsExporting(true);
     setExportProgress({ progress: 0 });
+    // v1.14: the payload rides the DISPLAY timeline — the virtual disclaimer
+    // segment at [0, N), every clip/SFX/cue/headline shifted by N, the music
+    // start delayed by N, totalMs extended by N. The FFmpeg side needs ZERO
+    // changes: the disclaimer is just another base-lane clip, the music
+    // adelay lands after the lead-in, and captions stay locked to the audio.
+    const leadInMs = disclaimerOffsetRef.current;
+    const exportSegments = previewSegments;
     const imageUrls: Record<string, string> = {};
-    for (const seg of timeline.segments) {
+    for (const seg of displaySegments) {
       const it = items.find((i) => i.id === seg.id);
       if (it) imageUrls[seg.id] = it.url;
     }
+    if (disclaimer && leadInMs > 0) {
+      imageUrls[DISCLAIMER_ID] = disclaimer.url;
+    }
     try {
       const res = await exportNative({
-        segments: timeline.segments,
+        segments: exportSegments,
         imageUrls,
         audioTrack,
         settings,
         kenBurns,
-        audio: audioSettings,
-        totalMs: timeline.totalMs,
-        subtitles,
+        audio:
+          leadInMs > 0
+            ? {
+                ...audioSettings,
+                musicStartMs: audioSettings.musicStartMs + leadInMs,
+              }
+            : audioSettings,
+        totalMs: displayTotalMs,
+        subtitles: displaySubtitles,
         captionSettings,
-        headlines: headlineItems.length ? headlineItems : null,
+        headlines: displayHeadlines.length ? displayHeadlines : null,
         transition: transitionSettings,
         watermark: watermarkImage
           ? { imageUrl: watermarkImage.url, settings: watermarkSettings }
@@ -1101,7 +1297,8 @@ export default function Page() {
         // v5.0: SFX placements (native.ts renders each unique effect once,
         // uploads the WAV, and the amix graph adelay's it at startMs). Omitted
         // when empty so v4.9-shaped projects keep the byte-identical IPC.
-        sfx: sfxItems.length > 0 ? sfxItems : undefined,
+        // v1.14: the shifted placements keep every SFX locked to the audio.
+        sfx: displaySfxItems.length > 0 ? displaySfxItems : undefined,
         onProgress: (p) => setExportProgress(p),
         signal: ac.signal,
       });
@@ -1240,21 +1437,24 @@ export default function Page() {
       abortRef.current = null;
     }
   }, [
-    timeline.segments,
-    timeline.totalMs,
+    timeline.segments.length,
+    displaySegments,
+    previewSegments,
+    displayTotalMs,
+    displaySubtitles,
+    displayHeadlines,
+    displaySfxItems,
     items,
     audioTrack,
     settings,
     kenBurns,
     audioSettings,
-    subtitles,
     captionSettings,
-    headlineItems,
     transitionSettings,
     watermarkImage,
     watermarkSettings,
     inElectron,
-    sfxItems,
+    disclaimer,
   ]);
 
   // Keep exportRef in sync so menu accelerators call the latest version
@@ -1498,6 +1698,15 @@ export default function Page() {
   // ---- Beat detection (v4.6) ---------------------------------------------
   const [beatInfo, setBeatInfo] = useState<BeatInfo | null>(null);
   const [beatBusy, setBeatBusy] = useState(false);
+  // v1.14: beat times shifted into DISPLAY space for the strip's tick rail
+  // (beat detection itself runs in base time — locked to the audio).
+  const displayBeatMs = useMemo(
+    () =>
+      disclaimerOffsetMs > 0 && beatInfo
+        ? beatInfo.beatMs.map((b) => b + disclaimerOffsetMs)
+        : beatInfo?.beatMs ?? null,
+    [beatInfo, disclaimerOffsetMs],
+  );
   // v4.7: waveform peaks for the timeline strip (decoded per audio track).
   const [waveform, setWaveform] = useState<WaveformData | null>(null);
   // Beat data is DERIVED from the audio — invalidated on every track swap
@@ -1544,6 +1753,148 @@ export default function Page() {
     });
     toast.success(`Audio: ${file.name}`);
   }, [requestHistoryPush, trackUrl, clearBeatInfo, clearWaveform]);
+
+  // ---- v1.14: Disclaimer / intro lead-in ----------------------------------
+  /**
+   * Probe a disclaimer VIDEO for its duration (+ a poster thumbnail). Images
+   * need nothing. The probe updates the clip in place — a "Full" video rides
+   * the probed length; a preset hold re-clamps against it.
+   */
+  const probeDisclaimerClip = useCallback((clip: DisclaimerClip) => {
+    if (typeof document === "undefined" || clip.kind !== "video") return;
+    const url = clip.url;
+    const v = document.createElement("video");
+    v.muted = true;
+    v.playsInline = true;
+    v.preload = "metadata";
+    let settled = false;
+    const finish = (durMs: number | null, thumb: string | null) => {
+      if (settled) return;
+      settled = true;
+      setDisclaimer((prev) => {
+        if (!prev || prev.url !== url) return prev;
+        const sourceDurationMs =
+          durMs != null && durMs > 0 ? durMs : prev.sourceDurationMs ?? null;
+        const durationMs = prev.videoFull
+          ? sourceDurationMs ?? prev.durationMs
+          : Math.min(prev.durationMs, sourceDurationMs ?? prev.durationMs);
+        return {
+          ...prev,
+          sourceDurationMs,
+          durationMs: Math.max(200, Math.round(durationMs)),
+          ...(thumb ? { thumbUrl: thumb } : {}),
+        };
+      });
+    };
+    v.onloadedmetadata = () => {
+      const durSec = v.duration && Number.isFinite(v.duration) ? v.duration : 0;
+      const durMs = durSec > 0 ? Math.round(durSec * 1000) : null;
+      const dims = { w: v.videoWidth || 0, h: v.videoHeight || 0 };
+      let thumb: string | null = null;
+      try {
+        if (dims.w > 0 && dims.h > 0) {
+          const c = document.createElement("canvas");
+          c.width = 96;
+          c.height = 54;
+          const cx = c.getContext("2d");
+          if (cx) {
+            const cover = Math.max(96 / dims.w, 54 / dims.h);
+            cx.drawImage(
+              v,
+              (96 - dims.w * cover) / 2,
+              (54 - dims.h * cover) / 2,
+              dims.w * cover,
+              dims.h * cover,
+            );
+            thumb = c.toDataURL("image/jpeg", 0.72);
+          }
+        }
+      } catch {
+        thumb = null;
+      }
+      finish(durMs, thumb);
+      try {
+        v.removeAttribute("src");
+        v.load();
+      } catch {
+        /* noop */
+      }
+    };
+    v.onerror = () => finish(null, null);
+    v.src = url;
+    window.setTimeout(() => finish(null, null), 8000);
+  }, []);
+
+  /** Pick/replace the disclaimer file — ANY name, never parsed by the
+   *  placement rules. Images default to a light 2s hold; videos default to
+   *  their full source length. */
+  const addDisclaimerFile = useCallback(
+    (file: File) => {
+      requestHistoryPush();
+      const url = trackUrl(URL.createObjectURL(file));
+      const kind: "image" | "video" = isVideoFile(file) ? "video" : "image";
+      const clip: DisclaimerClip = {
+        fileName: file.name,
+        kind,
+        file,
+        url,
+        sourceDurationMs: null,
+        ...(kind === "video" ? { videoFull: true } : {}),
+        durationMs: kind === "video" ? 5000 : DISCLAIMER_DEFAULT_MS,
+      };
+      setDisclaimer(clip);
+      if (kind === "video") probeDisclaimerClip(clip);
+      // Rewind so the user immediately SEES the lead-in (WYSIWYG).
+      currentMsRef.current = 0;
+      setCurrentMs(0);
+      setIsPlaying(false);
+      toast.success(
+        kind === "video"
+          ? "Disclaimer video added at the start"
+          : "Disclaimer image added at the start",
+        {
+          description:
+            kind === "video"
+              ? `${file.name} plays first at its full length — pick a shorter hold any time. Your clips, music and captions shift back together, in sync.`
+              : `Held for ${DISCLAIMER_DEFAULT_MS / 1000}s before your content — everything (clips + audio) shifts back together, in sync.`,
+        },
+      );
+    },
+    [requestHistoryPush, trackUrl, probeDisclaimerClip],
+  );
+
+  /** Change the hold duration (images: the hold; videos: first-Ns trim or
+   *  the full source length). */
+  const setDisclaimerDuration = useCallback(
+    (choice: number | "full") => {
+      requestHistoryPush(300);
+      setDisclaimer((prev) => {
+        if (!prev) return prev;
+        if (choice === "full") {
+          const dur =
+            prev.sourceDurationMs != null && prev.sourceDurationMs > 0
+              ? prev.sourceDurationMs
+              : prev.durationMs;
+          return { ...prev, videoFull: true, durationMs: Math.max(200, Math.round(dur)) };
+        }
+        const preset = Math.max(200, Math.round(choice));
+        const capped =
+          prev.kind === "video" && prev.sourceDurationMs != null && prev.sourceDurationMs > 0
+            ? Math.min(preset, prev.sourceDurationMs)
+            : preset;
+        return { ...prev, videoFull: false, durationMs: Math.max(200, Math.round(capped)) };
+      });
+    },
+    [requestHistoryPush],
+  );
+
+  const removeDisclaimer = useCallback(() => {
+    requestHistoryPush();
+    setDisclaimer(null);
+    toast.info("Disclaimer removed", {
+      description: "The timeline is back to starting at your first clip.",
+    });
+  }, [requestHistoryPush]);
 
   // v4.7: decode waveform peaks whenever a new audio track lands (async —
   // state is set in the promise continuation, not synchronously in the
@@ -2430,6 +2781,13 @@ const splitAtPlayhead = useCallback(() => {
   }
   const item = items.find((i) => i.id === seg.id);
   if (!item) return;
+  // v1.14: display→base for the ABSOLUTE-MODE RENAMES — filename timing
+  // encodes base time (buildTimeline re-shifts by the lead-in later).
+  // Durations (overrides/trim) are offset-invariant and stay as computed.
+  const off = disclaimerOffsetRef.current;
+  const splitNameAt = splitAt - off;
+  const segNameStart = seg.startMs - off;
+  const segNameEnd = seg.endMs - off;
 
   const speed = seg.speed != null && seg.speed > 0 ? seg.speed : 1;
   const leftDur = splitAt - seg.startMs;
@@ -2447,7 +2805,7 @@ const splitAtPlayhead = useCallback(() => {
     if (idx < 0) return prev;
     const absolute = timeline.mode === "absolute";
     const name = absolute
-      ? splitRangeName(item.file.name, splitAt, seg.endMs)
+      ? splitRangeName(item.file.name, splitNameAt, segNameEnd)
       : item.file.name;
     const copy: MediaItem = {
       id: rightId,
@@ -2469,7 +2827,7 @@ const splitAtPlayhead = useCallback(() => {
         ...next[idx],
         file: new File(
           [item.file],
-          splitRangeName(item.file.name, seg.startMs, splitAt),
+          splitRangeName(item.file.name, segNameStart, splitNameAt),
           { type: item.file.type },
         ),
       };
@@ -2693,6 +3051,25 @@ const handleRandomTransitionMix = useCallback(() => {
     [],
   );
 
+  /**
+   * v1.14: display→base translation for a TIMELINE edit patch. The ruler and
+   * the panel show display time (disclaimer lead-in included); the stored
+   * edits live in base time. Only startMs is a timeline POSITION — every
+   * other field (duration, trim, volume, track, overlay, speed) is
+   * offset-invariant.
+   */
+  const toBaseItemEdit = useCallback(
+    (patch: Partial<ItemEdit>): Partial<ItemEdit> => {
+      const off = disclaimerOffsetRef.current;
+      if (off <= 0 || typeof patch.startMs !== "number") return patch;
+      return {
+        ...patch,
+        startMs: Math.max(0, Math.round(patch.startMs - off)),
+      };
+    },
+    [],
+  );
+
   /** MediaPanel clip-settings channel (sliders → debounced history push).
    *
    * Two page-level translations keep the frozen data model honest:
@@ -2707,13 +3084,16 @@ const handleRandomTransitionMix = useCallback(() => {
   const handleSetItemEdit = useCallback(
     (id: string, patch: Partial<ItemEdit>) => {
       requestHistoryPush(500);
-      const { patch: eff, baseDurationMs } = translateItemEdit(id, patch);
+      const { patch: eff, baseDurationMs } = translateItemEdit(
+        id,
+        toBaseItemEdit(patch),
+      );
       applyItemEdit(id, eff);
       if (baseDurationMs != null) {
         setOverrides((prev) => ({ ...prev, [id]: baseDurationMs }));
       }
     },
-    [requestHistoryPush, applyItemEdit, translateItemEdit],
+    [requestHistoryPush, applyItemEdit, translateItemEdit, toBaseItemEdit],
   );
 
   /** TimelineRuler drag commits (move / trim / lane switch — discrete pushes
@@ -2721,13 +3101,16 @@ const handleRandomTransitionMix = useCallback(() => {
   const handleTimelineEdit = useCallback(
     (id: string, patch: Partial<ItemEdit>) => {
       requestHistoryPush();
-      const { patch: eff, baseDurationMs } = translateItemEdit(id, patch);
+      const { patch: eff, baseDurationMs } = translateItemEdit(
+        id,
+        toBaseItemEdit(patch),
+      );
       applyItemEdit(id, eff);
       if (baseDurationMs != null) {
         setOverrides((prev) => ({ ...prev, [id]: baseDurationMs }));
       }
     },
-    [requestHistoryPush, applyItemEdit, translateItemEdit],
+    [requestHistoryPush, applyItemEdit, translateItemEdit, toBaseItemEdit],
   );
 
   /**
@@ -2746,12 +3129,14 @@ const handleRandomTransitionMix = useCallback(() => {
     }) => {
       if (move.clips.length === 0 && move.sfx.length === 0) return;
       requestHistoryPush();
+      // v1.14: display→base — the ruler commits display-time starts.
+      const off = disclaimerOffsetRef.current;
       if (move.clips.length > 0) {
         setItemEdits((prev) => {
           const next = { ...prev };
           for (const c of move.clips) {
             const { patch: eff } = translateItemEdit(c.id, {
-              startMs: Math.max(0, Math.round(c.startMs)),
+              startMs: Math.max(0, Math.round(c.startMs - off)),
             });
             const base: ItemEdit = { ...(prev[c.id] ?? {}) };
             for (const [key, value] of Object.entries(eff) as [
@@ -2768,7 +3153,9 @@ const handleRandomTransitionMix = useCallback(() => {
         });
       }
       if (move.sfx.length > 0) {
-        const byId = new Map(move.sfx.map((s) => [s.id, s.startMs]));
+        const byId = new Map(
+          move.sfx.map((s) => [s.id, Math.max(0, s.startMs - off)]),
+        );
         setSfxItems((prev) =>
           prev.map((s) =>
             byId.has(s.id)
@@ -2776,7 +3163,7 @@ const handleRandomTransitionMix = useCallback(() => {
                   ...s,
                   startMs: Math.max(
                     0,
-                    Math.min(byId.get(s.id) ?? s.startMs, totalMsRef.current),
+                    Math.min(byId.get(s.id) ?? s.startMs, totalMsRef.current - off),
                   ),
                 }
               : s,
@@ -2784,7 +3171,7 @@ const handleRandomTransitionMix = useCallback(() => {
         );
       }
       if (move.musicStartMs != null) {
-        const ms = Math.max(0, Math.round(move.musicStartMs));
+        const ms = Math.max(0, Math.round(move.musicStartMs - off));
         setAudioSettings((prev) =>
           prev.musicStartMs === ms ? prev : { ...prev, musicStartMs: ms },
         );
@@ -2825,11 +3212,13 @@ const handleRandomTransitionMix = useCallback(() => {
     const sel = selectedIdsRef.current;
     const segs = timelineSegmentsRef.current;
     // Selection wins; fallback = the active (playhead) clip — editor std.
+    // v1.14: the playhead runs in display time; base segments are compared
+    // in base time (offset subtracted) so the clipboard stores base coords.
     let picked: MediaSegment[] = [];
     if (sel.length > 0) {
       picked = segs.filter((s) => sel.includes(s.id));
     } else {
-      const t = currentMsRef.current;
+      const t = currentMsRef.current - disclaimerOffsetRef.current;
       picked = segs.filter((s) => t >= s.startMs && t < s.endMs).slice(0, 1);
     }
     const sfxPicked = (stateRef.current?.sfxItems ?? []).filter((s) =>
@@ -2962,16 +3351,26 @@ const handleRandomTransitionMix = useCallback(() => {
     if (!clipboard) return;
     if (clipboard.clips.length === 0 && clipboard.sfx.length === 0) return;
     requestHistoryPush();
-    const atMs = Math.max(0, Math.round(currentMsRef.current));
+    // v1.14: display→base — paste lands at the playhead in base time; the
+    // base-total clamp keeps SFX inside the real content window.
+    const off = disclaimerOffsetRef.current;
+    const atMs = Math.max(0, Math.round(currentMsRef.current - off));
     const delta = atMs - clipboard.originMs;
-    pasteFromSnapshot(clipboard, atMs, delta, totalMsRef.current);
+    pasteFromSnapshot(clipboard, atMs, delta, Math.max(0, totalMsRef.current - off));
   }, [clipboard, requestHistoryPush, pasteFromSnapshot]);
 
   /** v5.0: add an SFX placement at the playhead (MediaPanel palette). */
   const handleAddSfx = useCallback(
     (sfxId: string) => {
       requestHistoryPush();
-      const startMs = Math.max(0, Math.min(currentMsRef.current, totalMsRef.current));
+      // v1.14: display→base (SFX placements live in base time).
+      const startMs = Math.max(
+        0,
+        Math.min(
+          currentMsRef.current - disclaimerOffsetRef.current,
+          Math.max(0, totalMsRef.current - disclaimerOffsetRef.current),
+        ),
+      );
       setSfxItems((prev) => [...prev, makeSfxItem({ sfxId, startMs, volume: 1 })]);
     },
     [requestHistoryPush],
@@ -2981,10 +3380,21 @@ const handleRandomTransitionMix = useCallback(() => {
   const handleMoveSfx = useCallback(
     (id: string, startMs: number) => {
       requestHistoryPush();
+      // v1.14: display→base + base-total clamp.
+      const off = disclaimerOffsetRef.current;
       setSfxItems((prev) =>
         prev.map((s) =>
           s.id === id
-            ? { ...s, startMs: Math.max(0, Math.min(startMs, totalMsRef.current)) }
+            ? {
+                ...s,
+                startMs: Math.max(
+                  0,
+                  Math.min(
+                    Math.max(0, startMs - off),
+                    Math.max(0, totalMsRef.current - off),
+                  ),
+                ),
+              }
             : s,
         ),
       );
@@ -2996,8 +3406,17 @@ const handleRandomTransitionMix = useCallback(() => {
   const handleUpdateSfx = useCallback(
     (id: string, patch: Partial<SfxItem>) => {
       requestHistoryPush(500);
+      // v1.14: a startMs patch arrives in display time (the ruler's edit
+      // popover); volumes / durations pass through untouched.
+      const eff =
+        typeof patch.startMs === "number" && disclaimerOffsetRef.current > 0
+          ? {
+              ...patch,
+              startMs: Math.max(0, patch.startMs - disclaimerOffsetRef.current),
+            }
+          : patch;
       setSfxItems((prev) =>
-        prev.map((s) => (s.id === id ? { ...s, ...patch } : s)),
+        prev.map((s) => (s.id === id ? { ...s, ...eff } : s)),
       );
     },
     [requestHistoryPush],
@@ -3054,6 +3473,14 @@ const handleRandomTransitionMix = useCallback(() => {
       itemEdits,
       sfxItems,
       videoDurations,
+      // v1.14: disclaimer / intro lead-in card (any filename).
+      disclaimer: disclaimer
+        ? {
+            file: disclaimer.file,
+            durationMs: disclaimer.durationMs,
+            videoFull: disclaimer.videoFull === true,
+          }
+        : null,
       settings: {
         kenBurns,
         video: settings,
@@ -3081,6 +3508,7 @@ const handleRandomTransitionMix = useCallback(() => {
     itemEdits,
     sfxItems,
     videoDurations,
+    disclaimer,
   ]);
 
   const saveProject = useCallback(async () => {
@@ -3275,6 +3703,29 @@ const handleRandomTransitionMix = useCallback(() => {
           project.watermark?.settings || defaultWatermarkSettings(),
         );
 
+        // v1.14: disclaimer / intro lead-in (any filename, never parsed).
+        if (loaded.disclaimerFile) {
+          const d = loaded.disclaimerFile;
+          const url = trackUrl(URL.createObjectURL(d.file));
+          const kind: "image" | "video" = isVideoFile(d.file) ? "video" : "image";
+          const clip: DisclaimerClip = {
+            fileName: d.file.name,
+            kind,
+            file: d.file,
+            url,
+            sourceDurationMs: null,
+            ...(kind === "video" ? { videoFull: d.videoFull } : {}),
+            // Until the probe lands: the saved duration (videos re-clamp).
+            durationMs: d.durationMs,
+          };
+          setDisclaimer(clip);
+          if (kind === "video") {
+            probeDisclaimerClip(clip);
+          }
+        } else {
+          setDisclaimer(null);
+        }
+
         // Settings + headlines + overrides.
         setKenBurns(project.settings.kenBurns);
         setSettings(project.settings.video);
@@ -3317,6 +3768,8 @@ const handleRandomTransitionMix = useCallback(() => {
               project.sfxItems?.length
                 ? ` · ${project.sfxItems.length} SFX restored`
                 : ""
+            }${
+              loaded.disclaimerFile ? " · disclaimer card restored" : ""
             }`,
           },
         );
@@ -3324,7 +3777,7 @@ const handleRandomTransitionMix = useCallback(() => {
         toast.error(e instanceof Error ? e.message : "Project load failed");
       }
     },
-    [requestHistoryPush, trackUrl, clearWaveform, probeVideoItem],
+    [requestHistoryPush, trackUrl, clearWaveform, probeVideoItem, probeDisclaimerClip],
   );
 
   /**
@@ -3361,7 +3814,8 @@ const handleRandomTransitionMix = useCallback(() => {
       audioTrack != null ||
       subtitles != null ||
       headlineItems.length > 0 ||
-      sfxItems.length > 0;
+      sfxItems.length > 0 ||
+      disclaimer != null;
     if (
       hasSession &&
       !window.confirm(
@@ -3380,6 +3834,8 @@ const handleRandomTransitionMix = useCallback(() => {
     setItemEdits({});
     setSfxItems([]);
     setVideoDurations({});
+    // v1.14: drop the disclaimer lead-in too.
+    setDisclaimer(null);
     // v5.1: stale per-item probe caches keyed by the (now removed) ids.
     setVideoDims({});
     setVideoThumbnails({});
@@ -3402,6 +3858,7 @@ const handleRandomTransitionMix = useCallback(() => {
     subtitles,
     headlineItems.length,
     sfxItems.length,
+    disclaimer,
     requestHistoryPush,
     clearBeatInfo,
     clearWaveform,
@@ -3466,8 +3923,14 @@ const handleRandomTransitionMix = useCallback(() => {
   const removeActiveSegment = useCallback(() => {
     const seg = activeSegment;
     if (!seg) return;
+    // v1.14: the active "clip" under the playhead can be the virtual
+    // disclaimer — Delete removes the lead-in itself.
+    if (seg.id === DISCLAIMER_ID) {
+      removeDisclaimer();
+      return;
+    }
     removeItem(seg.id);
-  }, [activeSegment, removeItem]);
+  }, [activeSegment, removeItem, removeDisclaimer]);
   const splitAtPlayheadRef = useRef(splitAtPlayhead);
   const removeActiveRef = useRef(removeActiveSegment);
   useEffect(() => {
@@ -3815,7 +4278,7 @@ const handleRandomTransitionMix = useCallback(() => {
           setShortcutsOpen(true);
         }}
         settings={settings}
-        totalMs={timeline.totalMs}
+        totalMs={displayTotalMs}
         projectName={currentProjectName}
       />
 
@@ -3883,7 +4346,7 @@ const handleRandomTransitionMix = useCallback(() => {
           )}
           <div className="min-h-0 flex-1">
           <MediaPanel
-            segments={timeline.segments}
+            segments={displaySegments}
             mode={timeline.mode}
             audioTrack={audioTrack}
             subtitles={subtitles}
@@ -3925,17 +4388,24 @@ const handleRandomTransitionMix = useCallback(() => {
             onMediaViewChange={(v) => setMediaView(v)}
             activeId={activeSegment?.id ?? null}
             onSelectSegment={(id) => {
-              const s = timeline.segments.find((x) => x.id === id);
+              // v1.14: display segments — seeking lands on the shifted clip.
+              const s = displaySegments.find((x) => x.id === id);
               if (s) seek(s.startMs);
             }}
             itemEdits={itemEdits}
             videoDurations={videoDurations}
             onSetItemEdit={handleSetItemEdit}
-            sfxItems={sfxItems}
+            sfxItems={displaySfxItems}
             onAddSfx={handleAddSfx}
             onUpdateSfx={handleUpdateSfx}
             onRemoveSfx={handleRemoveSfx}
             currentMs={currentMs}
+            // ---- v1.14: disclaimer / intro lead-in ----
+            disclaimer={disclaimer}
+            disclaimerOffsetMs={disclaimerOffsetMs}
+            openDisclaimerPicker={openDisclaimerPicker}
+            onSetDisclaimerDuration={setDisclaimerDuration}
+            onRemoveDisclaimer={removeDisclaimer}
           />
           </div>
         </section>
@@ -3997,18 +4467,18 @@ const handleRandomTransitionMix = useCallback(() => {
 
           <div className="min-h-0 flex-1 overflow-hidden">
             <PreviewPanel
-              segments={timeline.segments}
+              segments={previewSegments}
               images={images}
               videoUrls={videoUrls}
-              totalMs={timeline.totalMs}
+              totalMs={displayTotalMs}
               currentMs={currentMs}
               isPlaying={isPlaying}
               kenBurns={kenBurns}
               aspect={settings.aspect}
               activeSegment={activeSegment}
-              subtitles={subtitles}
+              subtitles={displaySubtitles}
               captionSettings={captionSettings}
-              headlineItems={headlineItems}
+              headlineItems={displayHeadlines}
               transition={transitionSettings}
               watermarkImage={watermarkImgEl}
               watermarkSettings={watermarkImage ? watermarkSettings : null}
@@ -4075,20 +4545,20 @@ const handleRandomTransitionMix = useCallback(() => {
             }
           >
           <TimelineRuler
-            segments={timeline.segments}
-            totalMs={timeline.totalMs}
+            segments={displaySegments}
+            totalMs={displayTotalMs}
             currentMs={currentMs}
             mode={timeline.mode}
             activeId={activeSegment?.id ?? null}
-            headlines={headlineItems}
+            headlines={displayHeadlines}
             transition={transitionSettings}
-            beats={beatInfo?.beatMs ?? null}
+            beats={displayBeatMs}
             waveform={waveform}
             onSeek={seek}
             onJumpToSegment={(id) => {
               // v4.9: filmstrip double-click — jump + a light selection cue
               // (the media card for this clip becomes active via the seek).
-              const s = timeline.segments.find((x) => x.id === id);
+              const s = displaySegments.find((x) => x.id === id);
               if (s) {
                 seek(s.startMs + 5);
                 toast.info(`Jumped to clip ${s.order + 1}`, {
@@ -4097,7 +4567,7 @@ const handleRandomTransitionMix = useCallback(() => {
               }
             }}
             onEditItem={handleTimelineEdit}
-            sfxItems={sfxItems}
+            sfxItems={displaySfxItems}
             onMoveSfx={handleMoveSfx}
             onEditSfx={handleUpdateSfx}
             onRemoveSfx={handleRemoveSfx}
@@ -4120,7 +4590,9 @@ const handleRandomTransitionMix = useCallback(() => {
                 : 0
             }
             // ---- v5.2: music placement (draggable clip on the audio lane) ----
-            musicStartMs={audioSettings.musicStartMs}
+            // v1.14: display-space start (strip coords); the commit
+            // translates back to base before storing.
+            musicStartMs={displayMusicStartMs}
             musicLoop={audioSettings.musicLoop}
             musicVolume={audioSettings.musicVolume}
             musicDurationMs={audioTrack?.durationMs ?? null}
@@ -4129,10 +4601,12 @@ const handleRandomTransitionMix = useCallback(() => {
               // v5.5: music drags are now undoable (one push per gesture —
               // the debounced flush coalesces pointerup bursts).
               requestHistoryPush();
+              const ms = Math.max(
+                0,
+                Math.round(startMs - disclaimerOffsetRef.current),
+              );
               setAudioSettings((prev) =>
-                prev.musicStartMs === startMs
-                  ? prev
-                  : { ...prev, musicStartMs: startMs },
+                prev.musicStartMs === ms ? prev : { ...prev, musicStartMs: ms },
               );
             }}
             onMusicLoopChange={(loop) => {
@@ -4160,6 +4634,17 @@ const handleRandomTransitionMix = useCallback(() => {
             // ---- v1: BIG-TIMELINE mode (one-click 65% height toggle) ----
             timelineBig={timelineBig}
             onToggleTimelineBig={toggleTimelineBig}
+            // ---- v1.14: disclaimer lead-in (fixed block at [0, N)) ----
+            disclaimer={
+              disclaimer && disclaimerOffsetMs > 0
+                ? {
+                    durationMs: disclaimerOffsetMs,
+                    fileName: disclaimer.fileName,
+                    kind: disclaimer.kind,
+                    thumbnailUrl: disclaimer.thumbUrl || disclaimer.url,
+                  }
+                : null
+            }
           />
           </div>
         </section>
@@ -4346,6 +4831,25 @@ const handleRandomTransitionMix = useCallback(() => {
         onChange={(e: ChangeEvent<HTMLInputElement>) => {
           const f = e.target.files?.[0];
           if (f) addSubtitles(f);
+          e.target.value = "";
+        }}
+      />
+      {/* v1.14: disclaimer picker — images AND videos, ANY filename (the
+          placement naming rules never apply to this file). */}
+      <input
+        ref={disclaimerInputRef}
+        type="file"
+        accept="image/png,image/jpeg,image/webp,image/gif,image/avif,image/bmp,video/mp4,video/webm,video/quicktime,video/x-matroska,video/x-msvideo,.png,.jpg,.jpeg,.webp,.gif,.avif,.bmp,.mp4,.webm,.mov,.mkv,.m4v,.avi"
+        style={{
+          position: "absolute",
+          opacity: 0,
+          width: 1,
+          height: 1,
+          pointerEvents: "none",
+        }}
+        onChange={(e: ChangeEvent<HTMLInputElement>) => {
+          const f = e.target.files?.[0];
+          if (f) addDisclaimerFile(f);
           e.target.value = "";
         }}
       />

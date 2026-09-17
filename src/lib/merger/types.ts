@@ -546,6 +546,47 @@ export function makeHeadlineItem(partial: Partial<HeadlineItem> = {}): HeadlineI
   };
 }
 
+// ---------------------------------------------------------------------------
+// DISCLAIMER / INTRO CARD (v1.14) — a lead-in image or video clip.
+//
+// The user picks ONE file with ANY filename (it is never run through the
+// placement naming parser) and a hold duration. It occupies the very start of
+// the output — [0, durationMs) — and the WHOLE existing timeline (segments,
+// music, SFX, subtitles, headlines) shifts back together by the same offset,
+// so image↔audio sync is preserved by construction. The disclaimer itself
+// has no link to the audio track (the music does not start until it ends).
+// Implementation: a virtual MediaSegment (DISCLAIMER_ID) is prepended at the
+// export payload + preview layer, so every FFmpeg path handles it like any
+// other clip with zero main-process changes.
+// ---------------------------------------------------------------------------
+
+/** Stable virtual segment id for the disclaimer clip. */
+export const DISCLAIMER_ID = "__ff_disclaimer__";
+
+/** Hold-duration presets for the disclaimer card (ms). */
+export const DISCLAIMER_PRESETS_MS = [1000, 2000, 3000, 5000, 10000] as const;
+
+export interface DisclaimerClip {
+  fileName: string;
+  /** Source kind — images are held, videos play (optionally trimmed). */
+  kind: "image" | "video";
+  /** The picked File (any name — placement naming rules NEVER apply). */
+  file: File;
+  /** Object URL for the preview + export byte fallback. */
+  url: string;
+  /** Probed video poster (96×54 JPEG dataURL) for cards / filmstrips. */
+  thumbUrl?: string | null;
+  /** Probed native video duration (null for images / unknown). */
+  sourceDurationMs?: number | null;
+  /**
+   * Video only: ride the FULL source length (durationMs tracks the probe).
+   * When false, durationMs is the preset clamped to the source length.
+   */
+  videoFull?: boolean;
+  /** Effective lead-in duration (ms) — the amount everything else shifts. */
+  durationMs: number;
+}
+
 export interface ExportNativeOptions {
   segments: MediaSegment[];
   /** segId -> object URL (or data URL) for the image. */
