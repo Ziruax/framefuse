@@ -24,7 +24,7 @@ import { cn } from "@/lib/utils";
 /** v1.12.1: the renderer's build constant — compared against the REAL exe
  *  version (app.getVersion()) so a stale/hybrid install is impossible to
  *  miss. Keep in sync with package.json on every release. */
-const BUILD_VERSION = "1.12.1";
+const BUILD_VERSION = "1.13.0";
 
 export interface LastExport {
   path: string;
@@ -56,6 +56,11 @@ export interface LastExport {
    *  stage (the Task-Manager-check number) + the machine's core count. */
   poolWorkers?: number;
   cpus?: number;
+  /** v1.13: the adaptive hardware tier + speed point that ran the export
+   *  ("Tier 3 · constrained CPU" / "ultrafast"). */
+  tier?: string;
+  tierLabel?: string;
+  enginePreset?: string;
 }
 
 interface HeaderProps {
@@ -226,7 +231,7 @@ export function Header({
               title={
                 versionStale
                   ? `Version mismatch — the app shell reports v${exeVersion} but this interface is build v${BUILD_VERSION}. The install is stale or mixed: reinstall FrameFuse ${BUILD_VERSION} and check "Add/Remove Programs" for an older copy.`
-                  : `FrameFuse v${shownVersion} — export throughput pass · 4 strict 1-thread parallel workers on ≥4-core CPUs (incl. the two-step fallback pool), d3d11va decode with auto fallback, superfast + fastdecode + CRF 22 speed tiers, honest pool telemetry`
+                  : `FrameFuse v${shownVersion} — adaptive 3-tier hardware engine · GPU ASIC (NVENC/QSV/AMF) when the probe verifies one, tier-tuned CPU workers (2×2 threads on constrained machines, min(4, cores/2)×2 on modern), ultrafast + no B-frames + stripped subtitle blur on Tier 3, honest pool telemetry`
               }
             >
               {versionStale && <TriangleAlert className="size-3" aria-hidden />}
@@ -441,6 +446,8 @@ export function Header({
             lastExport.elapsedSec != null
               ? `Exported in ${fmtElapsed(lastExport.elapsedSec)}${
                   lastExport.encoder ? ` · ${lastExport.encoder}` : ""
+                }${
+                  lastExport.tierLabel ? ` · ${lastExport.tierLabel}` : ""
                 }${
                   lastExport.totalChunks && lastExport.totalChunks > 1
                     ? ` · ${lastExport.totalChunks} chunks across ${

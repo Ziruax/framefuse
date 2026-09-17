@@ -225,9 +225,24 @@ ipcMain.handle("ffmpeg-status", async () => {
 
 // v5.1: encoder badge for the export UI (result of the async GPU probe).
 // v8.1: carries the forced flag so the badge can say "probe bypassed".
+// v1.13: also carries the resolved Adaptive Hardware Matrix tier (label,
+// workers × threads, CPU model, subtitle treatment) so the Export tab can
+// state the exact pool shape BEFORE an export starts.
 ipcMain.handle("export-info", async () => {
   const enc = await detectGpuEncoderAsync();
-  return { encoder: enc.label, encoderName: enc.name, forced: !!forcedEncoderKey };
+  const prof = await getHardwareProfile();
+  return {
+    encoder: enc.label,
+    encoderName: enc.name,
+    forced: !!forcedEncoderKey,
+    tier: prof.tier,
+    tierLabel: prof.tierLabel,
+    workers: prof.workers,
+    threadsPerWorker: prof.threadsPerWorker,
+    cpuCount: prof.cpuCount,
+    cpuModel: prof.cpuModel,
+    optimizeSubtitles: prof.optimizeSubtitles,
+  };
 });
 
 // v8.1: force-encoder override (Export tab diagnostics). key ∈
@@ -242,7 +257,8 @@ ipcMain.handle("export:set-force-encoder", async (_evt, key) => {
   detectedEncoder = null;
   encoderDetecting = null;
   const enc = await detectGpuEncoderAsync();
-  return { ok: true, forced: key, encoder: enc.label, encoderName: enc.name };
+  const prof = await getHardwareProfile();
+  return { ok: true, forced: key, encoder: enc.label, encoderName: enc.name, tier: prof.tier, tierLabel: prof.tierLabel, workers: prof.workers, threadsPerWorker: prof.threadsPerWorker };
 });
 
 ipcMain.handle("save-temp-image", async (_evt, { name, bytes }) => {
@@ -1530,6 +1546,72 @@ async function detectGpuEncoderAsync() {
 }
 
 // ---------------------------------------------------------------------------
+// v1.13 ADAPTIVE HARDWARE MATRIX (user directive) — three hardware tiers,
+// resolved once per export from the encoder probe + the CPU topology:
+//
+//   ┌── working NVENC / QSV / AMF? ──► TIER 1 · GPU ASIC (2 workers)
+//   ├── ≥ 6 logical cores ─────────► TIER 2 · modern multicore
+//   │   (min(4, cores/2) × 2-thread workers, superfast-class x264)
+//   └── ≤ 4 cores / legacy APU ─────► TIER 3 · constrained CPU
+//       (2 workers × 2 threads, ultrafast + -bf 0, low-cost subtitles)
+//
+// The field report that motivated this: v1.12's flat "≥4 cores → STRICTLY
+// 4 × 1-thread workers" was exactly wrong for 4-core dual-module APUs (AMD
+// A8-5550M-class Piledriver): 2 modules share 1 FPU + 1 L2 each, so 4
+// single-threaded ffmpeg processes thrashed the shared units harder than
+// the single process they replaced. One worker per physical module
+// (2 × 2 threads) is the shape those chips actually schedule well.
+// ---------------------------------------------------------------------------
+let hardwareProfileCache = null;
+
+/** Pure tier resolver — the user-specified decision tree. Tier 1 is only
+ * reached when the FPS-gated encoder probe above verified a REAL working
+ * ASIC (listed ≠ working; a crawling encoder is worse than none). */
+function resolveHardwareProfile(gpuCapabilities, cpuCount, cpuModel) {
+  let profile;
+  if (gpuCapabilities.hasNvenc) {
+    profile = { tier: "TIER_1_GPU", tierLabel: "Tier 1 · GPU hardware encode", encoder: "h264_nvenc", workers: 2, threadsSpec: 6, optimizeSubtitles: false };
+  } else if (gpuCapabilities.hasQsv) {
+    profile = { tier: "TIER_1_GPU", tierLabel: "Tier 1 · GPU hardware encode", encoder: "h264_qsv", workers: 2, threadsSpec: 6, optimizeSubtitles: false };
+  } else if (gpuCapabilities.hasAmf) {
+    profile = { tier: "TIER_1_GPU", tierLabel: "Tier 1 · GPU hardware encode", encoder: "h264_amf", workers: 2, threadsSpec: 6, optimizeSubtitles: false };
+  } else if (cpuCount >= 6) {
+    profile = { tier: "TIER_2_MODERN_CPU", tierLabel: "Tier 2 · modern multicore CPU", encoder: "libx264", workers: Math.max(2, Math.min(4, Math.floor(cpuCount / 2))), threadsSpec: 2, optimizeSubtitles: false };
+  } else {
+    profile = { tier: "TIER_3_CONSTRAINED_CPU", tierLabel: "Tier 3 · constrained CPU", encoder: "libx264", workers: 2, threadsSpec: 2, optimizeSubtitles: true };
+  }
+  profile.cpuCount = cpuCount;
+  profile.cpuModel = cpuModel;
+  // threadsPerWorker: the tier spec, clamped so workers × threads never
+  // exceeds the logical core count (a 2-core Tier-3 box → 1 thread each).
+  profile.threadsPerWorker = Math.max(1, Math.min(profile.threadsSpec, Math.floor(cpuCount / profile.workers) || 1));
+  return profile;
+}
+
+/** Async wrapper — derives the GPU caps from the (cached, force-aware)
+ * encoder probe, caches the profile per encoder+cpuCount, and logs the
+ * selection once per resolution. */
+async function getHardwareProfile() {
+  const enc = await detectGpuEncoderAsync();
+  const cpus = os.cpus() || [];
+  const cpuCount = cpus.length || 1;
+  const cpuModel = (cpus[0] && cpus[0].model) || "unknown";
+  const key = `${enc.name}|${cpuCount}`;
+  if (hardwareProfileCache && hardwareProfileCache.key === key) {
+    return hardwareProfileCache.profile;
+  }
+  const gpuCapabilities = {
+    hasNvenc: enc.name === "h264_nvenc",
+    hasQsv: enc.name === "h264_qsv",
+    hasAmf: enc.name === "h264_amf",
+  };
+  const profile = resolveHardwareProfile(gpuCapabilities, cpuCount, cpuModel);
+  hardwareProfileCache = { key, profile };
+  console.log(`[Hardware] ${profile.tier} — ${profile.encoder} · ${profile.workers} workers × ${profile.threadsPerWorker} thread(s) · ${cpuCount} core(s) · ${cpuModel}`);
+  return profile;
+}
+
+// ---------------------------------------------------------------------------
 // v1.4.2 HARDWARE DECODE PROBE — per source file, throughput-gated.
 //
 // v1.1 shipped hw decode UNCONDITIONALLY OFF (-hwaccel auto could silently
@@ -1622,7 +1704,11 @@ async function probeHwDecode(path) {
  *   streaming platforms, roughly doubling encode throughput on budget
  *   CPUs; fastdecode drops CABAC-side work that also slows the PREVIEW
  *   decode of the exported file. cinema keeps its faster/crf 17 master
- *   tier and draft keeps ultrafast — the speed tier stays the speed tier. */
+ *   tier and draft keeps ultrafast — the speed tier stays the speed tier.
+ * v1.13 (Adaptive Hardware Matrix): the last param is the hardware TIER
+ *   string. Tier 3 (constrained CPUs) drops the speed tiers to ultrafast +
+ *   crf 24 + -bf 0; every CPU tier rides -g 60. GPU rows unchanged (the
+ *   runtime probe validated those exact arg shapes). */
 const QUALITY_ENCODER = {
   draft:  { crf: 27, x264: "ultrafast", nvencPreset: "p1", nvencCq: 27, qsvQ: 27, amfI: 26, amfP: 28 },
   // v1.12: social veryfast/crf20 → superfast/crf22 + -tune fastdecode (see
@@ -1634,10 +1720,11 @@ const QUALITY_ENCODER = {
   cinema: { crf: 17, x264: "faster",  nvencPreset: "p6", nvencCq: 19, qsvQ: 19, amfI: 19, amfP: 21 },
 };
 
-function encoderArgs(encoderName, bitrateMbps, width, height, quality, crf, lowEndCpu) {
+function encoderArgs(encoderName, bitrateMbps, width, height, quality, crf, hardwareTier) {
   const q = QUALITY_ENCODER[quality] || QUALITY_ENCODER.social;
   const crfVal = quality === "custom" ? Math.max(14, Math.min(30, Number(crf) || 20)) : q.crf;
-  const lowEnd = lowEndCpu === true;
+  // v1.13: the old lowEnd boolean is now the hardware TIER string.
+  const t3 = hardwareTier === "TIER_3_CONSTRAINED_CPU";
   switch (encoderName) {
     case "h264_nvenc": {
       // v6: unconstrained constant-quality VBR — no maxrate/bufsize, CQ per
@@ -1653,24 +1740,31 @@ function encoderArgs(encoderName, bitrateMbps, width, height, quality, crf, lowE
     case "h264_amf":
       return ["-c:v", "h264_amf", "-quality", quality === "cinema" ? "quality" : "balanced", "-rc", "vbr_peak", "-qp_i", String(quality === "custom" ? crfVal : q.amfI), "-qp_p", String((quality === "custom" ? crfVal : q.amfP) + 2), "-b:v", `${bitrateMbps || 8}M`, "-pix_fmt", "yuv420p"];
     default: {
-      // libx264: v1.12 — the speed tiers (social/custom → superfast,
-      // draft → ultrafast) ALL ride `-tune fastdecode`; cinema keeps the
-      // faster-preset crf-17 master WITHOUT it (quality tier). superfast
-      // skips the expensive motion-estimation refinement passes whose
-      // loss is invisible after platform re-encoding, and doubles encode
-      // throughput on budget CPUs; fastdecode disables CABAC-side work
-      // (friendlier to the small L2/L3 caches of Atom/Celeron-class
-      // quads AND to playback on them).
+      // libx264 — v1.13 Adaptive Hardware Matrix. Tier 2 (≥6 modern
+      // cores) keeps the v1.12 ladder (superfast speed tiers + fastdecode;
+      // cinema keeps the faster-preset crf-17 master WITHOUT it). Tier 3
+      // (≤4 cores / dual-module APUs / budget quads) drops everything one
+      // notch: ultrafast + -bf 0 on the speed tiers (the B-frame motion
+      // search fights the shared module FPU for the same cycles), social
+      // rides crf 24 (ultrafast ≈ +2 CRF vs superfast at equal perceived
+      // quality — same picture, smaller file, none of the search cost),
+      // and cinema stays superfast to keep the crf-17 master watchable.
+      // Every CPU tier rides -g 60 (2 s GOPs at 30 fps — cheap seeking
+      // insurance on long exports).
       let preset;
-      if (lowEnd) {
-        preset = quality === "draft" ? "ultrafast" : "superfast";
+      let tierCrf = crfVal;
+      if (t3) {
+        preset = quality === "cinema" ? "superfast" : "ultrafast";
+        if (quality === "social") tierCrf = 24;
       } else {
         preset = quality === "cinema" ? q.x264 : (quality === "draft" ? "ultrafast" : q.x264);
       }
-      const args = ["-c:v", "libx264", "-preset", preset, "-crf", String(crfVal)];
+      const args = ["-c:v", "libx264", "-preset", preset, "-crf", String(tierCrf)];
       if (preset === "superfast" || preset === "ultrafast") {
         args.push("-tune", "fastdecode");
       }
+      args.push("-g", "60");
+      if (t3) args.push("-bf", "0");
       args.push("-pix_fmt", "yuv420p");
       return args;
     }
@@ -2839,6 +2933,35 @@ ipcMain.handle("export-ass-file", async (event, opts) => {
 // ./export-graph.js (pure CommonJS — shared with the test harness).
 // ---------------------------------------------------------------------------
 
+// v1.13 Tier 3 (user directive): LOW-COST SUBTITLE RASTERIZATION — strip
+// libass's expensive per-glyph work from the BURN-IN documents only (the
+// .ass sidecar export keeps the user's original styling). Gaussian blur
+// (\blur) and box blur (\be) re-rasterize every blurred glyph on EVERY
+// frame it is alive — across a 34,200-frame timeline that eats 30 %+ of a
+// constrained CPU; \blur0 swaps the soft glow for a clean hard shadow, and
+// outline / border widths clamp to ≤ 2 px so the stroke rasterizer touches
+// fewer scanlines per glyph.
+function optimizeAssForConstrainedCpu(doc) {
+  if (typeof doc !== "string" || doc.length === 0) return doc;
+  return doc
+    // Dialogue override tags: \blur<n> → \blur0 (hard edges), drop \be
+    // entirely, clamp \bord to ≤ 2 px.
+    .replace(/\\blur-?[0-9]+(?:\.[0-9]+)?/g, "\\blur0")
+    .replace(/\\be[0-9]*/g, "")
+    .replace(/\\bord([0-9]+(?:\.[0-9]+)?)/g, (_m, n) => `\\bord${Math.min(2, parseFloat(n))}`)
+    // Style lines (ours are exactly the 23-field v4+ shape): clamp the
+    // Outline (field 16) and Shadow (field 17) widths to 2 px.
+    .replace(/^Style: .+$/gm, (line) => {
+      const f = line.split(",");
+      if (f.length !== 23) return line;
+      for (const idx of [16, 17]) {
+        const v = parseFloat(f[idx]);
+        if (Number.isFinite(v) && v > 2) f[idx] = "2";
+      }
+      return f.join(",");
+    });
+}
+
 ipcMain.handle("export-native", async (event, opts) => {
   const { outputPath, fps, width, height, bitrateMbps, quality, crf, audioKbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark, overlays, sfx } = opts;
 
@@ -2982,13 +3105,22 @@ ipcMain.handle("export-native", async (event, opts) => {
     // route consumes them (audio branch list + probe-gated hw decode).
     const segInfo = [];
     let cumulativeMs = 0;
-    // v7 Step 5: low-end CPU detection — 4-or-fewer cores on the libx264
-    // fallback (no usable iGPU/dGPU) switches the preset ladder to
-    // superfast/ultrafast + -tune fastdecode and caps per-worker threads.
+    // v1.13 (user directive — Adaptive Hardware Matrix): the flat ≤4-core
+    // lowEnd flag is GONE. Every export resolves a 3-tier hardware profile
+    // (Tier 1 = a probe-verified GPU ASIC encoder · Tier 2 = ≥6 modern
+    // cores · Tier 3 = constrained/legacy CPUs, e.g. dual-module APUs)
+    // that decides the worker × thread shape, the x264 speed point, and
+    // whether libass gets the low-cost subtitle treatment.
     const cpuCount = os.cpus().length;
-    const lowEndCpu = cpuCount <= 4;
-    const lowEndX264 = lowEndCpu && encoder.name === "libx264";
-    const encArgs = encoderArgs(encoder.name, bitrateMbps, width, height, quality, crf, lowEndX264);
+    const hwProfile = await getHardwareProfile();
+    console.log(`[Export] Selected ${hwProfile.tier} (${encoder.name}) with ${hwProfile.workers} workers`);
+    const encArgs = encoderArgs(encoder.name, bitrateMbps, width, height, quality, crf, hwProfile.tier);
+    // v1.13: the compact speed-point descriptor for the completion toast
+    // ("Tier 3 · constrained CPU · ultrafast").
+    const enginePreset = (() => {
+      const i = encArgs.indexOf("-preset");
+      return i >= 0 ? String(encArgs[i + 1]) : encoder.name;
+    })();
     // v7 Step 1: QSV's d3d11va→qsv device-init globals ride at the head of
     // every real encode argv (the probe validated the exact environment).
     const encGlobalArgs = encoderGlobalArgs(encoder.name);
@@ -3012,21 +3144,13 @@ ipcMain.handle("export-native", async (event, opts) => {
     // overhead). The thread-budget division below is unchanged — a single
     // job still gets every core.
     const isGpuEncoder = encoder.name !== "libx264";
-    // v1.12.1 (user directive, follow-up): the two-step FALLBACK pool rides
-    // the same strict-4 recipe as the smart/parallel paths. The v6 formula
-    // min(2, floor(cpus/4)) ran exactly ONE ffmpeg process on a 4-core CPU —
-    // any smart-render init fallback (planner bail, graph over the 25 KB
-    // script budget, <4 s init error) silently degraded the export to the
-    // single-process pipeline the user saw in Task Manager (1 ffmpeg.exe,
-    // ~46 min for a 19-min video). ≥4 cores → STRICTLY 4 concurrent workers;
-    // the thread-budget division below pins each to 1 thread when the pool
-    // is full (the cache-line recipe). GPU encoders keep pool 1 — consumer
-    // GPU sessions serialize internally, more processes only add contention.
-    const poolN = isGpuEncoder
-      ? 1
-      : cpuCount >= 4
-        ? 4
-        : Math.max(1, Math.min(2, Math.floor(os.cpus().length / 4)));
+    // v1.13 (Adaptive Hardware Matrix): the fallback pool width is the
+    // TIER's worker count — the v1.12/v1.12.1 strict-4 recipe is now a
+    // Tier-2-only shape. Tier 3 (the 4-core dual-module APUs that strict-4
+    // was thrashing) runs 2 workers; Tier 1 keeps the GPU pool at 2 (the
+    // ASIC serializes encode sessions, but two decode/filter pipelines
+    // overlap nicely; the v6 3-worker fight was one too many).
+    const poolN = hwProfile.workers;
     // v1.4.2 CHUNKED PARALLEL ENCODE: long re-encode clips split into
     // frame-aligned ~60 s chunks (capped at the pool width — more chunks
     // than workers only adds seek overhead, fewer wastes the pool). This is
@@ -3059,11 +3183,11 @@ ipcMain.handle("export-native", async (event, opts) => {
     }, 0);
     const activeJobs = Math.max(1, Math.min(poolN, estVideoJobs || segments.length));
     const threadBudget = isGpuEncoder
-      ? Math.max(2, os.cpus().length)
-      : lowEndX264
-        // v7 Step 5: cap each pool worker at 2 threads on ≤4-core libx264
-        // boxes (W×threads stays within the physical core budget — no
-        // cache-thrashing oversubscription).
+      ? Math.max(2, Math.min(6, Math.floor(cpuCount / activeJobs) || 2))
+      : hwProfile.tier === "TIER_3_CONSTRAINED_CPU"
+        // v7 Step 5 → v1.13 Tier 3: cap each pool worker at 2 threads —
+        // one worker per physical Piledriver module, W×threads stays
+        // within the core budget (no FPU/cache-thrashing oversubscription).
         ? Math.max(1, Math.min(2, Math.floor(cpuCount / activeJobs)))
         : Math.max(1, Math.floor(cpuCount / activeJobs));
 
@@ -3089,7 +3213,12 @@ ipcMain.handle("export-native", async (event, opts) => {
     // path (tag = clip index _ chunk index).
     const writeAssFile = (doc, tag) => {
       const assPath = path.join(tempDir, `captions_${tag}_${Date.now()}.ass`);
-      fs.writeFileSync(assPath, doc, "utf-8");
+      // v1.13 Tier 3: strip libass's high-cost raster work from the BURN-IN
+      // documents only (gaussian/box blur → 0, outline/shadow widths clamped
+      // to 2 px — subtitle rasterization across a 34,200-frame timeline can
+      // eat 30 %+ of a constrained CPU). The .ass SIDECAR export keeps the
+      // user's original styling untouched.
+      fs.writeFileSync(assPath, hwProfile.optimizeSubtitles ? optimizeAssForConstrainedCpu(doc) : doc, "utf-8");
       tempFiles.push(assPath);
       const escapedAssPath = assPath
         .replace(/\\/g, "/")
@@ -3744,23 +3873,15 @@ ipcMain.handle("export-native", async (event, opts) => {
         }
 
         // ── Pool width + thread budgets ──────────────────────────────────
-        // spWorkers bounds the SUB-SPLIT width of the smart path (the v7
-        // core-division scheme; GPU encoders serialize in one process). The
-        // v1.10 parallel-pass mode overrides the pool budget BELOW — it runs
-        // W = max(2, min(4, cpus)) equal temporal windows with ONE encode
-        // thread each (the recipe: W single-threaded workers share the cores
-        // without oversubscription — the single-threaded libass/overlay
-        // filters stop stalling each other).
-        const isGpuEncoder = encoder.name !== "libx264";
-        // v1.12 (user directive): ≥4-core CPUs STRICTLY spawn 4 chunk
-        // workers — Windows schedules 4 separate 1-thread ffmpeg processes
-        // far better than fewer processes with fatter thread pools (the old
-        // floor(cpu/3) division capped the 4-core target at 2 — conservative).
-        const spWorkers = isGpuEncoder
-          ? 1
-          : cpuCount >= 4
-            ? 4
-            : 1;
+        // v1.13 (user directive — Adaptive Hardware Matrix): the smart-path
+        // sub-split width is the TIER worker count. The v1.12/v1.12.1
+        // "≥4 cores → STRICTLY 4 × 1-thread workers" recipe proved to be the
+        // WRONG shape for 4-core dual-module APUs (AMD A8-class Piledriver:
+        // 2 modules sharing 2 FPUs + L2 — 4 processes thrashed the shared
+        // units; the field report's 46-min exports). Tier 3 runs 2 × 2-thread
+        // workers (one worker per physical module), Tier 2 (≥6 cores) runs
+        // min(4, cores/2) × 2, Tier 1 (GPU ASIC) runs 2.
+        const spWorkers = hwProfile.workers;
 
         // ── The plan (pure) ──────────────────────────────────────────────
         const plan = SP.planSmartSegments({
@@ -3780,8 +3901,9 @@ ipcMain.handle("export-native", async (event, opts) => {
           workerCount: spWorkers,
           // v1.10 (Task 3): the equal-window parallel budget + the clean-
           // coverage ratio that triggers it (<30 % copied → mostly dirty).
-          // v1.12: ≥4 cores → STRICTLY 4 (user directive — no conservatism).
-          parallelWorkers: cpuCount >= 4 ? 4 : Math.max(2, Math.min(4, cpuCount)),
+          // v1.13: the tier worker count (2 on constrained CPUs — enough
+          // windows to fill both physical modules without FPU thrash).
+          parallelWorkers: hwProfile.workers,
           equalWindowRatio: 0.3,
         });
         if (!plan) {
@@ -3790,24 +3912,23 @@ ipcMain.handle("export-native", async (event, opts) => {
         }
 
         // ── Mode-aware pool budget ───────────────────────────────────────
-        // v1.12 (user directive): parallel-pass workers are HARD-PINNED to
-        // `-threads 1 -filter_threads 1` — 4 separate 1-thread processes
-        // never fight over the same CPU cache lines (motion estimation and
-        // CABAC contexts stay inside one core's L1/L2), and the leftover
-        // cores absorb the concurrent audio-bus pass + libass. Smart path
-        // keeps the v7 division + low-end caps.
+        // v1.13 (Adaptive Hardware Matrix): parallel-pass workers ride the
+        // tier's threadsPerWorker (2 on Tier 2/3 — the v1.12 hard-pin of
+        // 1 thread existed to keep 4 workers inside 4 cores' caches; with
+        // tier-sized worker counts, 2 threads per worker is the recipe).
+        // Smart path keeps the v7 division + the Tier-3 caps.
         let poolWidth;
         let threadsPer;
         let filterThreadsPer;
         if (plan.parallelMode) {
           poolWidth = Math.max(1, plan.workerCount);
-          threadsPer = 1;
-          filterThreadsPer = 1;
+          threadsPer = hwProfile.threadsPerWorker;
+          filterThreadsPer = hwProfile.threadsPerWorker;
         } else {
           poolWidth = Math.max(1, spWorkers);
           threadsPer = Math.max(1, Math.round(cpuCount / poolWidth));
           filterThreadsPer = Math.max(2, Math.min(8, Math.floor(cpuCount / poolWidth)));
-          if (lowEndX264) {
+          if (hwProfile.tier === "TIER_3_CONSTRAINED_CPU") {
             threadsPer = Math.max(1, Math.min(2, threadsPer));
             filterThreadsPer = Math.max(1, Math.min(2, filterThreadsPer));
           }
@@ -4170,6 +4291,11 @@ ipcMain.handle("export-native", async (event, opts) => {
           // toast/chip can never claim parallelism that did not run.
           poolWorkers: poolWidth,
           cpus: cpuCount,
+          // v1.13: the adaptive tier that ran this export + the speed point
+          // it chose (toast: "Tier 3 · constrained CPU · ultrafast").
+          tier: hwProfile.tier,
+          tierLabel: hwProfile.tierLabel,
+          enginePreset,
           singlePass: false,
           // v1.10: the parallel-pass mode (≥70 % dirty → W equal temporal
           // windows, 1 encode thread each) reports as "parallel-pass" so the
@@ -4205,7 +4331,7 @@ ipcMain.handle("export-native", async (event, opts) => {
     // LOG the pool shape so the main-process log (and the result payload's
     // poolWorkers) state exactly how many ffmpeg processes ran.
     console.log(
-      `[framefuse] TWO-STEP POOL: ${jobs.length + clipAudioJobs.length} job(s) · ${poolN} concurrent ffmpeg process(es) · encoder ${encoder.name} · ${cpuCount} CPU core(s)`,
+      `[framefuse] TWO-STEP POOL: ${jobs.length + clipAudioJobs.length} job(s) · ${poolN} concurrent ffmpeg process(es) · encoder ${encoder.name} · ${cpuCount} CPU core(s) · ${hwProfile.tier}`,
     );
     // N = min(4, max(1, os.cpus() − 2)) concurrent ffmpeg children
     // (child_process.spawn). Per-clip "time=" marks aggregate into the
@@ -4395,6 +4521,10 @@ ipcMain.handle("export-native", async (event, opts) => {
       // v1.12.1: the ACTUAL pool width (see the smart-path payload above).
       poolWorkers: poolN,
       cpus: cpuCount,
+      // v1.13: the adaptive tier + speed point (see the smart payload).
+      tier: hwProfile.tier,
+      tierLabel: hwProfile.tierLabel,
+      enginePreset,
       singlePass: false,
       mode: "two-step",
     };
@@ -4431,6 +4561,8 @@ app.on("will-quit", () => {
 // dev verification harness (scripts/verify-chunked-encode.js stubs the
 // electron module so main.js loads in plain node).
 // Harmless in production: nothing requires the Electron main entry.
+// v1.13: also exports the pure tier resolver + the Tier-3 ASS optimizer so
+// the throwaway harnesses can unit-verify the Adaptive Hardware Matrix.
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { buildAssDocument, assAnimTags, buildHeadlineEvents, probeHwDecode };
+  module.exports = { buildAssDocument, assAnimTags, buildHeadlineEvents, probeHwDecode, resolveHardwareProfile, optimizeAssForConstrainedCpu };
 }

@@ -354,6 +354,18 @@ export interface ExportResult {
   /** v1.12.1: the machine's CPU core count (the pool-width input) — lets
    *  the UI flag a single-process run on a ≥4-core box. */
   cpus?: number;
+  /** v1.13: the Adaptive Hardware Matrix tier that ran this export —
+   *  "TIER_1_GPU" (ASIC encode), "TIER_2_MODERN_CPU" (≥6 cores) or
+   *  "TIER_3_CONSTRAINED_CPU" (≤4 cores / legacy dual-module APUs:
+   *  2 × 2-thread workers, ultrafast + no B-frames, low-cost subtitle
+   *  rasterization). */
+  tier?: string;
+  /** v1.13: human-readable tier label for the completion toast
+   *  ("Tier 3 · constrained CPU"). */
+  tierLabel?: string;
+  /** v1.13: the encoder speed point actually used ("ultrafast",
+   *  "superfast", "faster", or a GPU preset like "p4"). */
+  enginePreset?: string;
   /** v9: True Smart Rendering telemetry — seconds of the timeline that
    *  rode the stream-copy fast path vs the re-encode windows. */
   smartCleanSec?: number;
@@ -799,11 +811,21 @@ declare global {
       onMenu: (channel: string, cb: (d?: unknown) => void) => () => void;
       /** v5.1: result of the async GPU-encoder probe (export-tab badge).
        *  v8.1 (Task 27-b): `forced` is true when a force-encoder override
-       *  bypassed the probe (Export-tab diagnostics dropdown). */
+       *  bypassed the probe (Export-tab diagnostics dropdown).
+       *  v1.13: also carries the Adaptive Hardware Matrix tier (workers ×
+       *  threads, CPU model, subtitle treatment) for the Export-tab tier
+       *  chip + the About strip. */
       getExportInfo: () => Promise<{
         encoder: string;
         encoderName: string;
         forced?: boolean;
+        tier?: string;
+        tierLabel?: string;
+        workers?: number;
+        threadsPerWorker?: number;
+        cpuCount?: number;
+        cpuModel?: string;
+        optimizeSubtitles?: boolean;
       }>;
       /** v8.1 (Task 27-b): force-encoder probe bypass (diagnostics).
        *  key ∈ null | "nvenc" | "qsv" | "amf" | "x264"; null restores the

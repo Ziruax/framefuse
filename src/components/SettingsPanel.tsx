@@ -15,6 +15,7 @@ import {
   RotateCcw,
   FileText,
   FileDown,
+  Gauge,
   Loader2,
   Sparkles,
   Type,
@@ -493,6 +494,13 @@ export function SettingsPanel(props: SettingsPanelProps) {
     encoder: string;
     encoderName: string;
     forced?: boolean;
+    tier?: string;
+    tierLabel?: string;
+    workers?: number;
+    threadsPerWorker?: number;
+    cpuCount?: number;
+    cpuModel?: string;
+    optimizeSubtitles?: boolean;
   } | null>(null);
   // v1.5: ffmpeg build diagnostics (which binary + its capabilities) — one
   // async fetch on mount, rendered in the Export tab next to the encoder badge.
@@ -1004,6 +1012,36 @@ export function SettingsPanel(props: SettingsPanelProps) {
                   {exportInfo.forced ? " (forced, probe bypassed)" : ""}
                 </span>
               )}
+              {/* v1.13: the Adaptive Hardware Matrix tier — the exact
+                  worker × thread shape exports will run on THIS machine,
+                  stated BEFORE an export starts (the "how many ffmpeg.exe
+                  should Task Manager show?" number). */}
+              {exportInfo?.tierLabel && (
+                <span
+                  className="mt-1 flex w-full flex-wrap items-center gap-x-1.5 gap-y-0.5 rounded border px-1.5 py-1 text-[9px] font-medium"
+                  style={{
+                    borderColor: "rgba(14, 116, 144, 0.55)",
+                    backgroundColor: "rgba(8, 51, 68, 0.25)",
+                    color: "#67e8f9",
+                  }}
+                  title={`Adaptive Hardware Matrix: ${exportInfo.tier} — exports run ${exportInfo.workers} ffmpeg worker(s) × ${exportInfo.threadsPerWorker} thread(s) each${exportInfo.optimizeSubtitles ? " · subtitle blur stripped (low-cost rasterization)" : ""}.${exportInfo.cpuModel ? ` CPU: ${exportInfo.cpuModel}` : ""}`}
+                >
+                  <Gauge size={11} aria-hidden />
+                  {exportInfo.tierLabel} · {exportInfo.workers}×
+                  {exportInfo.threadsPerWorker} threads
+                </span>
+              )}
+              {/* v1.13: Tier-3 machines get the 720p draft recommendation —
+                  half the pixels ≈ half the encode time on constrained CPUs. */}
+              {exportInfo?.tier === "TIER_3_CONSTRAINED_CPU" && (
+                <span
+                  className="mt-0.5 w-full text-[9px] leading-relaxed"
+                  style={{ color: "#fbbf24" }}
+                >
+                  This machine is Tier 3 — the Draft profile (720p) exports
+                  roughly 2× faster than 1080p here.
+                </span>
+              )}
             </div>
           </Section>
 
@@ -1384,14 +1422,14 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 (appInfo.platform ? ` · ${appInfo.platform}` : "")
               }
             >
-              {appInfo.version !== "1.12.1" ? (
+              {appInfo.version !== "1.13.0" ? (
                 <span
                   className="flex items-center gap-1 rounded px-1.5 py-0.5 font-bold"
                   style={{ backgroundColor: "rgba(245, 158, 11, 0.14)", color: "#fbbf24" }}
-                  title={`This install reports v${appInfo.version} — the current build is v1.12.1. Reinstall FrameFuse v1.12.1 (an old cached executable is running).`}
+                  title={`This install reports v${appInfo.version} — the current build is v1.13.0. Reinstall FrameFuse v1.13.0 (an old cached executable is running).`}
                 >
                   <TriangleAlert size={11} aria-hidden />
-                  App v{appInfo.version} — update to v1.12.1
+                  App v{appInfo.version} — update to v1.13.0
                 </span>
               ) : (
                 <span
@@ -1405,12 +1443,17 @@ export function SettingsPanel(props: SettingsPanelProps) {
               {appInfo.cpus != null && appInfo.cpus > 0 && (
                 <span
                   title={
-                    appInfo.cpus >= 4
-                      ? "≥4 cores: exports run STRICTLY 4 parallel 1-thread ffmpeg workers (check Task Manager → Details during an export)"
-                      : "<4 cores: exports run the conservative pool for this machine"
+                    exportInfo?.tierLabel
+                      ? `${exportInfo.tierLabel} — exports run ${exportInfo.workers} ffmpeg worker(s) × ${exportInfo.threadsPerWorker} thread(s) each (check Task Manager → Details during an export)`
+                      : appInfo.cpus >= 6
+                        ? "≥6 cores: Tier 2 — exports run min(4, cores/2) 2-thread ffmpeg workers (check Task Manager → Details during an export)"
+                        : "≤4 cores: Tier 3 — exports run 2 × 2-thread ffmpeg workers (the dual-module-friendly shape; check Task Manager → Details during an export)"
                   }
                 >
-                  {appInfo.cpus} CPU cores · {appInfo.cpus >= 4 ? "4" : Math.max(1, Math.min(2, Math.floor(appInfo.cpus / 4)))}× ffmpeg workers
+                  {appInfo.cpus} CPU cores ·{" "}
+                  {exportInfo?.workers
+                    ? `${exportInfo.workers}×${exportInfo.threadsPerWorker}-thread ffmpeg workers`
+                    : `${appInfo.cpus >= 6 ? Math.min(4, Math.floor(appInfo.cpus / 2)) : 2}× ffmpeg workers`}
                 </span>
               )}
               {appInfo.electron && <span>Electron {appInfo.electron}</span>}

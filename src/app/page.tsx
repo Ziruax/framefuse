@@ -1128,6 +1128,10 @@ export default function Page() {
         poolWorkers: res.poolWorkers,
         cpus: res.cpus,
         smartDirtyReason: res.smartDirtyReason,
+        // v1.13: the adaptive tier + speed point (toast/chip telemetry).
+        tier: res.tier,
+        tierLabel: res.tierLabel,
+        enginePreset: res.enginePreset,
       });
       // v1.1 TURBO: the success toast carries the performance story —
       // export time + encoder + stream-copy count — so a fast export is
@@ -1141,6 +1145,15 @@ export default function Page() {
         );
       }
       if (res.encoder) turboBits.push(res.encoder);
+      // v1.13: the adaptive hardware tier — WHICH engine class ran the
+      // encode ("Tier 3 · constrained CPU · ultrafast"). The field report
+      // showed users could not tell whether the new engine was active; this
+      // bit states it on every desktop export.
+      if (res.tierLabel) {
+        turboBits.push(
+          `${res.tierLabel}${res.enginePreset ? ` · ${res.enginePreset}` : ""}`,
+        );
+      }
       // v9: the smart-render story — "15.4 min stream-copied · 3.2 min
       // re-encoded" explains why a 19-minute timeline with edits finished
       // in minutes: only the dirty time-ranges paid the encode tax.

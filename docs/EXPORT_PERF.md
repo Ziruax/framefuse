@@ -485,3 +485,62 @@ ran; app version → the header chip and the Export tab strip both read the
 real exe resource and flag mismatches; pipeline mode → the toast names the
 mode ("smart render", "N parallel render passes (M ffmpeg processes)",
 "two-step") with the dirty reason when nothing could be copied.
+
+## v1.13 — the Adaptive Hardware Matrix (three tiers, probed per machine)
+
+The v1.12/v1.12.1 field reports ended with the real root cause: the 4-core
+target is an **AMD A8-5550M — a dual-module Piledriver APU**. Its 4 cores
+are 2 modules, and each module shares ONE FPU and ONE L2 between its two
+cores. The flat "≥4 cores → STRICTLY 4 × 1-thread workers" recipe put 4
+independent ffmpeg processes on 2 shared FPUs — cache thrash and thermal
+throttling, the exact "more workers made it slower" pathology. A single
+hardcoded pool shape cannot serve both a 2013 APU and a modern 12-core
+box, so v1.13 adopts the tier matrix pro video software uses:
+
+| Tier | Detection | Pool shape | x264 speed point | Subtitles |
+|---|---|---|---|---|
+| **1 · GPU ASIC** | the FPS-gated NVENC/QSV/AMF probe verifies a real working encoder (unchanged since v7 — listed ≠ working) | **2 workers** (two decode/filter pipelines overlap; the ASIC serializes encode sessions), filter threads `min(6, cores/2)` | per-quality NVENC/QSV/AMF knobs (unchanged, probe-validated arg shapes) | untouched |
+| **2 · modern multicore** | no working GPU ASIC + **≥6 logical cores** | `min(4, cores/2)` workers × **2 threads** | v1.12 ladder (social `superfast`/crf 22 + fastdecode, cinema `faster`/crf 17) **+ `-g 60`** | untouched |
+| **3 · constrained CPU** | everything else (≤4 cores: dual-module APUs, Celerons, budget quads) | **2 workers × 2 threads** — one worker per physical Piledriver module | speed tiers drop to **`ultrafast` + `-bf 0`**, social rides **crf 24** (ultrafast ≈ +2 CRF vs superfast at equal perceived quality — same picture, smaller file, none of the search cost), cinema keeps crf 17 on `superfast`; all rows **`-g 60`** | **low-cost rasterization**: `\blur→\blur0`, `\be` stripped, `\bord` + Style Outline/Shadow clamped to ≤ 2 px (burn-in documents only — the .ass sidecar keeps the user's styling) |
+
+Every decision is probed, never trusted blindly: Tier 1 only when a real
+test encode beats the measured CPU baseline by ≥ 1.2×; `threadsPerWorker`
+is clamped so workers × threads never exceeds the logical core count (a
+2-core Tier-3 box runs 2 × 1); and the smart sub-split, the equal-window
+parallel pass, and the two-step fallback pool ALL take the tier's worker
+count — no path can regress to a wrong-shaped pool. Hardware DECODE keeps
+the v1.12 tri-state d3d11va probe on every tier.
+
+**720p as the Tier-3 escape hatch**: the Draft profile (720p) and the
+resolution segmented control already flow exact pixel dims into the export
+graph (the `scale` runs before the subtitle burn, and a resolution
+mismatch marks sources re-encode-bound, never copy-bound) — 921k pixels
+vs 2.07M ≈ half the encode work. The Export tab now RECOMMENDS the Draft
+profile on detected Tier-3 machines.
+
+**Tier telemetry everywhere** (the "is the new engine even active?"
+answer): `export-info` carries the resolved tier, workers × threads, CPU
+model and subtitle treatment for the Export-tab chip; both result
+payloads carry `tier` / `tierLabel` / `enginePreset`; the completion toast
+states "Tier 3 · constrained CPU · ultrafast"; the main log states
+`[Export] Selected TIER_3_CONSTRAINED_CPU (libx264) with 2 workers`.
+
+**Expected field outcome on the A8-5550M** (Tier 3, 1080p): 2 × 2-thread
+ultrafast workers with stripped-down subtitle rasterization land the
+19-min timeline in the **~18–22 min band at 1080p, ~8–10 min at 720p**
+(vs the 46-min single-process baseline, and better than the thrashing
+4 × 1 shape). On a modern NVENC box (Tier 1) the same timeline targets
+the **2–5 min** band.
+
+**Verification** (throwaway harness — stubbed cores + real-ffmpeg spawn
+interception): 39/39 — the resolver unit tree (all three tiers, the
+2-core thread clamp, GPU-priority-over-core-count), the ASS optimizer
+unit (blur/box-blur/bord/Style clamps + edge cases), the `export-info`
+tier payload, forced-NVENC → TIER_1 + reset round trip, a REAL Tier-3
+export (2 concurrent workers, every argv `ultrafast + fastdecode +
+crf 24 + g 60 + bf 0 + threads 2`, burn-in ASS clamped 5→2, output
+decodes clean), a REAL Tier-2 export on a re-stubbed 8-core (4 × 2,
+`superfast`/crf 22, no `-bf 0`, ASS untouched), and the smart-planner
+regression (2 equal windows on Tier 3). Repo suites: timeline-chunks
+35/35, chunked-encode 36/36, kf-trims 22/22, singlepass-capabilities ok,
+export-parity 50/50, lint clean.

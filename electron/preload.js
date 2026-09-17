@@ -16,7 +16,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   // v5.1: result of the async GPU-encoder probe (for the export badge).
   // { encoder: "NVIDIA NVENC" | "Intel QSV" | "AMD AMF" | "CPU (libx264)",
-  //   encoderName: "h264_nvenc" | … | "libx264", forced: boolean }
+  //   encoderName: "h264_nvenc" | … | "libx264", forced: boolean,
+  //   tier: "TIER_1_GPU" | "TIER_2_MODERN_CPU" | "TIER_3_CONSTRAINED_CPU",
+  //   tierLabel, workers, threadsPerWorker, cpuCount, cpuModel,
+  //   optimizeSubtitles } — v1.13: the Adaptive Hardware Matrix facts.
   getExportInfo: () => ipcRenderer.invoke("export-info"),
 
   // v8.1: force-encoder probe bypass (diagnostics). key ∈
