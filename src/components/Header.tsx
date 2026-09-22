@@ -24,7 +24,7 @@ import { cn } from "@/lib/utils";
 /** v1.12.1: the renderer's build constant — compared against the REAL exe
  *  version (app.getVersion()) so a stale/hybrid install is impossible to
  *  miss. Keep in sync with package.json on every release. */
-const BUILD_VERSION = "1.14.1";
+const BUILD_VERSION = "1.14.2";
 
 export interface LastExport {
   path: string;
@@ -135,6 +135,16 @@ function parseTimemark(tm: string): number {
   else return 0;
   return ((h * 60 + m) * 60 + s) * 1000;
 }
+
+/** v1.14.2: friendly label for the export pipeline phase the backend
+ * reports alongside progress (see ExportProgress.phase). */
+const PHASE_LABEL: Record<string, string> = {
+  prepare: "preparing",
+  video: "rendering video",
+  audio: "mixing audio",
+  mux: "assembling",
+  done: "finishing",
+};
 
 export function Header({
   mode,
@@ -388,12 +398,22 @@ export function Header({
       </div>
 
       {/* Export progress (when exporting) — v1.11: percent always visible;
-          fps/timemark/ETA and the wider bar join at sm. */}
+          fps/timemark/ETA and the wider bar join at sm.
+          v1.14.2 (user directive: "not getting exact time"): the ETA is now
+          ALWAYS visible (it was hidden below sm and only unlocked after 4%
+          + 5 s — on fast exports it never appeared at all), with an
+          explicit "estimating…" state, the timeline position "@ 00:12 /
+          00:42", the live phase, and the overall ×-realtime rate. */}
       {isExporting && (
         <div className="flex items-center gap-2 sm:gap-3">
           <div
             className="flex items-center gap-2 text-[11px]"
             style={{ color: "#a1a1aa" }}
+            title={
+              exportProgress?.phase
+                ? `Export phase: ${PHASE_LABEL[exportProgress.phase] ?? exportProgress.phase}`
+                : undefined
+            }
           >
             <Timer
               className="size-3.5 animate-pulse"
@@ -405,19 +425,52 @@ export function Header({
             >
               {pctLabel}%
             </span>
+            {exportProgress?.phase && (
+              <span className="hidden sm:inline" style={{ color: "#71717a" }}>
+                {PHASE_LABEL[exportProgress.phase] ?? exportProgress.phase}
+              </span>
+            )}
+            {exportProgress?.timemark ? (
+              <span className="hidden sm:inline" style={{ color: "#71717a" }}>
+                @ {fmtTimecode(parseTimemark(exportProgress.timemark))}
+                {exportProgress?.total
+                  ? ` / ${fmtTimecode(exportProgress.total * 1000)}`
+                  : ""}
+              </span>
+            ) : null}
+            {/* ETA — the headline number the user asked for; "estimating…"
+                until the backend unlocks it rather than silently nothing. */}
+            {exportProgress?.eta != null &&
+            Number.isFinite(exportProgress.eta) ? (
+              <span
+                className="tabular-nums"
+                style={{ color: "#67e8f9" }}
+                title="Estimated time remaining"
+              >
+                ETA {fmtElapsed(exportProgress.eta)}
+              </span>
+            ) : (
+              <span
+                className="animate-pulse"
+                style={{ color: "#71717a" }}
+                title="Measuring the encode rate…"
+              >
+                estimating…
+              </span>
+            )}
             {exportProgress?.fps ? (
               <span className="hidden sm:inline" style={{ color: "#71717a" }}>
                 {exportProgress.fps.toFixed(0)} fps
               </span>
-            ) : null}
-            {exportProgress?.timemark ? (
-              <span className="hidden sm:inline" style={{ color: "#71717a" }}>
-                @ {fmtTimecode(parseTimemark(exportProgress.timemark))}
-              </span>
-            ) : null}
-            {exportProgress?.eta ? (
-              <span className="hidden sm:inline" style={{ color: "#71717a" }}>
-                ETA {fmtElapsed(exportProgress.eta)}
+            ) : exportProgress?.rate != null &&
+              Number.isFinite(exportProgress.rate) &&
+              exportProgress.rate > 0 ? (
+              <span
+                className="hidden tabular-nums sm:inline"
+                style={{ color: "#71717a" }}
+                title="Timeline seconds processed per wall-clock second"
+              >
+                {exportProgress.rate.toFixed(1)}×
               </span>
             ) : null}
           </div>
@@ -601,7 +654,7 @@ export function Header({
           title={
             inElectron
               ? "Export an MP4 with smart FFmpeg rendering — untouched video is stream-copied at full quality, only your edits are re-encoded"
-              : "Export a video (browser preview mode — run the desktop app for MP4 exports)"
+              : "Exports run in the FrameFuse desktop app for Windows — this browser session is a UI preview only"
           }
         >
           <Download className="size-4" />

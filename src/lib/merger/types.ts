@@ -310,6 +310,20 @@ export interface ExportProgress {
   fps?: number;
   eta?: number;
   timemark?: string;
+  /**
+   * v1.14.2 (user directive: "not getting exact time — how long will the
+   * export take"): the desktop export progress payload now carries enough
+   * context to render an honest time estimate instead of a bare percent:
+   *   - elapsed: wall-clock seconds since the export started
+   *   - total:   total timeline seconds (the "@ 00:12 / 00:42" denominator)
+   *   - phase:   "prepare" | "video" | "audio" | "mux" | "done"
+   *   - rate:    overall processing speed in × real-time (content-seconds
+   *              per wall-second — the same number ffmpeg prints as speed=)
+   */
+  elapsed?: number;
+  total?: number;
+  phase?: string;
+  rate?: number;
 }
 
 export interface ExportResult {

@@ -544,3 +544,63 @@ decodes clean), a REAL Tier-2 export on a re-stubbed 8-core (4 × 2,
 regression (2 equal windows on Tier 3). Repo suites: timeline-chunks
 35/35, chunked-encode 36/36, kf-trims 22/22, singlepass-capabilities ok,
 export-parity 50/50, lint clean.
+
+---
+
+## v1.14.2 — Task 44 field analysis: "export speed is significantly reduced"
+
+### What the user experienced
+
+Three separate things got conflated into "slower after the disclaimer update":
+
+1. **The disclaimer (v1.14.0) was NOT the cause.** `electron/main.js` was
+   byte-identical between v1.13 and v1.14 (ASAR-verified in Task 43), and the
+   real-ffmpeg disclaimer bench showed ±3.6 % noise: a disclaimer clip is a
+   bounded dirty window at `[0, N)`; the rest of the timeline keeps its
+   clean stream-copy pieces (6/7 copies on the bench payload).
+2. **The actual regression was v1.13's Tier-3 pool shape** (2 workers × 2
+   threads). For FILTER-dominated timelines — image storyboards, Ken Burns,
+   caption-heavy projects — every ffmpeg's zoompan/scale/libass chain is
+   single-threaded PER PROCESS, so process count fills a 4-thread machine.
+   v1.12.1 ran 4×1 there; v1.13's 2×2 halved filter throughput. The user
+   skipped v1.13 testing and met the regression when v1.14.0 shipped.
+   **Fixed in v1.14.1** (workload-aware pools: filter-dominant timelines
+   widen to `min(4, logical)` single-thread processes; video-dominated
+   keep 2×2).
+3. **A real serialization bug found in this round (v1.14.2):** the smart-
+   render audio bus ran AFTER the video pool instead of concurrently —
+   its entire runtime was added to the wall clock even though it never
+   consumes the pool's outputs (its inputs are the SOURCE media). The
+   export blueprint's Phase 4 explicitly requires the audio pass to run
+   "while the video workers are running". Now it launches before
+   `runPool` and is awaited after it; progress from both feeds one
+   combined fraction with the same 0–92/92–96/96.5–100 band layout, and
+   the audio failure semantics (<4 s = init failure → two-step fallback)
+   are preserved exactly. Typical audio passes run several × realtime, so
+   on long timelines this removes minutes of pure serial tail.
+
+### Why it FELT even slower than it was
+
+The progress UI hid every time signal: the ETA unlocked only after
+4 % progress AND 5 s elapsed (fast exports finished first), it was
+`hidden sm:inline` (invisible below 640 px), `fps` was hardcoded 0, and
+there was no elapsed/total context. A silent bar reads as "stuck".
+
+**v1.14.2 progress payload** adds `elapsed`, `total`, `phase`
+(`prepare → video → audio → mux → done`), and `rate` (×-realtime) to the
+existing `progress/eta/timemark`; the chip now reads
+`42.3% · rendering video · @ 00:12 / 00:42 · ETA 18s · 2.3×` with an
+explicit "estimating…" state while the rate settles. The ETA itself
+unlocks at 2 % + 2 s and blends the all-run average with the recent ~6 s
+slope (0.35/0.65) so it tracks clean-copy bursts and worker
+completions instead of lagging them; a sanity clamp bounds startup
+extrapolation spikes (the v1.3 multi-hour-estimate panic is still
+guarded).
+
+### Desktop-only (the "aim" clarification)
+
+The browser MediaRecorder export fallback was REMOVED — FrameFuse is a
+Windows desktop application; a browser session renders a landing page
+(installer download, requirements, feature grid) and the studio UI is a
+development preview only. Exports outside the Electron shell throw a
+typed desktop-only error. One engine, one honest performance story.

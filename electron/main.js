@@ -3152,8 +3152,15 @@ ipcMain.handle("export-native", async (event, opts) => {
   const tempFiles = [];
   const startTime = Date.now();
 
+  // v1.14.2 (user directive: "not getting exact time — how long will the
+  // export take"): the progress payload carries elapsed/total/phase/rate so
+  // the renderer can show an honest "@ 00:12 / 00:42 · ETA 18s · 2.3×"
+  // instead of a bare percent. phase: prepare → video → audio → mux → done.
+  let exportPhase = "prepare";
+
   function sendProgress(percent, timemarkSec, etaSec) {
     if (event.sender && !event.sender.isDestroyed()) {
+      const elapsedSec = (Date.now() - startTime) / 1000;
       event.sender.send("export-progress", {
         progress: Math.max(0, Math.min(100, percent)),
         fps: 0,
@@ -3164,6 +3171,17 @@ ipcMain.handle("export-native", async (event, opts) => {
         // parseTimemark produce NaN and the chip render "@ NaN:NaN" on
         // EVERY export since v1.2.
         timemark: timemarkSec != null ? assFmtTime(timemarkSec) : undefined,
+        // v1.14.2 additions (all optional — older shells ignore them):
+        elapsed: Math.round(elapsedSec * 10) / 10,
+        total: totalSec > 0 ? totalSec : undefined,
+        phase: exportPhase,
+        // Overall ×-realtime: content-seconds processed per wall-second
+        // (the timemark is the aggregated content position; this is the
+        // same number ffmpeg prints as speed=, measured across the pool).
+        rate:
+          elapsedSec > 0.5 && timemarkSec > 0
+            ? Math.round((timemarkSec / elapsedSec) * 100) / 100
+            : undefined,
       });
     }
   }
@@ -3175,11 +3193,43 @@ ipcMain.handle("export-native", async (event, opts) => {
   // users before the rate settled. 4% of content AND ≥ 5 s elapsed, and the
   // same gate applies on re-estimates (the elapsed/fraction formula is an
   // all-run average, so it only ever smooths).
+  // v1.14.2: the gate drops to 2% + 2 s (the user explicitly asked to see
+  // the time — an honest "estimating…" placeholder now covers the ramp
+  // instead of silence), and the estimate BLENDS the all-run average with
+  // the recent ~6 s slope so it tracks rate changes (clean-copy bursts,
+  // worker completions) instead of lagging behind them. A sanity clamp
+  // bounds startup-extrapolation spikes.
+  const etaSamples = [];
   function etaFor(fraction) {
-    if (fraction <= 0.04) return undefined;
-    const elapsed = (Date.now() - startTime) / 1000;
-    if (elapsed < 5) return undefined;
-    return Math.max(0, Math.round(elapsed / fraction - elapsed));
+    if (!(fraction > 0)) return undefined;
+    const now = Date.now();
+    etaSamples.push({ t: now, f: fraction });
+    if (etaSamples.length > 300) etaSamples.shift();
+    if (fraction <= 0.02) return undefined;
+    const elapsed = (now - startTime) / 1000;
+    if (elapsed < 2) return undefined;
+    const overall = fraction / elapsed;
+    let rate = overall;
+    // Recent slope: the oldest sample ≥6 s back vs the newest.
+    let oldIdx = -1;
+    for (let i = etaSamples.length - 1; i >= 0; i--) {
+      if (now - etaSamples[i].t >= 6000) { oldIdx = i; break; }
+    }
+    if (oldIdx >= 0 && oldIdx < etaSamples.length - 1) {
+      const a = etaSamples[oldIdx];
+      const b = etaSamples[etaSamples.length - 1];
+      const dt = (b.t - a.t) / 1000;
+      if (dt > 0.5) {
+        const recent = Math.max(0, (b.f - a.f) / dt);
+        rate = 0.35 * overall + 0.65 * recent;
+      }
+    }
+    if (!(rate > 1e-6)) return undefined;
+    const remaining = Math.max(0, 1 - fraction);
+    let eta = remaining / rate;
+    const cap = elapsed * 4 + 60;
+    if (eta > cap) eta = cap;
+    return Math.max(0, Math.round(eta));
   }
 
   try {
@@ -4317,31 +4367,105 @@ ipcMain.handle("export-native", async (event, opts) => {
         );
 
         // ── PHASE 3 (run): ONE pool over copies + dirty windows ───────────
+        // v1.14.2 (user directive: "export speed significantly reduced"):
+        // the audio bus used to run AFTER the pool completed — its whole
+        // runtime was ADDED to the wall clock even though it never touches
+        // the pool's outputs (its inputs are the SOURCE media). It now
+        // launches CONCURRENTLY with the video pool (the export blueprint's
+        // Phase 4: "process all timeline audio in a single pass WHILE the
+        // video workers are running"), and progress from both feeds ONE
+        // combined fraction: the pool owns 0–92 %, the concurrent audio
+        // pass 92–96 %, the concat mux 96.5–100 % (the same band layout as
+        // v1.14.1 — only the serialization changed).
         const chunkFrac = poolJobs.map(() => 0);
+        let spAudioFrac = 0;
         const poolStart = Date.now();
         let lastEmit = 0;
-        const emitChunkProgress = (force) => {
+        const emitSmartProgress = (force) => {
           const now = Date.now();
           if (!force && now - lastEmit < 100) return;
           lastEmit = now;
           let doneMs = 0;
           for (let k = 0; k < poolJobs.length; k++) doneMs += chunkFrac[k] * poolJobs[k].durationMs;
-          const frac = Math.min(1, doneMs / Math.max(1, totalMs));
-          sendProgress(frac * 92, frac * totalSec, etaFor(frac));
+          const poolFrac = Math.min(1, doneMs / Math.max(1, totalMs));
+          const frac = Math.min(0.96, 0.92 * poolFrac + 0.04 * spAudioFrac);
+          sendProgress(frac * 100, frac * totalSec, etaFor(frac));
         };
+
+        // ── Audio bus: ONE full-timeline pass (no per-chunk AAC boundary ──
+        // glitches, no windowed amix math), bounded by the VIDEO frame
+        // model; the final mux carries -shortest. v1.14.2: LAUNCHED BEFORE
+        // the pool and awaited after it (concurrent). Failures are recorded
+        // and re-raised with the exact v1.14.1 semantics (<4 s = filter-
+        // graph init failure → two-step fallback; later = hard error) once
+        // the pool settles, so the fallback decision point is unchanged.
+        let spAudioPath = null;
+        let spAudioErr = null;
+        const hasAudioBus =
+          clipAudioBranches.length > 0 || !!audioPath || sfxList.length > 0;
+        const spAudioPromise = hasAudioBus
+          ? (async () => {
+              const aPlan = SP.buildSinglePassPlan({
+                segments,
+                audioOnly: true,
+                fps,
+                width,
+                height,
+                totalMs,
+                audio,
+                audioPath,
+                sfx: sfxList,
+                clipAudio: clipAudioBranches,
+                loudnorm: spLoudnorm,
+                masterLoudnorm: spMasterLoudnorm,
+              });
+              if (!aPlan.hasAudioOut) return;
+              const aScriptPath = path.join(tempDir, `graph_sma_${Date.now()}.txt`);
+              fs.writeFileSync(aScriptPath, aPlan.script, "utf-8");
+              tempFiles.push(aScriptPath);
+              spAudioPath = path.join(tempDir, `spaudio_${Date.now()}.m4a`);
+              tempFiles.push(spAudioPath);
+              const aArgs = SP.buildAudioOnlyArgs({
+                plan: aPlan,
+                scriptPath: aScriptPath,
+                abr: `${abr}k`,
+                totalSec: plan.totalFrames / fps,
+                outputPath: spAudioPath,
+              });
+              const audioStart = Date.now();
+              try {
+                await runFfmpeg(aArgs, totalSec, (sec) => {
+                  spAudioFrac = Math.min(1, sec / Math.max(0.01, totalSec));
+                  emitSmartProgress(false);
+                });
+                console.log(
+                  `[framefuse] audio bus pass finished in ${((Date.now() - audioStart) / 1000).toFixed(1)}s (ran concurrent with the video pool)`,
+                );
+              } catch (err) {
+                spAudioErr = { err, elapsed: Date.now() - audioStart };
+              }
+            })()
+          : null;
+
+        exportPhase = "video";
         try {
           await runPool(poolJobs, poolWidth, {
             onTime: (idx, sec) => {
               chunkFrac[idx] = Math.min(1, sec / Math.max(0.01, poolJobs[idx].durSec));
-              emitChunkProgress(false);
+              emitSmartProgress(false);
             },
             onDone: (idx) => {
               chunkFrac[idx] = 1;
-              emitChunkProgress(true);
+              emitSmartProgress(true);
             },
           });
         } catch (err) {
-          if (err && err.message === "Export cancelled") throw err;
+          if (err && err.message === "Export cancelled") {
+            // The pool's kill-siblings already killed the concurrent audio
+            // ffmpeg (runFfmpeg registers every proc in activeProcs); its
+            // recorder swallowed the rejection, so just propagate.
+            throw err;
+          }
           if (Date.now() - poolStart < 4000) {
             console.warn("[framefuse] smart render pool failed at init — falling back to the two-step pool:", err.message);
             return null;
@@ -4349,58 +4473,24 @@ ipcMain.handle("export-native", async (event, opts) => {
           throw err;
         }
 
-        // ── Audio bus: ONE full-timeline pass (no per-chunk AAC boundary ──
-        // glitches, no windowed amix math), bounded by the VIDEO frame
-        // model; the final mux carries -shortest.
-        let spAudioPath = null;
-        const hasAudioBus =
-          clipAudioBranches.length > 0 || !!audioPath || sfxList.length > 0;
-        if (hasAudioBus) {
-          const aPlan = SP.buildSinglePassPlan({
-            segments,
-            audioOnly: true,
-            fps,
-            width,
-            height,
-            totalMs,
-            audio,
-            audioPath,
-            sfx: sfxList,
-            clipAudio: clipAudioBranches,
-            loudnorm: spLoudnorm,
-            masterLoudnorm: spMasterLoudnorm,
-          });
-          if (aPlan.hasAudioOut) {
-            const aScriptPath = path.join(tempDir, `graph_sma_${Date.now()}.txt`);
-            fs.writeFileSync(aScriptPath, aPlan.script, "utf-8");
-            tempFiles.push(aScriptPath);
-            spAudioPath = path.join(tempDir, `spaudio_${Date.now()}.m4a`);
-            tempFiles.push(spAudioPath);
-            const aArgs = SP.buildAudioOnlyArgs({
-              plan: aPlan,
-              scriptPath: aScriptPath,
-              abr: `${abr}k`,
-              totalSec: plan.totalFrames / fps,
-              outputPath: spAudioPath,
-            });
-            const audioStageStart = Date.now();
-            try {
-              await runFfmpeg(aArgs, totalSec, (sec) => {
-                const frac = 0.92 + 0.04 * Math.min(1, sec / Math.max(0.01, totalSec));
-                sendProgress(frac * 100, sec, etaFor(frac));
-              });
-            } catch (err) {
-              if (err && err.message === "Export cancelled") throw err;
-              if (Date.now() - audioStageStart < 4000) {
-                console.warn("[framefuse] smart render audio pass failed at init — falling back to the two-step pool:", err.message);
-                return null;
-              }
-              throw err;
-            }
+        // Audio bus join (usually already finished — it started with the
+        // pool and typically runs several × realtime).
+        if (spAudioPromise) {
+          exportPhase = "audio";
+          await spAudioPromise;
+        }
+        if (spAudioErr) {
+          const { err, elapsed } = spAudioErr;
+          if (err && err.message === "Export cancelled") throw err;
+          if (elapsed < 4000) {
+            console.warn("[framefuse] smart render audio pass failed at init — falling back to the two-step pool:", err.message);
+            return null;
           }
+          throw err;
         }
 
         // ── PHASE 4: concat demuxer stitch + mux (instant, -c copy) ───────
+        exportPhase = "mux";
         sendProgress(96.5, totalSec, etaFor(0.965));
         const spConcatPath = path.join(tempDir, `concat_${Date.now()}.txt`);
         tempFiles.push(spConcatPath);
@@ -4436,6 +4526,7 @@ ipcMain.handle("export-native", async (event, opts) => {
         }
 
         // ── Aggressive cleanup + the result payload ──────────────────────
+        exportPhase = "done";
         sendProgress(100, totalSec, 0);
         for (const f of tempFiles) { try { fs.unlinkSync(f); } catch (_) {} }
         let size = 0;
@@ -4526,6 +4617,7 @@ ipcMain.handle("export-native", async (event, opts) => {
       const frac = doneMs / Math.max(1, totalMs);
       sendProgress(frac * 95, doneMs / 1000, etaFor(frac));
     };
+    exportPhase = "video";
     await runPool(poolJobs, poolN, {
       onTime: (idx, sec) => {
         clipFrac[idx] = Math.min(1, sec / Math.max(0.01, poolJobs[idx].durSec));
@@ -4545,6 +4637,7 @@ ipcMain.handle("export-native", async (event, opts) => {
     // ACTUAL length — measure each clip file (parallel, cached probe) and
     // sum. A failed probe falls back to the requested duration for that
     // clip, and the whole total falls back when nothing is measurable.
+    exportPhase = "audio";
     sendProgress(96, totalSec, etaFor(0.96));
     // Probes run in bounded chunks (8 at a time) — a 100-clip project must
     // not spawn 100 ffmpeg children simultaneously on a weak machine.
@@ -4660,6 +4753,7 @@ ipcMain.handle("export-native", async (event, opts) => {
       newAudioGraph: anyVideoAudio || sfxList.length > 0,
     });
 
+    exportPhase = "mux";
     await runFfmpeg(concatArgs, actualTotalSec, (sec) => {
       const frac = 0.96 + 0.04 * Math.min(1, sec / Math.max(0.01, actualTotalSec));
       // v5 fix (pre-existing v4.9 bug): sendProgress takes PERCENT — the old
@@ -4668,6 +4762,7 @@ ipcMain.handle("export-native", async (event, opts) => {
       sendProgress(frac * 100, sec, etaFor(frac));
     });
 
+    exportPhase = "done";
     sendProgress(100, actualTotalSec, 0);
 
     // Cleanup

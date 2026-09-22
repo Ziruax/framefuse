@@ -17,17 +17,12 @@ import type {
   VideoSettings,
 } from "./types";
 import {
-  drawFrame,
-  drawFrameWithTransition,
-  applyGlobalFade,
-  computeGlobalFade,
-  drawWatermark,
   resolveDimensions,
   watermarkGeometry,
 } from "./renderer";
 import { getCaptionPreset, getFontOption } from "./captionPresets";
 import { getHeadlinePreset, type HeadlinePreset } from "./headlinePresets";
-import { cueAt, activeWordIndex, type WordTimestamp } from "./subtitles";
+import { activeWordIndex, type WordTimestamp } from "./subtitles";
 import {
   computeWordTransform,
   IDENTITY_TRANSFORM,
@@ -162,19 +157,13 @@ function nativeSourcePath(file?: File | null): string | null {
   }
 }
 
-/** v5 features the browser fallback exporters cannot render (yet). */
+/** v1.14.2 (user directive: "make this desktop app only, no browser"): the
+ * browser MediaRecorder fallback exporter was REMOVED — FrameFuse is a
+ * Windows desktop application and exports run exclusively through the
+ * native FFmpeg engine inside the Electron shell. A browser session gets
+ * this typed error (the studio UI preview is for development only). */
 const DESKTOP_ONLY_EXPORT_MSG =
-  "Video, chroma-key, overlay and SFX export requires the FrameFuse desktop app";
-
-/** Graceful, typed guard for the browser fallback paths. */
-function assertBrowserExportSupport(opts: ExportNativeOptions): void {
-  const hasV5 = (opts.segments || []).some(
-    (s) => s.mediaType === "video" || (s.track ?? 0) >= 1 || s.chroma != null,
-  );
-  if (hasV5 || (opts.sfx != null && opts.sfx.length > 0)) {
-    throw new Error(DESKTOP_ONLY_EXPORT_MSG);
-  }
-}
+  "Exports run in the FrameFuse desktop app for Windows — download the installer from github.com/Ziruax/framefuse/releases to export your project";
 
 /**
  * v4.4 watermark IPC payload: persists the image to a temp file and
@@ -673,182 +662,10 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
 }
 
 // ---------------------------------------------------------------------------
-// Browser fallback: MediaRecorder (real-time WebM)
+// v1.14.2: the browser MediaRecorder export path was REMOVED (desktop-only
+// directive). Canvas caption drawing below stays — the preview renderer and
+// the vestigial WebCodecs engine module still import these helpers.
 // ---------------------------------------------------------------------------
-async function exportViaMediaRecorder(
-  opts: ExportNativeOptions,
-): Promise<ExportResult> {
-  const {
-    segments,
-    imageUrls,
-    settings,
-    kenBurns,
-    totalMs,
-    onProgress,
-    signal,
-    subtitles,
-    captionSettings,
-  } = opts;
-
-  // v5.0 media features (video sources / overlay lanes / chroma key / SFX)
-  // are desktop-app only — fail with a clear typed error before any work.
-  assertBrowserExportSupport(opts);
-
-  const dims = resolveDimensions(settings.aspect, "720p");
-  const fps = settings.fps;
-
-  const canvas = document.createElement("canvas");
-  canvas.width = dims.w;
-  canvas.height = dims.h;
-  const ctx = canvas.getContext("2d", { alpha: false })!;
-
-  const imgCache = new Map<string, HTMLImageElement>();
-  await Promise.all(
-    segments.map(
-      (seg) =>
-        new Promise<void>((resolve) => {
-          const url = imageUrls[seg.id] || seg.thumbnailUrl;
-          const img = new Image();
-          img.onload = () => {
-            imgCache.set(seg.id, img);
-            resolve();
-          };
-          img.onerror = () => resolve();
-          img.src = url;
-        }),
-    ),
-  );
-
-  const stream = (canvas as any).captureStream(fps) as MediaStream;
-  const mimeType = pickMime();
-  const recorder = new MediaRecorder(stream, {
-    mimeType,
-    videoBitsPerSecond: browserQualityBitrate(settings),
-    // v1.2: honor the audio-bitrate setting as a recorder hint (browsers
-    // treat this as advisory and may clamp it).
-    audioBitsPerSecond: (settings.audioKbps ?? 192) * 1000,
-  });
-  const chunks: BlobPart[] = [];
-  recorder.ondataavailable = (e) => {
-    if (e.data.size > 0) chunks.push(e.data);
-  };
-
-  const done = new Promise<ExportResult>((resolve) => {
-    recorder.onstop = () => {
-      const blob = new Blob(chunks, { type: mimeType });
-      const url = URL.createObjectURL(blob);
-      triggerDownload(
-        url,
-        `framefuse_${Date.now()}.${mimeType.includes("mp4") ? "mp4" : "webm"}`,
-      );
-      setTimeout(() => URL.revokeObjectURL(url), 60000);
-      resolve({ path: "(browser download)", size: blob.size });
-    };
-  });
-
-  recorder.start();
-  const start = performance.now();
-
-  const drawCaptionsMR =
-    captionSettings?.enabled && subtitles && subtitles.cues.length > 0
-      ? (currentMsLocal: number) => {
-          const cue = cueAt(subtitles.cues, currentMsLocal);
-          if (!cue) return;
-          const capCtx = {
-            ...captionSettings,
-            words: cue.words,
-            currentMs: currentMsLocal,
-            cueStartMs: cue.startMs,
-            cueEndMs: cue.endMs,
-          };
-          drawCaption(ctx, cue.text, capCtx, dims.w, dims.h);
-        }
-      : null;
-
-  // Headline overlay items (v4.2) — drawn under captions.
-  const headlineItemsMR =
-    opts.headlines && opts.headlines.length > 0 ? opts.headlines : null;
-
-  // v4.3 transitions — scratch canvas for the head composite + global fades.
-  const transitionMR = opts.transition ?? null;
-  const scratchMR = document.createElement("canvas");
-  scratchMR.width = dims.w;
-  scratchMR.height = dims.h;
-
-  // v4.4 watermark — drawn UNDER headlines + captions (same as the export).
-  const wmImageMR =
-    opts.watermark?.imageUrl
-      ? await loadImageElement(opts.watermark.imageUrl)
-      : null;
-  const wmSettingsMR = opts.watermark?.settings ?? null;
-
-  await new Promise<void>((resolve) => {
-    const tick = () => {
-      const elapsed = performance.now() - start;
-      const currentMs = Math.min(elapsed, totalMs);
-      const segIdxMR = segments.findIndex(
-        (s) => currentMs >= s.startMs && currentMs < s.endMs,
-      );
-      const seg =
-        segIdxMR >= 0 ? segments[segIdxMR] : segments[segments.length - 1];
-      const img = seg ? imgCache.get(seg.id) : null;
-      if (seg) {
-        drawFrameWithTransition(
-          ctx, scratchMR, seg, Math.max(0, segIdxMR), segments, img ?? null,
-          imgCache, currentMs, dims.w, dims.h, kenBurns, transitionMR,
-        );
-      }
-      if (wmImageMR && wmSettingsMR) {
-        drawWatermark(ctx, wmImageMR, dims.w, dims.h, wmSettingsMR);
-      }
-      if (headlineItemsMR)
-        drawHeadline(ctx, headlineItemsMR, currentMs, dims.w, dims.h);
-      if (drawCaptionsMR) drawCaptionsMR(currentMs);
-      // Global fades AFTER captions (mirrors fade-after-subtitles in FFmpeg).
-      if (seg) {
-        applyGlobalFade(
-          ctx, scratchMR,
-          computeGlobalFade(
-            segments, Math.max(0, segments.indexOf(seg)), currentMs, transitionMR,
-          ),
-        );
-      }
-
-      onProgress?.({
-        progress: Math.min(100, (currentMs / totalMs) * 100),
-        fps,
-      });
-
-      if (signal?.aborted || currentMs >= totalMs) {
-        resolve();
-        return;
-      }
-      requestAnimationFrame(tick);
-    };
-    requestAnimationFrame(tick);
-  });
-
-  recorder.stop();
-  return done;
-}
-
-function pickMime(): string {
-  const candidates = [
-    "video/webm;codecs=vp9",
-    "video/webm;codecs=vp8",
-    "video/webm",
-    "video/mp4",
-  ];
-  for (const c of candidates) {
-    if (
-      typeof MediaRecorder !== "undefined" &&
-      MediaRecorder.isTypeSupported(c)
-    ) {
-      return c;
-    }
-  }
-  return "video/webm";
-}
 
 /** Trigger a browser download of `url` as `filename` (no native save
  * dialog). Exported since v8: the GPU (WebCodecs) engine reuses the exact
@@ -2243,7 +2060,9 @@ function drawRoundedRect(
  * Export the timeline to video.
  * - Inside Electron: native FFmpeg (MP4) — the ONLY export engine (v1.10:
  *   the WebCodecs engine was removed; one reliable FFmpeg codebase).
- * - In a browser: MediaRecorder WebM (preview convenience).
+ * - v1.14.2 (desktop-only directive): in a plain browser this now throws a
+ *   typed error instead of falling back to MediaRecorder — FrameFuse is a
+ *   Windows desktop app; the browser studio is a UI preview only.
  */
 export async function exportNative(
   opts: ExportNativeOptions,
@@ -2251,7 +2070,7 @@ export async function exportNative(
   if (isElectron()) {
     return exportViaFFmpeg(opts);
   }
-  return exportViaMediaRecorder(opts);
+  throw new Error(DESKTOP_ONLY_EXPORT_MSG);
 }
 
 /** Convenience: find the active segment for a time (re-exported helper). */

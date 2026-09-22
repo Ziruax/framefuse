@@ -13,6 +13,7 @@ import { ChevronLeft, ChevronRight, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Header, type LastExport } from "@/components/Header";
 import { ShortcutsOverlay } from "@/components/ShortcutsOverlay";
+import { DesktopOnlyLanding } from "@/components/DesktopOnlyLanding";
 import { MediaPanel } from "@/components/MediaPanel";
 import { PreviewPanel } from "@/components/PreviewPanel";
 import { MUSIC_SEL_ID, TimelineRuler } from "@/components/TimelineRuler";
@@ -139,6 +140,11 @@ function genId(): string {
 
 /** Default image hold duration (a "light" disclaimer — 2s). */
 const DISCLAIMER_DEFAULT_MS = 2000;
+
+/** v1.14.2: renderer build stamp — the desktop-only landing carries it so a
+ * browser visitor sees which build is live (in Electron, Header separately
+ * cross-checks it against the exe's app.getVersion()). */
+const BUILD_VERSION = "1.14.2";
 
 /** Effective lead-in duration of a disclaimer clip (ms, min 200). */
 function disclaimerDurationOf(d: DisclaimerClip | null): number {
@@ -456,6 +462,14 @@ export default function Page() {
   );
   const [lastExport, setLastExport] = useState<LastExport | null>(null);
   const [inElectron, setInElectron] = useState(false);
+  // v1.14.2 (user directive: "make this desktop app only, no browser"): a
+  // plain browser session renders the DesktopOnlyLanding page instead of
+  // the studio. envResolved gates the swap so the first paint never
+  // flashes the editor before the Electron check settles; studioPreview is
+  // the development bypass ("Open studio preview" on the landing, kept in
+  // sessionStorage) — exports still refuse to run outside the app.
+  const [envResolved, setEnvResolved] = useState(false);
+  const [studioPreview, setStudioPreview] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
 
   // ---- v1.2: keyboard shortcuts overlay (`?`) -----------------------------
@@ -1305,7 +1319,10 @@ export default function Page() {
       setLastExport({
         path: res.path,
         size: res.size,
-        method: inElectron ? "Native FFmpeg" : "MediaRecorder",
+        // v1.14.2: exports only ever run inside the Electron shell now (the
+        // browser MediaRecorder fallback was removed with the desktop-only
+        // directive) — there is no second method to label.
+        method: "Native FFmpeg",
         at: Date.now(),
         // v1.1 TURBO telemetry (desktop only — browser exports omit these).
         encoder: res.encoder,
@@ -1428,11 +1445,10 @@ export default function Page() {
         );
       }
       toast.success(`Exported ${fmtBytes(res.size)}`, {
-        description: inElectron
-          ? turboBits.length > 0
+        description:
+          turboBits.length > 0
             ? `${turboBits.join(" · ")}\n${res.path}`
-            : res.path
-          : "Saved to your downloads",
+            : res.path,
       });
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -1484,8 +1500,18 @@ export default function Page() {
 
   useEffect(() => {
     const electron = isElectron();
+    let preview = false;
+    try {
+      preview = sessionStorage.getItem("ff.studioPreview") === "1";
+    } catch {
+      /* storage unavailable — stay on the landing page */
+    }
     // Defer setState to avoid cascading renders
-    Promise.resolve().then(() => setInElectron(electron));
+    Promise.resolve().then(() => {
+      setInElectron(electron);
+      setStudioPreview(preview);
+      setEnvResolved(true);
+    });
     if (electron && window.electronAPI) {
       const api = window.electronAPI;
       const offExport = api.onMenu("menu:export", () => exportRef.current());
@@ -4261,6 +4287,26 @@ const handleRandomTransitionMix = useCallback(() => {
     activeSegment: activeSegment?.fileName ?? null,
     inElectron,
   };
+
+  // v1.14.2: DESKTOP-ONLY GATE — a browser session (no Electron shell, no
+  // dev preview bypass) shows the Windows-app landing page instead of the
+  // studio. Placed AFTER every hook so the component's hook order is stable
+  // whichever branch renders.
+  if (envResolved && !inElectron && !studioPreview) {
+    return (
+      <DesktopOnlyLanding
+        version={BUILD_VERSION}
+        onEnterPreview={() => {
+          try {
+            sessionStorage.setItem("ff.studioPreview", "1");
+          } catch {
+            /* storage unavailable — preview just won't persist this session */
+          }
+          setStudioPreview(true);
+        }}
+      />
+    );
+  }
 
   return (
     <div
