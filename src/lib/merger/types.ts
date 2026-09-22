@@ -352,13 +352,25 @@ export interface ExportResult {
    *  parallelism that did not run (a 1-process fallback shows as 1). */
   poolWorkers?: number;
   /** v1.12.1: the machine's CPU core count (the pool-width input) — lets
-   *  the UI flag a single-process run on a ≥4-core box. */
+   *  the UI flag a single-process run on a ≥4-core box. v1.14.1: this is
+   *  the LOGICAL thread count; cpuPhysicalCores/cpuLogicalCores carry the
+   *  measured topology. */
   cpus?: number;
+  /** v1.14.1: the measured topology — strong physical cores + logical
+   *  threads (e.g. "2 modules · 4 threads" on a dual-module AMD APU,
+   *  "4 cores · 8 threads (SMT)" on a modern laptop) + filterPool = the
+   *  widened process count that filter-dominated (image-heavy) exports
+   *  actually ran. */
+  cpuPhysicalCores?: number;
+  cpuLogicalCores?: number;
+  cpuTopology?: string;
+  filterPool?: boolean;
   /** v1.13: the Adaptive Hardware Matrix tier that ran this export —
-   *  "TIER_1_GPU" (ASIC encode), "TIER_2_MODERN_CPU" (≥6 cores) or
-   *  "TIER_3_CONSTRAINED_CPU" (≤4 cores / legacy dual-module APUs:
-   *  2 × 2-thread workers, ultrafast + no B-frames, low-cost subtitle
-   *  rasterization). */
+   *  "TIER_1_GPU" (ASIC encode), "TIER_2_MODERN_CPU" (≥4 strong physical
+   *  cores) or "TIER_3_CONSTRAINED_CPU" (≤3 strong cores / legacy
+   *  dual-module APUs: 2 × 2-thread encode workers, ultrafast + no
+   *  B-frames, low-cost subtitle rasterization; image-heavy exports widen
+   *  to min(4, logical) single-thread filter workers). */
   tier?: string;
   /** v1.13: human-readable tier label for the completion toast
    *  ("Tier 3 · constrained CPU"). */
@@ -815,13 +827,19 @@ declare global {
       /** v1.12.1: the REAL running-exe facts — app.getVersion() reads the
        *  rcedit-stamped version resource of the actual executable (stale
        *  installs disagree with the renderer's build constant) + the CPU
-       *  count that decides the parallel-pool width. */
+       *  topology that decides the parallel-pool width. v1.14.1: physical
+       *  cores AND logical threads (cpus stays the logical count for
+       *  compatibility — it was mislabeled "cores" on SMT machines). */
       appInfo: () => Promise<{
         version: string;
         electron?: string;
         node?: string;
         platform?: string;
         cpus?: number;
+        cpuPhysicalCores?: number;
+        cpuLogicalCores?: number;
+        cpuModel?: string;
+        cpuTopology?: string;
       }>;
       ffmpegStatus: () => Promise<{
         ok: boolean;
@@ -864,7 +882,11 @@ declare global {
         tierLabel?: string;
         workers?: number;
         threadsPerWorker?: number;
+        filterWorkers?: number;
         cpuCount?: number;
+        cpuLogical?: number;
+        cpuPhysical?: number;
+        cpuTopology?: string;
         cpuModel?: string;
         optimizeSubtitles?: boolean;
       }>;

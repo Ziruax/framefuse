@@ -1324,6 +1324,13 @@ export default function Page() {
         // process count (Task-Manager-check number) + the machine's cores.
         poolWorkers: res.poolWorkers,
         cpus: res.cpus,
+        // v1.14.1: the measured CPU topology (physical cores + threads) —
+        // the LastExport tooltip carries it so a field report states
+        // exactly what the engine saw.
+        cpuPhysicalCores: res.cpuPhysicalCores,
+        cpuLogicalCores: res.cpuLogicalCores,
+        cpuTopology: res.cpuTopology,
+        filterPool: res.filterPool,
         smartDirtyReason: res.smartDirtyReason,
         // v1.13: the adaptive tier + speed point (toast/chip telemetry).
         tier: res.tier,

@@ -1,0 +1,93 @@
+{
+  "box": "2× Intel(R) Xeon(R) Processor",
+  "leadMs": 3000,
+  "cases": {
+    "D1": {
+      "no": {
+        "ms": 1634,
+        "spawns": 16,
+        "mode": "two-step",
+        "copied": 6,
+        "encoded": 0,
+        "duration": 24,
+        "perSec": 0.068
+      },
+      "with": {
+        "ms": 1772,
+        "spawns": 9,
+        "mode": "smart-render",
+        "copied": 6,
+        "encoded": 1,
+        "parallelChunks": 1,
+        "duration": 27,
+        "perSec": 0.066
+      },
+      "perSecDelta": -2.9
+    },
+    "D2": {
+      "no": {
+        "ms": 7310,
+        "spawns": 4,
+        "mode": "parallel-pass",
+        "copied": 0,
+        "encoded": 2,
+        "parallelChunks": 2,
+        "duration": 40,
+        "perSec": 0.183
+      },
+      "with": {
+        "ms": 7945,
+        "spawns": 4,
+        "mode": "parallel-pass",
+        "copied": 0,
+        "encoded": 2,
+        "parallelChunks": 2,
+        "duration": 43,
+        "perSec": 0.185
+      },
+      "perSecDelta": 1.1
+    },
+    "D3": {
+      "no": {
+        "ms": 3339,
+        "spawns": 4,
+        "mode": "parallel-pass",
+        "copied": 0,
+        "encoded": 2,
+        "parallelChunks": 2,
+        "duration": 40,
+        "perSec": 0.083
+      },
+      "with": {
+        "ms": 3677,
+        "spawns": 4,
+        "mode": "parallel-pass",
+        "copied": 0,
+        "encoded": 2,
+        "parallelChunks": 2,
+        "duration": 43,
+        "perSec": 0.086
+      },
+      "perSecDelta": 3.6
+    },
+    "D1_8core": {
+      "no": {
+        "ms": 1238,
+        "spawns": 13,
+        "mode": "two-step",
+        "copied": 6,
+        "encoded": 0,
+        "duration": 24
+      },
+      "with": {
+        "ms": 1323,
+        "spawns": 9,
+        "mode": "smart-render",
+        "copied": 6,
+        "encoded": 1,
+        "parallelChunks": 1,
+        "duration": 27
+      }
+    }
+  }
+}

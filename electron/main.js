@@ -19,7 +19,7 @@ const {
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
-const { spawn } = require("child_process");
+const { spawn, execFile } = require("child_process");
 
 // v5.0: pure FFmpeg graph/arg builders (CommonJS, zero requires — also
 // imported directly by /home/z/harness/export-graph-harness.js). Holds the
@@ -175,13 +175,24 @@ ipcMain.handle("is-electron", () => true);
 // install is stale/hybrid and the UI flags it. Also carries the CPU count
 // (the fact that decides the parallel-pool width) for the Export-tab
 // diagnostics strip.
-ipcMain.handle("app-info", () => ({
-  version: app.getVersion(),
-  electron: process.versions.electron,
-  node: process.versions.node,
-  platform: process.platform,
-  cpus: os.cpus().length,
-}));
+ipcMain.handle("app-info", async () => {
+  // v1.14.1: the ACCURATE CPU topology — physical cores AND logical
+  // threads (os.cpus().length alone counts SMT threads, so a 4C/8T box
+  // reported "8 CPU cores" — the user-side "detection is not accurate"
+  // report). `cpus` stays the logical count for v1.12.1 compatibility.
+  const topo = await detectCpuTopology();
+  return {
+    version: app.getVersion(),
+    electron: process.versions.electron,
+    node: process.versions.node,
+    platform: process.platform,
+    cpus: topo.logical,
+    cpuPhysicalCores: topo.effectivePhysical,
+    cpuLogicalCores: topo.logical,
+    cpuModel: topo.model,
+    cpuTopology: topo.note,
+  };
+});
 
 // Diagnostics — lets the renderer verify ffmpeg is reachable (v5.1: async —
 // the old execSync blocked the main process up to 10 s on slow disks).
@@ -239,7 +250,11 @@ ipcMain.handle("export-info", async () => {
     tierLabel: prof.tierLabel,
     workers: prof.workers,
     threadsPerWorker: prof.threadsPerWorker,
+    filterWorkers: prof.filterWorkers,
     cpuCount: prof.cpuCount,
+    cpuLogical: prof.cpuLogical,
+    cpuPhysical: prof.cpuPhysical,
+    cpuTopology: prof.cpuTopology,
     cpuModel: prof.cpuModel,
     optimizeSubtitles: prof.optimizeSubtitles,
   };
@@ -1564,10 +1579,122 @@ async function detectGpuEncoderAsync() {
 // ---------------------------------------------------------------------------
 let hardwareProfileCache = null;
 
-/** Pure tier resolver — the user-specified decision tree. Tier 1 is only
- * reached when the FPS-gated encoder probe above verified a REAL working
- * ASIC (listed ≠ working; a crawling encoder is worse than none). */
-function resolveHardwareProfile(gpuCapabilities, cpuCount, cpuModel) {
+// ---------------------------------------------------------------------------
+// v1.14.1 ACCURATE CPU TOPOLOGY (user directive: "cpu cores detecting is
+// not accurate"). os.cpus().length counts SMT THREADS — a 4C/8T machine
+// reported "8 CPU cores" (the v1.13 tier gate AND the About strip consumed
+// that inflated number). This resolver measures the REAL shape:
+//   • logical          — os.cpus().length (threads; what the OS schedules)
+//   • physical         — Windows: wmic NumberOfCores (fast) with a
+//                        PowerShell CIM fallback (wmic is gone on 24H2+);
+//                        both summed across sockets. Other platforms or
+//                        tool failure: an SMT heuristic.
+//   • effectivePhysical — the STRONG-core count the tier gate consumes.
+//                        AMD module-era chips (A4/A6/A8/A10/A12-xxxx APUs,
+//                        FX-, E-series — the A8-5550M class) expose 2
+//                        int-cores per module sharing 1 FPU + 1 L2, so
+//                        Windows' "4 cores" is 2 strong modules → logical/2.
+// The UI shows BOTH numbers ("2 cores · 4 threads") so it can be verified
+// against Task Manager → Performance → CPU.
+// ---------------------------------------------------------------------------
+let cpuTopologyCache = null;
+let cpuTopologyDetecting = null;
+
+function cpuTopologyNote(topo) {
+  if (topo.amdModule) {
+    const per = topo.logical / topo.effectivePhysical;
+    return `${topo.effectivePhysical} module${topo.effectivePhysical > 1 ? "s" : ""} · ${topo.logical} threads (AMD CMT: ${per} int-cores/module, shared FPU/L2)`;
+  }
+  if (topo.logical > topo.physical) return `${topo.physical} cores · ${topo.logical} threads (SMT)`;
+  return `${topo.physical} cores · ${topo.logical} threads`;
+}
+
+async function detectCpuTopology() {
+  if (cpuTopologyCache) return cpuTopologyCache;
+  if (cpuTopologyDetecting) return cpuTopologyDetecting;
+  cpuTopologyDetecting = (async () => {
+    const cpus = os.cpus() || [];
+    const logical = Math.max(1, cpus.length);
+    const model = (cpus[0] && cpus[0].model) || "unknown";
+    let physical = 0;
+    let source = "os";
+    if (process.platform === "win32") {
+      try {
+        const out = await new Promise((resolve, reject) => {
+          execFile(
+            "wmic",
+            ["cpu", "get", "NumberOfCores,NumberOfLogicalProcessors", "/format:csv"],
+            { timeout: 12000 },
+            (err, stdout) => (err ? reject(err) : resolve(String(stdout || ""))),
+          );
+        });
+        let cores = 0;
+        for (const line of out.split(/\r?\n/)) {
+          const cells = line.split(",").map((s) => s.trim());
+          if (cells.length >= 3 && /^\d+$/.test(cells[cells.length - 2]) && /^\d+$/.test(cells[cells.length - 1])) {
+            cores += parseInt(cells[cells.length - 2], 10);
+          }
+        }
+        if (cores > 0) { physical = cores; source = "wmic"; }
+      } catch (_) { /* try CIM below */ }
+      if (!(physical > 0)) {
+        try {
+          const out = await new Promise((resolve, reject) => {
+            execFile(
+              "powershell",
+              ["-NoProfile", "-Command", "(Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum"],
+              { timeout: 20000 },
+              (err, stdout) => (err ? reject(err) : resolve(String(stdout || ""))),
+            );
+          });
+          const cores = parseInt(out.trim(), 10);
+          if (cores > 0) { physical = cores; source = "cim"; }
+        } catch (_) { /* heuristic below */ }
+      }
+    }
+    // AMD module-era (Piledriver/Trinity/Richland APUs + FX) — NOT Ryzen
+    // (Ryzen cores are real, SMT optional, and wmic already told the truth).
+    const amdModule =
+      /amd/i.test(model) &&
+      !/ryzen|threadripper|epyc/i.test(model) &&
+      (/\bA[468]-\d{4}[A-Z]?\b/.test(model) ||
+        /\bA1[02]-\d{4}[A-Z]?\b/.test(model) ||
+        /\bE[12]-\d{3,4}\b/.test(model) ||
+        /\bFX-?\d{2,4}\b/.test(model) ||
+        /\bAPU\b/.test(model));
+    if (!(physical > 0)) {
+      // Heuristic fallback when the OS tools are unavailable.
+      if (amdModule) physical = Math.max(1, Math.round(logical / 2));
+      else if (/intel/i.test(model) && logical >= 4 && logical % 2 === 0 && /(i[3-9]|Xeon|Core)/i.test(model)) physical = logical / 2;
+      else physical = logical;
+      source = "heuristic";
+    }
+    const effectivePhysical = amdModule ? Math.max(1, Math.round(logical / 2)) : Math.max(1, physical);
+    const topo = { logical, physical: Math.max(1, physical), effectivePhysical, amdModule, model, source };
+    topo.note = cpuTopologyNote(topo);
+    console.log(`[Hardware] CPU topology: ${topo.note} · ${model} (${source})`);
+    cpuTopologyCache = topo;
+    return topo;
+  })();
+  return cpuTopologyDetecting;
+}
+// Warm the detection at startup (~100-300 ms, once per app launch) so the
+// first app-info / export-info / export call never waits on it.
+detectCpuTopology().catch(() => {});
+
+/** Pure tier resolver. Tier 1 is only reached when the FPS-gated encoder
+ * probe above verified a REAL working ASIC (listed ≠ working; a crawling
+ * encoder is worse than none).
+ *
+ * v1.14.1: the tier gate consumes STRONG physical cores (topology-aware),
+ * not SMT-thread-inflated logical counts:
+ *   • Tier 2 = ≥4 strong cores (covers 4C/4T and 4C/8T desktop/laptop
+ *     CPUs the old "≥6 logical" gate mis-filed into Tier 3).
+ *   • Tier 3 = ≤3 strong cores, INCLUDING the AMD module-era APUs
+ *     (effectivePhysical halves their int-core count). */
+function resolveHardwareProfile(gpuCapabilities, topo) {
+  const logical = Math.max(1, topo.logical);
+  const strongCores = Math.max(1, topo.effectivePhysical);
   let profile;
   if (gpuCapabilities.hasNvenc) {
     profile = { tier: "TIER_1_GPU", tierLabel: "Tier 1 · GPU hardware encode", encoder: "h264_nvenc", workers: 2, threadsSpec: 6, optimizeSubtitles: false };
@@ -1575,28 +1702,41 @@ function resolveHardwareProfile(gpuCapabilities, cpuCount, cpuModel) {
     profile = { tier: "TIER_1_GPU", tierLabel: "Tier 1 · GPU hardware encode", encoder: "h264_qsv", workers: 2, threadsSpec: 6, optimizeSubtitles: false };
   } else if (gpuCapabilities.hasAmf) {
     profile = { tier: "TIER_1_GPU", tierLabel: "Tier 1 · GPU hardware encode", encoder: "h264_amf", workers: 2, threadsSpec: 6, optimizeSubtitles: false };
-  } else if (cpuCount >= 6) {
-    profile = { tier: "TIER_2_MODERN_CPU", tierLabel: "Tier 2 · modern multicore CPU", encoder: "libx264", workers: Math.max(2, Math.min(4, Math.floor(cpuCount / 2))), threadsSpec: 2, optimizeSubtitles: false };
+  } else if (strongCores >= 4) {
+    profile = { tier: "TIER_2_MODERN_CPU", tierLabel: "Tier 2 · modern multicore CPU", encoder: "libx264", workers: Math.max(2, Math.min(4, Math.floor(strongCores / 2))), threadsSpec: 2, optimizeSubtitles: false };
   } else {
     profile = { tier: "TIER_3_CONSTRAINED_CPU", tierLabel: "Tier 3 · constrained CPU", encoder: "libx264", workers: 2, threadsSpec: 2, optimizeSubtitles: true };
   }
-  profile.cpuCount = cpuCount;
-  profile.cpuModel = cpuModel;
+  profile.cpuCount = logical; // v1.12.1 telemetry field: logical processors
+  profile.cpuLogical = logical;
+  profile.cpuPhysical = strongCores; // module-aware strong cores
+  profile.cpuModel = topo.model;
+  profile.cpuTopology = topo.note;
   // threadsPerWorker: the tier spec, clamped so workers × threads never
-  // exceeds the logical core count (a 2-core Tier-3 box → 1 thread each).
-  profile.threadsPerWorker = Math.max(1, Math.min(profile.threadsSpec, Math.floor(cpuCount / profile.workers) || 1));
+  // exceeds the logical thread count (a 2-core Tier-3 box → 1 thread each).
+  profile.threadsPerWorker = Math.max(1, Math.min(profile.threadsSpec, Math.floor(logical / profile.workers) || 1));
+  // v1.14.1 (user directive: "export speed significantly reduced"): the
+  // FILTER-pool width — PROCESS parallelism for filter-dominated
+  // timelines. Every ffmpeg's zoompan/scale/libass chain is single-threaded
+  // PER PROCESS, so process count — not x264 threads — is what fills the
+  // machine when filters dominate (image/Ken Burns storyboards). Tier 3
+  // widens to min(4, logical): the 4-thread dual-module APUs get the
+  // v1.12.1 shape back for exactly this workload (v1.13's 2×2 windows
+  // halved their filter throughput). Tier 1/2 keep the encode shape
+  // (Tier 2 already runs 3-4 workers; its x264 threading is the win).
+  profile.filterWorkers = profile.tier === "TIER_3_CONSTRAINED_CPU"
+    ? Math.max(profile.workers, Math.min(4, logical))
+    : profile.workers;
   return profile;
 }
 
 /** Async wrapper — derives the GPU caps from the (cached, force-aware)
- * encoder probe, caches the profile per encoder+cpuCount, and logs the
- * selection once per resolution. */
+ * encoder probe + the measured CPU topology, caches the profile per
+ * encoder+topology, and logs the selection once per resolution. */
 async function getHardwareProfile() {
   const enc = await detectGpuEncoderAsync();
-  const cpus = os.cpus() || [];
-  const cpuCount = cpus.length || 1;
-  const cpuModel = (cpus[0] && cpus[0].model) || "unknown";
-  const key = `${enc.name}|${cpuCount}`;
+  const topo = await detectCpuTopology();
+  const key = `${enc.name}|${topo.logical}|${topo.effectivePhysical}`;
   if (hardwareProfileCache && hardwareProfileCache.key === key) {
     return hardwareProfileCache.profile;
   }
@@ -1605,9 +1745,13 @@ async function getHardwareProfile() {
     hasQsv: enc.name === "h264_qsv",
     hasAmf: enc.name === "h264_amf",
   };
-  const profile = resolveHardwareProfile(gpuCapabilities, cpuCount, cpuModel);
+  const profile = resolveHardwareProfile(gpuCapabilities, topo);
   hardwareProfileCache = { key, profile };
-  console.log(`[Hardware] ${profile.tier} — ${profile.encoder} · ${profile.workers} workers × ${profile.threadsPerWorker} thread(s) · ${cpuCount} core(s) · ${cpuModel}`);
+  console.log(
+    `[Hardware] ${profile.tier} — ${profile.encoder} · ${profile.workers} workers × ${profile.threadsPerWorker} thread(s)` +
+      `${profile.filterWorkers !== profile.workers ? ` (image-heavy exports widen to ${profile.filterWorkers}×1)` : ""}` +
+      ` · ${profile.cpuTopology} · ${profile.cpuModel}`,
+  );
   return profile;
 }
 
@@ -3014,7 +3158,12 @@ ipcMain.handle("export-native", async (event, opts) => {
         progress: Math.max(0, Math.min(100, percent)),
         fps: 0,
         eta: etaSec,
-        timemark: timemarkSec != null ? assFmtTime(timemarkSec).replace(".", ",") : undefined,
+        // v1.14.1 (user directive: "NaN:NaN in the frontend"): the timemark
+        // is sent as a plain parseable "H:MM:SS.cc" string — the old
+        // `.replace(".", ",")` ASS-style comma decimal made the renderer's
+        // parseTimemark produce NaN and the chip render "@ NaN:NaN" on
+        // EVERY export since v1.2.
+        timemark: timemarkSec != null ? assFmtTime(timemarkSec) : undefined,
       });
     }
   }
@@ -3107,13 +3256,16 @@ ipcMain.handle("export-native", async (event, opts) => {
     let cumulativeMs = 0;
     // v1.13 (user directive — Adaptive Hardware Matrix): the flat ≤4-core
     // lowEnd flag is GONE. Every export resolves a 3-tier hardware profile
-    // (Tier 1 = a probe-verified GPU ASIC encoder · Tier 2 = ≥6 modern
-    // cores · Tier 3 = constrained/legacy CPUs, e.g. dual-module APUs)
-    // that decides the worker × thread shape, the x264 speed point, and
-    // whether libass gets the low-cost subtitle treatment.
-    const cpuCount = os.cpus().length;
+    // (Tier 1 = a probe-verified GPU ASIC encoder · Tier 2 = ≥4 strong
+    // physical cores · Tier 3 = constrained/legacy CPUs, e.g. dual-module
+    // APUs) that decides the worker × thread shape, the x264 speed point,
+    // and whether libass gets the low-cost subtitle treatment.
     const hwProfile = await getHardwareProfile();
-    console.log(`[Export] Selected ${hwProfile.tier} (${encoder.name}) with ${hwProfile.workers} workers`);
+    // v1.14.1: logical threads from the MEASURED topology (one source of
+    // truth; identical to os.cpus().length but topology-aware consumers
+    // stay consistent).
+    const cpuCount = hwProfile.cpuLogical;
+    console.log(`[Export] Selected ${hwProfile.tier} (${encoder.name}) · ${hwProfile.cpuTopology} · encode pool ${hwProfile.workers}×${hwProfile.threadsPerWorker}${hwProfile.filterWorkers !== hwProfile.workers ? ` · filter pool ${hwProfile.filterWorkers}×1` : ""}`);
     const encArgs = encoderArgs(encoder.name, bitrateMbps, width, height, quality, crf, hwProfile.tier);
     // v1.13: the compact speed-point descriptor for the completion toast
     // ("Tier 3 · constrained CPU · ultrafast").
@@ -3144,13 +3296,19 @@ ipcMain.handle("export-native", async (event, opts) => {
     // overhead). The thread-budget division below is unchanged — a single
     // job still gets every core.
     const isGpuEncoder = encoder.name !== "libx264";
-    // v1.13 (Adaptive Hardware Matrix): the fallback pool width is the
-    // TIER's worker count — the v1.12/v1.12.1 strict-4 recipe is now a
-    // Tier-2-only shape. Tier 3 (the 4-core dual-module APUs that strict-4
-    // was thrashing) runs 2 workers; Tier 1 keeps the GPU pool at 2 (the
-    // ASIC serializes encode sessions, but two decode/filter pipelines
-    // overlap nicely; the v6 3-worker fight was one too many).
-    const poolN = hwProfile.workers;
+    // v1.14.1 (user directive: "export speed significantly reduced"): the
+    // FILTER-DOMINATED pool. Every ffmpeg's zoompan/scale/libass chain is
+    // single-threaded PER PROCESS, so process count — not x264 threads —
+    // is what fills the machine when the timeline is image/Ken Burns/
+    // caption-heavy. ≥half non-video segments → the pool widens to the
+    // profile's filterWorkers (Tier 3: min(4, logical) — the 4-thread
+    // dual-module APUs get their v1.12.1 shape back for exactly this
+    // workload; v1.13's 2×2 windows halved filter throughput there).
+    // Video-dominated timelines keep the v1.13 tier shape (x264 threads
+    // are the win on long encodes).
+    const nonVideoSegs = segments.reduce((n, s) => n + (s && s.mediaType !== "video" ? 1 : 0), 0);
+    const filterDominant = segments.length > 0 && nonVideoSegs >= Math.ceil(segments.length / 2);
+    const poolN = filterDominant ? hwProfile.filterWorkers : hwProfile.workers;
     // v1.4.2 CHUNKED PARALLEL ENCODE: long re-encode clips split into
     // frame-aligned ~60 s chunks (capped at the pool width — more chunks
     // than workers only adds seek overhead, fewer wastes the pool). This is
@@ -3901,9 +4059,13 @@ ipcMain.handle("export-native", async (event, opts) => {
           workerCount: spWorkers,
           // v1.10 (Task 3): the equal-window parallel budget + the clean-
           // coverage ratio that triggers it (<30 % copied → mostly dirty).
-          // v1.13: the tier worker count (2 on constrained CPUs — enough
-          // windows to fill both physical modules without FPU thrash).
-          parallelWorkers: hwProfile.workers,
+          // v1.14.1: the window budget rides the FILTER pool — parallel-pass
+          // timelines are by definition mostly-dirty (image/Ken Burns/
+          // caption-heavy), and their windowed graphs are single-threaded
+          // PER PROCESS, so Tier 3 widens to min(4, logical) processes (the
+          // v1.12.1 shape the dual-module APUs need HERE); Tier 2 keeps its
+          // worker shape (3-4 × 2 threads).
+          parallelWorkers: hwProfile.filterWorkers,
           equalWindowRatio: 0.3,
         });
         if (!plan) {
@@ -3917,13 +4079,20 @@ ipcMain.handle("export-native", async (event, opts) => {
         // 1 thread existed to keep 4 workers inside 4 cores' caches; with
         // tier-sized worker counts, 2 threads per worker is the recipe).
         // Smart path keeps the v7 division + the Tier-3 caps.
+        // v1.14.1: when the parallel-pass window count WIDENED past the
+        // tier's worker count (Tier 3 filter pools), each window takes a
+        // single-thread encoder — W × 1 fills every logical core with
+        // filter work where W/2 × 2 could not. Unwidened pools (Tier 2)
+        // keep the tier's threadsPerWorker.
         let poolWidth;
         let threadsPer;
         let filterThreadsPer;
         if (plan.parallelMode) {
           poolWidth = Math.max(1, plan.workerCount);
-          threadsPer = hwProfile.threadsPerWorker;
-          filterThreadsPer = hwProfile.threadsPerWorker;
+          threadsPer = poolWidth > hwProfile.workers
+            ? Math.max(1, Math.min(hwProfile.threadsPerWorker, Math.floor(cpuCount / poolWidth) || 1))
+            : hwProfile.threadsPerWorker;
+          filterThreadsPer = threadsPer;
         } else {
           poolWidth = Math.max(1, spWorkers);
           threadsPer = Math.max(1, Math.round(cpuCount / poolWidth));
@@ -4291,6 +4460,12 @@ ipcMain.handle("export-native", async (event, opts) => {
           // toast/chip can never claim parallelism that did not run.
           poolWorkers: poolWidth,
           cpus: cpuCount,
+          // v1.14.1: the accurate topology (physical cores + threads) so a
+          // field report states exactly what the engine saw.
+          cpuPhysicalCores: hwProfile.cpuPhysical,
+          cpuLogicalCores: hwProfile.cpuLogical,
+          cpuTopology: hwProfile.cpuTopology,
+          filterPool: !!plan.parallelMode && poolWidth > hwProfile.workers,
           // v1.13: the adaptive tier that ran this export + the speed point
           // it chose (toast: "Tier 3 · constrained CPU · ultrafast").
           tier: hwProfile.tier,
@@ -4521,6 +4696,11 @@ ipcMain.handle("export-native", async (event, opts) => {
       // v1.12.1: the ACTUAL pool width (see the smart-path payload above).
       poolWorkers: poolN,
       cpus: cpuCount,
+      // v1.14.1: the accurate topology (see the smart-path payload).
+      cpuPhysicalCores: hwProfile.cpuPhysical,
+      cpuLogicalCores: hwProfile.cpuLogical,
+      cpuTopology: hwProfile.cpuTopology,
+      filterPool: filterDominant && poolN > hwProfile.workers,
       // v1.13: the adaptive tier + speed point (see the smart payload).
       tier: hwProfile.tier,
       tierLabel: hwProfile.tierLabel,

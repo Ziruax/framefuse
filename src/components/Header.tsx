@@ -24,7 +24,7 @@ import { cn } from "@/lib/utils";
 /** v1.12.1: the renderer's build constant — compared against the REAL exe
  *  version (app.getVersion()) so a stale/hybrid install is impossible to
  *  miss. Keep in sync with package.json on every release. */
-const BUILD_VERSION = "1.14.0";
+const BUILD_VERSION = "1.14.1";
 
 export interface LastExport {
   path: string;
@@ -56,6 +56,13 @@ export interface LastExport {
    *  stage (the Task-Manager-check number) + the machine's core count. */
   poolWorkers?: number;
   cpus?: number;
+  /** v1.14.1: the measured CPU topology — physical cores + logical threads
+   *  ("4 cores · 8 threads (SMT)" / "2 modules · 4 threads") and whether
+   *  this export widened the pool for filter-dominated (image-heavy) work. */
+  cpuPhysicalCores?: number;
+  cpuLogicalCores?: number;
+  cpuTopology?: string;
+  filterPool?: boolean;
   /** v1.13: the adaptive hardware tier + speed point that ran the export
    *  ("Tier 3 · constrained CPU" / "ultrafast"). */
   tier?: string;
@@ -107,15 +114,25 @@ function fmtElapsed(sec: number): string {
   return `${h}h ${String(m % 60).padStart(2, "0")}m`;
 }
 
-/** Parse an ffmpeg timemark "HH:MM:SS.xx" into milliseconds. */
+/** Parse an ffmpeg timemark "H:MM:SS.cc" into milliseconds.
+ * v1.14.1 (user directive: "NaN:NaN in the frontend"): the v1.2-v1.14.0
+ * payloads carried ASS-style comma decimals ("0:00:04,16") — Number() on
+ * the comma produced NaN and the progress chip rendered "@ NaN:NaN" on
+ * EVERY export. Old-format strings are normalized (comma → dot) and any
+ * unparseable input collapses to 0 so a timecode can never render NaN. */
 function parseTimemark(tm: string): number {
-  const parts = tm.split(":").map(Number);
+  const parts = String(tm)
+    .replace(",", ".")
+    .split(":")
+    .map(Number);
+  if (parts.length === 0 || parts.some((n) => !Number.isFinite(n))) return 0;
   let h = 0,
     m = 0,
     s = 0;
   if (parts.length === 3) [h, m, s] = parts;
   else if (parts.length === 2) [m, s] = parts;
   else if (parts.length === 1) [s] = parts;
+  else return 0;
   return ((h * 60 + m) * 60 + s) * 1000;
 }
 
@@ -448,6 +465,10 @@ export function Header({
                   lastExport.encoder ? ` · ${lastExport.encoder}` : ""
                 }${
                   lastExport.tierLabel ? ` · ${lastExport.tierLabel}` : ""
+                }${
+                  lastExport.cpuTopology ? ` · ${lastExport.cpuTopology}` : ""
+                }${
+                  lastExport.filterPool ? " · widened filter pool (image-heavy timeline)" : ""
                 }${
                   lastExport.totalChunks && lastExport.totalChunks > 1
                     ? ` · ${lastExport.totalChunks} chunks across ${

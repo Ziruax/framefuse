@@ -1,6 +1,6 @@
 {
   "name": "framefuse",
-  "version": "1.14.0",
+  "version": "1.14.1",
   "private": true,
   "description": "FrameFuse v1 — Multi-track video studio: video clips, green/white/black screen chroma key with on-canvas PiP, overlay lane, background music with volume/loop, synthesized SFX, native Whisper captions (model bundled with the installer), True Smart Rendering FFmpeg export (clean ranges stream-copied, dirty windows re-encoded in parallel with hardware decode), native project files.",
   "main": "electron/main.js",
@@ -118,7 +118,9 @@
       "shortcutName": "FrameFuse",
       "perMachine": false,
       "uninstallDisplayName": "FrameFuse v1",
-      "deleteAppDataOnUninstall": false
+      "deleteAppDataOnUninstall": false,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico"
     },
     "npmRebuild": false
   }

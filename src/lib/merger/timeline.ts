@@ -585,7 +585,10 @@ export function overlaySegmentsAt(
 
 /** Format milliseconds as MM:SS or HH:MM:SS. */
 export function fmtTimecode(ms: number): string {
-  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  // v1.14.1: never render "NaN:NaN" — a non-finite input (a malformed
+  // timemark, a missing duration) collapses to 00:00 instead.
+  const safeMs = Number.isFinite(ms) ? ms : 0;
+  const totalSec = Math.max(0, Math.floor(safeMs / 1000));
   const h = Math.floor(totalSec / 3600);
   const m = Math.floor((totalSec % 3600) / 60);
   const s = totalSec % 60;

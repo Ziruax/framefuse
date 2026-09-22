@@ -498,7 +498,11 @@ export function SettingsPanel(props: SettingsPanelProps) {
     tierLabel?: string;
     workers?: number;
     threadsPerWorker?: number;
+    filterWorkers?: number;
     cpuCount?: number;
+    cpuLogical?: number;
+    cpuPhysical?: number;
+    cpuTopology?: string;
     cpuModel?: string;
     optimizeSubtitles?: boolean;
   } | null>(null);
@@ -563,6 +567,10 @@ export function SettingsPanel(props: SettingsPanelProps) {
     node?: string;
     platform?: string;
     cpus?: number;
+    cpuPhysicalCores?: number;
+    cpuLogicalCores?: number;
+    cpuModel?: string;
+    cpuTopology?: string;
   } | null>(null);
   useEffect(() => {
     if (!inElectron) return;
@@ -1024,11 +1032,19 @@ export function SettingsPanel(props: SettingsPanelProps) {
                     backgroundColor: "rgba(8, 51, 68, 0.25)",
                     color: "#67e8f9",
                   }}
-                  title={`Adaptive Hardware Matrix: ${exportInfo.tier} — exports run ${exportInfo.workers} ffmpeg worker(s) × ${exportInfo.threadsPerWorker} thread(s) each${exportInfo.optimizeSubtitles ? " · subtitle blur stripped (low-cost rasterization)" : ""}.${exportInfo.cpuModel ? ` CPU: ${exportInfo.cpuModel}` : ""}`}
+                  title={`Adaptive Hardware Matrix: ${exportInfo.tier} — encode pool ${exportInfo.workers ?? "?"} ffmpeg worker(s) × ${exportInfo.threadsPerWorker ?? "?"} thread(s) each${(exportInfo.filterWorkers ?? 0) > (exportInfo.workers ?? 0) ? `, image-heavy exports widen to ${exportInfo.filterWorkers}×1 filter workers` : ""}${exportInfo.optimizeSubtitles ? " · subtitle blur stripped (low-cost rasterization)" : ""}.${exportInfo.cpuTopology ? ` CPU: ${exportInfo.cpuTopology}` : ""}${exportInfo.cpuModel ? ` (${exportInfo.cpuModel})` : ""}`}
                 >
                   <Gauge size={11} aria-hidden />
                   {exportInfo.tierLabel} · {exportInfo.workers}×
                   {exportInfo.threadsPerWorker} threads
+                  {(exportInfo.filterWorkers ?? 0) > (exportInfo.workers ?? 0) && (
+                      <span
+                        title="Image/Ken Burns-heavy exports split across MORE single-thread processes — each ffmpeg's filter chain (zoompan/scale/captions) is single-threaded, so process count fills the machine"
+                      >
+                        · image pools {exportInfo.filterWorkers}×
+                        {Math.max(1, Math.floor((exportInfo.cpuLogical ?? exportInfo.cpuCount ?? exportInfo.filterWorkers ?? 1) / (exportInfo.filterWorkers ?? 1)))}t
+                      </span>
+                    )}
                 </span>
               )}
               {/* v1.13: Tier-3 machines get the 720p draft recommendation —
@@ -1422,14 +1438,14 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 (appInfo.platform ? ` · ${appInfo.platform}` : "")
               }
             >
-              {appInfo.version !== "1.14.0" ? (
+              {appInfo.version !== "1.14.1" ? (
                 <span
                   className="flex items-center gap-1 rounded px-1.5 py-0.5 font-bold"
                   style={{ backgroundColor: "rgba(245, 158, 11, 0.14)", color: "#fbbf24" }}
-                  title={`This install reports v${appInfo.version} — the current build is v1.14.0. Reinstall FrameFuse v1.14.0 (an old cached executable is running).`}
+                  title={`This install reports v${appInfo.version} — the current build is v1.14.1. Reinstall FrameFuse v1.14.1 (an old cached executable is running).`}
                 >
                   <TriangleAlert size={11} aria-hidden />
-                  App v{appInfo.version} — update to v1.14.0
+                  App v{appInfo.version} — update to v1.14.1
                 </span>
               ) : (
                 <span
@@ -1440,20 +1456,28 @@ export function SettingsPanel(props: SettingsPanelProps) {
                   App v{appInfo.version}
                 </span>
               )}
-              {appInfo.cpus != null && appInfo.cpus > 0 && (
+              {(appInfo.cpuPhysicalCores ?? appInfo.cpus) != null &&
+                (appInfo.cpuPhysicalCores ?? appInfo.cpus)! > 0 && (
                 <span
                   title={
-                    exportInfo?.tierLabel
-                      ? `${exportInfo.tierLabel} — exports run ${exportInfo.workers} ffmpeg worker(s) × ${exportInfo.threadsPerWorker} thread(s) each (check Task Manager → Details during an export)`
-                      : appInfo.cpus >= 6
-                        ? "≥6 cores: Tier 2 — exports run min(4, cores/2) 2-thread ffmpeg workers (check Task Manager → Details during an export)"
-                        : "≤4 cores: Tier 3 — exports run 2 × 2-thread ffmpeg workers (the dual-module-friendly shape; check Task Manager → Details during an export)"
+                    (appInfo.cpuTopology || `CPU: ${appInfo.cpuModel || "unknown"}`) +
+                    (exportInfo?.tierLabel
+                      ? ` — encode pool ${exportInfo.workers ?? "?"} ffmpeg worker(s) × ${exportInfo.threadsPerWorker ?? "?"} thread(s)${(exportInfo.filterWorkers ?? 0) > (exportInfo.workers ?? 0) ? `, image-heavy exports widen to ${exportInfo.filterWorkers}×1` : ""} (check Task Manager → Details during an export)`
+                      : " — exports size their worker pool from this topology")
                   }
                 >
-                  {appInfo.cpus} CPU cores ·{" "}
+                  {/* v1.14.1: BOTH numbers, accurately labeled — the old strip
+                      printed the SMT thread count as "CPU cores" (a 4C/8T
+                      machine showed "8 CPU cores"). */}
+                  {appInfo.cpuPhysicalCores != null
+                    ? `${appInfo.cpuPhysicalCores} core${appInfo.cpuPhysicalCores === 1 ? "" : "s"} · ${appInfo.cpuLogicalCores ?? appInfo.cpus} thread${(appInfo.cpuLogicalCores ?? appInfo.cpus) === 1 ? "" : "s"}`
+                    : `${appInfo.cpus} CPU cores`}{" "}
+                  ·{" "}
                   {exportInfo?.workers
-                    ? `${exportInfo.workers}×${exportInfo.threadsPerWorker}-thread ffmpeg workers`
-                    : `${appInfo.cpus >= 6 ? Math.min(4, Math.floor(appInfo.cpus / 2)) : 2}× ffmpeg workers`}
+                    ? (exportInfo.filterWorkers ?? 0) > (exportInfo.workers ?? 0)
+                      ? `${exportInfo.workers}×${exportInfo.threadsPerWorker}-thread encode · ${exportInfo.filterWorkers}×1 image pools`
+                      : `${exportInfo.workers}×${exportInfo.threadsPerWorker}-thread ffmpeg workers`
+                    : `${(appInfo.cpuPhysicalCores ?? appInfo.cpus)! >= 4 ? Math.min(4, Math.max(2, Math.floor((appInfo.cpuPhysicalCores ?? appInfo.cpus)! / 2))) : 2}× ffmpeg workers`}
                 </span>
               )}
               {appInfo.electron && <span>Electron {appInfo.electron}</span>}
