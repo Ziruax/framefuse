@@ -4822,6 +4822,25 @@ app.whenReady().then(() => {
   // v5.1: warm the GPU-encoder probe at startup so the FIRST export starts
   // encoding immediately instead of paying the detection latency up front.
   detectGpuEncoderAsync();
+  // v1.14.3 ICON FIX (field report: "icon blank on desktop/shortcut after
+  // install; the installer showed it fine"): the installed exe keeps its
+  // path across upgrades, so the Windows shell icon cache can keep the
+  // STALE pre-v1.14.1 near-blank entry instead of re-extracting. The
+  // installer now notifies the shell (build/installer.nsh), and THIS
+  // covers users who upgrade in place (auto-update / overwrite install):
+  // on the first launch of each new version, best-effort rebuild the
+  // per-user icon caches (ie4uinit -show; Windows 10/11, harmless no-op
+  // elsewhere). One marker file per version in userData.
+  try {
+    const iconFixMarker = path.join(app.getPath("userData"), "icon-cache-refreshed-v" + app.getVersion());
+    if (!fs.existsSync(iconFixMarker)) {
+      fs.writeFileSync(iconFixMarker, String(Date.now()), "utf8");
+      if (process.platform === "win32") {
+        const sysDir = process.env.SystemRoot ? path.join(process.env.SystemRoot, "System32") : "C:\\Windows\\System32";
+        spawn(path.join(sysDir, "ie4uinit.exe"), ["-show"], { detached: true, stdio: "ignore" }).unref();
+      }
+    }
+  } catch (_) { /* best-effort — never block startup */ }
   app.on("activate", () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 

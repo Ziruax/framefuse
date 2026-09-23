@@ -331,7 +331,7 @@ console.log("2) W=1 byte-differential vs git HEAD (regression guard)");
     const videoIdx = new Set(
       (segs || []).map((s, i) => (s && s.mediaType === "video" && s.videoPath ? i : -1)).filter((i) => i >= 0),
     );
-    return script.split(";").map((stmt) => {
+    let s = script.split(";").map((stmt) => {
       if (stmt.includes("setpts=PTS-STARTPTS")) return stmt;
       const m = /^\[(\d+):v\](.*)\[s(\d+)\]$/.exec(stmt);
       if (m && Number(m[1]) === Number(m[3]) && videoIdx.has(Number(m[1])) && !stmt.includes("zoompan")) {
@@ -339,6 +339,28 @@ console.log("2) W=1 byte-differential vs git HEAD (regression guard)");
       }
       return stmt;
     }).join(";");
+    // v1.14.3 INTENTIONAL layering change (same spirit as the setpts
+    // normalizer): burned captions moved ABOVE the global fades — the
+    // two adjacent trailing statements swap order. Rewrite HEAD's
+    // pre-v1.14.3 script into the new order so the differential still
+    // catches every OTHER drift. IDEMPOTENT — a HEAD that already ships
+    // the new order is untouched.
+    //   HEAD:  [X]subtitles=…[vsub];[vsub]fade…[vout]
+    //   NEW:   [X]fade…[vout];[vout]subtitles=…[vsub]
+    s = s.replace(
+      /;\[([^\]]+)\](subtitles=[^;]+?)\[vsub\];\[vsub\]([^;]*?)\[vout\]/g,
+      ";[$1]$3[vout];[vout]$2[vsub]",
+    );
+    return s;
+  };
+
+  /** v1.14.3: when the swap above fired, HEAD's plan ends on [vout] while
+   *  the new code ends on [vsub] (captions last). The videoOutLabel + the
+   *  args' -map label must follow the same rewrite. */
+  const normalizeHeadPlan = (plan, segs) => {
+    const script = normalizeHeadScript(plan.script, segs);
+    const swapped = script !== plan.script;
+    return { ...plan, script, videoOutLabel: swapped ? "[vsub]" : plan.videoOutLabel };
   };
 
   const fixBase = {
@@ -391,9 +413,10 @@ console.log("2) W=1 byte-differential vs git HEAD (regression guard)");
       o.audio = { normalize: false };
       o.segments = [{ id: "a", mediaType: "video", videoPath: "/tmp/v1.mp4", durationMs: 12800, trimInMs: 0, startMs: 0 }];
     }
-    const a = HSP.buildSinglePassPlan(o);
+    const aRaw = HSP.buildSinglePassPlan(o);
+    const a = normalizeHeadPlan(aRaw, o.segments);
     const b = SP.buildSinglePassPlan(o);
-    const aScript = normalizeHeadScript(a.script, o.segments);
+    const aScript = a.script;
     const samePlan = JSON.stringify([a.inputs, aScript, a.hasAudioOut, a.videoOutLabel]) ===
       JSON.stringify([b.inputs, b.script, b.hasAudioOut, b.videoOutLabel]);
     const aArgs = HSP.buildSinglePassArgs({ plan: a, scriptPath: "/tmp/g.txt", encArgs: ["-c:v", "libx264"], abr: "192k", fps: 30, outputPath: "/tmp/out.mp4", threads: 0, filterThreads: 4 });

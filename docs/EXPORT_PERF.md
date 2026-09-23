@@ -604,3 +604,54 @@ Windows desktop application; a browser session renders a landing page
 (installer download, requirements, feature grid) and the studio UI is a
 development preview only. Exports outside the Electron shell throw a
 typed desktop-only error. One engine, one honest performance story.
+
+---
+
+## v1.14.3 — the caption layering contract (dip transitions no longer cover burned captions)
+
+**Field report**: "the overlap is on top in video whereas captions have to be on top; overlap is for images."
+
+**Root cause** (reproduced as T8 in `scripts/verify-overlay-caption-order.js`): image↔image
+boundaries take xfade heads whose graph burns captions AFTER the blend — captions sat on top
+there. VIDEO boundaries can only ever take dip fades (the v5.0 rule: xfade needs both inputs
+as full-frame streams), and the graph applied the dip fades AFTER the caption burn — so every
+dip-to-black/white at a video boundary darkened and then covered the burned caption text.
+Same asymmetry in the preview (`applyGlobalFade` after `drawCaption`). The user's phrasing
+maps exactly: the overlap renders above captions in video; image "overlaps" (dissolves)
+keep captions on top.
+
+**Fix (the layering contract)**: burned captions + headlines are now the TOPMOST content
+layer — dips/bookend fades apply BEFORE the subtitle burn, so caption text stays fully
+readable through a transition (broadcast convention: subtitles persist through dips):
+
+- `electron/export-graph.js` — `post` = `[...postFades, assSuffix]` (complex graphs) and
+  the two plain `-vf` paths push fades before the suffix.
+- `electron/export-singlepass.js` — the windowed/full graph swaps the fades block before
+  the `subtitles=` block (`[X]fade…[vout];[vout]subtitles=…[vsub]`).
+- `src/components/PreviewPanel.tsx` — `applyGlobalFade` now runs BEFORE the headline +
+  caption draws (exact parity with the export graph).
+- `scripts/verify-timeline-chunks.js` — the W=1 byte-differential gained an IDEMPOTENT
+  normalizer for the intentional two-statement swap (same pattern as the v6.5 setpts
+  normalizer), so it still catches every OTHER drift: 35/35.
+
+**Verification**:
+- `scripts/verify-overlay-caption-order.js` 9/9 (NEW harness, real export-native handler +
+  real ffmpeg + pixel classification): T0 control, T1/T2 image/video overlay on a video base,
+  T3/T4/T5 parallel-pass image storyboards, T6 dissolve + boundary-spanning cue, T7 the full
+  user shape (6 images + video overlay + Ken Burns + dissolve), **T8 two videos + dip-black
+  800ms + boundary-spanning cue — pre-fix FAIL (fade covered the caption), post-fix PASS
+  (caption at full white floating over the 50%-dipped frame)**.
+- Preview parity (agent-browser, live canvas pixel probe): at the dip boundary the frame is
+  98.77% black and the caption renders 0.989% full-white pixels ON TOP — the export twin.
+- Regression: tier-pools 16/16, eta-payload 10/10, timeline-chunks 35/35, chunked-encode
+  36/36, singlepass-capabilities pass; kenburns drift 1.36px and kf-trims crash are
+  pre-existing on HEAD (verified by stash-diff) — environment artifacts, not regressions.
+
+**Icon fix (second field report)**: "the icon showed during installation but is blank on
+desktop and shortcut after install." The exe carries the full 7-entry icon group (verified),
+and each downloaded SETUP exe is a new file path so the installer always shows fresh — the
+INSTALLED exe keeps its path across upgrades and the Windows shell icon cache can keep the
+stale pre-v1.14.1 near-blank entry. v1.14.3 refreshes the cache from both sides:
+`build/installer.nsh` (customInstall: SHChangeNotify ASSOCCHANGED + ie4uinit -show, same on
+uninstall) and a first-launch-per-version best-effort `ie4uinit -show` from main.js for
+upgrade-in-place users.

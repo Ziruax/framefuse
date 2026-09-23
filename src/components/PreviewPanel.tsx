@@ -965,11 +965,13 @@ export function PreviewPanel({
     [],
   );
 
-  // Redraw whenever the playhead or inputs change. v5.0 draw order mirrors
-  // the FFmpeg export graph exactly: BASE → overlay lane (track asc) →
-  // watermark → headlines/captions (subtitles) → global fades. Video frames
-  // are painted from the hidden <video> elements — they may lag one frame
-  // behind the playhead (async decode), which is the accepted trade-off.
+  // Redraw whenever the playhead or inputs change. v5.0/v1.14.3 draw order
+  // mirrors the FFmpeg export graph exactly: BASE → overlay lane (track asc)
+  // → watermark → global fades → headlines/captions (subtitles, TOPMOST —
+  // v1.14.3: caption text stays fully readable through dip transitions).
+  // Video frames are painted from the hidden <video> elements — they may lag
+  // one frame behind the playhead (async decode), which is the accepted
+  // trade-off.
   // v5.2: the base VIDEO draw honors the Fit/Fill preview mode (contain =
   // letterbox; export stays cover), and the overlay lane renders the live
   // drag/override transform so on-canvas manipulation is immediate.
@@ -1214,6 +1216,21 @@ export function PreviewPanel({
       drawWatermark(ctx, watermarkImage, dims.w, dims.h, watermarkSettings);
     }
 
+    // v4.3 → v1.14.3: global fades BEFORE the caption/headline draw — the
+    // LAYERING CONTRACT twin of the export graph (fades → subtitles). A
+    // dip-to-black at a VIDEO boundary must not darken burned caption text:
+    // captions are the TOPMOST content layer and stay fully readable through
+    // the transition (broadcast convention; image↔image dissolves already
+    // rendered captions above the blend — the asymmetry was the reported bug).
+    if (seg && scratchRef.current) {
+      const segIdx = Math.max(0, segments.findIndex((s) => s.id === seg.id));
+      applyGlobalFade(
+        ctx,
+        scratchRef.current,
+        computeGlobalFade(segments, segIdx, currentMs, transition),
+      );
+    }
+
     // Headline overlay (v4.2) — under captions so center captions sit on top.
     if (headlineItems && headlineItems.length > 0) {
       drawHeadline(ctx, headlineItems, currentMs, dims.w, dims.h);
@@ -1239,17 +1256,6 @@ export function PreviewPanel({
         };
         drawCaption(ctx, cue.text, capCtx, dims.w, dims.h);
       }
-    }
-
-    // v4.3: global fades AFTER captions — mirrors fade-after-subtitles
-    // in the FFmpeg export (start/end fades + dip tails).
-    if (seg && scratchRef.current) {
-      const segIdx = Math.max(0, segments.findIndex((s) => s.id === seg.id));
-      applyGlobalFade(
-        ctx,
-        scratchRef.current,
-        computeGlobalFade(segments, segIdx, currentMs, transition),
-      );
     }
   }, [
     currentMs,

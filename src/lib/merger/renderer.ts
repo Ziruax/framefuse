@@ -519,9 +519,11 @@ export function computeTransitionFx(
 }
 
 /**
- * Global fade (applied AFTER captions, matching fade-after-subtitles in the
- * export): start fade-in on clip 0, end fade-out on the last clip, dip tails.
- * Returns the frame opacity (1 = untouched) + dip color for tail dips.
+ * Global fade (v1.14.3: applied BEFORE the caption draw — captions are the
+ * topmost layer and stay fully readable through dips; mirrors the export's
+ * fades-then-subtitles graph order): start fade-in on clip 0, end fade-out
+ * on the last clip, dip tails. Returns the frame opacity (1 = untouched) +
+ * dip color for tail dips.
  */
 export function computeGlobalFade(
   segments: MediaSegment[],

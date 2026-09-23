@@ -1411,8 +1411,16 @@ function buildClipArgs(ctx) {
   const wmOverlay = (baseLabel, outLabel) =>
     `${baseLabel}[wmx]overlay=${wm.x}:${wm.y}:eof_action=repeat${outLabel}`;
 
-  // v4.4: post-graph chain = [watermark overlay →] subtitles → fades.
-  const post = [assSuffix, ...postFades].filter(Boolean).join(",");
+  // v4.4 → v1.14.3: post-graph chain = [watermark overlay →] FADES → captions.
+  // THE LAYERING CONTRACT (user-reported, T8-reproduced): burned captions and
+  // headlines are the TOPMOST content layer — they render ABOVE dip/bookend
+  // fades so subtitle text stays fully readable through a dip-to-black
+  // (broadcast convention: captions persist through transitions). Image↔image
+  // xfade heads already burned captions on top of the blend; video boundaries
+  // could only ever take dips, and a fade applied after the burn used to
+  // darken the caption with the frame — "the overlap is on top in video,
+  // whereas captions have to be on top; overlap is for images".
+  const post = [...postFades, assSuffix].filter(Boolean).join(",");
 
   // v5.0 VIDEO RULE mirror: an xfade-family head is a hard cut when EITHER
   // side of the boundary is a VIDEO segment (renderer.transitionHeadMs
@@ -1572,9 +1580,11 @@ function buildClipArgs(ctx) {
       };
     }
     // Plain video path — mirrors the v4.9 single-input -vf layout.
+    // v1.14.3 layering contract: fades BEFORE the caption burn (captions
+    // topmost — same order as the complex-graph `post`).
     const vfParts = [videoChain];
-    if (assSuffix) vfParts.push(assSuffix);
     vfParts.push(...postFades);
+    if (assSuffix) vfParts.push(assSuffix);
     const args = [
       ...globals,
       ...inputs,
@@ -1662,8 +1672,9 @@ function buildClipArgs(ctx) {
   const imgInputOpts = staticImg
     ? ["-loop", "1", "-framerate", String(fps), "-i", seg.imagePath]
     : ["-loop", "1", "-i", seg.imagePath];
-  if (assSuffix) vfParts.push(assSuffix);
+  // v1.14.3 layering contract: fades BEFORE the caption burn (captions topmost).
   vfParts.push(...postFades);
+  if (assSuffix) vfParts.push(assSuffix);
   if (anyAudio) {
     return {
       args: [

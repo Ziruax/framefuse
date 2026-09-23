@@ -2,8 +2,9 @@
 //
 // ONE ffmpeg process renders the WHOLE timeline: every base segment input is
 // decoded once, composited through one filter graph (per-segment chains →
-// concat filter → overlays → watermark → ONE libass captions burn → global
-// fades), and encoded ONCE. The graph is written to a temp file and passed
+// concat filter → overlays → watermark → global fades → ONE libass captions
+// burn — v1.14.3 layering: captions/headlines are the TOPMOST layer, above
+// the fades, so dip transitions never cover subtitle text), and encoded ONCE. The graph is written to a temp file and passed
 // via `-filter_complex_script`, which removes the Windows CLI-length limit
 // that originally forced the two-step (per-clip encode → concat demuxer)
 // design: no N temp clip writes, no N encoder inits, no double aac pass, and
@@ -21,9 +22,10 @@
 //   - Overlays: overlayGeometryMirror + chroma/despill + motion-path
 //     expressions reused VERBATIM with GLOBAL-timeline windows (a/b in
 //     global seconds; tOffsetSec = −ovStart/1000 shifts the motion clock).
-//   - Fades: dip/bookend fades are applied AFTER the captions burn (the
-//     preview's applyGlobalFade order) as `fade=…:enable='between(t,a,b)'`
-//     windows on the global stream — verified black only inside the window.
+//   - Fades: dip/bookend fades are applied BEFORE the captions burn (the
+//     v1.14.3 layering contract — captions/headlines are the TOPMOST layer)
+//     as `fade=…:enable='between(t,a,b)'` windows on the global stream —
+//     verified black only inside the window AND captions readable through it.
 //   - Audio: the same buildAudioMixGraph (per-branch measured loudnorm →
 //     volume → adelay → aformat → amix normalize=0 → master volume →
 //     [estimated master loudnorm] → limiter → apad) with atempo riding the
@@ -1684,10 +1686,13 @@ function buildSinglePassPlan(o) {
     acc = "[vw]";
     idx += 1;
   }
-  if (assSuffix) {
-    graph.push(`${acc}${assSuffix}[vsub]`);
-    acc = "[vsub]";
-  }
+  // v1.14.3 LAYERING CONTRACT: fades BEFORE the captions burn — burned
+  // captions/headlines are the TOPMOST content layer (dip/bookend fades no
+  // longer darken subtitle text; the broadcast convention). The v4.3 order
+  // (captions → fades) made a dip-to-black at a VIDEO boundary cover the
+  // burned caption — the user-reported "the overlap is on top in video,
+  // whereas captions has to be on top; overlap is for images" (image↔image
+  // dissolves already burned captions on top of the blend, T6).
   // v6.5 windowed: fades arrive as the FULL-timeline strings and shift into
   // the chunk window (planner zones guarantee whole-fade containment).
   const fades = win
@@ -1696,6 +1701,10 @@ function buildSinglePassPlan(o) {
   if (fades.length > 0) {
     graph.push(`${acc}${fades.join(",")}[vout]`);
     acc = "[vout]";
+  }
+  if (assSuffix) {
+    graph.push(`${acc}${assSuffix}[vsub]`);
+    acc = "[vsub]";
   }
   const videoOutLabel = acc;
 
