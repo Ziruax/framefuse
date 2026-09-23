@@ -629,6 +629,10 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
       // v4.5 encode-quality profile ("social" keeps v4.4 behavior).
       quality: settings.quality || "social",
       crf: typeof settings.crf === "number" ? settings.crf : 20,
+      // v1.14.4: constrained-CPU fast mode (default ON — the main process
+      // only ever downscales on Tier-3 machines with mostly-dirty ≥4-min
+      // timelines, and the result payload says it happened).
+      fastMode: settings.constrainedFastMode !== false,
       // v1.2: export audio bitrate (192 default = v1.1 behavior).
       audioKbps: settings.audioKbps ?? 192,
       kenBurns,

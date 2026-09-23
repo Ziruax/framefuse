@@ -24,7 +24,7 @@ import { cn } from "@/lib/utils";
 /** v1.12.1: the renderer's build constant — compared against the REAL exe
  *  version (app.getVersion()) so a stale/hybrid install is impossible to
  *  miss. Keep in sync with package.json on every release. */
-const BUILD_VERSION = "1.14.3";
+const BUILD_VERSION = "1.14.4";
 
 export interface LastExport {
   path: string;
@@ -68,6 +68,13 @@ export interface LastExport {
   tier?: string;
   tierLabel?: string;
   enginePreset?: string;
+  /** v1.14.4: the constrained-CPU fast resolution ran (rendered at the
+   *  720p-class resolution of the requested aspect on a Tier-3 machine). */
+  fastMode?: boolean;
+  fastModeFrom?: string;
+  fastModeTo?: string;
+  outputWidth?: number;
+  outputHeight?: number;
 }
 
 interface HeaderProps {

@@ -1299,6 +1299,35 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 }
               />
             </Field>
+            {/* v1.14.4: the constrained-CPU fast-mode off switch (default ON).
+                Only ever engages on Tier-3 machines (≤3 strong cores /
+                legacy dual-module APUs) with a mostly-dirty ≥4-min timeline
+                requested at 1080p-class — renders the 720p-class resolution
+                of the SAME aspect for ~2.2× less encode work. The completion
+                toast always says it ran. */}
+            <Field
+              label="Constrained-CPU fast mode"
+              hint={settings.constrainedFastMode === false ? "Off" : "On (default)"}
+            >
+              <Segmented
+                options={[
+                  { value: "on", label: "On" },
+                  { value: "off", label: "Off" },
+                ]}
+                value={settings.constrainedFastMode === false ? "off" : "on"}
+                onChange={(v) =>
+                  onSettingsChange({
+                    ...settings,
+                    constrainedFastMode: v === "off" ? false : undefined,
+                  })
+                }
+              />
+              <p className="mt-0.5 text-[9px]" style={{ color: "#52525b" }}>
+                On older/slow CPUs, long 1080p exports with captions or images
+                render at 720p-class instead (~2× faster). The toast always
+                says when it happened.
+              </p>
+            </Field>
             <Field label="Frame rate">
               <Segmented
                 options={[

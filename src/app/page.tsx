@@ -144,7 +144,7 @@ const DISCLAIMER_DEFAULT_MS = 2000;
 /** v1.14.2: renderer build stamp — the desktop-only landing carries it so a
  * browser visitor sees which build is live (in Electron, Header separately
  * cross-checks it against the exe's app.getVersion()). */
-const BUILD_VERSION = "1.14.3";
+const BUILD_VERSION = "1.14.4";
 
 /** Effective lead-in duration of a disclaimer clip (ms, min 200). */
 function disclaimerDurationOf(d: DisclaimerClip | null): number {
@@ -1353,6 +1353,13 @@ export default function Page() {
         tier: res.tier,
         tierLabel: res.tierLabel,
         enginePreset: res.enginePreset,
+        // v1.14.4: the constrained-CPU fast resolution telemetry (toast +
+        // LastExport tooltip).
+        fastMode: res.fastMode,
+        fastModeFrom: res.fastModeFrom,
+        fastModeTo: res.fastModeTo,
+        outputWidth: res.outputWidth,
+        outputHeight: res.outputHeight,
       });
       // v1.1 TURBO: the success toast carries the performance story —
       // export time + encoder + stream-copy count — so a fast export is
@@ -1373,6 +1380,15 @@ export default function Page() {
       if (res.tierLabel) {
         turboBits.push(
           `${res.tierLabel}${res.enginePreset ? ` · ${res.enginePreset}` : ""}`,
+        );
+      }
+      // v1.14.4: the constrained-CPU fast resolution — NEVER silent. The
+      // user asked for 1080p and got 720p-class for ~2.2× the speed on a
+      // constrained machine; the toast says exactly that (and where to
+      // turn it off).
+      if (res.fastMode && res.fastModeFrom && res.fastModeTo) {
+        turboBits.push(
+          `fast mode: rendered ${res.fastModeTo} instead of ${res.fastModeFrom} (constrained CPU · ~2× faster — disable in Export settings)`,
         );
       }
       // v9: the smart-render story — "15.4 min stream-copied · 3.2 min

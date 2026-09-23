@@ -285,6 +285,13 @@ export interface VideoSettings {
    *  back to 192 (the v1.1 behavior) so old project files stay byte-compatible.
    *  Drives the desktop FFmpeg -b:a and hints the browser MediaRecorder. */
   audioKbps?: 96 | 128 | 192 | 256 | 320;
+  /** v1.14.4: constrained-CPU fast mode (default ON). On Tier-3 machines
+   *  (≤3 strong cores / legacy dual-module APUs) a mostly-dirty timeline ≥4
+   *  minutes requested at 1080p-class resolution renders at the 720p-class
+   *  resolution of the SAME aspect instead — ~2.2× fewer pixels to
+   *  encode. The completion toast always says it happened; false keeps the
+   *  requested resolution whatever the hardware. */
+  constrainedFastMode?: boolean;
 }
 
 /** Result of parsing a single filename. */
@@ -405,6 +412,15 @@ export interface ExportResult {
   /** v1.5: W — the number of parallel single-pass windows (parallel-pass
    *  only; aliases totalChunks for that mode). */
   parallelChunks?: number;
+  /** v1.14.4: the constrained-CPU fast resolution ran — the export rendered
+   *  at the 720p-class resolution of the requested aspect (fastModeFrom →
+   *  fastModeTo) on a Tier-3 machine with a mostly-dirty ≥4-min timeline.
+   *  Never silent: the completion toast + Export tab surface it. */
+  fastMode?: boolean;
+  fastModeFrom?: string;
+  fastModeTo?: string;
+  outputWidth?: number;
+  outputHeight?: number;
 }
 
 export interface CaptionSettings {

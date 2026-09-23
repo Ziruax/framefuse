@@ -655,3 +655,75 @@ stale pre-v1.14.1 near-blank entry. v1.14.3 refreshes the cache from both sides:
 `build/installer.nsh` (customInstall: SHChangeNotify ASSOCCHANGED + ie4uinit -show, same on
 uninstall) and a first-launch-per-version best-effort `ie4uinit -show` from main.js for
 upgrade-in-place users.
+
+---
+
+## v1.14.4 — the field report: "after version 12 and 13 export speed became terrible"
+
+### What v1.12/v1.13 actually cost (all four confirmed in code + measured)
+
+1. **The d3d11va decode-gate relaxation (v1.12) — the named regression.**
+   v1.12 replaced "ride hardware decode only when ≥1.3× FASTER" with "ride
+   it unless ≥1.5× SLOWER". Decode is a pipeline stage: on old iGPU driver
+   stacks a 10–50 %-slower d3d11va arm drags EVERY re-encode worker — the
+   "frees CPU cycles" theory only holds when the ASIC decode is real and
+   fast. The sandbox demonstrated the pathology literally: a source measured
+   `cpu 38ms vs hw 48ms (1.26× slower)` — the v1.12 gate RODE that; v1.14.4
+   gates on `gpuMs ≤ cpuMs × 1.05` (pure `hwDecodeGate()`, harness-unit
+   verified) and stays on CPU. The WARP (≥1.5× slower) log line is kept for
+   field diagnosis.
+2. **Per-source probe tax, re-paid after every app restart.** Each ≥20 s
+   video source cost 2 × 72-frame decode arms before the first frame
+   encoded, and the verdict lived in a session-only Map. Now 48 frames/arm
+   (−33 %) and the verdict persists to the probe-cache disk file
+   (path|mtime|size, 24 h TTL, synchronous flush) — measured 68 ms → 1 ms
+   on a fresh session, zero re-probe spawns.
+3. **Serial source-fact gathering.** The smart pipeline probed every segment
+   one-by-one (ffprobe + keyframe window scan + trim alignment — 0.3–1 s
+   per spawn on HDD-class machines → 20–60 s of "preparing" on a 20-clip
+   timeline). Now 4-wide bounded-parallel (`mapBoundedConcurrent`, order
+   preserved; probe caches are promise-level so same-key callers coalesce).
+4. **The v1.14.1 filter-pool widening missed smart-mode.** Image-heavy
+   timelines with 30–70 % clean coverage ran the Tier-3 2×2 pool while the
+   same machine got 4×1 the moment coverage dropped below 30 % — and
+   4 workers × 2 filter threads oversubscribed 4 logical cores 2×. The
+   smart pool now widens identically (`smartWidened` → single-thread
+   recipe), verified on the A8 mask: smart-render, 4 workers, `-threads 1`,
+   3 clean copies.
+
+### The honest fix for the wall itself: constrained-CPU fast resolution
+
+Beyond the regressions, physics remains: a 1080p full-dirty re-encode on a
+Piledriver-class APU runs ≈1× realtime at ultrafast — no thread topology
+changes that. v1.14.4 makes the Draft-profile escape hatch AUTOMATIC and
+LOUD: Tier 3 + mostly-dirty (parallel-pass) timeline ≥4 min + 1080p-class
+request + non-cinema quality → render at the 720p-class resolution of the
+SAME aspect (short edge 720: 1280×720 / 720×1280 / 720×720 / 720×900 —
+2.07 M → 0.92 M pixels, ~2.25× less encode+filter work). The watermark
+geometry scales with it; ASS/graph/overlay geometry derive from the
+re-assigned dims; the two-step fallback keeps the requested resolution
+(its jobs snapshot the pre-decision dims). NEVER silent: the result
+payload carries `fastMode`/`fastModeFrom`/`fastModeTo`, the completion
+toast reads "fast mode: rendered 1280x720 instead of 1920x1080
+(constrained CPU · ~2× faster — disable in Export settings)", and the
+Export tab gains a "Constrained-CPU fast mode" on/off switch (default on,
+absent field = on for old payloads).
+
+**A/B bench** (this genuinely Tier-3 2-core sandbox, 240 s image storyboard
++ burned captions + music, 1080p request): 7.1 s vs 8.8 s wall = 1.24× —
+compressed because the 3 fps bench fixture makes the concurrent audio bus
+the critical path; per-frame encode work is 2.25× lower, so real 30 fps
+field timelines (video-dominated) approach the pixel ratio. Output
+verified 1280×720, 240.00 s, captions visible at the downscaled dims.
+
+### Verification (`scripts/verify-export-speed.js`, 35/35)
+
+S1 gate unit tree (incl. the 1.4×-slower case the v1.12 gate rode) ·
+S2 mapBoundedConcurrent (order + bounded) · S3 disk persistence round-trip
+(fresh session = same verdict, zero probe spawns) · S4 the A/B bench
+(payload, real output dims, duration, caption pixels, measured speedup) ·
+S5 the gate matrix (1 ms below the 240 s gate, off-switch, cinema, portrait
+720×1280, square 720×720, 720p request untouched) · S6 the A8-mask
+smart-mode widening. Regressions: tier-pools 16/16, eta-payload 10/10,
+timeline-chunks 35/35, chunked-encode 36/36 (which now also documents the
+1.26×-slower-hw gate case live), overlay-caption-order 9/9.

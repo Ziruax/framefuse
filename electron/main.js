@@ -1761,41 +1761,86 @@ async function getHardwareProfile() {
 // v1.1 shipped hw decode UNCONDITIONALLY OFF (-hwaccel auto could silently
 // land on a WARP/broken-driver path decoding 1080p at ~1 fps). But CPU
 // decode of 4K/H.265 sources is a real bottleneck on the re-encode path —
-// so instead of a blanket flag, we MEASURE: decode 72 real frames of
-// the ACTUAL file twice (CPU vs -hwaccel <TOKEN>). Cached per path; any
+// so instead of a blanket flag, we MEASURE: decode 48 real frames of
+// the ACTUAL file twice (CPU vs -hwaccel <TOKEN>). Cached per path
+// (memory + the v1.14.4 disk verdict, 24 h TTL); any
 // error → never a failed export.
 //
 // v1.12 (user directive) — TRI-STATE verdict, d3d11va-first with a
 // graceful `-hwaccel auto` fallback:
-//   • d3d11va arm runs clean (exit 0) and is not catastrophically slower
-//     (< 1.5× the CPU arm) → ride the explicit token. The old "must be
-//     ≥ 1.3× FASTER" gate is GONE: in the 4-worker × 1-thread parallel
-//     pool, moving decode onto the iGPU's dedicated ASIC frees ~35 % of
-//     the CPU cycles for libx264 + libass EVEN WHEN raw decode
-//     throughput is merely equal (the per-frame system-memory download
-//     hides in the encode wait) — the throughput gate measured the wrong
-//     thing for a saturated quad.
+//   • d3d11va arm runs clean (exit 0) and is NOT SLOWER than the CPU arm
+//     (≤ +5 %) → ride the explicit token. v1.14.4 (field report: "after
+//     v12 and v13 export speed became terrible"): v1.12's relaxed "ride
+//     unless ≥ 1.5× slower" gate let a 10–50 %-slower d3d11va path drag
+//     every worker on exactly the constrained iGPUs it claimed to help —
+//     the "frees CPU cycles" theory only holds when the ASIC decode is
+//     real and fast; on old driver stacks the per-frame system-memory
+//     download IS the bottleneck. Ride hardware decode only when it
+//     measured not-slower.
 //   • d3d11va arm FAILS to run (non-zero exit — broken driver / missing
 //     D3D11) → fall back to `-hwaccel auto`: ffmpeg walks the remaining
 //     hwaccel methods and lands on software decode internally if none
 //     initialize. The export never depends on the hwaccel engaging.
-//   • d3d11va runs but ≥ 1.5× SLOWER than CPU (the WARP pathology — a
-//     software D3D11 adapter as the default device) → stay on pure CPU
-//     decode; "auto" would select the same broken path again.
+//   • d3d11va runs but slower than CPU → stay on pure CPU decode; the
+//     ≥ 1.5× case (the WARP pathology — a software D3D11 adapter as the
+//     default device) keeps its distinct log line because "auto" would
+//     select the same broken path again.
 // ---------------------------------------------------------------------------
 const hwDecodeCache = new Map();
 
-async function probeHwDecode(path) {
-  if (hwDecodeCache.has(path)) return hwDecodeCache.get(path);
+/** v1.14.4: the pure gate over the two measured arms. Kept separate (and
+ * exported) so the harness can unit-verify the policy WITHOUT spawning
+ * ffmpeg. Returns true (ride the token) / false (CPU) — the "auto" verdict
+ * is decided by the caller (init-failure arm, no timing to compare).
+ *
+ * THE v1.12 REGRESSION THIS REVERTS: "ride d3d11va unless it is ≥ 1.5×
+ * SLOWER" let a 10–50 %-slower hardware-decode path (old iGPU drivers,
+ * system-memory download on bandwidth-starved APUs) ride EVERY re-encode
+ * worker input — decode is a pipeline stage, so a slower arm drags the
+ * whole worker. v1.10/1.11 required hw decode to be ≥ 1.3× FASTER; v1.14.4
+ * rides it only when it measured NOT slower (≤ +5 % — measurement noise
+ * margin). The WARP pathology (≥ 1.5× slower) keeps its distinct log line
+ * so field reports stay diagnosable. */
+function hwDecodeGate(cpuMs, gpuMs) {
+  if (!(cpuMs > 0) || !(gpuMs > 0)) return false;
+  if (gpuMs <= cpuMs * 1.05) return true; // hw arm not slower → ride it
+  return false; // 1.05×–∞ slower → CPU decode
+}
+
+async function probeHwDecode(p) {
+  if (hwDecodeCache.has(p)) return hwDecodeCache.get(p);
+  // v1.14.4: DISK-persisted verdict (path|mtime|size, 24 h TTL) — the
+  // in-memory Map was session-only, so every app restart re-paid the two
+  // probe arms (2 × 72-frame 1080p decodes, 4–12 s per ≥20 s source on the
+  // constrained CPUs this probe gates) before the first frame encoded.
+  let diskKey = null;
+  try {
+    const st = fs.statSync(p);
+    diskKey = `${p}|${Math.round(st.mtimeMs)}|${st.size}`;
+    loadProbeDisk();
+    const hw = probeDisk.hwDecode || {};
+    const e = hw[diskKey];
+    if (
+      e &&
+      Date.now() - e.t < PROBE_TTL_MS &&
+      (e.verdict === true || e.verdict === false || e.verdict === "auto")
+    ) {
+      hwDecodeCache.set(p, e.verdict);
+      return e.verdict;
+    }
+  } catch (_) { /* no stat / unreadable disk cache — probe anyway */ }
   // Tri-state: true → the explicit platform token (d3d11va on Windows);
   // "auto" → d3d11va init-failed, graceful auto fallback; false → CPU.
   let verdict = false;
   try {
-    const FRAMES = 72;
+    // v1.14.4: 72 → 48 frames — 33 % cheaper probe with the same verdict
+    // stability (the gate now compares medians of multi-second runs, not
+    // noise; WARP is ≥ 1.5× off and survives any frame count).
+    const FRAMES = 48;
     const arm = (hw) => [
       "-hide_banner", "-loglevel", "error",
       ...(hw ? ["-hwaccel", G.HWACCEL_TOKEN] : []),
-      "-i", path,
+      "-i", p,
       "-map", "0:v:0",
       "-frames:v", String(FRAMES),
       "-f", "null", "-",
@@ -1809,20 +1854,34 @@ async function probeHwDecode(path) {
       if (gpu.code !== 0) {
         // D3D11VA init failed on this machine — the graceful auto fallback.
         verdict = "auto";
-        console.log(`hw-decode probe ${path}: d3d11va init FAILED → -hwaccel auto fallback`);
+        console.log(`hw-decode probe ${p}: d3d11va init FAILED → -hwaccel auto fallback`);
       } else {
         const gpuMs = Math.max(1, Date.now() - t1);
-        if (gpuMs < cpuMs * 1.5) {
+        if (hwDecodeGate(cpuMs, gpuMs)) {
           verdict = true;
-          console.log(`hw-decode probe ${path}: cpu ${cpuMs}ms vs hw ${gpuMs}ms → ENABLED (not ≥1.5× slower)`);
+          console.log(`hw-decode probe ${p}: cpu ${cpuMs}ms vs hw ${gpuMs}ms → ENABLED (hw not slower)`);
+        } else if (gpuMs >= cpuMs * 1.5) {
+          verdict = false;
+          console.log(`hw-decode probe ${p}: cpu ${cpuMs}ms vs hw ${gpuMs}ms → cpu (≥1.5× slower — WARP-like path, auto would pick it again)`);
         } else {
           verdict = false;
-          console.log(`hw-decode probe ${path}: cpu ${cpuMs}ms vs hw ${gpuMs}ms → cpu (≥1.5× slower — WARP-like path, auto would pick it again)`);
+          console.log(`hw-decode probe ${p}: cpu ${cpuMs}ms vs hw ${gpuMs}ms → cpu (hw ${(gpuMs / cpuMs).toFixed(2)}× slower — v1.14.4 gate: ride hw only when not slower)`);
         }
       }
     }
   } catch (_) { verdict = false; }
-  hwDecodeCache.set(path, verdict);
+  hwDecodeCache.set(p, verdict);
+  if (diskKey) {
+    try {
+      if (!probeDisk.hwDecode) probeDisk.hwDecode = {};
+      probeDisk.hwDecode[diskKey] = { t: Date.now(), verdict };
+      // Synchronous flush (not the 2 s debounced probeDisk save): hw-decode
+      // verdicts are rare (≤1 per ≥20 s source, 24 h TTL) and the sync write
+      // guarantees the verdict survives even a process that exits within the
+      // debounce window — the whole point of the disk cache.
+      fs.writeFileSync(probeDiskPath(), JSON.stringify(probeDisk));
+    } catch (_) { /* best-effort persistence */ }
+  }
   return verdict;
 }
 
@@ -2399,6 +2458,33 @@ function probeVideoTimescale(p) {
 // and kills all siblings; cancellation surfaces as the v4.9
 // "Export cancelled" error verbatim.
 // ---------------------------------------------------------------------------
+
+/** v1.14.4: bounded-concurrency ordered map. The pre-encode source-fact
+ * gathering (ffprobe JSON + keyframe window scans + trim alignment) used to
+ * run as a SERIAL for-await — on HDD-class constrained machines each
+ * spawn-bound ffprobe costs 0.3–1 s, so a 20-clip timeline burned 20–60 s
+ * of pure serial "preparing…" before the first frame encoded. These probes
+ * are independent and I/O-bound (not timing measurements), so 4-wide
+ * concurrency is safe: probeMediaAsync has in-flight dedup and
+ * probeKeyframesNear caches the PROMISE under its window key, so parallel
+ * callers of the same key coalesce. Order is preserved by slot. */
+async function mapBoundedConcurrent(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const width = Math.max(1, Math.min(Number(limit) || 1, items.length));
+  await Promise.all(
+    Array.from({ length: width }, async () => {
+      while (true) {
+        const idx = next;
+        next += 1;
+        if (idx >= items.length) return;
+        out[idx] = await fn(items[idx], idx);
+      }
+    }),
+  );
+  return out;
+}
+
 async function runPool(jobs, workerCount, cbs) {
   let next = 0;
   let aborted = false;
@@ -3107,7 +3193,15 @@ function optimizeAssForConstrainedCpu(doc) {
 }
 
 ipcMain.handle("export-native", async (event, opts) => {
-  const { outputPath, fps, width, height, bitrateMbps, quality, crf, audioKbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark, overlays, sfx } = opts;
+  const { outputPath, fps, width: reqWidth, height: reqHeight, bitrateMbps, quality, crf, audioKbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark, overlays, sfx, fastMode: fastModeWanted } = opts;
+  // v1.14.4 CONSTRAINED-CPU FAST MODE (see planSmartRenderingPipeline): the
+  // requested resolution can be DOWNSCALED mid-export on Tier-3 machines
+  // (mostly-dirty long timelines) — width/height stay mutable for that one
+  // re-assignment. Every consumer that must NOT see the fast-mode dims (the
+  // two-step fallback jobs, built before the smart pipeline runs) snapshots
+  // the values at build time.
+  let width = reqWidth;
+  let height = reqHeight;
 
   if (!outputPath) throw new Error("No output path");
   if (!segments || segments.length === 0) throw new Error("No segments");
@@ -4011,13 +4105,17 @@ ipcMain.handle("export-native", async (event, opts) => {
         // ── Source facts: per-segment copy capability + keyframe maps ──
         // (format probes are warm from the build loop; the keyframe window
         // scans ride the cached probeKeyframesNear).
-        const srcFacts = [];
-        for (let i = 0; i < segments.length; i++) {
-          const seg = segments[i];
+        // v1.14.4: this loop was a SERIAL for-await — each segment's
+        // probeMedia + trimAlign + keyframe scan is a spawn-bound ffprobe
+        // (0.3–1 s on HDD-class constrained machines), so a 20-clip
+        // timeline burned 20–60 s of "preparing" before the first frame
+        // encoded. The probes are independent and I/O-bound, so they now
+        // run 4-wide (mapBoundedConcurrent); same-key callers coalesce
+        // through the promise-level caches, and slot order is preserved.
+        const srcFacts = await mapBoundedConcurrent(segments, 4, async (seg) => {
           const isVideo = !!(seg && seg.mediaType === "video" && seg.videoPath);
           if (!isVideo || G.resolveSegSpeed(seg) !== 1) {
-            srcFacts.push({ copyCapable: false, keyframes: null, trimAligned: null, srcFps: 0, mismatch: null });
-            continue;
+            return { copyCapable: false, keyframes: null, trimAligned: null, srcFps: 0, mismatch: null };
           }
           const probe = await probeMediaAsync(seg.videoPath);
           const srcDurMs = Number(probe.durationMs) || 0;
@@ -4049,8 +4147,7 @@ ipcMain.handle("export-native", async (event, opts) => {
             } else {
               mismatch = `pixel format ${probe.pixFmt || "unknown"} (needs re-encode)`;
             }
-            srcFacts.push({ copyCapable: false, keyframes: null, trimAligned: null, srcFps: Number(probe.fps) || 0, bFrames: 0, srcDurMs: 0, mismatch });
-            continue;
+            return { copyCapable: false, keyframes: null, trimAligned: null, srcFps: Number(probe.fps) || 0, bFrames: 0, srcDurMs: 0, mismatch };
           }
           const trimInMs = Number(seg.trimInMs) || 0;
           const trimAligned = trimInMs > 0
@@ -4065,7 +4162,7 @@ ipcMain.handle("export-native", async (event, opts) => {
             Math.max(0, (trimInMs - 3500) / 1000),
             (Number(seg.durationMs) || 0) / 1000 + 12,
           );
-          srcFacts.push({
+          return {
             copyCapable: true,
             keyframes: kfs,
             trimAligned,
@@ -4077,8 +4174,8 @@ ipcMain.handle("export-native", async (event, opts) => {
             // concat seam: duplicate content + DTS collisions).
             bFrames: Math.max(0, Math.min(16, Math.round(Number(probe.bFrames) || 0))),
             srcDurMs,
-          });
-        }
+          };
+        });
 
         // ── Pool width + thread budgets ──────────────────────────────────
         // v1.13 (user directive — Adaptive Hardware Matrix): the smart-path
@@ -4089,7 +4186,18 @@ ipcMain.handle("export-native", async (event, opts) => {
         // units; the field report's 46-min exports). Tier 3 runs 2 × 2-thread
         // workers (one worker per physical module), Tier 2 (≥6 cores) runs
         // min(4, cores/2) × 2, Tier 1 (GPU ASIC) runs 2.
-        const spWorkers = hwProfile.workers;
+        // v1.14.4: filter-dominant timelines widen the SMART pool too —
+        // v1.14.1 widened only the parallel pass + the two-step fallback, so
+        // an image-heavy timeline with 30–70 % dirty coverage ran 2×2 while
+        // the SAME machine ran 4×1 the moment clean coverage dropped below
+        // 30 %. Any image segment is a dirty window by construction (images
+        // are never stream-copied), so ≥half images ⇒ the dirty windows are
+        // filter-bound (zoompan/scale/libass are single-threaded per
+        // PROCESS) — the v1.14.1 recipe applies verbatim. filterWorkers >
+        // workers only ever resolves on Tier 3.
+        const spWorkers = filterDominant && hwProfile.filterWorkers > hwProfile.workers
+          ? hwProfile.filterWorkers
+          : hwProfile.workers;
 
         // ── The plan (pure) ──────────────────────────────────────────────
         const plan = SP.planSmartSegments({
@@ -4123,6 +4231,56 @@ ipcMain.handle("export-native", async (event, opts) => {
           return null;
         }
 
+        // ── v1.14.4 CONSTRAINED-CPU FAST RESOLUTION ─────────────────
+        // Field report: "after version 12 and 13 export speed became
+        // terrible." Beyond the regressions fixed above (hw-decode gate,
+        // pool shapes, serial probes), the remaining wall is physics: a
+        // 1080p full-dirty re-encode on a Piledriver-class APU runs ≈1×
+        // realtime at ultrafast — no thread topology changes that. This is
+        // the Draft-profile escape hatch, made AUTOMATIC and honest:
+        // Tier 3 + a mostly-dirty (parallel-pass) timeline ≥4 min + a
+        // 1080p-class request + non-cinema quality → render at the 720p-class
+        // resolution of the SAME aspect (short edge 720; 921k vs 2.07M pixels
+        // ≈ 2.2× less encode+filter work). Every consumer below (ASS docs,
+        // windowed graphs, overlay geometry via the width/height closure)
+        // reads the re-assigned dims; the two-step fallback jobs were built
+        // BEFORE this point and keep the original resolution; the watermark
+        // geometry (absolute px from the renderer) is scaled by the same
+        // factor. The result payload + toast SAY it — never a silent quality
+        // change — and the renderer's Export settings carry the off switch.
+        let fastModeApplied = null;
+        if (
+          hwProfile.tier === "TIER_3_CONSTRAINED_CPU" &&
+          fastModeWanted !== false &&
+          plan.parallelMode &&
+          quality !== "cinema" &&
+          totalMs >= 240000 &&
+          Math.min(width, height) >= 1080
+        ) {
+          const s = 720 / Math.min(width, height);
+          const even = (v) => Math.max(2, Math.round((v * s) / 2) * 2);
+          const fw = even(width);
+          const fh = even(height);
+          if (fw < width || fh < height) {
+            fastModeApplied = { from: `${width}x${height}`, to: `${fw}x${fh}` };
+            console.log(
+              `[Export] CONSTRAINED-CPU FAST MODE: ${fastModeApplied.from} → ${fastModeApplied.to} ` +
+                `(Tier 3 · mostly-dirty ${(totalMs / 60000).toFixed(1)}-min timeline — ~2.2× fewer pixels to encode; disable in Export settings)`,
+            );
+            width = fw;
+            height = fh;
+            if (wm) {
+              // Absolute-px watermark geometry was computed by the renderer
+              // against the REQUESTED dims — carry it to the fast dims so it
+              // lands at the same relative position/size.
+              wm.x = Math.round(wm.x * s);
+              wm.y = Math.round(wm.y * s);
+              wm.w = Math.round(wm.w * s);
+              wm.h = Math.round(wm.h * s);
+            }
+          }
+        }
+
         // ── Mode-aware pool budget ───────────────────────────────────────
         // v1.13 (Adaptive Hardware Matrix): parallel-pass workers ride the
         // tier's threadsPerWorker (2 on Tier 2/3 — the v1.12 hard-pin of
@@ -4134,6 +4292,11 @@ ipcMain.handle("export-native", async (event, opts) => {
         // single-thread encoder — W × 1 fills every logical core with
         // filter work where W/2 × 2 could not. Unwidened pools (Tier 2)
         // keep the tier's threadsPerWorker.
+        // v1.14.4: the WIDENED smart pool (filter-dominant, above) rides the
+        // same single-thread recipe — 4 workers × 2 filter threads on 4
+        // logical cores would oversubscribe 2× for zero filter gain
+        // (zoompan/libass stay single-threaded regardless).
+        const smartWidened = spWorkers > hwProfile.workers;
         let poolWidth;
         let threadsPer;
         let filterThreadsPer;
@@ -4142,6 +4305,10 @@ ipcMain.handle("export-native", async (event, opts) => {
           threadsPer = poolWidth > hwProfile.workers
             ? Math.max(1, Math.min(hwProfile.threadsPerWorker, Math.floor(cpuCount / poolWidth) || 1))
             : hwProfile.threadsPerWorker;
+          filterThreadsPer = threadsPer;
+        } else if (smartWidened) {
+          poolWidth = Math.max(1, spWorkers);
+          threadsPer = Math.max(1, Math.floor(cpuCount / poolWidth) || 1);
           filterThreadsPer = threadsPer;
         } else {
           poolWidth = Math.max(1, spWorkers);
@@ -4570,6 +4737,14 @@ ipcMain.handle("export-native", async (event, opts) => {
           mode: plan.parallelMode ? "parallel-pass" : "smart-render",
           smartCleanSec: plan.cleanMs / 1000,
           smartDirtySec: plan.dirtyMs / 1000,
+          // v1.14.4: the constrained-CPU fast resolution ran (never silent —
+          // the completion toast + Export tab surface it, with the off
+          // switch in Export settings).
+          fastMode: fastModeApplied ? true : undefined,
+          fastModeFrom: fastModeApplied ? fastModeApplied.from : undefined,
+          fastModeTo: fastModeApplied ? fastModeApplied.to : undefined,
+          outputWidth: width,
+          outputHeight: height,
           // v1.10 (Task 2): the primary human-readable dirty reason — the
           // toast shows "Full re-encode required: [reason]" when 0 % was
           // copied.
@@ -4858,5 +5033,5 @@ app.on("will-quit", () => {
 // v1.13: also exports the pure tier resolver + the Tier-3 ASS optimizer so
 // the throwaway harnesses can unit-verify the Adaptive Hardware Matrix.
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { buildAssDocument, assAnimTags, buildHeadlineEvents, probeHwDecode, resolveHardwareProfile, optimizeAssForConstrainedCpu };
+  module.exports = { buildAssDocument, assAnimTags, buildHeadlineEvents, probeHwDecode, hwDecodeGate, resolveHardwareProfile, optimizeAssForConstrainedCpu, mapBoundedConcurrent };
 }
