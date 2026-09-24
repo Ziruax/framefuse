@@ -292,6 +292,12 @@ export interface VideoSettings {
    *  encode. The completion toast always says it happened; false keeps the
    *  requested resolution whatever the hardware. */
   constrainedFastMode?: boolean;
+  /** v1.14.5: slideshow 24-fps mode (default ON). A pure-image timeline
+   *  (no base-lane video segments) renders at 24 instead of 30/25 fps —
+   *  the film rate, 20 % fewer frames through every filter + the encoder.
+   *  Mixed-video timelines, 60 fps projects and cinema quality are never
+   *  touched; the completion toast says it happened. */
+  slideshowFps24?: boolean;
 }
 
 /** Result of parsing a single filename. */
@@ -421,6 +427,33 @@ export interface ExportResult {
   fastModeTo?: string;
   outputWidth?: number;
   outputHeight?: number;
+  /** v1.14.5 (Release A — the export-speed plan): the fps the export
+   *  actually rendered at, the slideshow 24-fps downgrade flag, the
+   *  render-cost strategy that drove the speed levers, the encoder speed
+   *  profile, whether the simple-audio fast path ran, the ffmpeg hardware
+   *  capability matrix, and the per-export performance profile (stage +
+   *  worker telemetry; `profile.file` is the full JSON on disk). */
+  outputFps?: number;
+  slideshowFps?: boolean;
+  slideshowFpsFrom?: number;
+  slideshowFpsTo?: number;
+  costStrategy?: "LOW" | "MEDIUM" | "HIGH" | "VERY_HIGH";
+  renderCost?: { score: number; pixelCost: number; effectCost: number };
+  encoderSpeedProfile?: "fast" | "balanced";
+  audioFastGain?: boolean;
+  hwCaps?: { hwaccels?: string[]; gpuFilters?: string[] };
+  profile?: {
+    file?: string | null;
+    totalMs?: number;
+    stages?: Record<string, number>;
+    classWallMs?: Record<string, number>;
+    framesEncoded?: number;
+    contentSec?: number;
+    speedX?: number | null;
+    cpuBusyPct?: number | null;
+    loudnessCache?: { hits?: number; misses?: number };
+    pool?: { width?: number; jobs?: number; copyJobs?: number; dirtyJobs?: number; threadsPerWorker?: number };
+  };
 }
 
 export interface CaptionSettings {

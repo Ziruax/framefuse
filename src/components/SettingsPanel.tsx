@@ -1328,6 +1328,32 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 says when it happened.
               </p>
             </Field>
+            {/* v1.14.5: the slideshow 24-fps off switch (default ON). Pure-image
+                timelines render 20 % fewer frames at the film rate (24 vs 30
+                fps); mixed-video timelines, 60 fps projects and cinema are
+                never touched, and the completion toast always says it ran. */}
+            <Field
+              label="Slideshow 24 fps"
+              hint={settings.slideshowFps24 === false ? "Off" : "On (default)"}
+            >
+              <Segmented
+                options={[
+                  { value: "on", label: "On" },
+                  { value: "off", label: "Off" },
+                ]}
+                value={settings.slideshowFps24 === false ? "off" : "on"}
+                onChange={(v) =>
+                  onSettingsChange({
+                    ...settings,
+                    slideshowFps24: v === "off" ? false : undefined,
+                  })
+                }
+              />
+              <p className="mt-0.5 text-[9px]" style={{ color: "#52525b" }}>
+                Image-only timelines export at 24 fps (the film rate) — 20 %
+                fewer frames, visibly faster, same feel. The toast says when.
+              </p>
+            </Field>
             <Field label="Frame rate">
               <Segmented
                 options={[

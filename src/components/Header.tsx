@@ -24,7 +24,7 @@ import { cn } from "@/lib/utils";
 /** v1.12.1: the renderer's build constant — compared against the REAL exe
  *  version (app.getVersion()) so a stale/hybrid install is impossible to
  *  miss. Keep in sync with package.json on every release. */
-const BUILD_VERSION = "1.14.4";
+const BUILD_VERSION = "1.14.5";
 
 export interface LastExport {
   path: string;
@@ -75,6 +75,30 @@ export interface LastExport {
   fastModeTo?: string;
   outputWidth?: number;
   outputHeight?: number;
+  /** v1.14.5 (Release A — the export-speed plan): slideshow 24-fps mode,
+   *  render-cost strategy, encoder speed profile, and the per-export
+   *  performance-profile summary (full JSON at profile.file — stage +
+   *  worker-class wall times, frames, ×-realtime, CPU busy). */
+  outputFps?: number;
+  slideshowFps?: boolean;
+  slideshowFpsFrom?: number;
+  slideshowFpsTo?: number;
+  costStrategy?: "LOW" | "MEDIUM" | "HIGH" | "VERY_HIGH";
+  renderCost?: { score: number; pixelCost: number; effectCost: number };
+  encoderSpeedProfile?: "fast" | "balanced";
+  audioFastGain?: boolean;
+  profile?: {
+    file?: string | null;
+    totalMs?: number;
+    stages?: Record<string, number>;
+    classWallMs?: Record<string, number>;
+    framesEncoded?: number;
+    contentSec?: number;
+    speedX?: number | null;
+    cpuBusyPct?: number | null;
+    loudnessCache?: { hits?: number; misses?: number };
+    pool?: { width?: number; jobs?: number; copyJobs?: number; dirtyJobs?: number; threadsPerWorker?: number };
+  };
 }
 
 interface HeaderProps {
@@ -547,6 +571,20 @@ export function Header({
                       (lastExport.keyframeCuts
                         ? ` · ${lastExport.keyframeCuts} keyframe-aligned cut${lastExport.keyframeCuts === 1 ? "" : "s"}`
                         : "")
+                    : ""
+                }${
+                  lastExport.slideshowFps && lastExport.slideshowFpsFrom
+                    ? ` · slideshow mode: ${lastExport.slideshowFpsTo} fps instead of ${lastExport.slideshowFpsFrom}`
+                    : ""
+                }${
+                  lastExport.costStrategy
+                    ? ` · render-cost ${lastExport.costStrategy}${lastExport.renderCost ? ` (${lastExport.renderCost.score})` : ""}`
+                    : ""
+                }${
+                  lastExport.profile && lastExport.profile.speedX != null
+                    ? ` · ${lastExport.profile.speedX}× realtime` +
+                      (lastExport.profile.cpuBusyPct != null ? ` · cpu ${lastExport.profile.cpuBusyPct}%` : "") +
+                      (lastExport.profile.file ? " · perf profile JSON saved" : "")
                     : ""
                 }`
               : undefined

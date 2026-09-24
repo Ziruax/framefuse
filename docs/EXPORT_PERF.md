@@ -727,3 +727,94 @@ S5 the gate matrix (1 ms below the 240 s gate, off-switch, cinema, portrait
 smart-mode widening. Regressions: tier-pools 16/16, eta-payload 10/10,
 timeline-chunks 35/35, chunked-encode 36/36 (which now also documents the
 1.26×-slower-hw gate case live), overlay-caption-order 9/9.
+
+## v1.14.5 — Release A of the export-speed improvement plan (cost-based decisions + profiler + audio wins)
+
+The user's final export-speed plan (Phase 0/1/2/8/9 + Phase 7 detection
+half) shipped as **Release A — the low-risk optimization release**:
+
+1. **Per-export profiler (plan §1, Phase 0)** — every export now records
+   WHERE its time went: stage wall (encoder-detect, build+probe, srcFacts,
+   loudness measurement, plan, pool, audio-bus, mux), one record per pool
+   job (copy vs dirty, wall ms, frame count, graph classes from the actual
+   filter script — zoompan/captions/overlay/chromakey/xfade), summed
+   worker wall per class, sampled CPU-busy EMA, and loudness-cache
+   hit/miss counts. Full JSON in `userData/export-profiles/` (last 20 +
+   `last.json`); the compact summary rides the result payload
+   (`profile`) and the completion log line. This is the "41 % zoompan,
+   27 % subtitles" instrumentation the plan demanded before any further
+   architecture work.
+2. **Satisfied-transform skips (plan §2, Phase 1)** — the base-lane video
+   chain drops filters the probed source already satisfies:
+   scale+crop at exact sample dims, `fps` only on verified-CFR sources
+   (avg == r_frame_rate) at the exact project rate with speed 1, `setsar`
+   when the probe reports 1:1, `format` when the source is already
+   yuv420p AND the input is not hardware-decoded (hw decode hands the
+   graph nv12 — the conversion just moves, so the filter stays).
+   Unknown facts keep the byte-identical legacy chain; a 2-window
+   E2E proves frame-exactness (120 frames / 4.000 s) with the skip
+   active, and a 29.97 source keeps the filter.
+3. **Slideshow 24 fps mode (plan §2)** — pure-image timelines (30/25 fps
+   request, < 60, non-cinema) render at the film rate: 20 % fewer frames
+   through every filter + the encoder. Never silent (payload + toast +
+   `slideshowFps24` off switch in Export settings). Mixed video, 60 fps
+   projects and cinema are untouched.
+4. **Permanent loudness cache (plan §4, Phase 2)** — measurements keyed
+   `path|mtime|size|window` on disk (`loudness-cache-v1.json`, pruned to
+   512): repeat exports + app restarts re-measure NOTHING (fresh-session
+   E2E: 0 ebur128 spawns, cache hit in the payload). Temp WAVs bypass the
+   cache by construction.
+5. **Simple-audio fast path (plan §5)** — normalize ON with ≤ 3 branches
+   and every branch measured → static `volume=<dB>` gains instead of the
+   loudnorm filters (same −16 LUFS landing, no per-branch ebur128
+   analysis), and the two-step master-mix render+remeasure round trip is
+   replaced by the energy-sum master estimate as a static gain.
+   E2E: fast path −18.0 LUFS, accurate path −16.5 LUFS (both at target).
+   Normalize OFF keeps the byte-identical no-loudnorm argv (verified).
+6. **Fast encoder profile (plan §10, Phase 8)** — NVENC p1 +
+   `-multipass disabled` + lookahead/spatial-AQ off (no hq tune) for
+   encode-bound exports; x264 speed tiers drop to ultrafast on Tier 2;
+   cinema is never fast-profiled. Selected automatically by the cost
+   strategy (≥ HIGH), reported as `encoderSpeedProfile`.
+7. **Render-cost strategy (plan §11, Phase 9)** — the duration-based
+   fast-mode trigger ("≥ 240 s AND 1080p") is replaced by a composite
+   score: `pixelCost` (W·H·fps·dirtySec, G pixel-frames — clean copies
+   cost ~0) × `effectCost` (per-frame multiplier: captions +1, overlays
+   +0.4 each, chromakey +0.6, Ken Burns +0.15/img, transitions +0.1).
+   LOW < 3 ≤ MEDIUM < 8 ≤ HIGH < 14 ≤ VERY HIGH. HIGH → fast encoder
+   profile; VERY HIGH → 720p-class fast mode (still Tier 3 + no clean
+   pieces + never cinema + ≥ 60 s + short edge > 720 + the off switch —
+   now triggered by WORK, not by a duration cliff: the 240 s/1080p anchor
+   case scores 14.93, a 239 s equivalent 14.87 — same decision). A/B at
+   fps 12: 720p-class 11.6 s vs 1080p 21.0 s wall = 1.8×.
+8. **Capability matrix (Phase 7 detection)** — ffmpeg-level hw decode
+   methods + GPU filter availability, detected separately from the encoder
+   probe (`-hwaccels`, `-filters`; one retry), logged once and carried in
+   the result payload — the groundwork for the Release-C GPU-compositor
+   routing.
+
+**Deliberately NOT in this release** (Release B/C of the plan): watermark
+late composition, layer-aware dirty tracking, caption caching, worker
+topology retuning, the GPU compositor + GPU Ken Burns + GPU-resident
+filter path. The profiler (§1) is the instrument that will steer those.
+
+### Verification (`scripts/verify-release-a.js`, 65/65)
+
+P1 chain-skip matrix (unit) · P2 loudness static-gain helpers · P3 the
+cost-score thresholds (incl. the 239/240 continuity + the v1.14.4 anchor)
+· P4 encoder fast-profile shapes (NVENC/QSV/AMF/x264 + cinema guard) ·
+P5 capability matrix + memoization · P6 disk-cache round trip ·
+P7 slideshow 24 fps (payload + real 24 fps/720-frame output + off/mixed/
+cinema/60 fps all keep the request) · P8 frame exactness with the fps
+skip + 29.97 keeps the filter + the bare-chain windowed graph (P8c) ·
+P9 profiler (payload + on-disk JSON) · P10 cross-session cache ·
+P11 fast/accurate audio paths at −16 LUFS · P12 cost-based fast mode
+(G1 720p + payload + probed dims + 1.8× wall, G2 off switch, G3 720p
+request) · P13 hwCaps payload.
+
+Regression suite: tier-pools 16/16 · eta-payload 10/10 · timeline-chunks
+35/35 · chunked-encode 36/36 · overlay-caption-order 9/9 (z-order
+intact) · export-speed 35/35 (its fps-3/fps-1 fixtures updated to the
+cost-gate reality — the A/B bench rides fps 12 and G1 is now a
+below-threshold workload instead of a one-millisecond-under-duration
+one; the same never-silent contract).

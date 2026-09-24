@@ -144,7 +144,7 @@ const DISCLAIMER_DEFAULT_MS = 2000;
 /** v1.14.2: renderer build stamp — the desktop-only landing carries it so a
  * browser visitor sees which build is live (in Electron, Header separately
  * cross-checks it against the exe's app.getVersion()). */
-const BUILD_VERSION = "1.14.4";
+const BUILD_VERSION = "1.14.5";
 
 /** Effective lead-in duration of a disclaimer clip (ms, min 200). */
 function disclaimerDurationOf(d: DisclaimerClip | null): number {
@@ -1360,6 +1360,18 @@ export default function Page() {
         fastModeTo: res.fastModeTo,
         outputWidth: res.outputWidth,
         outputHeight: res.outputHeight,
+        // v1.14.5 (Release A): the export-speed-plan telemetry — slideshow
+        // fps, cost strategy, encoder profile, capability matrix, and the
+        // perf-profile summary (the full JSON lives at profile.file).
+        outputFps: res.outputFps,
+        slideshowFps: res.slideshowFps,
+        slideshowFpsFrom: res.slideshowFpsFrom,
+        slideshowFpsTo: res.slideshowFpsTo,
+        costStrategy: res.costStrategy,
+        renderCost: res.renderCost,
+        encoderSpeedProfile: res.encoderSpeedProfile,
+        audioFastGain: res.audioFastGain,
+        profile: res.profile,
       });
       // v1.1 TURBO: the success toast carries the performance story —
       // export time + encoder + stream-copy count — so a fast export is
@@ -1390,6 +1402,19 @@ export default function Page() {
         turboBits.push(
           `fast mode: rendered ${res.fastModeTo} instead of ${res.fastModeFrom} (constrained CPU · ~2× faster — disable in Export settings)`,
         );
+      }
+      // v1.14.5: the slideshow 24-fps downgrade — NEVER silent (same rule as
+      // fast mode): the user asked for 30 and got the film rate for ~20 %
+      // less filter+encode work; the toast says it + where to turn it off.
+      if (res.slideshowFps && res.slideshowFpsFrom && res.slideshowFpsTo) {
+        turboBits.push(
+          `slideshow mode: rendered ${res.slideshowFpsTo} fps instead of ${res.slideshowFpsFrom} (image-only timeline · 20 % fewer frames — disable in Export settings)`,
+        );
+      }
+      // v1.14.5: the render-cost strategy drove a FAST encoder profile — a
+      // one-line heads-up so quality knobs never change invisibly.
+      if (res.encoderSpeedProfile === "fast") {
+        turboBits.push("fast encoder profile (render-cost HIGH+)" );
       }
       // v9: the smart-render story — "15.4 min stream-copied · 3.2 min
       // re-encoded" explains why a 19-minute timeline with edits finished

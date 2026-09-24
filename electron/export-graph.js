@@ -620,6 +620,23 @@ function clampNum(v, lo, hi, dflt) {
 // ---------------------------------------------------------------------------
 
 /**
+ * v1.14.5 SIMPLE-AUDIO FAST PATH: the static linear gain (dB) a measurement
+ * implies — `volume=(-16 − i)dB` lands the source at −16 LUFS exactly like
+ * the measured 2-pass loudnorm filter's linear mode, without running the
+ * loudnorm filter (which keeps an ebur128 analysis stage alive per branch).
+ * Clamped to ±24 dB (beyond that the measurement is suspect); null when the
+ * measurement is unusable — the caller keeps the accurate filter path.
+ */
+function loudnessGainDb(m) {
+  if (!m) return null;
+  const i = Number(m.i);
+  if (!Number.isFinite(i) || i <= -70 || i >= 0) return null;
+  const db = -16 - i;
+  if (!Number.isFinite(db) || Math.abs(db) > 24) return null;
+  return Math.round(db * 100) / 100;
+}
+
+/**
  * Build the MEASURED (2nd-pass) loudnorm filter string from a pass-1
  * measurement { i, lra, tp, thresh, offset } (see main.js
  * measureLoudnessAsync — the ffmpeg loudnorm JSON summary). This is the
@@ -847,19 +864,54 @@ function planChunkFrames(durationMs, fps, targetSec, maxChunks) {
  * v5.1: `o.speed` (≠1) inserts `setpts=PTS/speed` AFTER the cover-fit chain
  * and BEFORE fps — PTS divided by speed retimes the decoded frames onto
  * the clip's timeline clock. speed 1 → no setpts, chain unchanged.
+ * v1.14.5 SATISFIED-TRANSFORM SKIPS (the export-speed plan, Phase 1): when
+ * the probed source ALREADY satisfies the output contract, the matching
+ * filter is a true no-op — drop it instead of paying filter negotiation
+ * (+ for `format`, a swscale pass). `o.srcFacts` (from the ffprobe cache)
+ * carries { srcW, srcH, srcFps, rFps, sar, pixFmt, rotated, hwToken }:
+ *   • scale+crop  skipped only at EXACT sample dims, unrotated;
+ *   • fps         skipped only on a verified-CFR source (avg == r_frame_rate)
+ *                 at the exact project rate with speed 1 — a VFR-at-average
+ *                 source keeps the filter (it is the chain's CFR guarantee
+ *                 and the exact frame-count law the concat tiling counts
+ *                 on);
+ *   • setsar      skipped only when the probe reports sar exactly 1:1;
+ *   • format      skipped only when the source is already yuv420p AND the
+ *                 input is NOT hardware-decoded (d3d11va hands the graph
+ *                 nv12 — the yuv420p conversion has to happen somewhere,
+ *                 dropping the filter just moves it to the encode boundary).
+ * Every skipped condition is conservative: unknown facts (old cache
+ * entries, probe fallback) keep the full v4.9 chain byte-identical. An
+ * all-satisfied chain returns "" — callers substitute the `null` (identity)
+ * filter or drop the -vf flag entirely.
  */
 function buildVideoFilterChain(o) {
   const speed = resolveSegSpeed({ speed: o && o.speed });
   const pts =
     speed !== 1 ? [`setpts=PTS/${fmtSpeed(speed)}`] : [];
-  return [
-    `scale=${o.width}:${o.height}:force_original_aspect_ratio=increase`,
-    `crop=${o.width}:${o.height}`,
-    ...pts,
-    `fps=${o.fps}`,
-    `setsar=1`,
-    `format=yuv420p`,
-  ].join(",");
+  const f = (o && o.srcFacts) || null;
+  const parts = [];
+  const dimsSatisfied = !!(
+    f && f.srcW === o.width && f.srcH === o.height && !f.rotated
+  );
+  if (!dimsSatisfied) {
+    parts.push(
+      `scale=${o.width}:${o.height}:force_original_aspect_ratio=increase`,
+      `crop=${o.width}:${o.height}`,
+    );
+  }
+  parts.push(...pts);
+  const fpsSatisfied = !!(
+    f && speed === 1 &&
+    Number(f.srcFps) > 0 && Math.abs(Number(f.srcFps) - Number(o.fps)) < 0.02 &&
+    Number(f.rFps) > 0 && Math.abs(Number(f.rFps) - Number(f.srcFps)) < 0.02
+  );
+  if (!fpsSatisfied) parts.push(`fps=${o.fps}`);
+  const sarSatisfied = !!(f && Number(f.sar) === 1);
+  if (!sarSatisfied) parts.push(`setsar=1`);
+  const fmtSatisfied = !!(f && f.pixFmt === "yuv420p" && !f.hwToken);
+  if (!fmtSatisfied) parts.push(`format=yuv420p`);
+  return parts.join(",");
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,6 +1098,13 @@ function buildAudioMixGraph(o) {
   // the user's volume rides on top). Measurement must see the RAW wav —
   // loudnorm runs BEFORE volume/adelay.
   const loudnorm = (o && o.loudnorm) || null;
+  // v1.14.5 SIMPLE-AUDIO FAST PATH (export-speed plan §5): with
+  // `audioFastGain` the measured branches apply their STATIC gain
+  // (`volume=<dB>`, see loudnessGainDb) instead of the loudnorm filter —
+  // the same integrated result without the per-branch ebur128 analysis.
+  // Branches WITHOUT a usable measurement keep the accurate fallback
+  // (measured filter, else single-pass loudnorm).
+  const fastGain = !!(o && o.audioFastGain);
   const clipAudio = Array.isArray(o && o.clipAudio) ? o.clipAudio : [];
   clipAudio.forEach((c, k) => {
     const vol = clampNum(c && c.volume, 0, 2, 1);
@@ -1059,8 +1118,14 @@ function buildAudioMixGraph(o) {
     const tempo = Array.isArray(c && c.atempo) ? c.atempo.filter(Boolean) : [];
     if (tempo.length > 0) parts.push(tempo.join(","));
     if (audio.normalize) {
-      const ln = measuredLoudnormFilter(loudnorm && Array.isArray(loudnorm.clip) ? loudnorm.clip[k] : null);
-      if (ln) parts.push(ln);
+      const m = loudnorm && Array.isArray(loudnorm.clip) ? loudnorm.clip[k] : null;
+      if (fastGain) {
+        const db = loudnessGainDb(m);
+        if (db != null) parts.push(`volume=${db}dB`);
+      } else {
+        const ln = measuredLoudnormFilter(m);
+        if (ln) parts.push(ln);
+      }
     }
     if (vol !== 1) parts.push(`volume=${String(vol)}`);
     if (d > 0) parts.push(`adelay=${d}|${d}`);
@@ -1080,7 +1145,12 @@ function buildAudioMixGraph(o) {
     // the knob scales the NORMALIZED track (the DAW-standard order).
     const m = [];
     if (audio.normalize) {
-      m.push(measuredLoudnormFilter(loudnorm && loudnorm.music) || "loudnorm=I=-16:TP=-1.5:LRA=11");
+      if (fastGain) {
+        const db = loudnessGainDb(loudnorm && loudnorm.music);
+        if (db != null) m.push(`volume=${db}dB`);
+      } else {
+        m.push(measuredLoudnormFilter(loudnorm && loudnorm.music) || "loudnorm=I=-16:TP=-1.5:LRA=11");
+      }
     }
     const musicVol = clampNum(audio.musicVolume, 0, 2, 1);
     if (musicVol !== 1) m.push(`volume=${String(musicVol)}`);
@@ -1140,11 +1210,17 @@ function buildAudioMixGraph(o) {
   // (music + clip + SFX) — a limiter right before the pad keeps int16 output
   // from hard-clipping (the standard master-chain practice in Shotcut et al).
   // v6: an ESTIMATED master loudnorm (energy-sum of the per-branch measured
-  // levels — see estimateMixLoudnorm) rides between master volume and the
+  // levels — see estimateMixLoudnessDb) rides between master volume and the
   // limiter, replacing the v1.3 render-mix-to-WAV-remeasure round trip.
+  // v1.14.5: the fast path applies the estimate as a static `volume=dB`
+  // instead of the loudnorm filter string.
   const masterLn = (o && o.masterLoudnorm) || null;
+  const masterGainDb = fastGain && Number.isFinite(Number(o && o.masterGainDb)) ? Number(o.masterGainDb) : null;
+  const masterStage = masterGainDb != null
+    ? `volume=${masterGainDb}dB,`
+    : masterLn ? `${masterLn},` : "";
   parts.push(
-    `${last}${masterChain}${masterLn ? `${masterLn},` : ""}` +
+    `${last}${masterChain}${masterStage}` +
       `alimiter=limit=0.97:level=false,apad=whole_dur=${totalSec.toFixed(3)}[aout]`,
   );
   return { graph: parts.join(";"), outLabel: "[aout]" };
@@ -1164,6 +1240,23 @@ function buildAudioMixGraph(o) {
  * then keeps the v1.2 per-branch-only shape).
  */
 function estimateMixLoudnorm(o) {
+  const est = estimateMixLoudnessDb(o);
+  if (!est) return null;
+  return (
+    `loudnorm=I=-16:TP=-1.5:LRA=11` +
+    `:measured_I=${est.i.toFixed(2)}:measured_LRA=${Math.min(20, est.lra).toFixed(2)}` +
+    `:measured_TP=${Math.min(-0.5, est.tp).toFixed(2)}:measured_thresh=-70:linear=true`
+  );
+}
+
+/**
+ * v1.14.5: the NUMERIC half of estimateMixLoudnorm — the energy-sum mix
+ * loudness { i, tp, lra } (dB-domain, conservative TP) or null when fewer
+ * than two measured branches overlap. The SIMPLE-AUDIO fast path converts
+ * this directly into the master static gain (`-16 − i`), skipping the
+ * loudnorm filter the same way the per-branch fast path does.
+ */
+function estimateMixLoudnessDb(o) {
   const totalSec = Number(o && o.totalSec) || 0;
   if (totalSec <= 0) return null;
   const audio = (o && o.audio) || {};
@@ -1206,11 +1299,7 @@ function estimateMixLoudnorm(o) {
   if (!Number.isFinite(mixI) || mixI <= -70 || mixI >= 0) return null;
   const estTp = (maxTp > -99 ? maxTp : -1.5) + 3;
   const estLra = maxLra > 0 ? maxLra : 11;
-  return (
-    `loudnorm=I=-16:TP=-1.5:LRA=11` +
-    `:measured_I=${mixI.toFixed(2)}:measured_LRA=${Math.min(20, estLra).toFixed(2)}` +
-    `:measured_TP=${Math.min(-0.5, estTp).toFixed(2)}:measured_thresh=-70:linear=true`
-  );
+  return { i: Math.round(mixI * 100) / 100, tp: Math.round(estTp * 100) / 100, lra: Math.round(estLra * 100) / 100 };
 }
 
 /**
@@ -1259,6 +1348,9 @@ function buildAudioMixRenderArgs(o) {
     musicInputIdx: musicIdx,
     loudnorm: o.loudnorm,
     rawMix: true,
+    // v1.14.5: the simple-audio fast path rides the rawMix render too (the
+    // master stage is beyond rawMix's cut point — irrelevant here).
+    audioFastGain: o.audioFastGain,
     sfx: sfxList.map((s, k) => ({ inputIdx: sfxBase + k, startMs: s.startMs, volume: s.volume })),
   });
   args.push(
@@ -1317,6 +1409,10 @@ function buildClipArgs(ctx) {
     // clips keep whole-clip zoompan frame indexing). null/undefined = the
     // legacy whole-clip behavior, byte-identical argv.
     chunk,
+    // v1.14.5: probed source facts { srcW, srcH, srcFps, rFps, sar, pixFmt,
+    // rotated } for the satisfied-transform skips in buildVideoFilterChain.
+    // Absent (all legacy callers) → the full v4.9 chain, byte-identical.
+    srcFacts,
   } = ctx;
   const globals = Array.isArray(globalArgs) && globalArgs.length > 0 ? globalArgs : [];
 
@@ -1530,7 +1626,13 @@ function buildClipArgs(ctx) {
       inputs.push(...ov.inputArgs);
       inputIdx += 1;
     }
-    const videoChain = buildVideoFilterChain({ width, height, fps, speed });
+    // v1.14.5: srcFacts drives the satisfied-transform skips; the identity
+    // `null` filter substitutes for an all-satisfied (empty) chain so the
+    // filter_complex graph stays valid.
+    const videoChain = buildVideoFilterChain({
+      width, height, fps, speed,
+      srcFacts: srcFacts ? { ...srcFacts, hwToken: !!hwaccel } : null,
+    }) || "null";
     const tempo = atempoFilters(speed);
     const audioMaps = [];
     let audioGraph = null;
@@ -1778,6 +1880,10 @@ function buildConcatArgs(o) {
         hasMusic,
         musicInputIdx: musicIdx,
         loudnorm: o.loudnorm,
+        // v1.14.5: simple-audio fast path — static per-branch + master gains
+        // instead of the loudnorm filters (accurate path when absent).
+        audioFastGain: o.audioFastGain,
+        masterGainDb: o.masterGainDb,
         sfx: sfxList.map((s, k) => ({ inputIdx: sfxBase + k, startMs: s.startMs, volume: s.volume })),
       });
       args.push(
@@ -1889,6 +1995,9 @@ module.exports = {
   buildAudioMixRenderArgs,
   measuredLoudnormFilter,
   estimateMixLoudnorm,
+  // v1.14.5: loudness static-gain helpers (simple-audio fast path)
+  loudnessGainDb,
+  estimateMixLoudnessDb,
   AFORMAT,
   // full argv builders
   buildClipArgs,

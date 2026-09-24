@@ -1399,6 +1399,12 @@ function planSmartSegments(o) {
  *   masterLoudnorm,  // estimated measured-loudnorm filter string | null
  *   hwaccelPerSeg,   // ["d3d11va"-token bool | "auto" | false] per-source
  *                    // hw decode (v1.12 tri-state — see probeHwDecode)
+ *   srcFacts,        // v1.14.5: FULL-timeline-indexed probed source facts
+ *                    // [{ srcW, srcH, srcFps, rFps, sar, pixFmt, rotated }]
+ *                    // for the satisfied-transform skips (absent → full chain)
+ *   audioFastGain,   // v1.14.5: simple-audio fast path — static gains
+ *                    //   instead of loudnorm filters (audio-only mode)
+ *   masterGainDb,    // v1.14.5: the fast path's estimated master gain (dB)
  * }
  *
  * Returns { inputs, script, hasAudioOut, videoOutLabel, warnings }.
@@ -1424,6 +1430,11 @@ function buildSinglePassPlan(o) {
     transition, wm, assSuffix, overlaySpecs,
     audio, audioPath, sfx, clipAudio, loudnorm, masterLoudnorm,
     hwaccelPerSeg,
+    // v1.14.5: probed source facts (full-timeline indexed) + the audio
+    // fast-gain knobs (see the doc block above).
+    srcFacts,
+    audioFastGain,
+    masterGainDb,
     window: win,
     fullSegments,
     videoOnly,
@@ -1496,6 +1507,9 @@ function buildSinglePassPlan(o) {
       musicInputIdx,
       loudnorm,
       masterLoudnorm,
+      // v1.14.5: static-gain fast path (volume=dB instead of loudnorm).
+      audioFastGain,
+      masterGainDb,
       sfx: sfxRefs,
     });
     return {
@@ -1585,8 +1599,16 @@ function buildSinglePassPlan(o) {
       // emitted count EXACTLY ceil(dur×fps) — matching the two-step per-clip
       // path and the chunk frame model. Aligned trims are a no-op (STARTPTS
       // subtracts 0).
+      // v1.14.5: srcFacts (full-timeline indexed, from the probed sources)
+      // drives the satisfied-transform skips; an all-satisfied chain is ""
+      // and the setpts normalizer becomes the whole chain (no leading comma).
+      const factsIdx = meta ? meta[i].origIdx : i;
+      const segFacts = Array.isArray(srcFacts) && srcFacts[factsIdx]
+        ? { ...srcFacts[factsIdx], hwToken: !!(hwaccelPerSeg ? hwaccelPerSeg[factsIdx] : false) }
+        : null;
+      const vChain = G.buildVideoFilterChain({ width, height, fps, speed, srcFacts: segFacts });
       graph.push(
-        `${base}${G.buildVideoFilterChain({ width, height, fps, speed })},setpts=PTS-STARTPTS[s${i}]`,
+        `${base}${vChain ? `${vChain},` : ""}setpts=PTS-STARTPTS[s${i}]`,
       );
       segLabels.push(`[s${i}]`);
       continue;

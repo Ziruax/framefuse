@@ -490,6 +490,77 @@ function ffmpegCapture(args, timeoutMs = 12000) {
 // ---------------------------------------------------------------------------
 // v1.2 2-PASS MEASURED LOUDNORM — pass 1 (measurement)
 // ---------------------------------------------------------------------------
+// v1.14.5 PERMANENT LOUDNESS CACHE (export-speed plan §4). A loudness
+// measurement is a pure function of (file, window): keyed by
+// absolutePath|mtime|size|ssMs|durMs it never goes stale — the key itself
+// invalidates when the file changes. User sources are measured ONCE and
+// every later export (incl. after app restarts) reuses the numbers; the
+// two-step path's TEMP WAVs (unique names per export) are deliberately
+// bypassed so the cache never accumulates throwaway entries. Failures
+// (null measurements) are not cached — a retry next export is cheap and a
+// transient timeout must not freeze a wrong "unusable" verdict.
+// ---------------------------------------------------------------------------
+let loudnessDisk = null;           // { entries: { key: { t, m } } }
+let loudnessDiskDirty = false;
+let loudnessDiskTimer = null;
+const loudnessCacheStats = { hits: 0, misses: 0 }; // read by the export profiler
+
+function loudnessDiskPath() {
+  return path.join(app.getPath("userData"), "loudness-cache-v1.json");
+}
+
+function loadLoudnessDisk() {
+  if (loudnessDisk) return;
+  try {
+    loudnessDisk = JSON.parse(fs.readFileSync(loudnessDiskPath(), "utf8"));
+    if (!loudnessDisk || typeof loudnessDisk !== "object" || !loudnessDisk.entries) {
+      loudnessDisk = { entries: {} };
+    }
+  } catch (_) {
+    loudnessDisk = { entries: {} };
+  }
+}
+
+function scheduleLoudnessDiskSave() {
+  if (loudnessDiskTimer) return;
+  loudnessDiskTimer = setTimeout(() => {
+    loudnessDiskTimer = null;
+    if (!loudnessDiskDirty) return;
+    try {
+      fs.writeFileSync(loudnessDiskPath(), JSON.stringify(loudnessDisk));
+      loudnessDiskDirty = false;
+    } catch (_) { /* best-effort persistence */ }
+  }, 2000);
+}
+
+/** Synchronous flush — the export profiler calls this at the end of every
+ * export so a quick app close right after can never lose measurements. */
+function flushLoudnessDisk() {
+  if (loudnessDiskTimer) { clearTimeout(loudnessDiskTimer); loudnessDiskTimer = null; }
+  if (!loudnessDiskDirty || !loudnessDisk) return;
+  try {
+    fs.writeFileSync(loudnessDiskPath(), JSON.stringify(loudnessDisk));
+    loudnessDiskDirty = false;
+  } catch (_) { /* best-effort persistence */ }
+}
+
+function loudnessCacheKey(p, win, st) {
+  const winKey = win && Number(win.durMs) > 0
+    ? `${Math.max(0, Math.round(Number(win.ssMs) || 0))}|${Math.round(Number(win.durMs))}`
+    : "full";
+  return `${p}|${Math.round(st.mtimeMs)}|${st.size}|${winKey}`;
+}
+
+function pruneLoudnessDisk() {
+  const keys = Object.keys(loudnessDisk.entries);
+  if (keys.length <= 512) return;
+  keys
+    .map((k) => ({ k, t: Number(loudnessDisk.entries[k] && loudnessDisk.entries[k].t) || 0 }))
+    .sort((a, b) => a.t - b.t)
+    .slice(0, keys.length - 512)
+    .forEach((e) => { delete loudnessDisk.entries[e.k]; });
+}
+
 /**
  * Measure a file's loudness for 2-pass loudnorm: decodes audio ONLY (fast —
  * ebur128 runs hundreds of× realtime) through `loudnorm … print_format=json`
@@ -503,12 +574,34 @@ function ffmpegCapture(args, timeoutMs = 12000) {
  * without extracting PCM WAVs first. atempo preserves integrated loudness
  * (energy per unit time is unchanged by time-stretch), so measuring the
  * pre-atempo window is equivalent to the two-step's post-atempo WAV.
+ * v1.14.5: disk-cached per path|mtime|size|window (see the block above).
  */
 function measureLoudnessAsync(p, win) {
   if (typeof p !== "string" || !p) return Promise.resolve(null);
+  // Temp WAVs (the two-step clip extracts + master-mix renders) live under
+  // tempDir and never repeat — bypass the cache for them entirely.
+  const isTemp = typeof tempDir === "string" && p.startsWith(tempDir);
+  let statOk = false;
+  let key = null;
+  if (!isTemp) {
+    try {
+      const st = fs.statSync(p);
+      key = loudnessCacheKey(p, win, st);
+      statOk = true;
+    } catch (_) { /* unreadable now — measure uncached */ }
+  }
+  if (statOk && key) {
+    loadLoudnessDisk();
+    const e = loudnessDisk.entries[key];
+    if (e && e.m && Number.isFinite(Number(e.m.i))) {
+      loudnessCacheStats.hits += 1;
+      return Promise.resolve(e.m);
+    }
+  }
   const seekArgs = win && Number(win.durMs) > 0
     ? ["-ss", (Math.max(0, Number(win.ssMs) || 0) / 1000).toFixed(3), "-t", (Number(win.durMs) / 1000).toFixed(3)]
     : [];
+  loudnessCacheStats.misses += 1;
   return ffmpegCapture(
     [
       "-hide_banner", "-nostats",
@@ -535,7 +628,15 @@ function measureLoudnessAsync(p, win) {
     const tp = num(j.input_tp);
     const th = num(j.input_thresh);
     if (i == null || lra == null || tp == null || th == null) return null;
-    return { i, lra, tp, thresh: th, offset: num(j.target_offset) };
+    const m = { i, lra, tp, thresh: th, offset: num(j.target_offset) };
+    if (statOk && key) {
+      loadLoudnessDisk();
+      loudnessDisk.entries[key] = { t: Date.now(), m };
+      pruneLoudnessDisk();
+      loudnessDiskDirty = true;
+      scheduleLoudnessDiskSave();
+    }
+    return m;
   }).catch(() => null);
 }
 
@@ -1746,6 +1847,10 @@ async function getHardwareProfile() {
     hasAmf: enc.name === "h264_amf",
   };
   const profile = resolveHardwareProfile(gpuCapabilities, topo);
+  // v1.14.5: the ffmpeg-level capability matrix (decode methods + GPU
+  // filters), detected separately from the encoder probe — carried on the
+  // profile + into the export result payload.
+  profile.hwCaps = await detectHwCapsAsync();
   hardwareProfileCache = { key, profile };
   console.log(
     `[Hardware] ${profile.tier} — ${profile.encoder} · ${profile.workers} workers × ${profile.threadsPerWorker} thread(s)` +
@@ -1923,25 +2028,43 @@ const QUALITY_ENCODER = {
   cinema: { crf: 17, x264: "faster",  nvencPreset: "p6", nvencCq: 19, qsvQ: 19, amfI: 19, amfP: 21 },
 };
 
-function encoderArgs(encoderName, bitrateMbps, width, height, quality, crf, hardwareTier) {
+function encoderArgs(encoderName, bitrateMbps, width, height, quality, crf, hardwareTier, speedProfile) {
   const q = QUALITY_ENCODER[quality] || QUALITY_ENCODER.social;
   const crfVal = quality === "custom" ? Math.max(14, Math.min(30, Number(crf) || 20)) : q.crf;
   // v1.13: the old lowEnd boolean is now the hardware TIER string.
   const t3 = hardwareTier === "TIER_3_CONSTRAINED_CPU";
+  // v1.14.5 FAST ENCODER PROFILE (export-speed plan §10): the render-cost
+  // strategy resolves "fast" for encode-bound exports — the speed knobs
+  // ride every encoder family (NVENC p1 + multipass/lookahead/AQ disabled;
+  // x264 drops to ultrafast on the speed tiers). Cinema is NEVER
+  // fast-profiled (it is explicitly the quality tier).
+  const fast = speedProfile === "fast" && quality !== "cinema";
   switch (encoderName) {
     case "h264_nvenc": {
       // v6: unconstrained constant-quality VBR — no maxrate/bufsize, CQ per
       // tier, quarter-res multipass; B-frames-as-refs on the quality tiers.
+      // v1.14.5 fast profile: p1 + -multipass disabled + lookahead/spatial-AQ
+      // off + no hq tune — the minimal-analysis shape for encode-bound
+      // timelines (the plan: "do not make the quality-oriented configuration
+      // your fastest export mode").
       const cq = quality === "custom" ? crfVal : q.nvencCq;
-      const args = ["-c:v", "h264_nvenc", "-preset", q.nvencPreset, "-rc", "vbr", "-cq", String(cq), "-b:v", "0", "-multipass", "qres"];
-      if (quality !== "draft") args.push("-tune", "hq", "-b_ref_mode", "middle");
+      const args = ["-c:v", "h264_nvenc", "-preset", fast ? "p1" : q.nvencPreset, "-rc", "vbr", "-cq", String(cq), "-b:v", "0"];
+      if (fast) {
+        args.push("-multipass", "disabled", "-rc-lookahead", "0", "-spatial_aq", "0");
+      } else {
+        args.push("-multipass", "qres");
+        if (quality !== "draft") args.push("-tune", "hq", "-b_ref_mode", "middle");
+      }
       args.push("-pix_fmt", "yuv420p");
       return args;
     }
     case "h264_qsv":
+      // v1.14.5: the fast profile keeps QSV's veryfast (already the fastest
+      // stable preset on iGPU stacks) — only the explicit knobs drop.
       return ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", String(quality === "custom" ? crfVal : q.qsvQ), "-look_ahead", "0", "-pix_fmt", "yuv420p"];
     case "h264_amf":
-      return ["-c:v", "h264_amf", "-quality", quality === "cinema" ? "quality" : "balanced", "-rc", "vbr_peak", "-qp_i", String(quality === "custom" ? crfVal : q.amfI), "-qp_p", String((quality === "custom" ? crfVal : q.amfP) + 2), "-b:v", `${bitrateMbps || 8}M`, "-pix_fmt", "yuv420p"];
+      // v1.14.5: fast profile → AMF "speed" usage (the minimal-analysis tier).
+      return ["-c:v", "h264_amf", "-quality", quality === "cinema" ? "quality" : (fast ? "speed" : "balanced"), "-rc", "vbr_peak", "-qp_i", String(quality === "custom" ? crfVal : q.amfI), "-qp_p", String((quality === "custom" ? crfVal : q.amfP) + 2), "-b:v", `${bitrateMbps || 8}M`, "-pix_fmt", "yuv420p"];
     default: {
       // libx264 — v1.13 Adaptive Hardware Matrix. Tier 2 (≥6 modern
       // cores) keeps the v1.12 ladder (superfast speed tiers + fastdecode;
@@ -1960,7 +2083,9 @@ function encoderArgs(encoderName, bitrateMbps, width, height, quality, crf, hard
         preset = quality === "cinema" ? "superfast" : "ultrafast";
         if (quality === "social") tierCrf = 24;
       } else {
-        preset = quality === "cinema" ? q.x264 : (quality === "draft" ? "ultrafast" : q.x264);
+        // v1.14.5: the fast encoder profile drops the Tier-2 speed tiers one
+        // notch (superfast → ultrafast) — same shape Tier 3 already rides.
+        preset = quality === "cinema" ? q.x264 : (quality === "draft" || fast ? "ultrafast" : q.x264);
       }
       const args = ["-c:v", "libx264", "-preset", preset, "-crf", String(tierCrf)];
       if (preset === "superfast" || preset === "ultrafast") {
@@ -1972,6 +2097,250 @@ function encoderArgs(encoderName, bitrateMbps, width, height, quality, crf, hard
       return args;
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// v1.14.5 RENDER-COST SCORE (export-speed plan §11 — Phase 9). Replaces the
+// duration-based Fast Mode trigger ("Tier 3 AND mostly dirty AND ≥240 s AND
+// 1080p AND not cinema") with a composite WORKLOAD score so a 3:59 export
+// no longer behaves completely differently from a 4:01 one: the boundary now
+// sits in total-work space, where effects/resolution/fps/duration all move
+// it together.
+//
+//   pixelCost = rendered pixel-frames (billions): W·H·fps·dirtySec — clean
+//               stream-copied spans cost ≈0 (they are remuxed, not rendered)
+//   effectCost = per-frame work multiplier: each active effect raises the
+//               cost of EVERY rendered frame (captions ≈ ×2, each overlay
+//               +0.4, chromakey +0.6, Ken Burns +0.15/img, transitions
+//               +0.1/boundary — capped contributions)
+//   score      = pixelCost × effectCost
+//
+//   LOW (< 3)        normal
+//   MEDIUM (3–8)     optimized (default machinery)
+//   HIGH (≥ 8)       fast encoder profile (+ slideshow 24 fps, separately)
+//   VERY HIGH (≥ 14) 720p-class fast mode (Tier 3 + no clean pieces + never
+//                    cinema + the never-silent toast/off switch)
+//
+// Audio is deliberately NOT in the score: the audio bus runs CONCURRENT
+// with the video pool (v1.14.2) — dropping resolution for an audio-bound
+// export would be the wrong lever. Its cost is recorded in the profiler
+// telemetry instead.
+// Calibration anchor: 1920×1080·30fps·240 s full-dirty effectless = 14.93 —
+// the exact v1.14.4 trigger case — sits just above the VERY HIGH line.
+// ---------------------------------------------------------------------------
+function estimateRenderCost(o) {
+  const width = Math.max(1, Number(o && o.width) || 1);
+  const height = Math.max(1, Number(o && o.height) || 1);
+  const fps = Math.max(1, Number(o && o.fps) || 30);
+  const durationSec = Math.max(0, Number(o && o.durationSec) || 0);
+  const dirtySec = Math.min(durationSec, Math.max(0, Number(o && o.dirtySec) || 0));
+  const pixelCost = (width * height * fps * dirtySec) / 1e9;
+  let effectCost = 1;
+  if (o && o.captions) effectCost += 1;
+  if (o && o.headlines) effectCost += 0.5;
+  effectCost += Math.min(8, Math.max(0, Number(o && o.overlayCount) || 0)) * 0.4;
+  effectCost += Math.min(8, Math.max(0, Number(o && o.chromaCount) || 0)) * 0.6;
+  effectCost += Math.min(40, Math.max(0, Number(o && o.kenBurnsCount) || 0)) * 0.15;
+  effectCost += Math.min(40, Math.max(0, Number(o && o.transitionCount) || 0)) * 0.1;
+  const score = pixelCost * effectCost;
+  const strategy = score >= 14 ? "VERY_HIGH" : score >= 8 ? "HIGH" : score >= 3 ? "MEDIUM" : "LOW";
+  return {
+    score: Math.round(score * 100) / 100,
+    pixelCost: Math.round(pixelCost * 100) / 100,
+    effectCost: Math.round(effectCost * 100) / 100,
+    strategy,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// v1.14.5 CAPABILITY MATRIX (export-speed plan Phase 7, detection half):
+// ffmpeg-level hardware DECODE methods + GPU FILTER availability, detected
+// SEPARATELY from the encoder probe (a machine can have "GPU encoder = yes,
+// GPU filter = no"). Routing on this matrix is the Release-C GPU-compositor
+// work; today it is logged + carried in the export result payload so field
+// reports state exactly what the build supports.
+// ---------------------------------------------------------------------------
+let hwCapsCache = null;
+let hwCapsDetecting = null;
+function detectHwCapsAsync() {
+  if (hwCapsCache) return Promise.resolve(hwCapsCache);
+  if (hwCapsDetecting) return hwCapsDetecting;
+  hwCapsDetecting = (async () => {
+    const caps = { hwaccels: [], gpuFilters: [] };
+    // `-hwaccels` is a sub-second listing, but on a fully-saturated 2-core
+    // box a fresh ffmpeg spawn can exceed a tight timeout — retry once
+    // before settling on the empty (best-effort) matrix.
+    const listHwaccels = async () => {
+      try {
+        const r = await ffmpegCapture(["-hide_banner", "-hwaccels"], 15000);
+        const lines = String((r && r.out) || "").split(/\r?\n/);
+        const hdr = lines.findIndex((l) => /^Hardware acceleration methods:/i.test(String(l).trim()));
+        return (hdr >= 0 ? lines.slice(hdr + 1) : lines)
+          .map((l) => String(l).trim())
+          .filter((l) => /^[a-z0-9_]+$/i.test(l));
+      } catch (_) { return []; }
+    };
+    caps.hwaccels = await listHwaccels();
+    if (caps.hwaccels.length === 0) caps.hwaccels = await listHwaccels();
+    try {
+      const r = await ffmpegCapture(["-hide_banner", "-filters"], 15000);
+      const text = String((r && r.out) || "");
+      const wanted = [
+        "scale_cuda", "overlay_cuda", "chromakey_cuda", "hwupload_cuda", "scale_npp",
+        "scale_qsv", "overlay_qsv", "vpp_qsv", "hwupload", "hwdownload", "hwmap",
+      ];
+      for (const n of wanted) {
+        if (text.includes(` ${n} `)) caps.gpuFilters.push(n);
+      }
+    } catch (_) { /* best-effort */ }
+    if (caps.hwaccels.length === 0) {
+      console.warn("[Hardware] capability matrix: ffmpeg -hwaccels returned nothing after 2 attempts — reporting an empty decode list (best-effort)");
+    }
+    hwCapsCache = caps;
+    console.log(
+      `[Hardware] capability matrix — decode: ${caps.hwaccels.join(", ") || "none listed"} · gpu filters: ${caps.gpuFilters.join(", ") || "none"}`,
+    );
+    return caps;
+  })();
+  return hwCapsDetecting;
+}
+
+// ---------------------------------------------------------------------------
+// v1.14.5 EXPORT PROFILER (export-speed plan §1 — Phase 0). Per-export
+// telemetry that answers "WHERE did the time go", not just "how far along":
+//   • stages        — wall ms per pipeline stage (encoder detect, build+probe,
+//                     srcFacts, loudness measurement, plan, audio bus, mux)
+//   • workers       — one record per pool job: kind (copy/dirty), wall ms,
+//                     frame count, graph classes (zoompan/subtitles/overlay/
+//                     chromakey/xfade — from the actual filter script)
+//   • classWallMs   — summed worker wall per class (the pool runs jobs in
+//                     parallel — read it as "CPU-seconds of that class")
+//   • cpu.busyPct   — sampled whole-process busy % (2 s EMA)
+//   • loudness      — cache hits/misses for the measurement passes
+// The full JSON lands in userData/export-profiles/ (last 20 kept + a
+// last.json copy); the result payload carries the compact summary.
+// ---------------------------------------------------------------------------
+function createExportProfiler(meta) {
+  const t0 = Date.now();
+  const prof = {
+    schema: 1,
+    startedAtIso: new Date(t0).toISOString(),
+    ...(meta || {}),
+    stages: {},
+    workers: [],
+    pool: { width: null, jobs: 0, copyJobs: 0, dirtyJobs: 0, threadsPerWorker: null },
+    cpu: { samples: 0, busyPct: null },
+    loudness: { hits: 0, misses: 0 },
+  };
+  const stageTimers = {};
+  prof.beginStage = (name) => { stageTimers[name] = Date.now(); };
+  prof.endStage = (name) => {
+    const s = stageTimers[name];
+    if (s == null) return;
+    prof.stages[name] = Math.round((prof.stages[name] || 0) + (Date.now() - s));
+    delete stageTimers[name];
+  };
+  prof.setStage = (name, ms) => { prof.stages[name] = Math.round(ms); };
+  prof.worker = (rec) => { prof.workers.push(rec); };
+  prof.setPool = (p) => { Object.assign(prof.pool, p); };
+
+  let cpuTimer = null;
+  let cpuPrev = null;
+  function sampleCpus() {
+    try { return os.cpus().map((c) => c.times); } catch (_) { return null; }
+  }
+  prof.startCpuSampler = () => {
+    cpuPrev = sampleCpus();
+    if (!cpuPrev) return;
+    cpuTimer = setInterval(() => {
+      try {
+        const now = sampleCpus();
+        if (!now || now.length !== cpuPrev.length) { cpuPrev = now || cpuPrev; return; }
+        let idle = 0;
+        let total = 0;
+        for (let i = 0; i < now.length; i++) {
+          const d = {
+            user: now[i].user - cpuPrev[i].user,
+            nice: now[i].nice - cpuPrev[i].nice,
+            sys: now[i].sys - cpuPrev[i].sys,
+            idle: now[i].idle - cpuPrev[i].idle,
+            irq: now[i].irq - cpuPrev[i].irq,
+          };
+          idle += d.idle;
+          total += d.user + d.nice + d.sys + d.idle + d.irq;
+        }
+        cpuPrev = now;
+        if (total > 0) {
+          const busy = 100 * (1 - idle / total);
+          prof.cpu.busyPct = prof.cpu.samples === 0 ? busy : prof.cpu.busyPct * 0.7 + busy * 0.3;
+          prof.cpu.samples += 1;
+        }
+      } catch (_) { /* best-effort */ }
+    }, 2000);
+  };
+  prof.stopCpuSampler = () => { if (cpuTimer) { clearInterval(cpuTimer); cpuTimer = null; } };
+
+  prof.finish = (resultInfo) => {
+    prof.stopCpuSampler();
+    prof.totalMs = Date.now() - t0;
+    flushLoudnessDisk();
+    prof.loudness = { hits: loudnessCacheStats.hits, misses: loudnessCacheStats.misses };
+    const classWall = {};
+    let frames = 0;
+    for (const w of prof.workers) {
+      const cls = w.copy ? "stream-copy" : (Array.isArray(w.classes) && w.classes.length ? w.classes.join("+") : "encode");
+      classWall[cls] = (classWall[cls] || 0) + (Number(w.wallMs) || 0);
+      frames += Number(w.frames) || 0;
+    }
+    prof.classWallMs = classWall;
+    prof.framesEncoded = frames;
+    prof.contentSec = Number(resultInfo && resultInfo.contentSec) || 0;
+    prof.speedX = prof.totalMs > 0 && prof.contentSec > 0
+      ? Math.round((prof.contentSec / (prof.totalMs / 1000)) * 100) / 100
+      : null;
+    prof.output = {
+      path: resultInfo && resultInfo.path,
+      sizeBytes: Number(resultInfo && resultInfo.size) || 0,
+      mode: resultInfo && resultInfo.mode,
+    };
+    let file = null;
+    try {
+      const dir = path.join(app.getPath("userData"), "export-profiles");
+      fs.mkdirSync(dir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      file = path.join(dir, `profile-${stamp}.json`);
+      fs.writeFileSync(file, JSON.stringify(prof, null, 2));
+      fs.writeFileSync(path.join(dir, "last.json"), JSON.stringify(prof, null, 2));
+      const kept = fs.readdirSync(dir).filter((f) => /^profile-.*\.json$/.test(f)).sort();
+      for (const f of kept.slice(0, Math.max(0, kept.length - 20))) {
+        try { fs.unlinkSync(path.join(dir, f)); } catch (_) {}
+      }
+    } catch (_) { /* best-effort — profiling never fails an export */ }
+    const stageStr = Object.entries(prof.stages).map(([k, v]) => `${k} ${(v / 1000).toFixed(1)}s`).join(" · ");
+    const classStr = Object.entries(classWall).map(([k, v]) => `${k} ${(v / 1000).toFixed(1)}s`).join(" · ");
+    console.log(
+      `[Export] perf profile: ${file || "(not written)"} — total ${(prof.totalMs / 1000).toFixed(1)}s` +
+        `${stageStr ? ` · stages ${stageStr}` : ""}${classStr ? ` · worker wall ${classStr}` : ""}` +
+        ` · ${frames} frames · ${prof.speedX != null ? `${prof.speedX}×` : "?"} realtime` +
+        ` · cpu ${prof.cpu.busyPct != null ? `${Math.round(prof.cpu.busyPct)}%` : "?"}` +
+        ` · loudness cache ${prof.loudness.hits}h/${prof.loudness.misses}m`,
+    );
+    return {
+      file,
+      totalMs: prof.totalMs,
+      stages: prof.stages,
+      classWallMs: classWall,
+      framesEncoded: frames,
+      contentSec: prof.contentSec,
+      speedX: prof.speedX,
+      cpuBusyPct: prof.cpu.busyPct != null ? Math.round(prof.cpu.busyPct * 10) / 10 : null,
+      loudnessCache: prof.loudness,
+      pool: prof.pool,
+    };
+  };
+
+  prof.startCpuSampler();
+  return prof;
 }
 
 /** v6/v7: the exact probe argv for a GPU candidate — `pre` (ffmpeg GLOBAL
@@ -2184,6 +2553,17 @@ function parseFfprobeJson(text) {
       return Number.isFinite(n) && n > 0 ? n : 0;
     };
     out.fps = parseRate(v.avg_frame_rate) || parseRate(v.r_frame_rate);
+    // v1.14.5 (satisfied-transform skips): the REAL base rate (CFR check —
+    // avg == r on constant-rate sources; a VFR-at-average source keeps the
+    // fps filter) + the sample aspect ratio ("1:1" → 1; anything else /
+    // unset → 0 = keep setsar). Old probe-cache entries simply lack both →
+    // every skip condition stays false (the conservative full chain).
+    out.rFps = parseRate(v.r_frame_rate);
+    out.sar = (() => {
+      const m = /^(\d+)\:(\d+)$/.exec(String(v.sample_aspect_ratio || ""));
+      if (m && Number(m[2]) > 0) return Number(m[1]) / Number(m[2]);
+      return 0;
+    })();
     out.bFrames = Math.max(0, Math.min(16, Math.round(Number(v.has_b_frames) || 0)));
     const rotations = (Array.isArray(v.side_data_list) ? v.side_data_list : [])
       .map((sd) => Number(sd && sd.rotation))
@@ -2501,8 +2881,11 @@ async function runPool(jobs, workerCount, cbs) {
         const idx = next;
         next += 1;
         if (idx >= jobs.length) return;
+        // v1.14.5 PROFILER: per-job wall (from launch to process exit).
+        const jobStart = Date.now();
         try {
           await runFfmpeg(jobs[idx].args, jobs[idx].durSec, (sec) => cbs.onTime(idx, sec));
+          if (cbs.onJobEnd) cbs.onJobEnd(idx, Date.now() - jobStart);
           cbs.onDone(idx);
         } catch (err) {
           killSiblings();
@@ -3193,7 +3576,7 @@ function optimizeAssForConstrainedCpu(doc) {
 }
 
 ipcMain.handle("export-native", async (event, opts) => {
-  const { outputPath, fps, width: reqWidth, height: reqHeight, bitrateMbps, quality, crf, audioKbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark, overlays, sfx, fastMode: fastModeWanted } = opts;
+  const { outputPath, fps: reqFps, width: reqWidth, height: reqHeight, bitrateMbps, quality, crf, audioKbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark, overlays, sfx, fastMode: fastModeWanted, slideshowFps24 } = opts;
   // v1.14.4 CONSTRAINED-CPU FAST MODE (see planSmartRenderingPipeline): the
   // requested resolution can be DOWNSCALED mid-export on Tier-3 machines
   // (mostly-dirty long timelines) — width/height stay mutable for that one
@@ -3202,6 +3585,11 @@ ipcMain.handle("export-native", async (event, opts) => {
   // the values at build time.
   let width = reqWidth;
   let height = reqHeight;
+  // v1.14.5: fps is now `let` — the SLIDESHOW 24 FPS MODE (export-speed plan
+  // §2 — Phase 1) re-assigns it below for pure-image timelines. Every
+  // consumer (frame law, zoompan, ASS windows, chunk caps) reads this single
+  // binding, so one reassignment keeps the whole pipeline consistent.
+  let fps = Number(reqFps) || 30;
 
   if (!outputPath) throw new Error("No output path");
   if (!segments || segments.length === 0) throw new Error("No segments");
@@ -3235,12 +3623,53 @@ ipcMain.handle("export-native", async (event, opts) => {
   const headlinesEnabled = Array.isArray(headlines) && headlines.some((h) => h && h.text && h.endMs > h.startMs);
   const totalMs = segments.reduce((sum, s) => Math.max(sum, s.endMs ?? (s.startMs ?? 0) + s.durationMs), 0) || segments.reduce((sum, s) => sum + s.durationMs, 0);
   const totalSec = totalMs / 1000;
-  // v1.2: export audio bitrate — validated against the allowed ladder,
+
+  // ── v1.14.5 SLIDESHOW 24 FPS MODE (export-speed plan §2 — Phase 1) ──────
+  // A pure-image timeline (no base-lane VIDEO segments) renders 20 % fewer
+  // frames through EVERY downstream stage (zoompan, overlays, captions,
+  // encode) at 24 instead of 30 — the film rate, imperceptible on
+  // slideshows. Mixed video keeps the project rate, 60 fps projects keep 60,
+  // cinema is never touched, and the switch is NEVER silent: the result
+  // payload + toast say it, with the off switch in Export settings
+  // (`slideshowFps24`, default ON).
+  const allImages = segments.every((s) => s && s.mediaType !== "video");
+  let slideshowFpsApplied = null;
+  if (
+    allImages &&
+    slideshowFps24 !== false &&
+    fps > 24 && fps < 60 &&
+    quality !== "cinema" &&
+    totalMs >= 12000
+  ) {
+    slideshowFpsApplied = { from: fps, to: 24 };
+    fps = 24;
+    console.log(
+      `[Export] SLIDESHOW 24 FPS MODE: ${slideshowFpsApplied.from} → 24 fps ` +
+        `(pure-image ${(totalMs / 1000).toFixed(1)}-s timeline — 20 % fewer frames per filter; disable in Export settings)`,
+    );
+  }
+
+  // v1.14.5 EXPORT PROFILER (plan §1 — Phase 0): records stage/worker timing
+  // for THIS export; the payload + JSON file answer "where did the time go".
+  const prof = createExportProfiler({
+    requestedFps: Number(reqFps) || 30,
+    outputFps: fps,
+    width: reqWidth,
+    height: reqHeight,
+    quality,
+    segments: segments.length,
+    images: segments.reduce((n, s) => n + (s && s.mediaType !== "video" ? 1 : 0), 0),
+    slideshowFps: slideshowFpsApplied ? `${slideshowFpsApplied.from}->24` : null,
+  });
+
+  // v2.1: export audio bitrate — validated against the allowed ladder,
   // 192 default (the v1.1 constant).
   const abr = [96, 128, 192, 256, 320].includes(Number(audioKbps)) ? Number(audioKbps) : 192;
   // v5.1: async warm-started GPU detection — the handler NEVER blocks the
   // main process before the first frame (was: execSync up to 25 s).
+  prof.beginStage("encoder-detect");
   const encoder = await detectGpuEncoderAsync();
+  prof.endStage("encoder-detect");
 
   ensureTempDir();
   const tempFiles = [];
@@ -3380,6 +3809,8 @@ ipcMain.handle("export-native", async (event, opts) => {
       }
     }
 
+    prof.beginStage("build");
+
     // ─── STEP 1 (build): probes → per-clip argv jobs ───────────────
     // v4.3 transition planning + zoompan math + all three v4.9 branches
     // (xfade head / watermark graph / plain -vf) live in
@@ -3410,7 +3841,35 @@ ipcMain.handle("export-native", async (event, opts) => {
     // stay consistent).
     const cpuCount = hwProfile.cpuLogical;
     console.log(`[Export] Selected ${hwProfile.tier} (${encoder.name}) · ${hwProfile.cpuTopology} · encode pool ${hwProfile.workers}×${hwProfile.threadsPerWorker}${hwProfile.filterWorkers !== hwProfile.workers ? ` · filter pool ${hwProfile.filterWorkers}×1` : ""}`);
-    const encArgs = encoderArgs(encoder.name, bitrateMbps, width, height, quality, crf, hwProfile.tier);
+
+    // ── v1.14.5 RENDER-COST STRATEGY (pre-plan, worst-case bound) ──────
+    // The encoder profile must be decided BEFORE any job argv exists, so
+    // this first estimate bounds dirtySec at the FULL timeline (the smart
+    // plan's ACTUAL dirty share only refines the LATER 720p decision —
+    // over-estimating here can only pick the faster encoder, never a lower
+    // resolution). Structure-only inputs: no probes needed.
+    const costEstimate = estimateRenderCost({
+      width,
+      height,
+      fps,
+      durationSec: totalSec,
+      dirtySec: totalSec,
+      captions: captionsEnabled,
+      headlines: headlinesEnabled,
+      overlayCount: overlaySegs.length,
+      chromaCount: overlaySegs.filter((ov) => ov && ov.chroma).length,
+      kenBurnsCount: enabled ? segments.reduce((n, s) => n + (s && s.mediaType !== "video" ? 1 : 0), 0) : 0,
+      transitionCount: Math.max(0, segments.length - 1),
+    });
+    const speedProfile = costEstimate.strategy === "HIGH" || costEstimate.strategy === "VERY_HIGH" ? "fast" : "balanced";
+    prof.cost = { ...costEstimate, speedProfile };
+    if (speedProfile === "fast") {
+      console.log(
+        `[Export] render-cost ${costEstimate.score} (${costEstimate.strategy}: ${costEstimate.pixelCost} G-frames × ${costEstimate.effectCost} effects) → FAST encoder profile`,
+      );
+    }
+
+    const encArgs = encoderArgs(encoder.name, bitrateMbps, width, height, quality, crf, hwProfile.tier, speedProfile);
     // v1.13: the compact speed-point descriptor for the completion toast
     // ("Tier 3 · constrained CPU · ultrafast").
     const enginePreset = (() => {
@@ -4087,6 +4546,7 @@ ipcMain.handle("export-native", async (event, opts) => {
     // have nothing to segment); any smart-plan failure (probe, eligibility,
     // script budget, init-class error < 4 s) falls back to the
     // battle-tested two-step pool with zero user impact.
+    prof.endStage("build");
     const anyEncodeJob = jobs.length > 0 && jobs.some((j) => !j.copy);
 
     const planSmartRenderingPipeline = async () => {
@@ -4112,12 +4572,25 @@ ipcMain.handle("export-native", async (event, opts) => {
         // encoded. The probes are independent and I/O-bound, so they now
         // run 4-wide (mapBoundedConcurrent); same-key callers coalesce
         // through the promise-level caches, and slot order is preserved.
+        // v1.14.5: every VIDEO branch now also carries the probe shape the
+        // satisfied-transform skips need (srcW/srcH/srcFps/rFps/sar/pixFmt/
+        // rotated — planSmartSegments ignores the extras).
+        prof.beginStage("srcFacts");
         const srcFacts = await mapBoundedConcurrent(segments, 4, async (seg) => {
           const isVideo = !!(seg && seg.mediaType === "video" && seg.videoPath);
           if (!isVideo || G.resolveSegSpeed(seg) !== 1) {
-            return { copyCapable: false, keyframes: null, trimAligned: null, srcFps: 0, mismatch: null };
+            return { copyCapable: false, keyframes: null, trimAligned: null, srcFps: 0, srcW: 0, srcH: 0, rFps: 0, sar: 0, pixFmt: "", rotated: false, mismatch: null };
           }
           const probe = await probeMediaAsync(seg.videoPath);
+          const probeFacts = {
+            srcFps: Number(probe.fps) || 0,
+            srcW: Number(probe.width) || 0,
+            srcH: Number(probe.height) || 0,
+            rFps: Number(probe.rFps) || 0,
+            sar: Number(probe.sar) || 0,
+            pixFmt: String(probe.pixFmt || ""),
+            rotated: !!probe.rotated,
+          };
           const srcDurMs = Number(probe.durationMs) || 0;
           const specOk =
             probe.codec === "h264" &&
@@ -4147,7 +4620,7 @@ ipcMain.handle("export-native", async (event, opts) => {
             } else {
               mismatch = `pixel format ${probe.pixFmt || "unknown"} (needs re-encode)`;
             }
-            return { copyCapable: false, keyframes: null, trimAligned: null, srcFps: Number(probe.fps) || 0, bFrames: 0, srcDurMs: 0, mismatch };
+            return { copyCapable: false, keyframes: null, trimAligned: null, ...probeFacts, bFrames: 0, srcDurMs: 0, mismatch };
           }
           const trimInMs = Number(seg.trimInMs) || 0;
           const trimAligned = trimInMs > 0
@@ -4166,7 +4639,7 @@ ipcMain.handle("export-native", async (event, opts) => {
             copyCapable: true,
             keyframes: kfs,
             trimAligned,
-            srcFps: Number(probe.fps) || 0,
+            ...probeFacts,
             // v9: the codec reorder depth (DTS lags PTS by b frames) + the
             // source length — planSmartSegments subtracts b/g from a clean
             // piece's -t so the copy tail lands on the exact display frame
@@ -4176,6 +4649,7 @@ ipcMain.handle("export-native", async (event, opts) => {
             srcDurMs,
           };
         });
+        prof.endStage("srcFacts");
 
         // ── Pool width + thread budgets ──────────────────────────────────
         // v1.13 (user directive — Adaptive Hardware Matrix): the smart-path
@@ -4200,6 +4674,7 @@ ipcMain.handle("export-native", async (event, opts) => {
           : hwProfile.workers;
 
         // ── The plan (pure) ──────────────────────────────────────────────
+        prof.beginStage("plan");
         const plan = SP.planSmartSegments({
           segments,
           overlays: overlaySegs,
@@ -4230,6 +4705,7 @@ ipcMain.handle("export-native", async (event, opts) => {
           console.log("[framefuse] smart render skipped: planner returned no plan → two-step pool");
           return null;
         }
+        prof.endStage("plan");
 
         // ── v1.14.4 CONSTRAINED-CPU FAST RESOLUTION ─────────────────
         // Field report: "after version 12 and 13 export speed became
@@ -4238,24 +4714,48 @@ ipcMain.handle("export-native", async (event, opts) => {
         // 1080p full-dirty re-encode on a Piledriver-class APU runs ≈1×
         // realtime at ultrafast — no thread topology changes that. This is
         // the Draft-profile escape hatch, made AUTOMATIC and honest:
-        // Tier 3 + a mostly-dirty (parallel-pass) timeline ≥4 min + a
-        // 1080p-class request + non-cinema quality → render at the 720p-class
-        // resolution of the SAME aspect (short edge 720; 921k vs 2.07M pixels
-        // ≈ 2.2× less encode+filter work). Every consumer below (ASS docs,
-        // windowed graphs, overlay geometry via the width/height closure)
-        // reads the re-assigned dims; the two-step fallback jobs were built
-        // BEFORE this point and keep the original resolution; the watermark
-        // geometry (absolute px from the renderer) is scaled by the same
-        // factor. The result payload + toast SAY it — never a silent quality
-        // change — and the renderer's Export settings carry the off switch.
+        // ~2.2× less encode+filter work at the 720p-class resolution of the
+        // SAME aspect. Every consumer below (ASS docs, windowed graphs,
+        // overlay geometry via the width/height closure) reads the
+        // re-assigned dims; the two-step fallback jobs were built BEFORE this
+        // point and keep the original resolution; the watermark geometry
+        // (absolute px from the renderer) is scaled by the same factor. The
+        // result payload + toast SAY it — never a silent quality change —
+        // and the renderer's Export settings carry the off switch.
+        //
+        // v1.14.5: the TRIGGER is now the RENDER-COST SCORE (plan §11 —
+        // Phase 9) instead of "≥240 s AND ≥1080p": score ≥ 14 (VERY HIGH)
+        // computed from the plan's ACTUAL dirty seconds × the effect load —
+        // so a 3:59 and a 4:01 export of the same timeline behave the same,
+        // effect-heavy short timelines qualify, and effectless ones need
+        // duration to get there (the 240 s/1080p anchor case scores 14.93).
+        // The structural gates stay: Tier 3, no clean pieces (downscaling a
+        // mixed timeline would leave clean 1080p copies colliding with 720p
+        // chunks in the concat), never cinema, ≥60 s, short edge > 720,
+        // and the user's off switch.
+        const costPost = estimateRenderCost({
+          width,
+          height,
+          fps,
+          durationSec: totalSec,
+          dirtySec: (Number(plan.dirtyMs) || 0) / 1000,
+          captions: captionsEnabled,
+          headlines: headlinesEnabled,
+          overlayCount: overlaySegs.length,
+          chromaCount: overlaySegs.filter((ov) => ov && ov.chroma).length,
+          kenBurnsCount: enabled ? segments.reduce((n, s) => n + (s && s.mediaType !== "video" ? 1 : 0), 0) : 0,
+          transitionCount: Math.max(0, segments.length - 1),
+        });
+        prof.costPost = costPost;
         let fastModeApplied = null;
         if (
           hwProfile.tier === "TIER_3_CONSTRAINED_CPU" &&
           fastModeWanted !== false &&
           plan.parallelMode &&
           quality !== "cinema" &&
-          totalMs >= 240000 &&
-          Math.min(width, height) >= 1080
+          totalMs >= 60000 &&
+          Math.min(width, height) > 720 &&
+          costPost.strategy === "VERY_HIGH"
         ) {
           const s = 720 / Math.min(width, height);
           const even = (v) => Math.max(2, Math.round((v * s) / 2) * 2);
@@ -4265,7 +4765,7 @@ ipcMain.handle("export-native", async (event, opts) => {
             fastModeApplied = { from: `${width}x${height}`, to: `${fw}x${fh}` };
             console.log(
               `[Export] CONSTRAINED-CPU FAST MODE: ${fastModeApplied.from} → ${fastModeApplied.to} ` +
-                `(Tier 3 · mostly-dirty ${(totalMs / 60000).toFixed(1)}-min timeline — ~2.2× fewer pixels to encode; disable in Export settings)`,
+                `(Tier 3 · render-cost ${costPost.score} ${costPost.strategy} — ${costPost.pixelCost} G-frames × ${costPost.effectCost} effects · ~2.2× fewer pixels to encode; disable in Export settings)`,
             );
             width = fw;
             height = fh;
@@ -4336,7 +4836,16 @@ ipcMain.handle("export-native", async (event, opts) => {
         }
         let spLoudnorm = null;
         let spMasterLoudnorm = null;
+        // v1.14.5 SIMPLE-AUDIO FAST PATH (plan §5): ≤3 branches AND every
+        // branch has a usable measurement → the graph applies STATIC gains
+        // (volume=dB) instead of the loudnorm filters, and the master-bus
+        // estimate becomes a static gain too. The disk cache (§4) already
+        // removed the re-measurement spawns for repeat sources; this removes
+        // the per-branch ebur128 analysis from the render itself.
+        let spAudioFastGain = false;
+        let spMasterGainDb = null;
         if (audio && audio.normalize && (clipAudioBranches.length > 0 || audioPath)) {
+          prof.beginStage("loudness");
           const measures = { clip: new Array(clipAudioBranches.length).fill(null), music: null };
           const tasks = clipAudioBranches.map((c, k) => ({
             kind: "clip", k,
@@ -4355,17 +4864,46 @@ ipcMain.handle("export-native", async (event, opts) => {
               else measures.music = res[r];
             });
           }
+          prof.endStage("loudness");
           spLoudnorm = measures;
-          spMasterLoudnorm = G.estimateMixLoudnorm({
-            totalSec,
-            audio,
-            clipAudio: clipAudioBranches.map((c, k) => ({
-              measure: measures.clip[k],
-              volume: c.volume,
-              durationMs: c.durationMs,
-            })),
-            music: measures.music,
-          });
+          const branchCount = clipAudioBranches.length + (audioPath ? 1 : 0);
+          const clipsUsable = measures.clip.every((m) => G.loudnessGainDb(m) != null);
+          const musicUsable = !audioPath || G.loudnessGainDb(measures.music) != null;
+          spAudioFastGain = branchCount > 0 && branchCount <= 3 && clipsUsable && musicUsable;
+          if (spAudioFastGain) {
+            // The estimated mix loudness as the master static gain (same
+            // energy-sum math estimateMixLoudnorm uses for its filter form).
+            const est = G.estimateMixLoudnessDb({
+              totalSec,
+              audio,
+              clipAudio: clipAudioBranches.map((c, k) => ({
+                measure: measures.clip[k],
+                volume: c.volume,
+                durationMs: c.durationMs,
+              })),
+              music: measures.music,
+            });
+            if (est) {
+              const db = -16 - est.i;
+              if (Number.isFinite(db) && Math.abs(db) <= 24) spMasterGainDb = Math.round(db * 100) / 100;
+            }
+            console.log(
+              `[Export] simple-audio fast path: ${branchCount} branch(es), static gains ` +
+                `(volume=dB, master ${spMasterGainDb != null ? `${spMasterGainDb}dB` : "—"}) — loudnorm filters skipped`,
+            );
+          }
+          if (!spAudioFastGain) {
+            spMasterLoudnorm = G.estimateMixLoudnorm({
+              totalSec,
+              audio,
+              clipAudio: clipAudioBranches.map((c, k) => ({
+                measure: measures.clip[k],
+                volume: c.volume,
+                durationMs: c.durationMs,
+              })),
+              music: measures.music,
+            });
+          }
         }
 
         // ── Hw decode per source (probe-gated, cached per path) ───────────
@@ -4493,6 +5031,8 @@ ipcMain.handle("export-native", async (event, opts) => {
             loudnorm: null,
             masterLoudnorm: null,
             hwaccelPerSeg,
+            // v1.14.5: probed source facts for the satisfied-transform skips.
+            srcFacts,
           });
           if (cPlan.scriptBytes > SP.SINGLEPASS_MAX_SCRIPT_BYTES) {
             console.warn(`[framefuse] smart render skipped: piece ${pi + 1}/${plan.pieces.length} graph ${cPlan.scriptBytes}B > ${SP.SINGLEPASS_MAX_SCRIPT_BYTES}B budget → two-step pool`);
@@ -4502,6 +5042,15 @@ ipcMain.handle("export-native", async (event, opts) => {
           const scriptPath = path.join(tempDir, `graph_sm${pi}_${Date.now()}.txt`);
           fs.writeFileSync(scriptPath, cPlan.script, "utf-8");
           tempFiles.push(scriptPath);
+          // v1.14.5 PROFILER: classify the window's graph from the script it
+          // will actually run — the worker record reports where THIS piece's
+          // wall time went (zoompan/libass/overlay/chromakey/xfade).
+          const perfClasses = [];
+          if (/zoompan=/.test(cPlan.script)) perfClasses.push("zoompan");
+          if (/subtitles=/.test(cPlan.script)) perfClasses.push("captions");
+          if (/overlay=/.test(cPlan.script)) perfClasses.push("overlay");
+          if (/chromakey|lumakey/.test(cPlan.script)) perfClasses.push("chromakey");
+          if (/xfade=/.test(cPlan.script)) perfClasses.push("xfade");
           poolJobs.push({
             args: SP.buildSinglePassArgs({
               plan: cPlan,
@@ -4522,6 +5071,8 @@ ipcMain.handle("export-native", async (event, opts) => {
             segId: plan.parallelMode
               ? `parallel window ${dirtyWindows}/${dirtyTotal}`
               : `smart window ${dirtyWindows}/${dirtyTotal}`,
+            perfClasses,
+            frameCap: piece.frames,
           });
         }
         if (overBudget) return null;
@@ -4548,6 +5099,13 @@ ipcMain.handle("export-native", async (event, opts) => {
         let spAudioFrac = 0;
         const poolStart = Date.now();
         let lastEmit = 0;
+        prof.setPool({
+          width: poolWidth,
+          jobs: poolJobs.length,
+          copyJobs: cleanCopies,
+          dirtyJobs: dirtyWindows,
+          threadsPerWorker: threadsPer,
+        });
         const emitSmartProgress = (force) => {
           const now = Date.now();
           if (!force && now - lastEmit < 100) return;
@@ -4585,6 +5143,9 @@ ipcMain.handle("export-native", async (event, opts) => {
                 clipAudio: clipAudioBranches,
                 loudnorm: spLoudnorm,
                 masterLoudnorm: spMasterLoudnorm,
+                // v1.14.5: the simple-audio fast path (static gains).
+                audioFastGain: spAudioFastGain,
+                masterGainDb: spMasterGainDb,
               });
               if (!aPlan.hasAudioOut) return;
               const aScriptPath = path.join(tempDir, `graph_sma_${Date.now()}.txt`);
@@ -4605,6 +5166,7 @@ ipcMain.handle("export-native", async (event, opts) => {
                   spAudioFrac = Math.min(1, sec / Math.max(0.01, totalSec));
                   emitSmartProgress(false);
                 });
+                prof.setStage("audio-bus", Date.now() - audioStart);
                 console.log(
                   `[framefuse] audio bus pass finished in ${((Date.now() - audioStart) / 1000).toFixed(1)}s (ran concurrent with the video pool)`,
                 );
@@ -4615,6 +5177,7 @@ ipcMain.handle("export-native", async (event, opts) => {
           : null;
 
         exportPhase = "video";
+        prof.beginStage("pool");
         try {
           await runPool(poolJobs, poolWidth, {
             onTime: (idx, sec) => {
@@ -4624,6 +5187,19 @@ ipcMain.handle("export-native", async (event, opts) => {
             onDone: (idx) => {
               chunkFrac[idx] = 1;
               emitSmartProgress(true);
+            },
+            // v1.14.5 PROFILER: per-job wall + graph classes.
+            onJobEnd: (idx, wallMs) => {
+              const j = poolJobs[idx] || {};
+              prof.worker({
+                idx,
+                copy: !!j.copy,
+                segId: j.segId,
+                durMs: j.durationMs,
+                frames: j.frameCap || 0,
+                wallMs,
+                classes: j.perfClasses || [],
+              });
             },
           });
         } catch (err) {
@@ -4639,6 +5215,7 @@ ipcMain.handle("export-native", async (event, opts) => {
           }
           throw err;
         }
+        prof.endStage("pool");
 
         // Audio bus join (usually already finished — it started with the
         // pool and typically runs several × realtime).
@@ -4678,12 +5255,14 @@ ipcMain.handle("export-native", async (event, opts) => {
           outputPath,
         ];
         const muxStageStart = Date.now();
+        prof.beginStage("mux");
         try {
           await runFfmpeg(muxArgs, totalSec, (sec) => {
             const frac = 0.965 + 0.035 * Math.min(1, sec / Math.max(0.01, totalSec));
             sendProgress(frac * 100, sec, etaFor(frac));
           });
         } catch (err) {
+          prof.endStage("mux");
           if (err && err.message === "Export cancelled") throw err;
           if (Date.now() - muxStageStart < 4000) {
             console.warn("[framefuse] smart render concat/mux failed at init — falling back to the two-step pool:", err.message);
@@ -4691,6 +5270,7 @@ ipcMain.handle("export-native", async (event, opts) => {
           }
           throw err;
         }
+        prof.endStage("mux");
 
         // ── Aggressive cleanup + the result payload ──────────────────────
         exportPhase = "done";
@@ -4745,6 +5325,18 @@ ipcMain.handle("export-native", async (event, opts) => {
           fastModeTo: fastModeApplied ? fastModeApplied.to : undefined,
           outputWidth: width,
           outputHeight: height,
+          // v1.14.5: the slideshow 24-fps mode + the render-cost story + the
+          // per-export performance profile (stage/worker telemetry JSON).
+          outputFps: fps,
+          slideshowFps: slideshowFpsApplied ? true : undefined,
+          slideshowFpsFrom: slideshowFpsApplied ? slideshowFpsApplied.from : undefined,
+          slideshowFpsTo: slideshowFpsApplied ? slideshowFpsApplied.to : undefined,
+          costStrategy: costPost.strategy,
+          renderCost: { score: costPost.score, pixelCost: costPost.pixelCost, effectCost: costPost.effectCost },
+          encoderSpeedProfile: speedProfile,
+          audioFastGain: spAudioFastGain || undefined,
+          hwCaps: hwProfile.hwCaps || undefined,
+          profile: prof.finish({ path: outputPath, size, contentSec: totalSec, mode: plan.parallelMode ? "parallel-pass" : "smart-render" }),
           // v1.10 (Task 2): the primary human-readable dirty reason — the
           // toast shows "Full re-encode required: [reason]" when 0 % was
           // copied.
@@ -4793,6 +5385,14 @@ ipcMain.handle("export-native", async (event, opts) => {
       sendProgress(frac * 95, doneMs / 1000, etaFor(frac));
     };
     exportPhase = "video";
+    prof.setPool({
+      width: poolN,
+      jobs: poolJobs.length,
+      copyJobs: poolJobs.filter((j) => j.copy).length,
+      dirtyJobs: poolJobs.filter((j) => !j.copy).length,
+      threadsPerWorker: threadBudget,
+    });
+    prof.beginStage("pool");
     await runPool(poolJobs, poolN, {
       onTime: (idx, sec) => {
         clipFrac[idx] = Math.min(1, sec / Math.max(0.01, poolJobs[idx].durSec));
@@ -4802,7 +5402,21 @@ ipcMain.handle("export-native", async (event, opts) => {
         clipFrac[idx] = 1;
         emitProgress(true);
       },
+      // v1.14.5 PROFILER: per-job wall (two-step pool).
+      onJobEnd: (idx, wallMs) => {
+        const j = poolJobs[idx] || {};
+        prof.worker({
+          idx,
+          copy: !!j.copy,
+          segId: j.segId,
+          durMs: j.durationMs,
+          frames: 0,
+          wallMs,
+          classes: j.idx != null ? ["clip-encode"] : (j.copy ? [] : ["encode"]),
+        });
+      },
     });
+    prof.endStage("pool");
 
     // ─── STEP 2: Concat all clips + mix audio ONCE (video: -c copy) ──
     // v1.1 TURBO: stream copies cut at PACKET granularity and re-encodes
@@ -4847,9 +5461,42 @@ ipcMain.handle("export-native", async (event, opts) => {
     // Measurement failure per file → null → that branch falls back to
     // single-pass loudnorm (the v5.2 behavior); normalize OFF → argv
     // unchanged (byte-identical to v1.1).
+    // v1.14.5: the clip WAVs are temp files (unique per export — not
+    // disk-cacheable), but the MUSIC measurement is (user source). The
+    // SIMPLE-AUDIO fast path applies here too: ≤3 branches + all measured →
+    // static gains + the estimated master gain, skipping the v1.3
+    // render-mix-to-WAV-remeasure round trip entirely.
     let loudnormCtx = null;
+    let audioFastGain = false;
+    let masterGainDb = null;
     if (audio && audio.normalize && (clipAudioJobs.length > 0 || audioPath)) {
+      prof.beginStage("loudness");
       loudnormCtx = await measureLoudnormContext(clipAudioJobs, audioPath);
+      prof.endStage("loudness");
+      const branchCount = clipAudioJobs.length + (audioPath ? 1 : 0);
+      const clipsUsable = (loudnormCtx.clip || []).every((m) => G.loudnessGainDb(m) != null);
+      const musicUsable = !audioPath || G.loudnessGainDb(loudnormCtx.music) != null;
+      audioFastGain = branchCount > 0 && branchCount <= 3 && clipsUsable && musicUsable;
+      if (audioFastGain) {
+        const est = G.estimateMixLoudnessDb({
+          totalSec: actualTotalSec,
+          audio,
+          clipAudio: clipAudioJobs.map((j, k) => ({
+            measure: loudnormCtx.clip ? loudnormCtx.clip[k] : null,
+            volume: j.volume,
+            durationMs: j.durationMs,
+          })),
+          music: loudnormCtx.music,
+        });
+        if (est) {
+          const db = -16 - est.i;
+          if (Number.isFinite(db) && Math.abs(db) <= 24) masterGainDb = Math.round(db * 100) / 100;
+        }
+        console.log(
+          `[Export] simple-audio fast path: ${branchCount} branch(es), static gains ` +
+            `(volume=dB, master ${masterGainDb != null ? `${masterGainDb}dB` : "—"}) — loudnorm filters + master-mix render skipped`,
+        );
+      }
     }
 
     // ─── v1.3: MASTER-BUS loudnorm (render → measure → mux) ────────
@@ -4872,7 +5519,11 @@ ipcMain.handle("export-native", async (event, opts) => {
     const audioBranchCount =
       (audioPath ? 1 : 0) + clipAudioJobs.length + sfxList.length;
     if (
-      audio && audio.normalize && audioBranchCount >= 2 && actualTotalSec > 0
+      audio && audio.normalize && audioBranchCount >= 2 && actualTotalSec > 0 &&
+      // v1.14.5: the simple-audio fast path replaces the render+remeasure
+      // round trip with the energy-sum master estimate (a static gain in the
+      // direct graph — see buildConcatArgs' masterGainDb).
+      !audioFastGain
     ) {
       try {
         const mixWavPath = path.join(tempDir, `mixmaster_${Date.now()}.wav`);
@@ -4919,6 +5570,9 @@ ipcMain.handle("export-native", async (event, opts) => {
       sfx: sfxList,
       loudnorm: loudnormCtx,
       masterMix,
+      // v1.14.5: the simple-audio fast path (static gains).
+      audioFastGain,
+      masterGainDb,
       audioKbps: abr,
       clipAudio: clipAudioJobs.map((j) => ({
         wavPath: j.wavPath,
@@ -4929,6 +5583,7 @@ ipcMain.handle("export-native", async (event, opts) => {
     });
 
     exportPhase = "mux";
+    prof.beginStage("mux");
     await runFfmpeg(concatArgs, actualTotalSec, (sec) => {
       const frac = 0.96 + 0.04 * Math.min(1, sec / Math.max(0.01, actualTotalSec));
       // v5 fix (pre-existing v4.9 bug): sendProgress takes PERCENT — the old
@@ -4936,6 +5591,7 @@ ipcMain.handle("export-native", async (event, opts) => {
       // during the mux. Payload shape (progress/fps/eta/timemark) unchanged.
       sendProgress(frac * 100, sec, etaFor(frac));
     });
+    prof.endStage("mux");
 
     exportPhase = "done";
     sendProgress(100, actualTotalSec, 0);
@@ -4977,12 +5633,30 @@ ipcMain.handle("export-native", async (event, opts) => {
       enginePreset,
       singlePass: false,
       mode: "two-step",
+      // v1.14.5: the same payload story the smart path carries (slideshow
+      // fps, render-cost strategy, encoder profile, capability matrix,
+      // per-export performance profile).
+      outputFps: fps,
+      slideshowFps: slideshowFpsApplied ? true : undefined,
+      slideshowFpsFrom: slideshowFpsApplied ? slideshowFpsApplied.from : undefined,
+      slideshowFpsTo: slideshowFpsApplied ? slideshowFpsApplied.to : undefined,
+      outputWidth: width,
+      outputHeight: height,
+      costStrategy: costEstimate.strategy,
+      renderCost: { score: costEstimate.score, pixelCost: costEstimate.pixelCost, effectCost: costEstimate.effectCost },
+      encoderSpeedProfile: speedProfile,
+      audioFastGain: audioFastGain || undefined,
+      hwCaps: hwProfile.hwCaps || undefined,
+      profile: prof.finish({ path: outputPath, size, contentSec: actualTotalSec, mode: "two-step" }),
     };
 
   } catch (err) {
     for (const f of tempFiles) { try { fs.unlinkSync(f); } catch (_) {} }
     throw err;
   } finally {
+    // v1.14.5: the profiler's CPU sampler must never outlive the handler
+    // (success, failure, or cancellation).
+    try { prof.stopCpuSampler(); } catch (_) {}
     // v5 leak guard: a finished (or failed/cancelled) export must never
     // leave ffmpeg children behind — kill + warn if any survived.
     leakGuard();
@@ -4997,6 +5671,9 @@ app.whenReady().then(() => {
   // v5.1: warm the GPU-encoder probe at startup so the FIRST export starts
   // encoding immediately instead of paying the detection latency up front.
   detectGpuEncoderAsync();
+  // v1.14.5: warm the ffmpeg capability matrix alongside (one -hwaccels +
+  // one -filters listing — the first export's result payload gets it free).
+  detectHwCapsAsync();
   // v1.14.3 ICON FIX (field report: "icon blank on desktop/shortcut after
   // install; the installer showed it fine"): the installed exe keeps its
   // path across upgrades, so the Windows shell icon cache can keep the
@@ -5033,5 +5710,11 @@ app.on("will-quit", () => {
 // v1.13: also exports the pure tier resolver + the Tier-3 ASS optimizer so
 // the throwaway harnesses can unit-verify the Adaptive Hardware Matrix.
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { buildAssDocument, assAnimTags, buildHeadlineEvents, probeHwDecode, hwDecodeGate, resolveHardwareProfile, optimizeAssForConstrainedCpu, mapBoundedConcurrent };
+  module.exports = {
+    buildAssDocument, assAnimTags, buildHeadlineEvents, probeHwDecode, hwDecodeGate, resolveHardwareProfile, optimizeAssForConstrainedCpu, mapBoundedConcurrent,
+    // v1.14.5 Release-A hooks (verify-release-a.js): the cost score, the
+    // fast encoder profile, the profiler factory, the capability matrix,
+    // the cached loudness measurement, and the chain builder twin.
+    estimateRenderCost, encoderArgs, createExportProfiler, detectHwCapsAsync, measureLoudnessAsync, flushLoudnessDisk,
+  };
 }

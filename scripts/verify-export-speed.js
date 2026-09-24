@@ -57,7 +57,7 @@ const electronStub = {
     on: () => {},
     getPath: (k) => path.join(TMP, "userData"),
     getName: () => "FrameFuse",
-    getVersion: () => "1.14.4",
+    getVersion: () => "1.14.5",
     isReady: () => true,
     isPackaged: false,
     quit: () => {},
@@ -285,10 +285,14 @@ function check(name, cond, detail) {
     audioPath: `${TMP}/music30.wav`, captions: false,
   });
   const A = await runExport(benchHandler, `${TMP}/A_fast.mp4`, {
-    segments: benchSegs, fps: 3, width: 1920, height: 1080,
+    // v1.14.5: fps 3 → 12 — the cost-score gate needs real pixel-frames to
+    // reach VERY HIGH (1080p·12·240s·effects 3.9 = 23.3). A 3fps render is
+    // honestly CHEAP (5.8 → HIGH) and the new gate correctly declines to
+    // downgrade it — the plan's "cost-based, not duration-based" contract.
+    segments: benchSegs, fps: 12, width: 1920, height: 1080,
   });
   const B = await runExport(benchHandler, `${TMP}/B_full.mp4`, {
-    segments: benchSegs, fps: 3, width: 1920, height: 1080, fastMode: false,
+    segments: benchSegs, fps: 12, width: 1920, height: 1080, fastMode: false,
   });
   const dimsA = probeStream(`${TMP}/A_fast.mp4`);
   const dimsB = probeStream(`${TMP}/B_full.mp4`);
@@ -310,44 +314,49 @@ function check(name, cond, detail) {
 
   // ══ S5: the fast-mode gate matrix (never silent, never wrong) ═════════
   console.log("\n══ S5: fast-mode gate matrix ══");
-  // G1: 239 999ms — one millisecond below the ≥240s gate → no fast mode
-  // (7 images × 30 s + 1 × 29 999 ms)
+  // G1: a below-threshold workload keeps the requested resolution —
+  // v1.14.5 replaced the ≥240 s DURATION gate with the score gate, so "one
+  // ms under 240 s" is no longer the boundary; a genuinely cheaper
+  // workload (fps 6 → score 11.7 = HIGH) is. Same never-silent contract.
   const belowSegs = imageTimeline(7, 30000);
   belowSegs.push({
     ...imageTimeline(1, 29999)[0], id: "img7", fileName: "img7.png",
     imagePath: `${TMP}/img7.png`, startMs: 210000, endMs: 239999, durationMs: 29999,
   });
   const G1 = await runExport(benchHandler, `${TMP}/G1.mp4`, {
-    segments: belowSegs, fps: 1, width: 1920, height: 1080,
+    segments: belowSegs, fps: 6, width: 1920, height: 1080,
   });
-  check("G1: <240s keeps requested resolution", !G1.result.fastMode && probeStream(`${TMP}/G1.mp4`).w === 1920,
-    `${probeStream(`${TMP}/G1.mp4`).w}x${probeStream(`${TMP}/G1.mp4`).h}`);
-  // G2: fastMode:false (the Settings off switch)
+  check("G1: below-threshold workload keeps requested resolution", !G1.result.fastMode && probeStream(`${TMP}/G1.mp4`).w === 1920,
+    `${probeStream(`${TMP}/G1.mp4`).w}x${probeStream(`${TMP}/G1.mp4`).h} · score ${G1.result.renderCost && G1.result.renderCost.score}`);
+  // G2: fastMode:false (the Settings off switch) — the workload itself is
+  // VERY HIGH (fps 8 → 15.5); the switch blocks it.
   const G2 = await runExport(benchHandler, `${TMP}/G2.mp4`, {
-    segments: benchSegs, fps: 1, width: 1920, height: 1080, fastMode: false,
+    segments: benchSegs, fps: 8, width: 1920, height: 1080, fastMode: false,
   });
   check("G2: payload off-switch honored", !G2.result.fastMode && probeStream(`${TMP}/G2.mp4`).w === 1920);
-  // G3: cinema quality keeps the master resolution
+  // G3: cinema quality keeps the master resolution (score VERY HIGH,
+  // the cinema guard blocks the downgrade).
   const G3 = await runExport(benchHandler, `${TMP}/G3.mp4`, {
-    segments: benchSegs, fps: 1, width: 1920, height: 1080, quality: "cinema",
+    segments: benchSegs, fps: 8, width: 1920, height: 1080, quality: "cinema",
   });
   check("G3: cinema keeps full resolution", !G3.result.fastMode && probeStream(`${TMP}/G3.mp4`).w === 1920);
-  // G4: portrait 1080×1920 → 720×1280 (aspect ladder)
+  // G4: portrait 1080×1920 → 720×1280 (aspect ladder; fps 8 → 15.5 VH)
   const portSegs = imageTimeline(8, 30000, "img").map((s) => ({
     ...s, imagePath: `${TMP}/port0.png`, fileName: "port0.png",
   }));
   const G4 = await runExport(benchHandler, `${TMP}/G4.mp4`, {
-    segments: portSegs, fps: 1, width: 1080, height: 1920,
+    segments: portSegs, fps: 8, width: 1080, height: 1920,
   });
   const dimsG4 = probeStream(`${TMP}/G4.mp4`);
   check("G4: portrait maps to 720x1280", G4.result.fastModeTo === "720x1280" && dimsG4.w === 720 && dimsG4.h === 1280,
     `${dimsG4.w}x${dimsG4.h} · ${G4.result.fastModeTo}`);
-  // G5: square 1080×1080 → 720×720
-  const sqSegs = imageTimeline(8, 30000, "img").map((s) => ({
+  // G5: square 1080×1080 → 720×720 — the smaller pixel count needs more
+  // frames to reach 14 (200 s · fps 16 → 21.9)
+  const sqSegs = imageTimeline(8, 25000, "img").map((s) => ({
     ...s, imagePath: `${TMP}/sq0.png`, fileName: "sq0.png",
   }));
   const G5 = await runExport(benchHandler, `${TMP}/G5.mp4`, {
-    segments: sqSegs, fps: 1, width: 1080, height: 1080,
+    segments: sqSegs, fps: 16, width: 1080, height: 1080,
   });
   const dimsG5 = probeStream(`${TMP}/G5.mp4`);
   check("G5: square maps to 720x720", G5.result.fastModeTo === "720x720" && dimsG5.w === 720 && dimsG5.h === 720,

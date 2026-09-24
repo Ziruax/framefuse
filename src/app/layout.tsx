@@ -4,7 +4,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   // v1.14.2: the title states what the product is — a Windows desktop app
   // (the browser route is a landing page / dev preview, not the product).
-  title: "FrameFuse v1.14.4 — Windows Desktop Video Studio",
+  title: "FrameFuse v1.14.5 — Windows Desktop Video Studio",
   description:
     "Multi-track Windows desktop video studio: video clips, green-screen chroma key with on-canvas PiP, background music with volume & loop, SFX, native Whisper captions, and fast parallel FFmpeg export.",
   applicationName: "FrameFuse",

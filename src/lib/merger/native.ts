@@ -633,6 +633,10 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
       // only ever downscales on Tier-3 machines with mostly-dirty ≥4-min
       // timelines, and the result payload says it happened).
       fastMode: settings.constrainedFastMode !== false,
+      // v1.14.5: slideshow 24-fps mode (default ON — pure-image timelines
+      // render 20% fewer frames at the film rate; the result payload says
+      // it happened).
+      slideshowFps24: settings.slideshowFps24 !== false,
       // v1.2: export audio bitrate (192 default = v1.1 behavior).
       audioKbps: settings.audioKbps ?? 192,
       kenBurns,
