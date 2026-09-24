@@ -1319,3 +1319,24 @@ Stage Summary:
 - v1.14.4 released: 395113290, tag v1.14.4 → 4d5aa4a, assets FrameFuse-Setup-1.14.4.exe (376,937,250 B) + blockmap + latest.yml, hashes three-way verified.
 - The v1.12 regression (slow-d3d11va-riding) is reverted with a measured gate; probes persist 24 h; source probing is 4-wide; smart-mode image timelines get the widened 4×1 pool; and Tier-3 long mostly-dirty 1080p exports auto-render 720p-class (never silent, one-click off).
 - Known caveats: (1) the A/B bench's wall-clock 1.24× understates the pixel-ratio win because the 3 fps fixture is audio-bus-bound on the 2-core sandbox — real 30 fps video-dominated timelines approach 2×; (2) fast mode never applies to cinema quality or sub-4-minute timelines; (3) the GPU token still measured per source file (per-codec variance is why the probe is per-path rather than per-machine).
+
+---
+Task ID: 48
+Agent: main (Z.ai Code)
+
+Task: User round — "kindly list all details related to export function so that i analyse and suggest way to improve the export speed" (research/documentation only, no code changes).
+
+Work Log:
+- Read worklog Tasks 44–47 (v1.14.4 already shipped the export-speed regression fixes: hwDecodeGate, disk-persisted probes, 4-wide srcFacts, smart-pool widening, constrained-CPU fast mode).
+- CODE SURVEY for the report: electron/main.js export-native handler (L3195–4990) end-to-end (validation → probe warm → build loop w/ copy/sandwich/chunk paths → planSmartRenderingPipeline → audio bus → runPool → concat mux → two-step fallback + result telemetry); detectGpuEncoderAsync (L1489), detectCpuTopology (L1612), resolveHardwareProfile (L1695), hwDecodeGate/probeHwDecode (L1804/1810), encoderArgs + QUALITY_ENCODER (L1915–1975), runFfmpeg (L2020), runPool/mapBoundedConcurrent (L2471–2522), sendProgress/etaFor (L3255–3327), optimizeAssForConstrainedCpu (L3174).
+- export-singlepass.js: ceilings (SINGLEPASS_MAX_SEGMENTS 70 / OVERLAYS 40 / SCRIPT_BYTES 25000, CHUNKED 240/120), buildGlobalFades, segmentFrameSpans, planTimelineChunks, planSmartSegments (dirty zones → merge 400ms → keyframe snap ≤1frame/1GOP, absorb <750ms clean, parallel-mode gate <30% clean ≥15s, sub-split), buildSinglePassPlan (graph layer order: segs → concat → overlays → watermark → fades → captions), buildSinglePassArgs (-filter_threads, -video_track_timescale, -threads, -frames:v cap), buildAudioOnlyArgs.
+- export-graph.js: buildVideoInputArgs (tri-state hwaccel), buildVideoFilterChain (cover-fit scale/crop/setpts/fps/setsar/format), planChunkFrames (60s target), buildStreamCopyArgs (-c copy -an -avoid_negative_ts make_zero), buildAudioMixGraph (aformat 48k stereo, amix normalize=0, alimiter 0.97, apad whole_dur), atempoFilters, HWACCEL_TOKEN.
+- Frontend: src/lib/merger/native.ts (exportViaFFmpeg opts — zero-copy paths, dims via resolveDimensions), types.ts QUALITY_PROFILES (draft 720p/30/4Mbps, social 1080p/30/8, cinema 1080p/60/14), SettingsPanel quality/fps(24/30/60)/bitrate/CRF/audioKbps ladder.
+- docs/EXPORT_PERF.md read (TL;DR, routing, parity, benchmark tables, v1.14.4 section incl. A/B bench numbers).
+- Dev server was DOWN → restarted true double-fork, GET / 200.
+- Produced the comprehensive export-engine reference report in chat for the user's analysis (all 14 sections: pipeline stages, tier matrix, encoder ladder, pool/thread shapes, filter graph, audio bus, smart render, fast mode, progress/ETA, caches, version history, known bottlenecks).
+
+Stage Summary:
+- No code changes this round — the deliverable is the complete export-function technical reference handed to the user for their own speed-improvement analysis.
+- Current shipped state: v1.14.4 (main = 4d5aa4a + tag v1.14.4); all four v1.12/v1.13 speed regressions already fixed and verified 35/35; known remaining wall = Tier-3 physics (1080p full-dirty ≈ 1× realtime at ultrafast) + audio-bus-bound low-fps fixtures.
+- Dev server restarted (was down after the environment reaped it).
