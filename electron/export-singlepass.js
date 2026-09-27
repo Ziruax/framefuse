@@ -618,6 +618,14 @@ function padOverlayInputWindows(specs, durMs, padMs = 120) {
         Number(ov.b) > 0 &&
         Math.abs(Number(ov.b) - durSec) <= 0.001);
     if (!clipped) continue;
+    // v1.14.6 SINGLE-DECODE IMAGE OVERLAYS: their length lives as the
+    // chain's `loop=` count (ov.imgLoop — the input has no -t). Extend the
+    // count by the same pad instead of scanning argv.
+    if (ov.imgLoop != null) {
+      const extra = Math.max(1, Math.ceil((Math.max(0, Number(padMs) || 0) / 1000) * 25));
+      ov.imgLoop = Math.max(0, Math.round(Number(ov.imgLoop) || 0)) + extra;
+      continue;
+    }
     const args = ov.inputArgs;
     if (!Array.isArray(args)) continue;
     const iIdx = args.indexOf("-i");
@@ -1620,12 +1628,13 @@ function buildSinglePassPlan(o) {
     // path on a 12 MP still, i.e. the "static" images were the expensive
     // ones and image COUNT could never affect wall time: cost ∝ total
     // frames, not images). EVERY image now rides the single-frame input
-    // (no -loop): decode + supersample ONCE, then zoompan emits exactly the
-    // window's frames (d=emitFrames — the verified v6.5 frame-exactness
-    // machinery; kbEnabled=false renders the frozen z=1.1 static chain, the
-    // same shape the xfade frozen head already uses). Frame counts verified
-    // identical to the loop path (252 == 252 for 10.5 s @ 24 fps),
-    // scripts/verify-image-singledecode.js.
+    // (no -loop): decode ONCE, then the per-shape chain emits exactly the
+    // window's frames — ANIMATED: kenBurnsImageChain (zoompan d=emitFrames,
+    // the verified v6.5 frame-exactness machinery); STATIC:
+    // staticImageChain (scale/crop/format once + `loop` frame copies — a
+    // plain cover-fit, the exact frame the preview canvas and the two-step
+    // fallback draw, with ZERO per-frame pixel work). Frame counts verified
+    // exact (E1/E1b/E2 in scripts/verify-image-singledecode.js).
     inputs.push("-thread_queue_size", "512", "-i", seg.imagePath);
 
     if (headPlan[i].useXfadeHead) {
@@ -1638,31 +1647,47 @@ function buildSinglePassPlan(o) {
       const xfadeName = headPlan[i].plan.xfadeName;
       const prevSeg = segments[i - 1];
       const prevDir = kbEnabled ? prevSeg.direction || globalDir : "none";
-      const frz = G.frozenZoompanExpr(prevDir, zoomMax);
-      const scaleW = Math.round(width * 1.1);
-      const scaleH = Math.round(height * 1.1);
-      const pre =
-        `scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase:flags=lanczos,` +
-        `crop=${scaleW}:${scaleH}`;
-      const zpCommon = `d=${emitFrames}:s=${width}x${height}:fps=${fps}`;
+      // v1.14.6: a STATIC previous segment freezes at the plain cover-fit
+      // frame — the SAME pixels the preview and the non-transition static
+      // path show (the frozen z=1.1 crop was 10% tighter than both).
+      if (!kbEnabled || prevDir === "none") {
+        graph.push(
+          `[sp${i - 1}b]${G.staticImageChain({ segFrames, emitFrames, width, height, fps })}[fz${i}]`,
+        );
+      } else {
+        const frz = G.frozenZoompanExpr(prevDir, zoomMax);
+        const scaleW = Math.round(width * 1.1);
+        const scaleH = Math.round(height * 1.1);
+        const pre =
+          `scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase:flags=lanczos,` +
+          `crop=${scaleW}:${scaleH}`;
+        const zpCommon = `d=${emitFrames}:s=${width}x${height}:fps=${fps}`;
+        graph.push(
+          `[sp${i - 1}b]${pre},zoompan=z='${frz.z}':x='${frz.x}':y='${frz.y}':${zpCommon},` +
+            `setsar=1,format=yuv420p[fz${i}]`,
+        );
+      }
+      // v1.14.6: static current segment → the cover-fit loop chain; animated
+      // → Ken Burns (unchanged).
       graph.push(
-        `[sp${i - 1}b]${pre},zoompan=z='${frz.z}':x='${frz.x}':y='${frz.y}':${zpCommon},` +
-          `setsar=1,format=yuv420p[fz${i}]`,
-      );
-      graph.push(
-        `${base}${G.kenBurnsImageChain({ segFrames, emitFrames, onOffset, kbEnabled, dir, zoomMax, width, height, fps })}[sr${i}]`,
+        `${base}${!kbEnabled || dir === "none"
+          ? G.staticImageChain({ segFrames, emitFrames, width, height, fps })
+          : G.kenBurnsImageChain({ segFrames, emitFrames, onOffset, kbEnabled, dir, zoomMax, width, height, fps })}[sr${i}]`,
       );
       graph.push(`[fz${i}][sr${i}]xfade=transition=${xfadeName}:duration=${F}:offset=0[s${i}]`);
       segLabels.push(`[s${i}]`);
       continue;
     }
 
-    // v1.14.6: one code path for KB and static images — kenBurnsImageChain
-    // with kbEnabled=false emits the frozen z=1.1 chain (single decode +
-    // zoompan d=emitFrames), replacing the old per-frame looped decode for
-    // static segments (see the comment above the input push).
+    // v1.14.6: single-decode for BOTH shapes — animated rides
+    // kenBurnsImageChain (zoompan emits from one decoded frame), static
+    // rides staticImageChain (scale/crop/format ONCE + `loop` frame copies
+    // — cover-fit, exactly the preview's static frame, zero per-frame
+    // pixel work). See the comment above the input push.
     graph.push(
-      `${base}${G.kenBurnsImageChain({ segFrames, emitFrames, onOffset, kbEnabled, dir, zoomMax, width, height, fps })}[s${i}]`,
+      `${base}${!kbEnabled || dir === "none"
+        ? G.staticImageChain({ segFrames, emitFrames, width, height, fps })
+        : G.kenBurnsImageChain({ segFrames, emitFrames, onOffset, kbEnabled, dir, zoomMax, width, height, fps })}[s${i}]`,
     );
     segLabels.push(`[s${i}]`);
   }
@@ -1683,6 +1708,7 @@ function buildSinglePassPlan(o) {
     inputs.push("-thread_queue_size", "512", ...ov.inputArgs);
     graph.push(G.buildOverlayChain({
       inputIdx: idx, dw: ov.dw, dh: ov.dh, chroma: ov.chroma, a: ov.a, fps: ov.fps,
+      imgLoop: ov.imgLoop,
     }));
     const out = `[o${idx}]`;
     graph.push(G.buildOverlayFilter({
@@ -1758,6 +1784,11 @@ function buildSinglePassPlan(o) {
       musicInputIdx,
       loudnorm,
       masterLoudnorm,
+      // v1.14.6: forward the static-gain fast path (the audioOnly branch
+      // already did — this combined-graph call site dropped it, so W=1
+      // exports with normalize ON paid the ebur128 analysis for nothing).
+      audioFastGain,
+      masterGainDb,
       sfx: sfxList.map((s) => ({ inputIdx: s.inputIdx, startMs: s.startMs, volume: s.volume })),
     });
     graph.push(audioGraph);

@@ -4107,6 +4107,14 @@ ipcMain.handle("export-native", async (event, opts) => {
           inputArgs: isVid
             ? G.buildOverlayVideoInputArgs({ ssMs: win.ssMs, durMs: win.overlapMs, path: srcPath, loop: ovLoop, srcDurMs })
             : G.buildOverlayImageInputArgs({ durMs: win.overlapMs, path: srcPath }),
+          // v1.14.6 SINGLE-DECODE IMAGE OVERLAYS: EXTRA looped copies for
+          // the chain's `loop=` (one decoded frame → 25×overlap frames;
+          // imgLoop+1 ≥ ceil(25×overlapSec) covers the window the old
+          // `-loop 1 -t overlap` stream did — the 25 matches the image2
+          // default rate that input ran at).
+          imgLoop: isVid
+            ? undefined
+            : Math.max(1, Math.ceil(25 * (Math.max(0, Number(win.overlapMs) || 0) / 1000))),
           fps: normFps,
           x,
           y,

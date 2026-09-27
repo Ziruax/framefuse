@@ -250,6 +250,9 @@ function imageOverlaySpecsFor(overlays, width, height, winStartMs, winDurMs) {
     }
     specs.push({
       inputArgs: G.buildOverlayImageInputArgs({ durMs: win.overlapMs, path: ov.imagePath }),
+      // v1.14.6: image overlay streams are single-decode — the loop count
+      // lives here (mirrors main.js buildOverlaySpecsForWindow).
+      imgLoop: Math.max(1, Math.ceil(25 * (Math.max(0, Number(win.overlapMs) || 0) / 1000))),
       fps: null, x, y, xExpr, yExpr, dw: geo.dw, dh: geo.dh,
       chroma: ov.chroma || null, a: win.a, b: win.b,
       clippedEnd: win.clippedEnd,

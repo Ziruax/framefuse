@@ -253,9 +253,12 @@ export interface KenBurnsConfig {
 
 export function defaultKenBurnsConfig(): KenBurnsConfig {
   return {
-    // v5.2: OFF by default — effects must be opt-in per user request, not
-    // silently applied to every imported image.
-    enabled: false,
+    // v1.14.6 (user directive): ON by default — Ken Burns is the ONLY
+    // effect enabled by default; every other effect (transitions, captions,
+    // watermark, loudnorm, headlines…) stays opt-in. The v1.14.6
+    // single-decode image path makes the motion cheap (decode once per
+    // image, zoompan emits the frames).
+    enabled: true,
     intensity: 35,
     direction: "random",
     directionPool: ["in", "out", "left", "right", "up", "down"],

@@ -149,14 +149,17 @@ function staticTimeline(n, durMs) {
   for (let i = 0; i < plan.inputs.length; i++) {
     if (plan.inputs[i] === "-loop") loopInputs.push(plan.inputs.slice(i, i + 5).join(" "));
   }
-  const staticZoompans = (plan.script.match(/zoompan=/g) || []).length;
-  const frozenZ = /zoompan=z='1\.1':/.test(plan.script);
+  const staticChains = (plan.script.match(/loop=loop=\d+:size=1,settb=1\/30,setpts=N/g) || []).length;
+  const coverFit = plan.script.includes(
+    `scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,format=yuv420p,loop=`,
+  );
   const legacyChain = plan.script.includes(`scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},fps=`);
-  report("U1", "static plan: single-frame inputs (no -loop) + zoompan chain",
-    loopInputs.length === 0 && staticZoompans === 2 && frozenZ && !legacyChain,
-    `loops=${loopInputs.length} zoompans=${staticZoompans} frozenZ=${frozenZ} legacy=${legacyChain}`);
+  const frozenZ = /zoompan=z='1\.1':/.test(plan.script);
+  report("U1", "static plan: single-frame inputs + cover-fit loop chains (no zoompan)",
+    loopInputs.length === 0 && staticChains === 2 && coverFit && !frozenZ && !legacyChain,
+    `loops=${loopInputs.length} loopChains=${staticChains} coverFit=${coverFit} frozenZ=${frozenZ} legacy=${legacyChain}`);
 
-  // U2: windowed static plan — d=emitFrames (k1-k0), onOffset rides the clock.
+  // U2: windowed static plan — loop=emitFrames-1 (k1-k0) + single-frame input.
   const wsegs = [imgSeg(0, 3500)];
   const wplan = SP.buildSinglePassPlan({
     segments: wsegs, fullSegments: [imgSeg(0, 3500)],
@@ -167,10 +170,10 @@ function staticTimeline(n, durMs) {
     audio: {}, audioPath: null, sfx: [], clipAudio: [],
     loudnorm: null, masterLoudnorm: null,
   });
-  const dOk = /zoompan=z='1\.1':x='[^']*':y='[^']*':d=75:/.test(wplan.script);
+  const dOk = /loop=loop=74:size=1,settb=1\/30,setpts=N/.test(wplan.script);
   const wLoops = wplan.inputs.includes("-loop");
-  report("U2", "windowed static: d=75 (k1-k0) + single-frame input",
-    dOk && !wLoops, `d75=${dOk} loop=${wLoops}`);
+  report("U2", "windowed static: loop=74 (k1-k0) + single-frame input",
+    dOk && !wLoops, `loop74=${dOk} loop=${wLoops}`);
 }
 
 // ── E1/E1b/E2/E3: end-to-end through the REAL export-native handler ──

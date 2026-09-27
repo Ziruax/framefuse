@@ -113,6 +113,43 @@ function kenBurnsImageChain(o) {
   ].join(",");
 }
 
+/**
+ * v1.14.6 STATIC-IMAGE COVER-FIT CHAIN (single decode, ZERO per-frame
+ * pixel work): the preview canvas and the two-step fallback render a
+ * motion-off image as a plain cover-fit — this is the single-pass
+ * equivalent built from ONE decoded frame. scale+crop+format run ONCE on
+ * that frame; `loop` duplicates the CONVERTED frame (a ref-counted copy —
+ * no re-decode, no resample, unlike the frozen z=1.1 zoompan it replaces,
+ * which resampled every output frame AND rendered a 10% tighter crop than
+ * the preview). `setpts` rebuilds the project fps grid (N = output frame
+ * index — the exact pts zoompan's fps= emitted). Frame count = emitFrames
+ * (the chunk window's frames; loop=emitFrames-1 + the original).
+ */
+function staticImageChain(o) {
+  const width = Number(o && o.width) || 0;
+  const height = Number(o && o.height) || 0;
+  const fps = Math.max(1, Number(o && o.fps) || 30);
+  const segFrames = Math.max(2, Number(o && o.segFrames) || 2);
+  const emitFrames =
+    Number(o && o.emitFrames) > 0
+      ? Math.max(1, Math.round(Number(o.emitFrames)))
+      : segFrames;
+  return [
+    `scale=${width}:${height}:force_original_aspect_ratio=increase`,
+    `crop=${width}:${height}`,
+    `setsar=1`,
+    `format=yuv420p`,
+    `loop=loop=${Math.max(0, emitFrames - 1)}:size=1`,
+    // The timebase MUST become 1/fps BEFORE the retime: the one-frame image2
+    // input carries TB=1/25, and a `N/(fps*TB)` pts in that grid quantizes
+    // to 1/25 steps (only every 6th frame lands on a 1/30 slot) — the
+    // concat filter then drops a frame per boundary. settb makes the grid
+    // integer: pts=N ⇔ N/fps seconds, exactly what zoompan's fps= emitted.
+    `settb=1/${fps}`,
+    `setpts=N`,
+  ].join(",");
+}
+
 // ---------------------------------------------------------------------------
 // v4.3/v4.9 transition tables + helpers (moved verbatim from main.js)
 // ---------------------------------------------------------------------------
@@ -975,13 +1012,20 @@ function buildOverlayVideoInputArgs(o) {
 }
 
 /**
- * Input args for an IMAGE overlay: `-loop 1 -t <overlapDur> -i <path>`
- * (input-option -t so the looped image stream terminates at the window end;
- * brief's "overlapDur/1004" is treated as a typo for /1000 — dividing by
- * 1004 would make the stream SHORTER than the enable window).
+ * Input args for an IMAGE overlay: a SINGLE-DECODE one-frame `-i <path>`
+ * (v1.14.6 — see the comment inside). The stream length lives in the
+ * chain's `loop=` count (spec.imgLoop), NOT in an input -t.
  */
 function buildOverlayImageInputArgs(o) {
-  return ["-loop", "1", "-t", fmt3(Math.max(0, Number(o && o.durMs) || 0)), "-i", o && o.path];
+  // v1.14.6 SINGLE-DECODE: the old `-loop 1 -t <dur>` made the image2
+  // demuxer RE-DECODE the full-resolution overlay still once per OUTPUT
+  // FRAME for the overlay's whole window (the same waste class the base
+  // lane shed in v1.14.6). The input is now ONE decoded frame; the chain
+  // (buildOverlayChain imgLoop) duplicates it via the `loop` filter — a
+  // pure ref-counted frame copy: alpha preserved, zero per-frame pixel
+  // work, no re-decode. The frame count (imgLoop) is computed by the spec
+  // builder from the same window overlap that used to bound -t.
+  return ["-i", o && o.path];
 }
 
 /**
@@ -1039,7 +1083,20 @@ function buildOverlayChain(o) {
   }
   parts.push("format=rgba");
   const aSec = Number(o && o.a) || 0;
-  parts.push(`setpts=PTS+${aSec.toFixed(3)}/TB`);
+  // v1.14.6 SINGLE-DECODE IMAGE OVERLAYS (imgLoop present ⇒ one-frame
+  // input): scale/chroma/format already ran ONCE on the single decoded
+  // frame; `loop` duplicates it (ref-counted copy — zero pixel work,
+  // alpha-safe) and the setpts rebuilds the EXACT 25 fps grid the old
+  // `-loop 1` image2 input used (N/(25*TB)) plus the window shift, so the
+  // framesync contract (coverage [a, a+overlap], eof_action=pass after)
+  // is unchanged. imgLoop = EXTRA copies; imgLoop+1 ≥ ceil(25×overlap).
+  const imgLoop = Number(o && o.imgLoop);
+  if (Number.isFinite(imgLoop) && imgLoop >= 0) {
+    parts.push(`loop=loop=${Math.round(imgLoop)}:size=1`);
+    parts.push(`setpts=N/(25*TB)+${aSec.toFixed(3)}/TB`);
+  } else {
+    parts.push(`setpts=PTS+${aSec.toFixed(3)}/TB`);
+  }
   return `[${o.inputIdx}:v]${parts.join(",")}[ovl${o.inputIdx}]`;
 }
 
@@ -1528,7 +1585,7 @@ function buildClipArgs(ctx) {
   function applyOverlays(state) {
     for (const ov of overlays) {
       const oi = state.inputIdx;
-      state.graph += `;${buildOverlayChain({ inputIdx: oi, dw: ov.dw, dh: ov.dh, chroma: ov.chroma, a: ov.a, fps: ov.fps })}`;
+      state.graph += `;${buildOverlayChain({ inputIdx: oi, dw: ov.dw, dh: ov.dh, chroma: ov.chroma, a: ov.a, fps: ov.fps, imgLoop: ov.imgLoop })}`;
       const out = `[o${oi}]`;
       state.graph += `;${buildOverlayFilter({ accLabel: state.label, inputIdx: oi, x: ov.x, y: ov.y, a: ov.a, b: ov.b, outLabel: out })}`;
       state.label = out;
@@ -1653,7 +1710,7 @@ function buildClipArgs(ctx) {
       let label = "[base]";
       let oi = 1;
       for (const ov of overlays) {
-        g += `;${buildOverlayChain({ inputIdx: oi, dw: ov.dw, dh: ov.dh, chroma: ov.chroma, a: ov.a, fps: ov.fps })}`;
+        g += `;${buildOverlayChain({ inputIdx: oi, dw: ov.dw, dh: ov.dh, chroma: ov.chroma, a: ov.a, fps: ov.fps, imgLoop: ov.imgLoop })}`;
         const out = `[o${oi}]`;
         g += `;${buildOverlayFilter({ accLabel: label, inputIdx: oi, x: ov.x, y: ov.y, a: ov.a, b: ov.b, outLabel: out })}`;
         label = out;
@@ -1951,6 +2008,7 @@ module.exports = {
   // v6 single-pass Ken Burns chain (shared expression source)
   kenBurnsZoompanExprs,
   kenBurnsImageChain,
+  staticImageChain,
   // v5 renderer.ts mirrors
   overlayGeometryMirror,
   isXfadeStyleMirror,

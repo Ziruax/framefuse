@@ -381,7 +381,25 @@ export default function Page() {
 
   useEffect(() => {
     const p = loadPersisted();
-    if (p.kenBurns) setKenBurns(p.kenBurns);
+    if (p.kenBurns) {
+      // v1.14.6 (user directive): Ken Burns is the ONLY effect enabled by
+      // default. One-time re-on for installs persisted before this change
+      // (users who explicitly turn it back off keep their choice — the
+      // guard flag below never re-enables twice).
+      const merged = { ...defaultKenBurnsConfig(), ...p.kenBurns };
+      try {
+        if (
+          merged.enabled === false &&
+          window.localStorage.getItem("framefuse.v1146.kbDefaultOn") !== "1"
+        ) {
+          window.localStorage.setItem("framefuse.v1146.kbDefaultOn", "1");
+          merged.enabled = true;
+        }
+      } catch {
+        /* storage unavailable — keep the persisted value */
+      }
+      setKenBurns(merged);
+    }
      
     if (p.settings) setSettings(p.settings);
      
