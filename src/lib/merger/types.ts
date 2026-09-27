@@ -441,6 +441,10 @@ export interface ExportResult {
   renderCost?: { score: number; pixelCost: number; effectCost: number };
   encoderSpeedProfile?: "fast" | "balanced";
   audioFastGain?: boolean;
+  /** v1.14.6: the audio-normalize state that actually ran — false means
+   *  loudnorm was fully bypassed (0 measurement spawns, 0 filters). Surfaced
+   *  in the completion toast so the setting can never act silently. */
+  audioNormalize?: boolean;
   hwCaps?: { hwaccels?: string[]; gpuFilters?: string[] };
   profile?: {
     file?: string | null;

@@ -24,7 +24,7 @@ import { cn } from "@/lib/utils";
 /** v1.12.1: the renderer's build constant — compared against the REAL exe
  *  version (app.getVersion()) so a stale/hybrid install is impossible to
  *  miss. Keep in sync with package.json on every release. */
-const BUILD_VERSION = "1.14.5";
+const BUILD_VERSION = "1.14.6";
 
 export interface LastExport {
   path: string;
@@ -87,6 +87,9 @@ export interface LastExport {
   renderCost?: { score: number; pixelCost: number; effectCost: number };
   encoderSpeedProfile?: "fast" | "balanced";
   audioFastGain?: boolean;
+  /** v1.14.6: the audio-normalize state that ran — false = loudnorm fully
+   *  bypassed. Carried into the LastExport tooltip. */
+  audioNormalize?: boolean;
   profile?: {
     file?: string | null;
     totalMs?: number;
@@ -579,6 +582,14 @@ export function Header({
                 }${
                   lastExport.costStrategy
                     ? ` · render-cost ${lastExport.costStrategy}${lastExport.renderCost ? ` (${lastExport.renderCost.score})` : ""}`
+                    : ""
+                }${
+                  // v1.14.6: the loudnorm state — OFF proves the bypass, ON
+                  // explains the −16 LUFS measurement/filter work.
+                  lastExport.audioNormalize != null
+                    ? lastExport.audioNormalize
+                      ? " · loudnorm ON (−16 LUFS)"
+                      : " · loudnorm OFF (bypassed)"
                     : ""
                 }${
                   lastExport.profile && lastExport.profile.speedX != null

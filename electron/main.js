@@ -3281,17 +3281,26 @@ function buildHeadlineEvents(headlines, width, height, winStart, winEnd, clampDu
     const italic = p.italic ? -1 : 0;
     // Alignment: 8=top-center, 5=middle-center, 2=bottom-center.
     const alignment = item.position === "top" ? 8 : item.position === "center" ? 5 : 2;
+    // v1.14.6 preview parity (see buildAssDocument's BOX PARITY note):
+    // BorderStyle=3 box = OUTLINECOLOUR fill (verified) + Outline = padding
+    // extent; non-box outline/shadow scale with the output height exactly
+    // like the canvas painter (drawHeadline in native.ts).
     const borderStyle = p.bgColor ? 3 : 1;
-    const outline = p.bgColor ? 0 : Math.max(0, Math.round(p.borderWidth));
-    const shadowVal = p.shadow ? Math.max(1, Math.round(p.shadowBlur / 2)) : 0;
+    const outline = p.bgColor
+      ? Math.max(0, Math.round((p.bgPadding != null ? p.bgPadding : 10) * hScale))
+      : Math.max(0, Math.round((p.borderWidth || 0) * hScale));
+    const shadowVal = p.shadow ? Math.max(1, Math.round((p.shadowBlur || 3) / 2 * hScale)) : 0;
+    const outlineColour = p.bgColor
+      ? hexToAssColor(p.bgColor, p.bgAlpha != null ? p.bgAlpha : 1)
+      : hexToAssColor(p.borderColor || p.textColor);
     const backColour = p.bgColor
-      ? hexToAssColor(p.bgColor, p.bgAlpha)
+      ? (p.shadow ? hexToAssColor(p.accentColor || p.shadowColor || "#000000", 0.55) : hexToAssColor(p.bgColor, p.bgAlpha != null ? p.bgAlpha : 1))
       : hexToAssColor(p.accentColor || p.shadowColor || "#000000", 0.55);
     const marginLR = Math.round((width * (1 - p.maxWidth)) / 2);
     const spacing = Math.round((p.letterSpacing || 0) * hScale * 10) / 10;
 
     styleLines.push(
-      `Style: Headline,${p.ffmpegName},${fontSize},${hexToAssColor(p.textColor)},${hexToAssColor(p.textColor)},${hexToAssColor(p.borderColor || p.textColor)},${backColour},${bold},${italic},0,0,100,100,${spacing},0,${borderStyle},${outline},${shadowVal},${alignment},${marginLR},${marginLR},${positionY},1`,
+      `Style: Headline,${p.ffmpegName},${fontSize},${hexToAssColor(p.textColor)},${hexToAssColor(p.textColor)},${outlineColour},${backColour},${bold},${italic},0,0,100,100,${spacing},0,${borderStyle},${outline},${shadowVal},${alignment},${marginLR},${marginLR},${positionY},1`,
     );
 
     let text = String(item.text);
@@ -3336,12 +3345,20 @@ function buildAssDocument(cues, cs, headlines, width, height, segStartMs, segEnd
   const karaoke = wordMode === "word";
 
   const position = (cs && (cs.customPosition || cs.position)) || "bottom";
-  const marginV = cs && cs.positionY != null ? cs.positionY : 50;
+  // v1.14.6 PREVIEW PARITY (drawCaption in native.ts is the ground truth):
+  // every preset px unit is defined against a 1080p canvas and the preview
+  // scales it by ch/1080 — the ASS Style must scale the SAME way or
+  // captions sit at the wrong height/weight on 720p (fast mode) and any
+  // non-1080 export. positionY becomes marginV × hScale.
+  const hScale = height / 1080;
+  const positionYRaw = cs && cs.positionY != null ? cs.positionY : 50;
+  const marginV = Math.max(0, Math.round(positionYRaw * hScale));
   const fontWeight = (cs && cs.fontWeight) || 600;
   const bold = fontWeight >= 600 ? -1 : 0;
   const italic = ((cs && cs.fontStyle) || "normal") === "italic" ? -1 : 0;
   const bgColor = (cs && cs.bgColor) || null;
   const bgAlpha = cs && cs.bgAlpha != null ? cs.bgAlpha : 1;
+  const bgPadding = cs && cs.bgPadding != null ? cs.bgPadding : 12;
   const borderColor = (cs && cs.borderColor) || "#000000";
   const borderWidth = cs && cs.borderWidth != null ? cs.borderWidth : 2;
   const shadow = !!(cs && cs.shadow);
@@ -3356,11 +3373,26 @@ function buildAssDocument(cues, cs, headlines, width, height, segStartMs, segEnd
   if (alignment === "left") assAlignment -= 1;
   else if (alignment === "right") assAlignment += 1;
 
+  // v1.14.6 BOX PARITY — empirically verified libass semantics (see
+  // scripts/verify-caption-parity.js): BorderStyle=3 fills the box with
+  // OUTLINECOLOUR (with its alpha) and the box extends OUTLINE px beyond
+  // the glyphs — BackColour is the box SHADOW. Pre-v1.14.6 mapped the box
+  // color onto BackColour (invisible: the box rendered as borderColor at
+  // full opacity) and hard-set Outline=0 (bgPadding ignored → box flush
+  // against the text). Now: box fill = bgColor+bgAlpha on OutlineColour,
+  // padding = bgPadding×hScale on Outline (rounded corners have no ASS
+  // equivalent — bgRadius is dropped; text stroke over a box is not
+  // representable, matching the box presets that use borderColor=null).
   const borderStyle = bgColor ? 3 : 1;
-  const outline = bgColor ? 0 : borderWidth;
-  const shadowVal = shadow ? Math.max(1, Math.round(shadowBlur)) : 0;
-  const backColour = bgColor
+  const outline = bgColor
+    ? Math.max(0, Math.round(bgPadding * hScale))
+    : Math.max(0, Math.round(borderWidth * hScale));
+  const shadowVal = shadow ? Math.max(1, Math.round(shadowBlur * hScale)) : 0;
+  const outlineColour = bgColor
     ? hexToAssColor(bgColor, bgAlpha)
+    : hexToAssColor(borderColor);
+  const backColour = bgColor
+    ? (shadow ? hexToAssColor(shadowColor, 0.5) : hexToAssColor(bgColor, bgAlpha))
     : hexToAssColor(shadow ? shadowColor : "#000000", 0.5);
 
   // Karaoke \k mode: Primary = highlight (post-fill), Secondary = text.
@@ -3378,7 +3410,7 @@ function buildAssDocument(cues, cs, headlines, width, height, segStartMs, segEnd
   assLines.push("ScriptType: v4.00+");
   assLines.push(`PlayResX: ${width}`);
   assLines.push(`PlayResY: ${height}`);
-  assLines.push("WrapStyle: 0");
+  assLines.push("WrapStyle: 1");
   assLines.push("ScaledBorderAndShadow: yes");
   assLines.push("");
   assLines.push("[V4+ Styles]");
@@ -3396,7 +3428,7 @@ function buildAssDocument(cues, cs, headlines, width, height, segStartMs, segEnd
 
   // [V4+ Styles] — Default (captions) + Headline styles.
   if (cs) {
-    assLines.push(`Style: Default,${fontName},${fontSize},${hexToAssColor(primary)},${hexToAssColor(secondary)},${hexToAssColor(borderColor)},${backColour},${bold},${italic},0,0,100,100,${spacing},0,${borderStyle},${outline},${shadowVal},${assAlignment},40,40,${marginV},1`);
+    assLines.push(`Style: Default,${fontName},${fontSize},${hexToAssColor(primary)},${hexToAssColor(secondary)},${outlineColour},${backColour},${bold},${italic},0,0,100,100,${spacing},0,${borderStyle},${outline},${shadowVal},${assAlignment},40,40,${marginV},1`);
   }
   assLines.push(...headline.styleLines);
   assLines.push("");
@@ -3974,12 +4006,16 @@ ipcMain.handle("export-native", async (event, opts) => {
     // path (tag = clip index _ chunk index).
     const writeAssFile = (doc, tag) => {
       const assPath = path.join(tempDir, `captions_${tag}_${Date.now()}.ass`);
-      // v1.13 Tier 3: strip libass's high-cost raster work from the BURN-IN
-      // documents only (gaussian/box blur → 0, outline/shadow widths clamped
-      // to 2 px — subtitle rasterization across a 34,200-frame timeline can
-      // eat 30 %+ of a constrained CPU). The .ass SIDECAR export keeps the
-      // user's original styling untouched.
-      fs.writeFileSync(assPath, hwProfile.optimizeSubtitles ? optimizeAssForConstrainedCpu(doc) : doc, "utf-8");
+      // v1.14.6: the v1.13 Tier-3 caption raster downgrade is RETIRED for
+      // burn-in docs — it clamped Outline/Shadow to 2 px (and hard-killed
+      // blur), which visibly changed burned captions vs the preview on the
+      // constrained-CPU machines it fired on (the reported "export captions
+      // are not the same as the preview"). Our generated documents never
+      // emit \blur or \be (the actually-expensive per-glyph re-rasterization
+      // the v1.13 note feared), so the clamp bought ~nothing and cost parity.
+      // optimizeAssForConstrainedCpu stays exported for back-compat but is
+      // no longer applied to any burn-in document.
+      fs.writeFileSync(assPath, doc, "utf-8");
       tempFiles.push(assPath);
       const escapedAssPath = assPath
         .replace(/\\/g, "/")
@@ -4904,6 +4940,14 @@ ipcMain.handle("export-native", async (event, opts) => {
               music: measures.music,
             });
           }
+        } else if (audioPath || clipAudioBranches.length > 0) {
+          // v1.14.6 (user directive): normalize OFF → loudnorm is FULLY out
+          // of this export — no measurement spawns, no loudnorm filters, no
+          // master-mix render/remeasure. One explicit log line so the argv
+          // is provable (result.audioNormalize carries it to the UI toast).
+          console.log(
+            "[Export] audio: normalize OFF — loudnorm fully bypassed (0 measurement spawns, 0 loudnorm filters)",
+          );
         }
 
         // ── Hw decode per source (probe-gated, cached per path) ───────────
@@ -5335,6 +5379,9 @@ ipcMain.handle("export-native", async (event, opts) => {
           renderCost: { score: costPost.score, pixelCost: costPost.pixelCost, effectCost: costPost.effectCost },
           encoderSpeedProfile: speedProfile,
           audioFastGain: spAudioFastGain || undefined,
+          // v1.14.6 (user directive): the audio-normalize state that actually
+          // ran — false = loudnorm fully bypassed (the toast proves it).
+          audioNormalize: !!(audio && audio.normalize),
           hwCaps: hwProfile.hwCaps || undefined,
           profile: prof.finish({ path: outputPath, size, contentSec: totalSec, mode: plan.parallelMode ? "parallel-pass" : "smart-render" }),
           // v1.10 (Task 2): the primary human-readable dirty reason — the
@@ -5497,6 +5544,12 @@ ipcMain.handle("export-native", async (event, opts) => {
             `(volume=dB, master ${masterGainDb != null ? `${masterGainDb}dB` : "—"}) — loudnorm filters + master-mix render skipped`,
         );
       }
+    } else if (audioPath || clipAudioJobs.length > 0) {
+      // v1.14.6 (user directive): normalize OFF → loudnorm fully bypassed
+      // (mirrors the smart path's guarantee line).
+      console.log(
+        "[Export] audio: normalize OFF — loudnorm fully bypassed (0 measurement spawns, 0 loudnorm filters)",
+      );
     }
 
     // ─── v1.3: MASTER-BUS loudnorm (render → measure → mux) ────────
@@ -5646,6 +5699,9 @@ ipcMain.handle("export-native", async (event, opts) => {
       renderCost: { score: costEstimate.score, pixelCost: costEstimate.pixelCost, effectCost: costEstimate.effectCost },
       encoderSpeedProfile: speedProfile,
       audioFastGain: audioFastGain || undefined,
+      // v1.14.6 (user directive): the audio-normalize state that actually
+      // ran — false = loudnorm fully bypassed (the toast proves it).
+      audioNormalize: !!(audio && audio.normalize),
       hwCaps: hwProfile.hwCaps || undefined,
       profile: prof.finish({ path: outputPath, size, contentSec: actualTotalSec, mode: "two-step" }),
     };

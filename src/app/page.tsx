@@ -144,7 +144,7 @@ const DISCLAIMER_DEFAULT_MS = 2000;
 /** v1.14.2: renderer build stamp — the desktop-only landing carries it so a
  * browser visitor sees which build is live (in Electron, Header separately
  * cross-checks it against the exe's app.getVersion()). */
-const BUILD_VERSION = "1.14.5";
+const BUILD_VERSION = "1.14.6";
 
 /** Effective lead-in duration of a disclaimer clip (ms, min 200). */
 function disclaimerDurationOf(d: DisclaimerClip | null): number {
@@ -1371,6 +1371,8 @@ export default function Page() {
         renderCost: res.renderCost,
         encoderSpeedProfile: res.encoderSpeedProfile,
         audioFastGain: res.audioFastGain,
+        // v1.14.6: the loudnorm state that ran (LastExport tooltip).
+        audioNormalize: res.audioNormalize,
         profile: res.profile,
       });
       // v1.1 TURBO: the success toast carries the performance story —
@@ -1416,6 +1418,14 @@ export default function Page() {
       if (res.encoderSpeedProfile === "fast") {
         turboBits.push("fast encoder profile (render-cost HIGH+)" );
       }
+      // v1.14.6 (user directive): the loudnorm state is NEVER silent — if
+      // normalization ran the toast says so, and when it is OFF the toast
+      // proves the bypass (0 measurement spawns, 0 loudnorm filters).
+      turboBits.push(
+        res.audioNormalize
+          ? "loudnorm ON (−16 LUFS) — turn off in Audio settings to skip it"
+          : "audio raw · normalize OFF (loudnorm bypassed)",
+      );
       // v9: the smart-render story — "15.4 min stream-copied · 3.2 min
       // re-encoded" explains why a 19-minute timeline with edits finished
       // in minutes: only the dirty time-ranges paid the encode tax.

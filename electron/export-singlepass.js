@@ -64,10 +64,6 @@ const SINGLEPASS_MAX_SCRIPT_BYTES = 25000;
 const CHUNK_TARGET_SEC = 45;
 const CHUNK_MIN_TOTAL_SEC = 30;
 
-function fmt3(ms) {
-  return (Math.max(0, Number(ms) || 0) / 1000).toFixed(3);
-}
-
 /**
  * Pure eligibility check. o = { segments, overlayCount, totalSec,
  * captionsBurned }. Returns { ok, reason } — reason is a short machine string
@@ -1616,20 +1612,21 @@ function buildSinglePassPlan(o) {
 
     // IMAGE segment.
     const dir = kbEnabled ? seg.direction || globalDir : "none";
-    const kbChain = kbEnabled && dir !== "none";
-    if (headPlan[i].useXfadeHead || kbChain) {
-      // zoompan path: single-frame input (no -loop) — zoompan consumes the
-      // ONE frame and emits exactly segFrames (byte-identical to the
-      // two-step's `-loop 1` + output `-t`, see verify-kenburns-parity.js).
-      inputs.push("-thread_queue_size", "512", "-i", seg.imagePath);
-    } else {
-      // Static cover-fit: bounded looped input = exactly durMs of frames.
-      inputs.push(
-        "-thread_queue_size", "512",
-        "-loop", "1", "-framerate", String(fps), "-t", fmt3(durMs),
-        "-i", seg.imagePath,
-      );
-    }
+    // v1.14.6 STATIC-IMAGE SINGLE-DECODE: the pre-v1.14.6 static path looped
+    // the image at the OUTPUT fps (`-loop 1 -framerate <fps> -t <dur>`),
+    // which makes the image2 demuxer RE-DECODE the full-resolution still
+    // once per OUTPUT FRAME (a 22-min slideshow @ 24 fps = 31,680 full-res
+    // JPEG decodes + scales — A/B measured 6.2× slower than the Ken Burns
+    // path on a 12 MP still, i.e. the "static" images were the expensive
+    // ones and image COUNT could never affect wall time: cost ∝ total
+    // frames, not images). EVERY image now rides the single-frame input
+    // (no -loop): decode + supersample ONCE, then zoompan emits exactly the
+    // window's frames (d=emitFrames — the verified v6.5 frame-exactness
+    // machinery; kbEnabled=false renders the frozen z=1.1 static chain, the
+    // same shape the xfade frozen head already uses). Frame counts verified
+    // identical to the loop path (252 == 252 for 10.5 s @ 24 fps),
+    // scripts/verify-image-singledecode.js.
+    inputs.push("-thread_queue_size", "512", "-i", seg.imagePath);
 
     if (headPlan[i].useXfadeHead) {
       // v4.3 xfade HEAD composite — image↔image boundaries only (video
@@ -1660,16 +1657,13 @@ function buildSinglePassPlan(o) {
       continue;
     }
 
-    if (kbChain) {
-      graph.push(
-        `${base}${G.kenBurnsImageChain({ segFrames, emitFrames, onOffset, kbEnabled, dir, zoomMax, width, height, fps })}[s${i}]`,
-      );
-    } else {
-      graph.push(
-        `${base}scale=${width}:${height}:force_original_aspect_ratio=increase,` +
-          `crop=${width}:${height},fps=${fps},setsar=1,format=yuv420p[s${i}]`,
-      );
-    }
+    // v1.14.6: one code path for KB and static images — kenBurnsImageChain
+    // with kbEnabled=false emits the frozen z=1.1 chain (single decode +
+    // zoompan d=emitFrames), replacing the old per-frame looped decode for
+    // static segments (see the comment above the input push).
+    graph.push(
+      `${base}${G.kenBurnsImageChain({ segFrames, emitFrames, onOffset, kbEnabled, dir, zoomMax, width, height, fps })}[s${i}]`,
+    );
     segLabels.push(`[s${i}]`);
   }
 
