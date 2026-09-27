@@ -1420,3 +1420,23 @@ Work Log:
 Stage Summary:
 - v1.14.6 export pipeline is now fully "decode-once, off-by-default": Ken Burns is the ONLY default-enabled effect (with a one-time re-on migration for existing installs); static images render EXACT cover-fit parity with the preview at zero per-frame pixel work; image overlays decode once (17× faster on large stickers); loudnorm/fastGain gating closed; all 13 regression suites + new harnesses green; browser E2E clean.
 - NEXT: ship v1.14.6 (Task-45 playbook: clean → build → wasm → ffmpeg staging → electron-builder → release).
+
+---
+Task ID: ship-1.14.6-final
+Agent: main (Z.ai Code)
+Task: Build + ship v1.14.6 (Task-45 playbook) after the decode-once audit.
+
+Work Log:
+- PRE-FLIGHT: version markers 1.14.6 in package.json/Header.tsx/page.tsx/layout.tsx (bumped in the prior session); staging had been wiped by housekeeping again (resources/ gone) → full re-staging: clean + next build --webpack (routes /, /_not-found, /apple-icon.png, /icon.ico; wasm ×4) → fetch:ffmpeg (BtbN 187 MB) → stage:whisper (42 MB) → stage:whisper-model (7 dl) → stage:faster-whisper (cp311 guard ✓) → stage:faster-whisper-model (75 MB).
+- BUILDER: electron-builder --win nsis --publish never → dist/FrameFuse Setup 1.14.6.exe (377,710,110 B) + blockmap (394,780 B) + latest.yml (version 1.14.6, dash-named url, sha512 4nU51tik…).
+- ASAR VERIFIED: package.json 1.14.6; main.js carries the loudnorm-bypass line + imgLoop spec; export-graph.js carries staticImageChain + settb=1/${fps},setpts=N + loop chain + overlay single-decode (input + chain loop form); export-singlepass.js carries imgLoop forwarding + static branch + fastGain/masterGainDb forwarding + pad imgLoop; renderer chunks: 23 files, 1 with framefuse.v1146.kbDefaultOn migration + 1 with v1.14.6. exe version resource 1.14.6 ✓.
+- ICONS: 7-entry groups verified on BOTH exes (installer group 103/1033: 16/24/32/48/64/128 DIB + 256 PNG; app exe group 1/1033 identical).
+- GIT: local had TWO unpushed v1.14.6 commits (prior session's + this session's) → rebase onto remote main (one conflict: duplicate publish-release-1.14.5.js — resolved --theirs, worklog auto-merged) → pushed 1e94840..2a84ccf.
+- RELEASE: scripts/publish-release-1.14.6.js (node-built JSON, dupe-aware, full release notes) → release 397754125 https://github.com/Ziruax/framefuse/releases/tag/v1.14.6 — latest.yml (350 B) + blockmap (394,780 B) + exe (377,710,110 B @ 11.95 MB/s) all state=uploaded. Tag v1.14.6 = 2a84ccf = code HEAD (no force-move needed).
+- ROUND-TRIP: re-downloaded the exe asset by id (593468975) → size 377,710,110 EXACT, sha512 == local file == latest.yml.
+- DEV SERVER: restarted (double-fork) after the build; GET / 200.
+
+Stage Summary:
+- v1.14.6 SHIPPED: installer + release live at https://github.com/Ziruax/framefuse/releases/tag/v1.14.6 with hash-verified assets.
+- The release carries: decode-once pipeline (static 6.2×/image, overlays 17.4×, byte-identical outputs), Ken Burns as the only default-on effect (one-time re-on migration), provable loudnorm-off, caption export/preview parity, exact frame counts, all 13+ suites green.
+- GOTCHAS this round: staging wiped again (always re-run the chain); rebase conflict class = duplicate ship-record commits from prior unpushed sessions; the asar extractFile listFile API needs paths without leading slash.
