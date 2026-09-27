@@ -1148,10 +1148,19 @@ function planSmartSegments(o) {
       cleanFramesNow < totalFrames * equalWindowRatio &&
       totalSecNow >= 15
     ) {
-      // W = 2–4 (main.js passes 4 on any ≥4-core CPU — v1.12 user
-      // directive, no conservatism); shrink below 4 only when the timeline
-      // is too short to feed every worker a meaningful window (< 4 s each).
-      let W = Math.min(parallelWorkers, 4);
+      // W = 2–4 by default (main.js passes the tier/budget filter pool).
+      // v1.15.0: main.js derives a SCRIPT-BUDGET-AWARE worker count for
+      // image-heavy timelines — the windowed graph must fit
+      // SINGLEPASS_MAX_SCRIPT_BYTES per window, and a Ken Burns image
+      // chain is ~230-280 B, so ≈200+ images at W=2 blew the 25 KB budget
+      // and the export fell back to the two-step pool (the "259 images
+      // still slow" field report). maxParallelWindows is the engine-safe
+      // ceiling (4 for NVENC/QSV/AMF sessions, 6–8 for x264 with the
+      // thread budget dividing the cores); shrink W only when the
+      // timeline is too short to feed every worker a meaningful window
+      // (< 4 s each).
+      const winCap = Math.max(2, Math.round(Number(o && o.maxParallelWindows) || 4));
+      let W = Math.min(parallelWorkers, winCap);
       const minWindowSec = 4;
       while (W > 2 && totalSecNow / W < minWindowSec) W -= 1;
       if (totalSecNow / W >= minWindowSec * 0.75) {
@@ -1858,7 +1867,11 @@ function buildSinglePassArgs(o) {
   if (Number.isFinite(frameCap) && frameCap > 0) {
     args.push("-frames:v", String(Math.round(frameCap)));
   }
-  args.push("-movflags", "+faststart", o.outputPath);
+  // v1.15.0: chunk outputs DROP `-movflags +faststart` — it re-walks each
+  // intermediate file at close (a second pass over ~50-300 MB per chunk,
+  // pure waste when the final concat mux re-applies it — see main.js's
+  // concat step). moov-at-end is fine for demuxer concat.
+  args.push(o.outputPath);
   return args;
 }
 

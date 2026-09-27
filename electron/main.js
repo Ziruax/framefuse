@@ -1825,9 +1825,22 @@ function resolveHardwareProfile(gpuCapabilities, topo) {
   // v1.12.1 shape back for exactly this workload (v1.13's 2×2 windows
   // halved their filter throughput). Tier 1/2 keep the encode shape
   // (Tier 2 already runs 3-4 workers; its x264 threading is the win).
-  profile.filterWorkers = profile.tier === "TIER_3_CONSTRAINED_CPU"
-    ? Math.max(profile.workers, Math.min(4, logical))
-    : profile.workers;
+  // v1.15.0: Tier 1 (GPU ASIC encode) widens the FILTER pool too — the
+  // encoder moved to the GPU but the zoompan/scale/libass chains stay
+  // CPU-side and single-threaded PER PROCESS, so 2 filter processes left
+  // NVENC boxes CPU-starved on image/Ken Burns storyboards (the exact
+  // workload the Tier-3 recipe widened for in v1.14.1 — the GPU encode is
+  // nowhere near saturated when filters are the wall). Capped at 4 with
+  // a logical/2 floor; concurrent NVENC sessions are fine at 4 on any
+  // driver from 2023+ (5+ allowed), and filter-bound windows mean the
+  // ASIC never saturates (the v6 "sessions fight" doctrine applied to
+  // ENCODE-bound pools, not filter-bound ones).
+  profile.filterWorkers =
+    profile.tier === "TIER_3_CONSTRAINED_CPU"
+      ? Math.max(profile.workers, Math.min(4, logical))
+      : profile.tier === "TIER_1_GPU"
+        ? Math.max(3, Math.min(4, Math.floor(logical / 2)))
+        : profile.workers;
   return profile;
 }
 
@@ -4719,6 +4732,40 @@ ipcMain.handle("export-native", async (event, opts) => {
 
         // ── The plan (pure) ──────────────────────────────────────────────
         prof.beginStage("plan");
+        // v1.15.0 SCRIPT-BUDGET-AWARE WINDOW COUNT (decoupled from pool
+        // concurrency): the equal-window graph must fit
+        // SINGLEPASS_MAX_SCRIPT_BYTES (25 KB) per window AND a bounded
+        // number of INPUT STREAMS per window — a Ken Burns image chain is
+        // ~230-280 B of script and every image input costs ffmpeg a demux
+        // thread + decoder + queue (measured: 4 concurrent × 44-input
+        // graphs → pthread_create EAGAIN on a 2-core/4 GB box; the old
+        // W=2/130-input shape would have failed the same way had the 25 KB
+        // script check not bailed first — the budget bail accidentally
+        // protected the thread budget, and its absence at ≤200 images is
+        // ALSO why 85 vs 259 image exports both bottomed out badly). So:
+        //   • windowCount = max(script-budget windows, input-budget
+        //     windows at ≤48 image inputs each), clamped [2, 12];
+        //   • pool lanes stay the CPU/ENGINE-safe count (filterWorkers,
+        //     or 4 on GPU) — MORE windows than lanes run as a runPool QUEUE
+        //     (jobs drain as workers free up), never as more processes.
+        const imageSegCount = segments.reduce(
+          (n, s) => n + (s && s.imagePath && !s.videoPath ? 1 : 0),
+          0,
+        );
+        const estScriptBytes =
+          imageSegCount * 300 + (captionsEnabled ? subtitleCues.length * 64 : 0) + 2048;
+        const budgetWindows = Math.max(1, Math.ceil(estScriptBytes / 20000));
+        const inputWindows = Math.ceil(Math.max(1, imageSegCount) / 48);
+        const windowCount = Math.max(
+          2,
+          Math.min(12, Math.max(hwProfile.filterWorkers, budgetWindows, inputWindows)),
+        );
+        // Pool LANES (concurrent ffmpeg processes): GPU encoders cap at 4
+        // (NVENC/QSV/AMF session envelope); x264 rides the filter pool the
+        // tier already derived (Tier 2: 3-4, Tier 3: 2-4 by logical CPUs).
+        const parallelPoolLanes = isGpuEncoder
+          ? 4
+          : Math.max(2, Math.min(8, hwProfile.filterWorkers));
         const plan = SP.planSmartSegments({
           segments,
           overlays: overlaySegs,
@@ -4742,7 +4789,10 @@ ipcMain.handle("export-native", async (event, opts) => {
           // PER PROCESS, so Tier 3 widens to min(4, logical) processes (the
           // v1.12.1 shape the dual-module APUs need HERE); Tier 2 keeps its
           // worker shape (3-4 × 2 threads).
-          parallelWorkers: hwProfile.filterWorkers,
+          // v1.15.0: windowCount is the script/input-budget derivation
+          // above — windows beyond the pool LANES queue inside runPool.
+          parallelWorkers: windowCount,
+          maxParallelWindows: 12,
           equalWindowRatio: 0.3,
         });
         if (!plan) {
@@ -4791,9 +4841,21 @@ ipcMain.handle("export-native", async (event, opts) => {
           transitionCount: Math.max(0, segments.length - 1),
         });
         prof.costPost = costPost;
+        // v1.15.0: the gate also admits Tier-1 (GPU) boxes with a weak CPU
+        // (≤4 strong cores) — a Tier-*string* check alone meant a Tier-3-
+        // class CPU with a working NVENC was filed Tier 1 and never got
+        // the ~2.2× pixel cut even at VERY_HIGH render cost. Encode is on
+        // the ASIC, but the filter wall (zoompan/libass) is CPU — that
+        // combination is exactly who this mode is for. The structural
+        // gates stay: mostly-dirty (no clean pieces — downscaling a mixed
+        // timeline would collide 1080p copies with 720p chunks in the
+        // concat), never cinema, ≥60 s, short edge > 720, off switch.
+        const weakCpuFastMode =
+          hwProfile.tier === "TIER_3_CONSTRAINED_CPU" ||
+          (hwProfile.tier === "TIER_1_GPU" && (hwProfile.cpuPhysical || 0) <= 4);
         let fastModeApplied = null;
         if (
-          hwProfile.tier === "TIER_3_CONSTRAINED_CPU" &&
+          weakCpuFastMode &&
           fastModeWanted !== false &&
           plan.parallelMode &&
           quality !== "cinema" &&
@@ -4845,11 +4907,21 @@ ipcMain.handle("export-native", async (event, opts) => {
         let threadsPer;
         let filterThreadsPer;
         if (plan.parallelMode) {
-          poolWidth = Math.max(1, plan.workerCount);
+          // v1.15.0: window count and pool LANES are decoupled — the plan
+          // may carry MORE windows than lanes (script/input budget) and the
+          // pool drains them as a QUEUE (runPool semantics, equal-duration
+          // windows = good load balance). Lanes stay the engine/CPU-safe
+          // count: GPU 4, x264 the tier's filter pool.
+          poolWidth = Math.max(1, Math.min(plan.workerCount, parallelPoolLanes));
           threadsPer = poolWidth > hwProfile.workers
             ? Math.max(1, Math.min(hwProfile.threadsPerWorker, Math.floor(cpuCount / poolWidth) || 1))
             : hwProfile.threadsPerWorker;
           filterThreadsPer = threadsPer;
+          if (plan.workerCount > poolWidth) {
+            console.log(
+              `[framefuse] parallel pass: ${plan.workerCount} windows over ${poolWidth} lane(s) (queue) — script/input budget ${estScriptBytes}B est, ≤48 image inputs per window`,
+            );
+          }
         } else if (smartWidened) {
           poolWidth = Math.max(1, spWorkers);
           threadsPer = Math.max(1, Math.floor(cpuCount / poolWidth) || 1);

@@ -1612,7 +1612,11 @@ function buildClipArgs(ctx) {
       graph: `${aChain};${bChain};[a][b]xfade=transition=${xfadeName}:duration=${F}:offset=0[vx]`,
       label: "[vx]",
       inputIdx: 2,
-      inputs: ["-loop", "1", "-i", seg.imagePath, "-loop", "1", "-i", prevSeg.imagePath],
+      // v1.15.0 SINGLE-DECODE: no `-loop 1` — zoompan d=segFrames emits
+      // exactly the clip's frames from ONE decoded still (the -loop input
+      // re-decoded the full-res image once per output frame; 6-7× measured —
+      // scripts/verify-image-singledecode.js B1). `-t` still caps the tail.
+      inputs: ["-i", seg.imagePath, "-i", prevSeg.imagePath],
     });
     // Watermark (next input index) under the captions.
     if (wm) {
@@ -1769,14 +1773,18 @@ function buildClipArgs(ctx) {
     // cover-fit at the OUTPUT resolution is byte-equivalent visually and
     // an order of magnitude faster (zoompan is single-threaded and was the
     // dominant cost for slideshows).
+    // v1.15.0 SINGLE-DECODE: the image input drops `-loop 1`/`-framerate`
+    // (the image2 demuxer re-decoded the full-res still once per OUTPUT
+    // frame — 6-7× penalty on 12 MP photos). The chains emit the exact
+    // frame counts themselves: staticImageChain (loop= + settb/setpts —
+    // the verified v1.14.6 module) and the zoompan d=segFrames chain.
+    // `-t` stays as the muxer-side cap.
     const staticImg = !enabled || dir === "none";
     const baseChain = staticImg
-      ? `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},fps=${fps},setsar=1,format=yuv420p`
+      ? staticImageChain({ width, height, fps, segFrames })
       : `scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase:flags=lanczos,crop=${scaleW}:${scaleH},` +
         `zoompan=z='${zExpr}':x='${xExpr}':y='${yExpr}':d=${segFrames}:s=${width}x${height}:fps=${fps},setsar=1,format=yuv420p`;
-    const baseInputs = staticImg
-      ? ["-loop", "1", "-framerate", String(fps), "-i", seg.imagePath]
-      : ["-loop", "1", "-i", seg.imagePath];
+    const baseInputs = ["-i", seg.imagePath];
     const state = applyOverlays({
       graph: `[0:v]${baseChain}[base]`,
       label: "[base]",
@@ -1809,18 +1817,20 @@ function buildClipArgs(ctx) {
     };
   }
 
-  // ── Plain single-input path (no watermark) — v4.9 verbatim ──
+  // ── Plain single-input path (no watermark) ──
   // v5.2 SPEED: static frames (Ken Burns off — the new default) skip the
   // supersample + zoompan pipeline for a plain cover-fit scale/crop.
+  // v1.15.0 SINGLE-DECODE: bare `-i` (no `-loop 1`/`-framerate`) — the
+  // image2 demuxer with -loop re-decodes the full-res still once per
+  // OUTPUT frame (150 full-res decodes per 5 s @30 fps on a 12 MP photo;
+  // 6.2-6.7× measured, scripts/verify-image-singledecode.js B1). The
+  // chains emit their exact frame counts themselves: staticImageChain
+  // (scale/crop/setsar/format ONCE + loop= + settb=1/fps + setpts=N — the
+  // v1.14.6-verified module) and the zoompan d=segFrames chain. `-t`
+  // stays as the muxer-side cap; the concat re-probes the clip duration.
   const staticImg = !enabled || dir === "none";
   const vfParts = staticImg
-    ? [
-        `scale=${width}:${height}:force_original_aspect_ratio=increase`,
-        `crop=${width}:${height}`,
-        `fps=${fps}`,
-        `setsar=1`,
-        `format=yuv420p`,
-      ]
+    ? [staticImageChain({ width, height, fps, segFrames })]
     : [
         `scale=${scaleW}:${scaleH}:force_original_aspect_ratio=increase:flags=lanczos`,
         `crop=${scaleW}:${scaleH}`,
@@ -1828,9 +1838,7 @@ function buildClipArgs(ctx) {
         `setsar=1`,
         `format=yuv420p`,
       ];
-  const imgInputOpts = staticImg
-    ? ["-loop", "1", "-framerate", String(fps), "-i", seg.imagePath]
-    : ["-loop", "1", "-i", seg.imagePath];
+  const imgInputOpts = ["-i", seg.imagePath];
   // v1.14.3 layering contract: fades BEFORE the caption burn (captions topmost).
   vfParts.push(...postFades);
   if (assSuffix) vfParts.push(assSuffix);
