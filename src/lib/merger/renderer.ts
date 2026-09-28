@@ -19,6 +19,44 @@ import type {
 } from "./types";
 import { TRANSITION_STYLE_INFO, boundaryStyle } from "./types";
 
+// ---------------------------------------------------------------------------
+// v1.15.2 GPU-Shift (worker migration): the 2D-context union.
+//
+// The GPU export engine now runs inside a dedicated Web Worker, where the
+// ONLY canvas flavor is OffscreenCanvas (there is no `document` to create a
+// HTMLCanvasElement). The preview keeps painting on an HTMLCanvasElement.
+// Every paint helper below therefore accepts the UNION — both context types
+// implement the identical 2D draw surface used here (drawImage, fillRect,
+// setTransform, globalAlpha, fillText, measureText, clip, …), so the preview
+// and the export worker share ONE paint implementation, zero divergence.
+// ---------------------------------------------------------------------------
+
+/** A 2D rendering context from either an HTMLCanvasElement (main thread)
+ * or an OffscreenCanvas (worker). */
+export type Ctx2D = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
+
+/** A canvas surface on either thread. */
+export type PaintSurface = HTMLCanvasElement | OffscreenCanvas;
+
+/** Acquire the 2D context of either canvas flavor (null when exhausted).
+ * The two getContext overloads return different context types, so the union
+ * call needs one honest cast. */
+export function get2DContext(canvas: PaintSurface, alpha = false): Ctx2D | null {
+  return canvas.getContext("2d", { alpha }) as Ctx2D | null;
+}
+
+/** Create a canvas surface for the CURRENT thread — document-backed on the
+ * main thread, OffscreenCanvas inside the export worker. */
+export function createPaintSurface(width: number, height: number): PaintSurface {
+  if (typeof document !== "undefined") {
+    const c = document.createElement("canvas");
+    c.width = width;
+    c.height = height;
+    return c;
+  }
+  return new OffscreenCanvas(Math.max(1, width), Math.max(1, height));
+}
+
 /** easeInOutSine: -(cos(PI*t) - 1) / 2 */
 export function easeInOutSine(t: number): number {
   return -(Math.cos(Math.PI * t) - 1) / 2;
@@ -250,7 +288,7 @@ function clamp(v: number, lo: number, hi: number): number {
  * Uses object-fit: cover, high-quality smoothing, and sub-pixel transforms.
  */
 export function drawFrame(
-  ctx: CanvasRenderingContext2D,
+  ctx: Ctx2D,
   img: VideoFrameSource | null,
   seg: MediaSegment,
   currentMs: number,
@@ -344,8 +382,8 @@ export function drawFrame(
  * Useful for thumbnails / placeholders.
  */
 export function drawPoster(
-  ctx: CanvasRenderingContext2D,
-  img: HTMLImageElement | HTMLCanvasElement | null,
+  ctx: Ctx2D,
+  img: VideoFrameSource | null,
   seg: MediaSegment,
   cw: number,
   ch: number,
@@ -577,8 +615,8 @@ export function computeGlobalFade(
  * this (matching the export: subtitles burn after xfade).
  */
 export function drawFrameWithTransition(
-  ctx: CanvasRenderingContext2D,
-  scratch: HTMLCanvasElement,
+  ctx: Ctx2D,
+  scratch: PaintSurface,
   seg: MediaSegment,
   segIdx: number,
   segments: MediaSegment[],
@@ -597,7 +635,7 @@ export function drawFrameWithTransition(
     return;
   }
 
-  const sctx = scratch.getContext("2d", { alpha: false });
+  const sctx = get2DContext(scratch);
   if (!sctx) {
     drawFrame(ctx, img, seg, currentMs, cw, ch, kb);
     return;
@@ -685,12 +723,12 @@ export function drawFrameWithTransition(
  * fills the fade color and blits back at `alpha`.
  */
 export function applyGlobalFade(
-  ctx: CanvasRenderingContext2D,
-  scratch: HTMLCanvasElement,
+  ctx: Ctx2D,
+  scratch: PaintSurface,
   fade: { alpha: number; color: "black" | "white" | null },
 ): void {
   if (fade.alpha >= 1 || fade.color == null) return;
-  const sctx = scratch.getContext("2d", { alpha: false });
+  const sctx = get2DContext(scratch);
   if (!sctx) return;
   sctx.setTransform(1, 0, 0, 1, 0, 0);
   sctx.globalAlpha = 1;
@@ -751,15 +789,14 @@ export function watermarkGeometry(
 
 /** Draw the watermark with opacity (mirrors colorchannelmixer=aa). */
 export function drawWatermark(
-  ctx: CanvasRenderingContext2D,
-  img: HTMLImageElement | null,
+  ctx: Ctx2D,
+  img: VideoFrameSource | null,
   videoW: number,
   videoH: number,
   settings: WatermarkSettings | null | undefined,
 ): void {
   if (!img || !settings) return;
-  const iw = img.naturalWidth || img.width;
-  const ih = img.naturalHeight || img.height;
+  const { w: iw, h: ih } = paintSourceSize(img);
   if (!iw || !ih) return;
   const g = watermarkGeometry(videoW, videoH, iw, ih, settings);
   if (g.dw <= 0 || g.dh <= 0) return;
@@ -894,7 +931,7 @@ export function overlayGeometry(
  * keeps the default cover behavior so the output frame is always filled.
  */
 export function drawVideoFrame(
-  ctx: CanvasRenderingContext2D,
+  ctx: Ctx2D,
   source: VideoFrameSource | null | undefined,
   cw: number,
   ch: number,

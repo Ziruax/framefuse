@@ -1,6 +1,6 @@
 {
   "name": "framefuse",
-  "version": "1.15.0",
+  "version": "1.15.2",
   "private": true,
   "description": "FrameFuse v1 — Multi-track video studio: video clips, green/white/black screen chroma key with on-canvas PiP, overlay lane, background music with volume/loop, synthesized SFX, Whisper captions via Groq cloud (user's own API key, stored on-device) with an offline tiny-model fallback bundled in the installer, True Smart Rendering FFmpeg export (clean ranges stream-copied, dirty windows re-encoded in parallel with hardware decode), native project files.",
   "main": "electron/main.js",
@@ -9,11 +9,13 @@
   "scripts": {
     "dev": "next dev -p 3000 2>&1 | tee dev.log",
     "clean": "node scripts/clean.js",
-    "build": "npm run clean && next build --webpack && node scripts/copy-wasm.js",
+    "build": "npm run clean && next build --webpack && node scripts/build-gpu-worker.js && node scripts/copy-wasm.js",
     "start": "next start",
     "lint": "eslint .",
     "test:export-parity": "bun scripts/test-export-parity.ts",
     "bench:export": "node scripts/bench-export.js",
+    "bench:ab": "node scripts/ab-export-bench.js",
+    "build:gpu-worker": "node scripts/build-gpu-worker.js",
     "verify:kenburns": "node scripts/verify-kenburns-parity.js",
     "electron": "electron electron/main.js",
     "electron:dev": "concurrently -k \"npm run dev\" \"wait-on http://localhost:3000 && electron electron/main.js\"",
@@ -23,7 +25,7 @@
     "stage:faster-whisper": "node scripts/stage-faster-whisper.js",
     "stage:faster-whisper-model": "node scripts/stage-faster-whisper-model.js",
     "postinstall": "node scripts/patch-transformers.js && node scripts/patch-electron-builder.js",
-    "electron:build": "npm run clean && next build --webpack && node scripts/copy-wasm.js && node scripts/fetch-windows-ffmpeg.js && node scripts/stage-whisper-service.js && node scripts/stage-whisper-model.js && electron-builder --win nsis --publish never",
+    "electron:build": "npm run clean && next build --webpack && node scripts/build-gpu-worker.js && node scripts/copy-wasm.js && node scripts/fetch-windows-ffmpeg.js && node scripts/stage-whisper-service.js && node scripts/stage-whisper-model.js && electron-builder --win nsis --publish never",
     "electron:build:fw": "node scripts/stage-faster-whisper.js && node scripts/stage-faster-whisper-model.js"
   },
   "trustedDependencies": [

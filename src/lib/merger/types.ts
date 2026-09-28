@@ -399,6 +399,15 @@ export interface ExportResult {
   audioSkipped?: boolean;
   softwareFallback?: boolean;
   gpuFrameRenderMs?: number;
+  /** v1.15.2 (worker migration): jsCompositorOverheadMs = mean per-frame
+   *  PURE JS compositing cost (paint wall minus decode waits — the number a
+   *  v1.16 GLSL/WebGPU shader migration would attack); gpuDecodeWaitMs =
+   *  mean per-frame decoder wait (the mp4box→VideoDecoder arm);
+   *  workerRuntime = "worker" | "main-thread" — which execution context ran
+   *  the GPU engine (the UI thread stays free on "worker"). */
+  jsCompositorOverheadMs?: number;
+  gpuDecodeWaitMs?: number;
+  workerRuntime?: "worker" | "main-thread";
   elapsedSec?: number;
   copiedClips?: number;
   encodedClips?: number;

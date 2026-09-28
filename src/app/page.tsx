@@ -36,6 +36,7 @@ import {
   type SfxItem,
 } from "@/lib/merger/sfx";
 import { exportNative, isElectron } from "@/lib/merger/native";
+import { installBenchExportListener } from "@/lib/merger/benchExport";
 import {
   groupWordLevelCues,
   looksLikeWordLevelCues,
@@ -146,7 +147,7 @@ const DISCLAIMER_DEFAULT_MS = 2000;
 /** v1.14.2: renderer build stamp — the desktop-only landing carries it so a
  * browser visitor sees which build is live (in Electron, Header separately
  * cross-checks it against the exe's app.getVersion()). */
-const BUILD_VERSION = "1.15.0";
+const BUILD_VERSION = "1.15.2";
 
 /** Effective lead-in duration of a disclaimer clip (ms, min 200). */
 function disclaimerDurationOf(d: DisclaimerClip | null): number {
@@ -1379,6 +1380,9 @@ export default function Page() {
         engine: res.engine,
         framesEncoded: res.framesEncoded,
         gpuFrameRenderMs: res.gpuFrameRenderMs,
+        jsCompositorOverheadMs: res.jsCompositorOverheadMs,
+        gpuDecodeWaitMs: res.gpuDecodeWaitMs,
+        workerRuntime: res.workerRuntime,
         audioSkipped: res.audioSkipped,
         softwareFallback: res.softwareFallback,
         // v1.1 TURBO telemetry (desktop only — browser exports omit these).
@@ -1441,8 +1445,14 @@ export default function Page() {
       if (res.engine === "webcodecs-gpu") {
         turboBits.push(
           `GPU engine (WebCodecs${res.softwareFallback ? " · software rung after GPU stall" : ""})` +
+            (res.workerRuntime ? ` · ${res.workerRuntime === "worker" ? "worker" : "main thread"}` : "") +
             (res.framesEncoded != null ? ` · ${res.framesEncoded} frames` : "") +
-            (res.gpuFrameRenderMs != null ? ` · ${res.gpuFrameRenderMs} ms/frame GPU render` : ""),
+            (res.gpuFrameRenderMs != null ? ` · ${res.gpuFrameRenderMs} ms/frame GPU render` : "") +
+            // v1.15.2: the pure-JS compositor cost — the number that decides
+            // whether the v1.16 GLSL/WebGPU shader migration pays.
+            (res.jsCompositorOverheadMs != null
+              ? ` · ${res.jsCompositorOverheadMs} ms/frame JS compositor`
+              : ""),
         );
         if (res.audioSkipped) {
           toast.info("Exported without audio", {
@@ -1607,6 +1617,10 @@ export default function Page() {
   useEffect(() => {
     exportRef.current = handleExport;
   }, [handleExport]);
+
+  // v1.15.2: the real-hardware A/B export-bench listener (no-op outside
+  // FRAMEFUSE_BENCH runs — scripts/ab-export-bench.js drives the flow).
+  useEffect(() => installBenchExportListener(), []);
 
   // v1.2: keep the overlay's open-flag in lockstep with late remounts
   // (dev HMR) so a stale true can never swallow the keyboard.

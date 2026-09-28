@@ -32,6 +32,21 @@
 //     when AAC encode is available; otherwise the export degrades to
 //     video-only with audioSkipped:true so the UI can warn.
 //
+// v1.15.2 (GPU-Shift worker migration): this module now executes INSIDE a
+// dedicated Web Worker (gpu-export-worker.ts bundles it to the
+// self-contained public/gpu-worker.js) — compositing, VideoDecoder and the
+// VideoEncoder all run OFF the main thread; the page only receives progress
+// ticks, muxed chunks and the result via postMessage (gpu-worker-client.ts).
+// Thread abstractions: createPaintSurface/OffscreenCanvas, ImageBitmap image decode
+// (fetch + createImageBitmap — no HTMLImageElement in workers), the
+// injected `streamer` relay (opts.streamer overrides the window probe),
+// browserDelivery:"bytes" (the main thread triggers the download), the
+// PREBUILT audio track list + the cross-thread `audioProvider` (Web Audio
+// is [Exposed=Window] — the mixdown + AAC encode run on the main thread
+// with async boundaries, chunks stream back into this muxer). The engine
+// STILL runs on the main thread as the documented fallback when the worker
+// bundle cannot be constructed.
+//
 // VRAM RULE (user-mandated, same as the other v8 modules): every VideoFrame
 // created, cloned, or received is .close()d immediately after its last use on
 // EVERY path (draw-finally, encode-finally, decoder cleanup). Each close site
@@ -49,9 +64,11 @@ import {
   applyGlobalFade,
   computeGlobalFade,
   computeTransitionFx,
+  createPaintSurface,
   drawFrameWithTransition,
   drawVideoFrame,
   drawWatermark,
+  get2DContext,
   overlayGeometry,
   paintSourceSize,
   resolveDimensions,
@@ -68,9 +85,10 @@ import {
 import { cueAt } from "@/lib/merger/subtitles";
 import { segmentAtTime, overlaySegmentsAt } from "@/lib/merger/timeline";
 import { ChromaKeyer } from "@/lib/merger/chroma";
-import { renderSfxWav, sfxDurationMs } from "@/lib/merger/sfx";
 import { SourceDecoder } from "./SourceDecoder";
 import { AudioMixer, isAudioEncoderSupported, type AudioTrackData } from "./AudioMixer";
+import { buildAudioTracks, renderSfxTracks, videoSourceUrl, type PrebuiltAudio } from "./audio-tracks";
+import type { GpuTimelineAudioProvider } from "./worker-protocol";
 import {
   ChunkSink,
   ExportAbortedError,
@@ -87,6 +105,30 @@ export interface GpuTimelineExportOptions extends ExportNativeOptions {
   /** v1.8.2: skip the prefer-hardware encoder rung (Export-tab diagnostics
    * toggle — mirrors the FFmpeg force-encoder bypass for driver stalls). */
   forceSoftware?: boolean;
+  /** v1.15.2 (worker migration): the INJECTED byte streamer. When defined
+   * (bridge or null) it overrides the window.electronAPI probe — the worker
+   * harness passes a postMessage relay shim (Electron) or null (browser
+   * memory mode). Undefined = probe the window (main-thread runs). */
+  streamer?: ExportStreamerBridge | null;
+  /** v1.15.2: "bytes" returns the muxed MP4 in result.bytes (worker browser
+   * mode — the MAIN thread performs the download); "download" (default)
+   * triggers the download inside the engine (main-thread fallback runs). */
+  browserDelivery?: "download" | "bytes";
+  /** v1.15.2 (worker path): the track list + SFX blob URLs PREBUILT on the
+   * main thread — Web Audio is [Exposed=Window] (OfflineAudioContext and
+   * decodeAudioData do not exist in workers; spec-verified), so SFX
+   * rendering and track-list construction run where Web Audio lives. The
+   * CLIENT owns + revokes the sfxBlobUrls; the engine consumes the tracks
+   * without re-computing. Absent (main-thread fallback) → the engine
+   * computes them itself, exactly as in v1.15.1. */
+  prebuiltAudio?: PrebuiltAudio | null;
+  /** v1.15.2 (worker path): the CROSS-THREAD audio arm — the mixdown + AAC
+   * encode run on the MAIN thread (AudioMixer; async boundaries: the
+   * OfflineAudioContext render + the AudioEncoder ride their own native
+   * threads, the main thread only relays chunks) and the encoded chunks
+   * stream back here into the muxer. Absent → the engine runs the
+   * in-context AudioMixer (the v1.15.1 direct path). */
+  audioProvider?: GpuTimelineAudioProvider;
 }
 
 /** Result of a GPU-engine export — the ExportResult the UI already renders,
@@ -101,6 +143,20 @@ export interface GpuTimelineExportResult extends ExportResult {
    * no output (driver stall) and the engine automatically restarted the whole
    * pass on the software rung — the UI explains instead of failing. */
   softwareFallback?: boolean;
+  /** v1.15.2: the muxed MP4 when browserDelivery:"bytes" (worker browser
+   * mode — a TRANSFERABLE that rode the 'done' message, zero-copied). */
+  bytes?: ArrayBuffer;
+  /** v1.15.2: mean ms/frame of PURE JS compositing (the paint wall minus
+   * decoder waits — drawImage blends, Ken Burns math, text raster). This is
+   * the number a GLSL/WebGPU shader migration (v1.16) would attack; high on
+   * complex timelines = the shader migration pays. */
+  jsCompositorOverheadMs?: number;
+  /** v1.15.2: mean ms/frame spent AWAITING decoded source frames (the
+   * mp4box→VideoDecoder arm) — the decode-side twin of the compositor cost. */
+  gpuDecodeWaitMs?: number;
+  /** v1.15.2: which execution context ran the engine — set by the worker
+   * client ("worker" | "main-thread"), surfaced for telemetry + E2E. */
+  workerRuntime?: "worker" | "main-thread";
 }
 
 /** Overlay-lane items without an explicit geometry render centered at 60%
@@ -161,166 +217,20 @@ function clamp01(v: number): number {
   return Math.max(0, Math.min(1, v));
 }
 
-/** Load an image for drawing (same contract as native.ts's helper). */
-function loadImageElement(url: string): Promise<HTMLImageElement | null> {
-  return new Promise((resolve) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = () => resolve(null);
-    img.src = url;
-  });
-}
-
-/** The fetchable source URL of a VIDEO segment (page.tsx maps every item's
- * object URL under the segment id — videos included). Null when only the
- * original File exists (AudioMixer cannot fetch a File; the decoder can
- * still read it via arrayBuffer). */
-function videoSourceUrl(seg: MediaSegment, imageUrls: Record<string, string>): string | null {
-  const url = imageUrls[seg.id];
-  return typeof url === "string" && url.length > 0 ? url : null;
-}
-
-/**
- * Build the AudioMixer track list from the timeline model — EVERY audio
- * lane (Task 28-a):
- *  (a) the music track — pinned at musicStartMs (v5.2 placement), looping
- *      when the user enabled musicLoop OR the track is shorter than the
- *      timeline; volume = master × music; music-local fade-in/fade-out
- *      automation (the fade-out always ENDS at the video end — FFmpeg
- *      buildAudioMixGraph parity);
- *  (b) every BASE-lane video segment's audio at its timeline position with
- *      its trim offset and per-clip volume (scaled by master); speed≠1
- *      clips time-compress via playbackRate (sync-correct twin of atempo);
- *  (c) every OVERLAY-lane (PIP) video segment's audio — a GPU-engine
- *      SUPERSET: the FFmpeg graph maps overlay inputs video-only, so this
- *      is the only engine that mixes PIP audio. overlayLoop wraps audio
- *      identically to the video arm;
- *  (d) the pre-rendered SFX placements (`sfxTracks` — synthesized WAV blob
- *      URLs, the exact bytes the FFmpeg path uploads as temp files).
- *
- * Video-clip branches are `optional`: an MP4 with no audio track skips with
- * a warn instead of failing the export (the FFmpeg path probe-gates the
- * same case). Known deviations vs the FFmpeg audio bus (documented):
- * normalize/loudnorm is not part of the offline graph; playbackRate
- * pitch-shifts where atempo preserves pitch.
- */
-function buildAudioTracks(
-  opts: GpuTimelineExportOptions,
-  sfxTracks: AudioTrackData[],
-): AudioTrackData[] {
-  const tracks: AudioTrackData[] = [...sfxTracks];
-  const totalSec = opts.totalMs / 1000;
-  const masterVolume = clampNum(opts.audio?.masterVolume, 0, 2, 1);
-
-  if (opts.audioTrack) {
-    const startSec = Math.max(0, clampNum(opts.audio?.musicStartMs, 0, Infinity, 0) / 1000);
-    const trackShorter =
-      opts.audioTrack.durationMs != null && opts.audioTrack.durationMs < opts.totalMs;
-    const musicVolume = masterVolume * clampNum(opts.audio?.musicVolume, 0, 2, 1);
-    const fadeInMs = Math.max(0, clampNum(opts.audio?.fadeInMs, 0, Infinity, 0));
-    const fadeOutMs = Math.max(0, clampNum(opts.audio?.fadeOutMs, 0, Infinity, 0));
-    tracks.push({
-      url: opts.audioTrack.url,
-      startSec,
-      offsetSec: 0,
-      durationSec: Math.max(0.01, totalSec - startSec),
-      volume: musicVolume,
-      loop: opts.audio?.musicLoop === true || trackShorter,
-      // Music-local fades — the fade-out window is absolute and ends at the
-      // VIDEO end (the adelay-relative math in buildAudioMixGraph's twin).
-      ...(fadeInMs > 0 ? { fadeInSec: fadeInMs / 1000 } : {}),
-      ...(fadeOutMs > 0
-        ? { fadeOut: { startSec: Math.max(0, totalSec - fadeOutMs / 1000), endSec: totalSec } }
-        : {}),
-    });
+/** Load an image as a drawable ImageBitmap (v1.15.2 worker migration).
+ * Works on BOTH threads: the worker has no HTMLImageElement, so fetch +
+ * createImageBitmap is the thread-neutral twin of the browser path's
+ * `new Image()`. ImageBitmap satisfies both drawImage (CanvasImageSource)
+ * and the chroma keyer's texImage2D (TexImageSource). */
+async function loadImageBitmap(url: string): Promise<ImageBitmap | null> {
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const blob = await res.blob();
+    return await createImageBitmap(blob);
+  } catch {
+    return null;
   }
-
-  for (const seg of opts.segments) {
-    if (seg.mediaType !== "video") continue;
-    if (seg.volume <= 0) continue;
-    const url = videoSourceUrl(seg, opts.imageUrls);
-    if (!url) continue; // File-only sources are decodable but not fetchable
-    if ((seg.track ?? 0) >= 1) {
-      // (c) PIP/overlay clip audio — speed-1 by design (the export overlay
-      // graph is speed-1), looped when the overlay loops.
-      tracks.push({
-        url,
-        startSec: seg.startMs / 1000,
-        offsetSec: (seg.trimInMs || 0) / 1000,
-        durationSec: seg.durationMs / 1000,
-        volume: masterVolume * seg.volume,
-        loop: seg.overlayLoop === true,
-        optional: true, // no audio track in the container → skip, not fail
-      });
-      continue;
-    }
-    // (b) base-lane clip audio — the source window consumed is
-    // durationMs × speed buffer-seconds, played back at `speed` so it lands
-    // inside the (shorter) timeline window.
-    const speed = seg.speed || 1;
-    tracks.push({
-      url,
-      startSec: seg.startMs / 1000,
-      offsetSec: (seg.trimInMs || 0) / 1000,
-      durationSec: (seg.durationMs / 1000) * speed,
-      volume: masterVolume * seg.volume,
-      playbackRate: speed,
-      optional: true,
-    });
-  }
-  return tracks;
-}
-
-/**
- * Pre-render every SFX placement to a WAV blob URL (Task 28-a) — native.ts
- * IPC parity: one render per unique (sfxId, durMs), cached; failures skip
- * the placement with a console warn instead of failing the export. The
- * caller owns the blob URLs and revokes them when the export finishes.
- */
-async function renderSfxTracks(
-  opts: GpuTimelineExportOptions,
-  masterVolume: number,
-  blobUrls: string[],
-): Promise<AudioTrackData[]> {
-  const tracks: AudioTrackData[] = [];
-  if (!opts.sfx || opts.sfx.length === 0) return tracks;
-  const wavCache = new Map<string, { url: string; durationSec: number } | null>();
-  for (const item of opts.sfx) {
-    if (!item || !item.id || !item.sfxId) continue;
-    const itemDurMs = sfxDurationMs(item);
-    const cacheKey = `${item.sfxId}:${itemDurMs}`;
-    if (!wavCache.has(cacheKey)) {
-      let entry: { url: string; durationSec: number } | null = null;
-      try {
-        const rendered = await renderSfxWav(item.sfxId, itemDurMs);
-        if (rendered) {
-          const url = URL.createObjectURL(rendered.blob);
-          blobUrls.push(url);
-          entry = { url, durationSec: rendered.durationMs / 1000 };
-        } else {
-          console.warn(
-            `[framefuse] SFX "${item.sfxId}" could not be rendered (Web Audio unavailable?) — skipping placement ${item.id}`,
-          );
-        }
-      } catch (e) {
-        console.warn(`[framefuse] SFX "${item.sfxId}" render failed — skipping placement ${item.id}`, e);
-      }
-      wavCache.set(cacheKey, entry);
-    }
-    const cached = wavCache.get(cacheKey);
-    if (cached) {
-      tracks.push({
-        url: cached.url,
-        startSec: Math.max(0, item.startMs) / 1000,
-        offsetSec: 0,
-        durationSec: cached.durationSec,
-        // FFmpeg parity: the SFX branch rides clamp(volume, 0, 1) with the
-        // master volume applied at the mix bus (linearly identical).
-        volume: masterVolume * clampNum(item.volume, 0, 1, 1),
-      });
-    }
-  }
-  return tracks;
 }
 
 /**
@@ -363,45 +273,50 @@ export async function exportTimelineViaGpu(
   const frameDurationUs = Math.round(1e6 / fps);
   const keyInterval = Math.max(1, Math.round(fps * 2));
 
-  const canvas = document.createElement("canvas");
-  canvas.width = dims.w;
-  canvas.height = dims.h;
-  const ctx = canvas.getContext("2d", { alpha: false });
+  const canvas = createPaintSurface(dims.w, dims.h);
+  const ctx = get2DContext(canvas);
   if (!ctx) throw new GpuExportError("failed to acquire a 2d context on the export canvas");
 
   // ── Audio gate: build the track list, then check AAC support BEFORE the
   // muxer is constructed (an mp4 with a declared-but-empty audio track would
   // be unplayable). Sandbox Chromium has no AAC → video-only + audioSkipped.
-  // v1.8.1: the list now includes SFX + PIP (overlay) clip audio too.
+  // v1.8.1: the list includes SFX + PIP (overlay) clip audio.
+  // v1.15.2 (worker path): the list + SFX WAVs are PREBUILT on the main
+  // thread (Web Audio is [Exposed=Window] — spec-verified; workers have no
+  // OfflineAudioContext/decodeAudioData, so renderSfxTracks cannot run
+  // here). The engine recomputes them only on the main-thread fallback run.
   const masterVolume = clampNum(opts.audio?.masterVolume, 0, 2, 1);
-  const sfxBlobUrls: string[] = [];
-  const sfxTracks = await renderSfxTracks(opts, masterVolume, sfxBlobUrls);
-  const audioTracks = buildAudioTracks(opts, sfxTracks);
+  const sfxBlobUrls: string[] = []; // engine-owned URLs (compute branch only)
+  let audioTracks: AudioTrackData[];
+  if (opts.prebuiltAudio) {
+    audioTracks = opts.prebuiltAudio.tracks;
+  } else {
+    const sfxTracks = await renderSfxTracks(opts, masterVolume, sfxBlobUrls);
+    audioTracks = buildAudioTracks(opts, sfxTracks);
+  }
   const audioSupported = audioTracks.length > 0 ? await isAudioEncoderSupported() : false;
   const audioSkipped = audioTracks.length > 0 && !audioSupported;
   const activeAudioTracks = audioSupported ? audioTracks : [];
 
-  // ── Image preload (imgCache pattern from the browser path). Generalized
-  // to VideoFrameSource so the same cache could hold any paint source —
-  // here it only ever holds decoded HTMLImageElements (base AND overlay
-  // lanes — overlay images resolve through the same map).
+  // ── Image preload (imgCache pattern from the browser path). v1.15.2:
+  // decoded to ImageBitmaps — fetchable + decodable on BOTH threads (the
+  // worker has no `new Image()`), and ImageBitmap feeds drawImage AND the
+  // chroma keyer's texImage2D. blob: URLs created on the main thread are
+  // fetchable from same-agent-cluster dedicated workers in Chromium.
   const imgCache = new Map<string, VideoFrameSource>();
   await Promise.all(
     segments
       .filter((seg) => seg.mediaType !== "video")
-      .map(
-        (seg) =>
-          new Promise<void>((resolve) => {
-            const url = imageUrls[seg.id] || seg.thumbnailUrl;
-            const img = new Image();
-            img.onload = () => {
-              imgCache.set(seg.id, img);
-              resolve();
-            };
-            img.onerror = () => resolve();
-            img.src = url;
-          }),
-      ),
+      .map(async (seg) => {
+        const url = imageUrls[seg.id] || seg.thumbnailUrl;
+        if (typeof url !== "string" || url.length === 0) return;
+        const bmp = await loadImageBitmap(url);
+        if (bmp) imgCache.set(seg.id, bmp);
+        else
+          console.warn(
+            `[framefuse] GPU export: image "${seg.fileName || seg.id}" failed to decode — its frames render as the dark backdrop`,
+          );
+      }),
   );
 
   // ── Output sink: IPC stream (Electron + outputPath) or in-memory. ──────
@@ -409,7 +324,9 @@ export async function exportTimelineViaGpu(
   // PASS — the hardware→software retry re-runs bridge.exportStart, and the
   // main-process handler truncates + reopens the file, so a failed pass's
   // partial bytes never leak into the final output.
-  const bridge = getExportStreamer();
+  // v1.15.2: `opts.streamer` (when defined) overrides the window probe — the
+  // worker harness injects its postMessage relay shim; null = memory mode.
+  const bridge = opts.streamer !== undefined ? opts.streamer : getExportStreamer();
   const outputPath =
     typeof opts.outputPath === "string" && opts.outputPath.length > 0 ? opts.outputPath : null;
   const useIpc = bridge !== null && outputPath !== null;
@@ -505,6 +422,14 @@ export async function exportTimelineViaGpu(
   // it alongside framesEncoded). This is the number the FFmpeg CPU pipeline
   // must lose to: mean frame cost × total frames ≈ the GPU render wall.
   let framePaintMs = 0;
+  // v1.15.2 telemetry split (user directive: "add a telemetry metric
+  // specifically for jsCompositorOverheadMs"): the paint wall decomposed
+  // into PURE JS compositing (drawImage blends, Ken Burns math, text
+  // raster — the number the v1.16 GLSL/WebGPU shader migration attacks) and
+  // decoder waits (mp4box→VideoDecoder arms). gpuFrameRenderMs keeps its
+  // v1.15.1 meaning: composite + encode-submit, backpressure excluded.
+  let frameCompositeMs = 0;
+  let frameDecodeMs = 0;
   let lastEmitAt = 0;
   const emitProgress = (force = false): void => {
     const now = performance.now();
@@ -533,11 +458,9 @@ export async function exportTimelineViaGpu(
     overlayDecoders.clear();
   };
     // Scratch canvas for the transition composite + global fades (the
-    // browser path's twin).
-    const scratch = document.createElement("canvas");
-    scratch.width = dims.w;
-    scratch.height = dims.h;
-    const sctx = scratch.getContext("2d", { alpha: false });
+    // browser path's twin). v1.15.2: OffscreenCanvas inside the worker.
+    const scratch = createPaintSurface(dims.w, dims.h);
+    const sctx = get2DContext(scratch);
 
     // Caption draw closure — the SAME capCtx construction as the browser
     // path (word modes + kinetic animations render identically).
@@ -559,7 +482,9 @@ export async function exportTimelineViaGpu(
     const headlineItems =
       opts.headlines && opts.headlines.length > 0 ? opts.headlines : null;
     const transition = opts.transition ?? null;
-    const wmImage = opts.watermark?.imageUrl ? await loadImageElement(opts.watermark.imageUrl) : null;
+    const wmImage = opts.watermark?.imageUrl
+      ? await loadImageBitmap(opts.watermark.imageUrl)
+      : null;
     const wmSettings = opts.watermark?.settings ?? null;
 
     /**
@@ -631,11 +556,18 @@ export async function exportTimelineViaGpu(
       // pattern): chunks flow straight into the muxer, the promise is awaited
       // after the loop, before flush. v1.8.2: the per-pass AbortSignal lets a
       // retried pass stop this one's AAC encode instead of zombie-ing it.
+      // v1.15.2 (worker path): `opts.audioProvider` runs the mixdown + AAC
+      // encode on the MAIN THREAD (Web Audio is Window-only) and streams the
+      // encoded chunks back into this muxer — the async-boundary rule: the
+      // video loop here never waits on main-thread JS, and the main thread
+      // never runs the engine.
       if (activeAudioTracks.length > 0) {
-        const mixer = new AudioMixer((chunk, meta) => {
+        const onChunk = (chunk: EncodedAudioChunk, meta: EncodedAudioChunkMetadata | undefined) => {
           muxer.addAudioChunk(chunk, meta);
-        });
-        const p = mixer.renderAudio(totalSec, activeAudioTracks, audioCtl.signal);
+        };
+        const p = opts.audioProvider
+          ? opts.audioProvider(totalSec, activeAudioTracks, onChunk, audioCtl.signal)
+          : new AudioMixer(onChunk).renderAudio(totalSec, activeAudioTracks, audioCtl.signal);
         // Swallow-side handler: if the video loop aborts/errors BEFORE this
         // promise is awaited, its eventual rejection would otherwise surface
         // as an unhandled rejection. Attaching a catch does not consume the
@@ -709,8 +641,10 @@ export async function exportTimelineViaGpu(
 
       // v1.15.1 telemetry: the paint clock starts AFTER backpressure — only
       // composite + encode-submit time counts (waiting on a slow encoder is
-      // not "rendering" cost).
+      // not "rendering" cost). v1.15.2: the wall is decomposed into pure
+      // compositing vs decoder waits (jsCompositorOverheadMs / gpuDecodeWaitMs).
       const framePaintT0 = performance.now();
+      let decodeMsThisFrame = 0;
 
       // Active BASE segment — the preview's exact track-aware resolution
       // (segmentAtTime: base lane only, tail fallback to the last base
@@ -730,7 +664,11 @@ export async function exportTimelineViaGpu(
             (currentMs - seg.startMs) * (seg.speed || 1) + (seg.trimInMs || 0);
           // Caller-owned CLONE — closed immediately after ALL draws for this
           // frame are done (⚠ VRAM rule; finally covers the draw throws).
+          // v1.15.2: the decode await counts toward gpuDecodeWaitMs, not the
+          // compositor bucket.
+          const decodeT0 = performance.now();
           const frame = await decoder.getFrameForTimestamp(sourceTimeMs);
+          decodeMsThisFrame += performance.now() - decodeT0;
           try {
             const fx = computeTransitionFx(segments, segIdx, currentMs, transition);
             if (fx.kind === "dip-head" && sctx) {
@@ -792,8 +730,9 @@ export async function exportTimelineViaGpu(
         try {
           // Paint source union: every member satisfies BOTH CanvasImageSource
           // (drawImage) and TexImageSource (the keyer's texImage2D).
-          let src: VideoFrame | HTMLImageElement | null = null;
+          let src: VideoFrameSource | null = null;
           if (ov.mediaType === "video") {
+            const ovDecodeT0 = performance.now();
             const decoder = await getOverlayDecoder(ov);
             const speed = ov.speed || 1; // overlays resolve speed 1 by design
             let localMs = (ov.trimInMs || 0) + (currentMs - ov.startMs) * speed;
@@ -802,12 +741,12 @@ export async function exportTimelineViaGpu(
               localMs = ((localMs % dur) + dur) % dur;
             }
             owned = await decoder.getFrameForTimestamp(Math.max(0, localMs));
+            decodeMsThisFrame += performance.now() - ovDecodeT0; // v1.15.2
             src = owned;
           } else {
-            // imgCache only ever holds HTMLImageElements here (built from
-            // new Image() above) — the cast is honest and keeps the union
-            // narrow for the keyer's TexImageSource parameter.
-            src = (imgCache.get(ov.id) as HTMLImageElement | undefined) ?? null;
+            // v1.15.2: imgCache holds ImageBitmaps (worker-safe decode) — a
+            // first-class VideoFrameSource member, no cast needed.
+            src = imgCache.get(ov.id) ?? null;
           }
           if (!src) continue; // image not decoded / video frame unavailable
           const sd = paintSourceSize(src);
@@ -878,6 +817,10 @@ export async function exportTimelineViaGpu(
         }
       }
 
+      // v1.15.2: the composite clock ends here — the JS paint wall (minus
+      // decode waits) IS jsCompositorOverheadMs.
+      const compositeT1 = performance.now();
+
       const outFrame = new VideoFrame(canvas, {
         timestamp: Math.round(currentMs * 1000),
         duration: frameDurationUs,
@@ -889,6 +832,8 @@ export async function exportTimelineViaGpu(
       }
       framesEncoded = i + 1;
       framePaintMs += performance.now() - framePaintT0; // v1.15.1 telemetry
+      frameCompositeMs += compositeT1 - framePaintT0 - decodeMsThisFrame; // v1.15.2
+      frameDecodeMs += decodeMsThisFrame; // v1.15.2
       emitProgress();
     }
 
@@ -921,6 +866,7 @@ export async function exportTimelineViaGpu(
     await sink.finalize();
 
     let resultPath: string;
+    let resultBytes: ArrayBuffer | undefined;
     if (useIpc && outputPath) {
       resultPath = outputPath;
     } else {
@@ -928,14 +874,26 @@ export async function exportTimelineViaGpu(
       // filename pattern + revoke timeout as the legacy browser path).
       // (`.buffer` is the sink's exact-size copy — getBytes() builds a fresh
       // Uint8Array, so the whole buffer IS the file.)
+      // v1.15.2 "bytes" mode (worker browser export): the muxed MP4 rides
+      // the 'done' message back to the MAIN thread as a transferable — the
+      // download triggers there (the worker has no DOM to click an <a>).
       const bytes = sink.getBytes();
-      const blob = new Blob([bytes.buffer as ArrayBuffer], { type: "video/mp4" });
-      const downloadUrl = URL.createObjectURL(blob);
-      triggerDownload(downloadUrl, `framefuse_${Date.now()}.mp4`);
-      setTimeout(() => URL.revokeObjectURL(downloadUrl), 60000);
+      if (opts.browserDelivery === "bytes") {
+        resultBytes = bytes.buffer as ArrayBuffer;
+      } else {
+        const blob = new Blob([bytes.buffer as ArrayBuffer], { type: "video/mp4" });
+        const downloadUrl = URL.createObjectURL(blob);
+        triggerDownload(downloadUrl, `framefuse_${Date.now()}.mp4`);
+        setTimeout(() => URL.revokeObjectURL(downloadUrl), 60000);
+      }
       resultPath = "(browser download) framefuse.mp4";
     }
-    return { hardware, byteCount: sink.byteCount, resultPath };
+    return {
+      hardware,
+      byteCount: sink.byteCount,
+      resultPath,
+      ...(resultBytes ? { bytes: resultBytes } : {}),
+    };
     } finally {
       // Per-pass cleanup on EVERY path — success, error, and abort.
       if (!audioCompleted) audioCtl.abort(); // stop a zombie AAC render
@@ -962,7 +920,7 @@ export async function exportTimelineViaGpu(
     // ── v1.8.2: run the pass, retrying ONCE on the software rung when the
     // hardware encoder wedged before ANY frame was muxed (lossless restart).
     let softwareFallback = false;
-    let passResult: { hardware: boolean; byteCount: number; resultPath: string };
+    let passResult: { hardware: boolean; byteCount: number; resultPath: string; bytes?: ArrayBuffer };
     try {
       emitProgress(true);
       try {
@@ -981,6 +939,8 @@ export async function exportTimelineViaGpu(
           cleanupDecoders(); // pass 2 re-creates them lazily from the same sources
           framesEncoded = 0;
           framePaintMs = 0; // v1.15.1: telemetry tracks the FINAL pass only
+          frameCompositeMs = 0; // v1.15.2: both halves reset with it
+          frameDecodeMs = 0;
           stage = "preparing";
           emitProgress(true);
           passResult = await runEncodePass(true);
@@ -1004,7 +964,14 @@ export async function exportTimelineViaGpu(
         ...(audioSkipped ? { audioSkipped: true } : {}),
         framesEncoded,
         gpuFrameRenderMs: Math.round((framePaintMs / Math.max(1, framesEncoded)) * 10) / 10,
+        // v1.15.2 telemetry split (user directive): the pure-JS compositor
+        // cost — the number that decides whether the v1.16 GLSL/WebGPU
+        // shader migration pays — plus the decode-side twin.
+        jsCompositorOverheadMs:
+          Math.round((frameCompositeMs / Math.max(1, framesEncoded)) * 10) / 10,
+        gpuDecodeWaitMs: Math.round((frameDecodeMs / Math.max(1, framesEncoded)) * 10) / 10,
         ...(softwareFallback ? { softwareFallback: true } : {}),
+        ...(passResult.bytes ? { bytes: passResult.bytes } : {}),
       };
     } finally {
       // Export-level cleanup on EVERY path — success, error, and abort.

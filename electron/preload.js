@@ -120,4 +120,16 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on(channel, handler);
     return () => ipcRenderer.removeListener(channel, handler);
   },
+
+  // ── v1.15.2 REAL-HARDWARE A/B EXPORT BENCH (scripts/ab-export-bench.js) ──
+  // main → renderer: the bench payload (fixture media bytes + config) once
+  // the page is up. renderer → main: the results JSON (main writes it to
+  // disk and quits). Only present in bench-mode runs; the renderer listener
+  // (src/lib/merger/benchExport.ts) no-ops without these channels.
+  onBenchRun: (callback) => {
+    const handler = (_event, data) => callback(data);
+    ipcRenderer.on("bench:run", handler);
+    return () => ipcRenderer.removeListener("bench:run", handler);
+  },
+  benchResult: (payload) => ipcRenderer.invoke("bench:result", payload),
 });

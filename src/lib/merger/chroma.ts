@@ -8,6 +8,10 @@
 // core (hexToRgb / rgbToYuv / chromaDistance / sanitizeChromaKeySettings /
 // detectKeyColor / coverRect) + a browser keyer whose GL/DOM access lives
 // inside class methods — importing the module in Node is safe.
+// v1.15.2 (GPU-Shift worker migration): the keyer also runs INSIDE the
+// export Web Worker — the GL surface is created on an OffscreenCanvas there
+// (type-only import; the Node-safe-purity rule above is unchanged).
+import type { Ctx2D, PaintSurface } from "./renderer";
 //
 // YUV CONVENTION (one convention everywhere — JS, shader, harness):
 //   inputs are 0–255 channel values (÷255 internally; the shader samples
@@ -370,7 +374,9 @@ function buildProgram(
 }
 
 export class ChromaKeyer {
-  private glCanvas: HTMLCanvasElement | null = null;
+  // v1.15.2: HTMLCanvasElement on the main thread, OffscreenCanvas inside
+  // the export worker — the GL surface works identically on both.
+  private glCanvas: PaintSurface | null = null;
   private gl: WebGLRenderingContext | WebGL2RenderingContext | null = null;
   private program: WebGLProgram | null = null;
   private quad: WebGLBuffer | null = null;
@@ -420,10 +426,13 @@ export class ChromaKeyer {
    * when WebGL is unavailable / the context is lost / the frame isn't
    * decodable yet — the caller then falls back to a plain drawImage. */
   composite(
-    ctx: CanvasRenderingContext2D, source: TexImageSource, settings: ChromaKeySettings,
+    ctx: Ctx2D, source: TexImageSource, settings: ChromaKeySettings,
     dx: number, dy: number, dw: number, dh: number, opacity = 1,
   ): boolean {
-    if (typeof document === "undefined") return false; // SSR/Node → fallback
+    // SSR/Node only — workers create the GL surface off an OffscreenCanvas.
+    if (typeof document === "undefined" && typeof OffscreenCanvas === "undefined") {
+      return false; // fallback
+    }
     if (!ctx || !(dw > 0) || !(dh > 0)) return false;
     const dims = sourceDims(source);
     if (dims.w <= 0 || dims.h <= 0) return false;
@@ -504,9 +513,16 @@ export class ChromaKeyer {
    * composite rebuilds them. False = caller falls back to plain drawImage. */
   private ensureContext(): boolean {
     if (this.glFailed || this.lost) return false;
-    if (typeof document === "undefined") return false;
+    // v1.15.2: no document in the export worker — an OffscreenCanvas carries
+    // the same WebGL2/WebGL1 context (getContext overloads are identical).
+    if (typeof document === "undefined" && typeof OffscreenCanvas === "undefined") {
+      return false;
+    }
     if (this.glCanvas === null) {
-      const canvas = document.createElement("canvas");
+      const canvas: PaintSurface =
+        typeof document !== "undefined"
+          ? document.createElement("canvas")
+          : new OffscreenCanvas(1, 1);
       const opts: WebGLContextAttributes = {
         alpha: true, // keyed pixels must stay transparent
         premultipliedAlpha: true, // shader writes rgb·a (see FRAG_SRC)

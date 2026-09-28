@@ -36,3 +36,16 @@ export {
   type GpuTimelineExportOptions,
   type GpuTimelineExportResult,
 } from "./engine";
+// v1.15.2 (GPU-Shift worker migration): the worker harness — the router's GPU
+// entry. Runs the engine inside the dedicated worker (public/gpu-worker.js);
+// the main thread only relays progress/chunks/result. Boot failures fall
+// back to the in-page engine; engine failures propagate to the FFmpeg router.
+export {
+  runGpuTimelineExport,
+} from "./gpu-worker-client";
+export type {
+  GpuWorkerRequest,
+  GpuWorkerResponse,
+  GpuWorkerRunPayload,
+  GpuWorkerSinkMode,
+} from "./worker-protocol";

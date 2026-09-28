@@ -19,6 +19,7 @@ import type {
 import {
   resolveDimensions,
   watermarkGeometry,
+  type Ctx2D,
 } from "./renderer";
 import { getCaptionPreset, getFontOption } from "./captionPresets";
 import { getHeadlinePreset, type HeadlinePreset } from "./headlinePresets";
@@ -31,10 +32,12 @@ import {
 import type { CaptionAnimation } from "./types";
 import { renderSfxWav, sfxDurationMs } from "./sfx";
 import { sanitizeChromaKeySettings } from "./chroma";
-// v1.15.1 GPU-Shift: the revived WebCodecs/WebGL export engine (v8
-// architecture: SourceDecoder → GPU canvas → VideoEncoder → mp4-muxer →
-// streamed IPC sink) + its abort signal type for the router's re-throw.
-import { exportTimelineViaGpu, ExportAbortedError } from "@/lib/export";
+// v1.15.1 GPU-Shift + v1.15.2 worker migration: the revived WebCodecs/WebGL
+// engine + its abort signal type for the router's re-throw. The engine now
+// runs inside a DEDICATED WEB WORKER (public/gpu-worker.js — prebuilt,
+// self-contained; runGpuTimelineExport spawns + relays); the main thread
+// only receives progress ticks, muxed chunks, and the result.
+import { runGpuTimelineExport, ExportAbortedError } from "@/lib/export";
 
 /** True when running inside the FrameFuse Electron shell. */
 export function isElectron(): boolean {
@@ -684,7 +687,8 @@ async function exportViaFFmpeg(
 }
 
 // ---------------------------------------------------------------------------
-// v1.15.1 GPU-Shift — the export ROUTER.
+// v1.15.1 GPU-Shift — the export ROUTER (v1.15.2: the GPU arm runs in a
+// dedicated Web Worker).
 // ---------------------------------------------------------------------------
 // The WebCodecs/WebGL engine is an OPT-IN feature flag (settings.gpuExportEngine,
 // default OFF). Routing rules, in order:
@@ -693,17 +697,19 @@ async function exportViaFFmpeg(
 //      Non-routable = active burn-in text removal (the v1.15 delogo/blur/
 //      cover graphs are FFmpeg parity features) or loudness normalization
 //      ON (the 2-pass loudnorm chain).
-//   2. Flag ON + routable: the save dialog opens once; the GPU engine
-//      renders the full timeline (GPU canvas compositing + hardware H.264
-//      + streamed muxing). In the plain browser it runs its in-memory mode
-//      and downloads the MP4 (dev preview path).
+//   2. Flag ON + routable: the save dialog opens once; the GPU engine runs
+//      INSIDE the worker (OffscreenCanvas compositing + hardware H.264 +
+//      the OfflineAudioContext mixdown, muxed bytes relayed chunk-by-chunk
+//      to the preload IPC sink — the UI thread stays free). In the plain
+//      browser it runs the worker's in-memory mode and the main thread
+//      downloads the MP4 (dev preview path).
 //   3. ANY GPU-engine failure (init, encoder, muxer, watchdog) — except a
 //      user abort — falls back to the SAME FFmpeg pipeline with the
 //      already-chosen output path (no second save dialog): the master-plan
 //      graceful-degradation rule. In the browser there is no FFmpeg, so a
 //      GPU failure surfaces as a hard error there (dev preview honesty).
 // Every result carries engine: "webcodecs-gpu" | "ffmpeg-smart" + the
-// gpuFrameRenderMs/framesEncoded telemetry for A/B verification.
+// gpuFrameRenderMs/jsCompositorOverheadMs/framesEncoded telemetry for A/B.
 // ---------------------------------------------------------------------------
 function gpuRoutableTimeline(opts: ExportNativeOptions): boolean {
   if (typeof VideoEncoder === "undefined" || typeof VideoFrame === "undefined") {
@@ -735,8 +741,39 @@ export async function exportNative(
       outputPath = await api.chooseOutput();
       if (!outputPath) throw new Error("Export cancelled");
     }
+    return runExportNativeToPath(opts, outputPath);
+  }
+  if (isElectron()) {
+    return exportViaFFmpeg(opts);
+  }
+  throw new Error(DESKTOP_ONLY_EXPORT_MSG);
+}
+
+/**
+ * v1.15.2: the router core with a PRE-CHOSEN output path — no save dialog.
+ * `exportNative` (the user flow) resolves the path via chooseOutput and
+ * delegates here; the bench mode (src/lib/merger/benchExport.ts — the
+ * real-hardware A/B protocol) drives BOTH engines against fixed paths
+ * through this one entry so the comparison is apples-to-apples.
+ */
+export async function runExportNativeToPath(
+  opts: ExportNativeOptions,
+  outputPath: string | null,
+): Promise<ExportResult> {
+  if (opts.settings.gpuExportEngine === true && gpuRoutableTimeline(opts)) {
     try {
-      return await exportTimelineViaGpu({ ...opts, outputPath });
+      const gpuResult = await runGpuTimelineExport({ ...opts, outputPath });
+      // Worker browser mode: the muxed MP4 rode home as a transferable —
+      // trigger the download HERE (the worker has no DOM to click an <a>).
+      // The main-thread fallback engine already triggered it in-engine
+      // (browserDelivery "download"), and bytes are absent there.
+      if (!isElectron() && gpuResult.bytes) {
+        const blob = new Blob([gpuResult.bytes], { type: "video/mp4" });
+        const downloadUrl = URL.createObjectURL(blob);
+        triggerDownload(downloadUrl, `framefuse_${Date.now()}.mp4`);
+        setTimeout(() => URL.revokeObjectURL(downloadUrl), 60000);
+      }
+      return gpuResult;
     } catch (e) {
       if (e instanceof ExportAbortedError) throw e;
       if (e instanceof Error && e.message === "Export cancelled") throw e;
@@ -751,7 +788,7 @@ export async function exportNative(
     }
   }
   if (isElectron()) {
-    return exportViaFFmpeg(opts);
+    return exportViaFFmpeg(opts, outputPath);
   }
   throw new Error(DESKTOP_ONLY_EXPORT_MSG);
 }
@@ -833,7 +870,7 @@ export type { CanvasCaptionCtx };
  *   cue fade/scale using cue.startMs → cue.endMs (best-effort).
  */
 export function drawCaption(
-  ctx: CanvasRenderingContext2D,
+  ctx: Ctx2D,
   rawText: string,
   caption: CanvasCaptionCtx,
   cw: number,
@@ -1129,7 +1166,7 @@ function clamp01(v: number): number {
  * and BEFORE captions so center-positioned captions layer on top.
  */
 export function drawHeadline(
-  ctx: CanvasRenderingContext2D,
+  ctx: Ctx2D,
   items: HeadlineItem[],
   currentMs: number,
   cw: number,
@@ -1259,7 +1296,7 @@ export function drawHeadline(
 // ---------------------------------------------------------------------------
 
 function setupWordFont(
-  ctx: CanvasRenderingContext2D,
+  ctx: Ctx2D,
   preset: ReturnType<typeof getCaptionPreset>,
   font: ReturnType<typeof getFontOption>,
   ch: number,
@@ -1292,7 +1329,7 @@ function applyTransformText(
  * Returns a save/restore pair via the caller's ctx.save()/ctx.restore().
  */
 function applyWordTransform(
-  ctx: CanvasRenderingContext2D,
+  ctx: Ctx2D,
   t: WordTransform,
   wordX: number,
   wordY: number,
@@ -1340,7 +1377,7 @@ function applyWordTransform(
  * around the word box.
  */
 function drawStyledWord(
-  ctx: CanvasRenderingContext2D,
+  ctx: Ctx2D,
   word: string,
   x: number,
   y: number,
@@ -1398,7 +1435,7 @@ function drawStyledWord(
  * typography animation transform applied independently.
  */
 function drawWordHighlight(
-  ctx: CanvasRenderingContext2D,
+  ctx: Ctx2D,
   text: string,
   caption: CanvasCaptionCtx,
   preset: ReturnType<typeof getCaptionPreset>,
@@ -1598,7 +1635,7 @@ function drawWordHighlight(
  * centered. Kinetic typography animation applied to the single word.
  */
 function drawWordOnly(
-  ctx: CanvasRenderingContext2D,
+  ctx: Ctx2D,
   _text: string,
   caption: CanvasCaptionCtx,
   preset: ReturnType<typeof getCaptionPreset>,
@@ -1707,7 +1744,7 @@ function drawWordOnly(
  * window slides so the newest words stay visible.
  */
 function drawWordStack(
-  ctx: CanvasRenderingContext2D,
+  ctx: Ctx2D,
   _text: string,
   caption: CanvasCaptionCtx,
   preset: ReturnType<typeof getCaptionPreset>,
@@ -1841,7 +1878,7 @@ function drawWordStack(
  * full-text path (with whole-cue animation) when no word timestamps.
  */
 function drawWordAnimated(
-  ctx: CanvasRenderingContext2D,
+  ctx: Ctx2D,
   text: string,
   caption: CanvasCaptionCtx,
   preset: ReturnType<typeof getCaptionPreset>,
@@ -1982,7 +2019,7 @@ function drawWordAnimated(
 
 /** Word-wrap text to fit within maxW using the current ctx font. */
 function wrapText(
-  ctx: CanvasRenderingContext2D,
+  ctx: Ctx2D,
   text: string,
   maxW: number,
 ): string[] {
@@ -2019,7 +2056,7 @@ function wrapText(
  * greedy wrapping (which handles any number of lines).
  */
 function balancedWrapText(
-  ctx: CanvasRenderingContext2D,
+  ctx: Ctx2D,
   text: string,
   maxW: number,
   maxLines: number = 3,
@@ -2115,7 +2152,7 @@ function balancedWrapText(
 
 /** Cross-browser rounded-rect path helper. */
 function drawRoundedRect(
-  ctx: CanvasRenderingContext2D,
+  ctx: Ctx2D,
   x: number,
   y: number,
   w: number,

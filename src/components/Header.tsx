@@ -24,7 +24,7 @@ import { cn } from "@/lib/utils";
 /** v1.12.1: the renderer's build constant — compared against the REAL exe
  *  version (app.getVersion()) so a stale/hybrid install is impossible to
  *  miss. Keep in sync with package.json on every release. */
-const BUILD_VERSION = "1.15.0";
+const BUILD_VERSION = "1.15.2";
 
 export interface LastExport {
   path: string;
@@ -38,6 +38,11 @@ export interface LastExport {
   gpuFrameRenderMs?: number;
   audioSkipped?: boolean;
   softwareFallback?: boolean;
+  /** v1.15.2: the pure-JS compositor cost + the decode-side twin + whether
+   * the engine ran in its dedicated worker (the "UI never lags" proof). */
+  jsCompositorOverheadMs?: number;
+  gpuDecodeWaitMs?: number;
+  workerRuntime?: "worker" | "main-thread";
   /** v1.1 TURBO telemetry (desktop FFmpeg path only). */
   encoder?: string;
   elapsedSec?: number;
@@ -559,6 +564,25 @@ export function Header({
                   lastExport.encoder ? ` · ${lastExport.encoder}` : ""
                 }${
                   lastExport.tierLabel ? ` · ${lastExport.tierLabel}` : ""
+                }${
+                  // v1.15.2: the GPU engine's execution-context + frame-cost
+                  // story — worker vs main thread, render/compositor/decode
+                  // split (the A/B + shader-migration numbers).
+                  lastExport.engine === "webcodecs-gpu"
+                    ? ` · GPU engine in ${
+                        lastExport.workerRuntime === "main-thread" ? "main thread (fallback)" : "worker"
+                      }` +
+                      (lastExport.framesEncoded != null ? ` · ${lastExport.framesEncoded} frames` : "") +
+                      (lastExport.gpuFrameRenderMs != null
+                        ? ` · ${lastExport.gpuFrameRenderMs} ms/frame render`
+                        : "") +
+                      (lastExport.jsCompositorOverheadMs != null
+                        ? ` · ${lastExport.jsCompositorOverheadMs} ms/frame JS compositor`
+                        : "") +
+                      (lastExport.gpuDecodeWaitMs != null
+                        ? ` · ${lastExport.gpuDecodeWaitMs} ms/frame decode wait`
+                        : "")
+                    : ""
                 }${
                   lastExport.cpuTopology ? ` · ${lastExport.cpuTopology}` : ""
                 }${

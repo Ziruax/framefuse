@@ -90,7 +90,11 @@ const ffmpegBuildKind = /resources[\\/]ffmpeg([\\/]|$)/.test(String(ffmpegPath))
   : /ffmpeg-static/.test(String(ffmpegPath)) ? "ffmpeg-static" : "system-path";
 console.log(`[FFMPEG] Using: ${ffmpegPath} (${ffmpegBuildKind}) exists:`, (() => { try { return fs.existsSync(ffmpegPath); } catch { return false; } })());
 
-const isDev = !app.isPackaged;
+// v1.15.2 (A/B bench): FRAMEFUSE_LOAD_STATIC forces the packaged-style
+// out/index.html load even when running unpacked (npx electron .) — the
+// bench driver uses it so the worker bundle + static assets load exactly
+// as they do from the installer.
+const isDev = !app.isPackaged && process.env.FRAMEFUSE_LOAD_STATIC !== "1";
 let mainWindow = null;
 // v5.0: ALL live ffmpeg children (step-1 runs a parallel pool now). Cancel
 // kills everything in the set; a leak guard at export end verifies the set
@@ -6069,11 +6073,140 @@ ipcMain.handle("export-native", async (event, opts) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// v1.15.2 REAL-HARDWARE A/B EXPORT BENCH — the main-process arm.
+// See scripts/ab-export-bench.js (the driver) and
+// src/lib/merger/benchExport.ts (the renderer arm) for the full protocol.
+// ---------------------------------------------------------------------------
+let benchState = null; // { outPath, keepOpen, done }
+
+function writeBenchResults(payload) {
+  if (!benchState || benchState.done) return;
+  benchState.done = true;
+  try {
+    fs.mkdirSync(path.dirname(benchState.outPath), { recursive: true });
+    fs.writeFileSync(benchState.outPath, JSON.stringify(payload, null, 2));
+    console.log(`[BENCH] results written to ${benchState.outPath}`);
+  } catch (e) {
+    console.error(`[BENCH] results write failed: ${e.message}`);
+  }
+  if (!benchState.keepOpen) setTimeout(() => app.quit(), 250);
+}
+
+ipcMain.handle("bench:result", (_evt, payload) => {
+  writeBenchResults(payload);
+  return { ok: true };
+});
+
+function startExportBench() {
+  const planPath = process.env.FRAMEFUSE_BENCH_PLAN;
+  const outPath = process.env.FRAMEFUSE_BENCH_OUT;
+  if (!planPath || !outPath) {
+    console.error("[BENCH] FRAMEFUSE_BENCH needs FRAMEFUSE_BENCH_PLAN and FRAMEFUSE_BENCH_OUT");
+    app.quit();
+    return;
+  }
+  let plan;
+  try {
+    plan = JSON.parse(fs.readFileSync(planPath, "utf8"));
+  } catch (e) {
+    console.error(`[BENCH] plan read failed: ${e.message}`);
+    app.quit();
+    return;
+  }
+  benchState = {
+    outPath,
+    keepOpen: process.env.FRAMEFUSE_BENCH_KEEP_OPEN === "1",
+    done: false,
+  };
+
+  // Force the FFmpeg ladder to the plan's encoder (default nvenc) BEFORE
+  // any renderer export runs — the A/B's "FFmpeg NVENC path" arm.
+  const forceKey = plan.forceEncoder;
+  if (forceKey && Object.prototype.hasOwnProperty.call(FORCE_ENCODER_MAP, forceKey)) {
+    forcedEncoderKey = forceKey;
+    detectedEncoder = null; // invalidate the session cache
+    encoderDetecting = null;
+    console.log(`[BENCH] FFmpeg encoder forced to ${FORCE_ENCODER_MAP[forceKey].name}`);
+  }
+
+  const sendPlan = async () => {
+    const win = mainWindow;
+    if (!win || win.isDestroyed()) {
+      writeBenchResults({ ok: false, error: "bench window lost before the plan shipped", runs: [] });
+      return;
+    }
+    const media = [];
+    for (const item of plan.media || []) {
+      try {
+        const buf = await fs.promises.readFile(item.path);
+        media.push({
+          name: path.basename(item.path),
+          kind: item.kind,
+          // Buffer → exact-size ArrayBuffer (structured-clone payload).
+          bytes: buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
+        });
+      } catch (e) {
+        console.error(`[BENCH] media read failed (${item.path}): ${e.message}`);
+      }
+    }
+    if (media.length === 0) {
+      writeBenchResults({ ok: false, error: "no fixture media could be read", runs: [] });
+      return;
+    }
+    console.log(`[BENCH] shipping ${media.length} fixture files to the renderer`);
+    win.webContents.send("bench:run", {
+      media,
+      config: {
+        outputDir: plan.outputDir,
+        durationSec: plan.durationSec ?? 60,
+        fps: plan.fps ?? 30,
+        resolution: plan.resolution ?? "1080p",
+        aspect: plan.aspect ?? "16:9",
+        quality: plan.quality ?? "social",
+        forceEncoder: plan.forceEncoder ?? null,
+        captions: plan.captions === true,
+      },
+    });
+  };
+
+  // Fire when the page (and its React bench listener) is up. The window was
+  // just created, but cover the already-loaded case too.
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow.webContents.isLoadingMainFrame()) {
+      mainWindow.webContents.once("did-finish-load", () => setTimeout(() => { void sendPlan(); }, 2500));
+    } else {
+      setTimeout(() => { void sendPlan(); }, 2500);
+    }
+  } else {
+    writeBenchResults({ ok: false, error: "bench window lost before the plan shipped", runs: [] });
+    return;
+  }
+
+  // Hard timeout: never leave a bench app hanging (the driver also enforces
+  // its own 20-minute limit).
+  setTimeout(() => {
+    if (benchState && !benchState.done) {
+      writeBenchResults({ ok: false, error: "bench timed out after 20 minutes", runs: [] });
+    }
+  }, 20 * 60 * 1000).unref();
+}
+
 // App lifecycle
 app.whenReady().then(() => {
   ensureTempDir();
   buildApplicationMenu();
   createWindow();
+  // v1.15.2 REAL-HARDWARE A/B EXPORT BENCH: scripts/ab-export-bench.js
+  // spawns the app with FRAMEFUSE_BENCH=1 + a plan JSON + a results JSON
+  // path. main reads the plan → ships the fixture media bytes to the
+  // renderer ("bench:run") → the renderer runs BOTH engines against fixed
+  // output paths (FFmpeg forced to the plan's encoder — default NVENC —
+  // then the WebCodecs GPU worker) → "bench:result" carries the timings →
+  // written to disk → quit. Headless/VM runs prove nothing about ASIC
+  // speed; this exists to gather REAL wall-clock + gpuFrameRenderMs field
+  // data on actual GPU hardware.
+  if (process.env.FRAMEFUSE_BENCH === "1") startExportBench();
   // v5.1: warm the GPU-encoder probe at startup so the FIRST export starts
   // encoding immediately instead of paying the detection latency up front.
   detectGpuEncoderAsync();
