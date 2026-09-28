@@ -49,7 +49,7 @@ const electronStub = {
     on: () => {},
     getPath: (k) => path.join(TMP, "userData"),
     getName: () => "FrameFuse",
-    getVersion: () => "1.14.6",
+    getVersion: () => "1.15.0",
     isReady: () => true,
     isPackaged: false,
     quit: () => {},
