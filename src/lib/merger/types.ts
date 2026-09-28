@@ -690,9 +690,52 @@ export interface ExportNativeOptions {
   watermark?: WatermarkExportOptions | null;
   /** v5.0: SFX placements mixed into the export audio chain. */
   sfx?: SfxItem[];
+  /** v1.15: burn-in text detection & removal (default OFF — the renderer
+   *  passes the setting through to the main process, which sanitizes it). */
+  textRemoval?: TextRemovalSettings | null;
   onProgress?: (p: ExportProgress) => void;
   /** When aborted, the export stops as soon as possible. */
   signal?: AbortSignal;
+}
+
+// ---------------------------------------------------------------------------
+// v1.15 — BURN-IN TEXT DETECTION & REMOVAL (default OFF, purely opt-in).
+//
+// The renderer's OCR detector (tesseract.js) samples frames from the first
+// video source and stores word-box clusters as SOURCE-normalized rects
+// (0..1 of the source frame), so the same region applies to every video
+// segment regardless of output resolution — the filters run BEFORE the
+// cover-fit scale/crop in every export path and the preview mirrors the
+// same math, so framing can never diverge.
+// ---------------------------------------------------------------------------
+
+export type TextRemovalMode = "inpaint" | "blur" | "cover";
+
+export interface TextRemovalRegion {
+  id: string;
+  /** 0..1 of the SOURCE frame width. */
+  x: number;
+  /** 0..1 of the SOURCE frame height. */
+  y: number;
+  /** 0..1 of the SOURCE frame width. */
+  w: number;
+  /** 0..1 of the SOURCE frame height. */
+  h: number;
+  /** Where this region came from (auto-detect vs hand-drawn). */
+  source: "ocr" | "manual";
+  /** OCR excerpt for display (auto-detected regions only). */
+  label?: string;
+}
+
+export interface TextRemovalSettings {
+  /** OFF unless the user turns it on (the shipped default). */
+  enabled: boolean;
+  mode: TextRemovalMode;
+  regions: TextRemovalRegion[];
+}
+
+export function defaultTextRemovalSettings(): TextRemovalSettings {
+  return { enabled: false, mode: "inpaint", regions: [] };
 }
 
 /** Audio post-processing options for export (v4.1). v5.2 adds background
@@ -889,6 +932,17 @@ export const TRANSITION_STYLE_INFO: Record<
   },
 };
 
+/** v1.15: Groq Whisper API config payload returned by the Electron bridge.
+ *  The raw API key NEVER crosses the bridge — only this masked/device-local
+ *  view of it. */
+export interface GroqConfigPayload {
+  hasKey: boolean;
+  maskedKey: string;
+  model: string;
+  models: Array<{ id: string; label: string; hint: string }>;
+  fwAvailable: boolean;
+}
+
 // Augment the window with the Electron bridge (optional, only present in app).
 declare global {
   interface Window {
@@ -982,6 +1036,11 @@ declare global {
         language?: string;
         model?: string;
         runId?: string;
+        /** v1.15: STT routing — "groq" (cloud, user's key), "local"
+         *  (offline engines), or "auto" (cloud when a key is saved). */
+        engine?: "groq" | "local" | "auto";
+        /** v1.15: Groq model override (whisper-large-v3-turbo | whisper-large-v3). */
+        groqModel?: string;
       }) => Promise<{
         chunks: Array<{ text: string; timestamp: [number | null, number | null] }> | null;
         language: string | null;
@@ -995,6 +1054,18 @@ declare global {
       whisperFwPreload?: (p: { model: string }) => Promise<{ ok: boolean; model: string }>;
       whisperCancel: () => Promise<number>;
       onWhisperProgress: (cb: (d: { progress: number; status: string }) => void) => () => void;
+      /** v1.15: Groq Whisper API configuration. The key is the USER'S OWN and
+       *  lives only on this device (userData/groq.json, 0600) — the bridge
+       *  returns a MASKED form only, never the raw key. */
+      whisperGroqGet?: () => Promise<GroqConfigPayload>;
+      /** { apiKey?: string ("" clears), model?: string } → same payload as get. */
+      whisperGroqSet?: (p: { apiKey?: string; model?: string }) => Promise<GroqConfigPayload>;
+      /** { apiKey?: string } → { ok, message, whisperModels } — key check. */
+      whisperGroqTest?: (p: { apiKey?: string }) => Promise<{
+        ok: boolean;
+        message: string;
+        whisperModels: string[];
+      }>;
       /** ── v5.1 native project files (dialog-backed) ── */
       saveProject: (p: { doc: unknown; currentPath?: string | null }) => Promise<{ path: string; name: string } | null>;
       saveProjectAs: (p: { doc: unknown }) => Promise<{ path: string; name: string } | null>;

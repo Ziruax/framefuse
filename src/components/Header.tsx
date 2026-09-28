@@ -597,6 +597,23 @@ export function Header({
                       (lastExport.profile.cpuBusyPct != null ? ` · cpu ${lastExport.profile.cpuBusyPct}%` : "") +
                       (lastExport.profile.file ? " · perf profile JSON saved" : "")
                     : ""
+                }${
+                  // v1.15: the per-STAGE breakdown — "where did the time go"
+                  // answered inline (top 3 stages by wall time, from the
+                  // export profiler). The full JSON stays at profile.file.
+                  lastExport.profile?.stages
+                    ? (() => {
+                        const top = Object.entries(lastExport.profile!.stages!)
+                          .filter(([, ms]) => Number(ms) > 0)
+                          .sort((a, b) => Number(b[1]) - Number(a[1]))
+                          .slice(0, 3)
+                          .map(
+                            ([k, ms]) =>
+                              `${k} ${(Number(ms) / 1000).toFixed(1)}s`,
+                          );
+                        return top.length ? ` · time: ${top.join(" · ")}` : "";
+                      })()
+                    : ""
                 }`
               : undefined
           }

@@ -28,6 +28,7 @@ const GROUPS: ShortcutGroup[] = [
     icon: <span aria-hidden>▶</span>,
     rows: [
       { keys: ["Space"], action: "Play / pause" },
+      { keys: ["F"], action: "Full screen preview (Esc exits)" },
       { keys: ["L"], action: "Play / speed up (shuttle)" },
       { keys: ["J"], action: "Play / slow down (shuttle)" },
       { keys: ["K"], action: "Pause" },

@@ -31,6 +31,12 @@ import {
   Download,
   Check,
   TriangleAlert,
+  Cloud,
+  HardDrive,
+  KeyRound,
+  ExternalLink,
+  Eraser,
+  ScanText,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type {
@@ -44,6 +50,10 @@ import type {
   VideoSettings,
   WatermarkPosition,
   WatermarkSettings,
+  GroqConfigPayload,
+  TextRemovalSettings,
+  TextRemovalMode,
+  TextRemovalRegion,
 } from "@/lib/merger/types";
 import { TRANSITION_STYLE_INFO, QUALITY_PROFILES } from "@/lib/merger/types";
 import type { KenBurnsDirection } from "@/lib/merger/types";
@@ -67,6 +77,15 @@ import {
 } from "@/lib/merger/whisper";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
+// v1.15: burn-in text detection (tesseract.js) + STT engine routing.
+import { detectTextRegions } from "@/lib/merger/textDetect";
+// v1.15: STT engine routing (Groq cloud vs local) — an app-level device
+// preference, never stored in project files.
+import {
+  GROQ_MODEL_OPTIONS,
+  loadSttSettings,
+  saveSttSettings,
+} from "@/lib/merger/sttSettings";
 
 // ---------------------------------------------------------------------------
 // Whisper languages
@@ -158,6 +177,11 @@ interface SettingsPanelProps {
   onRemoveHeadline: (id: string) => void;
   /** Master timeline duration (for headline default windows). */
   totalMs: number;
+  /** v1.15: burn-in text detection & removal settings (default OFF). */
+  textRemoval: TextRemovalSettings;
+  onTextRemovalChange: (tr: TextRemovalSettings) => void;
+  /** v1.15: a video source the OCR detector can sample ({ url, name }). */
+  videoSourceForDetect: { url: string; name: string } | null;
   /** v5.1: assign a random transition mix to every boundary (page owns the
    *  base-lane boundary list; one commit = one undo step). */
   onRandomMix?: () => void;
@@ -480,6 +504,9 @@ export function SettingsPanel(props: SettingsPanelProps) {
     onUpdateHeadline,
     onRemoveHeadline,
     totalMs,
+    textRemoval,
+    onTextRemovalChange,
+    videoSourceForDetect,
     onRandomMix,
     boundaryCount,
     debug,
@@ -1588,6 +1615,13 @@ export function SettingsPanel(props: SettingsPanelProps) {
             onRemove={onRemoveHeadline}
             totalMs={totalMs}
           />
+
+          {/* ─── Text removal (v1.15 — default OFF) ─────────────────── */}
+          <TextRemovalSection
+            textRemoval={textRemoval}
+            onTextRemovalChange={onTextRemovalChange}
+            videoSourceForDetect={videoSourceForDetect}
+          />
         </div>
 
         {/* ─── Audio tab — normalize / fades ──────────────────────────── */}
@@ -1814,6 +1848,259 @@ export function SettingsPanel(props: SettingsPanelProps) {
         </div>
       </div>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// v1.15 — Text removal section (burned-in text detection & removal).
+// DEFAULT OFF. Auto-detect samples the first video source with OCR and
+// clusters stable word boxes into source-normalized regions.
+// ---------------------------------------------------------------------------
+interface TextRemovalSectionProps {
+  textRemoval: TextRemovalSettings;
+  onTextRemovalChange: (tr: TextRemovalSettings) => void;
+  videoSourceForDetect: { url: string; name: string } | null;
+}
+
+const TR_MODES: Array<{ value: TextRemovalMode; label: string; hint: string }> = [
+  {
+    value: "inpaint",
+    label: "Inpaint",
+    hint: "Smooth fill interpolated from the surroundings — best for clean text removal (recommended)",
+  },
+  {
+    value: "blur",
+    label: "Blur",
+    hint: "Strong region-limited Gaussian blur — the text becomes an unreadable smudge",
+  },
+  {
+    value: "cover",
+    label: "Cover",
+    hint: "Solid black box over the text — the classic hard cover",
+  },
+];
+
+function TextRemovalSection({
+  textRemoval,
+  onTextRemovalChange,
+  videoSourceForDetect,
+}: TextRemovalSectionProps) {
+  const [detecting, setDetecting] = useState(false);
+  const [detectProgress, setDetectProgress] = useState<{
+    progress: number;
+    status: string;
+  } | null>(null);
+  const detectAbortRef = useRef<AbortController | null>(null);
+
+  const set = (patch: Partial<TextRemovalSettings>) =>
+    onTextRemovalChange({ ...textRemoval, ...patch });
+
+  const runDetect = useCallback(async () => {
+    if (detecting || !videoSourceForDetect) return;
+    const ctrl = new AbortController();
+    detectAbortRef.current = ctrl;
+    setDetecting(true);
+    setDetectProgress({ progress: 0, status: "Starting…" });
+    try {
+      const result = await detectTextRegions(videoSourceForDetect, {
+        signal: ctrl.signal,
+        onProgress: (p) => setDetectProgress(p),
+      });
+      set({ regions: result.regions, enabled: true });
+      if (result.regions.length > 0) {
+        toast.success(`Found ${result.regions.length} text region(s)`, {
+          description:
+            "Removal is ON. Check the list below — remove any region you want to keep visible.",
+        });
+      } else {
+        toast.info("No stable text found", {
+          description:
+            "The scan sampled every sampled frame and found no text that stays put. You can still enable removal manually with your own regions.",
+        });
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("cancelled")) {
+        // silent — the user stopped it
+      } else {
+        toast.error("Text detection failed", { description: msg });
+      }
+    } finally {
+      setDetecting(false);
+      setDetectProgress(null);
+      detectAbortRef.current = null;
+    }
+  }, [detecting, videoSourceForDetect]);
+
+  const removeRegion = (id: string) =>
+    set({ regions: textRemoval.regions.filter((r) => r.id !== id) });
+
+  return (
+    <Section
+      icon={<Eraser size={13} />}
+      title="Text removal"
+      defaultOpen={false}
+    >
+      {/* Enable switch — OFF by default (the shipped default). Same Toggle
+          component as every other app switch (design consistency). */}
+      <div className="mb-3">
+        <Toggle
+          checked={textRemoval.enabled}
+          onChange={(v) => set({ enabled: v })}
+          label="Enable text removal"
+        />
+        <p className="mt-0.5 text-[10px] leading-snug text-zinc-500">
+          Watermarks, hard subtitles, usernames — detected on the video and
+          removed on export.
+        </p>
+      </div>
+
+      {/* Auto-detect — OCR over sampled frames of the first video source. */}
+      <button
+        type="button"
+        onClick={() => {
+          if (detecting) {
+            detectAbortRef.current?.abort();
+            return;
+          }
+          void runDetect();
+        }}
+        disabled={!videoSourceForDetect && !detecting}
+        className={cn(
+          "flex w-full items-center justify-center gap-2 rounded-md px-3 py-2 text-xs font-semibold transition-colors",
+          detecting
+            ? "bg-zinc-700 text-zinc-200 hover:bg-zinc-600"
+            : !videoSourceForDetect
+              ? "cursor-not-allowed bg-zinc-800 text-zinc-500"
+              : "bg-violet-500 text-white hover:bg-violet-400",
+        )}
+        title={
+          videoSourceForDetect
+            ? `Scan ${videoSourceForDetect.name} for burned-in text (samples up to 6 frames with OCR)`
+            : "Add a video clip first — detection scans a video source"
+        }
+      >
+        {detecting ? (
+          <>
+            <Loader2 size={13} className="animate-spin" />
+            Cancel scan
+          </>
+        ) : (
+          <>
+            <ScanText size={13} />
+            Detect text on video
+          </>
+        )}
+      </button>
+      {detectProgress && (
+        <div className="mt-2">
+          <div className="h-1 w-full overflow-hidden rounded-full bg-zinc-800">
+            <div
+              className="h-full bg-violet-500 transition-all"
+              style={{ width: `${detectProgress.progress}%` }}
+            />
+          </div>
+          <p className="mt-1 truncate text-[10px] text-zinc-500">
+            {detectProgress.status}
+          </p>
+        </div>
+      )}
+      {!videoSourceForDetect && (
+        <p className="mt-1.5 text-[10px] leading-snug text-zinc-600">
+          Detection needs at least one video clip on the timeline (it scans the
+          first one). The removal filters apply to every video segment.
+        </p>
+      )}
+
+      {/* Mode picker. */}
+      <div className="mt-3">
+        <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
+          Removal style
+        </div>
+        <div className="grid grid-cols-3 gap-1">
+          {TR_MODES.map((m) => (
+            <button
+              key={m.value}
+              type="button"
+              onClick={() => set({ mode: m.value })}
+              title={m.hint}
+              className={cn(
+                "rounded border px-2 py-1.5 text-[10px] font-medium transition-colors",
+                textRemoval.mode === m.value
+                  ? "border-violet-500/60 bg-violet-500/15 text-violet-300"
+                  : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200",
+              )}
+              aria-pressed={textRemoval.mode === m.value}
+            >
+              {m.label}
+            </button>
+          ))}
+        </div>
+        <p className="mt-1 text-[9px] leading-snug text-zinc-600">
+          {TR_MODES.find((m) => m.value === textRemoval.mode)?.hint}
+        </p>
+      </div>
+
+      {/* Regions list. */}
+      {textRemoval.regions.length > 0 && (
+        <div className="mt-3">
+          <div className="mb-1 flex items-center justify-between">
+            <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
+              Regions ({textRemoval.regions.length}/8)
+            </span>
+            <button
+              type="button"
+              onClick={() => set({ regions: [], enabled: false })}
+              className="rounded border px-1.5 py-0.5 text-[9px] font-medium text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-200"
+              style={{ borderColor: "#3f3f46" }}
+            >
+              Clear all
+            </button>
+          </div>
+          <div className="max-h-40 space-y-1 overflow-y-auto pr-1">
+            {textRemoval.regions.map((r) => (
+              <div
+                key={r.id}
+                className="flex items-center gap-2 rounded border px-2 py-1.5"
+                style={{ borderColor: "#27272a", backgroundColor: "#18181b" }}
+              >
+                <span
+                  className="size-2 shrink-0 rounded-sm"
+                  style={{
+                    background: "repeating-linear-gradient(45deg, #8b5cf6, #8b5cf6 3px, #4c1d95 3px, #4c1d95 6px)",
+                  }}
+                  aria-hidden
+                />
+                <span className="min-w-0 flex-1 truncate text-[10px] text-zinc-300">
+                  {r.label
+                    ? `“${r.label}”`
+                    : `Region @ ${(r.x * 100).toFixed(0)}%, ${(r.y * 100).toFixed(0)}% · ${(r.w * 100).toFixed(0)}×${(r.h * 100).toFixed(0)}%`}
+                  <span className="ml-1 text-zinc-600">
+                    {r.source === "ocr" ? "· detected" : "· manual"}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => removeRegion(r.id)}
+                  className="shrink-0 rounded p-1 text-zinc-500 transition-colors hover:bg-red-500/10 hover:text-red-400"
+                  aria-label="Remove this text-removal region"
+                >
+                  <X size={11} />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <p className="mt-3 text-[9px] leading-relaxed text-zinc-600">
+        Regions are detected on and applied to the video sources (before
+        reframing), so they follow every crop and aspect. The preview shows an
+        approximation; the export applies the true{" "}
+        {textRemoval.mode === "inpaint" ? "inpainting" : textRemoval.mode}. Off
+        by default — nothing runs unless you enable it.
+      </p>
+    </Section>
   );
 }
 
@@ -2660,6 +2947,157 @@ function CaptionsSection(props: CaptionsSectionProps) {
     }
   }, [predownloading, whisperBusy, whisperStatusApi, whisperModel]);
 
+  // ── v1.15 STT engine routing (Groq cloud vs this device) ──────────────
+  // App-level preference (localStorage, never in project files). The Groq
+  // API key itself lives in the MAIN process (userData/groq.json, 0600) and
+  // only a MASKED form ever crosses the bridge.
+  const groqApi =
+    typeof window !== "undefined" && window.electronAPI
+      ? (window.electronAPI as unknown as {
+          whisperGroqGet?: () => Promise<GroqConfigPayload>;
+          whisperGroqSet?: (p: {
+            apiKey?: string;
+            model?: string;
+          }) => Promise<GroqConfigPayload>;
+          whisperGroqTest?: (p: {
+            apiKey?: string;
+          }) => Promise<{ ok: boolean; message: string; whisperModels: string[] }>;
+        })
+      : undefined;
+  const [sttEngine, setSttEngine] = useState<"groq" | "local">(
+    () => loadSttSettings().engine,
+  );
+  const [groqCfg, setGroqCfg] = useState<GroqConfigPayload | null>(null);
+  const [groqKeyInput, setGroqKeyInput] = useState("");
+  const [groqKeyEditing, setGroqKeyEditing] = useState(false);
+  const [groqBusy, setGroqBusy] = useState<"" | "save" | "test" | "clear">("");
+
+  // Load the on-device Groq config once (masked key presence + model).
+  useEffect(() => {
+    const get = groqApi?.whisperGroqGet;
+    if (!get) return;
+    let cancelled = false;
+    get()
+      .then((cfg) => {
+        if (!cancelled && cfg) {
+          setGroqCfg(cfg);
+          // Mirror any main-side model drift into the app preference.
+          const cur = loadSttSettings();
+          if (cur.groqModel !== cfg.model) {
+            saveSttSettings({ ...cur, groqModel: cfg.model });
+          }
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const pickEngine = useCallback((next: "groq" | "local") => {
+    setSttEngine(next);
+    saveSttSettings({ ...loadSttSettings(), engine: next });
+  }, []);
+
+  const saveGroqKey = useCallback(async () => {
+    const set = groqApi?.whisperGroqSet;
+    const key = groqKeyInput.trim();
+    if (!set) return;
+    if (!key) {
+      toast.error("Paste an API key first", {
+        description: "Create a free key at console.groq.com → API Keys.",
+      });
+      return;
+    }
+    setGroqBusy("save");
+    try {
+      const cfg = await set({ apiKey: key });
+      setGroqCfg(cfg);
+      setGroqKeyInput("");
+      setGroqKeyEditing(false);
+      // Saving a key implies the user wants the cloud engine.
+      if (!loadSttSettings() || loadSttSettings().engine !== "groq") {
+        pickEngine("groq");
+      }
+      toast.success("Groq API key saved on this device", {
+        description: "whisper-large-v3-turbo is now the default captions engine.",
+      });
+    } catch (err) {
+      toast.error("Could not save the key", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setGroqBusy("");
+    }
+  }, [groqApi, groqKeyInput, pickEngine]);
+
+  const clearGroqKey = useCallback(async () => {
+    const set = groqApi?.whisperGroqSet;
+    if (!set) return;
+    setGroqBusy("clear");
+    try {
+      const cfg = await set({ apiKey: "" });
+      setGroqCfg(cfg);
+      // No key → the cloud engine can't run; move the preference to local.
+      pickEngine("local");
+      toast.success("API key removed", {
+        description: "Captions now use the built-in offline engine.",
+      });
+    } catch (err) {
+      toast.error("Could not remove the key", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setGroqBusy("");
+    }
+  }, [groqApi, pickEngine]);
+
+  const testGroqKey = useCallback(async () => {
+    const test = groqApi?.whisperGroqTest;
+    if (!test) return;
+    setGroqBusy("test");
+    try {
+      const r = await test(
+        groqKeyEditing && groqKeyInput.trim()
+          ? { apiKey: groqKeyInput.trim() }
+          : {},
+      );
+      if (r.ok) {
+        toast.success("Groq key works", {
+          description:
+            r.whisperModels.length > 0
+              ? `Available: ${r.whisperModels.slice(0, 3).join(", ")}`
+              : r.message,
+        });
+      } else {
+        toast.error("Groq key check failed", { description: r.message });
+      }
+    } catch (err) {
+      toast.error("Could not reach Groq", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setGroqBusy("");
+    }
+  }, [groqApi, groqKeyEditing, groqKeyInput]);
+
+  const pickGroqModel = useCallback(
+    async (model: string) => {
+      const cur = loadSttSettings();
+      saveSttSettings({ ...cur, groqModel: model });
+      const set = groqApi?.whisperGroqSet;
+      if (set) {
+        try {
+          const cfg = await set({ model });
+          setGroqCfg(cfg);
+        } catch {
+          /* main-side persistence is best-effort; the preference is set */
+        }
+      }
+    },
+    [groqApi],
+  );
+
   return (
     <Section icon={<Captions size={13} />} title="Captions" defaultOpen>
       {/* ── Whisper generation ── */}
@@ -2672,6 +3110,241 @@ function CaptionsSection(props: CaptionsSectionProps) {
           <span className="text-[11px] font-semibold text-zinc-200">
             AI Captions (Whisper)
           </span>
+        </div>
+
+        {/* ── v1.15: Speech-to-text ENGINE (Groq cloud vs this device) ── */}
+        <div
+          className="mb-2.5 rounded-lg border p-2.5"
+          style={{ borderColor: "#3f3f46", backgroundColor: "#141416" }}
+        >
+          <div className="mb-1.5 flex items-center justify-between">
+            <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
+              Engine
+            </span>
+            {sttEngine === "groq" && groqCfg?.hasKey && (
+              <span
+                className="flex items-center gap-1 text-[10px] font-medium text-emerald-400"
+                title="Groq key saved on this device"
+              >
+                <Check size={10} /> Key saved
+              </span>
+            )}
+          </div>
+          <div className="grid grid-cols-2 gap-1">
+            <button
+              type="button"
+              onClick={() => pickEngine("groq")}
+              className={cn(
+                "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
+                sttEngine === "groq"
+                  ? "border-cyan-500/60 bg-cyan-500/15 text-cyan-300"
+                  : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200",
+              )}
+              aria-pressed={sttEngine === "groq"}
+            >
+              <Cloud size={12} />
+              Groq Cloud
+              <span
+                className={cn(
+                  "rounded-full px-1.5 py-px text-[8px] font-semibold uppercase",
+                  sttEngine === "groq"
+                    ? "bg-cyan-500/25 text-cyan-200"
+                    : "bg-zinc-800 text-zinc-500",
+                )}
+              >
+                Fast
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => pickEngine("local")}
+              className={cn(
+                "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
+                sttEngine === "local"
+                  ? "border-amber-500/60 bg-amber-500/15 text-amber-300"
+                  : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200",
+              )}
+              aria-pressed={sttEngine === "local"}
+            >
+              <HardDrive size={12} />
+              This device
+            </button>
+          </div>
+
+          {sttEngine === "groq" ? (
+            <div className="mt-2">
+              {!inElectron || !groqApi?.whisperGroqGet ? (
+                <p className="text-[10px] leading-relaxed text-zinc-500">
+                  The cloud engine runs inside the FrameFuse desktop app — the
+                  browser preview falls back to the local engine. In the app:
+                  Settings → Captions → Engine → Groq Cloud.
+                </p>
+              ) : groqCfg?.hasKey && !groqKeyEditing ? (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <KeyRound size={11} className="shrink-0 text-cyan-400" />
+                    <span
+                      className="flex-1 truncate rounded border bg-zinc-900 px-2 py-1 font-mono text-[10px] text-zinc-300"
+                      style={{ borderColor: "#3f3f46" }}
+                      title={groqCfg.maskedKey}
+                    >
+                      {groqCfg.maskedKey}
+                    </span>
+                  </div>
+                  <div className="flex gap-1">
+                    <button
+                      type="button"
+                      onClick={testGroqKey}
+                      disabled={groqBusy !== ""}
+                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+                      style={{ borderColor: "#3f3f46" }}
+                    >
+                      {groqBusy === "test" ? (
+                        <Loader2 size={10} className="animate-spin" />
+                      ) : (
+                        <BadgeCheck size={10} />
+                      )}
+                      Test key
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setGroqKeyEditing(true);
+                        setGroqKeyInput("");
+                      }}
+                      disabled={groqBusy !== ""}
+                      className="rounded border px-2 py-1 text-[10px] font-medium text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+                      style={{ borderColor: "#3f3f46" }}
+                    >
+                      Replace
+                    </button>
+                    <button
+                      type="button"
+                      onClick={clearGroqKey}
+                      disabled={groqBusy !== ""}
+                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-red-400/90 transition-colors hover:bg-red-500/10 hover:border-red-500/40 disabled:cursor-not-allowed disabled:opacity-50"
+                      style={{ borderColor: "#3f3f46" }}
+                    >
+                      {groqBusy === "clear" ? (
+                        <Loader2 size={10} className="animate-spin" />
+                      ) : (
+                        <Trash2 size={10} />
+                      )}
+                      Remove
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <input
+                    type="password"
+                    value={groqKeyInput}
+                    onChange={(e) => setGroqKeyInput(e.target.value)}
+                    placeholder="gsk_… paste your Groq API key"
+                    spellCheck={false}
+                    autoComplete="off"
+                    className="w-full rounded border bg-zinc-900 px-2 py-1.5 font-mono text-[10px] text-zinc-200 placeholder:text-zinc-600 focus:border-cyan-500/60 focus:outline-none"
+                    style={{ borderColor: "#3f3f46" }}
+                    aria-label="Groq API key"
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        void saveGroqKey();
+                      }
+                    }}
+                  />
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={saveGroqKey}
+                      disabled={groqBusy !== "" || !groqKeyInput.trim()}
+                      className="flex items-center gap-1 rounded bg-cyan-500 px-2.5 py-1 text-[10px] font-semibold text-zinc-900 transition-colors hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      {groqBusy === "save" ? (
+                        <Loader2 size={10} className="animate-spin" />
+                      ) : (
+                        <KeyRound size={10} />
+                      )}
+                      Save key
+                    </button>
+                    {groqKeyEditing && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setGroqKeyEditing(false);
+                          setGroqKeyInput("");
+                        }}
+                        className="rounded border px-2 py-1 text-[10px] font-medium text-zinc-400 transition-colors hover:bg-zinc-800"
+                        style={{ borderColor: "#3f3f46" }}
+                      >
+                        Cancel
+                      </button>
+                    )}
+                    <a
+                      href="https://console.groq.com/keys"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="ml-auto flex items-center gap-1 text-[10px] font-medium text-cyan-400 underline-offset-2 hover:underline"
+                    >
+                      Get a free key
+                      <ExternalLink size={9} />
+                    </a>
+                  </div>
+                </div>
+              )}
+
+              {/* Cloud model — turbo is the default (faster). */}
+              <div className="mt-2">
+                <div className="mb-1 flex items-center justify-between">
+                  <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
+                    Cloud model
+                  </span>
+                  <span className="text-[9px] text-zinc-600">Whisper large</span>
+                </div>
+                <div className="grid grid-cols-2 gap-1">
+                  {GROQ_MODEL_OPTIONS.map((m) => {
+                    const active =
+                      (groqCfg?.model ?? loadSttSettings().groqModel) === m.id;
+                    return (
+                      <button
+                        key={m.id}
+                        type="button"
+                        onClick={() => {
+                          void pickGroqModel(m.id);
+                        }}
+                        title={m.hint}
+                        className={cn(
+                          "rounded border px-2 py-1.5 text-[10px] font-medium transition-colors",
+                          active
+                            ? "border-cyan-500/60 bg-cyan-500/15 text-cyan-300"
+                            : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200",
+                        )}
+                        aria-pressed={active}
+                      >
+                        {m.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <p className="mt-2 text-[9px] leading-relaxed text-zinc-600">
+                Your key stays on this device (never in project files). Audio is
+                uploaded to api.groq.com for transcription only. Falls back to
+                the built-in engine whenever the cloud is unreachable.
+              </p>
+            </div>
+          ) : (
+            <p className="mt-2 text-[10px] leading-relaxed text-zinc-500">
+              {groqCfg?.fwAvailable
+                ? "faster-whisper runtime detected — local transcription runs on your CPU."
+                : modelStatus?.bundled?.available
+                  ? "Offline Whisper-tiny is bundled with the installer — works without internet."
+                  : "Offline Whisper runs locally (model downloads once on first use)."}{" "}
+              Switch to <span className="text-cyan-400">Groq Cloud</span> for
+              whisper-large-v3 accuracy at cloud speed.
+            </p>
+          )}
         </div>
         <div className="mb-2 flex gap-2">
           <select
@@ -2688,8 +3361,10 @@ function CaptionsSection(props: CaptionsSectionProps) {
             ))}
           </select>
         </div>
-        {/* v1.3: model quality selector — the bundled faster-whisper engine
-            (CTranslate2 int8) makes larger models practical on CPU. */}
+        {/* v1.3: model quality selector — LOCAL engine sizes (tiny…medium).
+            v1.15: only relevant when the device engine is selected; the
+            Groq cloud path picks its model above. */}
+        {sttEngine === "local" && (
         <div className="mb-2">
           <div className="mb-1 flex items-center justify-between">
             <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
@@ -2726,6 +3401,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
             ))}
           </div>
         </div>
+        )}
         <button
           type="button"
           onClick={onGenerateCaptions}
@@ -2758,12 +3434,26 @@ function CaptionsSection(props: CaptionsSectionProps) {
           </div>
         )}
         <p className="mt-2 text-[10px] leading-relaxed text-zinc-500">
-          <span className="text-amber-400/90">faster-whisper</span> (CTranslate2
-          int8) runs locally — about 4× faster than the old engine, with VAD
-          silence skipping and{" "}
-          <span className="text-zinc-300">exact word-by-word timing</span> for
-          karaoke &amp; kinetic captions. Speech is taken from your audio track,
-          or the first video clip when no track is loaded.
+          {sttEngine === "groq" ? (
+            <>
+              <span className="text-cyan-400/90">Groq cloud</span> runs
+              whisper-large-v3-turbo — large-model accuracy at a fraction of
+              local compute, with{" "}
+              <span className="text-zinc-300">exact word-by-word timing</span>{" "}
+              for karaoke &amp; kinetic captions. Falls back to the offline
+              engine when the cloud is unreachable.
+            </>
+          ) : (
+            <>
+              <span className="text-amber-400/90">faster-whisper</span>{" "}
+              (CTranslate2 int8) runs locally — about 4× faster than the old
+              engine, with VAD silence skipping and{" "}
+              <span className="text-zinc-300">exact word-by-word timing</span>{" "}
+              for karaoke &amp; kinetic captions.
+            </>
+          )}{" "}
+          Speech is taken from your audio track, or the first video clip when no
+          track is loaded.
         </p>
 
         {/* ── v5.2: model cache status + pre-download (desktop only) ── */}

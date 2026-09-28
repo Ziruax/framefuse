@@ -660,6 +660,9 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
       // rendered SFX placements. Omitted entirely for v4.9-shaped projects.
       overlays: overlayPayload.length > 0 ? overlayPayload : undefined,
       sfx: ipcSfx.length > 0 ? ipcSfx : undefined,
+      // v1.15: burn-in text removal (default OFF — the main process
+      // sanitizes it; null/absent keeps every graph byte-identical).
+      textRemoval: opts.textRemoval ?? undefined,
     });
     return result;
   } finally {

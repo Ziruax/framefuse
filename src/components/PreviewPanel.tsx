@@ -5,6 +5,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useCallback,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
@@ -32,6 +33,8 @@ import {
   FolderOpen,
   Sparkles,
   Upload,
+  Maximize2,
+  Minimize2,
 } from "lucide-react";
 import type {
   AspectRatio,
@@ -42,6 +45,7 @@ import type {
   MediaSegment,
   OverlayTransform,
   SubtitleFile,
+  TextRemovalSettings,
   TransitionSettings,
   WatermarkSettings,
 } from "@/lib/merger/types";
@@ -272,6 +276,10 @@ interface PreviewPanelProps {
   onLoadSample?: () => void;
   /** "Open a project" card — picks a saved .framefuse.json. */
   onOpenProject?: () => void;
+  // ---- v1.15 burn-in text removal (default OFF) ----
+  /** Regions drawn over the active VIDEO segment's frame (blur/cover
+   *  approximation of the export filters). Null/undefined = nothing. */
+  textRemoval?: TextRemovalSettings | null;
 }
 
 /** v4.8: which concrete motion does a click at (nx, ny) ∈ [0,1]² aim at?
@@ -336,6 +344,7 @@ export function PreviewPanel({
   onImportMedia,
   onLoadSample,
   onOpenProject,
+  textRemoval = null,
 }: PreviewPanelProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const chromeRef = useRef<HTMLCanvasElement | null>(null);
@@ -398,6 +407,92 @@ export function PreviewPanel({
   // the stage letterboxes the aspect buffer inside the available box.
   const stageWrapRef = useRef<HTMLDivElement | null>(null);
   const [avail, setAvail] = useState<{ w: number; h: number }>({ w: 0, h: 0 });
+
+  // ---- v1.15 FULLSCREEN PREVIEW -------------------------------------------
+  // The user report: "i am unable to preview video in full screen". There
+  // was NO fullscreen affordance anywhere — the Maximize icon in the
+  // transport bar is "match project aspect", not fullscreen. This block
+  // gives the panel a real cinema mode: the WHOLE panel (stage + transport +
+  // scrubber) goes fullscreen so playback controls stay available, the
+  // stage letterboxes to the screen via the existing ResizeObserver path,
+  // and the canvas buffer upscales crisply (it renders at project resolution).
+  // Entry points: transport-bar button, F key, double-click on the stage.
+  // Exit: Esc (browser-native), F, button, double-click.
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  /** Current fullscreen element with the legacy webkit prefix (old
+   *  Chromium/Electron fallbacks — harmless when absent). */
+  function currentFullscreenElement(): Element | null {
+    if (typeof document === "undefined") return null;
+    const d = document as Document & { webkitFullscreenElement?: Element | null };
+    return d.fullscreenElement ?? d.webkitFullscreenElement ?? null;
+  }
+
+  /** The element this panel fullscreen-requests (panel root). */
+  function fullscreenTarget(): HTMLElement | null {
+    return rootRef.current;
+  }
+
+  const toggleFullscreen = useCallback(async () => {
+    const target = fullscreenTarget();
+    if (!target) return;
+    try {
+      if (currentFullscreenElement()) {
+        const d = document as Document & {
+          webkitExitFullscreen?: () => Promise<void> | void;
+        };
+        if (typeof d.exitFullscreen === "function") await d.exitFullscreen();
+        else if (d.webkitExitFullscreen) await d.webkitExitFullscreen();
+      } else {
+        const el = target as HTMLElement & {
+          webkitRequestFullscreen?: () => Promise<void> | void;
+        };
+        if (typeof el.requestFullscreen === "function") await el.requestFullscreen();
+        else if (el.webkitRequestFullscreen) await el.webkitRequestFullscreen();
+        // No Fullscreen API at all (embedded webviews without allow-
+        // fullscreen) — stay silent; the stage already scales to the panel.
+      }
+    } catch {
+      /* user gesture / security errors are non-fatal — ignore */
+    }
+  }, []);
+
+  // Track enter/exit from ANY source (Esc key, OS gestures, our button).
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const sync = () =>
+      setIsFullscreen(currentFullscreenElement() === fullscreenTarget());
+    document.addEventListener("fullscreenchange", sync);
+    document.addEventListener("webkitfullscreenchange", sync);
+    sync();
+    return () => {
+      document.removeEventListener("fullscreenchange", sync);
+      document.removeEventListener("webkitfullscreenchange", sync);
+    };
+  }, []);
+
+  // F key — global, but never while typing in a field. Mirrors the J/K/L
+  // shuttle conventions already shipped in this panel.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "f" && e.key !== "F") return;
+      const t = e.target as HTMLElement | null;
+      if (
+        t &&
+        (t.tagName === "INPUT" ||
+          t.tagName === "TEXTAREA" ||
+          t.tagName === "SELECT" ||
+          t.isContentEditable)
+      ) {
+        return;
+      }
+      e.preventDefault();
+      toggleFullscreen();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [toggleFullscreen]);
   const roRafRef = useRef<number | null>(null);
   const roPendingRef = useRef<{ w: number; h: number } | null>(null);
 
@@ -1216,6 +1311,57 @@ export function PreviewPanel({
       drawWatermark(ctx, watermarkImage, dims.w, dims.h, watermarkSettings);
     }
 
+    // ---- v1.15 TEXT REMOVAL preview pass (default OFF) ----------------------
+    // The export applies the removal filters to the decoded source BEFORE
+    // the cover-fit crop; the preview approximates the same regions over the
+    // composited base frame (blur ≈ delogo's smooth fill, exact for cover).
+    // Regions are SOURCE-normalized — mapped through the same cover-fit math
+    // drawVideoFrame uses (scale = max(outW/srcW, outH/srcH), center crop).
+    // Preview fit "contain" letterboxes differently; the mapping below rides
+    // the export cover geometry (the default preview fit).
+    if (
+      seg &&
+      seg.mediaType === "video" &&
+      textRemoval &&
+      textRemoval.enabled &&
+      textRemoval.regions.length > 0
+    ) {
+      const vEl = videoEls.get(seg.id);
+      const srcW = vEl?.videoWidth || 0;
+      const srcH = vEl?.videoHeight || 0;
+      if (srcW > 0 && srcH > 0 && canvasRef.current) {
+        const coverScale = Math.max(dims.w / srcW, dims.h / srcH);
+        const dispW = srcW * coverScale;
+        const dispH = srcH * coverScale;
+        const offX = (dispW - dims.w) / 2;
+        const offY = (dispH - dims.h) / 2;
+        for (const r of textRemoval.regions) {
+          const x0 = Math.max(0, r.x * dispW - offX);
+          const y0 = Math.max(0, r.y * dispH - offY);
+          const x1 = Math.min(dims.w, (r.x + r.w) * dispW - offX);
+          const y1 = Math.min(dims.h, (r.y + r.h) * dispH - offY);
+          const rw = x1 - x0;
+          const rh = y1 - y0;
+          if (rw < 2 || rh < 2) continue;
+          if (textRemoval.mode === "cover") {
+            ctx.fillStyle = "#000000";
+            ctx.fillRect(x0, y0, rw, rh);
+          } else {
+            // Blur the region in place (self-draw under clip+filter).
+            const radius = Math.max(4, Math.min(40, Math.min(rw, rh) / 6));
+            ctx.save();
+            ctx.beginPath();
+            ctx.rect(x0, y0, rw, rh);
+            ctx.clip();
+            ctx.filter = `blur(${radius}px)`;
+            ctx.drawImage(canvasRef.current, 0, 0);
+            ctx.filter = "none";
+            ctx.restore();
+          }
+        }
+      }
+    }
+
     // v4.3 → v1.14.3: global fades BEFORE the caption/headline draw — the
     // LAYERING CONTRACT twin of the export graph (fades → subtitles). A
     // dip-to-black at a VIDEO boundary must not darken burned caption text:
@@ -1282,6 +1428,8 @@ export function PreviewPanel({
     // v1.4: shuttle — rate changes re-run so paused elements pre-arm the
     // new playbackRate (playing elements pick it up on the next tick).
     previewRate,
+    // v1.15: text-removal regions (preview pass).
+    textRemoval,
   ]);
 
   // ---- v5.2 C: selection chrome (separate canvas, purely additive) -----------
@@ -1485,6 +1633,7 @@ export function PreviewPanel({
 
   return (
     <div
+      ref={rootRef}
       className="flex h-full flex-col overflow-hidden"
       style={{ backgroundColor: "#0c0c0e" }}
     >
@@ -1655,6 +1804,13 @@ export function PreviewPanel({
             }
             onMouseLeave={() => {
               if (aimActive) setAim(null);
+            }}
+            onDoubleClick={() => {
+              // v1.15: double-click = fullscreen toggle (the CapCut/YouTube
+              // muscle-memory gesture). Skip while aiming Ken Burns — a
+              // double click there is two aim taps, not a screen request.
+              if (aimActive) return;
+              void toggleFullscreen();
             }}
             onClick={
               aimActive && aim
@@ -2227,6 +2383,33 @@ export function PreviewPanel({
                 {fmtTenths(totalMs)}
               </span>
             </div>
+
+            {/* v1.15: FULLSCREEN toggle — the real one (F key / double-click
+                the stage / Esc to exit). Cyan when active. */}
+            <button
+              type="button"
+              onClick={() => {
+                void toggleFullscreen();
+              }}
+              disabled={segments.length === 0}
+              className="flex size-7 items-center justify-center rounded-lg transition-all hover:bg-white/10 active:scale-90 disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:shadow-none"
+              style={{ color: isFullscreen ? "#67e8f9" : "#a1a1aa" }}
+              title={
+                isFullscreen
+                  ? "Exit full screen (F / Esc)"
+                  : "Full screen preview (F — double-click the preview also works)"
+              }
+              aria-label={
+                isFullscreen ? "Exit full screen preview" : "Enter full screen preview"
+              }
+              aria-pressed={isFullscreen}
+            >
+              {isFullscreen ? (
+                <Minimize2 className="size-3.5" />
+              ) : (
+                <Maximize2 className="size-3.5" />
+              )}
+            </button>
           </div>
         </div>
 

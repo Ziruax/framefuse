@@ -1470,8 +1470,13 @@ function buildClipArgs(ctx) {
     // rotated } for the satisfied-transform skips in buildVideoFilterChain.
     // Absent (all legacy callers) → the full v4.9 chain, byte-identical.
     srcFacts,
+    // v1.15: burn-in text removal (default OFF — null keeps argv
+    // byte-identical; sanitizeTextRemoval enforces it).
+    textRemoval,
   } = ctx;
   const globals = Array.isArray(globalArgs) && globalArgs.length > 0 ? globalArgs : [];
+  const TR = require("./textremoval");
+  const trDesc = TR.sanitizeTextRemoval(textRemoval);
 
   const overlays = Array.isArray(overlaySpecs) ? overlaySpecs : [];
   const isVideo = !!(seg && seg.mediaType === "video" && seg.videoPath);
@@ -1694,6 +1699,36 @@ function buildClipArgs(ctx) {
       width, height, fps, speed,
       srcFacts: srcFacts ? { ...srcFacts, hwToken: !!hwaccel } : null,
     }) || "null";
+    // v1.15 TEXT REMOVAL — applied to the decoded source BEFORE the
+    // cover-fit chain (regions are SOURCE-normalized). The fragment maps
+    // [0:v] → [base] carrying `videoChain` along, so the overlay/watermark
+    // graph below is untouched. Blur mode needs the labeled pads → when
+    // there are no overlays/wm we FORCE the filter_complex branch (the
+    // plain -vf layout only supports linear inpaint/cover).
+    const trFacts =
+      trDesc && srcFacts && Number(srcFacts.srcW) > 0 && Number(srcFacts.srcH) > 0
+        ? { srcW: Number(srcFacts.srcW), srcH: Number(srcFacts.srcH) }
+        : null;
+    const trHead = trDesc && trFacts
+      ? TR.textRemovalGraph({
+          mode: trDesc.mode,
+          regions: trDesc.regions,
+          srcW: trFacts.srcW,
+          srcH: trFacts.srcH,
+          inLabel: "[0:v]",
+          outLabel: "[base]",
+          nextChain: videoChain,
+          uid: `tc${i}`,
+        })
+      : null;
+    const trLinear = trDesc && trFacts && !TR.textRemovalNeedsComplex(trDesc.mode)
+      ? TR.textRemovalLinearFilters({
+          mode: trDesc.mode,
+          regions: trDesc.regions,
+          srcW: trFacts.srcW,
+          srcH: trFacts.srcH,
+        })
+      : null;
     const tempo = atempoFilters(speed);
     const audioMaps = [];
     let audioGraph = null;
@@ -1708,9 +1743,11 @@ function buildClipArgs(ctx) {
         inputIdx += 1;
       }
     }
-    if (overlays.length > 0 || wm) {
+    if (overlays.length > 0 || wm || trHead) {
       // Complex graph path: base chain → overlays → watermark → post.
-      let g = `[0:v]${videoChain}[base]`;
+      // v1.15: trHead (when text removal is on) already maps [0:v]→[base]
+      // with the removal filters ahead of the cover-fit chain.
+      let g = trHead ?? `[0:v]${videoChain}[base]`;
       let label = "[base]";
       let oi = 1;
       for (const ov of overlays) {
@@ -1745,7 +1782,11 @@ function buildClipArgs(ctx) {
     // Plain video path — mirrors the v4.9 single-input -vf layout.
     // v1.14.3 layering contract: fades BEFORE the caption burn (captions
     // topmost — same order as the complex-graph `post`).
-    const vfParts = [videoChain];
+    // v1.15: linear text-removal filters (inpaint/cover — blur was routed
+    // to the complex branch above by definition) lead the chain.
+    const vfParts = [];
+    if (trLinear) vfParts.push(trLinear);
+    vfParts.push(videoChain);
     vfParts.push(...postFades);
     if (assSuffix) vfParts.push(assSuffix);
     const args = [

@@ -29,6 +29,10 @@ const G = require("./export-graph");
 // v6: the SINGLE-PASS whole-timeline graph builder (pure — shared with the
 // bun verification harness exactly like export-graph).
 const SP = require("./export-singlepass");
+// v1.15: Groq Whisper API engine (cloud STT, user's own key stored on-device
+// in userData/groq.json — never in project files). PREFERed engine chain head
+// when a key is saved; local engines remain as fallbacks.
+const GQ = require("./groq-whisper");
 
 // Resolve the FFmpeg binary path. v1.5: a FULL bundled build (staged by
 // scripts/fetch-windows-ffmpeg.js into resources/ffmpeg/<plat>/) is PREFERRED
@@ -1110,6 +1114,99 @@ ipcMain.handle("whisper:transcribe", async (event, payload) => {
   }
   const runId = ++whisperRunSeq;
   try {
+    // ── v1.15 ENGINE 0: Groq Whisper API (cloud, user's own key) ────────
+    // The user directive: whisper-large-v3(-turbo) via Groq when the user
+    // pasted their own API key (default), falling back to the local engines
+    // on any failure so transcription never goes down. Engine selection:
+    //   "groq" — force cloud (errors if no key)
+    //   "local" — skip cloud entirely
+    //   "auto"/undefined — cloud when a key is saved, else local.
+    const groqCfg = GQ.loadGroqConfig(app.getPath("userData"));
+    const enginePref =
+      payload && typeof payload.engine === "string" ? payload.engine : "auto";
+    const wantGroq =
+      enginePref === "groq" ||
+      (enginePref !== "local" && groqCfg.apiKey);
+    if (wantGroq) {
+      if (!groqCfg.apiKey) {
+        throw new Error(
+          "No Groq API key saved — open Settings → Captions, paste your key from console.groq.com (free), or switch the engine to “This device”.",
+        );
+      }
+      const groqModel = GQ.normalizeGroqModel(
+        payload && typeof payload.groqModel === "string" && payload.groqModel
+          ? payload.groqModel
+          : groqCfg.model,
+      );
+      // Register the run for whisper:cancel BEFORE any await — the abort
+      // hook kills the in-flight HTTPS upload.
+      let cancelReject = null;
+      const cancelled = new Promise((_res, rej) => { cancelReject = rej; });
+      const runEntry = {
+        resolve: () => {},
+        reject: (e) => cancelReject(e),
+        sender: event.sender,
+        clientRunId,
+        lastMsgAt: Date.now(),
+        phase: "transcribe",
+        groqAbort: null,
+      };
+      whisperRuns.set(runId, runEntry);
+      let compactAudio = null;
+      const groqWork = (async () => {
+        sendWhisperProgress(
+          runId, 8,
+          `Groq ${groqModel} — preparing audio…`,
+        );
+        compactAudio = await GQ.extractAudioForGroq(
+          ffmpegPath,
+          inputPath,
+          ensureTempDir(),
+          (s) => sendWhisperProgress(runId, 12, s),
+        );
+        const abortRef = { abort: null };
+        runEntry.groqAbort = () => { try { abortRef.abort(); } catch (_) {} };
+        const result = await GQ.groqTranscribe({
+          apiKey: groqCfg.apiKey,
+          model: groqModel,
+          filePath: compactAudio.filePath,
+          language,
+          onProgress: (p) => sendWhisperProgress(runId, p.progress, p.status),
+          abortRef,
+        });
+        sendWhisperProgress(runId, 80, "Aligning word timestamps…");
+        return result;
+      })();
+      try {
+        const groqResult = await Promise.race([groqWork, cancelled]);
+        whisperRuns.delete(runId);
+        try { if (compactAudio) fs.unlinkSync(compactAudio.filePath); } catch (_) {}
+        whisperState.lastError = null;
+        whisperState.lastErrorAt = 0;
+        return {
+          chunks: groqResult.chunks,
+          language: groqResult.language,
+          wordLevel: groqResult.wordLevel,
+          durationMs: groqResult.durationMs,
+          engine: "groq",
+        };
+      } catch (err) {
+        whisperRuns.delete(runId);
+        try { if (compactAudio) fs.unlinkSync(compactAudio.filePath); } catch (_) {}
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("cancelled")) throw err;
+        // Engine failure — surface it, then fall through to the local chain
+        // (a broken key/network must never take transcription down).
+        console.warn(`[whisper] Groq engine failed, falling back to local: ${msg}`);
+        whisperState.lastError = `groq: ${msg}`;
+        whisperState.lastErrorAt = Date.now();
+        sendWhisperProgress(
+          runId, 15,
+          `Groq unavailable (${msg.split(" [")[0].slice(0, 90)}) — using the local engine…`,
+        );
+      }
+    }
+
     // ── v1.3 ENGINE 1: faster-whisper sidecar (CTranslate2 int8) ──────
     // ~4× faster than the onnxruntime path, exact word timestamps, VAD
     // silence filtering, and base/small/medium models become practical.
@@ -1363,6 +1460,7 @@ ipcMain.handle("whisper:cancel", async (_event, payload) => {
       if (run.clientRunId === target) {
         whisperRuns.delete(runId);
         try { if (run.python) run.python.kill(); } catch (_) {}
+        try { if (run.groqAbort) run.groqAbort(); } catch (_) {}
         try { if (child) child.postMessage({ type: "cancel", runId }); } catch (_) {}
         run.reject(new Error("Transcription cancelled"));
         return 1;
@@ -1375,6 +1473,7 @@ ipcMain.handle("whisper:cancel", async (_event, payload) => {
   for (const [runId, run] of Array.from(whisperRuns)) {
     whisperRuns.delete(runId);
     try { if (run.python) run.python.kill(); } catch (_) {}
+    try { if (run.groqAbort) run.groqAbort(); } catch (_) {}
     try { if (child) child.postMessage({ type: "cancel", runId }); } catch (_) {}
     run.reject(new Error("Transcription cancelled"));
     cancelled++;
@@ -1483,7 +1582,70 @@ ipcMain.handle("whisper:status", async () => {
     fwCacheDir: fasterWhisperCacheDir(),
     fwCacheFiles,
     fwCacheBytes: fwCacheFiles.reduce((n, f) => n + f.sizeBytes, 0),
+    // v1.15: Groq engine state (key presence only — the raw key NEVER
+    // crosses the bridge) + faster-whisper runtime availability (no longer
+    // bundled with the installer — present only when staged/opt-in).
+    groq: (() => {
+      try {
+        const cfg = GQ.loadGroqConfig(app.getPath("userData"));
+        return { hasKey: !!cfg.apiKey, maskedKey: GQ.maskApiKey(cfg.apiKey), model: cfg.model };
+      } catch (_) {
+        return { hasKey: false, maskedKey: "", model: GQ.DEFAULT_GROQ_MODEL };
+      }
+    })(),
+    fwAvailable: fasterWhisperAvailable(),
   };
+});
+
+// ── v1.15 Groq Whisper API configuration IPC ────────────────────────────
+// The API key is the USER'S OWN, stored ONLY on this device (userData/
+// groq.json, mode 0600, never inside project files, never rendered raw —
+// the bridge returns a masked form). The renderer keeps an app-level
+// ENGINE preference in localStorage (groq when a key exists, else local).
+
+function groqConfigPayload() {
+  const cfg = GQ.loadGroqConfig(app.getPath("userData"));
+  return {
+    hasKey: !!cfg.apiKey,
+    maskedKey: GQ.maskApiKey(cfg.apiKey),
+    model: cfg.model,
+    models: GQ.GROQ_MODELS,
+    fwAvailable: fasterWhisperAvailable(),
+  };
+}
+
+ipcMain.handle("whisper:groq-get", async () => groqConfigPayload());
+
+/** { apiKey?: string ("" clears), model?: "whisper-large-v3-turbo" | "whisper-large-v3" } */
+ipcMain.handle("whisper:groq-set", async (_event, payload) => {
+  const patch = {};
+  if (payload && typeof payload.apiKey === "string") {
+    patch.apiKey = payload.apiKey.trim();
+  }
+  if (payload && typeof payload.model === "string" && payload.model) {
+    patch.model = payload.model;
+  }
+  GQ.saveGroqConfig(app.getPath("userData"), patch);
+  return groqConfigPayload();
+});
+
+/** Verify a key (the saved one, or a candidate passed in for validation
+ *  BEFORE saving). { ok, message, whisperModels } — whisperModels is the
+ *  account's available whisper-* ids (informational). */
+ipcMain.handle("whisper:groq-test", async (_event, payload) => {
+  const cfg = GQ.loadGroqConfig(app.getPath("userData"));
+  const candidate =
+    payload && typeof payload.apiKey === "string" && payload.apiKey.trim()
+      ? payload.apiKey.trim()
+      : cfg.apiKey;
+  if (!candidate) {
+    return {
+      ok: false,
+      message: "No API key yet — paste a key from console.groq.com first",
+      whisperModels: [],
+    };
+  }
+  return GQ.groqTestKey(candidate);
 });
 
 // ---------------------------------------------------------------------------
@@ -3621,7 +3783,22 @@ function optimizeAssForConstrainedCpu(doc) {
 }
 
 ipcMain.handle("export-native", async (event, opts) => {
-  const { outputPath, fps: reqFps, width: reqWidth, height: reqHeight, bitrateMbps, quality, crf, audioKbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark, overlays, sfx, fastMode: fastModeWanted, slideshowFps24 } = opts;
+  const { outputPath, fps: reqFps, width: reqWidth, height: reqHeight, bitrateMbps, quality, crf, audioKbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark, overlays, sfx, fastMode: fastModeWanted, slideshowFps24, textRemoval: textRemovalRaw } = opts;
+  // ── v1.15 BURN-IN TEXT REMOVAL (default OFF) ──────────────────────────
+  // sanitizeTextRemoval → null keeps every graph byte-identical when the
+  // feature is off (the only default). Region rects are SOURCE-normalized
+  // (0..1); the filters run BEFORE each video segment's cover-fit chain.
+  const textRemoval = require("./textremoval").sanitizeTextRemoval(textRemovalRaw);
+  if (textRemoval) {
+    const hasVideo = segments.some((s) => s && s.mediaType === "video");
+    console.log(
+      `[Export] text removal ON — mode=${textRemoval.mode}, regions=${textRemoval.regions.length}` +
+        (hasVideo ? "" : " (WARNING: no video segments — nothing to remove)"),
+    );
+    if (!hasVideo) {
+      // Still proceed (images ignore TR) but surface it in the log.
+    }
+  }
   // v1.14.4 CONSTRAINED-CPU FAST MODE (see planSmartRenderingPipeline): the
   // requested resolution can be DOWNSCALED mid-export on Tier-3 machines
   // (mostly-dirty long timelines) — width/height stay mutable for that one
@@ -4152,6 +4329,21 @@ ipcMain.handle("export-native", async (event, opts) => {
       const seg = segments[i];
       const clipPath = path.join(tempDir, `clip_${String(i).padStart(4, "0")}.mp4`);
 
+      // v1.15 TEXT REMOVAL (two-step path): the removal filters need the
+      // SOURCE dims per video segment (regions are source-normalized).
+      // The smart pipeline probes its own srcFacts; this fallback probes
+      // here ONLY when text removal is active (probeMediaAsync is cached
+      // per path — the hasAudio probe below hits the cache).
+      let trSrcFacts = null;
+      if (textRemoval && seg.mediaType === "video" && seg.videoPath) {
+        try {
+          const tp = await probeMediaAsync(seg.videoPath);
+          if (Number(tp.width) > 0 && Number(tp.height) > 0) {
+            trSrcFacts = { srcW: Number(tp.width), srcH: Number(tp.height) };
+          }
+        } catch (_) { /* dims unknown → TR skipped for this clip */ }
+      }
+
       const segStartMs = (typeof seg.startMs === "number") ? seg.startMs : cumulativeMs;
       const segEndMs = (typeof seg.endMs === "number") ? seg.endMs : (cumulativeMs + seg.durationMs);
 
@@ -4215,7 +4407,8 @@ ipcMain.handle("export-native", async (event, opts) => {
         // Skip the keyframe probe when the clip is ALREADY re-encode-bound
         // for other reasons (overlaps/captions/speed/fades/...) — patch
         // trimInMs to 0 so clipNeedsReEncode reports those reasons alone.
-        const otherwiseCopyEligible = !G.clipNeedsReEncode({
+        // v1.15: text removal is also re-encode-bound — skip the probe too.
+        const otherwiseCopyEligible = !textRemoval && !G.clipNeedsReEncode({
           i, seg: { ...seg, trimInMs: 0 }, segments, transition,
           overlayCount: overlaySpecs.length,
           assSuffix, wm,
@@ -4257,7 +4450,14 @@ ipcMain.handle("export-native", async (event, opts) => {
           }
         }
       }
-      if (!G.clipNeedsReEncode({
+      // v1.15: text removal rewrites every frame — kill every copy fast
+      // path (keyframe-aligned trims, sandwich middles, legacy copies).
+      if (textRemoval) {
+        trimKeyAligned = false;
+        trimSs = null;
+        sandwichPlan = null;
+      }
+      if (!textRemoval && !G.clipNeedsReEncode({
           i, seg, segments, transition,
           overlayCount: overlaySpecs.length,
           assSuffix, wm,
@@ -4365,6 +4565,9 @@ ipcMain.handle("export-native", async (event, opts) => {
               overlaySpecs,
               hwaccel: false,
               threads: threadBudget,
+              // v1.15: text removal (source-normalized regions).
+              textRemoval,
+              ...(trSrcFacts ? { srcFacts: trSrcFacts } : {}),
             });
             jobs.push({
               idx: i,
@@ -4487,6 +4690,9 @@ ipcMain.handle("export-native", async (event, opts) => {
             hwaccel: hw,
             threads: threadBudget,
             chunk: { offsetMs: ch.offsetMs, durMs: ch.durMs, first: ch.first, last: ch.last },
+            // v1.15: text removal (source-normalized regions).
+            textRemoval,
+            ...(trSrcFacts ? { srcFacts: trSrcFacts } : {}),
           });
           jobs.push({
             idx: i,
@@ -4529,6 +4735,9 @@ ipcMain.handle("export-native", async (event, opts) => {
           hwaccel: hw,
           // v5.2: thread budget (see the pool below).
           threads: threadBudget,
+          // v1.15: text removal (source-normalized regions).
+          textRemoval,
+          ...(trSrcFacts ? { srcFacts: trSrcFacts } : {}),
         });
 
         jobs.push({
@@ -4775,6 +4984,9 @@ ipcMain.handle("export-native", async (event, opts) => {
           kbEnabled: enabled,
           globalDir,
           wm,
+          // v1.15: text removal dirties the whole timeline (see the
+          // planner's text-removal range).
+          textRemoval,
           captionsEnabled,
           subtitleCues,
           headlinesEnabled,
@@ -5157,6 +5369,8 @@ ipcMain.handle("export-native", async (event, opts) => {
             hwaccelPerSeg,
             // v1.14.5: probed source facts for the satisfied-transform skips.
             srcFacts,
+            // v1.15: burn-in text removal.
+            textRemoval,
           });
           if (cPlan.scriptBytes > SP.SINGLEPASS_MAX_SCRIPT_BYTES) {
             console.warn(`[framefuse] smart render skipped: piece ${pi + 1}/${plan.pieces.length} graph ${cPlan.scriptBytes}B > ${SP.SINGLEPASS_MAX_SCRIPT_BYTES}B budget → two-step pool`);

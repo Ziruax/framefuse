@@ -2,7 +2,7 @@
   "name": "framefuse",
   "version": "1.14.6",
   "private": true,
-  "description": "FrameFuse v1 — Multi-track video studio: video clips, green/white/black screen chroma key with on-canvas PiP, overlay lane, background music with volume/loop, synthesized SFX, native Whisper captions (model bundled with the installer), True Smart Rendering FFmpeg export (clean ranges stream-copied, dirty windows re-encoded in parallel with hardware decode), native project files.",
+  "description": "FrameFuse v1 — Multi-track video studio: video clips, green/white/black screen chroma key with on-canvas PiP, overlay lane, background music with volume/loop, synthesized SFX, Whisper captions via Groq cloud (user's own API key, stored on-device) with an offline tiny-model fallback bundled in the installer, True Smart Rendering FFmpeg export (clean ranges stream-copied, dirty windows re-encoded in parallel with hardware decode), native project files.",
   "main": "electron/main.js",
   "author": "FrameFuse",
   "license": "MIT",
@@ -23,7 +23,8 @@
     "stage:faster-whisper": "node scripts/stage-faster-whisper.js",
     "stage:faster-whisper-model": "node scripts/stage-faster-whisper-model.js",
     "postinstall": "node scripts/patch-transformers.js && node scripts/patch-electron-builder.js",
-    "electron:build": "npm run clean && next build --webpack && node scripts/copy-wasm.js && node scripts/fetch-windows-ffmpeg.js && node scripts/stage-whisper-service.js && node scripts/stage-whisper-model.js && node scripts/stage-faster-whisper.js && node scripts/stage-faster-whisper-model.js && electron-builder --win nsis --publish never"
+    "electron:build": "npm run clean && next build --webpack && node scripts/copy-wasm.js && node scripts/fetch-windows-ffmpeg.js && node scripts/stage-whisper-service.js && node scripts/stage-whisper-model.js && electron-builder --win nsis --publish never",
+    "electron:build:fw": "node scripts/stage-faster-whisper.js && node scripts/stage-faster-whisper-model.js"
   },
   "trustedDependencies": [
     "electron",
@@ -40,7 +41,8 @@
     "onnxruntime-node": "1.14.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "tailwind-merge": "^3.3.1"
+    "tailwind-merge": "^3.3.1",
+    "tesseract.js": "^7.0.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",

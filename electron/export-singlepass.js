@@ -811,6 +811,9 @@ function planSmartSegments(o) {
   };
 
   if (wm) addRange(0, totalMs, "watermark");
+  // v1.15: burn-in text removal re-encodes EVERYTHING (the filters rewrite
+  // every frame — a stream copy can never carry them).
+  if (o && o.textRemoval) addRange(0, totalMs, "text-removal");
 
   // Burned text windows — captions burn per-cue, headlines per-headline.
   // v1.12 (user directive): a cue with NO visible text (empty string and
@@ -1448,12 +1451,19 @@ function buildSinglePassPlan(o) {
     srcFacts,
     audioFastGain,
     masterGainDb,
+    // v1.15: burn-in text removal (default OFF — sanitizeTextRemoval's null
+    // keeps every graph byte-identical for text-removal-free projects).
+    textRemoval,
     window: win,
     fullSegments,
     videoOnly,
     audioOnly,
     fades: fadesIn,
   } = o;
+  // Canonical descriptor once per plan (validated/clamped upstream in
+  // main.js too — re-sanitized here so harness calls stay safe).
+  const TR = require("./textremoval");
+  const trDesc = TR.sanitizeTextRemoval(textRemoval);
 
   const N = segments.length;
   const inputs = [];
@@ -1620,9 +1630,28 @@ function buildSinglePassPlan(o) {
         ? { ...srcFacts[factsIdx], hwToken: !!(hwaccelPerSeg ? hwaccelPerSeg[factsIdx] : false) }
         : null;
       const vChain = G.buildVideoFilterChain({ width, height, fps, speed, srcFacts: segFacts });
-      graph.push(
-        `${base}${vChain ? `${vChain},` : ""}setpts=PTS-STARTPTS[s${i}]`,
-      );
+      // v1.15 TEXT REMOVAL: wrap the segment's whole chain with the removal
+      // fragment (regions are SOURCE-normalized — applied before the
+      // cover-fit scale/crop so framing can never diverge). Requires the
+      // probed source dims; a missing-facts segment skips removal (logged
+      // by main.js once, not per segment).
+      const nextChain = `${vChain ? `${vChain},` : ""}setpts=PTS-STARTPTS`;
+      const trFacts = segFacts && Number(segFacts.srcW) > 0 && Number(segFacts.srcH) > 0
+        ? { srcW: Number(segFacts.srcW), srcH: Number(segFacts.srcH) }
+        : null;
+      const trLine = trDesc && trFacts
+        ? TR.textRemovalGraph({
+            mode: trDesc.mode,
+            regions: trDesc.regions,
+            srcW: trFacts.srcW,
+            srcH: trFacts.srcH,
+            inLabel: base,
+            outLabel: `[s${i}]`,
+            nextChain,
+            uid: `tr${i}`,
+          })
+        : null;
+      graph.push(trLine ?? `${base}${nextChain}[s${i}]`);
       segLabels.push(`[s${i}]`);
       continue;
     }

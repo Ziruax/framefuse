@@ -57,8 +57,17 @@ contextBridge.exposeInMainWorld("electronAPI", {
   whisperCancel: (payload) => ipcRenderer.invoke("whisper:cancel", payload),
   // v5.2: model cache diagnostics for the Captions settings panel →
   //   { cacheDir, hostUsed, modelReady, cacheFiles, totalCacheBytes,
-  //     lastError, childAlive, activeRuns }.
+  //     lastError, childAlive, activeRuns, groq, fwAvailable }.
   whisperStatus: () => ipcRenderer.invoke("whisper:status"),
+  // v1.15 GROQ WHISPER API — the user's own key, stored ONLY on this device
+  // (userData/groq.json). The bridge NEVER returns the raw key — only a
+  // masked form. { hasKey, maskedKey, model, models, fwAvailable }.
+  whisperGroqGet: () => ipcRenderer.invoke("whisper:groq-get"),
+  // { apiKey?: string ("" clears), model?: string } → same payload as get.
+  whisperGroqSet: (p) => ipcRenderer.invoke("whisper:groq-set", p),
+  // { apiKey?: string } → { ok, message, whisperModels } — validates the
+  // candidate (or the saved key) against GET /openai/v1/models.
+  whisperGroqTest: (p) => ipcRenderer.invoke("whisper:groq-test", p),
   onWhisperProgress: (callback) => {
     const handler = (_event, data) => callback(data);
     ipcRenderer.on("whisper:progress", handler);

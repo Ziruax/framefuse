@@ -60,6 +60,7 @@ import {
   defaultAudioSettings,
   defaultCaptionSettings,
   defaultKenBurnsConfig,
+  defaultTextRemovalSettings,
   defaultTransitionSettings,
   defaultWatermarkSettings,
   makeHeadlineItem,
@@ -76,6 +77,7 @@ import {
   type MediaSegment,
   type OverlayTransform,
   type SubtitleFile,
+  type TextRemovalSettings,
   type TransitionSettings,
   type TransitionStyle,
   type VideoSettings,
@@ -231,6 +233,10 @@ interface PersistedSettings {
   favoritePresets?: string[];
   /** v4.8: media library view mode ("list" | "grid") — app-level pref. */
   mediaView?: "list" | "grid";
+  /** v1.15: burn-in text removal settings (default OFF). Kept as an
+   *  app-level pref like caption styling — the detected regions are a
+   *  device-level export preference, not per-project media. */
+  textRemoval?: TextRemovalSettings;
 }
 
 function loadPersisted(): Partial<PersistedSettings> {
@@ -300,6 +306,11 @@ export default function Page() {
   // ---- Segment transitions (v4.3) -----------------------------------------
   const [transitionSettings, setTransitionSettings] =
     useState<TransitionSettings>(defaultTransitionSettings());
+
+  // ---- v1.15: burn-in text detection & removal (DEFAULT OFF) --------------
+  const [textRemoval, setTextRemoval] = useState<TextRemovalSettings>(
+    defaultTextRemovalSettings(),
+  );
 
   // ---- Watermark / logo overlay (v4.4) ------------------------------------
   const [watermarkImage, setWatermarkImage] = useState<MediaItem | null>(null);
@@ -412,6 +423,18 @@ export default function Page() {
     }
     if (p.transition) setTransitionSettings(p.transition);
     if (p.watermark) setWatermarkSettings(p.watermark);
+    // v1.15: text removal — merge over defaults (region shape drift-proof).
+    if (p.textRemoval) {
+      setTextRemoval({
+        ...defaultTextRemovalSettings(),
+        ...p.textRemoval,
+        regions: Array.isArray(p.textRemoval.regions)
+          ? p.textRemoval.regions.filter(
+              (r) => r && Number.isFinite(r.x) && Number.isFinite(r.w),
+            )
+          : [],
+      });
+    }
     if (Array.isArray(p.headlines)) {
        
       setHeadlineItems(
@@ -716,6 +739,13 @@ export default function Page() {
     if (disclaimer?.kind === "video") map[DISCLAIMER_ID] = disclaimer.url;
     return map;
   }, [items, disclaimer]);
+
+  /** v1.15: the video source the OCR text detector scans (first video
+   *  item — burn-in text usually sits at the same spot across sources). */
+  const videoSourceForDetect = useMemo(() => {
+    const first = items.find((it) => it.mediaType === "video");
+    return first ? { url: first.url, name: first.file.name } : null;
+  }, [items]);
 
   // ---- Undo / Redo (v4.3) — snapshot history of the editable session ------
   // Object URLs are NEVER revoked mid-session (only on unmount) so a removed
@@ -1331,6 +1361,9 @@ export default function Page() {
         // when empty so v4.9-shaped projects keep the byte-identical IPC.
         // v1.14: the shifted placements keep every SFX locked to the audio.
         sfx: displaySfxItems.length > 0 ? displaySfxItems : undefined,
+        // v1.15: burn-in text removal (default OFF — the main process
+        // sanitizes it into a no-op when disabled/empty).
+        textRemoval,
         onProgress: (p) => setExportProgress(p),
         signal: ac.signal,
       });
@@ -2291,6 +2324,7 @@ export default function Page() {
       beatStride,
       favoritePresets,
       mediaView,
+      textRemoval,
     };
     try {
       localStorage.setItem(LS_KEY, JSON.stringify({ v: LS_VERSION, data: payload }));
@@ -2303,7 +2337,7 @@ export default function Page() {
     } catch {
       /* storage full / private mode — non-fatal */
     }
-  }, [kenBurns, settings, captionSettings, audioSettings, whisperLanguage, whisperModel, headlineItems, transitionSettings, watermarkSettings, beatStride, favoritePresets, mediaView]);
+  }, [kenBurns, settings, captionSettings, audioSettings, whisperLanguage, whisperModel, headlineItems, transitionSettings, watermarkSettings, beatStride, favoritePresets, mediaView, textRemoval]);
 
   const generateCaptionsFromAudio = useCallback(async () => {
     // v1.3: the transcription source is the MUSIC track when present, else
@@ -4604,6 +4638,7 @@ const handleRandomTransitionMix = useCallback(() => {
               transition={transitionSettings}
               watermarkImage={watermarkImgEl}
               watermarkSettings={watermarkImage ? watermarkSettings : null}
+              textRemoval={textRemoval}
               onSeek={seek}
               onTogglePlay={togglePlay}
               onStep={stepSegment}
@@ -4856,6 +4891,9 @@ const handleRandomTransitionMix = useCallback(() => {
             onUpdateHeadline={updateHeadline}
             onRemoveHeadline={removeHeadline}
             totalMs={timeline.totalMs}
+            textRemoval={textRemoval}
+            onTextRemovalChange={setTextRemoval}
+            videoSourceForDetect={videoSourceForDetect}
             onRandomMix={handleRandomTransitionMix}
             boundaryCount={boundaryCount}
             debug={debug}

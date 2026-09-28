@@ -40,6 +40,8 @@ import type {
   RawWhisperChunk,
   WhisperWorkerResponse,
 } from "./whisper-worker";
+// v1.15: app-level STT engine routing (Groq cloud vs local).
+import { sttRouting } from "./sttSettings";
 
 // ---------------------------------------------------------------------------
 // Public API (unchanged since v4 — page.tsx imports these exact signatures).
@@ -432,6 +434,10 @@ async function transcribeWithWhisperNative(
       language: opts.language || "auto",
       model: opts.model || "tiny",
       runId,
+      // v1.15: engine routing — Groq cloud (user's own on-device key) vs
+      // local engines. sttSettings reads the app-level preference; the main
+      // process decides cloud-vs-local based on the SAVED key (auto).
+      ...sttRouting(),
     });
     // Classified/native error messages propagate VERBATIM — page.tsx shows
     // them in the failure toast, so users see the actionable text from
