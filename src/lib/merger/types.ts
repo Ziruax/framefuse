@@ -301,6 +301,15 @@ export interface VideoSettings {
    *  Mixed-video timelines, 60 fps projects and cinema quality are never
    *  touched; the completion toast says it happened. */
   slideshowFps24?: boolean;
+  /** v1.15.1 GPU-Shift: opt-in WebCodecs/WebGL export engine (feature
+   *  flag — DEFAULT OFF until field-verified). When true AND the timeline
+   *  is GPU-routable (no burn-in text removal, no loudness normalization)
+   *  AND WebCodecs is available, exports composite on the GPU canvas and
+   *  encode through the hardware H.264 encoder, streaming muxed bytes to
+   *  disk — any engine failure automatically falls back to the FFmpeg
+   *  smart-render pipeline. The result payload carries engine:
+   *  "webcodecs-gpu" + frame telemetry for A/B verification. */
+  gpuExportEngine?: boolean;
 }
 
 /** Result of parsing a single filename. */
@@ -340,11 +349,24 @@ export interface ExportProgress {
   total?: number;
   phase?: string;
   rate?: number;
+  /** v1.15.1 GPU-Shift: the WebCodecs engine's stage label
+   *  ("preparing" | "encoding" | "finalizing" | "done") — the GPU path's
+   *  heartbeat payload carries it the same way the FFmpeg path carries
+   *  `phase`. Same contract, distinct name so both engines keep their
+   *  vocabularies. */
+  stage?: string;
+  /** v1.15.1 GPU-Shift: the WebCodecs engine's heartbeat frame counters
+   *  (framesEncoded of totalFrames — the frame-exact law's live view). */
+  framesEncoded?: number;
+  totalFrames?: number;
 }
 
 export interface ExportResult {
   path: string;
   size: number;
+  /** v1.15.1 GPU-Shift: human label of the engine that produced this file
+   *  ("WebCodecs GPU" | "Native FFmpeg") — set by the export router. */
+  method?: string;
   /**
    * v1.1 TURBO export telemetry (desktop FFmpeg path only; browser
    * fallbacks omit them). encoder = the detected hardware/CPU encoder
@@ -359,6 +381,24 @@ export interface ExportResult {
    * riding the throughput-probed hardware decode path.
    */
   encoder?: string;
+  /** v1.15.1 GPU-Shift: which export engine actually ran.
+   *  "webcodecs-gpu" = the WebCodecs/WebGL pipeline (GPU canvas
+   *  compositing + hardware H.264, streamed muxing, frame-pooled memory
+   *  discipline); "ffmpeg-smart" = the native FFmpeg True Smart Rendering
+   *  pipeline. Carried on every result so the completion toast + LastExport
+   *  tooltip make A/B verification explicit. */
+  engine?: "webcodecs-gpu" | "ffmpeg-smart";
+  /** v1.15.1 GPU-Shift telemetry (webcodecs-gpu path): framesEncoded =
+   *  emitted H.264 frames (must equal totalFrames — frame-exact law);
+   *  audioSkipped = audio existed but AAC encode is unavailable in this
+   *  runtime (video-only result, the UI warns); softwareFallback = the
+   *  hardware encoder wedged before frame 0 and the pass auto-restarted
+   *  on the software rung; gpuFrameRenderMs = mean per-frame composite +
+   *  encode-submit cost (the number the CPU pipeline must lose to). */
+  framesEncoded?: number;
+  audioSkipped?: boolean;
+  softwareFallback?: boolean;
+  gpuFrameRenderMs?: number;
   elapsedSec?: number;
   copiedClips?: number;
   encodedClips?: number;
@@ -376,7 +416,7 @@ export interface ExportResult {
    *  "smart-render" = v9 True Smart Rendering (clean time-ranges
    *  stream-copied at TURBO speed, only the dirty windows re-encoded,
    *  stitched via the concat demuxer). */
-  mode?: "single-pass" | "parallel-pass" | "two-step" | "smart-render";
+  mode?: "single-pass" | "parallel-pass" | "two-step" | "smart-render" | "gpu-webcodecs";
   /** v1.12.1: the ACTUAL max-concurrent ffmpeg processes during the encode
    *  stage — the Task-Manager-check number. Telemetry can never claim
    *  parallelism that did not run (a 1-process fallback shows as 1). */

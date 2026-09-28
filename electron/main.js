@@ -675,6 +675,62 @@ ipcMain.handle("cancel-export", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// v1.15.1 GPU-Shift: the WebCodecs export stream sink (main-process side).
+// The renderer's mp4-muxer StreamTarget streams append-only bytes over IPC
+// (~5 MB chunks — ChunkSink contract): exportStart opens the file, ordered
+// exportChunk writes append, exportEnd flushes + closes and reports the
+// byte count. The renderer's sink guards sequential positions; the byte
+// accounting here cross-checks it. Abort semantics (engine-side): on cancel
+// the engine still calls exportEnd so the partial file closes cleanly.
+// ---------------------------------------------------------------------------
+let gpuExportStream = null; // active fs.WriteStream
+let gpuExportBytes = 0;
+let gpuExportPath = null;
+
+ipcMain.handle("gpu-export-start", (_evt, filePath) => {
+  if (typeof filePath !== "string" || filePath.length === 0) {
+    throw new Error("gpu-export-start: invalid output path");
+  }
+  if (gpuExportStream) {
+    try { gpuExportStream.destroy(); } catch { /* already closed */ }
+    gpuExportStream = null;
+  }
+  gpuExportStream = fs.createWriteStream(filePath, { flags: "w" });
+  gpuExportBytes = 0;
+  gpuExportPath = filePath;
+  gpuExportStream.on("error", (err) => {
+    console.error("[GPU-Export] stream write failed:", err.message);
+  });
+  console.log(`[GPU-Export] streaming WebCodecs export to ${filePath}`);
+  return true;
+});
+
+ipcMain.on("gpu-export-chunk", (_evt, buffer) => {
+  if (!gpuExportStream) return; // no active export (late chunk after abort)
+  try {
+    const buf = Buffer.from(buffer);
+    gpuExportStream.write(buf);
+    gpuExportBytes += buf.length;
+  } catch (err) {
+    console.error("[GPU-Export] chunk write failed:", err.message);
+  }
+});
+
+ipcMain.handle("gpu-export-end", async () => {
+  const ws = gpuExportStream;
+  if (!ws) return { bytes: 0, path: null };
+  gpuExportStream = null;
+  const bytes = gpuExportBytes;
+  const path = gpuExportPath;
+  gpuExportPath = null;
+  await new Promise((resolve, reject) => {
+    ws.end((err) => (err ? reject(err) : resolve()));
+  });
+  console.log(`[GPU-Export] stream closed — ${bytes} bytes written to ${path}`);
+  return { bytes, path };
+});
+
+// ---------------------------------------------------------------------------
 // v5.1 NATIVE WHISPER SERVICE (utilityProcess).
 //
 // The v5.0 renderer Web Worker broke in the PACKAGED app — webpack's worker

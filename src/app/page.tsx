@@ -1370,11 +1370,17 @@ export default function Page() {
       setLastExport({
         path: res.path,
         size: res.size,
-        // v1.14.2: exports only ever run inside the Electron shell now (the
-        // browser MediaRecorder fallback was removed with the desktop-only
-        // directive) — there is no second method to label.
-        method: "Native FFmpeg",
+        // v1.15.1 GPU-Shift: the result now states its own method —
+        // "WebCodecs GPU" (the opt-in GPU engine) or "Native FFmpeg".
+        method: res.method || "Native FFmpeg",
         at: Date.now(),
+        // v1.15.1 GPU-Shift telemetry — which engine ran + the per-frame
+        // GPU render cost (the A/B pair for the engine toggle).
+        engine: res.engine,
+        framesEncoded: res.framesEncoded,
+        gpuFrameRenderMs: res.gpuFrameRenderMs,
+        audioSkipped: res.audioSkipped,
+        softwareFallback: res.softwareFallback,
         // v1.1 TURBO telemetry (desktop only — browser exports omit these).
         encoder: res.encoder,
         elapsedSec: res.elapsedSec,
@@ -1430,6 +1436,21 @@ export default function Page() {
       // export time + encoder + stream-copy count — so a fast export is
       // visible and a slow one is diagnosable at a glance.
       const turboBits: string[] = [];
+      // v1.15.1 GPU-Shift: when the WebCodecs engine ran, the toast leads
+      // with the engine + the GPU frame telemetry (the A/B proof).
+      if (res.engine === "webcodecs-gpu") {
+        turboBits.push(
+          `GPU engine (WebCodecs${res.softwareFallback ? " · software rung after GPU stall" : ""})` +
+            (res.framesEncoded != null ? ` · ${res.framesEncoded} frames` : "") +
+            (res.gpuFrameRenderMs != null ? ` · ${res.gpuFrameRenderMs} ms/frame GPU render` : ""),
+        );
+        if (res.audioSkipped) {
+          toast.info("Exported without audio", {
+            description:
+              "This runtime cannot AAC-encode (Web Audio + AudioEncoder) — the GPU export completed video-only. The FFmpeg engine (toggle off) keeps audio.",
+          });
+        }
+      }
       if (res.elapsedSec != null && res.elapsedSec >= 1) {
         turboBits.push(
           res.elapsedSec < 60

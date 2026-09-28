@@ -28,6 +28,17 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   exportNative: (opts) => ipcRenderer.invoke("export-native", opts),
 
+  // v1.15.1 GPU-Shift: the WebCodecs export streamer bridge — muxed bytes
+  // stream to disk in ~5 MB chunks (ChunkSink's append-only contract).
+  // start/end are invoke() (the export must not proceed before the sink is
+  // open / the file is fully flushed+closed); chunks are ordered
+  // fire-and-forget send() — Chromium IPC preserves per-renderer message
+  // order, and the sink's sequential-position guard fails loud on any
+  // reordering, so no per-chunk round-trip is needed.
+  exportStart: (filePath) => ipcRenderer.invoke("gpu-export-start", filePath),
+  exportChunk: (buffer) => ipcRenderer.send("gpu-export-chunk", buffer),
+  exportEnd: () => ipcRenderer.invoke("gpu-export-end"),
+
   saveTempImage: (payload) => ipcRenderer.invoke("save-temp-image", payload),
   saveTempAudio: (payload) => ipcRenderer.invoke("save-temp-audio", payload),
   // v5.0: video sources for the multi-track timeline (same IPC pattern as

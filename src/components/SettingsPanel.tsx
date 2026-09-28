@@ -989,13 +989,14 @@ export function SettingsPanel(props: SettingsPanelProps) {
             tab === "export" ? "ff-tab-panel-in" : "hidden",
           )}
         >
-          {/* ─── v1.10: ENGINE — the FFmpeg pipeline is the one and only
-              export engine (the WebCodecs engine was removed: it saturated
-              integrated-GPU memory buses on low-end boxes). The card is a
-              status surface, not a selector — it carries the encoder probe
-              badge + the smart-render story. v1.11: copy compacted to two
-              friendly lines (the full architecture story lives in the
-              tooltip + docs/EXPORT_PERF.md). ────────────────────────── */}
+          {/* ─── v1.15.1 GPU-Shift: ENGINE — the export ROUTER card. The
+              FFmpeg True Smart Render pipeline stays the DEFAULT engine;
+              the revived WebCodecs/WebGL engine (v8 architecture: GPU
+              canvas compositing + hardware H.264 + streamed muxing, strict
+              frame-pool memory discipline) is an OPT-IN beta toggle below.
+              Any GPU-engine failure auto-falls back to FFmpeg. The card
+              carries the encoder probe badge + the smart-render story
+              (docs/EXPORT_PERF.md). ────────────────────────── */}
           <Section icon={<Zap size={13} />} title="Engine" defaultOpen>
             <div
               className="flex flex-col items-start gap-1 rounded-lg border p-2.5 text-left"
@@ -1379,6 +1380,39 @@ export function SettingsPanel(props: SettingsPanelProps) {
               <p className="mt-0.5 text-[9px]" style={{ color: "#52525b" }}>
                 Image-only timelines export at 24 fps (the film rate) — 20 %
                 fewer frames, visibly faster, same feel. The toast says when.
+              </p>
+            </Field>
+            {/* v1.15.1 GPU-Shift: the opt-in WebCodecs/WebGL export engine
+                (feature flag — DEFAULT OFF until field-verified). ON =
+                GPU canvas compositing + hardware H.264 encode, muxed bytes
+                streamed to disk; any engine failure auto-falls back to the
+                FFmpeg smart-render pipeline (the completion toast + export
+                result carry engine telemetry for A/B verification).
+                Timelines with burn-in text removal or loudness
+                normalization always route to FFmpeg (parity features). */}
+            <Field
+              label="GPU export engine (beta)"
+              hint={settings.gpuExportEngine ? "On — WebCodecs/WebGL" : "Off (default — FFmpeg)"}
+            >
+              <Segmented
+                options={[
+                  { value: "on", label: "On" },
+                  { value: "off", label: "Off" },
+                ]}
+                value={settings.gpuExportEngine ? "on" : "off"}
+                onChange={(v) =>
+                  onSettingsChange({
+                    ...settings,
+                    gpuExportEngine: v === "on" ? true : undefined,
+                  })
+                }
+              />
+              <p className="mt-0.5 text-[9px]" style={{ color: "#52525b" }}>
+                Composites and encodes on the GPU (WebCodecs hardware H.264)
+                instead of the CPU FFmpeg filter pipeline. If the GPU engine
+                hits any problem, the export automatically re-runs through
+                FFmpeg — no failed exports. The result toast shows which
+                engine ran + per-frame GPU render time.
               </p>
             </Field>
             <Field label="Frame rate">

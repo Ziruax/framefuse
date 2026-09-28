@@ -500,6 +500,11 @@ export async function exportTimelineViaGpu(
   // UI can always show life (and the header now shows decimals below 10%).
   let stage: ExportProgress["stage"] = "preparing";
   let framesEncoded = 0;
+  // v1.15.1 GPU-Shift telemetry: per-frame composite + encode-submit cost
+  // (ms, summed over the FINAL pass only — the software-rung retry resets
+  // it alongside framesEncoded). This is the number the FFmpeg CPU pipeline
+  // must lose to: mean frame cost × total frames ≈ the GPU render wall.
+  let framePaintMs = 0;
   let lastEmitAt = 0;
   const emitProgress = (force = false): void => {
     const now = performance.now();
@@ -512,7 +517,9 @@ export async function exportTimelineViaGpu(
       stage,
       framesEncoded,
       totalFrames,
-      elapsedSec: Math.round(elapsedSec * 10) / 10,
+      // v1.15.1: renamed to `elapsed` — the v1.14.2 ExportProgress contract
+      // the FFmpeg path already speaks (same seconds, same UI consumer).
+      elapsed: Math.round(elapsedSec * 10) / 10,
     });
   };
   const heartbeat = setInterval(() => {
@@ -668,6 +675,12 @@ export async function exportTimelineViaGpu(
         );
       }
 
+      // v1.15.1: yield to the event loop every few frames — the canvas
+      // paint + encode submit run in the GPU process, but a fully-synchronous
+      // loop (pure-image timelines touch no await between frames) would
+      // freeze the renderer UI for the whole export. 1 ms every 4 frames.
+      if ((i & 3) === 0) await delay(0);
+
       const currentMs = (i / fps) * 1000;
 
       // Backpressure: don't let the encoder queue grow without bound.
@@ -693,6 +706,11 @@ export async function exportTimelineViaGpu(
         }
         await delay(10);
       }
+
+      // v1.15.1 telemetry: the paint clock starts AFTER backpressure — only
+      // composite + encode-submit time counts (waiting on a slow encoder is
+      // not "rendering" cost).
+      const framePaintT0 = performance.now();
 
       // Active BASE segment — the preview's exact track-aware resolution
       // (segmentAtTime: base lane only, tail fallback to the last base
@@ -870,6 +888,7 @@ export async function exportTimelineViaGpu(
         outFrame.close(); // ⚠ immediately after last use — no path leaks it
       }
       framesEncoded = i + 1;
+      framePaintMs += performance.now() - framePaintT0; // v1.15.1 telemetry
       emitProgress();
     }
 
@@ -961,6 +980,7 @@ export async function exportTimelineViaGpu(
           );
           cleanupDecoders(); // pass 2 re-creates them lazily from the same sources
           framesEncoded = 0;
+          framePaintMs = 0; // v1.15.1: telemetry tracks the FINAL pass only
           stage = "preparing";
           emitProgress(true);
           passResult = await runEncodePass(true);
@@ -979,8 +999,11 @@ export async function exportTimelineViaGpu(
             : "WebCodecs H.264 · software",
         elapsedSec,
         mode: "gpu-webcodecs",
+        engine: "webcodecs-gpu",
+        method: "WebCodecs GPU",
         ...(audioSkipped ? { audioSkipped: true } : {}),
         framesEncoded,
+        gpuFrameRenderMs: Math.round((framePaintMs / Math.max(1, framesEncoded)) * 10) / 10,
         ...(softwareFallback ? { softwareFallback: true } : {}),
       };
     } finally {

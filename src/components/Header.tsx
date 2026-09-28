@@ -31,6 +31,13 @@ export interface LastExport {
   size: number;
   method: string;
   at: number;
+  /** v1.15.1 GPU-Shift: which engine ran ("webcodecs-gpu" |
+   *  "ffmpeg-smart") + the GPU frame telemetry for A/B verification. */
+  engine?: "webcodecs-gpu" | "ffmpeg-smart";
+  framesEncoded?: number;
+  gpuFrameRenderMs?: number;
+  audioSkipped?: boolean;
+  softwareFallback?: boolean;
   /** v1.1 TURBO telemetry (desktop FFmpeg path only). */
   encoder?: string;
   elapsedSec?: number;
@@ -44,7 +51,7 @@ export interface LastExport {
   hwDecodeClips?: number;
   /** v1.5: parallel single-pass windows (CPU-first chunked export). */
   parallelChunks?: number;
-  mode?: "single-pass" | "parallel-pass" | "two-step" | "smart-render";
+  mode?: "single-pass" | "parallel-pass" | "two-step" | "smart-render" | "gpu-webcodecs";
   /** v9: True Smart Rendering — clean seconds copied vs dirty seconds
    *  re-encoded. */
   smartCleanSec?: number;

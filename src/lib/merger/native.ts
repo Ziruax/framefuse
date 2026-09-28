@@ -31,6 +31,10 @@ import {
 import type { CaptionAnimation } from "./types";
 import { renderSfxWav, sfxDurationMs } from "./sfx";
 import { sanitizeChromaKeySettings } from "./chroma";
+// v1.15.1 GPU-Shift: the revived WebCodecs/WebGL export engine (v8
+// architecture: SourceDecoder → GPU canvas → VideoEncoder → mp4-muxer →
+// streamed IPC sink) + its abort signal type for the router's re-throw.
+import { exportTimelineViaGpu, ExportAbortedError } from "@/lib/export";
 
 /** True when running inside the FrameFuse Electron shell. */
 export function isElectron(): boolean {
@@ -299,7 +303,10 @@ export function browserQualityBitrate(settings: VideoSettings): number {
   }
 }
 
-async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult> {
+async function exportViaFFmpeg(
+  opts: ExportNativeOptions,
+  preChosenPath?: string | null,
+): Promise<ExportResult> {
   const api = window.electronAPI!;
   const {
     segments,
@@ -320,7 +327,9 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
   // BEFORE any media prep. The v5.x order (upload every source byte → THEN
   // ask where to save) is what users experienced as "5 to 10 minutes just
   // for showing the save dialog". Cancelling here now costs zero work.
-  const outputPath = await api.chooseOutput();
+  // v1.15.1: the GPU-Shift router passes the path it ALREADY chose when a
+  // GPU-engine failure falls back here — no second dialog.
+  const outputPath = preChosenPath ?? (await api.chooseOutput());
   if (!outputPath) {
     throw new Error("Export cancelled");
   }
@@ -664,7 +673,9 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
       // sanitizes it; null/absent keeps every graph byte-identical).
       textRemoval: opts.textRemoval ?? undefined,
     });
-    return result;
+    // v1.15.1 GPU-Shift: engine telemetry — every result says which pipeline
+    // actually ran (the A/B pair for the WebCodecs engine toggle).
+    return { ...result, engine: "ffmpeg-smart", method: "Native FFmpeg" };
   } finally {
     unsubscribe();
     if (signal) signal.removeEventListener("abort", onAbort);
@@ -673,10 +684,77 @@ async function exportViaFFmpeg(opts: ExportNativeOptions): Promise<ExportResult>
 }
 
 // ---------------------------------------------------------------------------
-// v1.14.2: the browser MediaRecorder export path was REMOVED (desktop-only
-// directive). Canvas caption drawing below stays — the preview renderer and
-// the vestigial WebCodecs engine module still import these helpers.
+// v1.15.1 GPU-Shift — the export ROUTER.
 // ---------------------------------------------------------------------------
+// The WebCodecs/WebGL engine is an OPT-IN feature flag (settings.gpuExportEngine,
+// default OFF). Routing rules, in order:
+//   1. Flag OFF, WebCodecs unavailable, or a NON-GPU-ROUTABLE timeline →
+//      the FFmpeg pipeline, exactly as before (byte-identical behavior).
+//      Non-routable = active burn-in text removal (the v1.15 delogo/blur/
+//      cover graphs are FFmpeg parity features) or loudness normalization
+//      ON (the 2-pass loudnorm chain).
+//   2. Flag ON + routable: the save dialog opens once; the GPU engine
+//      renders the full timeline (GPU canvas compositing + hardware H.264
+//      + streamed muxing). In the plain browser it runs its in-memory mode
+//      and downloads the MP4 (dev preview path).
+//   3. ANY GPU-engine failure (init, encoder, muxer, watchdog) — except a
+//      user abort — falls back to the SAME FFmpeg pipeline with the
+//      already-chosen output path (no second save dialog): the master-plan
+//      graceful-degradation rule. In the browser there is no FFmpeg, so a
+//      GPU failure surfaces as a hard error there (dev preview honesty).
+// Every result carries engine: "webcodecs-gpu" | "ffmpeg-smart" + the
+// gpuFrameRenderMs/framesEncoded telemetry for A/B verification.
+// ---------------------------------------------------------------------------
+function gpuRoutableTimeline(opts: ExportNativeOptions): boolean {
+  if (typeof VideoEncoder === "undefined" || typeof VideoFrame === "undefined") {
+    return false; // no WebCodecs in this runtime
+  }
+  // Burn-in text removal (v1.15): mirror of the main-process sanitizer's
+  // active condition — enabled with at least one region → FFmpeg parity.
+  const tr = opts.textRemoval as { enabled?: boolean; regions?: unknown[] } | undefined;
+  if (tr && tr.enabled !== false && Array.isArray(tr.regions) && tr.regions.length > 0) {
+    return false;
+  }
+  // Loudness normalization: the 2-pass loudnorm chain is an FFmpeg parity
+  // feature — GPU-path audio keeps the master-gain/limiter shape instead.
+  if (opts.audio?.normalize) {
+    return false;
+  }
+  return true;
+}
+
+export async function exportNative(
+  opts: ExportNativeOptions,
+): Promise<ExportResult> {
+  if (opts.settings.gpuExportEngine === true && gpuRoutableTimeline(opts)) {
+    let outputPath: string | null = null;
+    if (isElectron()) {
+      const api = window.electronAPI!;
+      // The dialog opens ONCE for BOTH engines — a GPU-engine failure that
+      // falls back to FFmpeg must not ask the user where to save again.
+      outputPath = await api.chooseOutput();
+      if (!outputPath) throw new Error("Export cancelled");
+    }
+    try {
+      return await exportTimelineViaGpu({ ...opts, outputPath });
+    } catch (e) {
+      if (e instanceof ExportAbortedError) throw e;
+      if (e instanceof Error && e.message === "Export cancelled") throw e;
+      if (isElectron()) {
+        console.warn(
+          "[framefuse] GPU export engine failed — falling back to the FFmpeg smart-render pipeline:",
+          e,
+        );
+        return exportViaFFmpeg(opts, outputPath);
+      }
+      throw e;
+    }
+  }
+  if (isElectron()) {
+    return exportViaFFmpeg(opts);
+  }
+  throw new Error(DESKTOP_ONLY_EXPORT_MSG);
+}
 
 /** Trigger a browser download of `url` as `filename` (no native save
  * dialog). Exported since v8: the GPU (WebCodecs) engine reuses the exact
@@ -691,9 +769,9 @@ export function triggerDownload(url: string, filename: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Canvas caption drawing — used by both the preview and the WebCodecs /
-// MediaRecorder browser exporters. The Electron FFmpeg path uses libass
-// instead (see buildCaptionFfmpegStyle).
+// v1.14.2: the browser MediaRecorder export path was REMOVED (desktop-only
+// directive). Canvas caption drawing below stays — the preview renderer and
+// the WebCodecs engine module still import these helpers.
 // ---------------------------------------------------------------------------
 
 interface CanvasCaptionCtx {
@@ -2065,23 +2143,6 @@ function drawRoundedRect(
   ctx.lineTo(x, y + radius);
   ctx.quadraticCurveTo(x, y, x + radius, y);
   ctx.closePath();
-}
-
-/**
- * Export the timeline to video.
- * - Inside Electron: native FFmpeg (MP4) — the ONLY export engine (v1.10:
- *   the WebCodecs engine was removed; one reliable FFmpeg codebase).
- * - v1.14.2 (desktop-only directive): in a plain browser this now throws a
- *   typed error instead of falling back to MediaRecorder — FrameFuse is a
- *   Windows desktop app; the browser studio is a UI preview only.
- */
-export async function exportNative(
-  opts: ExportNativeOptions,
-): Promise<ExportResult> {
-  if (isElectron()) {
-    return exportViaFFmpeg(opts);
-  }
-  throw new Error(DESKTOP_ONLY_EXPORT_MSG);
 }
 
 /** Convenience: find the active segment for a time (re-exported helper). */
