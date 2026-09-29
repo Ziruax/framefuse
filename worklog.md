@@ -1570,3 +1570,21 @@ Work Log:
 Stage Summary:
 - dist/FrameFuse Setup 1.15.2.exe (242,586,266 B) is READY for the real-hardware A/B: install it on a Windows box with an Nvidia/Intel/AMD GPU and run `node scripts/ab-export-bench.js --exe "C:\Users\<you>\AppData\Local\Programs\FrameFuse\FrameFuse.exe"` (or from the repo against `npx electron .` after `npm run build`) — it generates the 60s 1080p fixture timeline, forces the FFmpeg arm onto NVENC, runs the WebCodecs GPU arm through its worker, and prints the wall-clock + gpuFrameRenderMs/jsCompositorOverheadMs comparison. Headless results (1.38× software) stay explicitly labeled as non-proof.
 - Release to GitHub NOT done (no release command this round) — the installer sits in dist/ ready to publish on the word.
+
+---
+Task ID: 55
+Agent: main (Z.ai Code)
+Task: User round — push dist/FrameFuse Setup 1.15.2.exe to a GitHub release so it can be tested on real hardware.
+
+Work Log:
+- STATE: housekeeping had wiped dist/ (plus resources/, whisper-service/, out/ — same incident class as Task-52/54-ship). Git was clean (the "M" entries were 0-diff touch artifacts) and all commits already on origin/main (309a376). The installer had to be REBUILT before it could be published.
+- REBUILD (staged, one Bash call per stage because the sandbox reaps background processes between tool calls — the setsid/nohup launch died silently with a 0-byte log; each stage's disk outputs persist so nothing was lost): clean+next build --webpack (EXIT 0, 4 static routes) → build-gpu-worker + copy-wasm (public/gpu-worker.js = out/gpu-worker.js = 315,624 B, EXACTLY the Task-54 ship size) → fetch-windows-ffmpeg (BtbN master-gpl 187 MB) → stage-whisper-service + stage-whisper-model (42 MB tiny, 7 downloads) → electron-builder --win nsis --publish never. dist/FrameFuse Setup 1.15.2.exe = 242,593,790 B (+ blockmap 254,382 B + latest.yml v1.15.2, dash-named url, sha512 qQXcXKRS…).
+- ASAR VERIFIED (whole-archive extract to a SCRATCH cwd /tmp/asar-check — the Task-54 extract-file-clobbers-CWD rule): package.json 1.15.2; out/gpu-worker.js in the archive with ALL five v2-protocol strings (audio-mix, audio-mix-abort, audio-chunks, audio-complete, sink-chunk); electron/main.js FRAMEFUSE_BENCH ×6 + startExportBench ×2; preload bench:run/benchResult ×3; page-901b…js chunk: jsCompositorOverheadMs + workerRuntime + gpu-worker.js ref + 1.15.2 ×2; win-unpacked/resources: faster-whisper-runtime = README.txt ONLY + ffmpeg/win + ffmpeg-static + transformers-wasm (4 wasm) + whisper-service + icon.ico. Local exe sha512 == latest.yml sha512.
+- PUBLISH: scripts/publish-release-1.15.2.js (Task-45 playbook clone — token from git remote, dupe-aware uploads, 504 re-list guidance; body covers the worker migration, the spec-forced main-thread audio arm, the telemetry, the A/B bench command). Release created: id 398939138 https://github.com/Ziruax/framefuse/releases/tag/v1.15.2. Assets: latest.yml (350 B) + FrameFuse-Setup-1.15.2.exe.blockmap (254,382 B) + FrameFuse-Setup-1.15.2.exe (242,593,790 B @ 13.03 MB/s, 18.6 s).
+- THREE-WAY VERIFIED: re-downloaded the exe from the release URL — sha512 of the re-download == sha512 of the local file == latest.yml (qQXcXKRSB6ov…); GitHub asset size == local size. Also confirmed pre-publish that no v1.15.2 release existed (API list) and the token was alive.
+- CLEANUP: /tmp/re-dl-1152.exe + /tmp/asar-check removed; dev server restored.
+
+Stage Summary:
+- v1.15.2 is LIVE at https://github.com/Ziruax/framefuse/releases/tag/v1.15.2 — 3 assets, three-way sha512 verified, asar feature markers verified. Awaiting the user's real-hardware test results (install → optional A/B bench: node scripts/ab-export-bench.js --exe "C:\Users\<you>\AppData\Local\Programs\FrameFuse\FrameFuse.exe").
+- GOTCHA (new, environment): background processes (nohup AND setsid+disown) do not survive between Bash tool calls in this sandbox — run long chains as sequential stages, one synchronous Bash call each, relying on disk-persisted stage outputs.
+- NEXT: user tests 1.15.2 on real Windows GPU hardware → field data (bench table + jsCompositorOverheadMs) decides the v1.16 GLSL/WebGPU compositor migration and whether the worker engine becomes default.
