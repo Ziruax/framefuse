@@ -408,6 +408,15 @@ export interface ExportResult {
   jsCompositorOverheadMs?: number;
   gpuDecodeWaitMs?: number;
   workerRuntime?: "worker" | "main-thread";
+  /** v1.15.3 (lie detector): which encoder rung actually ran —
+   *  "require-hardware" = PROVEN hardware (the platform answered the probe),
+   *  "prefer-hardware" = hardware requested but unverifiable (legacy
+   *  runtime), "software"/"plain" = software by construction; +
+   *  hwRejectReason = the platform's own rejection message when hardware
+   *  was refused. The toast/tooltip/bench carry it so a "slow WebCodecs"
+   *  report is diagnosable at a glance. */
+  hwEncoder?: "require-hardware" | "prefer-hardware" | "software" | "plain";
+  hwRejectReason?: string;
   elapsedSec?: number;
   copiedClips?: number;
   encodedClips?: number;

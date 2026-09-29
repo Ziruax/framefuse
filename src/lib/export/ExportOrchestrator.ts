@@ -402,25 +402,63 @@ export interface VideoEncoderSetup {
   forceSoftware?: boolean;
 }
 
+/** v1.15.3: which rung of the encoder ladder actually configured the
+ * encoder. "require-hardware" is the ONLY rung that PROVES a hardware
+ * encoder is in use (the platform answers, it cannot silently substitute
+ * software); "prefer-hardware" means hardware was requested but not
+ * verified (runtimes without the require-hardware enum); "software"/
+ * "plain" are software by construction. */
+export type EncoderRung =
+  | "require-hardware"
+  | "prefer-hardware"
+  | "software"
+  | "plain";
+
 /** Which rung of the hardware→software ladder configured the encoder. */
 export interface ConfiguredVideoEncoder {
   encoder: VideoEncoder;
-  /** True = the prefer-hardware rung; false = the software fallback. */
+  /** True = a hardware rung (require-hardware or prefer-hardware). */
   hardware: boolean;
+  /** v1.15.3: the rung that won — the lie-detector verdict surfaced in
+   * result telemetry, the completion toast and the A/B bench table. */
+  rung: EncoderRung;
+  /** v1.15.3: the platform's own rejection reason when the require-hardware
+   * probe failed (harvested from a real configure() DOMException); absent
+   * when the probe passed (or never ran). */
+  hwRejectReason?: string;
 }
 
+/** WebCodecs `hardwareAcceleration: "require-hardware"` is a Chromium
+ * extension that not every TS DOM lib (nor every runtime) knows — widen
+ * through unknown so the probe can be attempted and its failure handled
+ * honestly at runtime instead of being forbidden at compile time. */
+const REQUIRE_HW = "require-hardware" as unknown as VideoEncoderConfig["hardwareAcceleration"];
+
 /**
- * Configure the export VideoEncoder with a hardware→software fallback ladder:
- * 1. prefer-hardware + quality latency (the GPU path this module exists for),
- * 2. same codec, software, still quality latency,
- * 3. same codec, PLAIN config (no latencyMode — the native.ts-proven shape
- *    some runtimes require near level-boundary frame budgets),
- * 4. unsupported codec → GpuExportError carrying the platform's
+ * Configure the export VideoEncoder with a hardware→software ladder.
+ * v1.15.3 (user directive — the LIE DETECTOR): rung 0 is a
+ * `require-hardware` probe. Unlike `prefer-hardware` (which the platform
+ * satisfies by SILENTLY configuring a software encoder when no GPU encoder
+ * exists — the "WebCodecs is slow as hell" trap), `require-hardware` makes
+ * the platform answer: supported:true ⇒ a hardware encoder WILL run;
+ * supported:false ⇒ there is none, we log the rejection LOUDLY (the
+ * "look at the console" field diagnostic) and skip straight to software
+ * (prefer-hardware could only silently give software then).
+ *
+ * Ladder:
+ * 0. require-hardware + quality latency — only present when the probe
+ *    answered supported:true (PROVEN hardware),
+ *    [probe threw (enum unknown to this runtime) → the legacy rung 0
+ *    prefer-hardware + quality, hardware unverified],
+ * 1. software + quality latency,
+ * 2. plain config (no latencyMode — the native.ts-proven shape some
+ *    runtimes require near level-boundary frame budgets),
+ * 3. nothing worked → GpuExportError carrying the platform's own
  *    DOMException message (harvested from a real configure() attempt).
  *
- * v8: exported (the timeline adapter reuses the identical ladder) and now
- * reports which rung won via `hardware`, so callers can label the export
- * "hardware" vs "software" truthfully. H.264 codecs additionally pin
+ * v8: exported (the timeline adapter reuses the identical ladder) and
+ * reports which rung won via `rung`/`hardware`, so callers can label the
+ * export "hardware" vs "software" truthfully. H.264 codecs additionally pin
  * `avc: { format: "avc" }` (the AVCC box format mp4-muxer expects — the
  * WebCodecs default, now explicit like the browser path in native.ts).
  */
@@ -438,22 +476,82 @@ export async function configureVideoEncoder(
     framerate: opts.fps,
     ...(codec.startsWith("avc1") ? { avc: { format: "avc" as const } } : {}),
   };
-  const configs: VideoEncoderConfig[] = [
-    // Rung 1: the GPU path this module exists for.
-    { ...common, latencyMode: "quality" as const, hardwareAcceleration: "prefer-hardware" },
-    // Rung 2: software encode, still quality latency.
-    { ...common, latencyMode: "quality" as const },
-    // Rung 3 (v1.8.1): the native.ts-proven PLAIN shape (no latencyMode).
-    // Empirically required: some runtimes reject latencyMode:"quality" for
-    // codecs whose H.264 level sits exactly at the frame-size/fps budget
-    // (e.g. Constrained Baseline L3.0 at 1280x720@30 — headless Chromium
-    // reports isConfigSupported:false there while the plain config works,
-    // which is how the legacy browser path always encoded 720p).
-    { ...common },
-  ];
 
-  for (let rung = opts.forceSoftware === true ? 1 : 0; rung < configs.length; rung++) {
-    const config = configs[rung];
+  // ── v1.15.3 LIE DETECTOR (user directive, Step 1): probe require-hardware
+  // BEFORE any configure(). Three outcomes: true (proven hardware — becomes
+  // rung 0), false (proven ABSENT — loud log, hardware rungs skipped), or
+  // throw (this runtime doesn't know the enum → legacy prefer-hardware rung).
+  let requireHw: boolean | null = null;
+  let hwRejectReason: string | undefined;
+  const hwProbeConfig: VideoEncoderConfig = {
+    ...common,
+    latencyMode: "quality" as const,
+    hardwareAcceleration: REQUIRE_HW,
+  };
+  if (opts.forceSoftware !== true) {
+    try {
+      const support = await VideoEncoder.isConfigSupported(hwProbeConfig);
+      requireHw = support.supported === true;
+    } catch {
+      requireHw = null; // enum value unknown to this runtime — legacy ladder
+      console.warn(
+        "[framefuse] this runtime does not know hardwareAcceleration:\"require-hardware\" — falling back to the prefer-hardware ladder (hardware unverifiable)",
+      );
+    }
+    if (requireHw === false) {
+      // Harvest the platform's own reason via a REAL configure() attempt —
+      // isConfigSupported returns no errorMessage, configure() does.
+      try {
+        const probe = new VideoEncoder({ output: () => {}, error: () => {} });
+        try {
+          probe.configure(hwProbeConfig);
+          probe.close();
+          hwRejectReason = "no hardware encoder accepted the config";
+        } catch (e) {
+          try { probe.close(); } catch { /* already closed by the throw */ }
+          hwRejectReason = e instanceof DOMException ? e.message : String(e);
+        }
+      } catch {
+        hwRejectReason = "probe encoder could not be constructed";
+      }
+      console.error(
+        `[framefuse] HARDWARE ENCODING REJECTED at ${opts.width}x${opts.height}@${opts.fps} — falling back to software (SLOW).`,
+      );
+      console.error(
+        `[framefuse] Reason: ${hwRejectReason}. Check the Electron GPU flags (D3D11VideoEncoder / ignore-gpu-blocklist), GPU driver, and that no other encoder session holds the device.`,
+      );
+    } else if (requireHw === true) {
+      console.log(
+        `[framefuse] hardware encoding CONFIRMED (require-hardware accepted) at ${opts.width}x${opts.height}@${opts.fps}`,
+      );
+    }
+  }
+
+  const configs: VideoEncoderConfig[] = [];
+  const rungs: EncoderRung[] = [];
+  if (opts.forceSoftware !== true) {
+    if (requireHw === true) {
+      // Rung 0: PROVEN hardware — the platform must answer for it, no silent
+      // substitution. A runtime configure() failure here falls to software.
+      configs.push(hwProbeConfig);
+      rungs.push("require-hardware");
+    } else if (requireHw === null) {
+      // Legacy runtime (enum unknown): the v1.15.2 ladder verbatim —
+      // hardware requested but unverifiable.
+      configs.push({ ...common, latencyMode: "quality" as const, hardwareAcceleration: "prefer-hardware" as const });
+      rungs.push("prefer-hardware");
+    }
+    // requireHw === false: hardware is PROVEN absent — a prefer-hardware
+    // rung would silently configure software; skip straight to software.
+  }
+  // Software rungs (also the ENTIRE ladder when forceSoftware).
+  configs.push({ ...common, latencyMode: "quality" as const });
+  rungs.push("software");
+  configs.push({ ...common });
+  rungs.push("plain");
+
+  for (let i = 0; i < configs.length; i++) {
+    const config = configs[i];
     let supported = false;
     try {
       const support = await VideoEncoder.isConfigSupported(config);
@@ -470,7 +568,13 @@ export async function configureVideoEncoder(
       try { encoder.close(); } catch { /* already closed by the throw */ }
       continue;
     }
-    return { encoder, hardware: rung === 0 };
+    const rung = rungs[i];
+    return {
+      encoder,
+      hardware: rung === "require-hardware" || rung === "prefer-hardware",
+      rung,
+      ...(hwRejectReason ? { hwRejectReason } : {}),
+    };
   }
 
   // No config worked — harvest the platform's own DOMException message via a

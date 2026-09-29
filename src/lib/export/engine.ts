@@ -157,6 +157,17 @@ export interface GpuTimelineExportResult extends ExportResult {
   /** v1.15.2: which execution context ran the engine — set by the worker
    * client ("worker" | "main-thread"), surfaced for telemetry + E2E. */
   workerRuntime?: "worker" | "main-thread";
+  /** v1.15.3 (lie detector): which encoder rung ACTUALLY ran —
+   * "require-hardware" = a hardware encoder is PROVEN in use (the platform
+   * answered the probe); "prefer-hardware" = hardware requested but
+   * unverifiable (legacy runtime without the require-hardware enum);
+   * "software"/"plain" = software by construction. The A/B bench, toast and
+   * Header tooltip carry it — "WebCodecs is slow" reports become
+   * diagnosable at a glance. */
+  hwEncoder?: "require-hardware" | "prefer-hardware" | "software" | "plain";
+  /** v1.15.3: the platform's own rejection reason when the require-hardware
+   * probe failed (harvested DOMException message) — the field diagnostic. */
+  hwRejectReason?: string;
 }
 
 /** Overlay-lane items without an explicit geometry render centered at 60%
@@ -168,8 +179,14 @@ const DEFAULT_OVERLAY_TRANSFORM: OverlayTransform = {
   position: "center",
 };
 
-/** Encoder backpressure: pause the paint loop above this many queued frames. */
-const MAX_ENCODE_QUEUE = 30;
+/** Encoder backpressure: pause the paint loop above this many queued
+ * frames. v1.15.3 (user directive, Step 4): 30 → 5 — a deep queue only
+ * inflates memory pressure (each queued VideoFrame is 1920×1080 of pixel
+ * storage) without adding throughput; with a hardware encoder the queue
+ * drains at ASIC speed and never reaches 5, with a slow software encoder
+ * the loop is encoder-bound either way — the lower cap just stops the
+ * balloon. The watchdog below still catches a wedged driver. */
+const MAX_ENCODE_QUEUE = 5;
 
 /**
  * v1.8.2 — encoder-output watchdog: a hardware VideoEncoder that ACCEPTS
@@ -274,7 +291,13 @@ export async function exportTimelineViaGpu(
   const keyInterval = Math.max(1, Math.round(fps * 2));
 
   const canvas = createPaintSurface(dims.w, dims.h);
-  const ctx = get2DContext(canvas);
+  // v1.15.3 (user directive, Step 3 — the canvas readback penalty):
+  // desynchronized + willReadFrequently:false + alpha:false (the default)
+  // request the GPU-resident low-latency path for the export stage — the
+  // browser skips unnecessary sync fences and never CPU-readies the surface
+  // for getImageData we never do. The VideoFrame(canvas) construction below
+  // is the only read, and it takes the fast texture path.
+  const ctx = get2DContext(canvas, false, { desynchronized: true, willReadFrequently: false });
   if (!ctx) throw new GpuExportError("failed to acquire a 2d context on the export canvas");
 
   // ── Audio gate: build the track list, then check AAC support BEFORE the
@@ -460,7 +483,7 @@ export async function exportTimelineViaGpu(
     // Scratch canvas for the transition composite + global fades (the
     // browser path's twin). v1.15.2: OffscreenCanvas inside the worker.
     const scratch = createPaintSurface(dims.w, dims.h);
-    const sctx = get2DContext(scratch);
+    const sctx = get2DContext(scratch, false, { desynchronized: true, willReadFrequently: false });
 
     // Caption draw closure — the SAME capCtx construction as the browser
     // path (word modes + kinetic animations render identically).
@@ -498,7 +521,14 @@ export async function exportTimelineViaGpu(
      */
     const runEncodePass = async (
       passForceSoftware: boolean,
-    ): Promise<{ hardware: boolean; byteCount: number; resultPath: string }> => {
+    ): Promise<{
+      hardware: boolean;
+      rung: "require-hardware" | "prefer-hardware" | "software" | "plain";
+      hwRejectReason?: string;
+      byteCount: number;
+      resultPath: string;
+      bytes?: ArrayBuffer;
+    }> => {
     const sink = new ChunkSink(useIpc ? bridge : null);
     if (useIpc && bridge && outputPath) {
       bridge.exportStart(outputPath);
@@ -528,6 +558,10 @@ export async function exportTimelineViaGpu(
     let encoderFatal: unknown = null;
     let videoEncoder: VideoEncoder | null = null;
     let encoderClosed = false;
+    // v1.15.3 lie-detector state — which rung configured THIS pass's encoder
+    // (pass 2 after a GPU-stall retry reports its own, software, rung).
+    let passRung: "require-hardware" | "prefer-hardware" | "software" | "plain" = "software";
+    let passHwRejectReason: string | undefined;
     let audioPromise: Promise<unknown> | null = null;
     let audioCompleted = false;
     const audioCtl = new AbortController();
@@ -539,7 +573,7 @@ export async function exportTimelineViaGpu(
     const passStartedAt = lastOutputAt;
 
     try {
-      const { encoder, hardware } = await configureVideoEncoder(
+      const { encoder, hardware, rung, hwRejectReason } = await configureVideoEncoder(
         { width: dims.w, height: dims.h, fps, videoBitrate: bitrate, videoCodec, forceSoftware: passForceSoftware },
         (chunk, meta) => {
           muxer.addVideoChunk(chunk, meta);
@@ -551,6 +585,8 @@ export async function exportTimelineViaGpu(
         },
       );
       videoEncoder = encoder;
+      passRung = rung;
+      passHwRejectReason = hwRejectReason;
 
       // Audio renders CONCURRENTLY with the frame loop (runGpuExport's proven
       // pattern): chunks flow straight into the muxer, the promise is awaited
@@ -636,7 +672,7 @@ export async function exportTimelineViaGpu(
             framesEncoded,
           );
         }
-        await delay(10);
+        await delay(2); // v1.15.3 (user directive, Step 4): tight 2 ms yield — the encoder drains on its own threads
       }
 
       // v1.15.1 telemetry: the paint clock starts AFTER backpressure — only
@@ -890,6 +926,8 @@ export async function exportTimelineViaGpu(
     }
     return {
       hardware,
+      rung: passRung,
+      ...(passHwRejectReason ? { hwRejectReason: passHwRejectReason } : {}),
       byteCount: sink.byteCount,
       resultPath,
       ...(resultBytes ? { bytes: resultBytes } : {}),
@@ -920,7 +958,14 @@ export async function exportTimelineViaGpu(
     // ── v1.8.2: run the pass, retrying ONCE on the software rung when the
     // hardware encoder wedged before ANY frame was muxed (lossless restart).
     let softwareFallback = false;
-    let passResult: { hardware: boolean; byteCount: number; resultPath: string; bytes?: ArrayBuffer };
+    let passResult: {
+      hardware: boolean;
+      rung: "require-hardware" | "prefer-hardware" | "software" | "plain";
+      hwRejectReason?: string;
+      byteCount: number;
+      resultPath: string;
+      bytes?: ArrayBuffer;
+    };
     try {
       emitProgress(true);
       try {
@@ -950,13 +995,19 @@ export async function exportTimelineViaGpu(
       }
 
       const elapsedSec = Math.max(0.001, (performance.now() - startedAt) / 1000);
+      // v1.15.3: the encoder label states the rung TRUTH — only
+      // require-hardware is proven hardware; prefer-hardware is requested
+      // but unverifiable; software/plain are software.
+      const rungLabel =
+        passResult.rung === "require-hardware"
+          ? "hardware (require-hardware)"
+          : passResult.rung === "prefer-hardware"
+            ? "hardware (prefer-hardware, unverified)"
+            : "software";
       return {
         path: passResult.resultPath,
         size: passResult.byteCount,
-        encoder:
-          passResult.hardware && !softwareFallback
-            ? "WebCodecs H.264 · hardware"
-            : "WebCodecs H.264 · software",
+        encoder: `WebCodecs H.264 · ${rungLabel}`,
         elapsedSec,
         mode: "gpu-webcodecs",
         engine: "webcodecs-gpu",
@@ -971,6 +1022,11 @@ export async function exportTimelineViaGpu(
           Math.round((frameCompositeMs / Math.max(1, framesEncoded)) * 10) / 10,
         gpuDecodeWaitMs: Math.round((frameDecodeMs / Math.max(1, framesEncoded)) * 10) / 10,
         ...(softwareFallback ? { softwareFallback: true } : {}),
+        // v1.15.3 lie-detector telemetry: the rung that ran + the platform's
+        // rejection reason when hardware was refused (survives the retry —
+        // it explains WHY hardware did not run).
+        hwEncoder: passResult.rung,
+        ...(passResult.hwRejectReason ? { hwRejectReason: passResult.hwRejectReason } : {}),
         ...(passResult.bytes ? { bytes: passResult.bytes } : {}),
       };
     } finally {

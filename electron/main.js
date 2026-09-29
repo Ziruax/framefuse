@@ -183,6 +183,49 @@ ipcMain.handle("is-electron", () => true);
 // install is stale/hybrid and the UI flags it. Also carries the CPU count
 // (the fact that decides the parallel-pool width) for the Export-tab
 // diagnostics strip.
+// v1.15.3 lie detector: app-info also carries the GPU-process summary —
+// vendor/model + every video-encode-related field app.getGPUInfo exposes
+// (the chrome://gpu "Video Acceleration" twin). On a Windows GPU box this
+// is the ground truth for "is a hardware H.264 encoder even visible to
+// Chromium" — the renderer-side require-hardware probe is the spec-side
+// check, this is the driver-side check.
+async function gpuVideoSummary() {
+  try {
+    const info = await app.getGPUInfo("complete");
+    if (!info || typeof info !== "object") return "gpu info unavailable";
+    const bits = [];
+    const gpu = info.gpu || {};
+    const vendor = [gpu.vendor, gpu.vendorString, gpu.deviceString, gpu.driverVendor, gpu.driverVersion]
+      .filter(Boolean).join(" · ");
+    if (vendor) bits.push(vendor);
+    // Defensive scan — the exact key set differs across Chromium versions
+    // (videoEncodeAcceleratorSupportedProfiles and successors); log whatever
+    // video/encode keys exist, never assume a shape.
+    const scan = (obj, prefix) => {
+      if (!obj || typeof obj !== "object") return;
+      for (const [k, v] of Object.entries(obj)) {
+        if (/video|encode/i.test(k)) {
+          const s = JSON.stringify(v);
+          bits.push(`${prefix}${k}: ${s && s.length > 260 ? s.slice(0, 260) + "…" : s}`);
+        }
+      }
+    };
+    scan(info, "");
+    scan(gpu, "gpu.");
+    if (info.featureStatus) {
+      for (const [k, v] of Object.entries(info.featureStatus)) {
+        if (/video|encode/i.test(k)) bits.push(`featureStatus.${k}: ${v}`);
+      }
+    }
+    if (bits.length === 0) {
+      bits.push("no video-encode fields exposed by this Electron's GPUInfo — check chrome://gpu manually");
+    }
+    return bits.join(" | ");
+  } catch (e) {
+    return `gpu info failed: ${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
 ipcMain.handle("app-info", async () => {
   // v1.14.1: the ACCURATE CPU topology — physical cores AND logical
   // threads (os.cpus().length alone counts SMT threads, so a 4C/8T box
@@ -199,6 +242,7 @@ ipcMain.handle("app-info", async () => {
     cpuLogicalCores: topo.logical,
     cpuModel: topo.model,
     cpuTopology: topo.note,
+    gpuInfo: await gpuVideoSummary(),
   };
 });
 
@@ -6193,10 +6237,34 @@ function startExportBench() {
 }
 
 // App lifecycle
+
+// ── v1.15.3 (user directive): force Chromium to expose the GPU video
+// encoders. Without these switches Electron can leave D3D11 video encode
+// (NVENC/QSV/AMF) disabled or blacklisted on Windows → the WebCodecs
+// engine's require-hardware probe is REJECTED → exports silently crawl on
+// the software encoder ("WebCodecs is slow as hell" trap). The engine's
+// watchdog + FFmpeg fallback still cover a genuinely broken driver; to
+// disable on a misbehaving machine, delete the three lines below.
+//   win32: D3D11VideoEncoder (hardware H.264 encode) + CanvasOopRasterization
+//          (canvas compositing in the GPU process)
+//   linux: VaapiVideoEncoder (VA-API — the dev-mode twin)
+if (process.platform === "win32") {
+  app.commandLine.appendSwitch("enable-features", "D3D11VideoEncoder,CanvasOopRasterization");
+} else if (process.platform === "linux") {
+  app.commandLine.appendSwitch("enable-features", "VaapiVideoEncoder");
+}
+app.commandLine.appendSwitch("ignore-gpu-blocklist");
+app.commandLine.appendSwitch("enable-gpu-rasterization");
+
 app.whenReady().then(() => {
   ensureTempDir();
   buildApplicationMenu();
   createWindow();
+  // v1.15.3 lie detector: dump the GPU-process video-encode summary at
+  // startup — the console answer to "is a hardware H.264 encoder visible to
+  // Chromium on THIS machine" (renderer probes spec-side; this is
+  // driver-side). Visible in the app log + the A/B bench's [bench-app] pipe.
+  gpuVideoSummary().then((s) => console.log(`[gpu-info] ${s}`)).catch(() => {});
   // v1.15.2 REAL-HARDWARE A/B EXPORT BENCH: scripts/ab-export-bench.js
   // spawns the app with FRAMEFUSE_BENCH=1 + a plan JSON + a results JSON
   // path. main reads the plan → ships the fixture media bytes to the

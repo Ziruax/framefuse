@@ -24,7 +24,7 @@ import { cn } from "@/lib/utils";
 /** v1.12.1: the renderer's build constant — compared against the REAL exe
  *  version (app.getVersion()) so a stale/hybrid install is impossible to
  *  miss. Keep in sync with package.json on every release. */
-const BUILD_VERSION = "1.15.2";
+const BUILD_VERSION = "1.15.3";
 
 export interface LastExport {
   path: string;
@@ -43,6 +43,10 @@ export interface LastExport {
   jsCompositorOverheadMs?: number;
   gpuDecodeWaitMs?: number;
   workerRuntime?: "worker" | "main-thread";
+  /** v1.15.3 lie detector: the encoder rung that actually ran + the
+   * platform's rejection reason when hardware encode was refused. */
+  hwEncoder?: "require-hardware" | "prefer-hardware" | "software" | "plain";
+  hwRejectReason?: string;
   /** v1.1 TURBO telemetry (desktop FFmpeg path only). */
   encoder?: string;
   elapsedSec?: number;
@@ -581,6 +585,14 @@ export function Header({
                         : "") +
                       (lastExport.gpuDecodeWaitMs != null
                         ? ` · ${lastExport.gpuDecodeWaitMs} ms/frame decode wait`
+                        : "") +
+                      // v1.15.3 lie detector: the encoder rung + the platform's
+                      // rejection reason when hardware was refused.
+                      (lastExport.hwEncoder
+                        ? ` · enc rung: ${lastExport.hwEncoder}`
+                        : "") +
+                      (lastExport.hwRejectReason
+                        ? ` · hardware rejected (${lastExport.hwRejectReason})`
                         : "")
                     : ""
                 }${

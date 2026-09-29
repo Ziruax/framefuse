@@ -61,6 +61,10 @@ interface BenchRunResult {
   gpuDecodeWaitMs?: number;
   softwareFallback?: boolean;
   workerRuntime?: string;
+  /** v1.15.3 lie detector: the encoder rung that actually ran + the
+   * platform's rejection reason when hardware was refused. */
+  hwEncoder?: string;
+  hwRejectReason?: string;
   audioSkipped?: boolean;
   error: string | null;
 }
@@ -216,6 +220,8 @@ function runResultOf(
     ...(res.gpuDecodeWaitMs != null ? { gpuDecodeWaitMs: res.gpuDecodeWaitMs } : {}),
     ...(res.softwareFallback != null ? { softwareFallback: res.softwareFallback } : {}),
     ...(res.workerRuntime != null ? { workerRuntime: res.workerRuntime } : {}),
+    ...(res.hwEncoder != null ? { hwEncoder: res.hwEncoder } : {}),
+    ...(res.hwRejectReason != null ? { hwRejectReason: res.hwRejectReason } : {}),
     ...(res.audioSkipped != null ? { audioSkipped: res.audioSkipped } : {}),
     error: null,
   };
@@ -228,10 +234,15 @@ async function runBench(payload: { media: BenchMedia[]; config: BenchConfig }): 
   const runs: BenchRunResult[] = [];
   let appVersion = "unknown";
   let platform = "unknown";
+  let gpuInfo: string | undefined;
   try {
     const info = await api.appInfo();
     appVersion = info?.version ?? appVersion;
     platform = info?.platform ?? platform;
+    // v1.15.3 lie detector: the GPU-process video-encode summary rides the
+    // results JSON — the driver-side half of the hardware truth.
+    const w = info as { gpuInfo?: string } | null;
+    if (w?.gpuInfo) gpuInfo = w.gpuInfo;
   } catch {
     /* non-fatal — telemetry only */
   }
@@ -351,6 +362,7 @@ async function runBench(payload: { media: BenchMedia[]; config: BenchConfig }): 
     ok,
     appVersion,
     platform,
+    ...(gpuInfo ? { gpuInfo } : {}),
     startedAt: new Date().toISOString(),
     runs,
     notes:

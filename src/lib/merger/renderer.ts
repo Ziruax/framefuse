@@ -38,11 +38,27 @@ export type Ctx2D = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D
 /** A canvas surface on either thread. */
 export type PaintSurface = HTMLCanvasElement | OffscreenCanvas;
 
+/** Extra 2D context attributes for the export path (v1.15.3 user
+ * directive, Step 3 — the canvas readback penalty): `desynchronized`
+ * requests the low-latency rendering path (no unnecessary sync fences),
+ * `willReadFrequently:false` tells the browser we never getImageData (the
+ * GPU-resident fast path), and the export always pairs them with
+ * `alpha:false` (already the default here). Preview keeps the defaults —
+ * only the export surfaces opt in. */
+export interface PaintSurfaceAttrs {
+  desynchronized?: boolean;
+  willReadFrequently?: boolean;
+}
+
 /** Acquire the 2D context of either canvas flavor (null when exhausted).
  * The two getContext overloads return different context types, so the union
  * call needs one honest cast. */
-export function get2DContext(canvas: PaintSurface, alpha = false): Ctx2D | null {
-  return canvas.getContext("2d", { alpha }) as Ctx2D | null;
+export function get2DContext(
+  canvas: PaintSurface,
+  alpha = false,
+  attrs?: PaintSurfaceAttrs,
+): Ctx2D | null {
+  return canvas.getContext("2d", { alpha, ...attrs }) as Ctx2D | null;
 }
 
 /** Create a canvas surface for the CURRENT thread — document-backed on the

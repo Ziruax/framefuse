@@ -254,7 +254,14 @@ function printTable(runs, durationSec) {
     const bytes = typeof run.size === "number" ? run.size : statSize(run.path);
     const flags = [run.ok === false && "FAILED", run.softwareFallback && "SW-FALLBACK",
       run.audioSkipped && "NO-AUDIO", run.engine === "ffmpeg-smart" && run.encoder && "enc=" + run.encoder,
-      gpu && run.workerRuntime && String(run.workerRuntime)].filter(Boolean).join(", ");
+      gpu && run.workerRuntime && String(run.workerRuntime),
+      // v1.15.3 lie detector: the WebCodecs run's ACTUAL encoder rung —
+      // hw=require-hardware = proven GPU ASIC; hw=software/plain + a printed
+      // HW-REJECTED line means the comparison is FFmpeg-vs-CPU and says
+      // NOTHING about WebCodecs-on-GPU speed.
+      gpu && run.hwEncoder && "hw=" + run.hwEncoder,
+      gpu && run.hwEncoder && run.hwEncoder !== "require-hardware" && run.hwEncoder !== "prefer-hardware" && "HW-REJECTED",
+      gpu && run.hwRejectReason && "reason: " + String(run.hwRejectReason).slice(0, 60)].filter(Boolean).join(", ");
     return [String(run.engine), isFinite(wallSec) ? wallSec.toFixed(1) : "-",
       isFinite(rt) ? rt.toFixed(2) + "x" : "-",
       typeof bytes === "number" ? (bytes / 1048576).toFixed(1) : "-",
@@ -271,7 +278,18 @@ function printTable(runs, durationSec) {
 
 function printReport(doc, title, durationSec) {
   console.log("\n== " + title + " — app " + String(doc.appVersion || "?") + " on " + String(doc.platform || "?") + " ==");
+  if (doc.gpuInfo) console.log("  GPU: " + String(doc.gpuInfo).slice(0, 220));
   printTable(doc.runs, durationSec);
+  // v1.15.3 lie detector advisory: a speedup number against a SOFTWARE
+  // WebCodecs run is not evidence about WebCodecs-on-GPU at all.
+  const gpuRun = doc.runs.find((r) => r.engine === "webcodecs-gpu");
+  if (gpuRun && gpuRun.ok && gpuRun.hwEncoder &&
+      gpuRun.hwEncoder !== "require-hardware" && gpuRun.hwEncoder !== "prefer-hardware") {
+    console.log("  !! HARDWARE ENCODING " +
+      (gpuRun.hwRejectReason ? "REJECTED: " + String(gpuRun.hwRejectReason) : "NOT AVAILABLE") +
+      " — the WebCodecs arm ran on the SOFTWARE encoder: this comparison says NOTHING about WebCodecs GPU speed." +
+      " Check the GPU driver + that the app build carries the D3D11VideoEncoder flags, then re-run.");
+  }
   for (const run of doc.runs) if (run.ok === false) console.log("  ! " + run.engine + " FAILED: " + (run.error || "(no error message)"));
   const ff = doc.runs.find((r) => r.engine === "ffmpeg-smart" && r.ok);
   const gpu = doc.runs.find((r) => r.engine === "webcodecs-gpu" && r.ok);

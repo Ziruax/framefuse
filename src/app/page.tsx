@@ -147,7 +147,7 @@ const DISCLAIMER_DEFAULT_MS = 2000;
 /** v1.14.2: renderer build stamp — the desktop-only landing carries it so a
  * browser visitor sees which build is live (in Electron, Header separately
  * cross-checks it against the exe's app.getVersion()). */
-const BUILD_VERSION = "1.15.2";
+const BUILD_VERSION = "1.15.3";
 
 /** Effective lead-in duration of a disclaimer clip (ms, min 200). */
 function disclaimerDurationOf(d: DisclaimerClip | null): number {
@@ -1383,6 +1383,8 @@ export default function Page() {
         jsCompositorOverheadMs: res.jsCompositorOverheadMs,
         gpuDecodeWaitMs: res.gpuDecodeWaitMs,
         workerRuntime: res.workerRuntime,
+        hwEncoder: res.hwEncoder,
+        hwRejectReason: res.hwRejectReason,
         audioSkipped: res.audioSkipped,
         softwareFallback: res.softwareFallback,
         // v1.1 TURBO telemetry (desktop only — browser exports omit these).
@@ -1443,8 +1445,20 @@ export default function Page() {
       // v1.15.1 GPU-Shift: when the WebCodecs engine ran, the toast leads
       // with the engine + the GPU frame telemetry (the A/B proof).
       if (res.engine === "webcodecs-gpu") {
+        // v1.15.3 lie detector: state the encoder TRUTH in the toast lead —
+        // require-hardware = proven GPU ASIC; anything else = software (and
+        // why). A "WebCodecs is slow" report must be diagnosable at a glance.
+        const hwBit =
+          res.hwEncoder === "require-hardware"
+            ? " · hardware encoder (verified)"
+            : res.hwEncoder === "prefer-hardware"
+              ? " · hardware (unverified)"
+              : res.hwEncoder
+                ? ` · SOFTWARE encoder${res.hwRejectReason ? " (hw rejected)" : ""}`
+                : "";
         turboBits.push(
           `GPU engine (WebCodecs${res.softwareFallback ? " · software rung after GPU stall" : ""})` +
+            hwBit +
             (res.workerRuntime ? ` · ${res.workerRuntime === "worker" ? "worker" : "main thread"}` : "") +
             (res.framesEncoded != null ? ` · ${res.framesEncoded} frames` : "") +
             (res.gpuFrameRenderMs != null ? ` · ${res.gpuFrameRenderMs} ms/frame GPU render` : "") +
