@@ -678,7 +678,10 @@ async function exportViaFFmpeg(
     });
     // v1.15.1 GPU-Shift: engine telemetry — every result says which pipeline
     // actually ran (the A/B pair for the WebCodecs engine toggle).
-    return { ...result, engine: "ffmpeg-smart", method: "Native FFmpeg" };
+    // v1.16: the main-process ROUTER now sets engine/method itself
+    // ("rust-native" for the Rust engine, "ffmpeg-smart" default) — pass
+    // those through instead of overwriting them.
+    return { ...result, engine: result.engine || "ffmpeg-smart", method: result.method || "Native FFmpeg" };
   } finally {
     unsubscribe();
     if (signal) signal.removeEventListener("abort", onAbort);

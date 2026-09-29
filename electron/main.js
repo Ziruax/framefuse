@@ -33,6 +33,12 @@ const SP = require("./export-singlepass");
 // in userData/groq.json — never in project files). PREFERed engine chain head
 // when a key is saved; local engines remain as fallbacks.
 const GQ = require("./groq-whisper");
+// v1.16 RUST NATIVE ENGINE (runtime-FFI): wgpu compositor + dlopen'ed FFmpeg
+// encode, replacing the CLI IPC hop. The router module owns eligibility,
+// timeline adaptation and the CLI Safe-Mode fallback; a failed load is NOT
+// an error — exports silently ride the FFmpeg-CLI pipeline (DIRECTIVE 5).
+const RUST = require("./rust-engine-router");
+console.log("[RustEngine]", JSON.stringify(RUST.rustEngineStatus()));
 
 // Resolve the FFmpeg binary path. v1.5: a FULL bundled build (staged by
 // scripts/fetch-windows-ffmpeg.js into resources/ffmpeg/<plat>/) is PREFERRED
@@ -718,6 +724,8 @@ async function measureLoudnormContext(clipAudioJobs, audioPath) {
 ipcMain.handle("cancel-export", async () => {
   try {
     killAllProcs();
+    // v1.16: also signal the Rust engine (its video loop checks per frame)
+    RUST.requestRustCancel();
     return true;
   } catch { return false; }
 });
@@ -3922,6 +3930,26 @@ ipcMain.handle("export-native", async (event, opts) => {
 
   if (!ffmpegPath || !fs.existsSync(ffmpegPath)) {
     throw new Error("FFmpeg not found. The bundled FFmpeg binary is missing or corrupted. Please reinstall FrameFuse. Expected at: " + ffmpegPath);
+  }
+
+  // ── v1.16 RUST NATIVE ENGINE ROUTER ─────────────────────────────────
+  // wgpu compositor + runtime-FFI encode (no child processes, no IPC pipes,
+  // no Chromium GPU process). v0.1 handles the core fast path; anything it
+  // doesn't support yet, or ANY runtime failure, silently returns null and
+  // this handler continues into the v1.14.5 CLI pipeline below (Safe Mode).
+  if (opts.useRustEngine !== false) {
+    const rustResult = await RUST.runRustExport(opts, event, {
+      ffmpegPath,
+      cpuCount: os.cpus().length,
+    });
+    if (rustResult) {
+      console.log(
+        `[Export] Rust engine: ${rustResult.encoderName} (${rustResult.engineUsed})` +
+          rustResult.adapter ? ` on ${rustResult.adapter}` : "",
+        `— ${rustResult.totalWallMs}ms wall, ${rustResult.framesEncoded} frames`,
+      );
+      return rustResult;
+    }
   }
 
   // v4.4 watermark: { imagePath, x, y, w, h, opacity } — geometry computed

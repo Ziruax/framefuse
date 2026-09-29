@@ -387,7 +387,7 @@ export interface ExportResult {
    *  discipline); "ffmpeg-smart" = the native FFmpeg True Smart Rendering
    *  pipeline. Carried on every result so the completion toast + LastExport
    *  tooltip make A/B verification explicit. */
-  engine?: "webcodecs-gpu" | "ffmpeg-smart";
+  engine?: "webcodecs-gpu" | "ffmpeg-smart" | "rust-native";
   /** v1.15.1 GPU-Shift telemetry (webcodecs-gpu path): framesEncoded =
    *  emitted H.264 frames (must equal totalFrames — frame-exact law);
    *  audioSkipped = audio existed but AAC encode is unavailable in this

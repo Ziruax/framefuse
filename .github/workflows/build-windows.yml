@@ -1,0 +1,313 @@
+# .github/workflows/build-windows.yml — FrameFuse Windows CI (Rust engine).
+#
+# Builds the Rust native export engine NATIVELY on Windows (cargo + MSVC),
+# runs the napi load probe, a full E2E smoke test (exportVideo → ffprobe),
+# and (separate job) the Electron installer + the A/B export bench on a
+# best-effort basis.
+#
+# WHY this workflow exists: the Linux dev sandbox has NO GPU, so this is the
+# only automated place where the Windows code path (MSVC cdylib, napi load,
+# DLL dlopen of the FFmpeg 7.1 shared libs, WARP/software wgpu fallback,
+# libx264 encoder ladder after the nvenc/qsv/amf probes fail) can be
+# validated end to end. NOTE: a GitHub windows-latest runner has NO physical
+# GPU either — NVENC/QSV/AMF hardware-encoder validation still requires a
+# real Windows machine (see the bench step comment below).
+
+name: "Build Windows Rust Engine"
+
+on:
+  push:
+    paths:
+      - "rust-engine/**"
+      - "electron/**"
+      - "scripts/**"
+      - "src/**"
+      - ".github/workflows/build-windows.yml"
+  pull_request:
+    paths:
+      - "rust-engine/**"
+      - "electron/**"
+      - "scripts/**"
+      - "src/**"
+      - ".github/workflows/build-windows.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 1: cargo build (x86_64-pc-windows-msvc) → .node → load probe →
+  #        E2E smoke test (exportVideo → real MP4 verified with ffprobe).
+  # ─────────────────────────────────────────────────────────────────────────
+  build-windows:
+    name: "Rust engine build + E2E smoke (MSVC)"
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable + x86_64-pc-windows-msvc target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo workspace (rust-engine)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "rust-engine"
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          # NOTE: no `cache: npm` — this repo ships bun.lock (no
+          # package-lock.json), so setup-node's npm cache would fail.
+
+      # Full install: heavy (electron, onnxruntime-node) but the later steps
+      # (fetch scripts, bench, electron-builder chain) all need it. postinstall
+      # runs the patch scripts; trustedDependencies allow electron etc.
+      - name: npm install
+        shell: bash
+        run: npm install --no-audit --no-fund
+
+      # Stages the full Windows ffmpeg.exe + ffprobe.exe into
+      # resources/ffmpeg/win/ (and, once scripts/fetch-windows-ffmpeg.js is
+      # extended by Task 8-b, the shared DLLs into resources/ffmpeg/win/dll/).
+      # Idempotent.
+      - name: Stage full Windows FFmpeg (ffmpeg.exe + ffprobe.exe)
+        shell: bash
+        run: node scripts/fetch-windows-ffmpeg.js
+
+      # The Rust engine dlopens the FFmpeg shared libraries at runtime
+      # (DIRECTIVE 1 "No-Link"): avcodec-61 / avformat-61 / avutil-59 /
+      # swscale-8 / swresample-5 (= FFmpeg 7.1, family 61/61/59/8/5). If
+      # fetch-windows-ffmpeg.js did not stage them (Task 8-b not landed yet,
+      # or the fetch fell back to a static-only source), download a shared
+      # build ourselves. Prefer gyan "release-full-shared" (the exact build
+      # the app ships); BtbN 7.1 shared zip is the GitHub-CDN fallback with
+      # the same DLL family.
+      - name: Ensure FFmpeg shared DLLs for the Rust engine (avcodec-61 family)
+        shell: bash
+        run: |
+          set -euo pipefail
+          DLLDIR="resources/ffmpeg/win/dll"
+          NEEDED="avcodec-61 avformat-61 avutil-59 swscale-8 swresample-5"
+          mkdir -p "$DLLDIR"
+          missing=0
+          for dll in $NEEDED; do
+            [ -f "$DLLDIR/$dll.dll" ] || missing=$((missing + 1))
+          done
+          if [ "$missing" -eq 0 ]; then
+            echo "[dlls] fetch-windows-ffmpeg.js already staged the shared libraries:"
+            ls -la "$DLLDIR"
+            exit 0
+          fi
+          echo "[dlls] $missing/5 shared libs missing — downloading a full shared FFmpeg build"
+
+          SEVENZ="$(command -v 7z || true)"
+          if [ -z "$SEVENZ" ] && [ -x "/c/Program Files/7-Zip/7z.exe" ]; then
+            SEVENZ="/c/Program Files/7-Zip/7z.exe"
+          fi
+          if [ -z "$SEVENZ" ]; then
+            echo "[dlls] FATAL: no 7z extractor found on the runner"
+            exit 1
+          fi
+          echo "[dlls] extractor: $SEVENZ"
+
+          TMPX="$RUNNER_TEMP/ffshared"
+          mkdir -p "$TMPX"
+
+          stage_from() { # $1=label $2=url — returns 0 only when all 5 DLLs land
+            local label="$1" url="$2"
+            local archive="$TMPX/$label.archive"
+            echo "[dlls] downloading $label …"
+            if ! curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 -o "$archive" "$url"; then
+              echo "[dlls] $label: download failed"
+              return 1
+            fi
+            rm -rf "$TMPX/x"
+            mkdir -p "$TMPX/x"
+            if ! "$SEVENZ" x -y "-o$TMPX/x" "$archive" >/dev/null; then
+              echo "[dlls] $label: extraction failed"
+              return 1
+            fi
+            local copied=0 dll
+            while IFS= read -r dll; do
+              cp "$dll" "$DLLDIR/" || return 1
+              copied=$((copied + 1))
+            done < <(find "$TMPX/x" -type f \( \
+              -iname "avcodec-61.dll"    -o -iname "avformat-61.dll"    -o \
+              -iname "avutil-59.dll"     -o -iname "swscale-8.dll"      -o \
+              -iname "swresample-5.dll" \))
+            echo "[dlls] $label: copied $copied/5 DLLs into $DLLDIR"
+            [ "$copied" -eq 5 ]
+          }
+
+          if ! stage_from gyan "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full-shared.7z"; then
+            echo "[dlls] gyan failed — falling back to the BtbN 7.1 shared zip (GitHub CDN)"
+            stage_from btbn "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-shared-7.1.zip" || {
+              echo "[dlls] FATAL: could not stage the FFmpeg shared libraries from either source"
+              exit 1
+            }
+          fi
+          ls -la "$DLLDIR"
+
+      # scripts/build-rust-engine.js resolves cargo (incl. ~/.cargo/bin),
+      # runs `cargo build --release --target x86_64-pc-windows-msvc`, stages
+      # target/.../framefuse_engine.dll → rust-engine/framefuse-engine.win32-x64.node,
+      # then runs the napi load probe (require + engineVersion).
+      - name: Build Rust engine (cargo MSVC → .node + load probe)
+        shell: bash
+        run: |
+          set -o pipefail
+          node scripts/build-rust-engine.js 2>&1 | tee rust-engine/build-windows.log
+
+      # Full pipeline smoke test: engine loads → probeFfmpegFamily(dll dir) →
+      # exportVideo (2-segment timeline: video + Ken Burns image, 2 text
+      # headlines, music) → ffprobe asserts h264 + ~150 frames + aac 48kHz.
+      # The smoke test generates its own fixtures with the staged
+      # resources/ffmpeg/win/ffmpeg.exe into $RUNNER_TEMP (testsrc2 + sine
+      # aac video, gradients PNG, 440Hz music.m4a) and uses
+      # C:/Windows/Fonts/arialbd.ttf as the sans font.
+      # CI expectations (no physical GPU): encoder ladder nvenc/qsv/amf fail
+      # to OPEN → libx264; wgpu may init on the WARP software adapter
+      # (engineUsed "rust-gpu") or fall back ("rust-cpu") — both accepted.
+      - name: Rust engine E2E smoke test (exportVideo → ffprobe)
+        shell: bash
+        env:
+          FF_TEST_FFMPEG: "resources/ffmpeg/win/ffmpeg.exe"
+          FF_TEST_FFPROBE: "resources/ffmpeg/win/ffprobe.exe"
+          FF_ENGINE_FFMPEG_DIR: "resources/ffmpeg/win/dll"
+          FF_TEST_MEDIA_DIR: "${{ runner.temp }}/fftest"
+          FF_TEST_FONT: "C:/Windows/Fonts/arialbd.ttf"
+          FF_ENGINE_INFO_OUT: "rust-engine/engine-info.json"
+        run: |
+          set -o pipefail
+          node rust-engine/tools/smoke-test-windows.js 2>&1 | tee rust-engine/smoke-windows.log
+
+      - name: Upload Rust engine artifact (.node + info + logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-engine-win32-x64
+          path: |
+            rust-engine/framefuse-engine.win32-x64.node
+            rust-engine/engine-info.json
+            rust-engine/build-windows.log
+            rust-engine/smoke-windows.log
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 2 (optional, heavy): full Electron installer. Reuses the .node binary
+  # that passed the smoke test in job 1 (RUST_ENGINE_SKIP=1 skips the cargo
+  # leg of `npm run electron:build`), then runs the A/B export bench once on a
+  # best-effort basis and uploads the installer.
+  # ─────────────────────────────────────────────────────────────────────────
+  build-installer:
+    name: "Electron installer + A/B bench (best-effort)"
+    runs-on: windows-latest
+    needs: build-windows
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: npm install
+        shell: bash
+        run: npm install --no-audit --no-fund
+
+      # The exact binary that passed the smoke test is what gets packaged.
+      # Download OUTSIDE rust-engine/ (rust-engine/** ships in the app — the
+      # artifact's logs/info must not end up inside the installer) and move
+      # ONLY the .node in.
+      - name: Stage the smoke-tested Rust binary
+        uses: actions/download-artifact@v4
+        with:
+          name: rust-engine-win32-x64
+          path: engine-artifact
+
+      - name: Move the .node into rust-engine/ + load probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          mv engine-artifact/framefuse-engine.win32-x64.node rust-engine/
+          ls -la rust-engine/
+          node -e "const e=require('./rust-engine/index.js'); if(!e.available()){console.error('LOAD FAILED:', e.loadError()); process.exit(1);} console.log('probe ok:', e.engineVersion(), e.loadedFrom)"
+
+      # Full chain: clean → next build → gpu-worker → copy-wasm →
+      # fetch-windows-ffmpeg → stage-whisper(-service/-model) →
+      # build-rust-engine (SKIPPED — binary already staged above) →
+      # electron-builder --win nsis --publish never.
+      # scripts/clean.js only removes .next/out/dist — the staged .node is
+      # safe. rust-engine/** ships asar-unpacked (package.json build config).
+      - name: Build Electron installer (reuses the smoke-tested .node)
+        shell: bash
+        env:
+          RUST_ENGINE_SKIP: "1"
+        run: npm run electron:build
+
+      # The bench's own fixture generation resolves ffmpeg at
+      # resources/ffmpeg/ffmpeg(.exe) or PATH — electron:build staged it at
+      # resources/ffmpeg/win/, so put that on PATH for subsequent steps.
+      # GITHUB_PATH needs a WINDOWS path: cygpath -w converts Git Bash's
+      # POSIX-style $PWD.
+      - name: Put staged ffmpeg on PATH (for the bench fixtures)
+        shell: bash
+        run: echo "$(cygpath -w "$PWD/resources/ffmpeg/win")" >> "$GITHUB_PATH"
+
+      # ── WHY continue-on-error ─────────────────────────────────────────────
+      # scripts/ab-export-bench.js LAUNCHES THE PACKAGED EXE and drives the
+      # export UI via the FRAMEFUSE_BENCH plan (FFmpeg arm with the encoder
+      # forced to NVENC vs WebCodecs arm). A GitHub windows-latest runner has
+      # NO physical GPU: the NVENC/QSV/AMF probes cannot open, the FFmpeg arm
+      # silently falls back to software, and the WebCodecs arm is
+      # hardware-REJECTED (the v1.15.3 lie-detector prints exactly that). Any
+      # timing numbers here validate ONLY the packaging + software-encode
+      # path — the bench's own header says: "headless/VM software runs prove
+      # nothing about NVENC/QSV/AMF ASIC speed — run on real Windows GPU
+      # hardware". The bench is still worth one best-effort round (it
+      # exercises installer → app boot → export end to end), so it runs with
+      # continue-on-error and never fails this job. Real GPU validation:
+      #   node scripts/ab-export-bench.js --exe "C:\...\FrameFuse.exe"
+      # on a physical Windows machine.
+      - name: A/B export bench (1 round — best effort, hardware verdicts need a real GPU)
+        shell: bash
+        continue-on-error: true
+        timeout-minutes: 30
+        run: |
+          set -o pipefail
+          EXE="$(ls -1 dist/FrameFuse*.exe 2>/dev/null | head -n 1 || true)"
+          if [ -z "$EXE" ]; then
+            echo "[bench] no dist/FrameFuse*.exe found — skipping bench"
+            exit 0
+          fi
+          echo "[bench] exe: $EXE"
+          node scripts/ab-export-bench.js --exe "$EXE" --rounds 1 --duration 12 --resolution 720p 2>&1 | tee ab-bench.log
+
+      - name: Upload A/B bench results (best-effort)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ab-bench-results
+          path: |
+            bench-results.json
+            ab-bench.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: framefuse-windows-installer
+          path: |
+            dist/FrameFuse Setup *.exe
+          if-no-files-found: error
+          retention-days: 14

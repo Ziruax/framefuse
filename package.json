@@ -2,7 +2,7 @@
   "name": "framefuse",
   "version": "1.15.3",
   "private": true,
-  "description": "FrameFuse v1 — Multi-track video studio: video clips, green/white/black screen chroma key with on-canvas PiP, overlay lane, background music with volume/loop, synthesized SFX, Whisper captions via Groq cloud (user's own API key, stored on-device) with an offline tiny-model fallback bundled in the installer, True Smart Rendering FFmpeg export (clean ranges stream-copied, dirty windows re-encoded in parallel with hardware decode), native project files.",
+  "description": "FrameFuse v1 \u2014 Multi-track video studio: video clips, green/white/black screen chroma key with on-canvas PiP, overlay lane, background music with volume/loop, synthesized SFX, Whisper captions via Groq cloud (user's own API key, stored on-device) with an offline tiny-model fallback bundled in the installer, True Smart Rendering FFmpeg export (clean ranges stream-copied, dirty windows re-encoded in parallel with hardware decode), native project files.",
   "main": "electron/main.js",
   "author": "FrameFuse",
   "license": "MIT",
@@ -25,8 +25,9 @@
     "stage:faster-whisper": "node scripts/stage-faster-whisper.js",
     "stage:faster-whisper-model": "node scripts/stage-faster-whisper-model.js",
     "postinstall": "node scripts/patch-transformers.js && node scripts/patch-electron-builder.js",
-    "electron:build": "npm run clean && next build --webpack && node scripts/build-gpu-worker.js && node scripts/copy-wasm.js && node scripts/fetch-windows-ffmpeg.js && node scripts/stage-whisper-service.js && node scripts/stage-whisper-model.js && electron-builder --win nsis --publish never",
-    "electron:build:fw": "node scripts/stage-faster-whisper.js && node scripts/stage-faster-whisper-model.js"
+    "electron:build": "npm run clean && next build --webpack && node scripts/build-gpu-worker.js && node scripts/copy-wasm.js && node scripts/fetch-windows-ffmpeg.js && node scripts/stage-whisper-service.js && node scripts/stage-whisper-model.js && node scripts/build-rust-engine.js && electron-builder --win nsis --publish never",
+    "electron:build:fw": "node scripts/stage-faster-whisper.js && node scripts/stage-faster-whisper-model.js",
+    "build:rust": "node scripts/build-rust-engine.js"
   },
   "trustedDependencies": [
     "electron",
@@ -72,7 +73,8 @@
       "electron/**/*",
       "build/**/*",
       "package.json",
-      "!node_modules"
+      "!node_modules",
+      "rust-engine/**/*"
     ],
     "extraResources": [
       {
@@ -108,7 +110,9 @@
         "to": "icon.ico"
       }
     ],
-    "asarUnpack": [],
+    "asarUnpack": [
+      "rust-engine/**"
+    ],
     "win": {
       "target": "nsis",
       "icon": "build/icon.ico",
