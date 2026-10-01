@@ -1237,6 +1237,22 @@ function buildAudioMixGraph(o) {
     });
   });
 
+  // v1.17 VOICEOVER/DUB: same treatment as SFX branches (volume +
+  // absolute-timeline adelay into the amix), EXCEPT the inputs can be MP3
+  // (Edge TTS narration = 24 kHz mono) — the chain therefore opens with an
+  // explicit aresample to the 48 kHz bus (a no-op for the 48 kHz WAV dubs)
+  // and aformat enforces stereo. Labels [vo<k>] never collide with [s<k>].
+  const vos = Array.isArray(o && o.voiceovers) ? o.voiceovers : [];
+  vos.forEach((v, k) => {
+    const vol = clampNum(v && v.volume, 0, 2, 1);
+    const d = Math.max(0, Math.round(Number(v && v.startMs) || 0));
+    const label = `[vo${k}]`;
+    branches.push({
+      label,
+      chain: `[${v.inputIdx}:a]volume=${String(vol)},adelay=${d}|${d},aresample=48000,${AFORMAT}${label}`,
+    });
+  });
+
   const parts = branches.map((b) => b.chain);
   let last;
   if (branches.length <= 1) {
@@ -1378,6 +1394,7 @@ function buildAudioMixRenderArgs(o) {
     ? o.clipAudio.filter((c) => c && typeof c.wavPath === "string" && c.wavPath)
     : [];
   const sfxList = Array.isArray(o && o.sfx) ? o.sfx.filter((s) => s && typeof s.wavPath === "string" && s.wavPath) : [];
+  const voList = Array.isArray(o && o.voiceovers) ? o.voiceovers.filter((v) => v && typeof v.wavPath === "string" && v.wavPath) : [];
   const hasMusic = !!o.audioPath;
   const loopMusic = hasMusic && !!(audio.musicLoop);
   const args = [];
@@ -1392,6 +1409,10 @@ function buildAudioMixRenderArgs(o) {
   clipAudio.forEach((c) => { args.push("-i", c.wavPath); idx += 1; });
   const sfxBase = idx;
   sfxList.forEach((s) => { args.push("-i", s.wavPath); idx += 1; });
+  // v1.17: VO inputs come AFTER the SFX inputs (input layout: music, clips,
+  // sfx, voiceovers — mirrors buildConcatArgs).
+  const voBase = idx;
+  voList.forEach((v) => { args.push("-i", v.wavPath); idx += 1; });
 
   const { graph } = buildAudioMixGraph({
     totalSec,
@@ -1409,6 +1430,7 @@ function buildAudioMixRenderArgs(o) {
     // master stage is beyond rawMix's cut point — irrelevant here).
     audioFastGain: o.audioFastGain,
     sfx: sfxList.map((s, k) => ({ inputIdx: sfxBase + k, startMs: s.startMs, volume: s.volume })),
+    voiceovers: voList.map((v, k) => ({ inputIdx: voBase + k, startMs: v.startMs, volume: v.volume })),
   });
   args.push(
     "-filter_complex", graph,
@@ -1922,9 +1944,12 @@ function buildClipArgs(ctx) {
  * pre-rendered to a WAV and MEASURED — mux that single input with the
  * measured master loudnorm instead of re-running the whole graph.
  * sfx items: [{ wavPath, startMs, volume }] (already uploaded WAVs).
+ * v1.17 voiceovers: same shape (MP3 narration or 48 kHz WAV dub segments —
+ * resampled to the bus inside buildAudioMixGraph).
  */
 function buildConcatArgs(o) {
   const sfxList = Array.isArray(o.sfx) ? o.sfx.filter((s) => s && typeof s.wavPath === "string" && s.wavPath) : [];
+  const voList = Array.isArray(o.voiceovers) ? o.voiceovers.filter((v) => v && typeof v.wavPath === "string" && v.wavPath) : [];
   const clipAudio = Array.isArray(o.clipAudio)
     ? o.clipAudio.filter((c) => c && typeof c.wavPath === "string" && c.wavPath)
     : [];
@@ -1970,11 +1995,15 @@ function buildConcatArgs(o) {
   clipAudio.forEach((c) => args.push("-i", c.wavPath));
   const sfxBase = clipBase + clipAudio.length;
   sfxList.forEach((s) => args.push("-i", s.wavPath));
+  // v1.17: VO inputs after the SFX inputs (input layout: 0 = concat video,
+  // 1 = music, then clip WAVs, SFX WAVs, VO MP3/WAVs).
+  const voBase = sfxBase + sfxList.length;
+  voList.forEach((v) => args.push("-i", v.wavPath));
   // ALWAYS -c copy for video (captions already burned in step 1)
   args.push("-c:v", "copy");
 
   if (o.newAudioGraph) {
-    if (hasMusic || clipAudio.length > 0 || sfxList.length > 0) {
+    if (hasMusic || clipAudio.length > 0 || sfxList.length > 0 || voList.length > 0) {
       const { graph } = buildAudioMixGraph({
         totalSec: o.totalSec,
         audio: o.audio,
@@ -1991,6 +2020,7 @@ function buildConcatArgs(o) {
         audioFastGain: o.audioFastGain,
         masterGainDb: o.masterGainDb,
         sfx: sfxList.map((s, k) => ({ inputIdx: sfxBase + k, startMs: s.startMs, volume: s.volume })),
+        voiceovers: voList.map((v, k) => ({ inputIdx: voBase + k, startMs: v.startMs, volume: v.volume })),
       });
       args.push(
         "-filter_complex", graph,

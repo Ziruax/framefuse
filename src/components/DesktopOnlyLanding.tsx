@@ -174,10 +174,9 @@ export function DesktopOnlyLanding({
         </h1>
 
         <p className="mt-5 max-w-2xl text-[15px] leading-relaxed sm:text-lg" style={{ color: "#a1a1aa" }}>
-          The full studio — timeline editing, the multi-core FFmpeg export engine,
-          offline Whisper captions — runs as a native Windows application.
-          Exports spawn real FFmpeg processes on your CPU, which a browser page
-          can never do. Install the desktop app to create and export videos.
+          The full studio — timeline editing, native-speed export, offline
+          Whisper captions — runs as a Windows desktop app. Install it to
+          create and export videos.
         </p>
 
         {/* CTA */}
@@ -262,11 +261,8 @@ export function DesktopOnlyLanding({
             Why not the browser?
           </h2>
           <p className="mt-2 text-[13px] leading-relaxed" style={{ color: "#a1a1aa" }}>
-            Fast exports mean native FFmpeg child processes sliced across your
-            CPU, hardware decode probes, and offline speech models — none of
-            which a web page is allowed to run. Keeping FrameFuse desktop-only
-            keeps the export engine honest: what you configure is what renders,
-            at the speed your machine can actually deliver.
+            Fast exports, offline captions and real video processing need
+            desktop power a web page can&rsquo;t provide.
           </p>
         </section>
 

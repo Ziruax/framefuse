@@ -262,6 +262,10 @@ interface PreviewPanelProps {
    *  HTMLMediaElement/gain ranges — the >1 boost remains export-only,
    *  same convention as the music volume knob. Default 1. */
   masterVolume?: number;
+  /** v1.17: original-audio duck while a dub track exists (0..1, default 1
+   *  = no dub). Scales ONLY the active base clip's volume — music/SFX/VO
+   *  stay at full level (the export applies the same factor in main). */
+  dubDuck?: number;
   /** v1.4: preview playback speed (shuttle). The master clock, music
    * element, SFX sources and every hidden video element advance at this
    * rate — preview only (exports render at 1×). Default 1. */
@@ -339,6 +343,7 @@ export function PreviewPanel({
   canMatchAspect,
   onOverlayTransformChange,
   masterVolume = 1,
+  dubDuck = 1,
   previewRate = 1,
   onPreviewRateChange,
   onImportMedia,
@@ -1114,7 +1119,10 @@ export function PreviewPanel({
         const master = Number.isFinite(masterVolume)
           ? Math.max(0, Math.min(2, masterVolume))
           : 1;
-        el.volume = Math.max(0, Math.min(1, segVol * master));
+        // v1.17: the dub duck rides LAST (0 = fully muted original speech
+        // under a dub track; music/SFX/VO sources are unaffected).
+        const duck = Number.isFinite(dubDuck) ? Math.max(0, Math.min(1, dubDuck)) : 1;
+        el.volume = Math.max(0, Math.min(1, segVol * master * duck));
         el.muted = false;
       } else {
         if (!el.muted) el.muted = true;

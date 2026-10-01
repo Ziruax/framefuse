@@ -77,6 +77,12 @@ function rustEligible(opts) {
   const sfx = opts.sfx;
   if (Array.isArray(sfx) && sfx.length > 0) reasons.push("sfx");
 
+  // v1.17 VOICEOVER/DUB: VO/dub placements ride the FFmpeg amix graph (the
+  // MP3/WAV adelay+volume branches + the dub duck) — the Rust engine has no
+  // extra-audio-input mixing yet, exactly like SFX.
+  const vos = opts.voiceovers;
+  if (Array.isArray(vos) && vos.length > 0) reasons.push("voiceovers");
+
   const tr = opts.textRemoval;
   if (tr && tr.mode && tr.mode !== "none" && Array.isArray(tr.regions) && tr.regions.length > 0) {
     reasons.push("text-removal");
@@ -94,6 +100,14 @@ function rustEligible(opts) {
 
   const audio = opts.audio;
   if (audio && audio.normalize) reasons.push("loudnorm");
+
+  // v1.17 STACK TEXT: any headline with a stackStyle set rides the ASS/
+  // libass CLI compositor (the kinetic recipes are libass tags — the Rust
+  // engine's fontdue texts have no equivalent). This is the "export picks
+  // the best technique by default" gate: kinetic Stack Text → CLI, plain
+  // headlines keep the Rust fast path.
+  const headlineList = Array.isArray(opts.headlines) ? opts.headlines : [];
+  if (headlineList.some((h) => h && h.stackStyle)) reasons.push("stack-text");
 
   // overlay motion keyframes (≥2 = an actual path; 1 = pinned, fine)
   const overlays = Array.isArray(opts.overlays) ? opts.overlays : [];
@@ -178,13 +192,23 @@ function kenBurnsFor(globalKenBurns, direction) {
   };
 }
 
-function headlinePosition(presetId, position) {
-  const p = String(position || presetId || "bottom");
-  if (p.includes("top")) return "top";
-  if (p.includes("upper")) return "upper";
-  if (p.includes("middle") || p.includes("center")) return "center";
-  if (p.includes("lower")) return "lower";
-  return "bottom";
+/**
+ * v1.17 Stack Text: the effective layout (stackLayout ?? legacyMap(position))
+ * collapses onto the Rust text-position vocabulary: top-banner → "top",
+ * bottom-center → "bottom", everything else → "center". Kinetic items never
+ * reach this path (rustEligible's "stack-text" gate) — this maps the
+ * layout of SIMPLE-style headline items.
+ */
+function headlinePositionFromLayout(h) {
+  const layout = (h && h.stackLayout) ||
+    (h && h.position === "top"
+      ? "top-banner"
+      : h && h.position === "bottom"
+        ? "bottom-center"
+        : "center-stack");
+  if (layout === "top-banner") return "top";
+  if (layout === "bottom-center") return "bottom";
+  return "center";
 }
 
 /**
@@ -297,7 +321,10 @@ function buildRustTimeline(opts) {
       size: 72 * (Number(h.sizeScale) || 1), // 1080p reference px
       color: "#ffffff",
       outlineColor: "#101010",
-      position: headlinePosition(h.presetId, h.position),
+      // v1.17: position from the effective Stack Text layout (stackLayout ??
+      // legacyMap(position)); kinetic stackStyle items are gated to the CLI
+      // before this ever runs.
+      position: headlinePositionFromLayout(h),
       x: 0.5,
       fadeMs: 250,
     }));

@@ -35,7 +35,12 @@ import {
   sfxDurationMs,
   type SfxItem,
 } from "@/lib/merger/sfx";
-import { exportNative, isElectron } from "@/lib/merger/native";
+import {
+  exportNative,
+  isElectron,
+  measureHeadlinesForExport,
+  nativeSourcePath,
+} from "@/lib/merger/native";
 import { installBenchExportListener } from "@/lib/merger/benchExport";
 import {
   groupWordLevelCues,
@@ -65,11 +70,14 @@ import {
   defaultTransitionSettings,
   defaultWatermarkSettings,
   makeHeadlineItem,
+  makeVoiceoverItem,
   DISCLAIMER_ID,
   type AudioSettings,
   type AudioTrack,
   type CaptionSettings,
   type DisclaimerClip,
+  type DubSettings,
+  type DubTrackResult,
   type ExportProgress,
   type HeadlineItem,
   type ItemEdit,
@@ -82,10 +90,11 @@ import {
   type TransitionSettings,
   type TransitionStyle,
   type VideoSettings,
+  type VoiceoverItem,
   type WatermarkSettings,
 } from "@/lib/merger/types";
 import { getCaptionPreset, getFontOption, CAPTION_PRESETS } from "@/lib/merger/captionPresets";
-import { closestAspectForRatio } from "@/lib/merger/renderer";
+import { closestAspectForRatio, resolveDimensions } from "@/lib/merger/renderer";
 import { middleEllipsis } from "@/lib/merger/text";
 import {
   buildProjectFile,
@@ -147,7 +156,7 @@ const DISCLAIMER_DEFAULT_MS = 2000;
 /** v1.14.2: renderer build stamp — the desktop-only landing carries it so a
  * browser visitor sees which build is live (in Electron, Header separately
  * cross-checks it against the exe's app.getVersion()). */
-const BUILD_VERSION = "1.16.0";
+const BUILD_VERSION = "1.17.0";
 
 /** Effective lead-in duration of a disclaimer clip (ms, min 200). */
 function disclaimerDurationOf(d: DisclaimerClip | null): number {
@@ -202,6 +211,60 @@ function shiftSegments(
     startMs: s.startMs + offsetMs,
     endMs: s.endMs + offsetMs,
   }));
+}
+
+// ---- v1.17 DUB SETTINGS persistence (localStorage — machine-level pref,
+// exactly like the stt engine choice; the target language is a property of
+// THIS device's user, not of a project). Key: "framefuse-dub". ----
+const DUB_LS_KEY = "framefuse-dub";
+
+const DEFAULT_DUB_SETTINGS: DubSettings = {
+  targetLanguage: "hi",
+  targetLocale: "hi-IN",
+  groqModel: "llama-3.3-70b-versatile",
+  femaleVoice: "",
+  maleVoice: "",
+  originalVolume: 0.15,
+};
+
+function loadDubSettings(): DubSettings {
+  if (typeof window === "undefined") return { ...DEFAULT_DUB_SETTINGS };
+  try {
+    const raw = window.localStorage.getItem(DUB_LS_KEY);
+    if (!raw) return { ...DEFAULT_DUB_SETTINGS };
+    const j = JSON.parse(raw) as Partial<DubSettings>;
+    return {
+      targetLanguage:
+        typeof j.targetLanguage === "string" && j.targetLanguage
+          ? j.targetLanguage
+          : DEFAULT_DUB_SETTINGS.targetLanguage,
+      targetLocale:
+        typeof j.targetLocale === "string" && j.targetLocale
+          ? j.targetLocale
+          : DEFAULT_DUB_SETTINGS.targetLocale,
+      groqModel:
+        typeof j.groqModel === "string" && j.groqModel
+          ? j.groqModel
+          : DEFAULT_DUB_SETTINGS.groqModel,
+      femaleVoice: typeof j.femaleVoice === "string" ? j.femaleVoice : "",
+      maleVoice: typeof j.maleVoice === "string" ? j.maleVoice : "",
+      originalVolume:
+        typeof j.originalVolume === "number" && Number.isFinite(j.originalVolume)
+          ? Math.max(0, Math.min(1, j.originalVolume))
+          : DEFAULT_DUB_SETTINGS.originalVolume,
+    };
+  } catch {
+    return { ...DEFAULT_DUB_SETTINGS };
+  }
+}
+
+function saveDubSettings(s: DubSettings): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(DUB_LS_KEY, JSON.stringify(s));
+  } catch {
+    /* storage unavailable — preference stays in-memory */
+  }
 }
 
 // ---- Settings persistence (production-ready: survive restarts) ----------
@@ -371,6 +434,13 @@ export default function Page() {
   const [videoThumbnails, setVideoThumbnails] = useState<Record<string, string>>({});
   /** SFX placements on the master timeline (preview-scheduled + exported). */
   const [sfxItems, setSfxItems] = useState<SfxItem[]>([]);
+  /** v1.17: voiceover/dub placements (narration + dub segments). Like SFX
+   *  these live in BASE time; audio BYTES live in voBytesRef (a ref — bytes
+   *  are never in undo snapshots or project files, they regenerate at
+   *  export). */
+  const [voItems, setVoItems] = useState<VoiceoverItem[]>([]);
+  /** v1.17: dub run configuration (machine-level localStorage pref). */
+  const [dubSettings, setDubSettings] = useState<DubSettings>(() => loadDubSettings());
   /** v5.4: timeline multi-select — ids of clips the USER selected (click /
    *  Ctrl-click / Shift-click / marquee / Ctrl+A). Deliberately NOT
    *  persisted and NOT playhead-derived (activeSegment covers that): the
@@ -651,6 +721,23 @@ export default function Page() {
         : sfxItems,
     [sfxItems, disclaimerOffsetMs],
   );
+  /** v1.17: voiceover/dub placements shifted for the strip + export payload
+   *  (displaySfxItems parity — the placements live in base time). */
+  const displayVoItems = useMemo(
+    () =>
+      disclaimerOffsetMs > 0 && voItems.length
+        ? voItems.map((v) => ({ ...v, startMs: v.startMs + disclaimerOffsetMs }))
+        : voItems,
+    [voItems, disclaimerOffsetMs],
+  );
+  /** v1.17: DUB DUCK — while a dub track exists, the ORIGINAL clip audio
+   *  preview sits under it at dubSettings.originalVolume (music/SFX/VO are
+   *  NOT ducked). The export twin runs in the MAIN process (payload carries
+   *  raw volumes + dubOriginalVolume) so the two can never disagree. */
+  const dubDuck =
+    voItems.some((v) => v.kind === "dub")
+      ? Math.max(0, Math.min(1, dubSettings.originalVolume))
+      : 1;
   /** Headline items shifted for the strip + export payload. */
   const displayHeadlines = useMemo(
     () =>
@@ -771,6 +858,9 @@ export default function Page() {
     /** v5.0: multi-track edits + SFX placements + probed video durations. */
     itemEdits: Record<string, ItemEdit>;
     sfxItems: SfxItem[];
+    /** v1.17: voiceover/dub PLACEMENTS (audio bytes deliberately NOT — they
+     *  live in voBytesRef and regenerate on demand). */
+    voItems: VoiceoverItem[];
     videoDurations: Record<string, number>;
     /** v1.14: disclaimer / intro lead-in clip (null = none). */
     disclaimer: DisclaimerClip | null;
@@ -815,6 +905,7 @@ export default function Page() {
       watermarkSettings,
       itemEdits,
       sfxItems,
+      voItems,
       videoDurations,
       disclaimer,
     };
@@ -899,6 +990,9 @@ export default function Page() {
     // v5.0: restore the multi-track session (edits, SFX, video durations).
     setItemEdits(snap.itemEdits);
     setSfxItems(snap.sfxItems);
+    // v1.17: restore the voiceover placements (bytes are ref-level; the
+    // restored ids keep their cached bytes when still present).
+    setVoItems(snap.voItems);
     setVideoDurations(snap.videoDurations);
     // v1.14: restore the disclaimer lead-in.
     setDisclaimer(snap.disclaimer ?? null);
@@ -1166,6 +1260,295 @@ export default function Page() {
     void scheduleSfxFrom(currentMsRef.current);
   }, [isPlaying, sfxItems, scheduleSfxFrom, stopSfxSources, previewRate]);
 
+  // ---- v1.17 VOICEOVER preview audio ---------------------------------------
+  // Mirrors the SFX machinery (same lazy AudioContext — SHARED with SFX so
+  // the page owns ONE context; separate source set + buffer cache + schedule
+  // token). Bytes arrive at "Add to timeline" time (narration synthesis or
+  // the dub result) and are decoded EAGERLY so playback is instant; a
+  // playhead inside an unbuffered item (reopened project) skips with a
+  // console warn — the EXPORT regenerates it honestly.
+  const voBytesRef = useRef<Map<string, Blob>>(new Map());
+  const voAudioRef = useRef<{ buffers: Map<string, AudioBuffer> }>({
+    buffers: new Map(),
+  });
+  const voSourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+  /** Bumped on every (re)schedule — in-flight async schedules self-abort when
+   *  superseded (scrub bursts, rapid seeks). */
+  const voSchedTokenRef = useRef(0);
+
+  /** Decode (and cache) an item's bytes — null when absent/undecodable. */
+  const getVoBuffer = useCallback(
+    async (id: string, force = false): Promise<AudioBuffer | null> => {
+      if (!force && voAudioRef.current.buffers.has(id)) {
+        return voAudioRef.current.buffers.get(id) ?? null;
+      }
+      const blob = voBytesRef.current.get(id);
+      if (!blob) return null;
+      const ctx = getSfxAudioContext();
+      if (!ctx) return null;
+      try {
+        const ab = await blob.arrayBuffer();
+        const buf = await ctx.decodeAudioData(ab);
+        voAudioRef.current.buffers.set(id, buf);
+        return buf;
+      } catch {
+        return null; // undecodable bytes — the export regenerates them
+      }
+    },
+    [getSfxAudioContext],
+  );
+
+  /** Store freshly synthesized/delivered bytes + decode them now. */
+  const storeVoBytes = useCallback(
+    (id: string, bytes: ArrayBuffer | Blob) => {
+      const blob =
+        bytes instanceof Blob ? bytes : new Blob([bytes], { type: "audio/mpeg" });
+      voBytesRef.current.set(id, blob);
+      void getVoBuffer(id, true);
+    },
+    [getVoBuffer],
+  );
+
+  const stopVoSources = useCallback(() => {
+    voSchedTokenRef.current += 1; // invalidate in-flight schedules
+    for (const src of voSourcesRef.current) {
+      try {
+        src.onended = null;
+        src.stop();
+      } catch {
+        /* already ended */
+      }
+      try {
+        src.disconnect();
+      } catch {
+        /* already disconnected */
+      }
+    }
+    voSourcesRef.current.clear();
+  }, []);
+
+  const scheduleVoFrom = useCallback(
+    async (fromMs: number) => {
+      stopVoSources();
+      const ctx = getSfxAudioContext();
+      if (!ctx) return; // no Web Audio (SSR/Node) — silent no-op
+      if (ctx.state === "suspended") ctx.resume().catch(() => {});
+      const items = stateRef.current?.voItems ?? [];
+      if (items.length === 0) return;
+      // v1.14: display→base (VO placements live in base time).
+      const baseFromMs = Math.max(0, fromMs - disclaimerOffsetRef.current);
+      const token = voSchedTokenRef.current;
+      const baseTime = ctx.currentTime;
+      const rate = previewRateRef.current || 1;
+      const masterVol =
+        audioSettings.masterVolume != null &&
+        Number.isFinite(audioSettings.masterVolume)
+          ? Math.max(0, Math.min(2, audioSettings.masterVolume))
+          : 1;
+      for (const item of items) {
+        const elapsedMs = baseFromMs - item.startMs;
+        if (elapsedMs >= item.durationMs) continue; // fully passed
+        // Long clips (narration/dub) resume MID-ITEM on seek — unlike the
+        // short SFX pills, skipping a half-played VO would mute minutes.
+        const buf =
+          voAudioRef.current.buffers.get(item.id) ?? (await getVoBuffer(item.id));
+        if (token !== voSchedTokenRef.current) return; // superseded
+        if (!buf) {
+          console.warn(
+            `[framefuse] Voiceover "${item.label}" has no audio in this session — it regenerates at export.`,
+          );
+          continue;
+        }
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        // v1.4: shuttle — VO sources play at the preview rate (buffer-time
+        // elapsed equals timeline-time elapsed, so the offset math is plain).
+        src.playbackRate.value = rate;
+        const gain = ctx.createGain();
+        gain.gain.value = Math.max(0, Math.min(1, item.volume * masterVol));
+        src.connect(gain);
+        gain.connect(ctx.destination);
+        try {
+          const delaySec = elapsedMs < 0 ? Math.max(0, -elapsedMs / 1000 / rate) : 0;
+          const offsetSec = Math.max(0, Math.min(elapsedMs / 1000, Math.max(0, buf.duration - 0.01)));
+          src.start(baseTime + delaySec, offsetSec);
+          voSourcesRef.current.add(src);
+          src.onended = () => {
+            voSourcesRef.current.delete(src);
+          };
+        } catch {
+          /* start threw (past time) — skip this placement */
+        }
+      }
+    },
+    [getSfxAudioContext, getVoBuffer, stopVoSources, audioSettings.masterVolume],
+  );
+
+  // VO scheduling mirrors the SFX effect: reschedule on play / list change /
+  // rate change; stop everything when paused.
+  useEffect(() => {
+    if (!isPlaying) {
+      stopVoSources();
+      return;
+    }
+    void scheduleVoFrom(currentMsRef.current);
+  }, [isPlaying, voItems, scheduleVoFrom, stopVoSources, previewRate]);
+
+  // ---- v1.17 VOICEOVER creation (Edge TTS runs in the MAIN process) -------
+  /** Freshly synthesized narration (from the Audio tab's Voiceover card) →
+   *  ONE placement at the playhead, in BASE time. */
+  const handleAddVoiceover = useCallback(
+    (r: {
+      text: string;
+      voice: string;
+      ratePct?: number;
+      pitchHz?: number;
+      volume: number;
+      durationMs: number;
+      bytes: ArrayBuffer;
+    }) => {
+      const baseMs = Math.max(0, currentMsRef.current - disclaimerOffsetRef.current);
+      const item = makeVoiceoverItem({
+        kind: "narration",
+        startMs: baseMs,
+        durationMs: r.durationMs,
+        volume: r.volume,
+        text: r.text,
+        voice: r.voice,
+        ratePct: r.ratePct,
+        pitchHz: r.pitchHz,
+      });
+      setVoItems((prev) => [...prev, item]);
+      storeVoBytes(item.id, r.bytes);
+      toast.success("Voiceover added", {
+        description: `${(r.durationMs / 1000).toFixed(1)}s at ${fmtTimecode(baseMs)}`,
+      });
+    },
+    [storeVoBytes],
+  );
+
+  // ---- v1.17 TRANSLATE & DUB (Groq Whisper → LLM → Edge TTS) — HMR probe ---
+  const [dubBusy, setDubBusy] = useState(false);
+  const [dubProgress, setDubProgress] = useState<{
+    phase: string;
+    progress: number;
+    status: string;
+  } | null>(null);
+  const [dubResult, setDubResult] = useState<DubTrackResult | null>(null);
+
+  // Progress events from the main process (same channel pattern as whisper).
+  useEffect(() => {
+    if (!inElectron) return;
+    const api = window.electronAPI;
+    if (typeof api?.onDubProgress !== "function") return;
+    return api.onDubProgress((d) => setDubProgress(d));
+  }, [inElectron]);
+
+  /** Base-lane LOCAL video files → the dub source list (audio is extracted
+   *  on the main side from these paths). NOTE v1: trimIn/speed are ignored —
+   *  the full source audio of each clip is transcribed and mapped onto its
+   *  timeline window (accurate for whole-clip edits, the common dub case). */
+  const dubSources = useMemo(
+    () =>
+      timeline.segments
+        .filter(
+          (s) =>
+            s.mediaType === "video" && (s.track ?? 0) === 0 && s.file != null,
+        )
+        .map((s) => ({
+          videoPath: nativeSourcePath(s.file) ?? "",
+          startMs: s.startMs,
+          endMs: s.endMs,
+        }))
+        .filter((s) => s.videoPath.length > 0),
+    [timeline.segments],
+  );
+
+  const startDub = useCallback(async () => {
+    if (dubBusy) return;
+    const api = window.electronAPI;
+    if (!api || typeof api.dubStart !== "function") {
+      toast.error("Dubbing runs in the FrameFuse desktop app");
+      return;
+    }
+    if (dubSources.length === 0) {
+      toast.error("No local video clips on the timeline to dub", {
+        description: "Import a video from disk (not a restored project) first.",
+      });
+      return;
+    }
+    setDubBusy(true);
+    setDubProgress({ phase: "prepare", progress: 0, status: "Starting…" });
+    setDubResult(null);
+    try {
+      const result = await api.dubStart({
+        segments: dubSources,
+        sourceLanguage: "auto",
+        targetLanguage: dubSettings.targetLanguage,
+        targetLocale: dubSettings.targetLocale,
+        groqModel: dubSettings.groqModel,
+        femaleVoice: dubSettings.femaleVoice || undefined,
+        maleVoice: dubSettings.maleVoice || undefined,
+      });
+      setDubResult(result);
+      toast.success("Dub track ready", {
+        description: `${result.segments.length} segments · ${result.speakers.length} speaker${
+          result.speakers.length === 1 ? "" : "s"
+        } — review it, then add it to the timeline.`,
+      });
+    } catch (err) {
+      toast.error("Dubbing failed", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setDubBusy(false);
+      setDubProgress(null);
+    }
+  }, [dubBusy, dubSources, dubSettings]);
+
+  const cancelDub = useCallback(async () => {
+    const api = window.electronAPI;
+    if (typeof api?.dubCancel !== "function") return;
+    try {
+      await api.dubCancel();
+    } catch {
+      /* no active run */
+    }
+  }, []);
+
+  /** Dub result → VO placements (kind "dub"). Applying a new track
+   *  REPLACES the previous dub lane (narration items are untouched); the
+   *  duck follows automatically because a dub item exists. */
+  const applyDubTrack = useCallback(() => {
+    if (!dubResult) return;
+    const items = dubResult.segments.map((s) =>
+      makeVoiceoverItem({
+        kind: "dub",
+        startMs: s.startMs,
+        endMs: s.endMs,
+        durationMs: s.ttsDurMs,
+        volume: 1,
+        text: s.translatedText,
+        voice: dubResult.speakers[s.speaker]?.voice ?? "",
+        speaker: s.speaker,
+        label: `S${(s.speaker ?? 0) + 1} · ${s.translatedText.slice(0, 24)}`,
+      }),
+    );
+    setVoItems((prev) => [...prev.filter((v) => v.kind !== "dub"), ...items]);
+    dubResult.segments.forEach((s, i) => {
+      if (s.bytes && items[i]) storeVoBytes(items[i].id, s.bytes);
+    });
+    setDubResult(null);
+    toast.success("Dub track added to the timeline", {
+      description: `${items.length} segments — original audio is ducked under it (Audio tab).`,
+    });
+  }, [dubResult, storeVoBytes]);
+
+  const handleDubSettingsChange = useCallback((next: DubSettings) => {
+    setDubSettings(next);
+    saveDubSettings(next);
+  }, []);
+
   // ---- Playback rAF loop --------------------------------------------------
   /**
    * v5.2: background music is now a first-class timeline citizen — map the
@@ -1336,6 +1719,77 @@ export default function Page() {
       imageUrls[DISCLAIMER_ID] = disclaimer.url;
     }
     try {
+      // v1.17 Stack Text: measure the headline line/word geometry at the
+      // EXPORT resolution (same resolveDimensions the native payload uses)
+      // so the kinetic ASS emitter wraps exactly like the canvas preview.
+      const exportDims = resolveDimensions(settings.aspect, settings.resolution);
+      const headlineGeometry = measureHeadlinesForExport(
+        displayHeadlines,
+        exportDims.w,
+        exportDims.h,
+      );
+      // v1.17 VOICEOVER/DUB export resolution: every placement must have
+      // BYTES (they never persist — reopened projects regenerate here via
+      // ttsSynthesize), then each blob uploads through saveTempAudio as
+      // vo_<id>.mp3/.wav. The main process mixes them as amix branches.
+      // dubOriginalVolume rides along RAW — the MAIN process applies the
+      // duck (single source of truth; the preview applies its own).
+      let voiceoverPayload:
+        | { wavPath: string; startMs: number; volume: number }[]
+        | undefined = undefined;
+      const hasDubTrack = displayVoItems.some((v) => v.kind === "dub");
+      if (displayVoItems.length > 0) {
+        const api = window.electronAPI;
+        if (
+          !api?.saveTempAudio ||
+          typeof window.electronAPI?.ttsSynthesize !== "function"
+        ) {
+          throw new Error(
+            "Voiceover export runs in the FrameFuse desktop app — save the project and export from the installed app.",
+          );
+        }
+        const missing = displayVoItems.filter(
+          (v) => !voBytesRef.current.has(v.id) && v.text && v.voice,
+        );
+        if (missing.length > 0) {
+          toast.info("Regenerating voiceovers…", {
+            description: `Synthesizing ${missing.length} placement${
+              missing.length === 1 ? "" : "s"
+            } — project files store text, not audio.`,
+          });
+          let done = 0;
+          for (const item of missing) {
+            const synth = await window.electronAPI!.ttsSynthesize!({
+              text: item.text,
+              voice: item.voice,
+              ratePct: item.ratePct,
+              pitchHz: item.pitchHz,
+            });
+            storeVoBytes(item.id, synth.bytes);
+            done += 1;
+          }
+        }
+        const uploads: { wavPath: string; startMs: number; volume: number }[] = [];
+        for (const item of displayVoItems) {
+          const blob = voBytesRef.current.get(item.id);
+          if (!blob) {
+            throw new Error(
+              `Voiceover "${item.label}" has no audio in this session and could not be regenerated — re-add it from the Audio tab.`,
+            );
+          }
+          const bytes = await blob.arrayBuffer();
+          const wavPath = await window.electronAPI!.saveTempAudio({
+            name: `vo_${item.id}.${item.kind === "dub" ? "wav" : "mp3"}`,
+            bytes,
+          });
+          uploads.push({
+            wavPath,
+            startMs: item.startMs,
+            volume: item.volume,
+          });
+        }
+        voiceoverPayload = uploads;
+      }
       const res = await exportNative({
         segments: exportSegments,
         imageUrls,
@@ -1353,6 +1807,9 @@ export default function Page() {
         subtitles: displaySubtitles,
         captionSettings,
         headlines: displayHeadlines.length ? displayHeadlines : null,
+        // v1.17 Stack Text: renderer-measured geometry (empty for
+        // legacy-only exports — main falls back to the legacy emitter).
+        headlineGeometry: headlineGeometry.length ? headlineGeometry : null,
         transition: transitionSettings,
         watermark: watermarkImage
           ? { imageUrl: watermarkImage.url, settings: watermarkSettings }
@@ -1362,6 +1819,11 @@ export default function Page() {
         // when empty so v4.9-shaped projects keep the byte-identical IPC.
         // v1.14: the shifted placements keep every SFX locked to the audio.
         sfx: displaySfxItems.length > 0 ? displaySfxItems : undefined,
+        // v1.17: voiceover/dub placements (bytes regenerated + uploaded
+        // above; the main process mixes each as an amix branch). The duck
+        // factor rides along raw — MAIN scales the base segment volumes.
+        voiceovers: voiceoverPayload,
+        dubOriginalVolume: hasDubTrack ? dubDuck : undefined,
         // v1.15: burn-in text removal (default OFF — the main process
         // sanitizes it into a no-op when disabled/empty).
         textRemoval,
@@ -1371,12 +1833,9 @@ export default function Page() {
       setLastExport({
         path: res.path,
         size: res.size,
-        // v1.15.1 GPU-Shift: the result now states its own method —
-        // "WebCodecs GPU" (the opt-in GPU engine) or "Native FFmpeg".
         method: res.method || "Native FFmpeg",
         at: Date.now(),
-        // v1.15.1 GPU-Shift telemetry — which engine ran + the per-frame
-        // GPU render cost (the A/B pair for the engine toggle).
+        // Engine + per-frame telemetry (carried for the LastExport tooltip).
         engine: res.engine,
         framesEncoded: res.framesEncoded,
         gpuFrameRenderMs: res.gpuFrameRenderMs,
@@ -1442,39 +1901,6 @@ export default function Page() {
       // export time + encoder + stream-copy count — so a fast export is
       // visible and a slow one is diagnosable at a glance.
       const turboBits: string[] = [];
-      // v1.15.1 GPU-Shift: when the WebCodecs engine ran, the toast leads
-      // with the engine + the GPU frame telemetry (the A/B proof).
-      if (res.engine === "webcodecs-gpu") {
-        // v1.15.3 lie detector: state the encoder TRUTH in the toast lead —
-        // require-hardware = proven GPU ASIC; anything else = software (and
-        // why). A "WebCodecs is slow" report must be diagnosable at a glance.
-        const hwBit =
-          res.hwEncoder === "require-hardware"
-            ? " · hardware encoder (verified)"
-            : res.hwEncoder === "prefer-hardware"
-              ? " · hardware (unverified)"
-              : res.hwEncoder
-                ? ` · SOFTWARE encoder${res.hwRejectReason ? " (hw rejected)" : ""}`
-                : "";
-        turboBits.push(
-          `GPU engine (WebCodecs${res.softwareFallback ? " · software rung after GPU stall" : ""})` +
-            hwBit +
-            (res.workerRuntime ? ` · ${res.workerRuntime === "worker" ? "worker" : "main thread"}` : "") +
-            (res.framesEncoded != null ? ` · ${res.framesEncoded} frames` : "") +
-            (res.gpuFrameRenderMs != null ? ` · ${res.gpuFrameRenderMs} ms/frame GPU render` : "") +
-            // v1.15.2: the pure-JS compositor cost — the number that decides
-            // whether the v1.16 GLSL/WebGPU shader migration pays.
-            (res.jsCompositorOverheadMs != null
-              ? ` · ${res.jsCompositorOverheadMs} ms/frame JS compositor`
-              : ""),
-        );
-        if (res.audioSkipped) {
-          toast.info("Exported without audio", {
-            description:
-              "This runtime cannot AAC-encode (Web Audio + AudioEncoder) — the GPU export completed video-only. The FFmpeg engine (toggle off) keeps audio.",
-          });
-        }
-      }
       if (res.elapsedSec != null && res.elapsedSec >= 1) {
         turboBits.push(
           res.elapsedSec < 60
@@ -3616,6 +4042,45 @@ const handleRandomTransitionMix = useCallback(() => {
     [requestHistoryPush],
   );
 
+  // ---- v1.17: VOICEOVER lane edits (drag / Alt+click — SFX parity) -------
+  const handleMoveVo = useCallback(
+    (id: string, startMs: number) => {
+      requestHistoryPush();
+      const off = disclaimerOffsetRef.current;
+      setVoItems((prev) =>
+        prev.map((v) =>
+          v.id === id
+            ? {
+                ...v,
+                startMs: Math.max(
+                  0,
+                  Math.min(
+                    Math.max(0, startMs - off),
+                    Math.max(0, totalMsRef.current - off),
+                  ),
+                ),
+              }
+            : v,
+        ),
+      );
+    },
+    [requestHistoryPush],
+  );
+
+  const handleRemoveVo = useCallback(
+    (id: string) => {
+      requestHistoryPush();
+      setVoItems((prev) => prev.filter((v) => v.id !== id));
+      try {
+        voBytesRef.current.delete(id);
+        voAudioRef.current.buffers.delete(id);
+      } catch {
+        /* cache cleanup is best-effort */
+      }
+    },
+    [requestHistoryPush],
+  );
+
   /**
    * v5.1: build the self-contained project document — the EXACT v5.0
    * serialization, shared by the browser download flow and the native
@@ -3657,6 +4122,9 @@ const handleRandomTransitionMix = useCallback(() => {
       // v5.0: multi-track session — edits, SFX placements, video durations.
       itemEdits,
       sfxItems,
+      // v1.17: voiceover/dub placements — the doc carries TEXT + voice +
+      // timing (bytes never persist; export regenerates them via TTS).
+      voiceovers: voItems,
       videoDurations,
       // v1.14: disclaimer / intro lead-in card (any filename).
       disclaimer: disclaimer
@@ -3692,6 +4160,7 @@ const handleRandomTransitionMix = useCallback(() => {
     watermarkSettings,
     itemEdits,
     sfxItems,
+    voItems,
     videoDurations,
     disclaimer,
   ]);
@@ -3823,6 +4292,9 @@ const handleRandomTransitionMix = useCallback(() => {
             : {},
         );
         setSfxItems(Array.isArray(project.sfxItems) ? project.sfxItems : []);
+        // v1.17: voiceover/dub placements — text+voice+timing ride the doc;
+        // the audio itself regenerates (lazily at export / on demand).
+        setVoItems(Array.isArray(project.voiceovers) ? project.voiceovers : []);
         setVideoDurations(
           project.videoDurations && typeof project.videoDurations === "object"
             ? project.videoDurations
@@ -4000,6 +4472,7 @@ const handleRandomTransitionMix = useCallback(() => {
       subtitles != null ||
       headlineItems.length > 0 ||
       sfxItems.length > 0 ||
+      voItems.length > 0 ||
       disclaimer != null;
     if (
       hasSession &&
@@ -4018,6 +4491,13 @@ const handleRandomTransitionMix = useCallback(() => {
     setAudioTrack(null);
     setItemEdits({});
     setSfxItems([]);
+    setVoItems([]);
+    try {
+      voBytesRef.current.clear();
+      voAudioRef.current.buffers.clear();
+    } catch {
+      /* best-effort cache clear */
+    }
     setVideoDurations({});
     // v1.14: drop the disclaimer lead-in too.
     setDisclaimer(null);
@@ -4431,15 +4911,6 @@ const handleRandomTransitionMix = useCallback(() => {
     }
   }, [timelineBig, layout]);
 
-  const debug = {
-    imageCount: timeline.segments.length,
-    mode: timeline.mode,
-    totalMs: timeline.totalMs,
-    currentMs,
-    activeSegment: activeSegment?.fileName ?? null,
-    inElectron,
-  };
-
   // v1.14.2: DESKTOP-ONLY GATE — a browser session (no Electron shell, no
   // dev preview bypass) shows the Windows-app landing page instead of the
   // studio. Placed AFTER every hook so the component's hook order is stable
@@ -4716,6 +5187,7 @@ const handleRandomTransitionMix = useCallback(() => {
                 applyItemEdit(segId, { overlay: t });
               }}
               masterVolume={audioSettings.masterVolume ?? 1}
+              dubDuck={dubDuck}
               previewRate={previewRate}
               onPreviewRateChange={setPreviewRate}
               // ---- v1.11 welcome hero (empty-canvas quick starts) ----
@@ -4777,6 +5249,9 @@ const handleRandomTransitionMix = useCallback(() => {
             onMoveSfx={handleMoveSfx}
             onEditSfx={handleUpdateSfx}
             onRemoveSfx={handleRemoveSfx}
+            voItems={displayVoItems}
+            onMoveVo={handleMoveVo}
+            onRemoveVo={handleRemoveVo}
             videoDurations={videoDurations}
             onSplit={splitAtPlayhead}
             onDuplicate={duplicateItem}
@@ -4945,7 +5420,18 @@ const handleRandomTransitionMix = useCallback(() => {
             videoSourceForDetect={videoSourceForDetect}
             onRandomMix={handleRandomTransitionMix}
             boundaryCount={boundaryCount}
-            debug={debug}
+            dubSettings={dubSettings}
+            onDubSettingsChange={handleDubSettingsChange}
+            onAddVoiceover={handleAddVoiceover}
+            dubSourceCount={dubSources.length}
+            dubBusy={dubBusy}
+            dubProgress={dubProgress}
+            dubResult={dubResult}
+            onStartDub={() => void startDub()}
+            onCancelDub={() => void cancelDub()}
+            onApplyDubTrack={applyDubTrack}
+            onDiscardDub={() => setDubResult(null)}
+            voCount={displayVoItems.length}
           />
           </div>
         </section>

@@ -1,0 +1,1194 @@
+// electron/edge-tts.js — Microsoft Edge neural TTS engine (the free
+// "Read Aloud" service) for in-editor voiceovers and multi-language video
+// dubbing (electron/dub-workflow.js consumes this module).
+//
+// v1.16 — FrameFuse needs neural voices without a cloud API key or a
+// bundled TTS runtime. Edge's Read Aloud endpoint serves the same voices
+// as the Edge browser's narrator over an undocumented protocol that was
+// reverse-engineered by the community (see github.com/rany2/edge-tts).
+// It is free and keyless, but uncontracted — it can change or throttle at
+// any time, so every failure path degrades cleanly here (built-in
+// FALLBACK_VOICES catalog, descriptive errors, one bounded retry).
+//
+// PROTOCOL SUMMARY
+//   1. DRM token "Sec-MS-GEC" (required since Nov 2024):
+//        ticks  = (Unix seconds + 11644473600) * 1e7   → 100-ns units since
+//                 the Windows epoch 1601-01-01, rounded DOWN to a 5-minute
+//                 window;
+//        token  = UPPERCASE HEX( SHA-256( decimal(ticks) + CLIENT_TOKEN ) )
+//      The value flips every 5 minutes — it is regenerated per connection
+//      attempt, never cached.
+//   2. Voice list: plain HTTPS GET
+//        /consumer/speech/synthesize/readaloud/voices/list?trustedclienttoken=…
+//      with Sec-MS-GEC + Sec-MS-GEC-Version + a real Edge User-Agent + the
+//      Read Aloud extension Origin. The body is a JSON array of voice
+//      descriptors. When the fetch fails (offline / 403 / timeout) the
+//      built-in FALLBACK_VOICES catalog is served instead.
+//   3. Synthesis: a WebSocket session (RFC 6455) to
+//        wss://speech.platform.bing.com/consumer/speech/synthesize/
+//             readaloud/edge/v1?TrustedClientToken=…&Sec-MS-GEC=…&
+//             Sec-MS-GEC-Version=…&ConnectionId=<32-hex>
+//      The packaged app runs Electron 33 (Node 20.18), which does NOT
+//      expose a global WebSocket — so the client is implemented RAW on
+//      tls.connect(): an HTTP/1.1 "Upgrade: websocket" handshake, then
+//      manual RFC-6455 framing (masked client text frames out; unmasked
+//      server text/binary frames in; minimal fragmentation + ping/pong).
+//   4. After the 101, exactly two masked TEXT messages are sent:
+//        Path:speech.config — output format + boundary metadata options
+//        Path:ssml          — the utterance (XML-escaped, prosody-wrapped)
+//   5. The server answers with binary frames of the shape
+//        [uint16 BE header length][ASCII header\r\n][payload]
+//      where Path:audio frames carry raw MP3 (audio-24khz-48kbitrate-
+//      mono-mp3) and Path:audio.metadata carries word-boundary JSON
+//      (ignored here — dub-workflow uses ffmpeg for timing). TEXT frames
+//      drive the session: Path:turn.end = done; Path:response may carry a
+//      403-style service error; Path:notification / turn.start are noise.
+//      The MP3 chunks are concatenated and returned (or written to
+//      o.outFile).
+//
+// Robustness rules (see the task contract with dub-workflow.js):
+//   • 25 s overall timeout per attempt (socket destroyed, promise rejected);
+//     ONE full retry with a freshly generated Sec-MS-GEC + ConnectionId on
+//     403-ish failures or handshake stalls.
+//   • 403 at the upgrade also teaches the module the server clock (from the
+//     response Date header) — the token window is validated server-side, so
+//     a wrong LOCAL clock otherwise means permanent 403s.
+//   • The service VERSION-GATES the client: the User-Agent must claim a
+//     current Edge build (see CHROMIUM_FULL_VERSION below — bumped from the
+//     historical 131 after the live service started 403-ing it).
+//   • Max 3000 characters of text per call (callers must chunk longer
+//     scripts); max 3 concurrent syntheses — extra callers queue FIFO.
+//   • o.abortRef = { abort: null } is populated with a cancel function
+//     (same pattern as groq-whisper.js) and works while queued, too.
+//
+// Zero npm dependencies (Node built-ins only), zero Electron imports —
+// smoke-testable directly:
+//   node -e "require('./electron/edge-tts').listVoices().then(v => …)"
+
+"use strict";
+
+const fs = require("fs");
+const path = require("path");
+const https = require("https");
+const tls = require("tls");
+const crypto = require("crypto");
+
+const SPEECH_HOST = "speech.platform.bing.com";
+const TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
+// GOTCHA (verified 2026-10): the service gates on the CLIENT EDGE VERSION —
+// an Edg/131-era User-Agent gets HTTP 403 at the WSS upgrade even with a
+// perfectly valid Sec-MS-GEC token, while Edg/143 is accepted. The original
+// reverse-engineered pair ("1-131.0.2903.112" + Edg/131) has aged out.
+// Both constants below therefore mirror the CURRENT reference client
+// (github.com/rany2/edge-tts, Chromium 143.0.3650.75) and must be bumped
+// TOGETHER if the service ever ratchets again.
+const CHROMIUM_FULL_VERSION = "143.0.3650.75";
+const CHROMIUM_MAJOR_VERSION = CHROMIUM_FULL_VERSION.split(".")[0];
+const SEC_MS_GEC_VERSION = `1-${CHROMIUM_FULL_VERSION}`;
+const EDGE_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  `(KHTML, like Gecko) Chrome/${CHROMIUM_MAJOR_VERSION}.0.0.0 Safari/537.36 ` +
+  `Edg/${CHROMIUM_MAJOR_VERSION}.0.0.0`;
+/** Origin of the Edge "Read Aloud" extension the service expects. */
+const EXTENSION_ORIGIN = "chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold";
+
+const VOICES_PATH = "/consumer/speech/synthesize/readaloud/voices/list";
+const WSS_PATH = "/consumer/speech/synthesize/readaloud/edge/v1";
+const OUTPUT_FORMAT = "audio-24khz-48kbitrate-mono-mp3";
+
+/** The service caps one synthesis request; longer scripts must be chunked
+ *  by the caller (dub-workflow.js splits on sentence boundaries). */
+const MAX_TEXT_LEN = 3000;
+const VOICES_TIMEOUT_MS = 15000;
+const SYNTH_TIMEOUT_MS = 25000;
+const HANDSHAKE_TIMEOUT_MS = 10000;
+/** In-flight cap — extra synthesize() callers wait in a FIFO queue. */
+const MAX_CONCURRENT_SYNTH = 3;
+/** Sanity guards for the raw frame parser (service frames are ~KB sized). */
+const MAX_WS_FRAME_BYTES = 16 * 1024 * 1024;
+const MAX_AUDIO_BYTES = 64 * 1024 * 1024;
+/** After a failed network fetch, wait this long before trying again. */
+const VOICE_FETCH_COOLDOWN_MS = 60000;
+
+// Prosody sanity clamps (the service clamps server-side too — these just
+// keep callers from shooting themselves in the foot silently far range).
+const RATE_RANGE = [-95, 300]; // %
+const PITCH_RANGE = [-200, 200]; // Hz
+const VOLUME_RANGE = [-100, 100]; // %
+
+// ---------------------------------------------------------------------------
+// DRM token (Sec-MS-GEC)
+// ---------------------------------------------------------------------------
+
+const WIN_EPOCH_SECONDS = 11644473600n; // 1601-01-01 → 1970-01-01
+const FIVE_MINUTES_IN_100NS = 300n * 10000000n;
+
+// Clock skew learned from a 403 response's Date header. The token window is
+// validated against the SERVER's clock — a wrong local system clock (dead
+// CMOS battery, VM snapshot) is the classic all-403s failure mode.
+let clockSkewMs = 0;
+
+/** Parse an RFC-1123 "Date:" header from an HTTP response head and
+ *  (re)learn the server-vs-local clock skew. Clamped to ±24 h sanity. */
+function learnClockSkewFromResponseHead(responseHead) {
+  const m = /^Date:\s*(.+)$/im.exec(responseHead);
+  if (!m) return;
+  const serverMs = Date.parse(m[1].trim());
+  if (!Number.isFinite(serverMs)) return;
+  const skew = serverMs - Date.now();
+  if (Math.abs(skew) <= 24 * 3600 * 1000) clockSkewMs = skew;
+}
+
+/** Generate the Sec-MS-GEC DRM token for RIGHT NOW (rounded down to the
+ *  5-minute window, so it stays stable for a few minutes, then flips).
+ *  Regenerated on every connection attempt — never cached.
+ *  @returns {string} 64 uppercase hex chars. */
+function generateSecMsgEC() {
+  const unixSeconds = BigInt(Math.floor((Date.now() + clockSkewMs) / 1000));
+  let ticks = (unixSeconds + WIN_EPOCH_SECONDS) * 10000000n; // 100-ns units
+  ticks -= ticks % FIVE_MINUTES_IN_100NS; // round DOWN to the window
+  return crypto
+    .createHash("sha256")
+    .update(ticks.toString() + TRUSTED_CLIENT_TOKEN, "utf8")
+    .digest("hex")
+    .toUpperCase();
+}
+
+// ---------------------------------------------------------------------------
+// Voice catalog — live fetch with a session cache + built-in fallback
+// ---------------------------------------------------------------------------
+
+/** Normalize one raw voice descriptor from the service (or the fallback
+ *  table) into FrameFuse's shape.
+ *  @returns {{shortName:string, gender:"Female"|"Male", locale:string,
+ *             friendlyName:string, displayName:string}|null} */
+function normalizeVoice(v) {
+  if (!v || typeof v !== "object") return null;
+  const shortName = typeof v.ShortName === "string" ? v.ShortName.trim() : "";
+  if (!shortName) return null;
+  const locale =
+    typeof v.Locale === "string" && v.Locale ? v.Locale : localeFromVoice(shortName);
+  const gender = v.Gender === "Male" ? "Male" : "Female";
+  // The live list gives "Microsoft Madhur Online (Natural) - Hindi (India)";
+  // strip the marketing wrapper when present, otherwise derive from the
+  // short name ("hi-IN-MadhurNeural" → "Madhur").
+  let friendlyName = "";
+  if (typeof v.FriendlyName === "string") {
+    const m = /^Microsoft\s+(.+?)\s+Online\b/.exec(v.FriendlyName);
+    if (m) friendlyName = m[1].trim();
+  }
+  if (!friendlyName) {
+    const tail = shortName.split("-").slice(2).join("-").replace(/Neural$/, "");
+    friendlyName = tail || shortName;
+  }
+  return {
+    shortName,
+    gender,
+    locale,
+    friendlyName,
+    displayName: `${friendlyName} (${locale}, ${gender})`,
+  };
+}
+
+/** Build a fallback-catalog entry directly. */
+function fallbackVoice(shortName, gender, friendlyName) {
+  return normalizeVoice({
+    ShortName: shortName,
+    Gender: gender,
+    Locale: shortName.split("-").slice(0, 2).join("-"),
+    FriendlyName: friendlyName,
+  });
+}
+
+/** Built-in catalog used when the voice-list endpoint is unreachable
+ *  (offline installs, service hiccups). Real published Read Aloud voices,
+ *  female + male pairs per locale (en-US gets a spare pair). Order matters:
+ *  the first female / first male of a locale become voicePairsByLocale()
+ *  picks. */
+const FALLBACK_VOICES = [
+  // Hindi (India) — the dubbing default locale.
+  fallbackVoice("hi-IN-SwaraNeural", "Female", "Swara"),
+  fallbackVoice("hi-IN-MadhurNeural", "Male", "Madhur"),
+  // English (United States)
+  fallbackVoice("en-US-AriaNeural", "Female", "Aria"),
+  fallbackVoice("en-US-GuyNeural", "Male", "Guy"),
+  fallbackVoice("en-US-JennyNeural", "Female", "Jenny"),
+  fallbackVoice("en-US-ChristopherNeural", "Male", "Christopher"),
+  // English (India)
+  fallbackVoice("en-IN-NeerjaNeural", "Female", "Neerja"),
+  fallbackVoice("en-IN-PrabhatNeural", "Male", "Prabhat"),
+  // English (United Kingdom)
+  fallbackVoice("en-GB-SoniaNeural", "Female", "Sonia"),
+  fallbackVoice("en-GB-RyanNeural", "Male", "Ryan"),
+  // Urdu (Pakistan)
+  fallbackVoice("ur-PK-UzmaNeural", "Female", "Uzma"),
+  fallbackVoice("ur-PK-AsadNeural", "Male", "Asad"),
+  // Arabic (Saudi Arabia)
+  fallbackVoice("ar-SA-ZariyahNeural", "Female", "Zariyah"),
+  fallbackVoice("ar-SA-HamedNeural", "Male", "Hamed"),
+  // Bengali (India)
+  fallbackVoice("bn-IN-TanishaaNeural", "Female", "Tanishaa"),
+  fallbackVoice("bn-IN-BashkarNeural", "Male", "Bashkar"),
+  // Spanish (Spain)
+  fallbackVoice("es-ES-ElviraNeural", "Female", "Elvira"),
+  fallbackVoice("es-ES-AlvaroNeural", "Male", "Álvaro"),
+  // French (France)
+  fallbackVoice("fr-FR-DeniseNeural", "Female", "Denise"),
+  fallbackVoice("fr-FR-HenriNeural", "Male", "Henri"),
+  // German (Germany)
+  fallbackVoice("de-DE-KatjaNeural", "Female", "Katja"),
+  fallbackVoice("de-DE-ConradNeural", "Male", "Conrad"),
+  // Portuguese (Brazil)
+  fallbackVoice("pt-BR-FranciscaNeural", "Female", "Francisca"),
+  fallbackVoice("pt-BR-AntonioNeural", "Male", "Antônio"),
+  // Russian (Russia)
+  fallbackVoice("ru-RU-SvetlanaNeural", "Female", "Svetlana"),
+  fallbackVoice("ru-RU-DmitryNeural", "Male", "Dmitry"),
+  // Chinese (Mandarin, Simplified)
+  fallbackVoice("zh-CN-XiaoxiaoNeural", "Female", "Xiaoxiao"),
+  fallbackVoice("zh-CN-YunxiNeural", "Male", "Yunxi"),
+  // Japanese (Japan)
+  fallbackVoice("ja-JP-NanamiNeural", "Female", "Nanami"),
+  fallbackVoice("ja-JP-KeitaNeural", "Male", "Keita"),
+  // Indonesian (Indonesia)
+  fallbackVoice("id-ID-GadisNeural", "Female", "Gadis"),
+  fallbackVoice("id-ID-ArdiNeural", "Male", "Ardi"),
+  // Tamil (India)
+  fallbackVoice("ta-IN-PallaviNeural", "Female", "Pallavi"),
+  fallbackVoice("ta-IN-ValluvarNeural", "Male", "Valluvar"),
+  // Telugu (India)
+  fallbackVoice("te-IN-ShrutiNeural", "Female", "Shruti"),
+  fallbackVoice("te-IN-MohanNeural", "Male", "Mohan"),
+  // Marathi (India)
+  fallbackVoice("mr-IN-AarohiNeural", "Female", "Aarohi"),
+  fallbackVoice("mr-IN-ManoharNeural", "Male", "Manohar"),
+  // Turkish (Turkey)
+  fallbackVoice("tr-TR-EmelNeural", "Female", "Emel"),
+  fallbackVoice("tr-TR-AhmetNeural", "Male", "Ahmet"),
+];
+
+let voicesCache = null; // successful live fetch — kept for the session
+let voicesPromise = null; // in-flight dedup for concurrent listVoices() calls
+let voicesFailedAt = 0; // last network failure (drives the retry cooldown)
+
+/** One HTTPS voice-list request. Rejects on any failure (status, network,
+ *  parse, 15 s timeout, >8 MB body). */
+function fetchVoiceList() {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        host: SPEECH_HOST,
+        path: `${VOICES_PATH}?trustedclienttoken=${TRUSTED_CLIENT_TOKEN}`,
+        method: "GET",
+        headers: {
+          "Sec-MS-GEC": generateSecMsgEC(),
+          "Sec-MS-GEC-Version": SEC_MS_GEC_VERSION,
+          "User-Agent": EDGE_USER_AGENT,
+          Origin: EXTENSION_ORIGIN,
+          "Accept-Encoding": "identity", // we do not decompress
+        },
+      },
+      (res) => {
+        const chunks = [];
+        let bytes = 0;
+        res.on("data", (d) => {
+          chunks.push(d);
+          bytes += d.length;
+          if (bytes > 8 * 1024 * 1024) {
+            req.destroy();
+            reject(new Error("Voice list response exceeded 8 MB"));
+          }
+        });
+        res.on("end", () => {
+          clearTimeout(timer);
+          if (res.statusCode !== 200) {
+            reject(new Error(`Voice list request failed (HTTP ${res.statusCode})`));
+            return;
+          }
+          try {
+            const list = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+            if (!Array.isArray(list) || list.length === 0) {
+              reject(new Error("Voice list response was empty or malformed"));
+              return;
+            }
+            const voices = list.map(normalizeVoice).filter(Boolean);
+            if (voices.length === 0) {
+              reject(new Error("Voice list contained no usable entries"));
+            } else {
+              resolve(voices);
+            }
+          } catch (err) {
+            reject(new Error(`Could not parse the voice list: ${err.message}`));
+          }
+        });
+      },
+    );
+    const timer = setTimeout(() => {
+      req.destroy();
+      reject(
+        new Error(`Could not reach ${SPEECH_HOST} for the voice list (15s timeout)`),
+      );
+    }, VOICES_TIMEOUT_MS);
+    req.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err instanceof Error ? err : new Error(String(err)));
+    });
+    req.end();
+  });
+}
+
+/** List the available neural voices (live fetch, cached for the session;
+ *  FALLBACK_VOICES on any network/DRM failure — never rejects).
+ *
+ *  Callers get a fresh array each time (safe to sort/filter in place) but
+ *  should treat the individual entries as read-only.
+ *
+ *  @returns {Promise<Array<{shortName:string, gender:"Female"|"Male",
+ *                            locale:string, friendlyName:string,
+ *                            displayName:string}>>} */
+function listVoices() {
+  if (voicesCache) return Promise.resolve(voicesCache.slice());
+  if (voicesPromise) return voicesPromise;
+  if (Date.now() - voicesFailedAt < VOICE_FETCH_COOLDOWN_MS) {
+    // Recently failed — serve the fallback without burning another 15 s.
+    return Promise.resolve(FALLBACK_VOICES.slice());
+  }
+  voicesPromise = fetchVoiceList().then(
+    (voices) => {
+      voicesCache = voices;
+      voicesPromise = null;
+      return voices.slice();
+    },
+    () => {
+      voicesPromise = null;
+      voicesFailedAt = Date.now();
+      // Offline / 403 / throttled — degrade to the built-in catalog.
+      return FALLBACK_VOICES.slice();
+    },
+  );
+  return voicesPromise;
+}
+
+/** Map locale → { female, male } short names, for the dubbing flow's
+ *  automatic male/female assignment per language. SYNCHRONOUS (dub-workflow
+ *  consumes the plain map without await; `await`ing it elsewhere is still
+ *  fine — a non-thenable resolves to itself): derived from the session
+ *  voice-list cache when the live catalog has already been fetched
+ *  (listVoices()), otherwise from the built-in FALLBACK_VOICES — a
+ *  background listVoices() fetch is kicked off so later calls reflect the
+ *  full live locale coverage (142+ locales vs the 19 fallback ones).
+ *  Locales that ship only one gender reuse that voice for both fields so
+ *  dubbing never dead-ends. Returns a fresh map each call — safe for
+ *  callers to mutate.
+ *
+ *  @returns {Object<string, {female:string, male:string}>}
+ */
+function voicePairsByLocale() {
+  const voices =
+    voicesCache && voicesCache.length > 0 ? voicesCache : FALLBACK_VOICES;
+  if (!voicesCache && !voicesPromise) {
+    // Fire-and-forget warm-up — this call answers from the fallback catalog,
+    // later calls use the live list. listVoices() never rejects (it falls
+    // back internally); the catch is belt-and-braces.
+    listVoices().catch(() => {});
+  }
+  const out = {};
+  for (const v of voices) {
+    if (!v.locale) continue;
+    let entry = out[v.locale];
+    if (!entry) {
+      entry = { female: null, male: null };
+      out[v.locale] = entry;
+    }
+    if (v.gender === "Male") {
+      if (!entry.male) entry.male = v.shortName;
+    } else if (!entry.female) entry.female = v.shortName;
+  }
+  for (const locale of Object.keys(out)) {
+    const entry = out[locale];
+    if (!entry.female) entry.female = entry.male;
+    if (!entry.male) entry.male = entry.female;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// SSML construction
+// ---------------------------------------------------------------------------
+
+/** XML-escape & < > " ' for embedding text/attributes in the SSML. */
+function escapeXml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+/** The service rejects a few C0 control characters (notably vertical tab,
+ *  which shows up in OCR'd PDF text) — replace them with spaces. */
+function removeIncompatibleCharacters(s) {
+  return String(s).replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, " ");
+}
+
+/** Derive the SSML xml:lang locale from a voice name — accepts both the
+ *  short form ("hi-IN-SwaraNeural") and the full service Name
+ *  ("Microsoft Server Speech Text to Speech Voice (hi-IN, MadhurNeural)"). */
+function localeFromVoice(voice) {
+  const v = String(voice || "");
+  if (v.startsWith("Microsoft Server Speech")) {
+    const m = /\(([^,)]+),/.exec(v);
+    if (m) return m[1].trim();
+  }
+  const parts = v.split("-");
+  if (parts.length >= 2) return `${parts[0]}-${parts[1]}`;
+  return "en-US";
+}
+
+/** Format a signed prosody value: 10/"%" → "+10%", -4/"Hz" → "-4Hz". */
+function formatSigned(value, unit) {
+  const v =
+    typeof value === "number" && Number.isFinite(value)
+      ? Math.round(value * 100) / 100
+      : 0;
+  return `${v >= 0 ? "+" : ""}${v}${unit}`;
+}
+
+/** Build the SSML utterance exactly as the service expects it.
+ *  @param {{text:string, voice:string, locale?:string,
+ *           ratePct?:number, pitchHz?:number, volumePct?:number}} o */
+function buildSsml(o) {
+  const locale = o.locale || localeFromVoice(o.voice);
+  const pitch = formatSigned(o.pitchHz, "Hz");
+  const rate = formatSigned(o.ratePct, "%");
+  const volume = formatSigned(o.volumePct, "%");
+  return (
+    `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' ` +
+    `xml:lang='${escapeXml(locale)}'>` +
+    `<voice name='${escapeXml(o.voice)}'>` +
+    `<prosody pitch='${pitch}' rate='${rate}' volume='${volume}'>` +
+    `${escapeXml(o.text)}` +
+    `</prosody></voice></speak>`
+  );
+}
+
+/** "Tue Jan 01 2025 00:00:00 GMT+0000 (Coordinated Universal Time)" — the
+ *  JS-style UTC date the service expects in X-Timestamp headers (the SSML
+ *  message additionally appends a literal "Z"). */
+function jsUtcDateString() {
+  const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const MONTHS = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+  ];
+  const d = new Date();
+  const p2 = (n) => (n < 10 ? `0${n}` : String(n));
+  return (
+    `${DAYS[d.getUTCDay()]} ${MONTHS[d.getUTCMonth()]} ${p2(d.getUTCDate())} ` +
+    `${d.getUTCFullYear()} ${p2(d.getUTCHours())}:${p2(d.getUTCMinutes())}:` +
+    `${p2(d.getUTCSeconds())} GMT+0000 (Coordinated Universal Time)`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Raw RFC-6455 WebSocket client framing (no global WebSocket in Electron 33)
+// ---------------------------------------------------------------------------
+
+const OP_CONT = 0x0;
+const OP_TEXT = 0x1;
+const OP_BINARY = 0x2;
+const OP_CLOSE = 0x8;
+const OP_PING = 0x9;
+const OP_PONG = 0xa;
+
+/** Build ONE masked client frame (RFC 6455 §5.3 — clients MUST mask).
+ *  @param {number} opcode 0x1 text, 0x2 binary, 0x8 close, 0x9/0xa ping/pong
+ *  @param {Buffer} payload
+ *  @returns {Buffer} complete frame, ready for a single socket.write() */
+function buildWsFrame(opcode, payload) {
+  const len = payload.length;
+  let header;
+  if (len < 126) {
+    header = Buffer.alloc(2);
+    header[1] = 0x80 | len;
+  } else if (len < 65536) {
+    header = Buffer.alloc(4);
+    header[1] = 0x80 | 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[1] = 0x80 | 127;
+    header.writeBigUInt64BE(BigInt(len), 2);
+  }
+  header[0] = 0x80 | opcode; // FIN + opcode (no fragmentation on send)
+  const mask = crypto.randomBytes(4);
+  const masked = Buffer.from(payload); // copy — never mutate the caller's data
+  for (let i = 0; i < masked.length; i++) masked[i] ^= mask[i & 3];
+  return Buffer.concat([header, mask, masked]);
+}
+
+/** Incremental parser for unmasked (and, defensively, masked) server
+ *  frames. Handles length forms 7/16/64-bit, minimal fragmentation
+ *  (continuation frames), and delivers control frames immediately.
+ *
+ *  @param {(opcode:number, payload:Buffer)=>void} onFrame
+ *      called with COMPLETE messages (text/binary) or control frames.
+ *  @param {(err:Error)=>void} [onError] protocol violations.
+ *  @returns {{write:(chunk:Buffer)=>void}} */
+function createWsFrameParser(onFrame, onError) {
+  let pending = null;
+  let fragOpcode = 0;
+  let fragParts = null;
+
+  const fail = (msg) => {
+    pending = null;
+    fragParts = null;
+    fragOpcode = 0;
+    if (onError) onError(new Error(msg));
+  };
+
+  const parse = () => {
+    for (;;) {
+      if (!pending || pending.length < 2) return;
+      const first = pending[0];
+      const fin = (first & 0x80) !== 0;
+      const opcode = first & 0x0f;
+      if (first & 0x70) {
+        fail("Edge TTS WebSocket protocol error (RSV bits set)");
+        return;
+      }
+      const second = pending[1];
+      const masked = (second & 0x80) !== 0;
+      const len7 = second & 0x7f;
+      let offset = 2;
+      let length = len7;
+      if (len7 === 126) {
+        if (pending.length < 4) return;
+        length = pending.readUInt16BE(2);
+        offset = 4;
+      } else if (len7 === 127) {
+        if (pending.length < 10) return;
+        const big = pending.readBigUInt64BE(2);
+        if (big > BigInt(MAX_WS_FRAME_BYTES)) {
+          fail(`Edge TTS WebSocket frame exceeded ${MAX_WS_FRAME_BYTES} bytes`);
+          return;
+        }
+        length = Number(big);
+        offset = 10;
+      }
+      let maskKey = null;
+      if (masked) {
+        if (pending.length < offset + 4) return;
+        maskKey = pending.slice(offset, offset + 4);
+        offset += 4;
+      }
+      if (pending.length < offset + length) return; // wait for more bytes
+      let payload = pending.slice(offset, offset + length);
+      if (maskKey) {
+        // Servers must NOT mask, but survive one that does.
+        payload = Buffer.from(payload);
+        for (let i = 0; i < payload.length; i++) payload[i] ^= maskKey[i & 3];
+      }
+      pending = pending.slice(offset + length);
+
+      if (opcode === OP_CONT) {
+        if (!fragParts) continue; // stray continuation — ignore
+        fragParts.push(payload);
+        if (fin) {
+          const whole = Buffer.concat(fragParts);
+          const wholeOpcode = fragOpcode;
+          fragParts = null;
+          fragOpcode = 0;
+          onFrame(wholeOpcode, whole);
+        }
+      } else if (opcode === OP_TEXT || opcode === OP_BINARY) {
+        if (fin) {
+          onFrame(opcode, payload);
+        } else {
+          fragOpcode = opcode;
+          fragParts = [payload];
+        }
+      } else if (opcode === OP_CLOSE || opcode === OP_PING || opcode === OP_PONG) {
+        // Control frames are never fragmented (RFC §5.5).
+        onFrame(opcode, payload);
+      } else {
+        fail(`Edge TTS WebSocket protocol error (unknown opcode 0x${opcode.toString(16)})`);
+        return;
+      }
+      if (pending && pending.length === 0) pending = null;
+    }
+  };
+
+  return {
+    write(chunk) {
+      pending = pending ? Buffer.concat([pending, chunk]) : chunk;
+      if (pending.length > MAX_WS_FRAME_BYTES + 14) {
+        fail(`Edge TTS WebSocket stream exceeded ${MAX_WS_FRAME_BYTES} bytes`);
+        return;
+      }
+      parse();
+    },
+  };
+}
+
+/** Read a value from a "\r\n"-separated header block (case-insensitive). */
+function headerValue(headerText, name) {
+  for (const line of headerText.split("\r\n")) {
+    const colon = line.indexOf(":");
+    if (colon === -1) continue;
+    if (line.slice(0, colon).trim().toLowerCase() === name.toLowerCase()) {
+      return line.slice(colon + 1).trim();
+    }
+  }
+  return "";
+}
+
+// ---------------------------------------------------------------------------
+// Synthesis — one TLS socket per attempt, raw WSS, MP3 reassembly
+// ---------------------------------------------------------------------------
+
+/** Inspect a Path:response JSON body — the service uses these frames to
+ *  surface auth/DRM failures (403-style). Returns null for benign acks. */
+function responseFrameError(bodyText) {
+  if (!bodyText) return null;
+  let payload = null;
+  try {
+    payload = JSON.parse(bodyText);
+  } catch (_) {
+    return null; // non-JSON body — benign
+  }
+  if (!payload || typeof payload !== "object") return null;
+  const sources = [payload, payload.data, payload.error].filter(
+    (s) => s && typeof s === "object",
+  );
+  let code = null;
+  let reason = "";
+  for (const src of sources) {
+    if (code === null && typeof src.code === "number") code = src.code;
+    if (!reason && typeof src.reason === "string") reason = src.reason;
+    if (!reason && typeof src.message === "string") reason = src.message;
+    if (!reason && typeof src.text === "string") reason = src.text;
+  }
+  const blob = `${code === null ? "" : code} ${reason}`.toLowerCase();
+  const authish = /40[13]|forbidden|unauthorized|drm|token/.test(blob);
+  const errorish =
+    authish ||
+    (code !== null && code >= 400) ||
+    /error/.test(String(payload.type || "").toLowerCase());
+  if (!errorish) return null;
+  const err = new Error(
+    `Edge TTS service error${code !== null ? ` (code ${code})` : ""}` +
+      `${reason ? `: ${reason}` : ""}`,
+  );
+  if (authish) err.retryable = true;
+  return err;
+}
+
+/** One full synthesis connection: TLS connect → WSS upgrade → speech.config
+ *  + SSML → drain frames until Path:turn.end. Sec-MS-GEC and ConnectionId
+ *  are regenerated on every call, so a retry is a genuinely fresh session.
+ *
+ *  @param {{ssml:string, abortRef?:object}} opts
+ *  @returns {Promise<Buffer>} the raw MP3 bytes
+ */
+function attemptSynthesis(opts) {
+  return new Promise((resolve, reject) => {
+    const connectId = crypto.randomBytes(16).toString("hex");
+    const requestId = crypto.randomBytes(16).toString("hex");
+    const secGec = generateSecMsgEC();
+    const wsKey = crypto.randomBytes(16).toString("base64");
+
+    const upgradePath =
+      `${WSS_PATH}?TrustedClientToken=${TRUSTED_CLIENT_TOKEN}` +
+      `&Sec-MS-GEC=${secGec}` +
+      `&Sec-MS-GEC-Version=${SEC_MS_GEC_VERSION}` +
+      `&ConnectionId=${connectId}`;
+    // Sec-MS-GEC / Sec-MS-GEC-Version ride BOTH as query params and as HTTP
+    // headers — the DRM gate at speech.platform.bing.com checks the header
+    // on every request, including the WSS upgrade.
+    const handshakeRequest =
+      `GET ${upgradePath} HTTP/1.1\r\n` +
+      `Host: ${SPEECH_HOST}\r\n` +
+      `Upgrade: websocket\r\n` +
+      `Connection: Upgrade\r\n` +
+      `Sec-WebSocket-Key: ${wsKey}\r\n` +
+      `Sec-WebSocket-Version: 13\r\n` +
+      `Sec-MS-GEC: ${secGec}\r\n` +
+      `Sec-MS-GEC-Version: ${SEC_MS_GEC_VERSION}\r\n` +
+      `Origin: ${EXTENSION_ORIGIN}\r\n` +
+      `User-Agent: ${EDGE_USER_AGENT}\r\n` +
+      `Cache-Control: no-cache\r\n` +
+      `Pragma: no-cache\r\n` +
+      `\r\n`;
+
+    const speechConfigMessage =
+      `X-Timestamp:${jsUtcDateString()}\r\n` +
+      `Content-Type:application/json; charset=utf-8\r\n` +
+      `Path:speech.config\r\n\r\n` +
+      `{"context":{"synthesis":{"audio":{"metadataoptions":` +
+      `{"sentenceBoundaryEnabled":"false","wordBoundaryEnabled":"true"},` +
+      `"outputFormat":"${OUTPUT_FORMAT}"}}}}\r\n`;
+
+    const ssmlMessage =
+      `X-RequestId:${requestId}\r\n` +
+      `Content-Type:application/ssml+xml\r\n` +
+      `X-Timestamp:${jsUtcDateString()}Z\r\n` +
+      `Path:ssml\r\n\r\n` +
+      opts.ssml;
+
+    const audioChunks = [];
+    let audioBytes = 0;
+    let settled = false;
+    let handshakeDone = false;
+    let closeSent = false;
+    let sock = null;
+    let handshakeBuffer = Buffer.alloc(0);
+    let handshakeTimer = null;
+    let overallTimer = null;
+
+    const parser = createWsFrameParser(onFrame, onProtocolError);
+
+    const clearTimers = () => {
+      if (handshakeTimer) {
+        clearTimeout(handshakeTimer);
+        handshakeTimer = null;
+      }
+      if (overallTimer) {
+        clearTimeout(overallTimer);
+        overallTimer = null;
+      }
+    };
+
+    const finish = (err, mp3Bytes) => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      if (sock) {
+        try {
+          sock.destroy();
+        } catch (_) {
+          /* best effort */
+        }
+      }
+      if (err) reject(err);
+      else resolve(mp3Bytes);
+    };
+
+    // Cancellation hook — the same { abort: fn } pattern as groq-whisper.
+    const hardAbort = () => {
+      if (opts.abortRef) opts.abortRef._cancelled = true;
+      finish(cancelledError());
+    };
+    if (opts.abortRef && typeof opts.abortRef === "object") {
+      opts.abortRef.abort = hardAbort;
+    }
+
+    // 25 s overall watchdog for THIS attempt.
+    overallTimer = setTimeout(() => {
+      finish(
+        new Error(
+          `Edge TTS timed out after ${Math.round(SYNTH_TIMEOUT_MS / 1000)}s ` +
+            "without finishing the audio stream",
+        ),
+      );
+    }, SYNTH_TIMEOUT_MS);
+
+    // Faster watchdog for a stalled upgrade (retryable → one fresh retry).
+    handshakeTimer = setTimeout(() => {
+      const err = new Error(
+        `Edge TTS WebSocket handshake stalled — no 101 within ` +
+          `${Math.round(HANDSHAKE_TIMEOUT_MS / 1000)}s`,
+      );
+      err.retryable = true;
+      finish(err);
+    }, HANDSHAKE_TIMEOUT_MS);
+
+    function onProtocolError(err) {
+      finish(err instanceof Error ? err : new Error(String(err)));
+    }
+
+    function sendClientFrame(opcode, payload) {
+      if (!sock || sock.destroyed) return;
+      try {
+        // Each protocol message goes out as ONE buffer (frames are a few KB
+        // at most) — Node's internal buffering absorbs any backpressure.
+        sock.write(buildWsFrame(opcode, payload));
+      } catch (_) {
+        // A dead socket surfaces through the error/close handlers.
+      }
+    }
+
+    function onFrame(opcode, payload) {
+      if (settled) return;
+      if (opcode === OP_TEXT) {
+        handleServerText(payload.toString("utf8"));
+      } else if (opcode === OP_BINARY) {
+        handleServerBinary(payload);
+      } else if (opcode === OP_CLOSE) {
+        handleServerClose(payload);
+      } else if (opcode === OP_PING) {
+        sendClientFrame(OP_PONG, payload); // RFC §5.5.2 — reply promptly
+      }
+      // Unsolicited pongs — ignore.
+    }
+
+    function handleServerText(text) {
+      const sep = text.indexOf("\r\n\r\n");
+      const headerText = sep === -1 ? text : text.slice(0, sep);
+      const bodyText = sep === -1 ? "" : text.slice(sep + 4);
+      const msgPath = headerValue(headerText, "Path");
+      if (msgPath === "turn.end") {
+        if (audioBytes === 0) {
+          finish(
+            new Error(
+              "Edge TTS finished without returning any audio — " +
+                "the voice name is probably invalid",
+            ),
+          );
+          return;
+        }
+        finish(null, Buffer.concat(audioChunks, audioBytes));
+        return;
+      }
+      if (msgPath === "response") {
+        const err = responseFrameError(bodyText);
+        if (err) finish(err);
+        // Benign response acks fall through — ignored.
+      }
+      // turn.start / audio.metadata / notification / … — not needed here.
+    }
+
+    function handleServerBinary(data) {
+      if (data.length < 2) return; // malformed — ignore
+      const headerLength = data.readUInt16BE(0);
+      if (headerLength > data.length - 2) return; // malformed — ignore
+      const headerText = data.slice(2, 2 + headerLength).toString("utf8");
+      const payload = data.slice(2 + headerLength);
+      if (headerValue(headerText, "Path") === "audio") {
+        if (payload.length > 0) {
+          audioChunks.push(payload);
+          audioBytes += payload.length;
+          if (audioBytes > MAX_AUDIO_BYTES) {
+            finish(
+              new Error(
+                `Edge TTS audio stream exceeded ` +
+                  `${Math.round(MAX_AUDIO_BYTES / 1048576)} MB — aborted`,
+              ),
+            );
+          }
+        }
+        return;
+      }
+      // Other binary messages (audio.metadata word boundaries, and on some
+      // server revisions turn.end) share the text-frame layout — reuse it.
+      handleServerText(
+        headerText +
+          (payload.length ? "\r\n\r\n" + payload.toString("utf8") : ""),
+      );
+    }
+
+    function handleServerClose(payload) {
+      if (!closeSent) {
+        closeSent = true;
+        // Echo the close (masked, ≤125-byte payload) per RFC §5.5.1.
+        sendClientFrame(OP_CLOSE, payload.slice(0, 125));
+      }
+      if (settled) return;
+      let code = "";
+      if (payload.length >= 2) code = ` (close code ${payload.readUInt16BE(0)})`;
+      const reason =
+        payload.length > 2 ? payload.slice(2).toString("utf8").trim() : "";
+      const err = new Error(
+        `Edge TTS server closed the connection before the audio finished` +
+          `${code}${reason ? `: ${reason}` : ""}`,
+      );
+      if (/40[13]|forbidden|unauthorized/i.test(`${code} ${reason}`)) {
+        err.retryable = true;
+      }
+      finish(err);
+    }
+
+    function onSocketData(chunk) {
+      if (settled) return;
+      if (!handshakeDone) {
+        // --- HTTP/1.1 upgrade phase: read until the blank line ---
+        handshakeBuffer = Buffer.concat([handshakeBuffer, chunk]);
+        const sep = handshakeBuffer.indexOf("\r\n\r\n");
+        if (sep === -1) {
+          if (handshakeBuffer.length > 16384) {
+            finish(
+              new Error(
+                "Edge TTS handshake response exceeded 16 KB — " +
+                  "not a WebSocket endpoint",
+              ),
+            );
+          }
+          return;
+        }
+        const responseHead = handshakeBuffer.slice(0, sep).toString("latin1");
+        const statusMatch = /^HTTP\/\d\.\d\s+(\d{3})/.exec(responseHead);
+        const status = statusMatch ? parseInt(statusMatch[1], 10) : 0;
+        if (status !== 101) {
+          // (The Sec-WebSocket-Accept value is deliberately not verified —
+          // the 101 status line is the meaningful signal for this peer.)
+          let err;
+          if (status === 401 || status === 403) {
+            // 403 is usually a DRM-token window mismatch — learn the server
+            // clock from the Date header so the retried token lines up.
+            learnClockSkewFromResponseHead(responseHead);
+            err = new Error(
+              `Edge TTS rejected the DRM token during the WebSocket upgrade ` +
+                `(HTTP ${status}) — retrying once with a fresh token`,
+            );
+            err.retryable = true;
+          } else {
+            err = new Error(
+              `Edge TTS WebSocket upgrade failed (HTTP ` +
+                `${status || "unparseable status line"})`,
+            );
+          }
+          finish(err);
+          return;
+        }
+        handshakeDone = true;
+        if (handshakeTimer) {
+          clearTimeout(handshakeTimer);
+          handshakeTimer = null;
+        }
+        // Session start — both protocol messages as single masked frames.
+        sendClientFrame(OP_TEXT, Buffer.from(speechConfigMessage, "utf8"));
+        sendClientFrame(OP_TEXT, Buffer.from(ssmlMessage, "utf8"));
+        const leftover = handshakeBuffer.slice(sep + 4);
+        handshakeBuffer = Buffer.alloc(0);
+        if (leftover.length > 0) parser.write(leftover);
+        return;
+      }
+      // --- established WSS phase ---
+      parser.write(chunk);
+    }
+
+    sock = tls.connect(
+      {
+        host: SPEECH_HOST,
+        port: 443,
+        servername: SPEECH_HOST,
+        // Pin HTTP/1.1 via ALPN so the raw request/response framing holds.
+        ALPNProtocols: ["http/1.1"],
+      },
+      () => {
+        if (settled) return;
+        try {
+          sock.setNoDelay(true);
+        } catch (_) {
+          /* older TLS stacks */
+        }
+        sock.write(handshakeRequest);
+      },
+    );
+    sock.on("data", onSocketData);
+    sock.on("error", (err) => {
+      if (settled) return;
+      const msg = new Error(
+        `Edge TTS connection error: ${err && err.message ? err.message : err}`,
+      );
+      if (!handshakeDone) msg.retryable = true; // → one fresh retry
+      finish(msg);
+    });
+    sock.on("close", () => {
+      if (settled) return;
+      const msg = new Error(
+        "Edge TTS connection closed unexpectedly before the audio finished",
+      );
+      if (!handshakeDone) msg.retryable = true;
+      finish(msg);
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Engine-slot queue — at most MAX_CONCURRENT_SYNTH sockets at a time; extra
+// callers wait in FIFO order (and can cancel while waiting).
+// ---------------------------------------------------------------------------
+
+let activeSynthCount = 0;
+const synthWaitQueue = []; // { resolve, reject, aborted }
+
+function acquireSlot(abortRef) {
+  return new Promise((resolve, reject) => {
+    if (activeSynthCount < MAX_CONCURRENT_SYNTH) {
+      activeSynthCount += 1;
+      resolve();
+      return;
+    }
+    const entry = { resolve, reject, aborted: false };
+    synthWaitQueue.push(entry);
+    if (abortRef) {
+      abortRef.abort = () => {
+        if (entry.aborted) return;
+        entry.aborted = true;
+        abortRef._cancelled = true;
+        const idx = synthWaitQueue.indexOf(entry);
+        if (idx !== -1) synthWaitQueue.splice(idx, 1);
+        reject(cancelledError());
+      };
+    }
+  });
+}
+
+function releaseSlot() {
+  const next = synthWaitQueue.shift();
+  if (next) next.resolve(); // hand the slot straight over (count unchanged)
+  else activeSynthCount -= 1;
+}
+
+function cancelledError() {
+  const err = new Error("Edge TTS synthesis cancelled");
+  err.cancelled = true;
+  return err;
+}
+
+// ---------------------------------------------------------------------------
+// Public synthesis entry point
+// ---------------------------------------------------------------------------
+
+/** Validate + normalize synthesize() options; throws descriptive errors
+ *  (a throw inside the async entry point becomes a rejection).
+ *  Out-of-range prosody values are silently clamped to sanity bounds. */
+function normalizeSynthOptions(o) {
+  if (!o || typeof o !== "object") {
+    throw new Error("synthesize: an options object is required ({ text, voice, … })");
+  }
+  const text = typeof o.text === "string" ? o.text : "";
+  if (!text.trim()) {
+    throw new Error("synthesize: text is required and must be a non-empty string");
+  }
+  if (text.length > MAX_TEXT_LEN) {
+    throw new Error(
+      `synthesize: text is ${text.length} characters — the Edge service caps ` +
+        `a request at ${MAX_TEXT_LEN}; split it into sentence chunks and ` +
+        `concatenate the MP3s (dub-workflow.js does exactly that)`,
+    );
+  }
+  const voice = typeof o.voice === "string" ? o.voice.trim() : "";
+  if (!voice) {
+    throw new Error(
+      'synthesize: voice is required (e.g. "hi-IN-SwaraNeural" — see listVoices())',
+    );
+  }
+  // Control characters the service chokes on → spaces (see remove… above).
+  const cleanText = removeIncompatibleCharacters(text);
+  const numberOrZero = (v) =>
+    typeof v === "number" && Number.isFinite(v) ? v : 0;
+  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  const ratePct = clamp(numberOrZero(o.ratePct), RATE_RANGE[0], RATE_RANGE[1]);
+  const pitchHz = clamp(numberOrZero(o.pitchHz), PITCH_RANGE[0], PITCH_RANGE[1]);
+  const volumePct = clamp(
+    numberOrZero(o.volumePct),
+    VOLUME_RANGE[0],
+    VOLUME_RANGE[1],
+  );
+  const locale = localeFromVoice(voice);
+  return {
+    text: cleanText,
+    voice,
+    locale,
+    ratePct,
+    pitchHz,
+    volumePct,
+    ssml: buildSsml({ text: cleanText, voice, locale, ratePct, pitchHz, volumePct }),
+    outFile:
+      typeof o.outFile === "string" && o.outFile.trim() ? o.outFile.trim() : null,
+    abortRef:
+      o.abortRef && typeof o.abortRef === "object" ? o.abortRef : null,
+  };
+}
+
+/**
+ * Synthesize `text` with an Edge neural voice over the raw-WSS protocol.
+ *
+ * @param {object} o
+ * @param {string} o.text          1…3000 characters (chunk longer scripts).
+ * @param {string} o.voice         Short name, e.g. "hi-IN-SwaraNeural"
+ *                                 (the full service Name also works).
+ * @param {number} [o.ratePct=0]   Rate delta — +10 = 10% faster (SSML rate).
+ * @param {number} [o.pitchHz=0]   Pitch delta in Hz (SSML pitch, "+2Hz").
+ * @param {number} [o.volumePct=0] Volume delta in % (SSML volume).
+ * @param {string} [o.outFile]     Absolute path — the MP3 is written there
+ *                                 (parent dirs created) and returned as
+ *                                 filePath.
+ * @param {{abort:Function}} [o.abortRef]
+ *                                 Populated with a cancel function (same
+ *                                 pattern as groq-whisper.js groqTranscribe).
+ *                                 Callable immediately, even while queued.
+ * @returns {Promise<{filePath:string|null, bytes:Buffer, bytesLen:number}>}
+ *          bytes = the raw MP3 (audio-24khz-48kbitrate-mono-mp3);
+ *          filePath = outFile when given, else null.
+ */
+async function synthesize(o) {
+  const opts = normalizeSynthOptions(o); // throws → rejected promise
+  // Early-cancel stub so abortRef.abort is always callable, even before the
+  // socket exists (or while the request waits for an engine slot).
+  if (opts.abortRef) {
+    opts.abortRef.abort = () => {
+      opts.abortRef._cancelled = true;
+    };
+  }
+  await acquireSlot(opts.abortRef); // rejects if cancelled while queued
+  try {
+    if (opts.abortRef && opts.abortRef._cancelled) throw cancelledError();
+    let mp3Bytes = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        mp3Bytes = await attemptSynthesis(opts);
+        break;
+      } catch (err) {
+        const cancelled =
+          (err && err.cancelled) ||
+          (opts.abortRef && opts.abortRef._cancelled);
+        const retryable = !!(err && err.retryable);
+        if (cancelled || !retryable || attempt === 2) throw err;
+        // 403-ish failure / handshake stall — ONE full retry. The retry
+        // regenerates Sec-MS-GEC + ConnectionId inside attemptSynthesis.
+      }
+    }
+    const result = { filePath: null, bytes: mp3Bytes, bytesLen: mp3Bytes.length };
+    if (opts.outFile) {
+      try {
+        fs.mkdirSync(path.dirname(opts.outFile), { recursive: true });
+        fs.writeFileSync(opts.outFile, mp3Bytes);
+        result.filePath = opts.outFile;
+      } catch (err) {
+        throw new Error(
+          `Could not write the TTS output file "${opts.outFile}": ${err.message}`,
+        );
+      }
+    }
+    return result;
+  } finally {
+    releaseSlot();
+  }
+}
+
+module.exports = {
+  // Public API — consumed by dub-workflow.js and the voiceover UI.
+  listVoices, // () => Promise<Array<{shortName, gender, locale, friendlyName, displayName}>>
+  voicePairsByLocale, // () => Object<string, {female, male}> (SYNC plain map)
+  synthesize, // (o) => Promise<{filePath, bytes, bytesLen}>
+  FALLBACK_VOICES, // built-in catalog (used automatically when offline)
+  // Constants surfaced for callers / tests.
+  SPEECH_HOST,
+  TRUSTED_CLIENT_TOKEN,
+  SEC_MS_GEC_VERSION,
+  EDGE_USER_AGENT,
+  EDGE_TTS_MAX_TEXT: MAX_TEXT_LEN,
+  MAX_CONCURRENT_SYNTH,
+  OUTPUT_FORMAT,
+  // Internals (unit tests / diagnostics).
+  generateSecMsgEC,
+  escapeXml,
+  localeFromVoice,
+  buildSsml,
+  buildWsFrame,
+  createWsFrameParser,
+};

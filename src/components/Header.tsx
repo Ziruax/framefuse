@@ -24,27 +24,23 @@ import { cn } from "@/lib/utils";
 /** v1.12.1: the renderer's build constant — compared against the REAL exe
  *  version (app.getVersion()) so a stale/hybrid install is impossible to
  *  miss. Keep in sync with package.json on every release. */
-const BUILD_VERSION = "1.16.0";
+const BUILD_VERSION = "1.17.0";
 
 export interface LastExport {
   path: string;
   size: number;
   method: string;
   at: number;
-  /** v1.15.1 GPU-Shift: which engine ran ("webcodecs-gpu" |
-   *  "ffmpeg-smart") + the GPU frame telemetry for A/B verification. */
-  engine?: "webcodecs-gpu" | "ffmpeg-smart";
+  /** Which export engine ran (passthrough from the export result). */
+  engine?: "webcodecs-gpu" | "ffmpeg-smart" | "rust-native";
+  /** Engine telemetry carried from the export result. */
   framesEncoded?: number;
   gpuFrameRenderMs?: number;
   audioSkipped?: boolean;
   softwareFallback?: boolean;
-  /** v1.15.2: the pure-JS compositor cost + the decode-side twin + whether
-   * the engine ran in its dedicated worker (the "UI never lags" proof). */
   jsCompositorOverheadMs?: number;
   gpuDecodeWaitMs?: number;
   workerRuntime?: "worker" | "main-thread";
-  /** v1.15.3 lie detector: the encoder rung that actually ran + the
-   * platform's rejection reason when hardware encode was refused. */
   hwEncoder?: "require-hardware" | "prefer-hardware" | "software" | "plain";
   hwRejectReason?: string;
   /** v1.1 TURBO telemetry (desktop FFmpeg path only). */
@@ -307,8 +303,8 @@ export function Header({
               }}
               title={
                 versionStale
-                  ? `Version mismatch — the app shell reports v${exeVersion} but this interface is build v${BUILD_VERSION}. The install is stale or mixed: reinstall FrameFuse ${BUILD_VERSION} and check "Add/Remove Programs" for an older copy.`
-                  : `FrameFuse v${shownVersion} — adaptive 3-tier hardware engine · GPU ASIC (NVENC/QSV/AMF) when the probe verifies one, tier-tuned CPU workers (2×2 threads on constrained machines, min(4, cores/2)×2 on modern), ultrafast + no B-frames + stripped subtitle blur on Tier 3, honest pool telemetry`
+                  ? `Version mismatch — reinstall FrameFuse ${BUILD_VERSION}.`
+                  : `FrameFuse v${shownVersion}`
               }
             >
               {versionStale && <TriangleAlert className="size-3" aria-hidden />}
@@ -569,33 +565,6 @@ export function Header({
                 }${
                   lastExport.tierLabel ? ` · ${lastExport.tierLabel}` : ""
                 }${
-                  // v1.15.2: the GPU engine's execution-context + frame-cost
-                  // story — worker vs main thread, render/compositor/decode
-                  // split (the A/B + shader-migration numbers).
-                  lastExport.engine === "webcodecs-gpu"
-                    ? ` · GPU engine in ${
-                        lastExport.workerRuntime === "main-thread" ? "main thread (fallback)" : "worker"
-                      }` +
-                      (lastExport.framesEncoded != null ? ` · ${lastExport.framesEncoded} frames` : "") +
-                      (lastExport.gpuFrameRenderMs != null
-                        ? ` · ${lastExport.gpuFrameRenderMs} ms/frame render`
-                        : "") +
-                      (lastExport.jsCompositorOverheadMs != null
-                        ? ` · ${lastExport.jsCompositorOverheadMs} ms/frame JS compositor`
-                        : "") +
-                      (lastExport.gpuDecodeWaitMs != null
-                        ? ` · ${lastExport.gpuDecodeWaitMs} ms/frame decode wait`
-                        : "") +
-                      // v1.15.3 lie detector: the encoder rung + the platform's
-                      // rejection reason when hardware was refused.
-                      (lastExport.hwEncoder
-                        ? ` · enc rung: ${lastExport.hwEncoder}`
-                        : "") +
-                      (lastExport.hwRejectReason
-                        ? ` · hardware rejected (${lastExport.hwRejectReason})`
-                        : "")
-                    : ""
-                }${
                   lastExport.cpuTopology ? ` · ${lastExport.cpuTopology}` : ""
                 }${
                   lastExport.filterPool ? " · widened filter pool (image-heavy timeline)" : ""
@@ -769,7 +738,7 @@ export function Header({
           )}
           title={
             inElectron
-              ? "Export an MP4 with smart FFmpeg rendering — untouched video is stream-copied at full quality, only your edits are re-encoded"
+              ? "Export your timeline as an MP4 — untouched video keeps full quality, only your edits are re-encoded"
               : "Exports run in the FrameFuse desktop app for Windows — this browser session is a UI preview only"
           }
         >

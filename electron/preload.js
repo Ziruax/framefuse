@@ -85,6 +85,36 @@ contextBridge.exposeInMainWorld("electronAPI", {
     return () => ipcRenderer.removeListener("whisper:progress", handler);
   },
 
+  // ── v1.17 VOICEOVER (Edge TTS) + TRANSLATE/DUB ────────────────────────────
+  // ttsVoices: () → { voices: [{shortName, gender, locale, friendlyName,
+  //   displayName}], pairs: { "hi-IN": { female, male }, … } } — the catalog
+  //   is cached main-side (one network fetch per session, fallback catalog
+  //   offline).
+  ttsVoices: () => ipcRenderer.invoke("tts:voices"),
+  // ttsPreview: ({ voice, text }) → { bytes: ArrayBuffer, bytesLen } — a
+  //   SHORT sample, never written to disk. Single-flight main-side: starting
+  //   a new preview cancels the previous one (voice browsing is rapid-fire).
+  ttsPreview: (p) => ipcRenderer.invoke("tts:preview", p),
+  // ttsSynthesize: ({ text, voice, ratePct, pitchHz, volumePct }) →
+  //   { filePath, bytes: ArrayBuffer(MP3), durationMs } — narration for the
+  //   timeline voiceover lane.
+  ttsSynthesize: (p) => ipcRenderer.invoke("tts:synthesize", p),
+  // dubStart: ({ segments, sourceLanguage, targetLanguage, targetLocale,
+  //   groqModel, femaleVoice, maleVoice }) → dub result (segments carry wav
+  //   BYTES). Progress arrives via onDubProgress. Reuses the Captions-tab
+  //   Groq key — there is no second key UI.
+  dubStart: (p) => ipcRenderer.invoke("dub:start", p),
+  // dubCancel: () → { ok, running } — aborts the active dub run.
+  dubCancel: (p) => ipcRenderer.invoke("dub:cancel", p),
+  // dubModels: () → { models, default, langNames } — picker data, no key
+  //   needed.
+  dubModels: () => ipcRenderer.invoke("dub:models"),
+  onDubProgress: (callback) => {
+    const handler = (_event, data) => callback(data);
+    ipcRenderer.on("dub:progress", handler);
+    return () => ipcRenderer.removeListener("dub:progress", handler);
+  },
+
   // ── v5.1 NATIVE PROJECT FILES ─────────────────────────────────────────────
   // saveProject: ({ doc, currentPath? }) → { path, name } | null (canceled)
   saveProject: (payload) => ipcRenderer.invoke("project:save", payload),

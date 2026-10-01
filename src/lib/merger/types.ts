@@ -8,10 +8,19 @@
 
 import type { ChromaKeySettings } from "./chroma";
 import type { SfxItem } from "./sfx";
+// v1.17 Stack Text: HeadlineItem's stackLayout/stackStyle ids + the new-item
+// defaults (stackTextPresets is pure data+math, zero imports — no cycle).
+import {
+  STACK_TEXT_DEFAULTS,
+  type StackLayoutId,
+  type StackStyleId,
+} from "./stackTextPresets";
 
 // Re-export the sibling-lib types so consumers can import the whole data
 // model from one place (type-only — no runtime dependency is created).
 export type { ChromaKeySettings, SfxItem };
+// v1.17: Stack Text ids are part of the headline data model surface.
+export type { StackLayoutId, StackStyleId };
 
 export type TimelineMode = "absolute" | "sequential";
 
@@ -666,10 +675,18 @@ export interface HeadlineItem {
   /** Headline preset id (headlinePresets.ts). */
   presetId: string;
   position: HeadlinePosition;
-  /** Entrance animation. */
+  /** Entrance animation (legacy simple styles — dead when stackStyle is set). */
   animation: HeadlineAnimation;
   /** Font size multiplier 0.5 - 2.0. */
   sizeScale: number;
+  /** v1.17 Stack Text LAYOUT (geometry of the stacked lines). Absent on
+   *  legacy items → derived from `position`: top→top-banner,
+   *  center→center-stack, bottom→bottom-center. Optional so every old
+   *  project file loads unchanged. */
+  stackLayout?: StackLayoutId;
+  /** v1.17 Stack Text kinetic STYLE. Absent → the legacy `animation` path
+   *  renders exactly as before (byte-identical for old projects). */
+  stackStyle?: StackStyleId;
 }
 
 export function makeHeadlineItem(partial: Partial<HeadlineItem> = {}): HeadlineItem {
@@ -680,7 +697,13 @@ export function makeHeadlineItem(partial: Partial<HeadlineItem> = {}): HeadlineI
     endMs: 3000,
     presetId: "impact",
     position: "top",
-    animation: "pop",
+    // v1.17 Stack Text: new items are kinetic by default (center-stack ×
+    // word-pop). `animation` stays "none" — the legacy entrance is only set
+    // when the user picks a Simple style in the Stack Text picker (which
+    // clears stackStyle). Both fields never fight: stackStyle wins when set.
+    stackLayout: STACK_TEXT_DEFAULTS.layout,
+    stackStyle: STACK_TEXT_DEFAULTS.style,
+    animation: "none",
     sizeScale: 1,
     ...partial,
   };
@@ -727,6 +750,136 @@ export interface DisclaimerClip {
   durationMs: number;
 }
 
+// ---------------------------------------------------------------------------
+// v1.17 VOICEOVER / DUB (Edge TTS) — narration items + dub track segments.
+//
+// Items live in BASE timeline time (like SfxItem — the disclaimer shifts
+// them only at render/export). The AUDIO BYTES never live here: they sit in
+// a page-level Map (id → Blob) so undo snapshots and project files stay
+// small — bytes regenerate at export via the stored text/voice/prosody, and
+// dub bytes arrive with the dub result. The export payload carries only
+// { wavPath, startMs, volume } per placement.
+// ---------------------------------------------------------------------------
+
+/** One synthesized voice placement on the master timeline. */
+export interface VoiceoverItem {
+  /** Instance id — unique per placement (see makeVoiceoverItem). */
+  id: string;
+  /** "narration" = a single TTS clip; "dub" = one segment of a dub track. */
+  kind: "narration" | "dub";
+  /** Position on the master (base) timeline, ms. */
+  startMs: number;
+  /** Actual audio duration, ms (measured by ffprobe at synthesis time). */
+  durationMs: number;
+  /** Playback volume 0..1. */
+  volume: number;
+  /** Short UI label (first words of the text — timeline chip). */
+  label: string;
+  /** Full text — persists in project files and drives regeneration. */
+  text: string;
+  /** Edge TTS voice ShortName, e.g. "hi-IN-SwaraNeural". */
+  voice: string;
+  /** Prosody deltas captured at synthesis time (regeneration parity). */
+  ratePct?: number;
+  pitchHz?: number;
+  /** Dub items: which speaker this segment belongs to (0-based). */
+  speaker?: number;
+  /** Dub items: the source utterance window end (ms) — diagnostics. */
+  endMs?: number;
+}
+
+/** v1.17 dub run configuration (the Translate & Dub card's knobs — a
+ *  MACHINE-level localStorage preference, never a project-file field). */
+export interface DubSettings {
+  targetLanguage: string;
+  targetLocale: string;
+  groqModel: string;
+  femaleVoice: string;
+  maleVoice: string;
+  /** Original-audio level under the dub (0..1) — the duck. */
+  originalVolume: number;
+}
+
+/** Renderer-side view of DUB.runDub's result (the main process returns it
+ *  from dub:start; wav BYTES arrive in-memory — paths are transient). */
+export interface DubSegmentResult {
+  /** Fitted placement start (base timeline ms). */
+  startMs: number;
+  /** Source utterance end (ms). */
+  endMs: number;
+  speaker: number;
+  sourceText: string;
+  translatedText: string;
+  wavPath: string;
+  /** Final (probed) audio duration, ms — post atempo fit. */
+  ttsDurMs: number;
+  speedApplied: number;
+  /** The wav bytes (present on the dub:start result). */
+  bytes?: ArrayBuffer;
+}
+
+export interface DubSpeakerResult {
+  id: number;
+  voice: string;
+  gender: string;
+}
+
+export interface DubTrackResult {
+  language: string;
+  speakers: DubSpeakerResult[];
+  segments: DubSegmentResult[];
+  wavPaths: string[];
+  totalDurationMs: number;
+  warnings: string[];
+  dubDir: string;
+}
+
+/** Monotonic sequence for instance ids (unique within the same ms). */
+let voSeq = 0;
+
+/**
+ * Factory for voiceover placements. Ids follow the makeSfxItem/makeHeadlineItem
+ * house style (`vo_<ts36>_<seq36>`). `volume` clamps to 0..1; non-finite
+ * numbers fall back to the defaults; optional fields pass through only when
+ * finite so JSON round-trips stay clean.
+ */
+export function makeVoiceoverItem(
+  partial: Partial<VoiceoverItem> = {},
+): VoiceoverItem {
+  voSeq += 1;
+  const num = (v: unknown, dflt: number, lo: number, hi: number) =>
+    typeof v === "number" && Number.isFinite(v)
+      ? Math.min(hi, Math.max(lo, v))
+      : dflt;
+  const kind: VoiceoverItem["kind"] = partial.kind === "dub" ? "dub" : "narration";
+  const text = typeof partial.text === "string" ? partial.text : "";
+  return {
+    id: partial.id ?? `vo_${Date.now().toString(36)}_${voSeq.toString(36)}`,
+    kind,
+    startMs: num(partial.startMs, 0, 0, Number.MAX_SAFE_INTEGER),
+    durationMs: num(partial.durationMs, 0, 0, Number.MAX_SAFE_INTEGER),
+    volume: num(partial.volume, 1, 0, 1),
+    label:
+      typeof partial.label === "string" && partial.label
+        ? partial.label
+        : text.slice(0, 28) || (kind === "dub" ? "Dub segment" : "Voiceover"),
+    text,
+    voice: typeof partial.voice === "string" ? partial.voice : "",
+    ...(typeof partial.ratePct === "number" && Number.isFinite(partial.ratePct)
+      ? { ratePct: partial.ratePct }
+      : {}),
+    ...(typeof partial.pitchHz === "number" && Number.isFinite(partial.pitchHz)
+      ? { pitchHz: partial.pitchHz }
+      : {}),
+    ...(typeof partial.speaker === "number" && Number.isFinite(partial.speaker)
+      ? { speaker: partial.speaker }
+      : {}),
+    ...(typeof partial.endMs === "number" && Number.isFinite(partial.endMs)
+      ? { endMs: partial.endMs }
+      : {}),
+  };
+}
+
 export interface ExportNativeOptions {
   segments: MediaSegment[];
   /** segId -> object URL (or data URL) for the image. */
@@ -740,6 +893,11 @@ export interface ExportNativeOptions {
   captionSettings?: CaptionSettings;
   /** Headline overlay items for burn-in (v4.2). */
   headlines?: HeadlineItem[] | null;
+  /** v1.17 Stack Text: renderer-measured headline geometry (wrapped lines,
+   *  word widths, block position at the export resolution) for kinetic
+   *  stackStyle items — guarantees canvas/export line-break parity. Absent
+   *  → the main process falls back to the legacy ASS emitter. */
+  headlineGeometry?: import("./native").HeadlineExportGeometry[] | null;
   /** Audio post-processing (normalize / fades). v4.1 */
   audio?: AudioSettings;
   /** Segment transitions (v4.3). */
@@ -748,6 +906,14 @@ export interface ExportNativeOptions {
   watermark?: WatermarkExportOptions | null;
   /** v5.0: SFX placements mixed into the export audio chain. */
   sfx?: SfxItem[];
+  /** v1.17: voiceover/dub placements — the renderer uploads each item's
+   *  bytes via saveTempAudio and passes only { wavPath, startMs, volume }.
+   *  Omitted when empty so legacy payloads stay byte-identical. */
+  voiceovers?: { wavPath: string; startMs: number; volume: number }[];
+  /** v1.17: original-audio level under a dub track (0..1, sent only when a
+   *  dub track exists — the MAIN process scales the base segments' volume
+   *  by it; the renderer never pre-scales). */
+  dubOriginalVolume?: number;
   /** v1.15: burn-in text detection & removal (default OFF — the renderer
    *  passes the setting through to the main process, which sanitizes it). */
   textRemoval?: TextRemovalSettings | null;
@@ -1124,6 +1290,55 @@ declare global {
         message: string;
         whisperModels: string[];
       }>;
+      /** ── v1.17 Edge TTS (voiceover + dubbing) ── */
+      /** Voice catalog + per-locale female/male default pairs. */
+      ttsVoices?: () => Promise<{
+        voices: Array<{
+          shortName: string;
+          gender: string;
+          locale: string;
+          friendlyName: string;
+          displayName: string;
+        }>;
+        pairs: Record<string, { female: string; male: string }>;
+      }>;
+      /** Short sample of a voice, played back in the pickers BEFORE the
+       *  user commits to it. Single-flight: a new preview cancels the old. */
+      ttsPreview?: (p: {
+        voice: string;
+        text?: string;
+      }) => Promise<{ bytes: ArrayBuffer; bytesLen: number }>;
+      /** Full narration synthesis → MP3 bytes + measured duration. */
+      ttsSynthesize?: (p: {
+        text: string;
+        voice: string;
+        ratePct?: number;
+        pitchHz?: number;
+        volumePct?: number;
+      }) => Promise<{ filePath: string; bytes: ArrayBuffer; durationMs: number }>;
+      /** ── v1.17 Groq dubbing (transcribe → speakers → translate → TTS) ── */
+      dubStart?: (p: {
+        segments: Array<{ videoPath: string; startMs: number; endMs?: number }>;
+        sourceLanguage?: string;
+        targetLanguage: string;
+        targetLocale: string;
+        groqModel?: string;
+        femaleVoice?: string;
+        maleVoice?: string;
+        ttsRatePct?: number;
+      }) => Promise<DubTrackResult>;
+      dubCancel?: () => Promise<{ ok: boolean; running: boolean }>;
+      /** Free-tier chat model list + defaults (no key needed). */
+      dubModels?: () => Promise<{
+        models: Array<{ id: string; label: string; hint: string }>;
+        default: string;
+        langNames: Record<string, string>;
+      }>;
+      onDubProgress?: (cb: (d: {
+        phase: string;
+        progress: number;
+        status: string;
+      }) => void) => () => void;
       /** ── v5.1 native project files (dialog-backed) ── */
       saveProject: (p: { doc: unknown; currentPath?: string | null }) => Promise<{ path: string; name: string } | null>;
       saveProjectAs: (p: { doc: unknown }) => Promise<{ path: string; name: string } | null>;

@@ -39,6 +39,19 @@ const GQ = require("./groq-whisper");
 // an error — exports silently ride the FFmpeg-CLI pipeline (DIRECTIVE 5).
 const RUST = require("./rust-engine-router");
 console.log("[RustEngine]", JSON.stringify(RUST.rustEngineStatus()));
+// v1.17 STACK TEXT (kinetic headline typography): the plain-JS mirror of
+// src/lib/merger/stackTextPresets.ts + the kinetic ASS emitter (recipes from
+// STACK_STYLE_ASS_DOC / STACK_LAYOUT_ASS_DOC). Consumed by
+// buildHeadlineEvents() for items with a kinetic stackStyle AND renderer-
+// measured geometry; everything else keeps the legacy v4.2 emitter.
+const StackText = require("./stack-text-ass");
+// v1.17 VOICEOVER + DUB: the Edge TTS engine (task 57-b, live-verified) and
+// the Groq transcribe→translate→synthesize orchestrator (task 57-c). Both
+// are plain Node modules with zero Electron imports; this file owns the IPC
+// surface, temp-file lifetimes and the Groq-key reuse (same userData/groq.json
+// as whisper — there is no second key UI).
+const TTS = require("./edge-tts");
+const DUB = require("./dub-workflow");
 
 // Resolve the FFmpeg binary path. v1.5: a FULL bundled build (staged by
 // scripts/fetch-windows-ffmpeg.js into resources/ffmpeg/<plat>/) is PREFERRED
@@ -1759,6 +1772,206 @@ ipcMain.handle("whisper:groq-test", async (_event, payload) => {
   }
   return GQ.groqTestKey(candidate);
 });
+
+// ---------------------------------------------------------------------------
+// v1.17 VOICEOVER (Edge TTS) + TRANSLATE/DUB IPC.
+//
+// The TTS engine and the dub orchestrator live in their own modules; these
+// handlers own: the memoized voice catalog, single-flight previews (voice
+// browsing fires them rapid-fire), narration synthesis into the SAME temp
+// dir saveTempAudio uses (probeMediaAsync then measures the real MP3
+// duration), and ONE dub run at a time with whisper-style progress events
+// on the "dub:progress" channel. The Groq key is the SAME one the Captions
+// tab manages (GQ.loadGroqConfig) — dubbing never asks for a second key.
+// ---------------------------------------------------------------------------
+
+/** Memoized listVoices() promise (the module caches too; this saves the hop). */
+let ttsVoicesPromise = null;
+function ttsVoicesOnce() {
+  if (!ttsVoicesPromise) ttsVoicesPromise = Promise.resolve(TTS.listVoices());
+  return ttsVoicesPromise;
+}
+
+/** Single-flight guard for tts:preview — the previous preview is cancelled
+ *  when a new one starts so only the newest voice is ever heard. */
+let ttsPreviewAbortRef = null;
+
+ipcMain.handle("tts:voices", async () => {
+  return { voices: await ttsVoicesOnce(), pairs: TTS.voicePairsByLocale() };
+});
+
+/** { voice, text? } → { bytes: ArrayBuffer, bytesLen } — a SHORT sample,
+ *  never written to disk. Text is trimmed to ≤120 chars; the caller passes
+ *  a locale-appropriate sample for non-Latin voices. */
+ipcMain.handle("tts:preview", async (_event, payload) => {
+  const p = payload || {};
+  const voice = typeof p.voice === "string" ? p.voice.trim() : "";
+  if (!voice) throw new Error("No voice selected");
+  let text = typeof p.text === "string" ? p.text.trim().slice(0, 120) : "";
+  if (!text) text = "This is a preview of the selected voice.";
+  if (ttsPreviewAbortRef && typeof ttsPreviewAbortRef.abort === "function") {
+    try { ttsPreviewAbortRef.abort(); } catch (_) { /* already dead */ }
+  }
+  const abortRef = { abort: null };
+  ttsPreviewAbortRef = abortRef;
+  try {
+    const r = await TTS.synthesize({ text, voice, abortRef });
+    const b = r.bytes || Buffer.alloc(0);
+    return {
+      bytes: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength),
+      bytesLen: r.bytesLen,
+    };
+  } finally {
+    if (ttsPreviewAbortRef === abortRef) ttsPreviewAbortRef = null;
+  }
+});
+
+/** { text, voice, ratePct, pitchHz, volumePct } → { filePath, bytes:
+ *  ArrayBuffer, durationMs } — full narration synthesis. The MP3 lands in
+ *  the shared temp dir (vo_<ts>_<rand>.mp3 — same lifecycle as saveTempAudio
+ *  files, wiped by cleanup-temp) and probeMediaAsync measures its REAL
+ *  duration (the 48 kbps mono MP3 ≈ 6000 B/s fallback only fires when
+ *  ffprobe is unavailable). */
+ipcMain.handle("tts:synthesize", async (_event, payload) => {
+  const p = payload || {};
+  const text = typeof p.text === "string" ? p.text.trim() : "";
+  const voice = typeof p.voice === "string" ? p.voice.trim() : "";
+  if (!voice) throw new Error("No voice selected");
+  if (!text) throw new Error("No narration text entered");
+  if (text.length > 3000) {
+    throw new Error(`Narration is ${text.length} characters — Edge TTS accepts up to 3000`);
+  }
+  const ratePct = Math.max(-50, Math.min(50, Number(p.ratePct) || 0));
+  const pitchHz = Math.max(-20, Math.min(20, Number(p.pitchHz) || 0));
+  const volumePct = Math.max(-100, Math.min(100, Number(p.volumePct) || 0));
+  ensureTempDir();
+  const outPath = path.join(
+    tempDir,
+    `vo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp3`,
+  );
+  const r = await TTS.synthesize({ text, voice, ratePct, pitchHz, volumePct, outFile: outPath });
+  let durationMs = 0;
+  try {
+    const info = await probeMediaAsync(outPath);
+    if (info && Number(info.durationMs) > 0) durationMs = info.durationMs;
+  } catch (_) { /* probe failure → the byte-rate estimate below */ }
+  if (!(durationMs > 0)) durationMs = Math.round((r.bytesLen / 6000) * 1000);
+  const b = r.bytes || Buffer.alloc(0);
+  return {
+    filePath: outPath,
+    bytes: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength),
+    durationMs,
+  };
+});
+
+/** Active dub run state (mirrors whisperState's role). ONE dub at a time. */
+const dubState = {
+  lastResult: null,   // { language, speakers, segments, at } — diagnostics
+  activeAbort: null,  // { abort } handed to DUB.runDub
+  running: false,
+};
+
+/** Payload: { segments:[{videoPath,startMs,endMs?}], sourceLanguage,
+ *  targetLanguage, targetLocale, groqModel, femaleVoice, maleVoice }.
+ *  Progress streams on "dub:progress" ({ phase, progress, status }).
+ *  On success every result segment carries its wav BYTES (ArrayBuffer) —
+ *  the renderer holds them in memory; the temp wav dir is deleted right
+ *  after the read (paths are transient, bytes are the truth). */
+ipcMain.handle("dub:start", async (event, payload) => {
+  if (dubState.running) {
+    throw new Error("A dub run is already in progress");
+  }
+  const p = payload || {};
+  // Same key + same friendly no-key message shape as the whisper handler.
+  const groqCfg = GQ.loadGroqConfig(app.getPath("userData"));
+  if (!groqCfg.apiKey) {
+    throw new Error(
+      "No Groq API key saved — open Settings → Captions, paste your key from console.groq.com (free), or add it before dubbing.",
+    );
+  }
+  const segs = (Array.isArray(p.segments) ? p.segments : [])
+    .map((s) => ({
+      videoPath: String((s && s.videoPath) || ""),
+      startMs: Math.max(0, Math.round(Number(s && s.startMs) || 0)),
+      endMs: Number.isFinite(Number(s && s.endMs)) ? Math.round(Number(s.endMs)) : undefined,
+    }))
+    .filter((s) => s.videoPath);
+  if (segs.length === 0) {
+    throw new Error("No video clips to dub — the timeline needs at least one video segment");
+  }
+  const abortRef = { abort: null };
+  dubState.running = true;
+  dubState.activeAbort = abortRef;
+  const sendProgress = (info) => {
+    if (event.sender && !event.sender.isDestroyed()) {
+      event.sender.send("dub:progress", info || {});
+    }
+  };
+  try {
+    const result = await DUB.runDub({
+      segments: segs,
+      sourceLanguage:
+        typeof p.sourceLanguage === "string" && p.sourceLanguage ? p.sourceLanguage : "auto",
+      targetLanguage:
+        typeof p.targetLanguage === "string" && p.targetLanguage ? p.targetLanguage : "hi",
+      targetLocale:
+        typeof p.targetLocale === "string" && p.targetLocale ? p.targetLocale : "hi-IN",
+      groqModel:
+        typeof p.groqModel === "string" && p.groqModel ? p.groqModel : DUB.DEFAULT_TEXT_MODEL,
+      // speakerVoices: {0: female, 1: male} — absent entries stay "auto".
+      speakerVoices: {
+        ...(typeof p.femaleVoice === "string" && p.femaleVoice ? { 0: p.femaleVoice } : {}),
+        ...(typeof p.maleVoice === "string" && p.maleVoice ? { 1: p.maleVoice } : {}),
+      },
+      tempDir: ensureTempDir(),
+      ffmpegPath,
+      ffprobePath: (await ffprobeAvailable()) || "ffprobe",
+      apiKey: groqCfg.apiKey,
+      onProgress: sendProgress,
+      abortRef,
+    });
+    // Read each wav's bytes INTO the result (cap ~200MB — realistically a
+    // dub track is a few MB), THEN delete the temp dir. Wav paths die here;
+    // the renderer keeps bytes for preview + re-upload at export.
+    let totalBytes = 0;
+    for (const seg of result.segments) {
+      const b = fs.readFileSync(seg.wavPath);
+      totalBytes += b.length;
+      if (totalBytes > 200 * 1024 * 1024) {
+        throw new Error("The dub track exceeds 200 MB — too long to attach to the timeline");
+      }
+      seg.bytes = b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+    }
+    DUB.cleanupDubTemp(result.dubDir);
+    dubState.lastResult = {
+      language: result.language,
+      speakers: result.speakers.length,
+      segments: result.segments.length,
+      warnings: result.warnings.length,
+      at: Date.now(),
+    };
+    return result;
+  } finally {
+    dubState.running = false;
+    dubState.activeAbort = null;
+  }
+});
+
+/** Abort the active dub run → { ok, running } (ok=false: nothing to cancel). */
+ipcMain.handle("dub:cancel", async () => {
+  if (!dubState.running || !dubState.activeAbort) {
+    return { ok: false, running: dubState.running };
+  }
+  try { dubState.activeAbort.abort(); } catch (_) { /* best effort */ }
+  return { ok: true, running: true };
+});
+
+/** { models, default, langNames } — picker data, no key needed. */
+ipcMain.handle("dub:models", async () => ({
+  models: DUB.GROQ_TEXT_MODELS,
+  default: DUB.DEFAULT_TEXT_MODEL,
+  langNames: DUB.LANG_NAMES,
+}));
 
 // ---------------------------------------------------------------------------
 // GPU encoder detection + RUNTIME PROBE.
@@ -3547,11 +3760,19 @@ function headlineAnimTags(animation, ch) {
  * { styleLines, eventLines } — the caller places the styles inside
  * [V4+ Styles] and the events inside [Events]. Layer 1 so headlines
  * render above caption lines.
+ *
+ * v1.17 Stack Text: items with a kinetic `stackStyle` AND a matching entry
+ * in `headlineGeometry` (renderer-measured line/word layout at the export
+ * resolution) ride the kinetic emitter in electron/stack-text-ass.js —
+ * per-style recipes from the preset library mirror, geometry-parity with
+ * the canvas painter. Kinetic items WITHOUT geometry (old callers/tests)
+ * and plain legacy items keep the v4.2 path below, byte-identical.
  */
-function buildHeadlineEvents(headlines, width, height, winStart, winEnd, clampDur) {
+function buildHeadlineEvents(headlines, width, height, winStart, winEnd, clampDur, headlineGeometry) {
   const styleLines = [];
   const eventLines = [];
   const hScale = height / 1080;
+  const geos = Array.isArray(headlineGeometry) ? headlineGeometry : null;
 
   for (const item of headlines) {
     if (!item || !item.text) continue;
@@ -3560,6 +3781,45 @@ function buildHeadlineEvents(headlines, width, height, winStart, winEnd, clampDu
     const relEnd = Math.min(clampDur, item.endMs - winStart);
     if (relEnd <= relStart) continue;
 
+    // v1.17: kinetic Stack Text dispatch (geometry matched by the item's
+    // text + window + preset + size — the geometry array is the renderer's
+    // filtered copy, so duplicate-window items still match their own).
+    if (item.stackStyle && StackText.isKineticStyle(item.stackStyle)) {
+      const geo = geos
+        ? geos.find(
+            (g) =>
+              g &&
+              g.text === item.text &&
+              g.startMs === item.startMs &&
+              g.endMs === item.endMs &&
+              g.presetId === item.presetId &&
+              (g.sizeScale || 1) === (item.sizeScale || 1),
+          )
+        : null;
+      if (geo) {
+        const emitted = StackText.emitStackHeadlineItem(
+          item,
+          geo,
+          getHeadlinePreset(item.presetId),
+          width,
+          height,
+          winStart,
+          winEnd,
+          clampDur,
+          // Unique per-item style name (karaoke-fill needs its own
+          // Primary/Secondary color pair on the Style line).
+          `HeadlineK${headlines.indexOf(item)}`,
+        );
+        if (emitted) {
+          styleLines.push(...emitted.styleLines);
+          eventLines.push(...emitted.eventLines);
+          continue;
+        }
+      }
+      // No geometry / unmeasurable → fall through to the legacy emitter
+      // (the safe v4.2 path — never crash on old callers or tests).
+    }
+
     const p = getHeadlinePreset(item.presetId);
     const sizeScale = item.sizeScale || 1;
     const fontSize = Math.max(10, Math.round(p.fontSize * height * sizeScale));
@@ -3567,7 +3827,15 @@ function buildHeadlineEvents(headlines, width, height, winStart, winEnd, clampDu
     const bold = p.fontWeight >= 600 ? -1 : 0;
     const italic = p.italic ? -1 : 0;
     // Alignment: 8=top-center, 5=middle-center, 2=bottom-center.
-    const alignment = item.position === "top" ? 8 : item.position === "center" ? 5 : 2;
+    // v1.17: the effective position derives from the layout (round-trips
+    // legacyLayoutFor, so old items keep their exact v4.2 alignment; a
+    // stackLayout + SIMPLE style collapses onto it — mirror of the canvas
+    // painter's legacyPositionFor).
+    const effLayout =
+      item.stackLayout || StackText.legacyLayoutFor(item.position);
+    const effPosition =
+      effLayout === "top-banner" ? "top" : effLayout === "bottom-center" ? "bottom" : "center";
+    const alignment = effPosition === "top" ? 8 : effPosition === "center" ? 5 : 2;
     // v1.14.6 preview parity (see buildAssDocument's BOX PARITY note):
     // BorderStyle=3 box = OUTLINECOLOUR fill (verified) + Outline = padding
     // extent; non-box outline/shadow scale with the output height exactly
@@ -3609,6 +3877,9 @@ function buildHeadlineEvents(headlines, width, height, winStart, winEnd, clampDu
  *
  * Headlines (v4.2): when `headlines` is a non-empty array, a Headline
  * style + one Dialogue per item are appended (Layer 1, above captions).
+ * v1.17 Stack Text: `headlineGeometry` (renderer-measured) routes kinetic
+ * stackStyle items through electron/stack-text-ass.js; absent/null keeps
+ * the legacy emitter for every item (old callers/tests — safe fallback).
  *
  * Word modes:
  *   - "off": one Dialogue per cue (full text).
@@ -3619,7 +3890,7 @@ function buildHeadlineEvents(headlines, width, height, winStart, winEnd, clampDu
  *     [start, next word's start), shows words 0..i stacked with \N,
  *     previous words dim, active word highlighted + animated.
  */
-function buildAssDocument(cues, cs, headlines, width, height, segStartMs, segEndMs, segDurMs) {
+function buildAssDocument(cues, cs, headlines, width, height, segStartMs, segEndMs, segDurMs, headlineGeometry) {
   const hasHeadlines = Array.isArray(headlines) && headlines.some((h) => h && h.text);
   if (!cs && !hasHeadlines) return null;
 
@@ -3710,7 +3981,7 @@ function buildAssDocument(cues, cs, headlines, width, height, segStartMs, segEnd
 
   // ── Headline overlay styles + events (v4.2, Layer 1) ──
   const headline = hasHeadlines
-    ? buildHeadlineEvents(headlines, width, height, winStart, winEnd, clampDur)
+    ? buildHeadlineEvents(headlines, width, height, winStart, winEnd, clampDur, headlineGeometry)
     : { styleLines: [], eventLines: [], count: 0 };
 
   // [V4+ Styles] — Default (captions) + Headline styles.
@@ -3895,7 +4166,7 @@ function optimizeAssForConstrainedCpu(doc) {
 }
 
 ipcMain.handle("export-native", async (event, opts) => {
-  const { outputPath, fps: reqFps, width: reqWidth, height: reqHeight, bitrateMbps, quality, crf, audioKbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark, overlays, sfx, fastMode: fastModeWanted, slideshowFps24, textRemoval: textRemovalRaw } = opts;
+  const { outputPath, fps: reqFps, width: reqWidth, height: reqHeight, bitrateMbps, quality, crf, audioKbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark, overlays, sfx, fastMode: fastModeWanted, slideshowFps24, textRemoval: textRemovalRaw, headlineGeometry, voiceovers, dubOriginalVolume } = opts;
   // ── v1.15 BURN-IN TEXT REMOVAL (default OFF) ──────────────────────────
   // sanitizeTextRemoval → null keeps every graph byte-identical when the
   // feature is off (the only default). Region rects are SOURCE-normalized
@@ -4126,6 +4397,35 @@ ipcMain.handle("export-native", async (event, opts) => {
     const sfxList = (Array.isArray(sfx) ? sfx : []).filter(
       (s) => s && typeof s.wavPath === "string" && s.wavPath,
     );
+    // v1.17 VOICEOVER/DUB: narration MP3s + dub WAVs, already uploaded to temp
+    // by the renderer (same lifecycle as SFX WAVs). Mixed as extra amix
+    // branches — volume + absolute-timeline adelay, resampled to the 48 kHz
+    // stereo bus (MP3s arrive 24 kHz mono).
+    const voiceoverList = (Array.isArray(voiceovers) ? voiceovers : []).filter(
+      (v) => v && typeof v.wavPath === "string" && v.wavPath,
+    );
+    // DUB DUCK — the ORIGINAL clip audio sits under the dub track. The
+    // renderer sends RAW segment volumes + dubOriginalVolume (0..1, only
+    // when a dub track exists); the scale is applied HERE (single source of
+    // truth) so preview and export can never disagree. Music/SFX/VO are
+    // NOT ducked.
+    const dubDuck =
+      Number.isFinite(Number(dubOriginalVolume)) && voiceoverList.length > 0
+        ? Math.max(0, Math.min(1, Number(dubOriginalVolume)))
+        : 1;
+    if (voiceoverList.length > 0) {
+      console.log(
+        `[Export] voiceovers: ${voiceoverList.length} track(s)` +
+          (dubDuck < 1 ? ` · original audio ducked to ${(dubDuck * 100).toFixed(0)}%` : ""),
+      );
+    }
+    if (dubDuck < 1) {
+      for (const s of segments) {
+        if (s && s.mediaType === "video") {
+          s.volume = G.normalizeVolume(s.volume) * dubDuck;
+        }
+      }
+    }
 
     // Base-lane validation: a VIDEO segment must carry its temp file.
     for (let i = 0; i < segments.length; i++) {
@@ -4486,6 +4786,7 @@ ipcMain.handle("export-native", async (event, opts) => {
           captionsEnabled ? captionSettings : null,
           headlinesEnabled ? headlines : null,
           width, height, segStartMs, segEndMs, seg.durationMs,
+          headlinesEnabled ? headlineGeometry : undefined,
         );
       }
 
@@ -4794,6 +5095,7 @@ ipcMain.handle("export-native", async (event, opts) => {
               captionsEnabled ? captionSettings : null,
               headlinesEnabled ? headlines : null,
               width, height, chunkStartMs, chunkStartMs + ch.durMs, ch.durMs,
+              headlinesEnabled ? headlineGeometry : undefined,
             );
             chunkAssSuffix = doc
               ? writeAssFile(doc, `${String(i).padStart(4, "0")}_${String(k).padStart(2, "0")}`)
@@ -5472,6 +5774,7 @@ ipcMain.handle("export-native", async (event, opts) => {
               captionsEnabled ? captionSettings : null,
               headlinesEnabled ? headlines : null,
               width, height, piece.t0Ms, piece.t0Ms + piece.durMs, piece.durMs,
+              headlinesEnabled ? headlineGeometry : undefined,
             );
             pieceAssSuffix = doc ? writeAssFile(doc, `sm${String(pi).padStart(3, "0")}`) : null;
           }
@@ -5597,7 +5900,8 @@ ipcMain.handle("export-native", async (event, opts) => {
         let spAudioPath = null;
         let spAudioErr = null;
         const hasAudioBus =
-          clipAudioBranches.length > 0 || !!audioPath || sfxList.length > 0;
+          clipAudioBranches.length > 0 || !!audioPath || sfxList.length > 0 ||
+          voiceoverList.length > 0;
         const spAudioPromise = hasAudioBus
           ? (async () => {
               const aPlan = SP.buildSinglePassPlan({
@@ -5610,6 +5914,7 @@ ipcMain.handle("export-native", async (event, opts) => {
                 audio,
                 audioPath,
                 sfx: sfxList,
+                voiceovers: voiceoverList,
                 clipAudio: clipAudioBranches,
                 loudnorm: spLoudnorm,
                 masterLoudnorm: spMasterLoudnorm,
@@ -5996,7 +6301,8 @@ ipcMain.handle("export-native", async (event, opts) => {
     // falls back to the v1.2 direct graph — never to a failed export.
     let masterMix = null;
     const audioBranchCount =
-      (audioPath ? 1 : 0) + clipAudioJobs.length + sfxList.length;
+      (audioPath ? 1 : 0) + clipAudioJobs.length + sfxList.length +
+      voiceoverList.length;
     if (
       audio && audio.normalize && audioBranchCount >= 2 && actualTotalSec > 0 &&
       // v1.14.5: the simple-audio fast path replaces the render+remeasure
@@ -6012,6 +6318,7 @@ ipcMain.handle("export-native", async (event, opts) => {
           audio,
           totalSec: actualTotalSec,
           sfx: sfxList,
+          voiceovers: voiceoverList,
           loudnorm: loudnormCtx,
           clipAudio: clipAudioJobs.map((j) => ({
             wavPath: j.wavPath,
@@ -6047,6 +6354,7 @@ ipcMain.handle("export-native", async (event, opts) => {
       outputPath,
       totalSec: actualTotalSec,
       sfx: sfxList,
+      voiceovers: voiceoverList,
       loudnorm: loudnormCtx,
       masterMix,
       // v1.14.5: the simple-audio fast path (static gains).
@@ -6058,7 +6366,7 @@ ipcMain.handle("export-native", async (event, opts) => {
         startMs: j.startMs,
         volume: j.volume,
       })),
-      newAudioGraph: anyVideoAudio || sfxList.length > 0,
+      newAudioGraph: anyVideoAudio || sfxList.length > 0 || voiceoverList.length > 0,
     });
 
     exportPhase = "mux";

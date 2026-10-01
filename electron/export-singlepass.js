@@ -1409,6 +1409,7 @@ function planSmartSegments(o) {
  *   audio,           // AudioSettings
  *   audioPath,       // music absolute path | null
  *   sfx,             // [{ wavPath, startMs, volume }]
+ *   voiceovers,      // v1.17: same shape — narration MP3s + dub WAVs
  *   clipAudio,       // [{ inputIdx (= base segment index), startMs, volume,
  *                    //    atempo: ["atempo=…"], durationMs }]
  *   loudnorm,        // { clip: [measure|null…], music: measure|null } | null
@@ -1480,7 +1481,8 @@ function buildSinglePassPlan(o) {
   if (audioOnly) {
     const clipAudioList = Array.isArray(clipAudio) ? clipAudio : [];
     const sfxList = Array.isArray(sfx) ? sfx : [];
-    if (!(clipAudioList.length > 0 || audioPath || sfxList.length > 0)) {
+    const voList = Array.isArray(o.voiceovers) ? o.voiceovers : [];
+    if (!(clipAudioList.length > 0 || audioPath || sfxList.length > 0 || voList.length > 0)) {
       return {
         inputs: [], script: "", hasAudioOut: false, videoOutLabel: null,
         warnings, scriptBytes: 0,
@@ -1522,6 +1524,14 @@ function buildSinglePassPlan(o) {
       sfxRefs.push({ inputIdx: idx, startMs: s.startMs, volume: s.volume });
       idx += 1;
     });
+    // v1.17 VOICEOVER/DUB — inputs after SFX (same layout as the two-step
+    // graph); narration MP3s get resampled inside buildAudioMixGraph.
+    const voRefs = [];
+    voList.forEach((v) => {
+      inputs.push("-thread_queue_size", "512", "-i", v.wavPath);
+      voRefs.push({ inputIdx: idx, startMs: v.startMs, volume: v.volume });
+      idx += 1;
+    });
     const { graph: audioGraph } = G.buildAudioMixGraph({
       totalSec: totalMs / 1000,
       audio,
@@ -1534,6 +1544,7 @@ function buildSinglePassPlan(o) {
       audioFastGain,
       masterGainDb,
       sfx: sfxRefs,
+      voiceovers: voRefs,
     });
     return {
       inputs,
@@ -1793,8 +1804,9 @@ function buildSinglePassPlan(o) {
   // no per-chunk AAC boundary glitches, no windowed amix math.
   const sfxList = Array.isArray(sfx) ? sfx : [];
   const clipAudioList = Array.isArray(clipAudio) ? clipAudio : [];
+  const voList = Array.isArray(o.voiceovers) ? o.voiceovers : [];
   const hasAudioOut = !videoOnly &&
-    (clipAudioList.length > 0 || !!audioPath || sfxList.length > 0);
+    (clipAudioList.length > 0 || !!audioPath || sfxList.length > 0 || voList.length > 0);
   if (hasAudioOut) {
     const loopMusic = !!(audioPath && audio && audio.musicLoop);
     if (audioPath) {
@@ -1807,6 +1819,14 @@ function buildSinglePassPlan(o) {
     sfxList.forEach((s) => {
       inputs.push("-thread_queue_size", "512", "-i", s.wavPath);
       s.inputIdx = idx;
+      idx += 1;
+    });
+    // v1.17 VOICEOVER/DUB — inputs after SFX (same layout as the audioOnly
+    // branch and the two-step graph).
+    const voRefs = [];
+    voList.forEach((v) => {
+      inputs.push("-thread_queue_size", "512", "-i", v.wavPath);
+      voRefs.push({ inputIdx: idx, startMs: v.startMs, volume: v.volume });
       idx += 1;
     });
     const { graph: audioGraph } = G.buildAudioMixGraph({
@@ -1828,6 +1848,7 @@ function buildSinglePassPlan(o) {
       audioFastGain,
       masterGainDb,
       sfx: sfxList.map((s) => ({ inputIdx: s.inputIdx, startMs: s.startMs, volume: s.volume })),
+      voiceovers: voRefs,
     });
     graph.push(audioGraph);
   }

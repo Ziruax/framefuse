@@ -11,6 +11,9 @@
 //   AUDIO lane   — the v4.7 waveform strip on its own labeled lane.
 //   SFX lane     — SfxItem pills (click = seek to start, drag = move,
 //                  Alt+click / hover x = remove).
+//   VO lane (v1.17) — VoiceoverItem chips: narration ("VO") + dub
+//                  segments ("DUB S1/S2…"); click = seek, drag = move,
+//                  Alt+click / hover x = remove (SFX pill parity).
 //
 // COMPATIBILITY: every new prop is OPTIONAL. When none of them is passed the
 // component renders the exact v4.9 single-track layout (base filmstrip +
@@ -39,6 +42,7 @@ import {
   Eraser,
   Layers,
   Maximize,
+  Mic,
   Music2,
   Play,
   Repeat,
@@ -65,6 +69,7 @@ import type {
   TimelineMode,
   TransitionSettings,
   TransitionStyle,
+  VoiceoverItem,
 } from "@/lib/merger/types";
 import { DISCLAIMER_ID, boundaryStyle } from "@/lib/merger/types";
 import { fmtTimecode } from "@/lib/merger/timeline";
@@ -105,6 +110,13 @@ interface TimelineRulerProps {
   onEditSfx?: (id: string, patch: Partial<SfxItem>) => void;
   /** v5: remove an SFX item. */
   onRemoveSfx?: (id: string) => void;
+  /** v1.17: voiceover/dub placements → chips on their own lane (click =
+   *  seek to start, drag = move, Alt+click / x = remove — SFX parity). */
+  voItems?: VoiceoverItem[];
+  /** v1.17: move a voiceover placement to a new start time (ms). */
+  onMoveVo?: (id: string, startMs: number) => void;
+  /** v1.17: remove a voiceover placement. */
+  onRemoveVo?: (id: string) => void;
   /** v5: video source durations (id → ms) for trim clamping. */
   videoDurations?: Record<string, number>;
   /** v5.1: split the ACTIVE base clip at the playhead (toolbar / S key). */
@@ -1540,6 +1552,9 @@ export function TimelineRuler({
   onMoveSfx,
   onEditSfx,
   onRemoveSfx,
+  voItems,
+  onMoveVo,
+  onRemoveVo,
   videoDurations,
   onSplit,
   onDuplicate,
@@ -1677,6 +1692,7 @@ export function TimelineRuler({
     onRemoveSfx != null ||
     videoDurations != null;
   const sfxList = sfxItems ?? [];
+  const voList = voItems ?? [];
 
   // ------------------------------------------------------------------
   // v5.1 PIXEL ZOOM state (4..400 px per timeline second).
@@ -1983,6 +1999,67 @@ export function TimelineRuler({
   };
 
   const handleMusicDragAbort = () => setMusicDrag(null);
+
+  // ---- v1.17 VOICEOVER chip drag (self-contained, music-drag parity: no
+  // lane switching, no shared DragInfo, no marquee/selection integration).
+  // Press seeks to the item's start (SFX pill parity); drag previews
+  // locally, commits once on pointerup; Alt+press is reserved for remove.
+  const [voDrag, setVoDrag] = useState<{
+    id: string;
+    pointerId: number;
+    startX: number;
+    origStart: number;
+    startMs: number;
+    didDrag: boolean;
+  } | null>(null);
+
+  const beginVoDrag = (e: ReactPointerEvent<HTMLDivElement>, item: VoiceoverItem) => {
+    if (e.button !== 0 || !onMoveVo) return;
+    e.stopPropagation();
+    if (e.altKey && onRemoveVo) return;
+    onSeek(Math.max(0, item.startMs));
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch {
+      // best-effort
+    }
+    setVoDrag({
+      id: item.id,
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      origStart: Math.max(0, item.startMs),
+      startMs: Math.max(0, item.startMs),
+      didDrag: false,
+    });
+  };
+
+  const handleVoPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const d = voDrag;
+    if (!d || d.pointerId !== e.pointerId) return;
+    const dx = e.clientX - d.startX;
+    if (!d.didDrag) {
+      if (Math.abs(dx) <= DRAG_DEADZONE_PX) return;
+    }
+    const msPerPx = msPerPxNow();
+    const ns = Math.max(
+      0,
+      Math.min(totalMs, snapMs(d.origStart + dx * msPerPx)),
+    );
+    setVoDrag((prev) =>
+      prev && prev.pointerId === e.pointerId
+        ? { ...prev, didDrag: true, startMs: ns }
+        : prev,
+    );
+  };
+
+  const handleVoPointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const d = voDrag;
+    if (!d || d.pointerId !== e.pointerId) return;
+    setVoDrag(null);
+    if (d.didDrag) onMoveVo?.(d.id, d.startMs);
+  };
+
+  const handleVoDragAbort = () => setVoDrag(null);
 
   // ------------------------------------------------------------------
   // v5.5 GROUP drag — pressing an item that belongs to a multi-selection
@@ -4131,7 +4208,7 @@ export function TimelineRuler({
           <div
             role="group"
             aria-label="Sound effects lane"
-            className="flex shrink-0 rounded-b-[7px]"
+            className="flex shrink-0"
             style={{ height: SFX_H, backgroundColor: LANE_BG_B }}
           >
             <LaneLabel icon={Zap} text="SFX" accent="#fbbf24" sticky />
@@ -4292,6 +4369,149 @@ export function TimelineRuler({
                           onClick={(e) => {
                             e.stopPropagation();
                             onRemoveSfx(item.id);
+                          }}
+                        >
+                          <X className="size-2.5" aria-hidden />
+                        </button>
+                      )}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+
+          {/* LANE 5 — VOICEOVER / DUB (v1.17; SFX pill parity, self-contained
+              drag). Narration chips read "VO", dub segments "DUB S1/S2…" with
+              the speaker index; width ∝ the ACTUAL audio duration. */}
+          <div
+            role="group"
+            aria-label="Voiceover lane"
+            className="flex shrink-0 rounded-b-[7px]"
+            style={{ height: SFX_H, backgroundColor: LANE_BG_B }}
+          >
+            <LaneLabel icon={Mic} text="VO" accent="#34d399" sticky />
+            <div
+              className="relative min-w-0 shrink-0 transition-colors hover:bg-white/[0.02]"
+              style={{ width: axisW }}
+            >
+              {voList.length === 0 ? (
+                <EmptyHint>No voiceover — narrate or dub from the Audio tab</EmptyHint>
+              ) : (
+                voList.map((item) => {
+                  const pv = voDrag?.id === item.id ? voDrag : null;
+                  const startMs = Math.max(0, pv?.startMs ?? item.startMs);
+                  const durMs = Math.max(40, item.durationMs);
+                  const pos =
+                    layout != null
+                      ? {
+                          left: layout.pxOf(startMs),
+                          width: Math.max(
+                            2,
+                            layout.pxOf(startMs + durMs) - layout.pxOf(startMs),
+                          ),
+                        }
+                      : {
+                          left: `${
+                            totalMs > 0
+                              ? Math.max(0, Math.min(100, (startMs / totalMs) * 100))
+                              : 0
+                          }%`,
+                          width: `${totalMs > 0 ? Math.max(0.2, (durMs / totalMs) * 100) : 0}%`,
+                        };
+                  const isDub = item.kind === "dub";
+                  const chipLabel = isDub
+                    ? `DUB S${(item.speaker ?? 0) + 1}`
+                    : "VO";
+                  return (
+                    <div
+                      key={item.id}
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`${isDub ? "Dub segment" : "Voiceover"} "${item.label}" at ${fmtTimecode(startMs)}`}
+                      className={cn(
+                        "group absolute select-none rounded-full border pl-1.5 pr-2 text-[8px] font-semibold",
+                        onMoveVo
+                          ? "cursor-grab touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-300/70"
+                          : "cursor-pointer",
+                        pv != null && pv.didDrag && "z-[3] cursor-grabbing",
+                      )}
+                      style={{
+                        ...pos,
+                        minWidth: 30,
+                        top: 4,
+                        height: 22,
+                        // v1.17: emerald chips (the VO accent), hotter while
+                        // dragging; dub chips carry a rose tint to tell the
+                        // two kinds apart at a glance.
+                        backgroundColor: isDub
+                          ? pv?.didDrag
+                            ? "rgba(251, 113, 133, 0.34)"
+                            : "rgba(251, 113, 133, 0.16)"
+                          : pv?.didDrag
+                            ? "rgba(52, 211, 153, 0.34)"
+                            : "rgba(52, 211, 153, 0.16)",
+                        borderColor: isDub
+                          ? "rgba(253, 164, 175, 0.5)"
+                          : "rgba(110, 231, 183, 0.5)",
+                        color: isDub ? "#fecdd3" : "#a7f3d0",
+                        boxShadow:
+                          pv?.didDrag
+                            ? "0 0 0 1.5px rgba(255,255,255,0.55), 0 3px 10px rgba(0,0,0,0.55)"
+                            : "0 1px 2px rgba(0,0,0,0.45)",
+                      }}
+                      title={`${isDub ? "Dub segment" : "Voiceover"} · ${fmtTimecode(startMs)} · ${(durMs / 1000).toFixed(1)}s · click to seek${onMoveVo ? ", drag to move" : ""}${onRemoveVo ? ", Alt+click or x to remove" : ""}`}
+                      onPointerDown={(e) => beginVoDrag(e, item)}
+                      onPointerMove={handleVoPointerMove}
+                      onPointerUp={handleVoPointerUp}
+                      onPointerCancel={handleVoDragAbort}
+                      onLostPointerCapture={handleVoDragAbort}
+                      onClick={(e) => {
+                        if (e.altKey && onRemoveVo) {
+                          e.stopPropagation();
+                          onRemoveVo(item.id);
+                        }
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          onSeek(Math.max(0, item.startMs));
+                        } else if (
+                          (e.key === "Delete" || e.key === "Backspace") &&
+                          onRemoveVo
+                        ) {
+                          e.preventDefault();
+                          onRemoveVo(item.id);
+                        }
+                      }}
+                    >
+                      <span
+                        className="flex shrink-0 items-center"
+                        aria-hidden
+                      >
+                        <Mic className="size-2.5" aria-hidden />
+                      </span>
+                      <span className="min-w-0 flex-1 truncate">{chipLabel}</span>
+                      <span className="shrink-0 tabular-nums opacity-70">
+                        {(durMs / 1000).toFixed(durMs < 1000 ? 2 : 1)}s
+                      </span>
+                      {onRemoveVo && (
+                        <button
+                          type="button"
+                          aria-label={`Remove ${isDub ? "dub segment" : "voiceover"}`}
+                          className="absolute -right-1 -top-1 z-[2] flex size-[14px] cursor-pointer items-center justify-center rounded-full border opacity-0 transition-opacity hover:border-red-400/60 hover:bg-red-500/70 focus-visible:opacity-100 group-hover:opacity-100"
+                          style={{
+                            borderColor: "rgba(63, 63, 70, 0.9)",
+                            backgroundColor: "#27272a",
+                            color: "#d4d4d8",
+                          }}
+                          onPointerDown={(e) => {
+                            // Don't start a chip drag / press-seek from the x.
+                            e.stopPropagation();
+                          }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onRemoveVo(item.id);
                           }}
                         >
                           <X className="size-2.5" aria-hidden />

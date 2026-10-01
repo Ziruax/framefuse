@@ -1,21 +1,18 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronDown,
   Zap,
-  Cpu,
   Film,
   Captions,
   AudioLines,
   ArrowLeftRight,
   BadgeCheck,
-  Bug,
   Wand2,
   RotateCcw,
   FileText,
   FileDown,
-  Gauge,
   Loader2,
   Sparkles,
   Type,
@@ -30,13 +27,16 @@ import {
   Images,
   Download,
   Check,
-  TriangleAlert,
   Cloud,
   HardDrive,
   KeyRound,
   ExternalLink,
   Eraser,
   ScanText,
+  Mic,
+  Languages,
+  Play,
+  Square,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type {
@@ -54,6 +54,8 @@ import type {
   TextRemovalSettings,
   TextRemovalMode,
   TextRemovalRegion,
+  DubSettings,
+  DubTrackResult,
 } from "@/lib/merger/types";
 import { TRANSITION_STYLE_INFO, QUALITY_PROFILES } from "@/lib/merger/types";
 import type { KenBurnsDirection } from "@/lib/merger/types";
@@ -68,6 +70,20 @@ import {
   HEADLINE_PRESETS,
   getHeadlinePreset,
 } from "@/lib/merger/headlinePresets";
+// v1.17 Stack Text: layout + kinetic-style preset vocabulary + the pure
+// animation math (reused directly by the inline live preview).
+import {
+  STACK_LAYOUTS,
+  STACK_STYLES,
+  SIMPLE_STYLES,
+  getStackStyle,
+  isKineticStyle,
+  stackUnitTransforms,
+  STACK_FADE_OUT_MS,
+  type StackLayoutId,
+  type StackStyleId,
+  type StackUnitTransform,
+} from "@/lib/merger/stackTextPresets";
 import { ANIMATION_LABELS } from "@/lib/merger/captionAnimations";
 import {
   preloadWhisper,
@@ -188,16 +204,33 @@ interface SettingsPanelProps {
   /** v5.1: number of boundaries the random mix would cover (enables the
    *  button; 0/undefined hides it). */
   boundaryCount?: number;
-  debug: {
-    imageCount: number;
-    mode: string | null;
-    totalMs: number;
-    currentMs: number;
-    activeSegment: string | null;
-    inElectron: boolean;
-  };
   // (v1.11: the Chroma tab props were removed with the tab — the per-clip
   // keyer + track switch live in the media panel's clip settings.)
+  /** ── v1.17 Voiceover (Edge TTS) + Translate & Dub ── */
+  /** Synthesized narration lands at the playhead (page owns currentMs). */
+  onAddVoiceover: (r: {
+    text: string;
+    voice: string;
+    ratePct?: number;
+    pitchHz?: number;
+    volume: number;
+    durationMs: number;
+    bytes: ArrayBuffer;
+  }) => void;
+  /** Machine-level dub preferences (localStorage). */
+  dubSettings: DubSettings;
+  onDubSettingsChange: (s: DubSettings) => void;
+  /** Local base-lane video clips available as dub sources. */
+  dubSourceCount: number;
+  dubBusy: boolean;
+  dubProgress: { phase: string; progress: number; status: string } | null;
+  dubResult: DubTrackResult | null;
+  onStartDub: () => void;
+  onCancelDub: () => void;
+  onApplyDubTrack: () => void;
+  onDiscardDub: () => void;
+  /** Placements currently on the VO lane (narration + dub). */
+  voCount: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -509,159 +542,21 @@ export function SettingsPanel(props: SettingsPanelProps) {
     videoSourceForDetect,
     onRandomMix,
     boundaryCount,
-    debug,
+    onAddVoiceover,
+    dubSettings,
+    onDubSettingsChange,
+    dubSourceCount,
+    dubBusy,
+    dubProgress,
+    dubResult,
+    onStartDub,
+    onCancelDub,
+    onApplyDubTrack,
+    onDiscardDub,
+    voCount,
   } = props;
 
   const zoomMax = 1.06 + (kenBurns.intensity / 100) * 0.18;
-
-  // v5.1: async GPU-encoder probe (Electron only) for the export-tab badge.
-  // v8.1 (Task 27-b): `forced` is true when the force-encoder dropdown
-  // bypassed the probe — the badge then says "(forced, probe bypassed)".
-  const [exportInfo, setExportInfo] = useState<{
-    encoder: string;
-    encoderName: string;
-    forced?: boolean;
-    tier?: string;
-    tierLabel?: string;
-    workers?: number;
-    threadsPerWorker?: number;
-    filterWorkers?: number;
-    cpuCount?: number;
-    cpuLogical?: number;
-    cpuPhysical?: number;
-    cpuTopology?: string;
-    cpuModel?: string;
-    optimizeSubtitles?: boolean;
-  } | null>(null);
-  // v1.5: ffmpeg build diagnostics (which binary + its capabilities) — one
-  // async fetch on mount, rendered in the Export tab next to the encoder badge.
-  const [ffStatus, setFfStatus] = useState<{
-    ok: boolean;
-    path: string;
-    version: string | null;
-    error: string | null;
-    build?: "bundled-full" | "ffmpeg-static" | "system-path";
-    hasFfprobe?: boolean;
-    hasNvenc?: boolean;
-    hasQsv?: boolean;
-    hasAmf?: boolean;
-    hasLibass?: boolean;
-  } | null>(null);
-  useEffect(() => {
-    if (!inElectron) return; // browser: no ffmpeg binary
-    const api = window.electronAPI;
-    if (!api?.ffmpegStatus) return;
-    let cancelled = false;
-    api
-      .ffmpegStatus()
-      .then((status) => {
-        if (!cancelled && status && status.ok) setFfStatus(status);
-      })
-      .catch(() => {
-        /* diagnostics only — the encoder badge tells the story otherwise */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [inElectron]);
-  useEffect(() => {
-    if (!inElectron) return; // browser: no badge
-    const api = window.electronAPI;
-    if (!api?.getExportInfo) return;
-    let cancelled = false;
-    api
-      .getExportInfo()
-      .then((info) => {
-        if (!cancelled && info && typeof info.encoderName === "string") {
-          setExportInfo(info);
-        }
-      })
-      .catch(() => {
-        /* probe failed — no badge */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [inElectron]);
-
-  // v1.12.1: the REAL running-exe facts (app.getVersion() via app-info IPC)
-  // — powers the "About this build" strip at the bottom of the Export tab:
-  // the honest version check (a stale/hybrid install flags amber), the CPU
-  // core count, and the parallel-pool width this machine will use.
-  const [appInfo, setAppInfo] = useState<{
-    version: string;
-    electron?: string;
-    node?: string;
-    platform?: string;
-    cpus?: number;
-    cpuPhysicalCores?: number;
-    cpuLogicalCores?: number;
-    cpuModel?: string;
-    cpuTopology?: string;
-  } | null>(null);
-  useEffect(() => {
-    if (!inElectron) return;
-    const api = window.electronAPI;
-    if (!api?.appInfo) return;
-    let cancelled = false;
-    api
-      .appInfo()
-      .then((info) => {
-        if (!cancelled && info && typeof info.version === "string") {
-          setAppInfo(info);
-        }
-      })
-      .catch(() => {
-        /* diagnostics only */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [inElectron]);
-
-  // ── v8.1 (Task 27-b): force-encoder probe bypass — capability flag (render-
-  // safe: window is only touched inside the effect) + the change handler.
-  const [canForceEncoder, setCanForceEncoder] = useState(false);
-  useEffect(() => {
-    if (!inElectron) return;
-    const api = window.electronAPI;
-    // One-shot capability sync with the preload bridge (computed AFTER mount
-    // so the SSR'd markup — which has no window — never mismatches).
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setCanForceEncoder(typeof api?.setForceEncoder === "function");
-  }, [inElectron]);
-  const [forceKey, setForceKey] = useState<string>("auto");
-  const handleForceEncoderChange = useCallback(
-    async (key: string) => {
-      const api = window.electronAPI;
-      if (!api || typeof api.setForceEncoder !== "function") return;
-      const ipcKey = key === "auto" ? null : key;
-      try {
-        const res = await api.setForceEncoder(ipcKey);
-        if (!res || res.ok !== true) {
-          toast.error(res && res.error ? res.error : "Could not set forced encoder");
-          return;
-        }
-        setForceKey(key);
-        // One round trip: re-read export-info so the badge reflects the
-        // forced encoder + its `forced` flag immediately.
-        try {
-          const info = await api.getExportInfo();
-          if (info && typeof info.encoderName === "string") setExportInfo(info);
-        } catch {
-          /* badge keeps its last state */
-        }
-        toast.success(
-          key === "auto"
-            ? `Encoder probe restored — ${res.encoderName}`
-            : `Forced ${res.encoderName} (probe bypassed)`,
-        );
-      } catch (e) {
-        toast.error(e instanceof Error ? e.message : "Could not set forced encoder");
-      }
-    },
-    [],
-  );
 
   // Ken Burns pool toggle: clicking a chip toggles it in the pool while
   // staying in "random" mode (2+ selected = random among those). A single
@@ -978,7 +873,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
             </Field>
           </Section>
         </div>
-        {/* ─── Export tab — Video + Debug ────────────────────────────── */}
+        {/* ─── Export tab — Engine + Video ─────────────────────────── */}
         <div
           id="ff-settings-tabpanel-export"
           role="tabpanel"
@@ -989,198 +884,14 @@ export function SettingsPanel(props: SettingsPanelProps) {
             tab === "export" ? "ff-tab-panel-in" : "hidden",
           )}
         >
-          {/* ─── v1.15.1 GPU-Shift: ENGINE — the export ROUTER card. The
-              FFmpeg True Smart Render pipeline stays the DEFAULT engine;
-              the revived WebCodecs/WebGL engine (v8 architecture: GPU
-              canvas compositing + hardware H.264 + streamed muxing, strict
-              frame-pool memory discipline) is an OPT-IN beta toggle below.
-              Any GPU-engine failure auto-falls back to FFmpeg. The card
-              carries the encoder probe badge + the smart-render story
-              (docs/EXPORT_PERF.md). ────────────────────────── */}
+          {/* ─── ENGINE — Rust native (default) with automatic FFmpeg
+              fallback. ────────────────────────────────────────────────── */}
           <Section icon={<Zap size={13} />} title="Engine" defaultOpen>
-            <div
-              className="flex flex-col items-start gap-1 rounded-lg border p-2.5 text-left"
-              style={{
-                borderColor: "rgba(14, 116, 144, 0.5)",
-                backgroundColor: "rgba(8, 51, 68, 0.18)",
-              }}
-            >
-              <span className="flex w-full items-center justify-between gap-2">
-                <span className="text-[11px] font-bold" style={{ color: "#a5f3fc" }}>
-                  Smart Render
-                </span>
-                <span
-                  className="rounded px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wide"
-                  style={{
-                    backgroundColor: "rgba(34, 211, 238, 0.16)",
-                    color: "#67e8f9",
-                  }}
-                >
-                  active
-                </span>
-              </span>
-              <span className="text-[9px] leading-relaxed" style={{ color: "#8b8b94" }}
-                title="True Smart Rendering: untouched ranges are stream-copied at original quality; only your edits are re-encoded. Heavily-edited timelines (≥70% dirty — full-length subtitles, watermarks, framerate resamples) split into 2–4 parallel render passes with hardware decode, and iGPU encoders (QSV/AMF/NVENC) are used when available."
-              >
-                Untouched footage is copied at full quality — only your edits
-                are re-encoded, in parallel when needed.
-              </span>
-              {/* v5.1: encoder badge — bordered chip, Zap (GPU) / Cpu
-                  (software) icon + label. Describes the encoder probe result
-                  (Electron only; hidden in the browser). v8.1: shows the
-                  forced state when the probe was bypassed. */}
-              {exportInfo && (
-                <span
-                  className="mt-1 flex w-full flex-wrap items-center gap-x-1.5 gap-y-0.5 rounded border px-1.5 py-1 text-[9px] font-medium"
-                  style={{
-                    borderColor: "rgba(14, 116, 144, 0.55)",
-                    backgroundColor: "rgba(8, 51, 68, 0.25)",
-                    color: "#67e8f9",
-                  }}
-                  title={`Exports encode with ${exportInfo.encoderName} (${exportInfo.encoder})`}
-                >
-                  {/nvenc|qsv|amf|videotoolbox|hw/i.test(exportInfo.encoder) ? (
-                    <Zap size={11} aria-hidden />
-                  ) : (
-                    <Cpu size={11} aria-hidden />
-                  )}
-                  Video encoder: {exportInfo.encoderName}
-                  {exportInfo.forced ? " (forced, probe bypassed)" : ""}
-                </span>
-              )}
-              {/* v1.13: the Adaptive Hardware Matrix tier — the exact
-                  worker × thread shape exports will run on THIS machine,
-                  stated BEFORE an export starts (the "how many ffmpeg.exe
-                  should Task Manager show?" number). */}
-              {exportInfo?.tierLabel && (
-                <span
-                  className="mt-1 flex w-full flex-wrap items-center gap-x-1.5 gap-y-0.5 rounded border px-1.5 py-1 text-[9px] font-medium"
-                  style={{
-                    borderColor: "rgba(14, 116, 144, 0.55)",
-                    backgroundColor: "rgba(8, 51, 68, 0.25)",
-                    color: "#67e8f9",
-                  }}
-                  title={`Adaptive Hardware Matrix: ${exportInfo.tier} — encode pool ${exportInfo.workers ?? "?"} ffmpeg worker(s) × ${exportInfo.threadsPerWorker ?? "?"} thread(s) each${(exportInfo.filterWorkers ?? 0) > (exportInfo.workers ?? 0) ? `, image-heavy exports widen to ${exportInfo.filterWorkers}×1 filter workers` : ""}${exportInfo.optimizeSubtitles ? " · subtitle blur stripped (low-cost rasterization)" : ""}.${exportInfo.cpuTopology ? ` CPU: ${exportInfo.cpuTopology}` : ""}${exportInfo.cpuModel ? ` (${exportInfo.cpuModel})` : ""}`}
-                >
-                  <Gauge size={11} aria-hidden />
-                  {exportInfo.tierLabel} · {exportInfo.workers}×
-                  {exportInfo.threadsPerWorker} threads
-                  {(exportInfo.filterWorkers ?? 0) > (exportInfo.workers ?? 0) && (
-                      <span
-                        title="Image/Ken Burns-heavy exports split across MORE single-thread processes — each ffmpeg's filter chain (zoompan/scale/captions) is single-threaded, so process count fills the machine"
-                      >
-                        · image pools {exportInfo.filterWorkers}×
-                        {Math.max(1, Math.floor((exportInfo.cpuLogical ?? exportInfo.cpuCount ?? exportInfo.filterWorkers ?? 1) / (exportInfo.filterWorkers ?? 1)))}t
-                      </span>
-                    )}
-                </span>
-              )}
-              {/* v1.13: Tier-3 machines get the 720p draft recommendation —
-                  half the pixels ≈ half the encode time on constrained CPUs. */}
-              {exportInfo?.tier === "TIER_3_CONSTRAINED_CPU" && (
-                <span
-                  className="mt-0.5 w-full text-[9px] leading-relaxed"
-                  style={{ color: "#fbbf24" }}
-                >
-                  This machine is Tier 3 — the Draft profile (720p) exports
-                  roughly 2× faster than 1080p here.
-                </span>
-              )}
-            </div>
+            <p className="text-[10px] leading-relaxed text-zinc-500">
+              Export engine: Rust native (auto) — falls back to FFmpeg
+              automatically if unavailable.
+            </p>
           </Section>
-
-          {/* ─── v8.1 (Task 27-b): force-encoder dropdown — bypass the FFmpeg
-              probe for driver diagnosis (Electron only). ─────────────────── */}
-          {inElectron && canForceEncoder && (
-            <div className="mb-3 px-1">
-              <select
-                value={forceKey}
-                onChange={(e) => {
-                  void handleForceEncoderChange(e.target.value);
-                }}
-                className="w-full rounded border bg-zinc-900 px-2 py-1.5 text-[11px] text-zinc-200"
-                style={{ borderColor: "#3f3f46" }}
-                aria-label="Force encoder (diagnostics)"
-              >
-                <option value="auto">Encoder probe: Auto</option>
-                <option value="nvenc">Force NVENC</option>
-                <option value="qsv">Force QSV</option>
-                <option value="amf">Force AMF</option>
-                <option value="x264">Force libx264</option>
-              </select>
-              <p
-                className="mt-1 text-[9px] leading-relaxed"
-                style={{ color: "#52525b" }}
-              >
-                Diagnostic: bypass the probe to test whether the GPU driver
-                works at all — a failed export here means the driver/binary,
-                not the probe.
-              </p>
-            </div>
-          )}
-
-          {/* v1.5: ffmpeg build + pipeline diagnostics — which binary is in
-              use and what it can do (full build ⇒ hardware encoders possible
-              + ffprobe fast probes; CPU exports run W timeline windows in
-              parallel). Electron only. */}
-          {ffStatus && ffStatus.ok && (
-            <div
-              className="ff-fade-up mb-3 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border px-2.5 py-1.5 text-[10px]"
-              style={{
-                borderColor: "rgba(24, 24, 27, 0.9)",
-                backgroundColor: "rgba(24, 24, 27, 0.35)",
-                color: "#a1a1aa",
-              }}
-              title={`${ffStatus.version || "ffmpeg"}\n${ffStatus.path}`}
-            >
-              <span
-                className="rounded px-1.5 py-0.5 font-bold uppercase tracking-wide"
-                style={
-                  ffStatus.build === "bundled-full"
-                    ? { backgroundColor: "rgba(16, 185, 129, 0.14)", color: "#34d399" }
-                    : { backgroundColor: "rgba(245, 158, 11, 0.12)", color: "#fbbf24" }
-                }
-              >
-                {ffStatus.build === "bundled-full"
-                  ? "full ffmpeg"
-                  : ffStatus.build === "ffmpeg-static"
-                    ? "minimal ffmpeg"
-                    : "system ffmpeg"}
-              </span>
-              {ffStatus.hasNvenc || ffStatus.hasQsv || ffStatus.hasAmf ? (
-                <span
-                  title="Hardware encoders compiled into this build — the runtime probe picks one only if it actually beats the CPU"
-                >
-                  {[
-                    ffStatus.hasNvenc ? "NVENC" : null,
-                    ffStatus.hasQsv ? "QSV" : null,
-                    ffStatus.hasAmf ? "AMF" : null,
-                  ]
-                    .filter(Boolean)
-                    .join(" · ")}
-                </span>
-              ) : (
-                <span title="This build has no hardware encoders — exports always ride the CPU (still parallel)">
-                  CPU-only build
-                </span>
-              )}
-              <span
-                title={
-                  ffStatus.hasFfprobe
-                    ? "ffprobe available — media analysis uses fast JSON probes (cached 24 h)"
-                    : "No ffprobe — media analysis uses the slower ffmpeg parser"
-                }
-              >
-                {ffStatus.hasFfprobe ? "ffprobe ✓" : "no ffprobe"}
-              </span>
-              <span title="Caption burn-in and karaoke tags require libass">
-                {ffStatus.hasLibass ? "libass ✓" : "no libass"}
-              </span>
-              <span title="CPU exports split the timeline across parallel ffmpeg processes (one per window) + one audio pass">
-                parallel CPU export ✓
-              </span>
-            </div>
-          )}
 
           {/* ─── Video ─────────────────────────────────────────────────── */}
           <Section icon={<Film size={13} />} title="Video" defaultOpen>
@@ -1351,9 +1062,8 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 }
               />
               <p className="mt-0.5 text-[9px]" style={{ color: "#52525b" }}>
-                On older/slow CPUs, long 1080p exports with captions or images
-                render at 720p-class instead (~2× faster). The toast always
-                says when it happened.
+                On slow CPUs, long 1080p exports render at 720p-class (~2×
+                faster) — the toast says when.
               </p>
             </Field>
             {/* v1.14.5: the slideshow 24-fps off switch (default ON). Pure-image
@@ -1378,41 +1088,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 }
               />
               <p className="mt-0.5 text-[9px]" style={{ color: "#52525b" }}>
-                Image-only timelines export at 24 fps (the film rate) — 20 %
-                fewer frames, visibly faster, same feel. The toast says when.
-              </p>
-            </Field>
-            {/* v1.15.1 GPU-Shift: the opt-in WebCodecs/WebGL export engine
-                (feature flag — DEFAULT OFF until field-verified). ON =
-                GPU canvas compositing + hardware H.264 encode, muxed bytes
-                streamed to disk; any engine failure auto-falls back to the
-                FFmpeg smart-render pipeline (the completion toast + export
-                result carry engine telemetry for A/B verification).
-                Timelines with burn-in text removal or loudness
-                normalization always route to FFmpeg (parity features). */}
-            <Field
-              label="GPU export engine (beta)"
-              hint={settings.gpuExportEngine ? "On — WebCodecs/WebGL" : "Off (default — FFmpeg)"}
-            >
-              <Segmented
-                options={[
-                  { value: "on", label: "On" },
-                  { value: "off", label: "Off" },
-                ]}
-                value={settings.gpuExportEngine ? "on" : "off"}
-                onChange={(v) =>
-                  onSettingsChange({
-                    ...settings,
-                    gpuExportEngine: v === "on" ? true : undefined,
-                  })
-                }
-              />
-              <p className="mt-0.5 text-[9px]" style={{ color: "#52525b" }}>
-                Composites and encodes on the GPU (WebCodecs hardware H.264)
-                instead of the CPU FFmpeg filter pipeline. If the GPU engine
-                hits any problem, the export automatically re-runs through
-                FFmpeg — no failed exports. The result toast shows which
-                engine ran + per-frame GPU render time.
+                Image-only timelines export at 24 fps — 20 % fewer frames.
               </p>
             </Field>
             <Field label="Frame rate">
@@ -1475,8 +1151,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 aria-label="Constant quality factor"
               />
               <p className="mt-0.5 text-[9px]" style={{ color: "#52525b" }}>
-                Lower = better quality + larger files. 18–22 is the sweet spot
-                for social uploads.
+                Lower = better quality + larger files; 18–22 suits social.
               </p>
             </Field>
             <Field
@@ -1514,91 +1189,11 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 })}
               </div>
               <p className="mt-0.5 text-[9px]" style={{ color: "#52525b" }}>
-                AAC export bitrate for clips + music. 192 suits most social
-                video; 320 keeps music projects near-transparent.
+                192 suits most social video; 320 for music projects.
               </p>
             </Field>
           </Section>
 
-          {/* ─── Debug ─────────────────────────────────────────────────── */}
-          <Section icon={<Bug size={13} />} title="Debug">
-            <div className="space-y-1 font-mono text-[10px] text-zinc-500">
-              <div>images: {debug.imageCount}</div>
-              <div>mode: {String(debug.mode)}</div>
-              <div>total: {(debug.totalMs / 1000).toFixed(1)}s</div>
-              <div>playhead: {(debug.currentMs / 1000).toFixed(1)}s</div>
-              <div>active: {debug.activeSegment ?? "—"}</div>
-              <div>env: {debug.inElectron ? "electron" : "browser"}</div>
-            </div>
-          </Section>
-
-          {/* ─── v1.12.1: ABOUT THIS BUILD — the honest version check at the
-              bottom of Settings → Export. The version shown is the REAL exe
-              version (app.getVersion(), the rcedit-stamped resource), not a
-              renderer constant: a stale install (old shell + new interface or
-              vice versa) turns the strip amber and says so. Also carries the
-              CPU core count and the parallel-pool width exports will use on
-              THIS machine — the "how many ffmpeg.exe should Task Manager
-              show?" number, before you even start an export. ─────────── */}
-          {inElectron && appInfo && (
-            <div
-              className="ff-fade-up mb-2 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border px-2.5 py-1.5 text-[10px]"
-              style={{
-                borderColor: "rgba(24, 24, 27, 0.9)",
-                backgroundColor: "rgba(24, 24, 27, 0.35)",
-                color: "#a1a1aa",
-              }}
-              title={
-                `The app shell reports v${appInfo.version}` +
-                (appInfo.electron ? ` · Electron ${appInfo.electron}` : "") +
-                (appInfo.platform ? ` · ${appInfo.platform}` : "")
-              }
-            >
-              {appInfo.version !== "1.14.1" ? (
-                <span
-                  className="flex items-center gap-1 rounded px-1.5 py-0.5 font-bold"
-                  style={{ backgroundColor: "rgba(245, 158, 11, 0.14)", color: "#fbbf24" }}
-                  title={`This install reports v${appInfo.version} — the current build is v1.14.1. Reinstall FrameFuse v1.14.1 (an old cached executable is running).`}
-                >
-                  <TriangleAlert size={11} aria-hidden />
-                  App v{appInfo.version} — update to v1.14.1
-                </span>
-              ) : (
-                <span
-                  className="rounded px-1.5 py-0.5 font-bold"
-                  style={{ backgroundColor: "rgba(16, 185, 129, 0.14)", color: "#34d399" }}
-                  title="The running executable matches the current build."
-                >
-                  App v{appInfo.version}
-                </span>
-              )}
-              {(appInfo.cpuPhysicalCores ?? appInfo.cpus) != null &&
-                (appInfo.cpuPhysicalCores ?? appInfo.cpus)! > 0 && (
-                <span
-                  title={
-                    (appInfo.cpuTopology || `CPU: ${appInfo.cpuModel || "unknown"}`) +
-                    (exportInfo?.tierLabel
-                      ? ` — encode pool ${exportInfo.workers ?? "?"} ffmpeg worker(s) × ${exportInfo.threadsPerWorker ?? "?"} thread(s)${(exportInfo.filterWorkers ?? 0) > (exportInfo.workers ?? 0) ? `, image-heavy exports widen to ${exportInfo.filterWorkers}×1` : ""} (check Task Manager → Details during an export)`
-                      : " — exports size their worker pool from this topology")
-                  }
-                >
-                  {/* v1.14.1: BOTH numbers, accurately labeled — the old strip
-                      printed the SMT thread count as "CPU cores" (a 4C/8T
-                      machine showed "8 CPU cores"). */}
-                  {appInfo.cpuPhysicalCores != null
-                    ? `${appInfo.cpuPhysicalCores} core${appInfo.cpuPhysicalCores === 1 ? "" : "s"} · ${appInfo.cpuLogicalCores ?? appInfo.cpus} thread${(appInfo.cpuLogicalCores ?? appInfo.cpus) === 1 ? "" : "s"}`
-                    : `${appInfo.cpus} CPU cores`}{" "}
-                  ·{" "}
-                  {exportInfo?.workers
-                    ? (exportInfo.filterWorkers ?? 0) > (exportInfo.workers ?? 0)
-                      ? `${exportInfo.workers}×${exportInfo.threadsPerWorker}-thread encode · ${exportInfo.filterWorkers}×1 image pools`
-                      : `${exportInfo.workers}×${exportInfo.threadsPerWorker}-thread ffmpeg workers`
-                    : `${(appInfo.cpuPhysicalCores ?? appInfo.cpus)! >= 4 ? Math.min(4, Math.max(2, Math.floor((appInfo.cpuPhysicalCores ?? appInfo.cpus)! / 2))) : 2}× ffmpeg workers`}
-                </span>
-              )}
-              {appInfo.electron && <span>Electron {appInfo.electron}</span>}
-            </div>
-          )}
         </div>
 
         {/* ─── Effects tab — Transitions + Watermark + Titles ────────── */}
@@ -1641,7 +1236,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
             />
           </Section>
 
-          {/* ─── Title overlay (v4.2) ────────────────────────────────── */}
+          {/* ─── Stack Text (v4.2 headline overlay → v1.17) ────────────── */}
           <HeadlineSection
             items={headlineItems}
             onAdd={onAddHeadline}
@@ -1699,10 +1294,8 @@ export function SettingsPanel(props: SettingsPanelProps) {
               </div>
             </Row>
             <p className="mb-3 mt-[-8px] text-[10px] leading-relaxed text-zinc-500">
-              Scales everything — clip audio, music and sound effects — after
-              their own volume settings. 100% leaves the mix untouched. The
-              preview caps each source at 100%; above-100% boosts apply on
-              export (a limiter guards against clipping).
+              Scales clip audio, music and SFX — boosts above 100% apply on
+              export.
             </p>
             {/* ── v5.2: Background music placement ───────────────────────── */}
             {hasAudio ? (
@@ -1747,14 +1340,12 @@ export function SettingsPanel(props: SettingsPanelProps) {
                   />
                 </Row>
                 <p className="mb-3 mt-[-8px] text-[10px] leading-relaxed text-zinc-500">
-                  Music placement: drag the clip on the timeline's Audio lane to
-                  reposition it
+                  Drag the music clip on the timeline's Audio lane to reposition
+                  it
                   {audioSettings.musicStartMs > 0
                     ? ` (currently starting at ${(audioSettings.musicStartMs / 1000).toFixed(1)}s)`
                     : ""}
-                  . Loop repeats the track until the video ends — ideal when the
-                  music (2 min+) is longer than the edit. Volume above 100%
-                  boosts in the export (preview caps at 100%).
+                  . Loop repeats it until the video ends.
                 </p>
               </>
             ) : (
@@ -1786,13 +1377,8 @@ export function SettingsPanel(props: SettingsPanelProps) {
               </div>
             </Row>
             <p className="mb-3 mt-[-8px] text-[10px] leading-relaxed text-zinc-500">
-              Measures every clip and the music track first, then masters each
-              to −16 LUFS (social-media standard) with a static gain — evens
-              out quiet/loud sources with none of the pumping of one-pass
-              normalization. With several overlapping sources the summed mix
-              gets a final master measurement so the exported file always
-              lands at −16. Volume settings ride on top of the normalized
-              audio.
+              Masters every source to −16 LUFS (social standard) with a static
+              gain.
             </p>
             <Field
               label="Fade in"
@@ -1843,6 +1429,27 @@ export function SettingsPanel(props: SettingsPanelProps) {
               />
             </Field>
           </Section>
+
+          {/* ── v1.17: Voiceover (Edge TTS narration, Electron only) ────── */}
+          {inElectron && (
+            <VoiceoverSection onAddVoiceover={onAddVoiceover} voCount={voCount} />
+          )}
+
+          {/* ── v1.17: Translate & Dub (Groq Whisper → LLM → Edge TTS) ──── */}
+          {inElectron && (
+            <DubSection
+              dubSettings={dubSettings}
+              onDubSettingsChange={onDubSettingsChange}
+              dubSourceCount={dubSourceCount}
+              dubBusy={dubBusy}
+              dubProgress={dubProgress}
+              dubResult={dubResult}
+              onStartDub={onStartDub}
+              onCancelDub={onCancelDub}
+              onApplyDubTrack={onApplyDubTrack}
+              onDiscardDub={onDiscardDub}
+            />
+          )}
         </div>
 
         {/* ─── Captions tab — presets, word mode, Whisper, sidecars ──── */}
@@ -2041,8 +1648,7 @@ function TextRemovalSection({
       )}
       {!videoSourceForDetect && (
         <p className="mt-1.5 text-[10px] leading-snug text-zinc-600">
-          Detection needs at least one video clip on the timeline (it scans the
-          first one). The removal filters apply to every video segment.
+          Detection needs at least one video clip on the timeline.
         </p>
       )}
 
@@ -2128,18 +1734,15 @@ function TextRemovalSection({
       )}
 
       <p className="mt-3 text-[9px] leading-relaxed text-zinc-600">
-        Regions are detected on and applied to the video sources (before
-        reframing), so they follow every crop and aspect. The preview shows an
-        approximation; the export applies the true{" "}
-        {textRemoval.mode === "inpaint" ? "inpainting" : textRemoval.mode}. Off
-        by default — nothing runs unless you enable it.
+        Regions follow every crop and aspect — the preview is an approximation.
       </p>
     </Section>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Headline overlay section (v4.2) — viral hook titles
+// Headline overlay section (v4.2 → v1.17 "Stack Text") — viral hook titles
+// with LAYOUT (geometry) × STYLE (kinetic choreography) pickers.
 // ---------------------------------------------------------------------------
 interface HeadlineSectionProps {
   items: HeadlineItem[];
@@ -2149,17 +1752,143 @@ interface HeadlineSectionProps {
   totalMs: number;
 }
 
-const HEADLINE_ANIMATIONS: {
-  value: HeadlineItem["animation"];
-  label: string;
-  title: string;
-}[] = [
-  { value: "none", label: "None", title: "Static — no entrance" },
-  { value: "fade", label: "Fade", title: "Fade in / out (300ms)" },
-  { value: "slide-up", label: "Slide", title: "Slide up from below (280ms)" },
-  { value: "pop", label: "Pop", title: "Pop 0.6 → 1 with overshoot (260ms)" },
-  { value: "zoom-punch", label: "Punch", title: "Zoom 2.0 → 1 fast (200ms)" },
-];
+/** Legacy item.position → StackLayout derivation (stackLayout absent). */
+function legacyLayoutFor(position: HeadlineItem["position"]): StackLayoutId {
+  if (position === "top") return "top-banner";
+  if (position === "bottom") return "bottom-center";
+  return "center-stack";
+}
+
+// ── v1.17: animated inline style preview (tiny canvas-free rAF loop that
+// reuses stackUnitTransforms — the same math the export painter runs).
+const STACK_PREVIEW_W = 220;
+const STACK_PREVIEW_H = 64;
+const STACK_PREVIEW_LOOP_MS = 2600;
+
+function StackStylePreview({
+  text,
+  styleId,
+  accentColor,
+}: {
+  text: string;
+  styleId: string;
+  accentColor: string;
+}) {
+  const hostRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    const unitEls = Array.from(host.children) as HTMLElement[];
+    if (unitEls.length === 0) return;
+    if (!isKineticStyle(styleId)) {
+      // Simple styles: static chip (the canvas preview plays them).
+      for (const el of unitEls) {
+        el.style.opacity = "1";
+        el.style.transform = "none";
+        el.style.filter = "none";
+        el.style.clipPath = "none";
+      }
+      return;
+    }
+    const loopMs = STACK_PREVIEW_LOOP_MS;
+    let raf = 0;
+    const startedAt = performance.now();
+    const tick = (now: number) => {
+      const currentMs = (now - startedAt) % loopMs;
+      const outTail = Math.max(
+        0,
+        Math.min(1, (loopMs - currentMs) / STACK_FADE_OUT_MS),
+      );
+      const transforms = stackUnitTransforms({
+        style: styleId as StackStyleId,
+        startMs: 0,
+        endMs: loopMs,
+        currentMs,
+        unitCount: unitEls.length,
+        canvasH: STACK_PREVIEW_H,
+        canvasW: STACK_PREVIEW_W,
+        unitWeights: unitEls.map((el) => Math.max(1, (el.dataset.ch || "").length)),
+      });
+      for (let i = 0; i < unitEls.length; i++) {
+        const t: StackUnitTransform | undefined = transforms[i];
+        const el = unitEls[i];
+        if (!t) continue;
+        if (!t.visible) {
+          el.style.opacity = "0";
+          continue;
+        }
+        el.style.opacity = String(t.alpha * outTail);
+        el.style.transform =
+          `translate(${t.offsetX.toFixed(1)}px, ${t.offsetY.toFixed(1)}px) ` +
+          `rotate(${t.rotate.toFixed(1)}deg) scale(${Math.max(0.01, t.scale).toFixed(3)})`;
+        const blur = t.blur * (STACK_PREVIEW_H / 1080);
+        el.style.filter = blur > 0.05 ? `blur(${blur.toFixed(2)}px)` : "none";
+        el.style.clipPath =
+          t.reveal < 1
+            ? `inset(0 ${(100 * (1 - t.reveal)).toFixed(1)}% 0 0)`
+            : "none";
+        // Karaoke fill: the accent overlay is the second child (clipped).
+        const fill = el.querySelector<HTMLElement>("[data-fill]");
+        if (fill) fill.style.width = `${(t.fillProgress * 100).toFixed(1)}%`;
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [styleId, text]);
+
+  const kinetic = isKineticStyle(styleId);
+  const unit = kinetic ? getStackStyle(styleId as StackStyleId).spec.unit : "word";
+  const karaoke = styleId === "karaoke-fill";
+  const units =
+    unit === "line"
+      ? text.split(/\n+/).filter(Boolean).slice(0, 3)
+      : text.split(/\s+/).filter(Boolean).slice(0, 6);
+
+  return (
+    <div
+      ref={hostRef}
+      className={cn(
+        "flex h-16 w-full select-none items-center justify-center gap-0.5 overflow-hidden rounded border px-1",
+        unit === "line" ? "flex-col" : "flex-row flex-wrap",
+      )}
+      style={{
+        borderColor: "#27272a",
+        backgroundColor: "#0a0a0a",
+        maxHeight: STACK_PREVIEW_H,
+        maxWidth: STACK_PREVIEW_W * 2,
+      }}
+      aria-hidden="true"
+    >
+      {units.length === 0 ? (
+        <span className="text-[10px] text-zinc-600">no text</span>
+      ) : (
+        units.map((u, i) => (
+          <span
+            key={i}
+            data-ch={u}
+            className={cn(
+              "relative inline-block whitespace-nowrap text-[11px] font-extrabold uppercase leading-tight text-white will-change-transform",
+              unit === "word" ? "m-[0_2px]" : "block",
+            )}
+          >
+            {u}
+            {karaoke && (
+              <span
+                className="absolute inset-y-0 left-0 overflow-hidden"
+                data-fill
+                style={{ width: "0%", color: accentColor }}
+              >
+                <span className="whitespace-nowrap">{u}</span>
+              </span>
+            )}
+          </span>
+        ))
+      )}
+    </div>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Transition section (v4.3) — style tiles with LIVE CSS mini-previews
@@ -2541,12 +2270,12 @@ function HeadlineSection({
     <Section
       key={items.length > 0 ? "hl-with-items" : "hl-empty"}
       icon={<Type size={13} />}
-      title="Title Overlay"
+      title="Stack Text"
       defaultOpen={items.length > 0}
     >
       <p className="mb-3 text-[10px] leading-relaxed text-zinc-500">
-        Big hook titles independent of captions — perfect for the first 3
-        seconds. Burned into the export exactly like the preview.
+        Big hook titles — 6 layouts × kinetic styles, burned into the export
+        exactly like the preview.
       </p>
 
       {/* Status line */}
@@ -2571,6 +2300,15 @@ function HeadlineSection({
           const preset = getHeadlinePreset(item.presetId);
           const dur = (item.endMs - item.startMs) / 1000;
           const invalid = item.endMs <= item.startMs;
+          // v1.17 Stack Text: effective layout (legacy items derive one from
+          // their position) + effective style (kinetic stackStyle, or the
+          // legacy simple animation when the item has none).
+          const effLayout: StackLayoutId =
+            item.stackLayout ?? legacyLayoutFor(item.position);
+          const effStyle: string =
+            item.stackStyle && isKineticStyle(item.stackStyle)
+              ? item.stackStyle
+              : item.animation;
           return (
             <div
               key={item.id}
@@ -2698,7 +2436,7 @@ function HeadlineSection({
                 </span>
               </div>
 
-              {/* Preset select */}
+              {/* Preset select (visual style) */}
               <select
                 value={item.presetId}
                 onChange={(e) =>
@@ -2706,7 +2444,7 @@ function HeadlineSection({
                 }
                 className="mb-2 w-full rounded border bg-zinc-900 px-2 py-1.5 text-[11px] text-zinc-200 focus:border-violet-500"
                 style={{ borderColor: "#3f3f46" }}
-                aria-label={`Headline ${idx + 1} style`}
+                aria-label={`Headline ${idx + 1} visual style`}
               >
                 {HEADLINE_PRESETS.map((p) => (
                   <option key={p.id} value={p.id}>
@@ -2715,37 +2453,88 @@ function HeadlineSection({
                 ))}
               </select>
 
-              {/* Position + animation */}
-              <Segmented
-                size="sm"
-                options={[
-                  { value: "top", label: "Top", title: "Top of frame" },
-                  {
-                    value: "center",
-                    label: "Center",
-                    title: "Middle of frame",
-                  },
-                  {
-                    value: "bottom",
-                    label: "Bottom",
-                    title: "Bottom of frame",
-                  },
-                ]}
-                value={item.position}
-                onChange={(v) => onUpdate(item.id, { position: v })}
+              {/* v1.17 Stack Text: Layout picker (geometry of the lines) */}
+              <label
+                className="mb-0.5 block text-[10px] font-medium text-zinc-400"
+                htmlFor={`stack-layout-${item.id}`}
+              >
+                Layout
+              </label>
+              <select
+                id={`stack-layout-${item.id}`}
+                value={effLayout}
+                onChange={(e) =>
+                  onUpdate(item.id, {
+                    stackLayout: e.target.value as StackLayoutId,
+                  })
+                }
+                className="mb-2 w-full rounded border bg-zinc-900 px-2 py-1.5 text-[11px] text-zinc-200 focus:border-violet-500"
+                style={{ borderColor: "#3f3f46" }}
+                aria-label={`Headline ${idx + 1} layout`}
+              >
+                {STACK_LAYOUTS.map((l) => (
+                  <option key={l.id} value={l.id} title={l.hint}>
+                    {l.name} — {l.hint}
+                  </option>
+                ))}
+              </select>
+
+              {/* v1.17 Stack Text: Style picker (8 kinetic + 4 simple) */}
+              <label
+                className="mb-0.5 block text-[10px] font-medium text-zinc-400"
+                htmlFor={`stack-style-${item.id}`}
+              >
+                Style
+              </label>
+              <select
+                id={`stack-style-${item.id}`}
+                value={effStyle}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (isKineticStyle(v)) {
+                    // Kinetic: stackStyle wins, legacy animation neutralized.
+                    onUpdate(item.id, {
+                      stackStyle: v as StackStyleId,
+                      animation: "none",
+                    });
+                  } else {
+                    // Simple: legacy animation wins, stackStyle cleared.
+                    onUpdate(item.id, {
+                      stackStyle: undefined,
+                      animation: v as HeadlineItem["animation"],
+                    });
+                  }
+                }}
+                className="mb-1.5 w-full rounded border bg-zinc-900 px-2 py-1.5 text-[11px] text-zinc-200 focus:border-violet-500"
+                style={{ borderColor: "#3f3f46" }}
+                aria-label={`Headline ${idx + 1} animation style`}
+              >
+                <optgroup label="Kinetic">
+                  {STACK_STYLES.map((s) => (
+                    <option key={s.id} value={s.id} title={s.hint}>
+                      {s.name} — {s.hint}
+                    </option>
+                  ))}
+                </optgroup>
+                <optgroup label="Simple">
+                  {SIMPLE_STYLES.map((s) => (
+                    <option key={s.id} value={s.id} title={s.hint}>
+                      {s.name} — {s.hint}
+                    </option>
+                  ))}
+                </optgroup>
+              </select>
+
+              {/* Animated live style preview */}
+              <StackStylePreview
+                text={item.text}
+                styleId={effStyle}
+                accentColor={preset.accentColor || "#FACC15"}
               />
-              <div className="mt-1.5">
-                <Segmented
-                  size="sm"
-                  options={HEADLINE_ANIMATIONS.map((a) => ({
-                    value: a.value,
-                    label: a.label,
-                    title: a.title,
-                  }))}
-                  value={item.animation}
-                  onChange={(v) => onUpdate(item.id, { animation: v })}
-                />
-              </div>
+              <p className="mb-1 mt-1 text-[9px] leading-relaxed text-zinc-500">
+                Kinetic styles render via the ASS compositor at export — the
+                engine picks automatically.
+              </p>
 
               {/* Size */}
               <div className="mt-2">
@@ -3209,9 +2998,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
             <div className="mt-2">
               {!inElectron || !groqApi?.whisperGroqGet ? (
                 <p className="text-[10px] leading-relaxed text-zinc-500">
-                  The cloud engine runs inside the FrameFuse desktop app — the
-                  browser preview falls back to the local engine. In the app:
-                  Settings → Captions → Engine → Groq Cloud.
+                  Cloud captions run in the desktop app — the browser preview
+                  uses the local engine.
                 </p>
               ) : groqCfg?.hasKey && !groqKeyEditing ? (
                 <div className="space-y-2">
@@ -3363,9 +3151,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
               </div>
 
               <p className="mt-2 text-[9px] leading-relaxed text-zinc-600">
-                Your key stays on this device (never in project files). Audio is
-                uploaded to api.groq.com for transcription only. Falls back to
-                the built-in engine whenever the cloud is unreachable.
+                Your key stays on this device; audio is sent to api.groq.com
+                for transcription only.
               </p>
             </div>
           ) : (
@@ -3374,9 +3161,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
                 ? "faster-whisper runtime detected — local transcription runs on your CPU."
                 : modelStatus?.bundled?.available
                   ? "Offline Whisper-tiny is bundled with the installer — works without internet."
-                  : "Offline Whisper runs locally (model downloads once on first use)."}{" "}
-              Switch to <span className="text-cyan-400">Groq Cloud</span> for
-              whisper-large-v3 accuracy at cloud speed.
+                  : "Offline Whisper runs locally (model downloads once on first use)."}
             </p>
           )}
         </div>
@@ -3468,24 +3253,6 @@ function CaptionsSection(props: CaptionsSectionProps) {
           </div>
         )}
         <p className="mt-2 text-[10px] leading-relaxed text-zinc-500">
-          {sttEngine === "groq" ? (
-            <>
-              <span className="text-cyan-400/90">Groq cloud</span> runs
-              whisper-large-v3-turbo — large-model accuracy at a fraction of
-              local compute, with{" "}
-              <span className="text-zinc-300">exact word-by-word timing</span>{" "}
-              for karaoke &amp; kinetic captions. Falls back to the offline
-              engine when the cloud is unreachable.
-            </>
-          ) : (
-            <>
-              <span className="text-amber-400/90">faster-whisper</span>{" "}
-              (CTranslate2 int8) runs locally — about 4× faster than the old
-              engine, with VAD silence skipping and{" "}
-              <span className="text-zinc-300">exact word-by-word timing</span>{" "}
-              for karaoke &amp; kinetic captions.
-            </>
-          )}{" "}
           Speech is taken from your audio track, or the first video clip when no
           track is loaded.
         </p>
@@ -4161,6 +3928,726 @@ function CaptionsSection(props: CaptionsSectionProps) {
           </button>
         </div>
       </Field>
+    </Section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// v1.17 — VOICEOVER (Edge TTS narration, created in-editor).
+// The MAIN process talks to Microsoft's Edge neural voices (free); the
+// renderer only picks a language/voice (previewable BEFORE committing),
+// writes the narration text, and adds the synthesized clip at the playhead.
+// ---------------------------------------------------------------------------
+
+/** Locale-appropriate one-liners for voice previews (non-Latin scripts need
+ *  native text — an English sample read by a Hindi voice sounds wrong). */
+const VOICE_PREVIEW_SAMPLES: Record<string, string> = {
+  hi: "नमस्ते, यह आवाज़ का एक नमूना है।",
+  ur: "ہیلو، یہ آواز کا ایک نمونہ ہے۔",
+  bn: "হ্যালো, এটি একটি ভয়েস নমুনা।",
+  ta: "வணக்கம், இது ஒரு குரல் மாதிரி.",
+  te: "హలో, ఇది వాయిస్ నమూనా.",
+  mr: "नमस्कार, हा आवाजाचा एक नमुना आहे.",
+  gu: "નમસ્તે, આ અવાજનો એક નમૂનો છે.",
+  kn: "ಹಲೋ, ಇದು ಧ್ವನಿ ಮಾದರಿ.",
+  ml: "ഹലോ, ഇതൊരു ശബ്ദ സാമ്പിൾ ആണ്.",
+  pa: "ਸਤ ਸ੍ਰੀ ਅਕਾਲ, ਇਹ ਆਵਾਜ਼ ਦਾ ਨਮੂਨਾ ਹੈ।",
+  ar: "مرحبًا، هذا عيّنة صوت.",
+  fa: "سلام، این یک نمونه صدا است.",
+  zh: "你好，这是一段语音示例。",
+  ja: "こんにちは、これは音声サンプルです。",
+  ko: "안녕하세요, 이것은 음성 샘플입니다.",
+  th: "สวัสดี นี่คือตัวอย่างเสียง",
+  vi: "Xin chào, đây là một mẫu giọng nói.",
+  ru: "Привет, это образец голоса.",
+  uk: "Привіт, це зразок голосу.",
+  tr: "Merhaba, bu bir ses örneğidir.",
+};
+
+function voicePreviewSample(locale: string, userText: string): string {
+  const first = userText.trim().slice(0, 90);
+  if (first) return first;
+  const lang = (locale || "").split("-")[0].toLowerCase();
+  return VOICE_PREVIEW_SAMPLES[lang] ?? "This is a voice preview.";
+}
+
+interface TtsVoice {
+  shortName: string;
+  gender: string;
+  locale: string;
+  friendlyName: string;
+  displayName: string;
+}
+
+/** Shared lazy voice-catalog loader (one fetch per mounted section; the
+ *  main process caches too — repeated calls are cheap). */
+function useTtsVoices() {
+  const [voices, setVoices] = useState<TtsVoice[] | null>(null);
+  const [pairs, setPairs] = useState<Record<string, { female: string; male: string }>>({});
+  useEffect(() => {
+    const get = window.electronAPI?.ttsVoices;
+    if (typeof get !== "function") return;
+    let cancelled = false;
+    get()
+      .then((r) => {
+        if (cancelled || !r) return;
+        setVoices(r.voices ?? []);
+        setPairs(r.pairs ?? {});
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return { voices, pairs };
+}
+
+function VoiceoverSection({
+  onAddVoiceover,
+  voCount,
+}: {
+  onAddVoiceover: (r: {
+    text: string;
+    voice: string;
+    ratePct?: number;
+    pitchHz?: number;
+    volume: number;
+    durationMs: number;
+    bytes: ArrayBuffer;
+  }) => void;
+  voCount: number;
+}) {
+  const { voices, pairs } = useTtsVoices();
+  const [text, setText] = useState("");
+  const [locale, setLocale] = useState("en-US");
+  const [voice, setVoice] = useState("en-US-AriaNeural");
+  const [ratePct, setRatePct] = useState(0);
+  const [pitchHz, setPitchHz] = useState(0);
+  const [volume, setVolume] = useState(1);
+  const [busy, setBusy] = useState(false);
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  const locales = useMemo(() => {
+    const set = new Set<string>();
+    for (const v of voices ?? []) set.add(v.locale);
+    return Array.from(set).sort();
+  }, [voices]);
+  const localeVoices = useMemo(
+    () => (voices ?? []).filter((v) => v.locale === locale),
+    [voices, locale],
+  );
+
+  // Locale switch → default to that locale's female pair voice.
+  const changeLocale = useCallback(
+    (next: string) => {
+      setLocale(next);
+      const pair = pairs[next];
+      if (pair?.female) setVoice(pair.female);
+      else {
+        const first = (voices ?? []).find((v) => v.locale === next);
+        if (first) setVoice(first.shortName);
+      }
+    },
+    [pairs, voices],
+  );
+
+  const stopPreview = useCallback(() => {
+    const a = previewAudioRef.current;
+    if (a) {
+      a.pause();
+      previewAudioRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => stopPreview, [stopPreview]);
+
+  const playPreview = useCallback(async () => {
+    const preview = window.electronAPI?.ttsPreview;
+    if (typeof preview !== "function") return;
+    stopPreview();
+    setPreviewBusy(true);
+    try {
+      const r = await preview({
+        voice,
+        text: voicePreviewSample(locale, text),
+      });
+      const blob = new Blob([r.bytes], { type: "audio/mpeg" });
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      previewAudioRef.current = audio;
+      audio.onended = () => URL.revokeObjectURL(url);
+      await audio.play();
+    } catch (err) {
+      toast.error("Voice preview failed", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setPreviewBusy(false);
+    }
+  }, [voice, locale, text, stopPreview]);
+
+  const addVoiceover = useCallback(async () => {
+    const synth = window.electronAPI?.ttsSynthesize;
+    if (typeof synth !== "function") return;
+    const trimmed = text.trim();
+    if (!trimmed) {
+      toast.error("Write the narration text first");
+      return;
+    }
+    setBusy(true);
+    try {
+      const r = await synth({
+        text: trimmed,
+        voice,
+        ratePct,
+        pitchHz,
+        volumePct: 0,
+      });
+      onAddVoiceover({
+        text: trimmed,
+        voice,
+        ratePct,
+        pitchHz,
+        volume,
+        durationMs: r.durationMs,
+        bytes: r.bytes,
+      });
+      setText("");
+    } catch (err) {
+      toast.error("Voiceover synthesis failed", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setBusy(false);
+    }
+  }, [text, voice, ratePct, pitchHz, volume, onAddVoiceover]);
+
+  const selectCls =
+    "w-full rounded border bg-zinc-900 px-2 py-1.5 text-[11px] text-zinc-200 focus:border-violet-500";
+
+  return (
+    <Section icon={<Mic size={13} />} title="Voiceover (TTS)" defaultOpen={false}>
+      <textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        rows={3}
+        placeholder="Narration text — one clip is placed at the playhead."
+        className="mb-2 w-full resize-y rounded border bg-zinc-900 px-2 py-1.5 text-[11px] text-zinc-200 placeholder:text-zinc-600 focus:border-violet-500 focus:outline-none"
+        style={{ borderColor: "#3f3f46" }}
+        aria-label="Narration text"
+      />
+      <div className="mb-2 grid grid-cols-2 gap-1.5">
+        <div>
+          <label className="mb-0.5 block text-[10px] font-medium text-zinc-400">
+            Language
+          </label>
+          <select
+            value={locale}
+            onChange={(e) => changeLocale(e.target.value)}
+            className={selectCls}
+            style={{ borderColor: "#3f3f46" }}
+            aria-label="Voiceover language"
+          >
+            {locales.length === 0 && <option value={locale}>{locale}</option>}
+            {locales.map((l) => (
+              <option key={l} value={l}>
+                {l}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label className="mb-0.5 block text-[10px] font-medium text-zinc-400">
+            Voice
+          </label>
+          <div className="flex items-center gap-1">
+            <select
+              value={voice}
+              onChange={(e) => setVoice(e.target.value)}
+              className={cn(selectCls, "flex-1")}
+              style={{ borderColor: "#3f3f46" }}
+              aria-label="Voiceover voice"
+            >
+              {localeVoices.length === 0 && <option value={voice}>{voice}</option>}
+              {localeVoices.map((v) => (
+                <option key={v.shortName} value={v.shortName}>
+                  {v.displayName}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={() => void playPreview()}
+              disabled={previewBusy || !voice}
+              title="Listen to this voice before using it"
+              className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded border text-cyan-300 transition-colors hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-40"
+              style={{ borderColor: "#3f3f46" }}
+              aria-label="Preview voice"
+            >
+              {previewBusy ? (
+                <Loader2 size={11} className="animate-spin" />
+              ) : (
+                <Play size={11} />
+              )}
+            </button>
+          </div>
+        </div>
+      </div>
+      <div className="mb-2 grid grid-cols-3 gap-1.5">
+        <Field label="Rate" hint={`${ratePct > 0 ? "+" : ""}${ratePct}%`}>
+          <input
+            type="range"
+            min={-50}
+            max={50}
+            step={5}
+            value={ratePct}
+            onChange={(e) => setRatePct(Number(e.target.value))}
+            className="w-full accent-violet-400"
+            aria-label="Speech rate"
+          />
+        </Field>
+        <Field label="Pitch" hint={`${pitchHz > 0 ? "+" : ""}${pitchHz}Hz`}>
+          <input
+            type="range"
+            min={-20}
+            max={20}
+            step={2}
+            value={pitchHz}
+            onChange={(e) => setPitchHz(Number(e.target.value))}
+            className="w-full accent-violet-400"
+            aria-label="Pitch"
+          />
+        </Field>
+        <Field label="Volume" hint={`${Math.round(volume * 100)}%`}>
+          <input
+            type="range"
+            min={0}
+            max={100}
+            step={5}
+            value={Math.round(volume * 100)}
+            onChange={(e) => setVolume(Number(e.target.value) / 100)}
+            className="w-full accent-violet-400"
+            aria-label="Voiceover volume"
+          />
+        </Field>
+      </div>
+      <button
+        type="button"
+        onClick={() => void addVoiceover()}
+        disabled={busy || !text.trim()}
+        className="flex w-full items-center justify-center gap-1.5 rounded bg-violet-500 px-2.5 py-1.5 text-[11px] font-semibold text-zinc-950 transition-colors hover:bg-violet-400 disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        {busy ? (
+          <>
+            <Loader2 size={11} className="animate-spin" /> Synthesizing…
+          </>
+        ) : (
+          <>
+            <Mic size={11} /> Add at playhead
+          </>
+        )}
+      </button>
+      <p className="mb-1 mt-1 text-[10px] leading-relaxed text-zinc-500">
+        {voCount > 0
+          ? `${voCount} clip${voCount === 1 ? "" : "s"} on the VO lane — drag to move, Alt+click to remove.`
+          : "Voiceovers regenerate automatically at export after a project is reopened."}
+      </p>
+    </Section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// v1.17 — TRANSLATE & DUB (Groq Whisper → free LLM → Edge TTS).
+// Source = the timeline's local video clips. Free-tier discipline: audio is
+// extracted + compressed for Groq's 25MB cap (auto-chunked when long), the
+// script is generated by llama-3.3-70b-versatile by default, speakers are
+// detected best-effort and auto-assigned male/female voices.
+// ---------------------------------------------------------------------------
+
+interface DubSectionProps {
+  dubSettings: DubSettings;
+  onDubSettingsChange: (s: DubSettings) => void;
+  dubSourceCount: number;
+  dubBusy: boolean;
+  dubProgress: { phase: string; progress: number; status: string } | null;
+  dubResult: DubTrackResult | null;
+  onStartDub: () => void;
+  onCancelDub: () => void;
+  onApplyDubTrack: () => void;
+  onDiscardDub: () => void;
+}
+
+const DUB_LOCALE_PREFERENCE = ["-IN", "-US", "-GB", "-CA", "-AU"];
+
+/** Best locale for a language code, given the pairs the TTS engine offers
+ *  (prefers IN first — the user's market — then the classic majors). */
+function dubLocaleFor(lang: string, pairs: Record<string, { female: string; male: string }>): string {
+  for (const suffix of DUB_LOCALE_PREFERENCE) {
+    const cand = `${lang}${suffix}`;
+    if (pairs[cand]) return cand;
+  }
+  const hit = Object.keys(pairs).find((k) => k.toLowerCase().startsWith(`${lang.toLowerCase()}-`));
+  return hit ?? `${lang}-IN`;
+}
+
+function DubSection(props: DubSectionProps) {
+  const {
+    dubSettings,
+    onDubSettingsChange,
+    dubSourceCount,
+    dubBusy,
+    dubProgress,
+    dubResult,
+    onStartDub,
+    onCancelDub,
+    onApplyDubTrack,
+    onDiscardDub,
+  } = props;
+
+  const { voices, pairs } = useTtsVoices();
+  const [models, setModels] = useState<Array<{ id: string; label: string; hint: string }>>([]);
+  const [langNames, setLangNames] = useState<Record<string, string>>({});
+  const [groqHasKey, setGroqHasKey] = useState<boolean | null>(null);
+  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  useEffect(() => {
+    const api = window.electronAPI;
+    if (typeof api?.dubModels === "function") {
+      api
+        .dubModels()
+        .then((r) => {
+          setModels(r.models ?? []);
+          setLangNames(r.langNames ?? {});
+        })
+        .catch(() => {});
+    }
+    if (typeof api?.whisperGroqGet === "function") {
+      api
+        .whisperGroqGet()
+        .then((cfg) => setGroqHasKey(!!cfg?.hasKey))
+        .catch(() => setGroqHasKey(false));
+    }
+  }, []);
+
+  // Keep the effective locale + default voices in sync with the language.
+  useEffect(() => {
+    const locale = dubLocaleFor(dubSettings.targetLanguage, pairs);
+    const pair = pairs[locale];
+    if (
+      locale !== dubSettings.targetLocale ||
+      (pair?.female && dubSettings.femaleVoice !== pair.female) ||
+      (pair?.male && dubSettings.maleVoice !== pair.male)
+    ) {
+      onDubSettingsChange({
+        ...dubSettings,
+        targetLocale: locale,
+        femaleVoice: pair?.female ?? dubSettings.femaleVoice,
+        maleVoice: pair?.male ?? dubSettings.maleVoice,
+      });
+    }
+  }, [dubSettings.targetLanguage, pairs]);
+
+  const localeVoices = useMemo(
+    () => (voices ?? []).filter((v) => v.locale === dubSettings.targetLocale),
+    [voices, dubSettings.targetLocale],
+  );
+
+  const changeLanguage = useCallback(
+    (lang: string) => {
+      const locale = dubLocaleFor(lang, pairs);
+      const pair = pairs[locale];
+      onDubSettingsChange({
+        ...dubSettings,
+        targetLanguage: lang,
+        targetLocale: locale,
+        femaleVoice: pair?.female ?? "",
+        maleVoice: pair?.male ?? "",
+      });
+    },
+    [dubSettings, pairs, onDubSettingsChange],
+  );
+
+  const playPreview = useCallback(
+    async (voice: string) => {
+      const preview = window.electronAPI?.ttsPreview;
+      if (typeof preview !== "function") return;
+      const a = previewAudioRef.current;
+      if (a) a.pause();
+      try {
+        const r = await preview({
+          voice,
+          text: voicePreviewSample(dubSettings.targetLocale, ""),
+        });
+        const blob = new Blob([r.bytes], { type: "audio/mpeg" });
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        previewAudioRef.current = audio;
+        audio.onended = () => URL.revokeObjectURL(url);
+        await audio.play();
+      } catch {
+        /* preview is best-effort */
+      }
+    },
+    [dubSettings.targetLocale],
+  );
+
+  useEffect(() => {
+    const a = previewAudioRef.current;
+    return () => {
+      if (a) a.pause();
+    };
+  }, []);
+
+  const languages = useMemo(
+    () =>
+      Object.entries(langNames)
+        .map(([code, name]) => ({ code, name }))
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    [langNames],
+  );
+
+  const selectCls =
+    "w-full rounded border bg-zinc-900 px-2 py-1.5 text-[11px] text-zinc-200 focus:border-cyan-500";
+  const startDisabled =
+    dubBusy ||
+    dubSourceCount === 0 ||
+    groqHasKey === false;
+
+  return (
+    <Section icon={<Languages size={13} />} title="Translate & Dub" defaultOpen={false}>
+      <div className="mb-2 grid grid-cols-2 gap-1.5">
+        <div>
+          <label className="mb-0.5 block text-[10px] font-medium text-zinc-400">
+            Dub into
+          </label>
+          <select
+            value={dubSettings.targetLanguage}
+            onChange={(e) => changeLanguage(e.target.value)}
+            className={selectCls}
+            style={{ borderColor: "#3f3f46" }}
+            aria-label="Target dub language"
+          >
+            {languages.length === 0 && (
+              <option value={dubSettings.targetLanguage}>
+                {langNames[dubSettings.targetLanguage] ?? dubSettings.targetLanguage}
+              </option>
+            )}
+            {languages.map((l) => (
+              <option key={l.code} value={l.code}>
+                {l.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label className="mb-0.5 block text-[10px] font-medium text-zinc-400">
+            Groq model (free tier)
+          </label>
+          <select
+            value={dubSettings.groqModel}
+            onChange={(e) =>
+              onDubSettingsChange({ ...dubSettings, groqModel: e.target.value })
+            }
+            className={selectCls}
+            style={{ borderColor: "#3f3f46" }}
+            aria-label="Groq text model"
+          >
+            {models.length === 0 && (
+              <option value={dubSettings.groqModel}>{dubSettings.groqModel}</option>
+            )}
+            {models.map((m) => (
+              <option key={m.id} value={m.id} title={m.hint}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+      <div className="mb-2 grid grid-cols-2 gap-1.5">
+        {(
+          [
+            ["Speaker 1 · female", "femaleVoice"],
+            ["Speaker 2 · male", "maleVoice"],
+          ] as const
+        ).map(([label, key]) => (
+          <div key={key}>
+            <label className="mb-0.5 block text-[10px] font-medium text-zinc-400">
+              {label}
+            </label>
+            <div className="flex items-center gap-1">
+              <select
+                value={dubSettings[key]}
+                onChange={(e) =>
+                  onDubSettingsChange({ ...dubSettings, [key]: e.target.value })
+                }
+                className={cn(selectCls, "flex-1")}
+                style={{ borderColor: "#3f3f46" }}
+                aria-label={label}
+              >
+                {localeVoices.length === 0 && (
+                  <option value={dubSettings[key]}>{dubSettings[key] || "auto"}</option>
+                )}
+                {localeVoices
+                  .filter(
+                    (v) =>
+                      (key === "femaleVoice"
+                        ? v.gender === "Female"
+                        : v.gender === "Male") || localeVoices.length <= 2,
+                  )
+                  .map((v) => (
+                    <option key={v.shortName} value={v.shortName}>
+                      {v.displayName}
+                    </option>
+                  ))}
+              </select>
+              <button
+                type="button"
+                onClick={() => void playPreview(dubSettings[key])}
+                disabled={!dubSettings[key]}
+                title="Listen to this voice"
+                className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded border text-cyan-300 transition-colors hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-40"
+                style={{ borderColor: "#3f3f46" }}
+                aria-label={`Preview ${label}`}
+              >
+                <Play size={11} />
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+      <Field
+        label="Original audio"
+        hint={`${Math.round(dubSettings.originalVolume * 100)}%`}
+      >
+        <input
+          type="range"
+          min={0}
+          max={100}
+          step={5}
+          value={Math.round(dubSettings.originalVolume * 100)}
+          onChange={(e) =>
+            onDubSettingsChange({
+              ...dubSettings,
+              originalVolume: Number(e.target.value) / 100,
+            })
+          }
+          className="w-full accent-cyan-500"
+          aria-label="Original audio level under the dub"
+        />
+      </Field>
+
+      {dubBusy && dubProgress ? (
+        <div className="mb-2">
+          <div className="mb-1 flex items-center justify-between gap-2">
+            <span className="flex items-center gap-1 text-[10px] text-zinc-300">
+              <Loader2 size={10} className="animate-spin" /> {dubProgress.status}
+            </span>
+            <button
+              type="button"
+              onClick={onCancelDub}
+              className="flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] text-zinc-400 transition-colors hover:bg-white/5"
+              style={{ borderColor: "#3f3f46" }}
+            >
+              <Square size={9} /> Cancel
+            </button>
+          </div>
+          <div
+            className="h-1 w-full overflow-hidden rounded-full"
+            style={{ backgroundColor: "#27272a" }}
+            role="progressbar"
+            aria-valuenow={Math.round(dubProgress.progress)}
+            aria-valuemin={0}
+            aria-valuemax={100}
+          >
+            <div
+              className="h-full rounded-full bg-cyan-400 transition-all"
+              style={{ width: `${Math.max(3, Math.min(100, dubProgress.progress))}%` }}
+            />
+          </div>
+        </div>
+      ) : (
+        <button
+          type="button"
+          onClick={onStartDub}
+          disabled={startDisabled}
+          title={
+            dubSourceCount === 0
+              ? "Import a local video clip first — the dub uses the timeline's audio"
+              : groqHasKey === false
+                ? "Add your free Groq API key in the Captions tab first"
+                : "Transcribe → translate → synthesize a full dub track"
+          }
+          className="flex w-full items-center justify-center gap-1.5 rounded bg-cyan-500 px-2.5 py-1.5 text-[11px] font-semibold text-zinc-950 transition-colors hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          <Languages size={11} />
+          {dubBusy ? "Dubbing…" : "Start dubbing"}
+        </button>
+      )}
+
+      {dubResult && (
+        <div className="mt-2 rounded border" style={{ borderColor: "#3f3f46" }}>
+          <div className="flex items-center justify-between px-2 py-1.5">
+            <span className="text-[10px] font-semibold text-zinc-300">
+              {dubResult.speakers.length} speaker
+              {dubResult.speakers.length === 1 ? "" : "s"} ·{" "}
+              {dubResult.segments.length} segments
+            </span>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={onApplyDubTrack}
+                className="flex items-center gap-1 rounded bg-cyan-500 px-2 py-1 text-[10px] font-semibold text-zinc-950 transition-colors hover:bg-cyan-400"
+              >
+                <Check size={10} /> Add to timeline
+              </button>
+              <button
+                type="button"
+                onClick={onDiscardDub}
+                className="flex items-center gap-1 rounded border px-1.5 py-1 text-[10px] text-zinc-400 transition-colors hover:bg-white/5"
+                style={{ borderColor: "#3f3f46" }}
+              >
+                <Trash2 size={10} /> Discard
+              </button>
+            </div>
+          </div>
+          <div
+            className="ff-scroll-thin max-h-64 overflow-y-auto px-2 pb-2"
+            role="log"
+            aria-label="Dub segments"
+          >
+            {dubResult.segments.map((s, i) => (
+              <div
+                key={i}
+                className="mb-1 rounded px-1.5 py-1 text-[10px] leading-relaxed"
+                style={{ backgroundColor: "#18181b" }}
+              >
+                <span
+                  className="mr-1 rounded px-1 py-px font-mono text-[9px] font-semibold"
+                  style={{
+                    backgroundColor: s.speaker === 0 ? "#0e7490" : "#78350f",
+                    color: "#e4e4e7",
+                  }}
+                >
+                  S{(s.speaker ?? 0) + 1}
+                </span>
+                <span className="text-zinc-500">
+                  {(s.startMs / 1000).toFixed(1)}s
+                </span>
+                <span className="mx-1 text-zinc-600">·</span>
+                {s.translatedText}
+                <div className="mt-0.5 truncate text-zinc-600">{s.sourceText}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <p className="mb-1 mt-1 text-[10px] leading-relaxed text-zinc-500">
+        {dubSourceCount > 0
+          ? `Source: ${dubSourceCount} timeline clip${dubSourceCount === 1 ? "" : "s"} — free Groq key required (Captions tab).`
+          : "Import a local video clip on the timeline to dub it."}
+      </p>
     </Section>
   );
 }

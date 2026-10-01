@@ -41,6 +41,7 @@ import type {
   OverlayPos,
   TransitionSettings,
   VideoSettings,
+  VoiceoverItem,
   WatermarkSettings,
 } from "./types";
 import { serializeSrt, type SubtitleCue } from "./subtitles";
@@ -105,6 +106,10 @@ export interface ProjectFile {
   /** v5.0: SFX placements on the master timeline (sanitized to known
    *  SFX_LIBRARY ids on load; invalid entries are dropped). */
   sfxItems?: SfxItem[];
+  /** v1.17: voiceover/dub placements — ITEMS ONLY (text/voice/prosody). The
+   *  audio bytes never persist; they regenerate at export (narration) or
+   *  ride with the dub result in-session. Sanitized on load. */
+  voiceovers?: VoiceoverItem[];
   /** v5.0: known source durations for video items (id → ms). */
   videoDurations?: Record<string, number>;
   /** Watermark / logo overlay (v4.4): image + settings. */
@@ -143,6 +148,8 @@ export interface SaveProjectInput {
   /** v5.0: SFX placements (rendered WAVs are re-synthesized on load —
    *  effects are procedural, only the placements persist). */
   sfxItems?: SfxItem[];
+  /** v1.17: voiceover/dub placements (bytes regenerate at export). */
+  voiceovers?: VoiceoverItem[];
   /** v5.0: known video source durations (id → ms). */
   videoDurations?: Record<string, number>;
   /** v1.14: disclaimer / intro lead-in card. */
@@ -255,6 +262,7 @@ export async function buildProjectFile(
     motionOverrides: sanitizeMotionOverrides(input.motionOverrides),
     itemEdits: sanitizeItemEdits(input.itemEdits),
     sfxItems: sanitizeSfxItems(input.sfxItems),
+    voiceovers: sanitizeVoiceoverItems(input.voiceovers),
     videoDurations: sanitizeVideoDurations(input.videoDurations),
     watermark,
     disclaimer,
@@ -387,6 +395,55 @@ export function sanitizeSfxItems(
   return out.length > 0 ? out : undefined;
 }
 
+/**
+ * v1.17: drop voiceover/dub placements that don't match the
+ * makeVoiceoverItem shapes — missing ids, unknown kinds, non-finite starts.
+ * Audio BYTES never persist (they regenerate at export from text/voice), so
+ * only the placement facts round-trip. Returns undefined when nothing
+ * survives (field omitted — ≤1.16 files load unchanged).
+ */
+export function sanitizeVoiceoverItems(
+  items: VoiceoverItem[] | undefined | null,
+): VoiceoverItem[] | undefined {
+  if (!Array.isArray(items)) return undefined;
+  const out: VoiceoverItem[] = [];
+  for (const it of items) {
+    if (!it || typeof it !== "object") continue;
+    if (typeof it.id !== "string" || !it.id) continue;
+    if (it.kind !== "narration" && it.kind !== "dub") continue;
+    if (typeof it.startMs !== "number" || !Number.isFinite(it.startMs)) continue;
+    if (typeof it.durationMs !== "number" || !Number.isFinite(it.durationMs)) continue;
+    const num = (v: unknown, dflt: number, lo: number, hi: number) =>
+      typeof v === "number" && Number.isFinite(v)
+        ? Math.min(hi, Math.max(lo, v))
+        : dflt;
+    const text = typeof it.text === "string" ? it.text : "";
+    out.push({
+      id: it.id,
+      kind: it.kind,
+      startMs: it.startMs,
+      durationMs: it.durationMs,
+      volume: num(it.volume, 1, 0, 1),
+      label: typeof it.label === "string" && it.label ? it.label.slice(0, 40) : text.slice(0, 28),
+      text,
+      voice: typeof it.voice === "string" ? it.voice : "",
+      ...(typeof it.ratePct === "number" && Number.isFinite(it.ratePct)
+        ? { ratePct: it.ratePct }
+        : {}),
+      ...(typeof it.pitchHz === "number" && Number.isFinite(it.pitchHz)
+        ? { pitchHz: it.pitchHz }
+        : {}),
+      ...(typeof it.speaker === "number" && Number.isFinite(it.speaker)
+        ? { speaker: it.speaker }
+        : {}),
+      ...(typeof it.endMs === "number" && Number.isFinite(it.endMs)
+        ? { endMs: it.endMs }
+        : {}),
+    });
+  }
+  return out.length > 0 ? out : undefined;
+}
+
 /** v5.0: keep finite, positive source durations only. */
 export function sanitizeVideoDurations(
   d: Record<string, number> | undefined | null,
@@ -488,6 +545,7 @@ export async function parseProjectDoc(doc: unknown): Promise<LoadedProject> {
   // clean data.
   project.itemEdits = sanitizeItemEdits(project.itemEdits);
   project.sfxItems = sanitizeSfxItems(project.sfxItems);
+  project.voiceovers = sanitizeVoiceoverItems(project.voiceovers);
   project.videoDurations = sanitizeVideoDurations(project.videoDurations);
 
   const imageFiles: { id: string; file: File; mediaType?: MediaKind }[] = [];

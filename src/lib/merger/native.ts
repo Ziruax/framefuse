@@ -23,6 +23,21 @@ import {
 } from "./renderer";
 import { getCaptionPreset, getFontOption } from "./captionPresets";
 import { getHeadlinePreset, type HeadlinePreset } from "./headlinePresets";
+// v1.17 Stack Text (kinetic headline typography) — the preset library is the
+// single source of truth shared with the main-process ASS twin.
+import {
+  getStackLayout,
+  getStackStyle,
+  isKineticStyle,
+  middleBandActiveLine,
+  stackLayoutLineOffsetX,
+  stackUnitTransforms,
+  STACK_FADE_OUT_MS,
+  type StackLayout,
+  type StackLayoutId,
+  type StackStyleId,
+  type StackUnitTransform,
+} from "./stackTextPresets";
 import { activeWordIndex, type WordTimestamp } from "./subtitles";
 import {
   computeWordTransform,
@@ -151,7 +166,10 @@ async function videoSourceBytes(
  * return null and keep the byte-upload fallback. This is exactly how
  * Shotcut/Kdenlive address sources (they never copy media on export).
  */
-function nativeSourcePath(file?: File | null): string | null {
+/** v1.17: absolute path of a local File (Electron's webUtils bridge) —
+ *  exported for the dubbing flow, which needs the timeline's video sources
+ *  as PATHS on the main-process side (audio extraction happens there). */
+export function nativeSourcePath(file?: File | null): string | null {
   if (!file) return null;
   try {
     const api = (window as Window & {
@@ -594,6 +612,10 @@ async function exportViaFFmpeg(
   }
 
   // 3.5 Headline overlay payload (v4.2) — burned in via extra ASS lines.
+  // v1.17 Stack Text: stackLayout/stackStyle ride along (absent on legacy
+  // items so old payloads stay byte-identical) + the renderer-measured
+  // geometry at the export resolution (line/word layout for the kinetic
+  // ASS emitter — line-break parity with the canvas by construction).
   const ipcHeadlines =
     opts.headlines && opts.headlines.length > 0
       ? opts.headlines
@@ -606,7 +628,13 @@ async function exportViaFFmpeg(
             position: h.position,
             animation: h.animation,
             sizeScale: h.sizeScale || 1,
+            ...(h.stackLayout ? { stackLayout: h.stackLayout } : {}),
+            ...(h.stackStyle ? { stackStyle: h.stackStyle } : {}),
           }))
+      : undefined;
+  const ipcHeadlineGeometry =
+    opts.headlineGeometry && opts.headlineGeometry.length > 0
+      ? opts.headlineGeometry
       : undefined;
 
   // 3.6 Watermark overlay payload (v4.4) — geometry computed once here so
@@ -658,6 +686,9 @@ async function exportViaFFmpeg(
       captionSettings: ipcCaptionSettings,
       subtitleCues: ipcSubtitleCues,
       headlines: ipcHeadlines,
+      // v1.17 Stack Text: measured line/word geometry for the kinetic ASS
+      // emitter (absent for legacy-only exports — main falls back safely).
+      headlineGeometry: ipcHeadlineGeometry,
       transition: opts.transition
         ? {
             style: opts.transition.style,
@@ -672,6 +703,18 @@ async function exportViaFFmpeg(
       // rendered SFX placements. Omitted entirely for v4.9-shaped projects.
       overlays: overlayPayload.length > 0 ? overlayPayload : undefined,
       sfx: ipcSfx.length > 0 ? ipcSfx : undefined,
+      // v1.17: voiceover/dub placements — the renderer (page.tsx) owns the
+      // byte cache + regeneration and uploads each item via saveTempAudio
+      // BEFORE this call; these are the resolved { wavPath, startMs, volume }
+      // triples (MP3 narration + 48 kHz WAV dub, mixed as amix branches).
+      // dubOriginalVolume rides along raw — the MAIN process scales the base
+      // segments' volume by it (single source of truth).
+      voiceovers: opts.voiceovers?.length ? opts.voiceovers : undefined,
+      dubOriginalVolume:
+        typeof opts.dubOriginalVolume === "number" &&
+        Number.isFinite(opts.dubOriginalVolume)
+          ? Math.max(0, Math.min(1, opts.dubOriginalVolume))
+          : undefined,
       // v1.15: burn-in text removal (default OFF — the main process
       // sanitizes it; null/absent keeps every graph byte-identical).
       textRemoval: opts.textRemoval ?? undefined,
@@ -717,6 +760,11 @@ async function exportViaFFmpeg(
 function gpuRoutableTimeline(opts: ExportNativeOptions): boolean {
   if (typeof VideoEncoder === "undefined" || typeof VideoFrame === "undefined") {
     return false; // no WebCodecs in this runtime
+  }
+  // v1.17: voiceover/dub placements are an FFmpeg amix feature — the GPU
+  // worker's audio mixdown has no VO inputs, so such exports stay native.
+  if (opts.voiceovers && opts.voiceovers.length > 0) {
+    return false;
   }
   // Burn-in text removal (v1.15): mirror of the main-process sanitizer's
   // active condition — enabled with at least one region → FFmpeg parity.
@@ -1163,10 +1211,437 @@ function clamp01(v: number): number {
   return Math.max(0, Math.min(1, v));
 }
 
+// ---------------------------------------------------------------------------
+// STACK TEXT (v1.17) — kinetic typography for headline items.
+//
+// Headline items with a kinetic `stackStyle` render through this path: the
+// LAYOUT (geometry of the stacked lines) comes from the item's stackLayout
+// (legacy items derive one from `position`), the per-unit choreography from
+// stackUnitTransforms() in stackTextPresets.ts. The legacy path above is
+// kept byte-identical for items without a stackStyle.
+//
+// Mirror twin: electron/main.js burns the SAME specs into ASS Dialogue lines
+// via electron/stack-text-ass.js — every number there traces back to the
+// preset library, never to this painter.
+// ---------------------------------------------------------------------------
+
+/**
+ * Karaoke-fill accent fallback for presets without an accentColor (impact /
+ * serif). Mirrored in electron/stack-text-ass.js — keep in sync.
+ */
+const KARAOKE_ACCENT_FALLBACK = "#FACC15";
+
+/** Legacy item.position → StackLayout derivation (stackLayout absent). */
+function legacyLayoutFor(position: HeadlineItem["position"]): StackLayoutId {
+  if (position === "top") return "top-banner";
+  if (position === "bottom") return "bottom-center";
+  return "center-stack";
+}
+
+/** Effective layout id for an item (stackLayout ?? legacyMap(position)). */
+function effectiveStackLayoutId(item: HeadlineItem): StackLayoutId {
+  return item.stackLayout ?? legacyLayoutFor(item.position);
+}
+
+/**
+ * Inverse of legacyLayoutFor — the legacy v4.2 renderer only knows
+ * top/center/bottom; items with a stackLayout but a SIMPLE style collapse
+ * their layout onto it (left-stack/stagger-offset → center). Round-trips
+ * legacyLayoutFor exactly, so old projects render byte-identical.
+ */
+function legacyPositionFor(layoutId: StackLayoutId): HeadlineItem["position"] {
+  if (layoutId === "top-banner") return "top";
+  if (layoutId === "bottom-center") return "bottom";
+  return "center";
+}
+
+/** One measured line of a stack-text block, painter + exporter shared. */
+interface StackMeasuredLine {
+  text: string;
+  /** Line width (px). */
+  width: number;
+  /** Left edge (px) incl. the layout's cascade offset. */
+  x: number;
+  /** Top edge (px). */
+  y: number;
+  /** Per-word text + width (word-unit styles). */
+  words: { text: string; width: number }[];
+}
+
+interface StackPaintMeasure {
+  preset: HeadlinePreset;
+  layout: StackLayout;
+  fontPx: number;
+  lineHeight: number;
+  lines: StackMeasuredLine[];
+  /** Reference block left (px) — widest line, no cascade. */
+  blockLeft: number;
+  blockTop: number;
+  /** Union width across lines incl. cascade offsets (the bg box width). */
+  blockW: number;
+}
+
+/**
+ * Measure one headline item with the EXACT painter font + wrap rules.
+ * Shared by the kinetic canvas painter and measureHeadlinesForExport() so
+ * the preview, the export payload and the ASS emitter can never disagree
+ * on line breaks or geometry.
+ */
+function measureHeadlineItem(
+  ctx: Ctx2D,
+  item: HeadlineItem,
+  cw: number,
+  ch: number,
+): StackPaintMeasure | null {
+  const preset: HeadlinePreset = getHeadlinePreset(item.presetId);
+  const layout = getStackLayout(effectiveStackLayoutId(item));
+
+  const scale = item.sizeScale || 1;
+  const fontPx = Math.max(10, Math.round(preset.fontSize * ch * scale));
+  const italic = preset.fontStyle === "italic" ? "italic " : "";
+  ctx.font = `${italic}${preset.fontWeight} ${fontPx}px ${preset.fontFamily}`;
+  ctx.textBaseline = "top";
+  try {
+    (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
+      `${(preset.letterSpacing / 1080) * ch}px`;
+  } catch {
+    /* not supported — ignore */
+  }
+
+  let display = item.text;
+  if (preset.textTransform === "uppercase") display = display.toUpperCase();
+
+  // Manual line breaks (\n in the text) + auto wrap at maxWidth — the same
+  // wrap the legacy painter and the ASS \N line breaks use.
+  const maxW = Math.max(60, preset.maxWidth * cw);
+  const rawLines: string[] = [];
+  for (const rawLine of display.split(/\n+/)) {
+    rawLines.push(...wrapText(ctx, rawLine, maxW));
+  }
+  if (rawLines.length === 0) return null;
+
+  const lineHeight = Math.round(
+    fontPx * (layout.spec.lineSpacingFrac ?? 1.22),
+  );
+  const middleBand = layout.spec.rotate === "middle-band";
+  // middle-band: ONE line on screen at a time → the block is a single-line
+  // band; every line renders at the same y (its slice owns the screen).
+  const blockH = (middleBand ? 1 : rawLines.length) * lineHeight;
+  let blockTop: number;
+  if (layout.spec.anchorY === "top") {
+    blockTop = layout.spec.marginYFrac * ch;
+  } else if (layout.spec.anchorY === "center") {
+    blockTop = layout.spec.marginYFrac * ch - blockH / 2;
+  } else {
+    blockTop = ch - layout.spec.marginYFrac * ch - blockH;
+  }
+
+  let minLeft = Infinity;
+  let maxRight = -Infinity;
+  const lines: StackMeasuredLine[] = rawLines.map((text, i) => {
+    const width = ctx.measureText(text).width;
+    const x =
+      (layout.spec.blockAlignmentX === "left"
+        ? layout.spec.leftMarginFrac * cw
+        : (cw - width) / 2) + stackLayoutLineOffsetX(layout, i, cw);
+    const y = middleBand ? blockTop : blockTop + i * lineHeight;
+    const words = text
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((w) => ({ text: w, width: ctx.measureText(w).width }));
+    minLeft = Math.min(minLeft, x);
+    maxRight = Math.max(maxRight, x + width);
+    return { text, width, x, y, words };
+  });
+
+  const blockLeft =
+    layout.spec.blockAlignmentX === "left"
+      ? layout.spec.leftMarginFrac * cw
+      : (cw - Math.max(...lines.map((l) => l.width))) / 2;
+
+  return {
+    preset,
+    layout,
+    fontPx,
+    lineHeight,
+    lines,
+    blockLeft,
+    blockTop,
+    blockW: Math.max(0, maxRight - minLeft),
+  };
+}
+
+/** One paintable unit: a word (word styles) or a whole line (line styles). */
+interface StackPaintUnit {
+  text: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  /** Global unit index (line index for line-unit styles). */
+  line: number;
+}
+
+/** Paint one unit with its per-unit transform (save/restore scoped). */
+function paintStackUnit(
+  ctx: Ctx2D,
+  unit: StackPaintUnit,
+  t: StackUnitTransform,
+  preset: HeadlinePreset,
+  blockAlpha: number,
+  ch: number,
+): void {
+  if (!t.visible) return;
+  const alpha = t.alpha * blockAlpha;
+  if (alpha <= 0.004) return;
+
+  ctx.save();
+  // Wipe styles: clip the unit to its revealed fraction (left → right).
+  if (t.reveal < 1) {
+    ctx.beginPath();
+    ctx.rect(unit.x, unit.y, unit.w * t.reveal, unit.h);
+    ctx.clip();
+  }
+
+  // Entrance transform around the unit's center.
+  if (t.scale !== 1 || t.offsetX !== 0 || t.offsetY !== 0 || t.rotate !== 0) {
+    const cx = unit.x + unit.w / 2;
+    const cy = unit.y + unit.h / 2;
+    ctx.translate(cx + t.offsetX, cy + t.offsetY);
+    ctx.rotate((t.rotate * Math.PI) / 180);
+    ctx.scale(t.scale, t.scale);
+    ctx.translate(-cx, -cy);
+  }
+
+  // blurPx is 1080p-referenced (spec contract) — scale to the live canvas.
+  const blurPx = t.blur * (ch / 1080);
+  if (blurPx > 0.05) {
+    ctx.filter = `blur(${blurPx}px)`;
+  }
+  ctx.globalAlpha = alpha;
+
+  // Glow / shadow (same shape as the legacy painter).
+  if (preset.shadow) {
+    ctx.shadowColor = preset.accentColor || preset.shadowColor;
+    ctx.shadowBlur = preset.shadowBlur * (ch / 540);
+    ctx.shadowOffsetX = 0;
+    ctx.shadowOffsetY = 0;
+  }
+
+  if (!preset.bgColor && preset.borderColor && preset.borderWidth > 0) {
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = preset.borderColor;
+    ctx.lineWidth = Math.max(1, (preset.borderWidth / 1080) * ch * 2);
+    ctx.strokeText(unit.text, unit.x, unit.y);
+  }
+  ctx.fillStyle = preset.textColor;
+  ctx.fillText(unit.text, unit.x, unit.y);
+
+  // Karaoke fill: overdraw the swept fraction in the accent color.
+  if (t.fillProgress > 0) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(unit.x, unit.y, unit.w * t.fillProgress, unit.h);
+    ctx.clip();
+    ctx.fillStyle = preset.accentColor || KARAOKE_ACCENT_FALLBACK;
+    ctx.fillText(unit.text, unit.x, unit.y);
+    ctx.restore();
+  }
+
+  ctx.restore();
+  ctx.filter = "none";
+}
+
+/**
+ * Kinetic Stack Text painter for ONE headline item. Geometry + wrap come
+ * from measureHeadlineItem (shared with the export payload), transforms
+ * from stackUnitTransforms (shared with the ASS twin's tag timings).
+ */
+function drawStackTextItem(
+  ctx: Ctx2D,
+  item: HeadlineItem,
+  styleId: StackStyleId,
+  currentMs: number,
+  cw: number,
+  ch: number,
+): void {
+  const measure = measureHeadlineItem(ctx, item, cw, ch);
+  if (!measure || measure.lines.length === 0) {
+    resetLetterSpacing(ctx);
+    return;
+  }
+  const { preset, layout, fontPx, lineHeight, lines } = measure;
+  const style = getStackStyle(styleId);
+  const wordUnit = style.spec.unit === "word";
+  const middleBand = layout.spec.rotate === "middle-band";
+
+  // Universal 300 ms block fade-out tail (matches the legacy outT).
+  const blockAlpha = clamp01((item.endMs - currentMs) / STACK_FADE_OUT_MS);
+  if (blockAlpha <= 0) {
+    resetLetterSpacing(ctx);
+    return;
+  }
+
+  // Background / sticker box — drawn around the WHOLE block (the union of
+  // the cascade-shifted lines), alpha scaled by the block tail. ASS has no
+  // box equivalent for kinetic items (canvas-only asymmetry, kept simple).
+  if (preset.bgColor) {
+    const padding = Math.round((preset.bgPadding / 1080) * ch);
+    const radius = Math.round((preset.bgRadius / 1080) * ch);
+    let boxX = Infinity;
+    let boxRight = -Infinity;
+    const boxY = measure.blockTop - padding;
+    const boxH =
+      (middleBand ? 1 : lines.length) * lineHeight + padding * 2;
+    for (const l of lines) {
+      boxX = Math.min(boxX, l.x - padding);
+      boxRight = Math.max(boxRight, l.x + l.width + padding);
+    }
+    const boxW = Math.min(cw - 8, boxRight - boxX);
+    ctx.save();
+    ctx.globalAlpha = preset.bgAlpha * blockAlpha;
+    ctx.fillStyle = preset.bgColor;
+    drawRoundedRect(ctx, boxX, boxY, boxW, boxH, radius);
+    ctx.fill();
+    if (preset.borderColor && preset.borderWidth > 0) {
+      ctx.lineJoin = "round";
+      ctx.strokeStyle = preset.borderColor;
+      ctx.lineWidth = Math.max(1, (preset.borderWidth / 1080) * ch * 2);
+      drawRoundedRect(ctx, boxX, boxY, boxW, boxH, radius);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // ── Build the paintable units + their transform inputs ──
+  let units: StackPaintUnit[] = [];
+  let startMs = item.startMs;
+  let endMs = item.endMs;
+  let unitWeights: number[] | undefined;
+
+  if (middleBand) {
+    // ONE line on screen at a time; the entrance re-triggers per slice.
+    const active = middleBandActiveLine(
+      item.startMs,
+      item.endMs,
+      currentMs,
+      lines.length,
+    );
+    if (active < 0) {
+      resetLetterSpacing(ctx);
+      return;
+    }
+    const sliceDur = (item.endMs - item.startMs) / lines.length;
+    startMs = item.startMs + active * sliceDur;
+    endMs = item.startMs + (active + 1) * sliceDur;
+    const line = lines[active];
+    if (wordUnit) {
+      units = lineWordsToUnits(line, active, fontPx, ctx);
+      unitWeights = units.map((u) => Math.max(1, u.text.length));
+    } else {
+      units = [
+        {
+          text: line.text,
+          x: line.x,
+          y: line.y,
+          w: line.width,
+          h: lineHeight,
+          line: active,
+        },
+      ];
+    }
+  } else if (wordUnit) {
+    // Word-unit styles: ONE transform call over the GLOBAL word sequence.
+    const spaceW = ctx.measureText(" ").width;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      let wx = line.x;
+      for (const w of line.words) {
+        units.push({
+          text: w.text,
+          x: wx,
+          y: line.y,
+          w: Math.max(1, w.width),
+          h: fontPx,
+          line: i,
+        });
+        wx += w.width + spaceW;
+      }
+    }
+    // Karaoke-fill sweep windows ∝ word length (mirrors the ASS \kf weights).
+    unitWeights = units.map((u) => Math.max(1, u.text.length));
+  } else {
+    // Line-unit styles: one unit per line.
+    units = lines.map((l, i) => ({
+      text: l.text,
+      x: l.x,
+      y: l.y,
+      w: Math.max(1, l.width),
+      h: lineHeight,
+      line: i,
+    }));
+  }
+
+  const transforms = stackUnitTransforms({
+    style: styleId,
+    startMs,
+    endMs,
+    currentMs,
+    unitCount: units.length,
+    canvasH: ch,
+    canvasW: cw,
+    unitWeights,
+  });
+
+  for (let i = 0; i < units.length; i++) {
+    paintStackUnit(ctx, units[i], transforms[i] ?? transforms[0], preset, blockAlpha, ch);
+  }
+
+  resetLetterSpacing(ctx);
+}
+
+/** Word units of one line, laid out left→right from the line's x. */
+function lineWordsToUnits(
+  line: StackMeasuredLine,
+  lineIndex: number,
+  fontPx: number,
+  ctx: Ctx2D,
+): StackPaintUnit[] {
+  const spaceW = ctx.measureText(" ").width;
+  const out: StackPaintUnit[] = [];
+  let wx = line.x;
+  for (const w of line.words) {
+    out.push({
+      text: w.text,
+      x: wx,
+      y: line.y,
+      w: Math.max(1, w.width),
+      h: fontPx,
+      line: lineIndex,
+    });
+    wx += w.width + spaceW;
+  }
+  return out;
+}
+
+/** Reset the canvas letterSpacing (leak guard — shared by both paths). */
+function resetLetterSpacing(ctx: Ctx2D): void {
+  try {
+    (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
+      "0px";
+  } catch {
+    /* noop */
+  }
+}
+
 /**
  * Draw every headline item active at currentMs onto the canvas.
  * Called by the preview + browser-export render loops after drawFrame()
  * and BEFORE captions so center-positioned captions layer on top.
+ *
+ * v1.17 Stack Text: items with a kinetic stackStyle render through the
+ * stack-text painter (layout geometry + per-unit choreography); items
+ * without one keep the legacy v4.2 entrance path, byte-identical.
  */
 export function drawHeadline(
   ctx: Ctx2D,
@@ -1179,6 +1654,13 @@ export function drawHeadline(
     if (!item?.text) continue;
     if (currentMs < item.startMs || currentMs >= item.endMs) continue;
 
+    const styleId = typeof item.stackStyle === "string" ? item.stackStyle : null;
+    if (styleId && isKineticStyle(styleId)) {
+      drawStackTextItem(ctx, item, styleId, currentMs, cw, ch);
+      continue;
+    }
+
+    // ── LEGACY PATH (v4.2) — unchanged ──────────────────────────────────
     const preset: HeadlinePreset = getHeadlinePreset(item.presetId);
     const t = headlineTransform(
       item.animation,
@@ -1218,9 +1700,13 @@ export function drawHeadline(
     const maxWidthLine = Math.max(...lines.map((l) => ctx.measureText(l).width));
 
     const positionYpx = Math.round((preset.positionY / 1080) * ch);
+    // v1.17: the effective position derives from the layout (round-trips
+    // legacyLayoutFor, so old items keep their exact v4.2 geometry; items
+    // with a stackLayout + SIMPLE style collapse onto it).
+    const effPosition = legacyPositionFor(effectiveStackLayoutId(item));
     let blockTop: number;
-    if (item.position === "top") blockTop = positionYpx;
-    else if (item.position === "center") blockTop = (ch - blockH) / 2;
+    if (effPosition === "top") blockTop = positionYpx;
+    else if (effPosition === "center") blockTop = (ch - blockH) / 2;
     else blockTop = ch - blockH - positionYpx;
 
     const blockLeft = (cw - maxWidthLine) / 2;
@@ -1282,13 +1768,104 @@ export function drawHeadline(
     ctx.restore();
 
     // Reset letterSpacing (leak guard).
-    try {
-      (ctx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing =
-        "0px";
-    } catch {
-      /* noop */
-    }
+    resetLetterSpacing(ctx);
   }
+}
+
+// ---------------------------------------------------------------------------
+// STACK TEXT EXPORT GEOMETRY (v1.17) — renderer-measured line/word layout
+// at the export resolution, shipped in the export-native payload so the
+// main-process ASS emitter (electron/stack-text-ass.js) uses the EXACT
+// canvas wrap + positions (line-break parity by construction).
+// ---------------------------------------------------------------------------
+
+/** One word of a measured export line. */
+export interface HeadlineExportWord {
+  text: string;
+  width: number;
+}
+
+/** One measured export line (all px at the export resolution). */
+export interface HeadlineExportLine {
+  /** Display text (preset transform applied — the painter's wrap output). */
+  text: string;
+  words: HeadlineExportWord[];
+  width: number;
+  /** Left edge incl. the layout's cascade offset. */
+  x: number;
+  /** Top edge. */
+  y: number;
+}
+
+/** Measured geometry for one headline item (see measureHeadlinesForExport). */
+export interface HeadlineExportGeometry {
+  text: string;
+  startMs: number;
+  endMs: number;
+  presetId: string;
+  sizeScale: number;
+  /** Legacy entrance field (dead when style ≠ "legacy"). */
+  animation: HeadlineItem["animation"];
+  /** Kinetic stackStyle id, or "legacy" when the item has none. */
+  style: string;
+  /** Effective layout id (stackLayout ?? legacyMap(position)). */
+  layout: string;
+  fontPx: number;
+  lineHeight: number;
+  blockLeft: number;
+  blockTop: number;
+  lines: HeadlineExportLine[];
+}
+
+/**
+ * Measure every headline item at the EXPORT resolution using the same font
+ * strings + wrap rules the painter uses — the export payload carries this
+ * so canvas and ASS agree on line breaks, word positions and block
+ * geometry. Pure DOM-canvas measurement (renderer side); returns [] when
+ * the DOM is unavailable (SSR/tests) or nothing is measurable.
+ */
+export function measureHeadlinesForExport(
+  items: HeadlineItem[],
+  width: number,
+  height: number,
+): HeadlineExportGeometry[] {
+  if (typeof document === "undefined" || !Array.isArray(items)) return [];
+  const out: HeadlineExportGeometry[] = [];
+  if (items.length === 0) return out;
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(width) || 1920);
+  canvas.height = Math.max(1, Math.round(height) || 1080);
+  const ctx = canvas.getContext("2d") as Ctx2D | null;
+  if (!ctx) return out;
+
+  for (const item of items) {
+    if (!item?.text || !(item.endMs > item.startMs)) continue;
+    const m = measureHeadlineItem(ctx, item, canvas.width, canvas.height);
+    if (!m || m.lines.length === 0) continue;
+    out.push({
+      text: item.text,
+      startMs: item.startMs,
+      endMs: item.endMs,
+      presetId: item.presetId,
+      sizeScale: item.sizeScale || 1,
+      animation: item.animation,
+      style: item.stackStyle ?? "legacy",
+      layout: effectiveStackLayoutId(item),
+      fontPx: m.fontPx,
+      lineHeight: m.lineHeight,
+      blockLeft: m.blockLeft,
+      blockTop: m.blockTop,
+      lines: m.lines.map((l) => ({
+        text: l.text,
+        words: l.words,
+        width: l.width,
+        x: Math.round(l.x * 100) / 100,
+        y: Math.round(l.y * 100) / 100,
+      })),
+    });
+    resetLetterSpacing(ctx);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
