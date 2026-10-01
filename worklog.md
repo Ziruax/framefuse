@@ -1852,3 +1852,20 @@ Work Log:
 
 Stage Summary:
 - All four user directives are implemented and browser-verified: (1) UI cleanup −619/+39 lines of residual controls + verbose text; (2) Stack Text kinetic typography (6 layouts × 8 kinetic styles, canvas↔ASS parity via measured geometry, export auto-routes kinetic to the libass compositor); (3) Edge TTS voiceover in the editor; (4) the full free-tier dubbing workflow (Groq Whisper with 25MB discipline → speaker detection → llama-3.3-70b-versatile translation → Hindi-by-default Edge TTS with previewable voices → ducked original audio).
+
+---
+Task ID: 57-g (release)
+Agent: main (Z.ai Code)
+Task: v1.17.0 release build + publish.
+
+Work Log:
+- CI run 36880536847 (push 5d513ad): job 1 first FAILED on a TRANSIENT npm-install sharp/libvips download timeout (windows-latest network flake, not code) → rerun-failed-jobs → PASSED: native MSVC engine 11,457,536 B, smoke-test assertions all green (rust-gpu/WARP, libx264 ladder, family 61/61/59/8/5, 150/150 frames, h264+aac 48kHz stereo, 5.013s, wall 3.67s). Artifact 11171920650 downloaded + staged into rust-engine/.
+- Housekeeping had wiped ALL staging (resources/, whisper-service/, dist/, out/, rust-engine/*.node — Task-55 class): rebuilt in parallel — next build --webpack + gpu-worker + wasm, fetch-windows-ffmpeg (DLLs from the tag-pinned GyanD 7.1.1 mirror + BtbN master exes), whisper service + 42MB tiny model.
+- RUST_ENGINE_SKIP=1 electron-builder --win nsis portable → FrameFuse Setup 1.17.0.exe (276,820,281 B) + FrameFuse 1.17.0.exe portable (276,556,358 B).
+- ASAR verified: app version 1.17.0; framefuse-engine.win32-x64.node BYTE-IDENTICAL to the CI artifact; 5 FFmpeg 7.1.1 DLLs + ffmpeg/ffprobe in win-unpacked; ALL 4 new electron modules (edge-tts, groq-chat, dub-workflow, stack-text-ass) inside the asar.
+- Released v1.17.0 (id 401094952): latest.yml + blockmap + FrameFuse-Setup-1.17.0.exe + FrameFuse-Portable-1.17.0.exe uploaded; three-way sha512 VERIFIED (local == latest.yml == re-downloaded GitHub asset) for the installer; portable re-download hash+size MATCH.
+- Dev server healthy: title "FrameFuse v1.17.0 — Windows Desktop Video Studio", zero page errors; bun run lint exit 0.
+
+Stage Summary:
+- v1.17.0 is LIVE: https://github.com/Ziruax/framefuse/releases/tag/v1.17.0 (both installer + portable, CI-smoke-tested Rust engine, all new voice/dub/stack-text modules in the package).
+- Gotchas for future rounds: (1) CI npm-install of sharp's libvips can TIME OUT transiently — rerun-failed-jobs fixes it, consider a retry step in the workflow; (2) the browser stub-verification stack (electronAPI bridge + :3100 proxy) has three traps — the HMR websocket MUST be proxied with an Origin rewrite (hydration never completes otherwise), a frozen HTML snapshot goes stale against the live dev server (reload loop — re-curl before each run), and cold-cache hydration takes 6-15s (wait LONGER than feels sane); (3) agent-browser's `errors` command silently drops messages — use a raw CDP Runtime.exceptionThrown listener for real error capture.
