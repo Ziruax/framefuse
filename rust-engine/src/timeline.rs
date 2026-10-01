@@ -43,6 +43,24 @@ pub struct Timeline {
     pub texts: Vec<TextOverlay>,
     /// Corner watermark image.
     pub watermark: Option<Watermark>,
+    /// v2: extra placed audio sources (voiceover narration + dub segments
+    /// + SFX placements) mixed into the output bus. Electron maps BOTH the
+    /// v1.17 `voiceovers` and `sfx` payload lists onto these — they are
+    /// absolute-timeline, never ducked, never looped.
+    #[serde(default)]
+    pub extra_audio: Vec<ExtraAudio>,
+}
+
+/// v2: a placed audio source outside the segment/music lanes.
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ExtraAudio {
+    /// Absolute source path (WAV or MP3 — decoded + resampled to the bus).
+    pub path: String,
+    /// Absolute timeline placement (ms).
+    pub start_ms: f64,
+    /// 0..2 gain (1 = unity).
+    pub volume: f64,
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -87,6 +105,30 @@ pub struct Segment {
     pub overlay_loop: bool,
     /// Has an audio stream (video only).
     pub has_audio: bool,
+    // ── v2 TRANSITION PLAN (baked by Electron — EXACT mirror of the CLI
+    // pipeline's planBoundaryFades: style per boundary = overrides[seg.id]
+    // ?? global; duration clamped to ≤45% of the segment; dissolve at a
+    // boundary where EITHER side is video degrades to a hard cut). All
+    // values are 0 when no transition applies. ──────────────────────────
+    /// Fade/dissolve window at the START of this segment (ms).
+    #[serde(default)]
+    pub trans_head_ms: f64,
+    /// "none" | "dissolve" | "dip-black" | "dip-white" (the styles the
+    /// NATIVE engine implements; slide/wipe/circleopen never reach Rust).
+    #[serde(default)]
+    pub trans_head_style: String,
+    /// Dip window at the END of this segment (ms, style of the NEXT
+    /// boundary's dip).
+    #[serde(default)]
+    pub trans_tail_ms: f64,
+    #[serde(default)]
+    pub trans_tail_style: String,
+    /// Whole-video fade-in from black at the FIRST segment (ms).
+    #[serde(default)]
+    pub bookend_start_ms: f64,
+    /// Whole-video fade-out to black at the LAST segment (ms).
+    #[serde(default)]
+    pub bookend_end_ms: f64,
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]

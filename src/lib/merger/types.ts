@@ -364,6 +364,10 @@ export interface ExportProgress {
    *  `phase`. Same contract, distinct name so both engines keep their
    *  vocabularies. */
   stage?: string;
+  /** v1.18: WHICH backend is running this export — "rust" (the native
+   *  wgpu + dlopen-FFI engine) or "cli" (the FFmpeg-CLI Safe Mode
+   *  pipeline). The Header's engine badge renders it live. */
+  engine?: "rust" | "cli";
   /** v1.15.1 GPU-Shift: the WebCodecs engine's heartbeat frame counters
    *  (framesEncoded of totalFrames — the frame-exact law's live view). */
   framesEncoded?: number;
@@ -1237,6 +1241,14 @@ declare global {
         cpuTopology?: string;
         cpuModel?: string;
         optimizeSubtitles?: boolean;
+        /** v1.18: the native Rust engine's load status (version/binary or
+         *  the load error) — the engine badge + diagnostics line. */
+        rustEngine?: {
+          loaded: boolean;
+          version?: string | null;
+          binary?: string | null;
+          error?: string | null;
+        };
       }>;
       /** v8.1 (Task 27-b): force-encoder probe bypass (diagnostics).
        *  key ∈ null | "nvenc" | "qsv" | "amf" | "x264"; null restores the

@@ -1,0 +1,48 @@
+{
+  "engineVersion": "0.2.0",
+  "binary": "framefuse-engine.linux-x64.node",
+  "loadedFrom": "/home/z/my-project/rust-engine/framefuse-engine.linux-x64.node",
+  "platform": {
+    "os": "linux",
+    "arch": "x64",
+    "node": "24.21.0"
+  },
+  "ffmpegDir": "(system loader path)",
+  "probeFfmpegFamily": "61/61/59/8/5",
+  "result": {
+    "success": true,
+    "engineUsed": "rust-cpu",
+    "encoderName": "libx264",
+    "durationMs": 707,
+    "frames": 150,
+    "compositorMs": 488,
+    "encodeMs": 153,
+    "decodeMs": 34,
+    "audioMs": 71,
+    "sizeBytes": 300325,
+    "ffmpegFamily": "61/61/59/8/5"
+  },
+  "ffprobe": {
+    "video": {
+      "codec_name": "h264",
+      "width": 640,
+      "height": 360,
+      "r_frame_rate": "30/1",
+      "nb_read_frames": "150"
+    },
+    "audio": {
+      "codec_name": "aac",
+      "sample_rate": "48000",
+      "channels": 2
+    },
+    "format": {
+      "duration": "5.013000",
+      "size": "300325"
+    },
+    "outputBytes": 300325
+  },
+  "assertionsPassed": true,
+  "assertionFailures": [],
+  "wallMs": 1344,
+  "generatedAt": "2026-10-01T18:03:58.087Z"
+}

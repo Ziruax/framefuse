@@ -13,8 +13,7 @@
 // silently routes to the battle-tested v1.14.5 FFmpeg-CLI pipeline. The
 // Rust path must never make an export FAIL that would have succeeded.
 //
-// v0.1 eligibility (features the Rust engine implements; everything else
-// rides the CLI until Phase 2+):
+// v2 eligibility (the engine grew up):
 //   ✓ base-lane video/image segments: trim, speed, per-segment volume,
 //     Ken Burns (images), cover-fit
 //   ✓ overlay lanes: geometry (9-grid + free-form), opacity, chroma key,
@@ -23,8 +22,12 @@
 //   ✓ headline texts (position presets, fades, outline) via fontdue +
 //     OS font paths
 //   ✓ watermark image
-//   ✗ SFX placements, burn-in text removal, ASS captions, xfade
-//     transitions, loudnorm normalize, overlay motion keyframes → CLI
+//   ✓ v1.17 VOICEOVER + DUB + SFX placements → timeline.extraAudio (the
+//     native audio bus mixes them with the dub duck applied Electron-side)
+//   ✓ v2 TRANSITIONS: dissolve (image↔image), dip-black, dip-white +
+//     fadeStartEnd bookends — the plan mirrors planBoundaryFades exactly
+//   ✗ slide/wipe/circleopen transitions, burn-in text removal, ASS
+//     captions/kinetic Stack Text, loudnorm, overlay motion keyframes → CLI
 
 "use strict";
 
@@ -70,18 +73,20 @@ function safeCall(fn) {
 /**
  * v0.1 feature gate. `opts` is the raw `export-native` payload.
  */
+// Transition styles the NATIVE engine composites. slide/wipe/circleopen
+// (xfade geometry styles) + kinetic ASS captions stay on the CLI pipeline.
+const NATIVE_TRANSITION_STYLES = new Set(["none", "dissolve", "dip-black", "dip-white"]);
+const DIP_COLOR_STYLES = new Set(["dip-black", "dip-white"]);
+/** EXACT mirror of export-graph's XFADE_NAMES keys (the xfade family). */
+const XFADE_FAMILY_STYLES = new Set([
+  "dissolve", "slide-left", "slide-right", "wipe-left", "wipe-right", "circleopen",
+]);
+
 function rustEligible(opts) {
   if (!rustEngine) return { ok: false, reason: rustEngineError || "engine not loaded" };
   const reasons = [];
 
-  const sfx = opts.sfx;
-  if (Array.isArray(sfx) && sfx.length > 0) reasons.push("sfx");
-
-  // v1.17 VOICEOVER/DUB: VO/dub placements ride the FFmpeg amix graph (the
-  // MP3/WAV adelay+volume branches + the dub duck) — the Rust engine has no
-  // extra-audio-input mixing yet, exactly like SFX.
-  const vos = opts.voiceovers;
-  if (Array.isArray(vos) && vos.length > 0) reasons.push("voiceovers");
+  // v2: voiceovers + SFX ride the NATIVE audio bus (extraAudio) — no gate.
 
   const tr = opts.textRemoval;
   if (tr && tr.mode && tr.mode !== "none" && Array.isArray(tr.regions) && tr.regions.length > 0) {
@@ -93,9 +98,25 @@ function rustEligible(opts) {
     Array.isArray(opts.subtitleCues) && opts.subtitleCues.length > 0;
   if (captionsOn) reasons.push("captions");
 
+  // v2 TRANSITIONS: dissolve/dips are native; the geometric xfade styles
+  // (slide/wipe/circleopen) ride the CLI's xfade filter. Per-boundary
+  // overrides count — ANY non-native style at ANY boundary → CLI.
   const trans = opts.transition;
-  if (trans && typeof trans.style === "string" && trans.style !== "none") {
-    reasons.push("transition:" + trans.style);
+  if (trans && typeof trans.style === "string") {
+    const overrides =
+      trans.overrides && typeof trans.overrides === "object" ? trans.overrides : null;
+    const styles = new Set([trans.style]);
+    if (overrides) {
+      for (const k of Object.keys(overrides)) {
+        const v = overrides[k];
+        if (typeof v === "string") styles.add(v);
+      }
+    }
+    for (const s of styles) {
+      if (s !== "none" && !NATIVE_TRANSITION_STYLES.has(s)) {
+        reasons.push("transition:" + s);
+      }
+    }
   }
 
   const audio = opts.audio;
@@ -119,14 +140,66 @@ function rustEligible(opts) {
     }
   }
 
-  // per-boundary transition overrides keyed on segment ids
-  const segments = Array.isArray(opts.segments) ? opts.segments : [];
-  if (segments.some((s) => s && s.transition && s.transition.style && s.transition.style !== "none")) {
-    reasons.push("per-segment-transition");
-  }
-
   if (reasons.length > 0) return { ok: false, reason: reasons.join(",") };
   return { ok: true };
+}
+
+// ── v2 transition planning (EXACT mirror of export-graph.planBoundaryFades)
+// ──────────────────────────────────────────────────────────────────────────
+const TRANSITION_MAX_FRACTION = 0.45;
+
+function clampTrMs(ms, segDurMs) {
+  return ms > 0 && segDurMs > 200
+    ? Math.min(ms, Math.floor(segDurMs * TRANSITION_MAX_FRACTION))
+    : 0;
+}
+
+/**
+ * Per-segment native transition plan: head (dissolve/dip-in), tail
+ * (dip-out, NEXT boundary's color), bookends (fadeStartEnd). The Rust
+ * timeline consumes exactly these fields.
+ */
+function planNativeTransitions(segments, transition) {
+  const trGlobal = transition && transition.style ? transition.style : "none";
+  const overrides =
+    transition && transition.overrides && typeof transition.overrides === "object"
+      ? transition.overrides
+      : null;
+  const styleAt = (seg) =>
+    seg && overrides && Object.prototype.hasOwnProperty.call(overrides, seg.id)
+      ? overrides[seg.id]
+      : trGlobal;
+  const trWanted = transition && Number(transition.durationMs) > 0 ? Number(transition.durationMs) : 0;
+  const fadeStartEnd = !!(transition && transition.fadeStartEnd);
+  const isVideo = (s) => !!(s && s.mediaType === "video");
+
+  const plans = segments.map((seg, i) => {
+    const curStyle = i > 0 ? styleAt(seg) : "none";
+    const nextStyle = i < segments.length - 1 ? styleAt(segments[i + 1]) : "none";
+    const last = i === segments.length - 1;
+
+    let headMs = i > 0 && curStyle !== "none" ? clampTrMs(trWanted, seg.durationMs) : 0;
+    // v5.0 VIDEO RULE mirror: an xfade-family head is a HARD CUT when
+    // either side of the boundary is a VIDEO segment (dips unaffected).
+    if (
+      headMs > 0 &&
+      XFADE_FAMILY_STYLES.has(curStyle) &&
+      (isVideo(seg) || isVideo(segments[i - 1]))
+    ) {
+      headMs = 0;
+    }
+    const dipTailMs =
+      DIP_COLOR_STYLES.has(nextStyle) && !last ? clampTrMs(trWanted, seg.durationMs) : 0;
+    return {
+      headMs,
+      headStyle: headMs > 0 ? curStyle : "none",
+      tailMs: dipTailMs,
+      tailStyle: dipTailMs > 0 ? nextStyle : "none",
+      bookendStartMs: i === 0 && fadeStartEnd ? clampTrMs(trWanted, seg.durationMs) : 0,
+      bookendEndMs: last && fadeStartEnd ? clampTrMs(trWanted, seg.durationMs) : 0,
+    };
+  });
+  return plans;
 }
 
 // ── timeline adaptation (export-native payload → Rust timeline JSON) ──────
@@ -243,15 +316,44 @@ function buildRustTimeline(opts) {
   }
 
   const masterVolume = Math.max(0, Math.min(2, Number(opts.audio && opts.audio.masterVolume) || 1));
-  const zv = (v) => Math.max(0, Math.min(2, Number(v) || 0)) * masterVolume;
+  let zvScale = masterVolume;
+
+  // v1.17 DUB DUCK (EXACT mirror of the CLI branch in main.js): when a
+  // voiceover/dub track exists, the ORIGINAL clip audio (base-lane video
+  // segments only) scales by dubOriginalVolume. Music/SFX/VO are NOT
+  // ducked. Applied HERE so the native bus and the CLI amix agree.
+  const voList = (Array.isArray(opts.voiceovers) ? opts.voiceovers : []).filter(
+    (v) => v && typeof v.wavPath === "string" && v.wavPath,
+  );
+  const sfxList = (Array.isArray(opts.sfx) ? opts.sfx : []).filter(
+    (s) => s && typeof s.wavPath === "string" && s.wavPath,
+  );
+  let duckApplied = 0;
+  if (voList.length > 0 && Number.isFinite(Number(opts.dubOriginalVolume))) {
+    duckApplied = Math.max(0, Math.min(1, Number(opts.dubOriginalVolume)));
+    if (duckApplied < 1) {
+      zvScale = masterVolume * duckApplied;
+    }
+  }
+  // Per-segment volume: VIDEO segments get the ducked scale (the duck is a
+  // property of the ORIGINAL clip audio, not music/images); everything
+  // else keeps the master scale.
+  const zvVideo = (v) => Math.max(0, Math.min(2, Number(v) || 0)) * zvScale;
+  const zvPlain = (v) => Math.max(0, Math.min(2, Number(v) || 0)) * masterVolume;
+
+  // v2 TRANSITION PLAN (mirrors planBoundaryFades; only native styles can
+  // reach here — rustEligible gated the geometric xfade styles to the CLI).
+  const trPlans = planNativeTransitions(segments, opts.transition);
 
   // ── base lane + overlay lanes → Rust segments ──
   const rustSegments = [];
-  for (const s of segments) {
+  for (let i = 0; i < segments.length; i++) {
+    const s = segments[i];
     if (!s) continue;
     const isVideo = s.mediaType === "video";
     const p = isVideo ? s.videoPath : s.imagePath;
     if (typeof p !== "string" || !p) return { error: "segment missing source path" };
+    const plan = trPlans[i] || {};
     rustSegments.push({
       id: String(s.id || `seg${rustSegments.length}`),
       mediaType: isVideo ? "video" : "image",
@@ -263,7 +365,7 @@ function buildRustTimeline(opts) {
       sourceDurationMs: Number.isFinite(s.sourceDurationMs) ? s.sourceDurationMs : null,
       speed: Math.max(0.25, Math.min(4, Number(s.speed) || 1)),
       track: 0,
-      volume: zv(s.volume),
+      volume: isVideo ? zvVideo(s.volume) : zvPlain(s.volume),
       sourceWidth: Number.isFinite(s.sourceWidth) ? s.sourceWidth : null,
       sourceHeight: Number.isFinite(s.sourceHeight) ? s.sourceHeight : null,
       kenBurns: kenBurnsFor(opts.kenBurns, s.direction),
@@ -272,6 +374,13 @@ function buildRustTimeline(opts) {
       opacity: 1,
       overlayLoop: false,
       hasAudio: isVideo,
+      // v2 native transition plan
+      transHeadMs: Number(plan.headMs) || 0,
+      transHeadStyle: String(plan.headStyle || "none"),
+      transTailMs: Number(plan.tailMs) || 0,
+      transTailStyle: String(plan.tailStyle || "none"),
+      bookendStartMs: Number(plan.bookendStartMs) || 0,
+      bookendEndMs: Number(plan.bookendEndMs) || 0,
     });
   }
   for (const o of overlays) {
@@ -340,6 +449,31 @@ function buildRustTimeline(opts) {
       }
     : null;
 
+  // ── v2 EXTRA AUDIO: voiceovers (narration MP3 / dub WAVs) + SFX
+  // placements → the native audio bus. MP3s arrive 24 kHz mono — the
+  // engine's swresample stage upmixes to the 48 kHz stereo bus.
+  const extraAudio = [];
+  for (const v of voList) {
+    extraAudio.push({
+      path: String(v.wavPath),
+      startMs: Math.max(0, Number(v.startMs) || 0),
+      volume: Math.max(0, Math.min(2, Number(v.volume) || 1)),
+    });
+  }
+  for (const s of sfxList) {
+    extraAudio.push({
+      path: String(s.wavPath),
+      startMs: Math.max(0, Number(s.startMs) || 0),
+      volume: Math.max(0, Math.min(2, Number(s.volume) || 1)),
+    });
+  }
+  if (voList.length > 0 && duckApplied < 1) {
+    console.log(
+      `[RustEngine] native audio bus: ${voList.length} VO + ${sfxList.length} SFX track(s)` +
+        ` · original audio ducked to ${(duckApplied * 100).toFixed(0)}%`,
+    );
+  }
+
   // ── watermark (pixel coords, as the CLI chain consumes) ──
   const wm = opts.watermark;
   const watermark =
@@ -372,6 +506,7 @@ function buildRustTimeline(opts) {
     fonts: { sans: pickFont("sans"), mono: pickFont("mono") },
     segments: rustSegments,
     music,
+    extraAudio,
     texts,
     watermark,
   };
@@ -436,6 +571,8 @@ async function runRustExport(opts, event, { ffmpegPath, cpuCount, sendCliProgres
           total: p.totalSec,
           phase: p.phase,
           rate: p.rate,
+          // v1.18: WHICH engine is running — the Header badge renders it.
+          engine: "rust",
         });
       },
     );

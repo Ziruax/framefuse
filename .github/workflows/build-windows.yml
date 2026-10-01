@@ -166,14 +166,20 @@ jobs:
 
       # Full pipeline smoke test: engine loads → probeFfmpegFamily(dll dir) →
       # exportVideo (2-segment timeline: video + Ken Burns image, 2 text
-      # headlines, music) → ffprobe asserts h264 + ~150 frames + aac 48kHz.
+      # headlines, music) → ffprobe asserts h264 + ~150 frames + aac 48kHz,
+      # plus v2 luma sanity (signalstats YAVG — proves the GPU-YUV compute
+      # path produced real pictures, not black/garbage).
       # The smoke test generates its own fixtures with the staged
       # resources/ffmpeg/win/ffmpeg.exe into $RUNNER_TEMP (testsrc2 + sine
       # aac video, gradients PNG, 440Hz music.m4a) and uses
       # C:/Windows/Fonts/arialbd.ttf as the sans font.
       # CI expectations (no physical GPU): encoder ladder nvenc/qsv/amf fail
-      # to OPEN → libx264; wgpu may init on the WARP software adapter
-      # (engineUsed "rust-gpu") or fall back ("rust-cpu") — both accepted.
+      # to OPEN → libx264 (v2: with auto threads + per-tier pix_fmt).
+      # FRAMEFUSE_ENGINE_ALLOW_SOFTWARE_GPU=1 lets wgpu init on the WARP
+      # software adapter so the FULL v2 GPU code path (single-submit batch,
+      # texture pool, compute-shader YUV, packed readback) runs end-to-end —
+      # the production build REJECTS software adapters (4-20× slower than
+      # the CPU rasterizer) and uses the CPU path instead.
       - name: Rust engine E2E smoke test (exportVideo → ffprobe)
         shell: bash
         env:
@@ -183,9 +189,26 @@ jobs:
           FF_TEST_MEDIA_DIR: "${{ runner.temp }}/fftest"
           FF_TEST_FONT: "C:/Windows/Fonts/arialbd.ttf"
           FF_ENGINE_INFO_OUT: "rust-engine/engine-info.json"
+          FRAMEFUSE_ENGINE_ALLOW_SOFTWARE_GPU: "1"
         run: |
           set -o pipefail
           node rust-engine/tools/smoke-test-windows.js 2>&1 | tee rust-engine/smoke-windows.log
+
+      # v2 engine feature test: native transitions (dissolve + dips +
+      # bookends) + extra audio (voiceover/SFX on the native bus), with
+      # luma-profile + volumedetect assertions. Runs after the smoke test.
+      - name: Rust engine v2 feature test (transitions + extra audio)
+        shell: bash
+        env:
+          FF_TEST_FFMPEG: "resources/ffmpeg/win/ffmpeg.exe"
+          FF_TEST_FFPROBE: "resources/ffmpeg/win/ffprobe.exe"
+          FF_ENGINE_FFMPEG_DIR: "resources/ffmpeg/win/dll"
+          FF_TEST_MEDIA_DIR: "${{ runner.temp }}/fftest-v2"
+          FF_TEST_FONT: "C:/Windows/Fonts/arialbd.ttf"
+          FRAMEFUSE_ENGINE_ALLOW_SOFTWARE_GPU: "1"
+        run: |
+          set -o pipefail
+          node rust-engine/tools/v2-feature-test.js 2>&1 | tee rust-engine/feature-v2.log
 
       - name: Upload Rust engine artifact (.node + info + logs)
         if: always()
@@ -197,6 +220,7 @@ jobs:
             rust-engine/engine-info.json
             rust-engine/build-windows.log
             rust-engine/smoke-windows.log
+            rust-engine/feature-v2.log
           if-no-files-found: warn
           retention-days: 14
 

@@ -368,6 +368,43 @@ function main() {
       check(as && Number(as.sample_rate) === 48000 && Number(as.channels) === 2,
         "audio is 48kHz stereo (got: " + (as && as.sample_rate + "Hz/" + as.channels + "ch") + ")");
 
+      // v2: VISUAL sanity — the GPU-YUV compute path (exercised on WARP in
+      // CI via FRAMEFUSE_ENGINE_ALLOW_SOFTWARE_GPU=1) must produce REAL
+      // luma, not a black/garbage frame. signalstats gives per-frame YAVG.
+      try {
+        const stats = spawnSync(
+          FFPROBE,
+          [
+            "-v", "error",
+            "-f", "lavfi",
+            "-i", "movie=" + OUT_MP4.replace(/\\/g, "/") + ",signalstats",
+            "-show_entries", "frame_tags=lavfi.signalstats.YAVG",
+            "-of", "csv=p=0",
+          ],
+          { encoding: "utf8", timeout: 60000, maxBuffer: 32 * 1024 * 1024 },
+        );
+        const yavgs = String(stats.stdout || "")
+          .split("\n")
+          .map((l) => Number(l))
+          .filter((n) => Number.isFinite(n));
+        if (yavgs.length > 60) {
+          const f30 = yavgs[30]; // mid first segment (video + headline)
+          const f90 = yavgs[90]; // second segment (Ken Burns image + text)
+          check(
+            f30 > 8 && f30 < 247,
+            "frame 30 luma in a sane range (GPU-YUV not black/clipped): YAVG=" + f30.toFixed(1),
+          );
+          check(
+            Math.abs(f90 - f30) > 0.5,
+            "content changes between segments (YAVG " + f30.toFixed(1) + " → " + f90.toFixed(1) + ")",
+          );
+        } else {
+          check(false, "signalstats produced < 60 frames of luma (got " + yavgs.length + ")");
+        }
+      } catch (e) {
+        console.log("  (signalstats luma check unavailable: " + (e && e.message) + ")");
+      }
+
       const wallMs = Date.now() - t0;
 
       // 5. engine-info.json (CI artifact: version + probe + result summary)

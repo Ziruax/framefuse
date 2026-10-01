@@ -24,7 +24,7 @@ import { cn } from "@/lib/utils";
 /** v1.12.1: the renderer's build constant — compared against the REAL exe
  *  version (app.getVersion()) so a stale/hybrid install is impossible to
  *  miss. Keep in sync with package.json on every release. */
-const BUILD_VERSION = "1.17.0";
+const BUILD_VERSION = "1.18.0";
 
 export interface LastExport {
   path: string;
@@ -504,6 +504,26 @@ export function Header({
                 estimating…
               </span>
             )}
+            {/* v1.18: WHICH engine is running — the native Rust engine
+                (wgpu + dlopen'd FFmpeg, no CLI children) or the FFmpeg-CLI
+                Safe Mode pipeline. Honest telemetry, live. */}
+            {exportProgress?.engine ? (
+              <span
+                className="hidden rounded-sm px-1.5 py-0.5 sm:inline"
+                style={{
+                  color: exportProgress.engine === "rust" ? "#67e8f9" : "#a1a1aa",
+                  backgroundColor:
+                    exportProgress.engine === "rust" ? "rgba(8, 145, 178, 0.18)" : "rgba(63, 63, 70, 0.35)",
+                }}
+                title={
+                  exportProgress.engine === "rust"
+                    ? "Native Rust engine — wgpu GPU composite + direct FFmpeg library encode (pipelined)"
+                    : "FFmpeg CLI pipeline (Safe Mode)"
+                }
+              >
+                {exportProgress.engine === "rust" ? "Rust engine" : "FFmpeg CLI"}
+              </span>
+            ) : null}
             {exportProgress?.fps ? (
               <span className="hidden sm:inline" style={{ color: "#71717a" }}>
                 {exportProgress.fps.toFixed(0)} fps

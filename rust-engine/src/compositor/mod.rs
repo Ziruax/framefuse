@@ -9,12 +9,32 @@ pub mod gpu;
 use crate::timeline::{ChromaKey, Timeline};
 use std::sync::Arc;
 
-/// Which RGBA byte layout the compositor emits (both are sws_scale-able).
+/// The byte layout the compositor emits for each rendered frame.
+///
+/// v2 pipeline: the GPU compositor converts RGBA → planar YUV ON THE GPU
+/// (compute shader, BT.601 limited-range — the same matrix sws_scale
+/// defaults to) and reads back 1.5 bytes/pixel instead of 4, which the
+/// encoder consumes with a plain per-plane memcpy (no CPU sws pass at
+/// all). The CPU rasterizer keeps emitting RGBA (sws handles the
+/// conversion on that path — it is already on the CPU).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // Bgra reserved for direct-GPU-native pipelines
 pub enum OutputFormat {
     Rgba,
-    Bgra,
+    /// Planar YUV 4:2:0 (BT.601 limited): Y plane (w×h), then U (w/2×h/2),
+    /// then V — rows padded to a 4-byte stride (tail bytes ignored).
+    Yuv420p,
+    /// NV12 (BT.601 limited): Y plane, then interleaved UV. Rows padded to
+    /// a 4-byte stride.
+    Nv12,
+}
+
+/// Which YUV packing the GPU compute pass should emit — chosen by the
+/// encoder that actually opened (QSV/AMF/MF want NV12; NVENC/x264 want
+/// YUV420P).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum YuvMode {
+    Yuv420p,
+    Nv12,
 }
 
 /// An RGBA8 source bitmap (decoded video frame or image) at native size.
@@ -56,6 +76,11 @@ pub struct Layer {
     pub alpha: f32,
     /// Chroma key applied before alpha blend.
     pub chroma: Option<ChromaKey>,
+    /// v2: true for VIDEO-layer content (a fresh Bitmap id per decoded
+    /// frame) — the GPU compositor uploads these through a pooled slot
+    /// instead of the static LRU texture cache. Images/texts stay false.
+    #[allow(clippy::clone_on_copy)]
+    pub dynamic: bool,
 }
 
 /// A text strip produced by `text.rs` — rasterized once, blitted per frame.
@@ -86,27 +111,39 @@ pub trait Compositor: Send {
     /// no per-frame allocation or ownership juggling).
     fn output_format(&self) -> OutputFormat;
     fn output(&self) -> &[u8];
+    /// Packed-YUV plane geometry the consumer must respect: (y_stride,
+    /// c_stride) in BYTES. Only meaningful when output_format() is
+    /// Yuv420p/Nv12 — consumers memcpy `width` real bytes per row and skip
+    /// the padding tail.
+    fn yuv_strides(&self) -> (usize, usize) {
+        (0, 0)
+    }
 }
 
 /// Factory: GPU first, CPU fallback (DIRECTIVE 4). A wgpu adapter failure
 /// (missing driver, TDR'd device, headless sandbox) must degrade, never
 /// crash — the export continues at CPU raster speed.
-pub fn create_compositor(width: u32, height: u32) -> Box<dyn Compositor> {
+pub fn create_compositor(width: u32, height: u32, yuv: YuvMode) -> Box<dyn Compositor> {
     #[cfg(feature = "gpu")]
     {
-        match gpu::GpuCompositor::new(width, height) {
+        match gpu::GpuCompositor::new(width, height, yuv) {
             Ok(gpu) => {
-                log::info!("[rust-engine] wGPU compositor initialized ({}) — hardware accelerated", gpu.adapter_info());
+                log::info!(
+                    "[rust-engine] wGPU compositor initialized ({}) — hardware accelerated, GPU YUV {}",
+                    gpu.adapter_info(),
+                    if yuv == YuvMode::Nv12 { "NV12" } else { "YUV420P" }
+                );
                 Box::new(gpu)
             }
             Err(e) => {
-                log::warn!("[rust-engine] wGPU compositor failed ({}), falling back to CPU rasterizer", e);
+                log::warn!("[rust-engine] wGPU compositor unavailable ({}), using the CPU rasterizer", e);
                 Box::new(cpu::CpuCompositor::new(width, height))
             }
         }
     }
     #[cfg(not(feature = "gpu"))]
     {
+        let _ = yuv;
         log::info!("[rust-engine] CPU rasterizer (compiled without wgpu feature)");
         Box::new(cpu::CpuCompositor::new(width, height))
     }

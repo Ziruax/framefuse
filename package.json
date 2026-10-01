@@ -1,8 +1,8 @@
 {
   "name": "framefuse",
-  "version": "1.17.0",
+  "version": "1.18.0",
   "private": true,
-  "description": "FrameFuse v1 \u2014 Multi-track video studio: video clips, green/white/black screen chroma key with on-canvas PiP, overlay lane, background music with volume/loop, synthesized SFX, Whisper captions via Groq cloud (user's own API key, stored on-device) with an offline tiny-model fallback bundled in the installer, True Smart Rendering FFmpeg export (clean ranges stream-copied, dirty windows re-encoded in parallel with hardware decode), native project files.",
+  "description": "Multi-track Windows video studio with fast native export.",
   "main": "electron/main.js",
   "author": "FrameFuse",
   "license": "MIT",
@@ -118,8 +118,7 @@
     ],
     "win": {
       "target": [
-        "nsis",
-        "portable"
+        "nsis"
       ],
       "icon": "build/icon.ico",
       "signtoolOptions": null,

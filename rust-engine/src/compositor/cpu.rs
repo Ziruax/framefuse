@@ -10,7 +10,6 @@ use fast_image_resize::FilterType;
 use fast_image_resize::{Image, PixelType, ResizeAlg, Resizer};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::sync::Arc;
 
 pub struct CpuCompositor {
     width: u32,

@@ -39,6 +39,14 @@ const GQ = require("./groq-whisper");
 // an error — exports silently ride the FFmpeg-CLI pipeline (DIRECTIVE 5).
 const RUST = require("./rust-engine-router");
 console.log("[RustEngine]", JSON.stringify(RUST.rustEngineStatus()));
+
+// v1.18 ICON FIX (taskbar): Windows groups + icons the RUNNING app by its
+// AppUserModelID. Without this call Electron windows fall back to a
+// process-derived AUMID, and Windows 10/11 then renders a BLANK/WHITE
+// taskbar icon for the live window even when the exe + shortcut icons are
+// perfect. Must match electron-builder's appId (it writes the same AUMID
+// into the shortcuts during install).
+app.setAppUserModelId("com.framefuse.app");
 // v1.17 STACK TEXT (kinetic headline typography): the plain-JS mirror of
 // src/lib/merger/stackTextPresets.ts + the kinetic ASS emitter (recipes from
 // STACK_STYLE_ASS_DOC / STACK_LAYOUT_ASS_DOC). Consumed by
@@ -313,6 +321,7 @@ ipcMain.handle("ffmpeg-status", async () => {
 ipcMain.handle("export-info", async () => {
   const enc = await detectGpuEncoderAsync();
   const prof = await getHardwareProfile();
+  const rust = RUST.rustEngineStatus();
   return {
     encoder: enc.label,
     encoderName: enc.name,
@@ -328,6 +337,14 @@ ipcMain.handle("export-info", async () => {
     cpuTopology: prof.cpuTopology,
     cpuModel: prof.cpuModel,
     optimizeSubtitles: prof.optimizeSubtitles,
+    // v1.18: the native engine status — loaded/binary/version (or the load
+    // error). The Export tab renders the engine badge from this.
+    rustEngine: {
+      loaded: !!rust.loaded,
+      version: rust.version || null,
+      binary: rust.binary || null,
+      error: rust.error || null,
+    },
   };
 });
 
@@ -4323,6 +4340,9 @@ ipcMain.handle("export-native", async (event, opts) => {
         elapsed: Math.round(elapsedSec * 10) / 10,
         total: totalSec > 0 ? totalSec : undefined,
         phase: exportPhase,
+        // v1.18: WHICH engine is running — the Header badge renders it
+        // ("FFmpeg CLI" vs the Rust router's engine: "rust" events).
+        engine: "cli",
         // Overall ×-realtime: content-seconds processed per wall-second
         // (the timemark is the aggregated content position; this is the
         // same number ffmpeg prints as speed=, measured across the pool).
