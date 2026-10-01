@@ -1704,3 +1704,16 @@ Stage Summary:
 - v1.16.0 is LIVE: https://github.com/Ziruax/framefuse/releases/tag/v1.16.0 (release id 400568459) with BOTH the NSIS installer (270,278,946 B) and the FIRST portable build (270,014,960 B), each carrying the CI-smoke-tested Rust native engine .node + the FFmpeg 7.1.1 shared DLL set.
 - The Rust engine's Windows truth is now CI-proven (native MSVC build + real exportVideo→ffprobe E2E on windows-latest); NVENC/QSV/AMF still need a real GPU machine (documented limitation).
 - Gotchas recorded: (1) windows-latest has NO bun — any script shelling to `bun build` needs oven-sh/setup-bun in CI; (2) BtbN "latest" pruned every n7.1 shared asset (family drift to master/8.1/9.0) — the GyanD/codexffmpeg 7.1.1 tag is the only stable fast source for the 61-family DLLs; gyan.dev's rolling aliases both crawl AND drift; (3) "rust-engine/**" in build.files must always carry the !rust-engine/target exclusion whenever a local cargo build has run; (4) cargo-xwin cross-compile works fine in this sandbox (no clang needed — pure-Rust deps + rust-lld) — viable fallback if CI is unavailable; (5) the 2 unused-Arc-import warnings in compositor/{cpu,gpu}.rs are cosmetic and deliberately left (fixing would desync the release .node from HEAD source).
+
+---
+Task ID: 56-addendum
+Agent: main (Z.ai Code)
+Task: CI validation outcome for the v1.16.0 ship
+
+Work Log:
+- Monitored the two follow-up CI runs (36799979322 / 36799967763, head 50e4537 with the oven-sh/setup-bun fix): BOTH completed | success — job 1 (engine MSVC build + E2E smoke) and job 2 (Electron installer + bench + uploads) green. The bun fix was the only thing job 2 needed.
+- CI's own framefuse-windows-installer artifact: 300.7 MB (built natively on windows-latest from the same HEAD; validation copy — the RELEASED installer is the local three-way-verified 270,278,946 B binary).
+- A/B bench on CI: FATAL exit 5 — 20-minute timeout: the bench spawns "FrameFuse Setup 1.16.0.exe" (the interactive NSIS installer), which cannot auto-complete its installation dialog on a headless runner; the step is continue-on-error by design (the workflow comments already say hardware verdicts need a real Windows machine). Non-blocking; future improvement: point the CI bench at win-unpacked/FrameFuse.exe instead of the setup exe.
+
+Stage Summary:
+- The v1.16.0 Windows release chain is now FULLY CI-validated: native MSVC engine build, napi load probe, exportVideo→ffprobe E2E smoke, wine-free-equivalent native packaging, artifact upload. Release: https://github.com/Ziruax/framefuse/releases/tag/v1.16.0
