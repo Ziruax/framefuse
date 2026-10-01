@@ -9,7 +9,18 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
-const MEDIA = path.join(os.tmpdir(), "fftest-yuv");
+
+const ROOT = path.join(__dirname, "..", "..");
+const IS_WIN = process.platform === "win32";
+const FFMPEG = process.env.FF_TEST_FFMPEG || (IS_WIN ? path.join(ROOT, "resources", "ffmpeg", "win", "ffmpeg.exe") : "ffmpeg");
+const FFMPEG_DIR = process.env.FF_ENGINE_FFMPEG_DIR !== undefined
+  ? process.env.FF_ENGINE_FFMPEG_DIR
+  : IS_WIN
+    ? path.join(ROOT, "resources", "ffmpeg", "win", "dll")
+    : "";
+const MEDIA = process.env.FF_TEST_MEDIA_DIR
+  ? path.resolve(process.env.FF_TEST_MEDIA_DIR)
+  : path.join(os.tmpdir(), "fftest-yuv");
 fs.mkdirSync(MEDIA, { recursive: true });
 
 const color = process.env.YUV_TEST_COLOR || "red";
@@ -23,7 +34,7 @@ const expect = {
 const img = path.join(MEDIA, color + ".png");
 const out = path.join(MEDIA, "out_" + color + ".mp4");
 if (!fs.existsSync(img)) {
-  const r = spawnSync("ffmpeg", ["-y", "-f", "lavfi", "-i", "color=c=" + color + ":size=320x180", "-frames:v", "1", img]);
+  const r = spawnSync(FFMPEG, ["-y", "-f", "lavfi", "-i", "color=c=" + color + ":size=320x180", "-frames:v", "1", img]);
   if (r.status !== 0) { console.error("fixture failed"); process.exit(1); }
 }
 
@@ -40,9 +51,9 @@ const timeline = {
 };
 
 const engine = require(path.join(__dirname, "..", "index.js"));
-engine.exportVideo(JSON.stringify(timeline), out, "", () => {}).then((res) => {
+engine.exportVideo(JSON.stringify(timeline), out, FFMPEG_DIR, () => {}).then((res) => {
   // raw YUV readback: decode to rawvideo and read the center pixel
-  const r = spawnSync("ffmpeg", ["-i", out, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"], {
+  const r = spawnSync(FFMPEG, ["-i", out, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"], {
     maxBuffer: 64 * 1024 * 1024, timeout: 60000,
   });
   const yuv = r.stdout;
