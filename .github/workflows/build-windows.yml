@@ -220,6 +220,14 @@ jobs:
         with:
           node-version: 20
 
+      # scripts/build-gpu-worker.js shells out to `bun build` (IIFE worker
+      # bundle) — the windows runner has no bun by default, and job 2 died
+      # at exactly that line on the first run ('bun' is not recognized).
+      - name: Setup Bun (worker bundle build)
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
       - name: npm install
         shell: bash
         run: npm install --no-audit --no-fund
