@@ -92,12 +92,19 @@ engine
     console.log("result:", JSON.stringify({ success: res.success, engine: res.engineUsed, encoder: res.encoderName, frames: res.frames, audioMs: res.audioMs, wall: res.durationMs }));
 
     // luma profile: frame 5 (bookend, ~almost black), frame 45 (mid A),
-    // frame 105 (dissolve B ramping), frame 178 (dip tail ~dark)
-    const stats = spawnSync(FFPROBE, [
-      "-v", "error", "-f", "lavfi", "-i", "movie=" + OUT + ",signalstats",
-      "-show_entries", "frame_tags=lavfi.signalstats.YAVG", "-of", "csv=p=0",
-    ], { encoding: "utf8", timeout: 60000, maxBuffer: 32 * 1024 * 1024 });
-    const y = String(stats.stdout || "").split("\n").map(Number).filter(Number.isFinite);
+    // frame 105 (dissolve B ramping), frame 178 (dip tail ~dark) — raw GRAY
+    // decode (portable; no lavfi movie-filter path quirks on Windows).
+    const gray = spawnSync(FFMPEG, [
+      "-v", "error", "-i", OUT, "-f", "rawvideo", "-pix_fmt", "gray", "-",
+    ], { timeout: 120000, maxBuffer: 256 * 1024 * 1024 });
+    const W = 640, H = 360, FB = W * H;
+    const nFrames = gray.stdout ? Math.floor(gray.stdout.length / FB) : 0;
+    const y = [];
+    for (let i = 0; i < nFrames; i++) {
+      let sum = 0;
+      for (let b = i * FB; b < (i + 1) * FB; b++) sum += gray.stdout[b];
+      y.push(sum / FB);
+    }
     const at = (i) => y[i];
     console.log("YAVG f5=" + at(5) + " f45=" + at(45) + " f92=" + at(92) + " f105=" + at(105) + " f178=" + at(178));
     const checks = [
