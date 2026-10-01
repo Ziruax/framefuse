@@ -1895,3 +1895,22 @@ Stage Summary:
 - The "falling back to CLI" complaint had TWO roots: eligibility gates (VO/SFX/transitions — now native) AND the silent QSV/x264 encoder-tier failures (fixed).
 - Icon fixes: AUMID + short description + explicit shortcut icons (three independent root causes addressed).
 - Next: CI artifact → stage .node → electron-builder --win nsis (local) → publish v1.18.0 installer only.
+
+---
+Task ID: 58-b (the black-frame bug)
+Agent: main (Z.ai Code)
+Task: GPU-path verification of engine v2 → found + fixed THE v1.16-era black-frame bug.
+
+Work Log:
+- Installed rustup + mesa-vulkan-drivers (extracted to /tmp, custom VK_ICD_FILENAMES with llvmpipe) on the sandbox → FIRST-EVER local GPU-path test capability. With FRAMEFUSE_ENGINE_ALLOW_SOFTWARE_GPU=1 the engine ran "rust-gpu" on llvmpipe.
+- CI (WARP) first caught a wgpu Validation Error (dynamic-offset binding used as_entire_binding → "maximum the binding can be offset is 0 bytes") + the uniform buffer was sized 96×MAX_LAYERS instead of slot-stride×MAX_LAYERS. Fixed (explicit BufferBinding size=96; correct buffer size).
+- GPU path then rendered BLACK (clear worked, layers invisible). Isolation ladder: constant-color fragment → no draw; hardcoded fullscreen vertex → DRAWS (255,51,26); uniform-buffer dump → data present + correct; non-dynamic binding → still black; git-stash v1 engine → ALSO BLACK. → PRE-EXISTING since v1.16.0.
+- ROOT CAUSE: WGSL uniform layout gives mat3x3<f32> 16-byte COLUMN STRIDES (vec3 columns padded to vec4 — col0@0..12, col1@16..28, col2@32..44). v1 wrote the 9 floats PACKED (36 contiguous bytes) → shader read col1/col2 from wrong offsets → transform degenerated to y'=0, w=0 (zero-area triangles) → NOTHING rasterized → BLACK FRAMES from the GPU compositor since v1.16.0. CI never caught it (frame-count assertions pass on black video). This explains years of "rust-gpu" CI greens and very plausibly the user's "export falls back / engine not working properly" reports.
+- FIX: write_layer_uniform writes strided columns (0/16/32). All GPU tests green on llvmpipe: color test exact (red 81/90/240, blue 41/240/110, white 235/128, green 81/90/80 — ffmpeg color names are the half-brightness CSS set, expectation table fixed), smoke YAVG 124.0→80.5 (CPU: 124.0→79.9 — GPU/CPU parity), v2 feature test (dissolve f92=73 ramp, dip f178=16, bookend, VO -43.1dB) PASSED on rust-gpu.
+- New permanent regression tests: rust-engine/tools/yuv-color-test.js (solid-color center pixel through the FULL engine, both paths) + the smoke test's signalstats YAVG assertions — black-frame regressions can never pass silently again. Color test added to CI (with the WARP override).
+- Committed a3c202b + pushed; CI run 36908650583 in progress.
+
+Stage Summary:
+- The GPU compositor is now VERIFIED CORRECT for the first time in the project's history (v1.16-v1.17 shipped a silently-black GPU path; the three-level fallback chain masked it).
+- Local GPU test rig: rustup + llvmpipe ICD at /tmp/lvp-icd/lvp_icd.json (VK_ICD_FILENAMES) + FRAMEFUSE_ENGINE_ALLOW_SOFTWARE_GPU=1 — future rounds can test rust-gpu on the sandbox.
+- The dynamic-offset single-pass batching is RESTORED and verified working (with strided matrices).

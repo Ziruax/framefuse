@@ -370,39 +370,46 @@ function main() {
 
       // v2: VISUAL sanity — the GPU-YUV compute path (exercised on WARP in
       // CI via FRAMEFUSE_ENGINE_ALLOW_SOFTWARE_GPU=1) must produce REAL
-      // luma, not a black/garbage frame. signalstats gives per-frame YAVG.
+      // luma, not a black/garbage frame. Decodes the whole output as 8-bit
+      // GRAY (portable — no lavfi movie-filter path quirks on Windows) and
+      // computes per-frame YAVG in JS. This is the assertion that can never
+      // let a black-frame regression pass silently again.
       try {
-        const stats = spawnSync(
-          FFPROBE,
-          [
-            "-v", "error",
-            "-f", "lavfi",
-            "-i", "movie=" + OUT_MP4.replace(/\\/g, "/") + ",signalstats",
-            "-show_entries", "frame_tags=lavfi.signalstats.YAVG",
-            "-of", "csv=p=0",
-          ],
-          { encoding: "utf8", timeout: 60000, maxBuffer: 32 * 1024 * 1024 },
+        const gray = spawnSync(
+          FFMPEG,
+          ["-v", "error", "-i", OUT_MP4, "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+          { timeout: 120000, maxBuffer: 256 * 1024 * 1024 },
         );
-        const yavgs = String(stats.stdout || "")
-          .split("\n")
-          .map((l) => Number(l))
-          .filter((n) => Number.isFinite(n));
-        if (yavgs.length > 60) {
-          const f30 = yavgs[30]; // mid first segment (video + headline)
-          const f90 = yavgs[90]; // second segment (Ken Burns image + text)
-          check(
-            f30 > 8 && f30 < 247,
-            "frame 30 luma in a sane range (GPU-YUV not black/clipped): YAVG=" + f30.toFixed(1),
-          );
-          check(
-            Math.abs(f90 - f30) > 0.5,
-            "content changes between segments (YAVG " + f30.toFixed(1) + " → " + f90.toFixed(1) + ")",
-          );
+        if (!gray.error && gray.status === 0 && gray.stdout && gray.stdout.length > 0) {
+          const W = Number(vs && vs.width) || 640;
+          const H = Number(vs && vs.height) || 360;
+          const frameBytes = W * H;
+          const nFrames = Math.floor(gray.stdout.length / frameBytes);
+          const yavg = (idx) => {
+            const start = idx * frameBytes;
+            let sum = 0;
+            for (let i = start; i < start + frameBytes; i++) sum += gray.stdout[i];
+            return sum / frameBytes;
+          };
+          if (nFrames > 90) {
+            const f30 = yavg(30); // mid first segment (video + headline)
+            const f90 = yavg(90); // second segment (Ken Burns image + text)
+            check(
+              f30 > 8 && f30 < 247,
+              "frame 30 luma in a sane range (not black/clipped): YAVG=" + f30.toFixed(1),
+            );
+            check(
+              Math.abs(f90 - f30) > 0.5,
+              "content changes between segments (YAVG " + f30.toFixed(1) + " → " + f90.toFixed(1) + ")",
+            );
+          } else {
+            check(false, "gray decode produced < 90 frames (got " + nFrames + ")");
+          }
         } else {
-          check(false, "signalstats produced < 60 frames of luma (got " + yavgs.length + ")");
+          check(false, "gray decode failed (status " + gray.status + ")");
         }
       } catch (e) {
-        console.log("  (signalstats luma check unavailable: " + (e && e.message) + ")");
+        console.log("  (luma check unavailable: " + (e && e.message) + ")");
       }
 
       const wallMs = Date.now() - t0;

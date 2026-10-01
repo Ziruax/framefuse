@@ -11,16 +11,15 @@
   "probeFfmpegFamily": "61/61/59/8/5",
   "result": {
     "success": true,
-    "engineUsed": "rust-gpu",
+    "engineUsed": "rust-cpu",
     "encoderName": "libx264",
-    "durationMs": 939,
+    "durationMs": 776,
     "frames": 150,
-    "compositorMs": 683,
-    "encodeMs": 49,
-    "decodeMs": 25,
+    "compositorMs": 499,
+    "encodeMs": 146,
+    "decodeMs": 32,
     "audioMs": 72,
-    "sizeBytes": 877346,
-    "adapter": "llvmpipe (LLVM 19.1.7, 256 bits)",
+    "sizeBytes": 300325,
     "ffmpegFamily": "61/61/59/8/5"
   },
   "ffprobe": {
@@ -38,12 +37,12 @@
     },
     "format": {
       "duration": "5.013000",
-      "size": "877346"
+      "size": "300325"
     },
-    "outputBytes": 877346
+    "outputBytes": 300325
   },
   "assertionsPassed": true,
   "assertionFailures": [],
-  "wallMs": 1677,
-  "generatedAt": "2026-10-01T18:40:02.727Z"
+  "wallMs": 1183,
+  "generatedAt": "2026-10-01T18:48:04.483Z"
 }
