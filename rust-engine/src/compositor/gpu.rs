@@ -63,6 +63,7 @@ pub struct GpuCompositor {
     yuv_params: wgpu::Buffer,
     yuv_store: wgpu::Buffer,
     yuv_readback: wgpu::Buffer,
+    yuv_bg: Option<wgpu::BindGroup>,
     yuv_mode: YuvMode,
     yuv_bytes: usize,
     y_stride: usize,
@@ -316,7 +317,7 @@ impl GpuCompositor {
 
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("layer-uniforms"),
-            size: UNIFORM_SIZE * MAX_LAYERS as u64,
+            size: uniform_slot as u64 * MAX_LAYERS as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -339,6 +340,7 @@ impl GpuCompositor {
             yuv_params,
             yuv_store,
             yuv_readback,
+            yuv_bg: None,
             yuv_mode: yuv,
             yuv_bytes,
             y_stride,
@@ -459,7 +461,15 @@ impl GpuCompositor {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: self.uniform.as_entire_binding(),
+                    // EXPLICIT size — a dynamic-offset binding that takes
+                    // the whole buffer validates "offset must be 0"
+                    // (wgpu: "the maximum the binding can be offset is 0
+                    // bytes"). Binding exactly one uniform slot per draw.
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.uniform,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(UNIFORM_SIZE),
+                    }),
                 },
             ],
         });
@@ -477,9 +487,21 @@ impl GpuCompositor {
     }
 
     /// Pack one layer's uniforms into scratch slot `i` (256-aligned stride).
+    ///
+    /// THE v1.16-v1.17 BLACK-FRAME BUG (found via llvmpipe GPU testing):
+    /// WGSL's UNIFORM address space gives mat3x3<f32> 16-byte column strides
+    /// (each vec3 column padded to vec4), i.e. col0@0..12, col1@16..28,
+    /// col2@32..44. Writing the 9 floats PACKED (36 contiguous bytes) made
+    /// the shader read col1/col2 from the wrong offsets — the transform
+    /// degenerated to y'=0, w=0 (zero-area triangles) and the GPU
+    /// compositor silently rendered BLACK FRAMES since v1.16.0 (CI only
+    /// asserted frame counts, never pixel content).
     fn write_layer_uniform(&mut self, i: usize, transform: [f32; 9], alpha: f32, chroma: Option<(&str, f64, f64)>, tex_w: u32, tex_h: u32) {
         let slot = &mut self.uniform_scratch[i * self.uniform_slot as usize..];
-        slot[0..36].copy_from_slice(bytemuck_of(&transform));
+        // strided columns: the WGSL uniform layout for mat3x3
+        slot[0..12].copy_from_slice(bytemuck_of(&transform[0..3]));
+        slot[16..28].copy_from_slice(bytemuck_of(&transform[3..6]));
+        slot[32..44].copy_from_slice(bytemuck_of(&transform[6..9]));
         let a = alpha.clamp(0.0, 1.0);
         slot[48..52].copy_from_slice(bytemuck_of(&[a]));
         let (key, similar, smooth) = if let Some((color, similarity, smoothness)) = chroma {
@@ -673,32 +695,36 @@ impl Compositor for GpuCompositor {
         }
         // compute: RGBA → YUV (planar/NV12) into the packed storage buffer
         if self.yuv_pipeline.is_some() {
-            let yuv_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("yuv-bg"),
-                layout: &self.yuv_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&self.target_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &self.yuv_store,
-                            offset: 0,
-                            size: None,
-                        }),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &self.yuv_params,
-                            offset: 0,
-                            size: None,
-                        }),
-                    },
-                ],
-            });
+            if self.yuv_bg.is_none() {
+                let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("yuv-bg"),
+                    layout: &self.yuv_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&self.target_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &self.yuv_store,
+                                offset: 0,
+                                size: None,
+                            }),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &self.yuv_params,
+                                offset: 0,
+                                size: None,
+                            }),
+                        },
+                    ],
+                });
+                self.yuv_bg = Some(bg);
+            }
+            let yuv_bg = self.yuv_bg.as_ref().unwrap();
             // one invocation per 8x2 pixel stripe; workgroup_size(4,4,1)
             let inv_x = (self.width + 7) / 8;
             let inv_y = (self.height + 1) / 2;

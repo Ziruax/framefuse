@@ -1869,3 +1869,29 @@ Work Log:
 Stage Summary:
 - v1.17.0 is LIVE: https://github.com/Ziruax/framefuse/releases/tag/v1.17.0 (both installer + portable, CI-smoke-tested Rust engine, all new voice/dub/stack-text modules in the package).
 - Gotchas for future rounds: (1) CI npm-install of sharp's libvips can TIME OUT transiently — rerun-failed-jobs fixes it, consider a retry step in the workflow; (2) the browser stub-verification stack (electronAPI bridge + :3100 proxy) has three traps — the HMR websocket MUST be proxied with an Origin rewrite (hydration never completes otherwise), a frozen HTML snapshot goes stale against the live dev server (reload loop — re-curl before each run), and cold-cache hydration takes 6-15s (wait LONGER than feels sane); (3) agent-browser's `errors` command silently drops messages — use a raw CDP Runtime.exceptionThrown listener for real error capture.
+
+---
+Task ID: 58-a (engine v2)
+Agent: main (Z.ai Code)
+Task: v1.18.0 — Rust engine "full potential" speed work + fix CLI fallback + icon fixes + installer-only build.
+
+Work Log:
+- Research (41 web searches, primary sources): NVIDIA SDK-10 preset ladders, QSV/AMF settings, wgpu readback ring-buffering + storage-buffer YUV packing, FFmpeg thread-safety rules, pipeline architecture, electron icon bugs (AUMID, electron-builder #2435 long-description NSIS blank shortcut).
+- CRITICAL BUGS FOUND in v1 engine: (1) h264_qsv tier opened with YUV420P but QSV ONLY accepts NV12 → Intel machines silently fell back to single-threaded libx264; (2) cc_set_threads_auto never called on the PRIMARY encoder → libx264 ran SINGLE-THREADED; (3) NVENC delay=0 forced synchronous packet-per-frame (killed NVENC pipelining); (4) per-layer queue.submit + full-cache wipe at 32 textures + per-frame texture alloc for video; (5) audio decode/mix serialized AFTER the video loop.
+- rust-engine v2 (engine version 0.2.0): 3-stage pipeline (decode-ahead producer thread → bounded sync_channel(4) → composite+encode consumer; audio thread decodes/mixes IN PARALLEL, joined at the audio phase); ONE encoder+submit per frame with dynamic-offset uniform batching; LRU static texture cache + pooled dynamic video slots; compute-shader RGBA→YUV420P/NV12 (BT.601 limited = sws parity, packed 1.5B/px readback, no CPU sws on GPU path); AVFrame ring; per-encoder pix_fmt (QSV/AMF/MF=NV12); x264 threads auto; NVENC p3/p4/p6+multipass/lookahead ladders, no delay=0; EAGAIN send/drain retry contract; movflags +faststart; WARP/software adapter rejection (CI override FRAMEFUSE_ENGINE_ALLOW_SOFTWARE_GPU=1).
+- Timeline schema v2: extraAudio (VO+SFX native bus) + per-segment transition plan (transHeadMs/Style, transTailMs/Style, bookendStart/End).
+- NATIVE transitions: dissolve (prev image at frozen Ken Burns end-state + current ramping, VIDEO RULE hard-cut, overlays not cross-faded — CLI layering parity) + dip-black/dip-white head/tail + fadeStartEnd bookends; captions stay above fades (the layering contract).
+- Router: voiceovers+SFX gates REMOVED (extraAudio); dubDuck applied router-side (mirror of main.js math); transition gate split — dissolve/dips native, slide/wipe/circleopen → CLI; per-seg transition dead gate removed; progress events carry engine:"rust".
+- main.js: app.setAppUserModelId("com.framefuse.app") (the taskbar blank-white fix — matches electron-builder's shortcut AUMI); CLI progress carries engine:"cli"; export-info gains rustEngine status.
+- Renderer: Header engine badge (Rust engine | FFmpeg CLI) during export; types extended; version strings → 1.18.0.
+- ICONS: package.json description 430→62 chars (electron-builder #2435: long descriptions overflow the NSIS CreateShortCut command → blank shortcut icon); installer.nsh customInstall recreates desktop+start-menu shortcuts with EXPLICIT $INSTDIR\resources\icon.ico icons + WinShell::SetLnkAUMI + SHChangeNotify + ie4uinit (customInstall runs AFTER addDesktopLink in the electron-builder template — verified).
+- package.json: win.target = ["nsis"] ONLY (portable dropped per directive); version 1.18.0.
+- CI: FRAMEFUSE_ENGINE_ALLOW_SOFTWARE_GPU=1 for smoke (exercises the FULL GPU path on WARP: compute YUV, pooling, single-submit) + luma sanity assertions (signalstats YAVG); NEW v2 feature test job step (transitions + extra audio, luma-profile + volumedetect assertions).
+- LOCAL VERIFICATION (sandbox, system ffmpeg family 61/61/59/8/5, rustup installed): cargo build --release ZERO warnings; smoke test PASSED (150/150 frames, h264, aac 48kHz stereo, luma 124.0/79.9, wall 1.34s — encodeMs 156ms for 150 frames ≈ 95fps proves the x264 threads fix); v2 feature test PASSED (dissolve f92 luma 74→45 ramp, dip tail f178=16, bookend, VO tone at -43.1dB mean volume); bun run lint exit 0; tsc clean on touched files; agent-browser: landing + studio render at v1.18.0 with ZERO page errors.
+- Committed a7dd073 + pushed; CI run 36904338355 in progress.
+
+Stage Summary:
+- Engine v2 delivers the researched best-practice stack: pipelined stages, single-submit GPU batching, GPU color conversion, encoder-tier correctness (QSV NV12, x264 threads, NVENC async), parallel audio, faststart.
+- The "falling back to CLI" complaint had TWO roots: eligibility gates (VO/SFX/transitions — now native) AND the silent QSV/x264 encoder-tier failures (fixed).
+- Icon fixes: AUMID + short description + explicit shortcut icons (three independent root causes addressed).
+- Next: CI artifact → stage .node → electron-builder --win nsis (local) → publish v1.18.0 installer only.

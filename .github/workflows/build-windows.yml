@@ -194,6 +194,25 @@ jobs:
           set -o pipefail
           node rust-engine/tools/smoke-test-windows.js 2>&1 | tee rust-engine/smoke-windows.log
 
+      # v2 GPU color regression: the mat3x3-uniform-stride bug (v1.16-v1.17
+      # rendered BLACK frames on every real-GPU machine — WGSL uniform
+      # layout gives mat3x3 16-byte column strides; the packed write
+      # degenerated the transform). Solid colors through the FULL engine
+      # (composite → GPU YUV → encode → decode), center-pixel verified
+      # against the BT.601 limited-range matrix.
+      - name: Rust engine GPU color test (black-frame regression)
+        shell: bash
+        env:
+          FF_ENGINE_FFMPEG_DIR: "resources/ffmpeg/win/dll"
+          FF_TEST_MEDIA_DIR: "${{ runner.temp }}/fftest-color"
+          FRAMEFUSE_ENGINE_ALLOW_SOFTWARE_GPU: "1"
+        run: |
+          set -o pipefail
+          for c in red blue white green; do
+            echo "--- color: $c ---"
+            YUV_TEST_COLOR=$c node rust-engine/tools/yuv-color-test.js 2>&1 | tee -a rust-engine/color-test.log
+          done
+
       # v2 engine feature test: native transitions (dissolve + dips +
       # bookends) + extra audio (voiceover/SFX on the native bus), with
       # luma-profile + volumedetect assertions. Runs after the smoke test.
@@ -221,6 +240,7 @@ jobs:
             rust-engine/build-windows.log
             rust-engine/smoke-windows.log
             rust-engine/feature-v2.log
+            rust-engine/color-test.log
           if-no-files-found: warn
           retention-days: 14
 
