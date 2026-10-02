@@ -314,6 +314,43 @@ export function drawKineticComposition(
 
 // ── Plan cache (preview + GPU export call every frame — reference-keyed) ───
 
+/**
+ * v1.21 FONT PRELOAD: canvas `ctx.font` usage does NOT trigger @font-face
+ * downloads — only DOM text does. The kinetic faces (Inter/Montserrat/
+ * Bebas/…) are canvas-only, so without an explicit document.fonts.load()
+ * the painter and the EXPORT measurement silently measure with fallback
+ * system fonts (the "designs don't look like the pasted reference" bug).
+ * Called on app mount and before export measurement.
+ */
+const KINETIC_FONT_FAMILIES = [
+  "Inter",
+  "Roboto",
+  "Montserrat",
+  "Bebas Neue",
+  "Playfair Display",
+];
+let kineticFontsLoadStarted = false;
+export async function ensureKineticFontsLoaded(): Promise<void> {
+  if (typeof document === "undefined" || !document.fonts?.load) return;
+  kineticFontsLoadStarted = true;
+  try {
+    await Promise.all(
+      KINETIC_FONT_FAMILIES.flatMap((f) =>
+        [400, 500, 600, 700, 800, 900].map((w) =>
+          document.fonts.load(`${w} 32px "${f}"`).catch(() => undefined),
+        ),
+      ),
+    );
+  } catch {
+    /* offline / blocked — the stacks fall back as before */
+  }
+}
+
+/** True once ensureKineticFontsLoaded() has been kicked off (debug aid). */
+export function kineticFontsLoadPending(): boolean {
+  return !kineticFontsLoadStarted;
+}
+
 let planCache: {
   cues: KineticCueInput[] | undefined;
   settings: KineticCaptionSettings | undefined;
@@ -375,6 +412,10 @@ export function measureKineticPlanFor(
     const geoWords: KineticGeoWord[] = [];
     layout.lines.forEach((line) => {
       line.words.forEach((lw) => {
+        // v1.21: carry the word's plan row (timing/semantics/weight) so the
+        // native Rust renderer is self-contained — it joins geometry +
+        // motion WITHOUT re-deriving the semantic plan (§36 parity).
+        const planWord = comp.words[lw.wordIdx];
         geoWords.push({
           text: lw.text,
           x: Math.round(lw.x * 10) / 10,
@@ -383,6 +424,12 @@ export function measureKineticPlanFor(
           h: Math.round(lw.h * 10) / 10,
           fontPx: Math.round(lw.fontPx),
           wordIdx: lw.wordIdx,
+          weight: lw.weight,
+          emphasis: lw.emphasis,
+          role: lw.role,
+          phraseIndex: planWord ? planWord.phraseIndex : 0,
+          startMs: planWord ? planWord.startMs : comp.startMs,
+          endMs: planWord ? planWord.endMs : comp.endMs,
         });
       });
     });
@@ -403,6 +450,11 @@ export function measureKineticPlanFor(
         y: Math.round(l.y),
         h: l.h,
         align: l.align,
+      })),
+      // v1.21: per-phrase role/align for the native motion solver.
+      phrases: comp.phrases.map((p) => ({
+        role: p.role,
+        align: p.align,
       })),
       words: geoWords,
     });

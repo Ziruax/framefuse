@@ -2,8 +2,39 @@
 
 @custom-variant dark (&:is(.dark *));
 
+/* ── v1.21 BUNDLED CAPTION/KINETIC FONTS ─────────────────────────────────
+ * The caption + kinetic typography font stacks reference Inter, Roboto,
+ * Montserrat, Bebas Neue and Playfair Display. Before v1.21 NONE of them
+ * were loaded, so the canvas painter/measurer silently fell back to the
+ * system sans — the kinetic designs lost their entire typographic identity
+ * (Bebas Neue is a condensed all-caps display face, Montserrat is geometric,
+ * Playfair is a high-contrast serif). The SAME static TTFs ship with the
+ * desktop app (extraResources "fonts") so the Rust engine renders and the
+ * browser preview measures with byte-identical font files.
+ * font-display: block keeps canvas measurement from racing the download. */
+@font-face { font-family: "Inter"; font-style: normal; font-weight: 400; font-display: block; src: url("/fonts/Inter-400.ttf") format("truetype"); }
+@font-face { font-family: "Inter"; font-style: normal; font-weight: 500; font-display: block; src: url("/fonts/Inter-500.ttf") format("truetype"); }
+@font-face { font-family: "Inter"; font-style: normal; font-weight: 600; font-display: block; src: url("/fonts/Inter-600.ttf") format("truetype"); }
+@font-face { font-family: "Inter"; font-style: normal; font-weight: 700; font-display: block; src: url("/fonts/Inter-700.ttf") format("truetype"); }
+@font-face { font-family: "Inter"; font-style: normal; font-weight: 800; font-display: block; src: url("/fonts/Inter-800.ttf") format("truetype"); }
+@font-face { font-family: "Inter"; font-style: normal; font-weight: 900; font-display: block; src: url("/fonts/Inter-900.ttf") format("truetype"); }
+@font-face { font-family: "Roboto"; font-style: normal; font-weight: 400; font-display: block; src: url("/fonts/Roboto-400.ttf") format("truetype"); }
+@font-face { font-family: "Roboto"; font-style: normal; font-weight: 500; font-display: block; src: url("/fonts/Roboto-500.ttf") format("truetype"); }
+@font-face { font-family: "Roboto"; font-style: normal; font-weight: 700; font-display: block; src: url("/fonts/Roboto-700.ttf") format("truetype"); }
+@font-face { font-family: "Roboto"; font-style: normal; font-weight: 900; font-display: block; src: url("/fonts/Roboto-900.ttf") format("truetype"); }
+@font-face { font-family: "Montserrat"; font-style: normal; font-weight: 400; font-display: block; src: url("/fonts/Montserrat-400.ttf") format("truetype"); }
+@font-face { font-family: "Montserrat"; font-style: normal; font-weight: 500; font-display: block; src: url("/fonts/Montserrat-500.ttf") format("truetype"); }
+@font-face { font-family: "Montserrat"; font-style: normal; font-weight: 600; font-display: block; src: url("/fonts/Montserrat-600.ttf") format("truetype"); }
+@font-face { font-family: "Montserrat"; font-style: normal; font-weight: 700; font-display: block; src: url("/fonts/Montserrat-700.ttf") format("truetype"); }
+@font-face { font-family: "Montserrat"; font-style: normal; font-weight: 800; font-display: block; src: url("/fonts/Montserrat-800.ttf") format("truetype"); }
+@font-face { font-family: "Montserrat"; font-style: normal; font-weight: 900; font-display: block; src: url("/fonts/Montserrat-900.ttf") format("truetype"); }
+@font-face { font-family: "Bebas Neue"; font-style: normal; font-weight: 400; font-display: block; src: url("/fonts/BebasNeue-400.ttf") format("truetype"); }
+@font-face { font-family: "Playfair Display"; font-style: normal; font-weight: 400; font-display: block; src: url("/fonts/PlayfairDisplay-400.ttf") format("truetype"); }
+@font-face { font-family: "Playfair Display"; font-style: normal; font-weight: 700; font-display: block; src: url("/fonts/PlayfairDisplay-700.ttf") format("truetype"); }
+@font-face { font-family: "Playfair Display"; font-style: normal; font-weight: 900; font-display: block; src: url("/fonts/PlayfairDisplay-900.ttf") format("truetype"); }
+
 @theme inline {
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-mono: ui-monospace, "Cascadia Code", "Source Code Pro", Menlo, Consolas, monospace;
 }
 
@@ -31,7 +62,7 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     overscroll-behavior: none;
-    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-family: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     text-rendering: optimizeLegibility;
   }
 

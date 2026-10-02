@@ -47,7 +47,7 @@ import {
 import type { CaptionAnimation } from "./types";
 // v1.18 Kinetic Typography caption engine — the painter + plan cache + export
 // geometry measurement (renderer-side; the ASS twin lives in main).
-import { drawKineticCaption, measureKineticPlanDom } from "./kinetic/render";
+import { drawKineticCaption, measureKineticPlanDom, ensureKineticFontsLoaded } from "./kinetic/render";
 import { buildKineticPlan, type KineticCueInput } from "./kinetic/engine";
 import { KINETIC_PRESETS } from "./kinetic/presets";
 import type {
@@ -633,6 +633,10 @@ async function exportViaFFmpeg(
     // resolution (canvas ↔ ASS parity). Kinetic rides the ASS/libass CLI
     // compositor, exactly like v1.17 stack-text headlines.
     if (captionSettings.kinetic?.enabled) {
+      // v1.21: the kinetic faces are canvas-only @font-face resources — load
+      // them BEFORE measuring or the geometry is solved with fallback
+      // system metrics (wrong wrap, wrong export parity).
+      await ensureKineticFontsLoaded();
       const kineticSettings = captionSettings.kinetic;
       const kineticCues: KineticCueInput[] = subtitles.cues.map((c) => ({
         startMs: c.startMs,

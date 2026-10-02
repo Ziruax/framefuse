@@ -272,7 +272,8 @@ export const KINETIC_IDENTITY: KineticWordTransform = {
   colorOverride: null,
 };
 
-// ── Export geometry (measured in the renderer, consumed by the ASS mirror) ─
+// ── Export geometry (measured in the renderer, consumed by the ASS mirror
+// AND — since v1.21 — the NATIVE Rust kinetic renderer) ─────────────────────
 
 export interface KineticGeoWord {
   text: string;
@@ -284,6 +285,17 @@ export interface KineticGeoWord {
   fontPx: number;
   /** Index into the composition's flat word list. */
   wordIdx: number;
+  // ── v1.21 native Rust render fields (self-contained payload: the Rust
+  // engine needs per-word timing + semantics + weight but does NOT
+  // re-derive layout — the rects above are the canvas-measured truth) ──
+  /** Effective font weight (inline emphasis may bump it). */
+  weight?: number;
+  emphasis?: boolean;
+  /** "primary" | "secondary" | "supporting". */
+  role?: KineticRole;
+  phraseIndex?: number;
+  startMs?: number;
+  endMs?: number;
 }
 
 export interface KineticGeoLine {
@@ -291,6 +303,11 @@ export interface KineticGeoLine {
   fontPx: number;
   y: number;
   h: number;
+  align: "left" | "center" | "right";
+}
+
+export interface KineticGeoPhrase {
+  role: KineticRole;
   align: "left" | "center" | "right";
 }
 
@@ -306,6 +323,10 @@ export interface KineticGeoComposition {
   blockRotateDeg: number;
   lines: KineticGeoLine[];
   words: KineticGeoWord[];
+  /** v1.21: per-phrase role/align (indexed by word.phraseIndex) — the Rust
+   * motion solver needs the phrase alignment (slide-x direction) and the
+   * push-out grouping without re-deriving the semantic plan. */
+  phrases?: KineticGeoPhrase[];
 }
 
 /** Serialized per-cue composition payload (renderer → main, §36 parity). */

@@ -473,6 +473,12 @@ export default function Page() {
   // the localStorage "external system".
 
   useEffect(() => {
+    // v1.21: preload the bundled caption/kinetic faces — canvas usage never
+    // triggers @font-face downloads, so without this the preview + design
+    // gallery + export measurement all render with fallback system fonts.
+    void import("@/lib/merger/kinetic/render").then((m) =>
+      m.ensureKineticFontsLoaded(),
+    );
     const p = loadPersisted();
     if (p.kenBurns) {
       // v1.14.6 (user directive): Ken Burns is the ONLY effect enabled by

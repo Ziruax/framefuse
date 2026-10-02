@@ -54,10 +54,101 @@ pub struct Timeline {
     /// animations). Electron precomputes every concrete style number (the
     /// renderer resolved the CaptionPreset before the payload shipped), so
     /// this is a pure paint contract — no preset knowledge lives in Rust.
-    /// Kinetic-typography-engine captions and Stack Text headlines still
-    /// ride the CLI/libass compositor (gated Electron-side).
+    /// Stack Text headlines still ride the CLI/libass compositor.
     #[serde(default)]
     pub captions: Option<CaptionsTimeline>,
+    /// v1.21 NATIVE KINETIC TYPOGRAPHY: the v1.18 kinetic-typography engine
+    /// rendered natively (per-word choreography over renderer-measured
+    /// geometry). The renderer measured every word rect with the SAME
+    /// bundled TTFs, and Electron embedded each composition's preset
+    /// motion/visual spec — Rust solves motion (a math-only port of
+    /// kinetic/motion.ts) and blits fontdue strips. When this is present it
+    /// REPLACES `captions` (the preview painter dispatches the same way).
+    #[serde(default)]
+    pub kinetic: Option<KineticTimeline>,
+}
+
+/// v1.21: the native kinetic typography timeline.
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct KineticTimeline {
+    /// Base (non-emphasis) text color, "#rrggbb" — customColor override or
+    /// the canvas default white.
+    pub base_color: String,
+    /// Emphasis/accent color — accentOverride or the preset's accent.
+    pub accent_color: String,
+    /// "subtle" | "balanced" | "dynamic" | "extreme" (motion energy).
+    pub motion_level: String,
+    /// Compositions in time order.
+    pub comps: Vec<KineticComp>,
+}
+
+/// One kinetic composition: measured word rects + the embedded preset spec.
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct KineticComp {
+    pub start_ms: f64,
+    pub end_ms: f64,
+    /// The preset motion/visual spec (embedded by Electron from its mirror
+    /// of kinetic/presets.ts — Rust never looks presets up by id).
+    pub preset: KineticPresetSpec,
+    /// Renderer-measured word rects (absolute px at the output dims), each
+    /// carrying its own timing + semantics + weight.
+    pub words: Vec<KineticGeoWordR>,
+    /// Per-phrase role/align (indexed by word.phrase_index).
+    pub phrases: Vec<KineticPhraseSpec>,
+}
+
+/// Motion/visual spec subset of KineticPresetSpec (presets.ts) — exactly the
+/// fields the motion solver + rasterizer read.
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct KineticPresetSpec {
+    pub entrance: String,
+    pub entrance_ms: f64,
+    pub stagger_ms: f64,
+    pub overshoot: f64,
+    /// "scale-punch" | "pulse" | "shake" | "hold".
+    pub emphasis_motion: String,
+    /// "none" | "drift" | "pulse" | "active-word" | "active-accent".
+    pub hold: String,
+    /// "fade" | "slide-down" | "scale-out" | "collapse" | "push-out".
+    pub exit: String,
+    pub exit_ms: f64,
+    pub shadow: bool,
+    /// Supporting-tier alpha multiplier (§27 muted tier).
+    pub support_alpha: f64,
+}
+
+/// A renderer-measured kinetic word.
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct KineticGeoWordR {
+    pub text: String,
+    pub start_ms: f64,
+    pub end_ms: f64,
+    /// Absolute rect (px at output dims; y = line top).
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    pub font_px: f64,
+    /// Effective font weight — routes the rasterizer to the weight file.
+    pub weight: u32,
+    pub emphasis: bool,
+    /// "primary" | "secondary" | "supporting".
+    pub role: String,
+    pub phrase_index: usize,
+    /// Font key into timeline.fonts (Electron resolved family+weight → file).
+    pub font_key: String,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct KineticPhraseSpec {
+    pub role: String,
+    /// "left" | "center" | "right" — drives slide-x direction.
+    pub align: String,
 }
 
 /// v1.20: the native caption system's resolved style + cue list.

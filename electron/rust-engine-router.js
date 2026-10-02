@@ -538,7 +538,7 @@ function buildRustTimeline(opts) {
       sourceDurationMs: Number.isFinite(o.sourceDurationMs) ? o.sourceDurationMs : null,
       speed: 1,
       track: Math.max(1, Number(o.track) || 1),
-      volume: zv(o.volume),
+      volume: zvPlain(o.volume),
       sourceWidth: null,
       sourceHeight: null,
       kenBurns: null,
@@ -694,7 +694,20 @@ async function runRustExport(opts, event, { ffmpegPath, cpuCount, sendCliProgres
     }
     return null;
   }
-  const built = buildRustTimeline(opts);
+  // v1.20.1 SAFE-MODE HARDENING: buildRustTimeline runs INSIDE the guard —
+  // ANY bug in the timeline mapping (a ReferenceError like the v1.20 `zv`
+  // typo that crashed the whole `export-native` IPC call with "zv is not
+  // defined") must degrade to the FFmpeg-CLI pipeline, never fail an export
+  // that would otherwise succeed.
+  let built;
+  try {
+    built = buildRustTimeline(opts);
+  } catch (err) {
+    console.log(
+      `[RustEngine] timeline build failed (${(err && err.message) || err}) — Safe Mode: CLI pipeline`,
+    );
+    return null;
+  }
   if (built.error) {
     console.log(`[RustEngine] timeline build refused: ${built.error}`);
     return null;
