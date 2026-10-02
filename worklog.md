@@ -2222,3 +2222,22 @@ Stage Summary:
 - Fonts: the five web families (Inter, Roboto, Montserrat, Bebas Neue, Playfair Display; 24 weight files) ship in the app and are used by preview (@font-face), native Rust rendering (fontdue reads the same files) and the libass fallback (fontsdir). Font selection now matches the pasted reference.
 - The zv IPC crash ("Error invoking remote method 'export-native': zv is not defined") is fixed AND hardened (timeline build wrapped in try/catch → Safe Mode).
 - User-friendly UI: live-preview font picker, human-language engine badge.
+
+---
+Task ID: 2 (ship v1.21.0)
+Agent: main (Z.ai Code)
+Task: Ship v1.21.0 — build the NSIS installer + push to GitHub + publish the release.
+
+Work Log:
+- Commit 337aec4 pushed to main ("v1.21.0: native Rust kinetic typography + bundled real fonts + live-preview font picker", 15 files, +682/−137).
+- CI run 37058828606 job 1 (windows-latest MSVC) GREEN: cargo build → .node load probe → E2E smoke (engineUsed rust-gpu, 150 frames h264 + aac 48kHz, all assertions) → v2 feature test → GPU color test → artifact uploaded.
+- Artifact 11250262369 downloaded + staged: framefuse-engine.win32-x64.node (11,842,048 B; sha256 750969bf…) — the installer ships EXACTLY this smoke-tested binary (sha verified inside app.asar.unpacked).
+- Freed 1.6 GB of rust-engine/target first (the v1.20 OOM lesson); clean → next build --webpack → gpu-worker (356 KB) → copy-wasm → electron-builder --win nsis (skipped fetch-ffmpeg: already staged; skipped build-rust: both .node binaries already smoke-tested).
+- dist/FrameFuse Setup 1.21.0.exe (221,184,820 B) + blockmap + latest.yml; rcedit: FrameFuse.exe 1.21.0.0, icon replaced.
+- ASAR verification: renderer page chunk carries the FontPicker (ff-font-scroll) + kinetic payload markers + Montserrat; electron/rust-engine-router.js carries buildRustKinetic + zvPlain + resolveBundledFont; main.js carries fontsdir; kinetic-ass.js carries the real Bebas Neue name; resources/fonts has the 24 TTFs; package.json 1.21.0.
+- PUBLISHED scripts/publish-release-1.21.0.js: release 402129048 created at 337aec4, assets FrameFuse-Setup-1.21.0.exe + latest.yml + blockmap uploaded. THREE-WAY sha512 VERIFIED (local == latest.yml == re-downloaded; size exact).
+
+Stage Summary:
+- v1.21.0 IS LIVE: https://github.com/Ziruax/framefuse/releases/tag/v1.21.0 (installer only — NSIS, per the standing directive).
+- This round: native Rust kinetic typography (the kinetic-captions FFmpeg-fallback fix), the zv IPC crash fix + Safe-Mode hardening, real bundled fonts end-to-end (preview = export = reference), the live-preview font picker, human-language engine badge.
+- CI job 2 (installer + bench, best-effort) left running.
