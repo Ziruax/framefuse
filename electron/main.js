@@ -53,6 +53,12 @@ app.setAppUserModelId("com.framefuse.app");
 // buildHeadlineEvents() for items with a kinetic stackStyle AND renderer-
 // measured geometry; everything else keeps the legacy v4.2 emitter.
 const StackText = require("./stack-text-ass");
+// v1.18 KINETIC CAPTIONS (kinetic typography): the plain-JS ASS mirror of
+// src/lib/merger/kinetic/{presets,motion}.ts (emission-relevant subset) +
+// the per-word override-tag emitter. Consumed by buildAssDocument() when
+// cs.kinetic.enabled AND the renderer's compositions + measured geometry
+// are present; kinetic replaces the legacy caption path for covered cues.
+const KineticASS = require("./kinetic-ass");
 // v1.17 VOICEOVER + DUB: the Edge TTS engine (task 57-b, live-verified) and
 // the Groq transcribe→translate→synthesize orchestrator (task 57-c). Both
 // are plain Node modules with zero Electron imports; this file owns the IPC
@@ -3897,6 +3903,12 @@ function buildHeadlineEvents(headlines, width, height, winStart, winEnd, clampDu
  * v1.17 Stack Text: `headlineGeometry` (renderer-measured) routes kinetic
  * stackStyle items through electron/stack-text-ass.js; absent/null keeps
  * the legacy emitter for every item (old callers/tests — safe fallback).
+ * v1.18 Kinetic Captions: `kineticCompositions` + `kineticGeometry`
+ * (renderer-planned + renderer-measured) emit per-word ASS events (Layer 0,
+ * after the headline events) through electron/kinetic-ass.js; cues covered
+ * by a GEOMETRY-MATCHED composition skip the legacy loop below (kinetic
+ * replaces captions for them), uncovered cues keep it (never crash on old
+ * payloads — missing geometry falls back).
  *
  * Word modes:
  *   - "off": one Dialogue per cue (full text).
@@ -3907,7 +3919,7 @@ function buildHeadlineEvents(headlines, width, height, winStart, winEnd, clampDu
  *     [start, next word's start), shows words 0..i stacked with \N,
  *     previous words dim, active word highlighted + animated.
  */
-function buildAssDocument(cues, cs, headlines, width, height, segStartMs, segEndMs, segDurMs, headlineGeometry) {
+function buildAssDocument(cues, cs, headlines, width, height, segStartMs, segEndMs, segDurMs, headlineGeometry, kineticCompositions, kineticGeometry) {
   const hasHeadlines = Array.isArray(headlines) && headlines.some((h) => h && h.text);
   if (!cs && !hasHeadlines) return null;
 
@@ -4001,17 +4013,59 @@ function buildAssDocument(cues, cs, headlines, width, height, segStartMs, segEnd
     ? buildHeadlineEvents(headlines, width, height, winStart, winEnd, clampDur, headlineGeometry)
     : { styleLines: [], eventLines: [], count: 0 };
 
-  // [V4+ Styles] — Default (captions) + Headline styles.
+  // ── v1.18 Kinetic Typography captions (Layer 0 — kinetic REPLACES the
+  // legacy caption loop for cues covered by an EMITTING composition).
+  // Compositions are renderer-planned (semantic phrase grouping,
+  // hierarchy, motion choreography — the main process never re-derives
+  // them, §36 determinism) and matched to renderer-measured geometry by
+  // cueStartMs; a composition without geometry emits NOTHING and covers
+  // nothing → its cues keep the legacy caption path (safe fallback).
+  const kineticActive = !!(
+    cs &&
+    cs.kinetic &&
+    cs.kinetic.enabled &&
+    Array.isArray(kineticCompositions) &&
+    kineticCompositions.length > 0
+  );
+  const kineticGeoList = kineticActive && Array.isArray(kineticGeometry) ? kineticGeometry : [];
+  const kinetic = kineticActive
+    ? KineticASS.emitKineticCompositions({
+        compositions: kineticCompositions,
+        geometry: kineticGeoList,
+        settings: cs.kinetic,
+        textColor: cs.textColor || "#FFFFFF",
+        width,
+        height,
+        winStart,
+        winEnd,
+        clampDur,
+        // Font resolution is INTERNAL to kinetic-ass.js (FONT_ASS_NAMES
+        // mirrors the renderer's FONT_OPTIONS ffmpegName table) — no
+        // fontNameResolver needed from this side.
+      })
+    : { styleLines: [], eventLines: [], count: 0 };
+  // A cue is covered when a GEOMETRY-MATCHED composition overlaps it
+  // (kinetic requires word timing; the UI only offers it with word timing
+  // present — plain .srt cues stay legacy).
+  const kineticEmitting = kineticActive
+    ? kineticCompositions.filter((k) => k && kineticGeoList.some((g) => g && g.cueStartMs === k.startMs))
+    : [];
+  const kineticCovered = (cue) =>
+    kineticEmitting.some((k) => cue.endMs > k.startMs && cue.startMs < k.endMs);
+
+  // [V4+ Styles] — Default (captions) + Headline styles + Kinetic styles.
   if (cs) {
     assLines.push(`Style: Default,${fontName},${fontSize},${hexToAssColor(primary)},${hexToAssColor(secondary)},${outlineColour},${backColour},${bold},${italic},0,0,100,100,${spacing},0,${borderStyle},${outline},${shadowVal},${assAlignment},40,40,${marginV},1`);
   }
   assLines.push(...headline.styleLines);
+  assLines.push(...kinetic.styleLines);
   assLines.push("");
   assLines.push("[Events]");
   assLines.push("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text");
   assLines.push(...headline.eventLines);
+  assLines.push(...kinetic.eventLines);
 
-  let emitted = headline.count;
+  let emitted = headline.count + kinetic.count;
 
   if (!cs || !Array.isArray(cues) || cues.length === 0) {
     return emitted > 0 ? assLines.join("\n") : null;
@@ -4019,6 +4073,9 @@ function buildAssDocument(cues, cs, headlines, width, height, segStartMs, segEnd
 
   for (const cue of cues) {
     if (cue.endMs <= winStart || cue.startMs >= winEnd) continue;
+    // v1.18: kinetic compositions replace the legacy caption emission for
+    // the cues they cover (geometry-matched only — see kineticEmitting).
+    if (kineticActive && kineticCovered(cue)) continue;
 
     const relStartMs = Math.max(0, cue.startMs - winStart);
     const relEndMs = Math.min(clampDur, cue.endMs - winStart);
@@ -4183,7 +4240,7 @@ function optimizeAssForConstrainedCpu(doc) {
 }
 
 ipcMain.handle("export-native", async (event, opts) => {
-  const { outputPath, fps: reqFps, width: reqWidth, height: reqHeight, bitrateMbps, quality, crf, audioKbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark, overlays, sfx, fastMode: fastModeWanted, slideshowFps24, textRemoval: textRemovalRaw, headlineGeometry, voiceovers, dubOriginalVolume } = opts;
+  const { outputPath, fps: reqFps, width: reqWidth, height: reqHeight, bitrateMbps, quality, crf, audioKbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark, overlays, sfx, fastMode: fastModeWanted, slideshowFps24, textRemoval: textRemovalRaw, headlineGeometry, kineticCompositions, kineticGeometry, voiceovers, dubOriginalVolume } = opts;
   // ── v1.15 BURN-IN TEXT REMOVAL (default OFF) ──────────────────────────
   // sanitizeTextRemoval → null keeps every graph byte-identical when the
   // feature is off (the only default). Region rects are SOURCE-normalized
@@ -4807,6 +4864,9 @@ ipcMain.handle("export-native", async (event, opts) => {
           headlinesEnabled ? headlines : null,
           width, height, segStartMs, segEndMs, seg.durationMs,
           headlinesEnabled ? headlineGeometry : undefined,
+          // v1.18 kinetic typography (rides captions — captionsEnabled gate):
+          captionsEnabled ? kineticCompositions : undefined,
+          captionsEnabled ? kineticGeometry : undefined,
         );
       }
 
@@ -5116,6 +5176,9 @@ ipcMain.handle("export-native", async (event, opts) => {
               headlinesEnabled ? headlines : null,
               width, height, chunkStartMs, chunkStartMs + ch.durMs, ch.durMs,
               headlinesEnabled ? headlineGeometry : undefined,
+              // v1.18 kinetic typography (rides captions — captionsEnabled gate):
+              captionsEnabled ? kineticCompositions : undefined,
+              captionsEnabled ? kineticGeometry : undefined,
             );
             chunkAssSuffix = doc
               ? writeAssFile(doc, `${String(i).padStart(4, "0")}_${String(k).padStart(2, "0")}`)
@@ -5795,6 +5858,9 @@ ipcMain.handle("export-native", async (event, opts) => {
               headlinesEnabled ? headlines : null,
               width, height, piece.t0Ms, piece.t0Ms + piece.durMs, piece.durMs,
               headlinesEnabled ? headlineGeometry : undefined,
+              // v1.18 kinetic typography (rides captions — captionsEnabled gate):
+              captionsEnabled ? kineticCompositions : undefined,
+              captionsEnabled ? kineticGeometry : undefined,
             );
             pieceAssSuffix = doc ? writeAssFile(doc, `sm${String(pi).padStart(3, "0")}`) : null;
           }

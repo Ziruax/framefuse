@@ -498,6 +498,8 @@ export async function exportTimelineViaGpu(
               currentMs: currentMsLocal,
               cueStartMs: cue.startMs,
               cueEndMs: cue.endMs,
+              // v1.18 kinetic typography: full cue list for the plan cache.
+              kineticCues: subtitles.cues as unknown as CanvasCaptionCtx["kineticCues"],
             };
             drawCaption(ctx, cue.text, capCtx, dims.w, dims.h);
           }

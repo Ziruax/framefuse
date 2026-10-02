@@ -1407,6 +1407,9 @@ export function PreviewPanel({
           currentMs,
           cueStartMs: cue.startMs,
           cueEndMs: cue.endMs,
+          // v1.18 kinetic typography: full cue list for the plan cache
+          // (style memory across cues — reference-keyed, no per-frame cost).
+          kineticCues: subtitles.cues,
         };
         drawCaption(ctx, cue.text, capCtx, dims.w, dims.h);
       }

@@ -1,0 +1,1942 @@
+# FINAL IMPLEMENTATION DIRECTIVE
+
+## Professional Kinetic Typography Caption System for 16:9 Storytelling Videos
+
+You are modifying an existing video caption system.
+
+The goal is NOT to simply add more stacked caption layouts.
+
+The goal is to build a **professional, modern kinetic typography system** suitable for 16:9 storytelling, documentary, narrative, emotional, cinematic, and high-retention YouTube videos.
+
+The existing problem is:
+
+> The current "Stack Captions" implementation creates multiple lines of text, but the result still looks like ordinary stacked subtitles. It lacks modern typography hierarchy, composition, semantic emphasis, kinetic movement, visual rhythm, and professional motion-design behavior.
+
+You must fix the underlying system rather than adding superficial animation.
+
+---
+
+# 1. CORE DEFINITION
+
+A **Stack Caption** is NOT:
+
+```text
+LINE 1
+LINE 2
+LINE 3
+LINE 4
+```
+
+A Stack Caption is a complete **kinetic typography composition**.
+
+Each composition must combine:
+
+* Text segmentation
+* Semantic grouping
+* Typography hierarchy
+* Font hierarchy
+* Weight hierarchy
+* Scale hierarchy
+* Spatial hierarchy
+* Alignment
+* Word emphasis
+* Motion choreography
+* Entrance animation
+* Emphasis animation
+* Hold behavior
+* Exit animation
+* Timing
+* Easing
+* Overshoot
+* Visual rhythm
+* Safe-area management
+
+The final rendered result should still look intentionally designed when paused on a frame.
+
+If the result looks like ordinary subtitles with animation added afterward, the implementation is incorrect.
+
+---
+
+# 2. PRIMARY TARGET
+
+The system is optimized primarily for:
+
+* 16:9 YouTube videos
+* 1920x1080
+* 1280x720
+* Long-form storytelling
+* Family storytelling
+* Documentary storytelling
+* Emotional narratives
+* Narrative voiceovers
+* Cinematic videos
+* High-retention videos
+
+The system must also remain responsive to different resolutions.
+
+Do not hard-code typography exclusively around one canvas size.
+
+Use normalized coordinates, proportional scaling, or an equivalent responsive layout system.
+
+---
+
+# 3. 16:9 CAPTION DENSITY
+
+The current concept uses too few words per composition.
+
+For 16:9 videos, normal kinetic compositions should generally contain:
+
+* 5 to 12 words
+* 1 to 3 primary visual lines
+* 2 to 5 lines for major dramatic moments
+* Approximately 55 to 70 characters as a practical upper boundary for a single composition
+
+Do NOT force every caption into 2 to 4 words.
+
+Short captions are reserved for:
+
+* Major revelations
+* Shock moments
+* Important keywords
+* Emotional climax
+* Strong narrative turns
+* Single-word impact events
+
+For normal narration, use longer groups.
+
+Example of weak implementation:
+
+```text
+I
+
+NEVER
+
+TRUSTED
+
+HIM
+```
+
+This is too sparse for normal 16:9 storytelling.
+
+Instead:
+
+```text
+I NEVER TRUSTED HIM
+
+BUT I NEVER IMAGINED
+HE WOULD LIE TO ME
+FOR SO MANY YEARS
+```
+
+However, do NOT render these lines identically.
+
+The important words must receive hierarchy.
+
+For example:
+
+```text
+I NEVER TRUSTED
+
+        HIM
+
+BUT I NEVER IMAGINED
+HE WOULD
+
+        LIE
+
+TO ME FOR SO MANY YEARS
+```
+
+The exact composition can vary by preset.
+
+---
+
+# 4. NEVER SHRINK TEXT TO FIT
+
+When text becomes too long:
+
+DO NOT:
+
+* Reduce the font until everything fits
+* Make the caption tiny
+* Compress all words equally
+* Create unreadable blocks
+
+Instead:
+
+1. Segment the narration semantically.
+2. Divide it into multiple kinetic compositions.
+3. Maintain strong typography.
+4. Preserve readability.
+5. Use timing to distribute the information.
+
+Example:
+
+Instead of:
+
+```text
+I NEVER TRUSTED HIM BUT I NEVER IMAGINED HE WOULD LIE TO ME FOR SO MANY YEARS
+```
+
+as one tiny block,
+
+split it:
+
+```text
+I NEVER TRUSTED HIM
+```
+
+then:
+
+```text
+BUT I NEVER IMAGINED
+HE WOULD LIE TO ME
+```
+
+then:
+
+```text
+FOR SO MANY YEARS
+```
+
+Each composition should have its own kinetic treatment.
+
+---
+
+# 5. TYPOGRAPHIC HIERARCHY
+
+Every kinetic composition must support hierarchy.
+
+Do not render every word equally.
+
+Hierarchy can be created using:
+
+* Font size
+* Font weight
+* Font width
+* Position
+* Tracking
+* Opacity
+* Scale
+* Accent treatment
+* Motion intensity
+* Duration
+* Spatial isolation
+
+Example:
+
+```text
+I NEVER
+
+     TRUSTED
+
+HIM
+```
+
+`TRUSTED` should be visually dominant.
+
+Another example:
+
+```text
+I THOUGHT MY FAMILY
+WOULD
+
+       ALWAYS
+
+BE THERE
+```
+
+`ALWAYS` becomes the visual anchor.
+
+---
+
+# 6. SEMANTIC EMPHASIS
+
+The engine must understand that not every word deserves equal visual treatment.
+
+Before generating the composition, identify:
+
+* Context words
+* Subject
+* Action
+* Emotional words
+* Important nouns
+* Important verbs
+* Time expressions
+* Negations
+* Contrasts
+* Revelation words
+* Narrative keywords
+
+Example narration:
+
+> "I realized my husband had been lying to me for years."
+
+Possible semantic structure:
+
+```text
+context:
+I realized
+
+subject:
+my husband
+
+action:
+LYING
+
+duration:
+FOR YEARS
+```
+
+The typography should reflect this.
+
+Possible result:
+
+```text
+I REALIZED
+
+MY HUSBAND
+
+       LYING
+
+FOR YEARS
+```
+
+The word `LYING` receives the strongest visual event.
+
+Do not mechanically emphasize random words.
+
+---
+
+# 7. TYPOGRAPHY PRESET LIBRARY
+
+Create a proper preset library.
+
+Presets must be actual motion typography systems, not merely text positions.
+
+## FAMILY A: CINEMATIC
+
+### 1. Editorial Stack
+
+Sophisticated asymmetric typography.
+
+Use:
+
+* Large primary phrase
+* Smaller supporting phrase
+* Mixed weights
+* Strong whitespace
+* Restrained motion
+
+Best for:
+
+* Reflection
+* Narration
+* Emotional scenes
+* Serious storytelling
+
+### 2. Cinematic Stack
+
+Large condensed typography with subtle movement.
+
+Best for:
+
+* Narrative progression
+* Documentary storytelling
+* Transitional scenes
+
+### 3. Perspective Stack
+
+Use scale and spatial depth.
+
+Words may progressively move:
+
+* toward the viewer
+* away from the viewer
+* diagonally
+* vertically
+
+Best for:
+
+* Memory
+* realization
+* important narrative moments
+
+### 4. Whisper Type
+
+Small, restrained typography.
+
+Best for:
+
+* intimate narration
+* emotional reflection
+* quiet scenes
+
+### 5. Progressive Stack
+
+Build the sentence progressively.
+
+Example:
+
+```text
+I KNEW
+
+I KNEW SOMETHING
+
+I KNEW SOMETHING WAS WRONG
+```
+
+Do not necessarily show all previous text literally. The system may transform or replace earlier phrases.
+
+---
+
+# FAMILY B: DRAMATIC
+
+### 6. Punch Stack
+
+Large stacked typography.
+
+One keyword becomes dominant.
+
+Best for:
+
+* accusations
+* emotional statements
+* dramatic narration
+
+### 7. Impact Word
+
+One major keyword occupies a large portion of the frame.
+
+Example:
+
+```text
+I FINALLY
+
+        UNDERSTOOD
+```
+
+`UNDERSTOOD` receives the major animation event.
+
+### 8. Highlight Stack
+
+Normal text plus one dominant keyword.
+
+Best for:
+
+* important facts
+* revelations
+* narrative emphasis
+
+### 9. Full Screen Type
+
+Typography temporarily becomes the primary visual element.
+
+Use sparingly.
+
+Best for:
+
+* climax
+* major revelation
+* major narrative turning point
+
+### 10. Build & Collapse
+
+Typography progressively builds and then contracts/disappears.
+
+Best for:
+
+* emotional escalation
+* realization
+* climax
+
+---
+
+# FAMILY C: CONFLICT
+
+### 11. Split Stack
+
+Separate semantic groups spatially.
+
+Example:
+
+```text
+I TRUSTED              HIM
+
+BUT HE
+
+             LIED
+```
+
+Different groups may enter from different directions.
+
+### 12. Type Collision
+
+Two text groups move toward one another.
+
+They may:
+
+* collide
+* overlap
+* push each other
+* separate
+
+Best for:
+
+* conflict
+* confrontation
+* betrayal
+
+### 13. Push Stack
+
+New phrases push previous phrases out of the composition.
+
+Best for:
+
+* escalating arguments
+* sequential discoveries
+
+### 14. Opposing Stack
+
+Two semantic groups occupy opposite sides.
+
+Best for:
+
+* contrast
+* disagreement
+* before/after
+* truth vs assumption
+
+### 15. Diagonal Stack
+
+Typography follows a diagonal composition.
+
+Use controlled angles.
+
+Do not rotate text randomly.
+
+---
+
+# FAMILY D: CONVERSATIONAL
+
+### 16. Kinetic Sentence
+
+The sentence remains readable while semantic phrases animate individually.
+
+Example:
+
+```text
+I THOUGHT
+everything was
+
+        NORMAL
+```
+
+Then:
+
+```text
+UNTIL
+I SAW
+
+        THE MESSAGE
+```
+
+### 17. Word Cascade
+
+Words enter sequentially with vertical or horizontal offsets.
+
+### 18. Mixed Weight
+
+Use multiple font weights inside one sentence.
+
+Example:
+
+```text
+I WAS
+NEVER READY
+FOR THIS
+```
+
+`NEVER READY` becomes dominant.
+
+### 19. Sliding Sentence
+
+Semantic phrases slide into position sequentially.
+
+### 20. Phrase Reveal
+
+Reveal phrase groups using masks, wipes, clipping, or controlled movement.
+
+---
+
+# FAMILY E: HIGH INTENSITY
+
+### 21. Word Burst
+
+Words enter from multiple controlled spatial directions.
+
+### 22. Collision
+
+Words move toward a common anchor.
+
+### 23. Rapid Stack
+
+Fast sequential typography.
+
+Use only for high-energy moments.
+
+### 24. Full Screen Impact
+
+Very large typography.
+
+Use sparingly.
+
+---
+
+# 8. PRESET DATA MODEL
+
+Every preset must define at minimum:
+
+```text
+presetId
+name
+family
+description
+
+layout:
+  composition
+  anchor
+  alignment
+  safeArea
+  maxWidth
+  maxHeight
+
+typography:
+  fontFamily
+  fallbackFonts
+  baseWeight
+  emphasisWeight
+  baseSize
+  emphasisSize
+  lineHeight
+  letterSpacing
+  casing
+  widthBehavior
+
+hierarchy:
+  primaryWords
+  secondaryWords
+  supportingWords
+  emphasisScale
+  emphasisWeight
+
+segmentation:
+  maxWords
+  preferredWords
+  maxCharacters
+  groupingRules
+
+entrance:
+  animation
+  duration
+  stagger
+  easing
+
+emphasis:
+  animation
+  duration
+  scale
+  overshoot
+
+hold:
+  duration
+  subtleMotion
+
+exit:
+  animation
+  duration
+  easing
+
+motion:
+  direction
+  intensity
+  damping
+  overshoot
+  rotation
+  displacement
+
+visual:
+  backgroundTreatment
+  accentTreatment
+  shadow
+  outline
+  opacity
+
+compatibility:
+  narrativeTypes
+  intensityRange
+  preferredCaptionLengths
+```
+
+Do not create presets that only contain:
+
+```text
+position
+font
+color
+animation
+```
+
+That is insufficient.
+
+---
+
+# 9. TYPOGRAPHY FAMILIES AND FONTS
+
+Support modern typography families.
+
+Preferred visual categories:
+
+## Condensed Cinematic
+
+Examples of font families:
+
+* Anton
+* Bebas Neue
+* Oswald
+* Archivo Narrow
+* Roboto Condensed
+* League Gothic
+
+Use for:
+
+* impact
+* drama
+* large keywords
+* cinematic headlines
+
+## Modern Sans
+
+Examples:
+
+* Inter
+* Manrope
+* DM Sans
+* Plus Jakarta Sans
+* Satoshi-style geometric sans
+
+Use for:
+
+* contemporary storytelling
+* documentary
+* narration
+
+## Editorial Serif
+
+Use selectively.
+
+Do NOT make every caption serif.
+
+Serif can be used for:
+
+* reflective words
+* emotional emphasis
+* sophisticated editorial compositions
+
+Support mixed serif/sans compositions where appropriate.
+
+---
+
+# 10. CAPTION TYPOGRAPHY MODES
+
+Implement four major modes.
+
+## MODE 1: SINGLE STYLE
+
+User selects one typography preset.
+
+Example:
+
+```text
+Punch Stack
+```
+
+The video maintains that visual language.
+
+Useful for users who want consistency.
+
+---
+
+# 11. MODE 2: AUTO MIX
+
+This should be the default recommended architecture for storytelling.
+
+The engine automatically selects typography based on:
+
+* Semantic meaning
+* Narrative function
+* Emotional intensity
+* Caption length
+* Previous typography
+* Previous animation
+* Visual continuity
+* Typography family
+* User-selected variation level
+
+Example:
+
+```text
+00:00
+Editorial Stack
+
+00:08
+Kinetic Sentence
+
+00:15
+Progressive Stack
+
+00:23
+Highlight Stack
+
+00:31
+Impact Word
+
+00:39
+Split Stack
+
+00:48
+Kinetic Sentence
+
+00:56
+Full Screen Type
+```
+
+Do NOT randomly switch styles.
+
+The engine must understand visual continuity.
+
+---
+
+# 12. MODE 3: MANUAL MIX
+
+Allow users to select multiple typography presets simultaneously.
+
+Example:
+
+```text
+SELECTED STYLES
+
+[x] Punch Stack
+[x] Editorial Stack
+[x] Highlight Stack
+[x] Kinetic Sentence
+[x] Progressive Stack
+[x] Split Stack
+```
+
+Allow weighting:
+
+```text
+Punch Stack          20%
+Editorial Stack      20%
+Highlight Stack      20%
+Kinetic Sentence     15%
+Progressive Stack    15%
+Split Stack          10%
+```
+
+The percentages are preference weights, not rigid requirements.
+
+The semantic engine still determines the final style.
+
+Example:
+
+A user may give Impact Word a 30% preference, but if the current caption is quiet reflective narration, the engine should not force an Impact Word composition.
+
+---
+
+# 13. MODE 4: ALL STYLES
+
+"All Styles" does NOT mean randomize everything.
+
+It means:
+
+> Use the entire compatible typography library and intelligently select the most appropriate style based on narrative meaning, emotional intensity, caption length, visual continuity, style history, and user preferences.
+
+The system must still maintain:
+
+* visual coherence
+* professional design
+* semantic relevance
+* rhythm
+* readability
+
+Never randomly jump between unrelated design languages.
+
+---
+
+# 14. TYPOGRAPHY VARIATION CONTROL
+
+Add a variation setting:
+
+```text
+LOW
+MEDIUM
+HIGH
+EXTREME
+```
+
+## LOW
+
+Mostly consistent typography.
+
+Use:
+
+* small layout changes
+* subtle animation variation
+* occasional emphasis changes
+
+## MEDIUM
+
+Balanced variation.
+
+Suitable for:
+
+* documentaries
+* general storytelling
+
+## HIGH
+
+Frequent kinetic typography variation.
+
+Suitable for:
+
+* YouTube storytelling
+* emotional narratives
+* retention-focused editing
+
+## EXTREME
+
+Major typography changes.
+
+Use only for high-energy formats.
+
+Default storytelling setting:
+
+```text
+HIGH
+```
+
+or:
+
+```text
+MEDIUM-HIGH
+```
+
+---
+
+# 15. SEMANTIC CLASSIFICATION
+
+Before selecting a typography preset, classify the caption group.
+
+Supported classifications:
+
+```text
+NORMAL_NARRATION
+SETUP
+SUSPENSE
+REVELATION
+SHOCK
+CONFLICT
+ACCUSATION
+REALIZATION
+EMOTIONAL
+REFLECTION
+TRANSITION
+CLIMAX
+```
+
+Map them intelligently.
+
+```text
+NORMAL_NARRATION
+→ Kinetic Sentence
+→ Editorial Stack
+
+SETUP
+→ Editorial Stack
+→ Cinematic Stack
+
+SUSPENSE
+→ Progressive Stack
+→ Cascade
+
+REVELATION
+→ Highlight Stack
+→ Impact Word
+
+SHOCK
+→ Impact Word
+→ Word Burst
+
+CONFLICT
+→ Split Stack
+→ Type Collision
+
+ACCUSATION
+→ Punch Stack
+→ Split Stack
+
+REALIZATION
+→ Progressive Stack
+→ Replacement Stack
+→ Impact Word
+
+EMOTIONAL
+→ Whisper Type
+→ Editorial Stack
+
+REFLECTION
+→ Cinematic Stack
+→ Editorial Stack
+
+TRANSITION
+→ Cascade
+→ Sliding Sentence
+
+CLIMAX
+→ Full Screen Type
+→ Impact Word
+→ Build & Collapse
+```
+
+---
+
+# 16. INTENSITY SYSTEM
+
+Every caption group should have an intensity score from 0 to 100.
+
+```text
+0-25
+Subtle
+
+26-50
+Moderate
+
+51-75
+Strong
+
+76-100
+Major kinetic event
+```
+
+Use stronger typography for stronger narrative moments.
+
+Do NOT use 80-100 intensity continuously.
+
+Reserve maximum intensity for:
+
+* revelations
+* discoveries
+* emotional peaks
+* major accusations
+* climaxes
+* important narrative turns
+
+A video where every caption screams is a video where nothing matters.
+
+---
+
+# 17. STYLE MEMORY
+
+The engine must remember recently used styles.
+
+Maintain:
+
+```text
+recentPresets[]
+recentFamilies[]
+recentAnimations[]
+recentLayouts[]
+```
+
+Apply repetition penalties.
+
+Rules:
+
+* Do not repeat the exact same preset more than 2 consecutive groups.
+* Strongly discourage immediate repetition.
+* Avoid repeating the same animation pattern continuously.
+* Avoid excessive use of the same typography family.
+* Do not repeatedly use full-screen typography.
+* Do not repeatedly use impact typography.
+* Maintain compatibility between consecutive compositions.
+
+---
+
+# 18. STYLE SELECTION ALGORITHM
+
+Conceptually calculate:
+
+```text
+styleScore =
+    semanticMatch
+  + narrativeMatch
+  + captionLengthCompatibility
+  + emotionalIntensityMatch
+  + visualContinuity
+  + userPreference
+  + familyCompatibility
+  - recentPresetPenalty
+  - recentFamilyPenalty
+  - animationRepetitionPenalty
+  - layoutRepetitionPenalty
+```
+
+Select the highest-scoring compatible preset.
+
+Do not use pure randomness.
+
+Controlled variation is required.
+
+---
+
+# 19. VISUAL RHYTHM
+
+Typography should change over time.
+
+Example:
+
+```text
+NORMAL
+↓
+Editorial
+↓
+Kinetic Sentence
+↓
+Progressive
+↓
+Highlight
+↓
+Punch
+↓
+Impact
+↓
+CLIMAX
+↓
+Full Screen
+↓
+Editorial
+↓
+Reflection
+```
+
+This creates a visual narrative arc.
+
+The typography should support the story rather than compete with it.
+
+---
+
+# 20. MOTION LIBRARY
+
+Support these motion behaviors:
+
+```text
+wordByWordReveal
+phraseReveal
+stagger
+scalePunch
+scaleOvershoot
+slideLeft
+slideRight
+slideUp
+slideDown
+directionalWipe
+maskReveal
+trackingExpand
+trackingCompress
+verticalDisplacement
+horizontalDisplacement
+rotation
+collision
+pushOut
+replacement
+fadeThrough
+kineticZoom
+perspectiveMove
+build
+collapse
+```
+
+Every motion must have:
+
+```text
+duration
+delay
+easing
+intensity
+overshoot
+damping
+direction
+```
+
+Do not animate every word identically.
+
+---
+
+# 21. MOTION SHOULD FOLLOW MEANING
+
+Example:
+
+```text
+"I finally understood."
+```
+
+`UNDERSTOOD` may:
+
+* scale up
+* overshoot slightly
+* settle
+* remain longer
+
+Example:
+
+```text
+"But he lied to me."
+```
+
+`LIED` may:
+
+* enter abruptly
+* shift position
+* receive stronger contrast
+* use a sharper movement
+
+Example:
+
+```text
+"For seventeen years."
+```
+
+`SEVENTEEN YEARS` may progressively enlarge or separate spatially.
+
+The animation must communicate meaning.
+
+---
+
+# 22. WORD GROUPING
+
+Do not treat every word as an independent animation object.
+
+Group semantically.
+
+Example:
+
+```text
+I REALIZED
+```
+
+is one phrase.
+
+```text
+MY HUSBAND
+```
+
+is another.
+
+```text
+HAD BEEN LYING
+```
+
+is another.
+
+```text
+FOR SEVENTEEN YEARS
+```
+
+is another.
+
+The system should choose grouping according to grammar and meaning.
+
+Avoid awkward splits such as:
+
+```text
+MY
+
+HUS
+
+BAND
+```
+
+unless intentionally using a specific experimental typography preset.
+
+---
+
+# 23. TYPOGRAPHY MUST LOOK GOOD WHEN PAUSED
+
+This is a hard quality requirement.
+
+Pause the video at any significant frame.
+
+The typography should still have:
+
+* clear hierarchy
+* intentional composition
+* readable grouping
+* balanced spacing
+* professional alignment
+* strong visual structure
+
+If it only looks good while moving, the design system is weak.
+
+---
+
+# 24. SAFE AREA
+
+All typography must respect safe areas.
+
+Never place important text:
+
+* directly against the edge
+* behind platform UI zones
+* too close to video boundaries
+* over important faces unless intentionally designed
+
+The layout engine should calculate:
+
+```text
+safeArea
+maxWidth
+maxHeight
+horizontalPadding
+verticalPadding
+```
+
+for 16:9.
+
+---
+
+# 25. RESPONSIVE SCALING
+
+The system must support:
+
+```text
+1920x1080
+1280x720
+```
+
+and equivalent 16:9 resolutions.
+
+Typography should scale proportionally.
+
+Do not simply use:
+
+```text
+fontSize = 120px
+```
+
+without considering canvas dimensions.
+
+Use a normalized scale system.
+
+Example:
+
+```text
+referenceWidth = 1920
+referenceHeight = 1080
+scale = currentWidth / referenceWidth
+```
+
+or an equivalent robust responsive system.
+
+---
+
+# 26. READABILITY
+
+Kinetic typography must remain readable.
+
+Never sacrifice readability purely for visual complexity.
+
+Support:
+
+* contrast
+* shadow
+* outline
+* controlled background cards
+* subtle blur behind text where necessary
+* appropriate line spacing
+* sufficient display time
+
+Avoid excessive:
+
+* outlines
+* glow
+* shadows
+* gradients
+* decorative effects
+
+Modern kinetic typography is primarily driven by **type hierarchy and motion**, not visual effects.
+
+---
+
+# 27. COLOR SYSTEM
+
+Typography should support:
+
+```text
+Primary
+Secondary
+Accent
+Muted
+```
+
+The accent should generally identify semantic importance.
+
+Do not randomly color individual words.
+
+Example:
+
+```text
+I THOUGHT EVERYTHING
+WAS
+
+WRONG
+```
+
+`WRONG` can receive the accent treatment.
+
+The accent should be semantically justified.
+
+---
+
+# 28. DO NOT OVER-ANIMATE
+
+Avoid:
+
+```text
+Every word bouncing
+Every word rotating
+Every word scaling
+Every word changing color
+Every word entering from a different direction
+```
+
+That is not sophisticated kinetic typography.
+
+Professional motion design uses hierarchy.
+
+Primary word:
+
+```text
+strong motion
+```
+
+Secondary words:
+
+```text
+moderate motion
+```
+
+Supporting words:
+
+```text
+subtle motion
+```
+
+---
+
+# 29. RETENTION-ORIENTED VARIATION
+
+The purpose of multi-style typography is to prevent visual monotony.
+
+However, retention must come from:
+
+* narrative progression
+* information changes
+* semantic emphasis
+* visual rhythm
+* meaningful typography changes
+
+Do NOT try to maintain retention by constantly adding motion.
+
+The system should create **micro-variation** during normal narration and **macro-variation** during narrative events.
+
+Example:
+
+```text
+Normal narration
+→ small movement changes
+
+Important statement
+→ stronger hierarchy
+
+Suspense
+→ progressive movement
+
+Revelation
+→ impact composition
+
+Climax
+→ major typography event
+
+Reflection
+→ visual simplification
+```
+
+This creates a natural visual rhythm.
+
+---
+
+# 30. MICRO VS MACRO VARIATION
+
+## MICRO VARIATION
+
+Change:
+
+* alignment
+* scale
+* stagger
+* entrance direction
+* word grouping
+* weight
+* tracking
+
+without completely changing the design language.
+
+Use frequently.
+
+## MACRO VARIATION
+
+Change:
+
+* typography preset
+* composition
+* typography family
+* spatial arrangement
+* motion system
+
+Use at meaningful narrative points.
+
+Do not use macro variation every few seconds.
+
+---
+
+# 31. PRESET COMPATIBILITY
+
+Each preset should contain compatibility metadata.
+
+Example:
+
+```text
+compatibleWith:
+  Editorial Stack
+  Cinematic Stack
+  Progressive Stack
+
+avoidAfter:
+  Full Screen Type
+  Word Burst
+```
+
+This prevents ugly transitions between unrelated styles.
+
+---
+
+# 32. TRANSITION BETWEEN PRESETS
+
+When switching presets:
+
+Do not abruptly replace the visual language unless the narrative calls for it.
+
+Use transitional relationships.
+
+Example:
+
+```text
+Editorial Stack
+→ Progressive Stack
+→ Highlight Stack
+```
+
+is natural.
+
+But:
+
+```text
+Whisper Type
+→ Extreme Word Burst
+```
+
+requires a meaningful narrative reason.
+
+The transition itself may become part of the kinetic animation.
+
+---
+
+# 33. USER CONTROL
+
+Expose the following controls:
+
+```text
+Typography Mode:
+[Single Style]
+[Auto Mix]
+[Manual Mix]
+[All Styles]
+
+Variation:
+[Low]
+[Medium]
+[High]
+[Extreme]
+
+Intensity:
+[Low]
+[Medium]
+[High]
+
+Word Density:
+[Short]
+[Medium]
+[Long]
+[Auto]
+
+Motion:
+[Subtle]
+[Balanced]
+[Dynamic]
+[Extreme]
+```
+
+For storytelling, recommended defaults:
+
+```text
+Mode:
+Auto Mix
+
+Variation:
+High
+
+Intensity:
+Auto
+
+Word Density:
+Auto
+
+Motion:
+Dynamic
+```
+
+---
+
+# 34. MANUAL STYLE MIX UI
+
+The user should be able to:
+
+1. Select multiple styles.
+2. Enable/disable individual styles.
+3. Set preference weights.
+4. Reorder priority.
+5. Preview each style.
+6. Apply the mix to the complete video.
+7. Apply the mix to selected scenes.
+8. Lock specific styles for specific scenes if the existing application supports scene-level controls.
+
+Example:
+
+```text
+TYPOGRAPHY MIX
+
+[x] Editorial Stack       20%
+[x] Kinetic Sentence      20%
+[x] Highlight Stack       20%
+[x] Punch Stack           15%
+[x] Progressive Stack     15%
+[x] Split Stack           10%
+
+Variation: HIGH
+```
+
+---
+
+# 35. STYLE LOCKING
+
+Allow a user to lock a preset for a selected caption or scene.
+
+Example:
+
+```text
+Scene 14
+Preset: Impact Word
+LOCKED
+```
+
+The automatic engine must respect the lock.
+
+However, locked scenes should still maintain proper typography rendering and timing.
+
+---
+
+# 36. AUTO MODE MUST REMAIN DETERMINISTIC
+
+Avoid completely random results.
+
+Given the same:
+
+* video
+* caption data
+* settings
+* seed
+
+the same typography sequence should be reproducible.
+
+If randomness is required for variation, use a controlled seed.
+
+This is important for editing workflows.
+
+---
+
+# 37. PERFORMANCE
+
+The typography system must not unnecessarily increase render time.
+
+Avoid expensive effects when simple transforms can achieve the same result.
+
+Prefer:
+
+* transform
+* opacity
+* scale
+* position
+* clipping
+* masks
+* simple easing
+
+before expensive rendering effects.
+
+The typography system must remain practical for the existing video rendering pipeline.
+
+---
+
+# 38. BACKWARD COMPATIBILITY
+
+Do not break existing caption presets.
+
+Existing Stack Caption functionality should continue to work.
+
+Upgrade the architecture so that existing presets can eventually inherit the new kinetic typography capabilities.
+
+Do not remove existing user options without necessity.
+
+---
+
+# 39. QUALITY VALIDATION
+
+Create automated or manual validation for every preset.
+
+Check:
+
+### Typography
+
+* Is hierarchy visible?
+* Are important words emphasized?
+* Is text readable?
+* Is the composition balanced?
+
+### Layout
+
+* Does it work at 1920x1080?
+* Does it work at 1280x720?
+* Does it respect safe areas?
+* Does it avoid excessive empty space?
+
+### Motion
+
+* Does movement have purpose?
+* Is timing coherent?
+* Is easing natural?
+* Is the emphasis word receiving stronger motion?
+
+### Storytelling
+
+* Does the style fit the narrative state?
+* Does the style fit caption length?
+* Does it fit emotional intensity?
+
+### Variation
+
+* Is the previous preset being considered?
+* Is the same animation being repeated?
+* Is the typography becoming visually monotonous?
+* Is the system switching styles too aggressively?
+
+---
+
+# 40. HARD FAILURE CONDITIONS
+
+The implementation is considered incorrect if:
+
+1. Stack captions still look like ordinary subtitles.
+2. Every line uses identical font size.
+3. Every line uses identical weight.
+4. Every word receives identical animation.
+5. The system only changes position without changing typographic hierarchy.
+6. 16:9 captions contain only 2 to 4 words during normal narration.
+7. Long sentences are shrunk to tiny text.
+8. Typography styles are selected randomly.
+9. The same preset repeats continuously.
+10. Every caption uses maximum animation intensity.
+11. Full-screen typography appears constantly.
+12. Every word has a bounce or pop animation.
+13. Color changes are random.
+14. The system ignores semantic meaning.
+15. The typography looks generic when paused.
+16. Different presets have visually indistinguishable designs.
+17. "All Styles" simply randomizes every preset.
+18. Auto Mix produces chaotic visual transitions.
+19. Manual Mix ignores user weighting.
+20. Typography becomes unreadable on 16:9.
+21. The system breaks existing caption functionality.
+22. Typography variation increases rendering cost unnecessarily.
+
+---
+
+# 41. EXPECTED FINAL EXPERIENCE
+
+A finished storytelling video should visually behave approximately like this:
+
+```text
+NORMAL NARRATION
+        ↓
+Editorial typography
+
+IMPORTANT INFORMATION
+        ↓
+Kinetic Sentence
+
+SUSPENSE
+        ↓
+Progressive Stack
+
+DISCOVERY
+        ↓
+Highlight Stack
+
+REVELATION
+        ↓
+Impact Word
+
+CONFLICT
+        ↓
+Split Stack / Collision
+
+EMOTIONAL PEAK
+        ↓
+Punch Stack
+
+CLIMAX
+        ↓
+Full Screen Type
+
+REFLECTION
+        ↓
+Editorial / Whisper
+```
+
+The viewer should perceive continuous visual movement and variation without feeling that the captions are randomly changing templates.
+
+---
+
+# 42. FINAL DESIGN PRINCIPLE
+
+The system must follow this hierarchy:
+
+```text
+STORY
+  ↓
+SEMANTIC MEANING
+  ↓
+NARRATIVE FUNCTION
+  ↓
+EMOTIONAL INTENSITY
+  ↓
+TYPOGRAPHY HIERARCHY
+  ↓
+LAYOUT
+  ↓
+MOTION
+  ↓
+VISUAL EFFECTS
+```
+
+NOT:
+
+```text
+FONT
+  ↓
+ANIMATION
+  ↓
+STACK
+  ↓
+RANDOM EFFECTS
+```
+
+The first approach creates professional kinetic typography.
+
+The second creates animated subtitles.
+
+The implementation must follow the first approach.
+
+# 43. IMPLEMENTATION ORDER
+
+Implement in this order:
+
+### Phase 1
+
+Refactor the existing Stack Caption architecture into a reusable kinetic typography preset system.
+
+### Phase 2
+
+Implement the typography hierarchy and semantic word grouping system.
+
+### Phase 3
+
+Implement the complete preset library.
+
+### Phase 4
+
+Implement semantic narrative classification.
+
+### Phase 5
+
+Implement Auto Mix.
+
+### Phase 6
+
+Implement Manual Mix with weighting.
+
+### Phase 7
+
+Implement All Styles mode.
+
+### Phase 8
+
+Implement style memory and repetition penalties.
+
+### Phase 9
+
+Implement intensity and variation controls.
+
+### Phase 10
+
+Implement responsive 16:9 scaling and safe-area validation.
+
+### Phase 11
+
+Validate every preset visually and technically.
+
+### Phase 12
+
+Test complete long-form storytelling videos to ensure typography changes create visual rhythm without becoming chaotic.
+
+Do not stop after creating the preset names or basic layouts. The feature is complete only when the rendered captions visibly demonstrate modern kinetic typography through **composition, hierarchy, semantic emphasis, and motion choreography**, rather than merely stacking text on multiple lines.

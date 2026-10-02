@@ -61,6 +61,7 @@ import { TRANSITION_STYLE_INFO, QUALITY_PROFILES } from "@/lib/merger/types";
 import type { KenBurnsDirection } from "@/lib/merger/types";
 import {
   FONT_OPTIONS,
+  getFontOption,
   presetsByCategory,
   getCaptionPreset,
   PRESET_CATEGORIES,
@@ -84,6 +85,25 @@ import {
   type StackStyleId,
   type StackUnitTransform,
 } from "@/lib/merger/stackTextPresets";
+// v1.18 Kinetic Typography: the semantic composition engine's settings
+// block (CaptionSettings.kinetic) + the live preview, which renders through
+// the REAL engine (buildKineticPlan → drawKineticComposition — the same code
+// path the canvas preview and the export run).
+import {
+  KINETIC_DEFAULTS,
+  type KineticCaptionSettings,
+  type KineticFamily,
+} from "@/lib/merger/kinetic/types";
+import {
+  KINETIC_PRESETS,
+  KINETIC_FAMILY_LABELS,
+  getKineticPreset,
+} from "@/lib/merger/kinetic/presets";
+import {
+  buildKineticPlan,
+  type KineticCueInput,
+} from "@/lib/merger/kinetic/engine";
+import { drawKineticComposition } from "@/lib/merger/kinetic/render";
 import { ANIMATION_LABELS } from "@/lib/merger/captionAnimations";
 import {
   preloadWhisper,
@@ -2680,6 +2700,10 @@ function CaptionsSection(props: CaptionsSectionProps) {
   const hasCues = !!subtitles && subtitles.cues.length > 0;
   const hasWords =
     hasCues && subtitles!.cues.some((c) => c.words && c.words.length > 0);
+  // v1.18: while the kinetic engine is active (and word timing exists — the
+  // engine needs it), its semantic compositions REPLACE word mode + the
+  // per-word animation pickers, so those two fields hide.
+  const kineticOn = hasWords && !!captionSettings.kinetic?.enabled;
 
   // ── v5.2 Whisper model status + pre-download (desktop only) ──────────────
   // The status row only renders when the Electron bridge exists; in the
@@ -3624,111 +3648,124 @@ function CaptionsSection(props: CaptionsSectionProps) {
         )}
       </Field>
 
-      {/* ── Word mode ── */}
-      <Field
-        label="Word mode"
-        hint={
-          hasWords
-            ? "Word-level timing detected — all modes available."
-            : "Word modes need word timestamps — generate captions from audio first."
-        }
-      >
-        <Segmented
-          size="sm"
-          options={[
-            {
-              value: "off",
-              label: "Full text",
-              title: "Standard subtitle block",
-            },
-            {
-              value: "word",
-              label: "Karaoke",
-              title: "Highlight the spoken word",
-            },
-            {
-              value: "word-only",
-              label: "Single",
-              title: "One word at a time (Hormozi)",
-            },
-            {
-              value: "stack",
-              label: "Stack",
-              title: "Words stack as spoken (quote builder)",
-            },
-          ]}
-          value={captionSettings.wordMode}
-          onChange={(v) => set({ wordMode: v })}
-        />
-      </Field>
-
-      {/* ── Animation ── */}
-      <Field
-        label="Kinetic animation"
-        hint={
-          captionSettings.animation
-            ? "Pinned — preset switches keep your choice"
-            : "Following preset default (pin to override)"
-        }
-      >
-        <div
-          className="max-h-56 overflow-y-auto rounded-md border"
-          style={{ borderColor: "#27272a" }}
+      {/* ── Word mode ── (hidden while the v1.18 kinetic engine owns
+          composition + motion) */}
+      {!kineticOn && (
+        <Field
+          label="Word mode"
+          hint={
+            hasWords
+              ? "Word-level timing detected — all modes available."
+              : "Word modes need word timestamps — generate captions from audio first."
+          }
         >
-          {[
-            { id: "classic", label: "Classic" },
-            { id: "viral", label: "Viral pack ✦" },
-          ].map((grp) => (
-            <div key={grp.id}>
-              <div className="sticky top-0 z-10 bg-[#131316] px-2 py-1 text-[9px] font-bold uppercase tracking-widest text-zinc-500">
-                {grp.label}
-              </div>
-              <div className="grid grid-cols-2 gap-1 p-1">
-                {ANIMATION_LABELS.filter((a) => a.group === grp.id).map((a) => {
-                  const active =
-                    (captionSettings.animation ||
-                      preset.animation ||
-                      "none") === a.value;
-                  return (
-                    <button
-                      key={a.value}
-                      type="button"
-                      title={a.hint}
-                      onClick={() =>
-                        set({
-                          animation: a.value,
-                          animationPinned: a.value !== "none" ? true : false,
-                        })
-                      }
-                      className={cn(
-                        "rounded px-1.5 py-1.5 text-left text-[10px] font-medium transition-colors",
-                        active
-                          ? "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-500/40"
-                          : "bg-zinc-800/50 text-zinc-400 hover:bg-white/5",
-                      )}
-                      aria-pressed={active}
-                    >
-                      {a.label}
-                      <span className="block truncate text-[8px] font-normal text-zinc-500">
-                        {a.hint}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          ))}
-        </div>
-        {captionSettings.animation && (
-          <button
-            type="button"
-            onClick={() => set({ animation: null, animationPinned: false })}
-            className="mt-1 flex items-center gap-1 text-[10px] text-zinc-500 hover:text-zinc-300"
+          <Segmented
+            size="sm"
+            options={[
+              {
+                value: "off",
+                label: "Full text",
+                title: "Standard subtitle block",
+              },
+              {
+                value: "word",
+                label: "Karaoke",
+                title: "Highlight the spoken word",
+              },
+              {
+                value: "word-only",
+                label: "Single",
+                title: "One word at a time (Hormozi)",
+              },
+              {
+                value: "stack",
+                label: "Stack",
+                title: "Words stack as spoken (quote builder)",
+              },
+            ]}
+            value={captionSettings.wordMode}
+            onChange={(v) => set({ wordMode: v })}
+          />
+        </Field>
+      )}
+
+      {/* ── v1.18 Kinetic Typography engine (semantic compositions) —
+          renders only when word timing exists ── */}
+      <KineticTypographySection
+        captionSettings={captionSettings}
+        onCaptionSettingsChange={onCaptionSettingsChange}
+        hasWords={hasWords}
+      />
+
+      {/* ── Animation ── (hidden while the kinetic engine owns motion) */}
+      {!kineticOn && (
+        <Field
+          label="Kinetic animation"
+          hint={
+            captionSettings.animation
+              ? "Pinned — preset switches keep your choice"
+              : "Following preset default (pin to override)"
+          }
+        >
+          <div
+            className="max-h-56 overflow-y-auto rounded-md border"
+            style={{ borderColor: "#27272a" }}
           >
-            <RotateCcw size={10} /> Follow preset default
-          </button>
-        )}
-      </Field>
+            {[
+              { id: "classic", label: "Classic" },
+              { id: "viral", label: "Viral pack ✦" },
+            ].map((grp) => (
+              <div key={grp.id}>
+                <div className="sticky top-0 z-10 bg-[#131316] px-2 py-1 text-[9px] font-bold uppercase tracking-widest text-zinc-500">
+                  {grp.label}
+                </div>
+                <div className="grid grid-cols-2 gap-1 p-1">
+                  {ANIMATION_LABELS.filter((a) => a.group === grp.id).map((a) => {
+                    const active =
+                      (captionSettings.animation ||
+                        preset.animation ||
+                        "none") === a.value;
+                    return (
+                      <button
+                        key={a.value}
+                        type="button"
+                        title={a.hint}
+                        onClick={() =>
+                          set({
+                            animation: a.value,
+                            animationPinned: a.value !== "none" ? true : false,
+                          })
+                        }
+                        className={cn(
+                          "rounded px-1.5 py-1.5 text-left text-[10px] font-medium transition-colors",
+                          active
+                            ? "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-500/40"
+                            : "bg-zinc-800/50 text-zinc-400 hover:bg-white/5",
+                        )}
+                        aria-pressed={active}
+                      >
+                        {a.label}
+                        <span className="block truncate text-[8px] font-normal text-zinc-500">
+                          {a.hint}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+          </div>
+          {captionSettings.animation && (
+            <button
+              type="button"
+              onClick={() => set({ animation: null, animationPinned: false })}
+              className="mt-1 flex items-center gap-1 text-[10px] text-zinc-500 hover:text-zinc-300"
+            >
+              <RotateCcw size={10} /> Follow preset default
+            </button>
+          )}
+        </Field>
+      )}
 
       {/* ── Font ── */}
       <Field
@@ -3737,7 +3774,25 @@ function CaptionsSection(props: CaptionsSectionProps) {
       >
         <select
           value={captionSettings.fontId}
-          onChange={(e) => set({ fontId: e.target.value })}
+          onChange={(e) => {
+            const fontId = e.target.value;
+            if (kineticOn) {
+              // v1.18: while the kinetic engine is active the Font picker also
+              // drives kinetic.fontOverride so preview + export typography
+              // match (the engine's presets would otherwise pick their own).
+              onCaptionSettingsChange({
+                ...captionSettings,
+                fontId,
+                kinetic: {
+                  ...KINETIC_DEFAULTS,
+                  ...captionSettings.kinetic,
+                  fontOverride: fontId,
+                },
+              });
+            } else {
+              set({ fontId });
+            }
+          }}
           className="w-full rounded border bg-zinc-900 px-2 py-1.5 text-[11px] text-zinc-200"
           style={{ borderColor: "#3f3f46" }}
           aria-label="Caption font"
@@ -3929,6 +3984,562 @@ function CaptionsSection(props: CaptionsSectionProps) {
         </div>
       </Field>
     </Section>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// v1.18 — KINETIC TYPOGRAPHY (the professional semantic caption engine).
+// Settings for the 24-preset composition system that lives inside
+// CaptionSettings.kinetic, plus a live animated preview rendered through
+// the REAL engine — buildKineticPlan on a sample cue set, then
+// drawKineticComposition every rAF frame (the StackStylePreview pattern,
+// scaled up to a 16:9 canvas). No page.tsx changes: kinetic rides the
+// existing captionSettings persistence.
+// ---------------------------------------------------------------------------
+
+/** Display order for the preset <optgroup>s (family id → label). */
+const KINETIC_FAMILY_ORDER = Object.keys(
+  KINETIC_FAMILY_LABELS,
+) as KineticFamily[];
+
+/**
+ * Font scale for the preview canvas: ~160px tall vs the 1080p reference the
+ * preset baseSizeFrac values target. The layout solver's 10px floor keeps
+ * the base type readable at this size while emphasisScale/supportScale
+ * multipliers still show each preset's hierarchy.
+ */
+const KINETIC_PREVIEW_FONT_SCALE = 0.42;
+
+/** Gap of dark silence between preview loops (ms). */
+const KINETIC_PREVIEW_GAP_MS = 800;
+
+/** Builds a preview cue with evenly-spread word timings. */
+function kineticPreviewCue(
+  startMs: number,
+  endMs: number,
+  text: string,
+): KineticCueInput {
+  const words = text.split(/\s+/).filter(Boolean);
+  const span = (endMs - startMs) / Math.max(1, words.length);
+  return {
+    startMs,
+    endMs,
+    text,
+    words: words.map((w, i) => ({
+      text: w,
+      startMs: Math.round(startMs + i * span),
+      endMs: Math.round(startMs + (i + 1) * span),
+    })),
+  };
+}
+
+/**
+ * Sample narration that exercises the whole engine: a long narration cue
+ * (13 words, multi-phrase), a mid-length reveal, and a short dramatic sting
+ * (auto drama-shortening + full-screen candidates).
+ */
+const KINETIC_PREVIEW_CUES: KineticCueInput[] = [
+  kineticPreviewCue(
+    0,
+    3200,
+    "I never trusted him but I never imagined he would lie to me",
+  ),
+  kineticPreviewCue(3400, 5400, "and then suddenly the truth came out"),
+  kineticPreviewCue(5600, 6800, "seventeen years of secrets"),
+];
+
+interface KineticTypographySectionProps {
+  captionSettings: CaptionSettings;
+  onCaptionSettingsChange: (cs: CaptionSettings) => void;
+  /** Word timestamps present — the engine (and this section) needs them. */
+  hasWords: boolean;
+}
+
+function KineticTypographySection(props: KineticTypographySectionProps) {
+  const { captionSettings, onCaptionSettingsChange, hasWords } = props;
+
+  // Legacy default (§38): old projects have no kinetic block at all — read
+  // through KINETIC_DEFAULTS; every write spreads defaults first.
+  const kinetic: KineticCaptionSettings = {
+    ...KINETIC_DEFAULTS,
+    ...captionSettings.kinetic,
+  };
+
+  const setKinetic = (patch: Partial<KineticCaptionSettings>) =>
+    onCaptionSettingsChange({
+      ...captionSettings,
+      kinetic: { ...KINETIC_DEFAULTS, ...captionSettings.kinetic, ...patch },
+    });
+
+  // The plan is always built (enabled forced true) so the preview animates
+  // from the current settings; the canvas itself only mounts when enabled.
+  const plan = useMemo(
+    () =>
+      buildKineticPlan(KINETIC_PREVIEW_CUES, {
+        ...KINETIC_DEFAULTS,
+        ...captionSettings.kinetic,
+        enabled: true,
+      }),
+    [captionSettings.kinetic],
+  );
+
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [previewInfo, setPreviewInfo] = useState<{
+    name: string;
+    family: string;
+    classification: string;
+    intensity: number;
+  } | null>(null);
+  const lastCompStartRef = useRef(-1);
+
+  const fontOverride = kinetic.fontOverride ?? null;
+  const accentOverride = kinetic.accentOverride ?? null;
+  const motionLevel = kinetic.motion;
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const compositions = plan.compositions;
+    const planEndMs = compositions.length
+      ? compositions[compositions.length - 1].endMs
+      : 0;
+    const loopMs = planEndMs + KINETIC_PREVIEW_GAP_MS;
+    const startedAt = performance.now();
+    let raf = 0;
+
+    const tick = (now: number) => {
+      raf = requestAnimationFrame(tick);
+      // Backing store = CSS size × DPR (crisp text). The painter is fully
+      // proportional to cw/ch, so a dpr transform reproduces the exact
+      // layout at any backing resolution.
+      const dpr = window.devicePixelRatio || 1;
+      const cssW = Math.max(1, canvas.clientWidth);
+      const cssH = Math.max(1, canvas.clientHeight);
+      const bw = Math.max(1, Math.round(cssW * dpr));
+      const bh = Math.max(1, Math.round(cssH * dpr));
+      if (canvas.width !== bw || canvas.height !== bh) {
+        canvas.width = bw;
+        canvas.height = bh;
+      }
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.fillStyle = "#0a0a0c";
+      ctx.fillRect(0, 0, cssW, cssH);
+
+      const t = (now - startedAt) % loopMs;
+      const comp = plan.compositionAt(t);
+      if (comp) {
+        const preset = getKineticPreset(comp.presetId);
+        // Same measure contract as drawKineticCaption: set ctx.font with the
+        // preset/override stack BEFORE measuring.
+        const stack = getFontOption(fontOverride || preset.fontId).stack;
+        drawKineticComposition(
+          ctx,
+          comp,
+          preset,
+          {
+            fontSizeScale: KINETIC_PREVIEW_FONT_SCALE,
+            customColor: null,
+            fontOverride,
+            accentOverride,
+            motionLevel,
+            currentMs: t,
+          },
+          cssW,
+          cssH,
+          (text, weight, fontPx) => {
+            ctx.font = `${weight} ${fontPx}px ${stack}`;
+            return ctx.measureText(text).width;
+          },
+        );
+        // Info line — throttled: setState only when the composition changes.
+        if (comp.startMs !== lastCompStartRef.current) {
+          lastCompStartRef.current = comp.startMs;
+          setPreviewInfo({
+            name: preset.name,
+            family: KINETIC_FAMILY_LABELS[preset.family] ?? preset.family,
+            classification: comp.classification.replace(/_/g, " ").toLowerCase(),
+            intensity: comp.intensity,
+          });
+        }
+      }
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [plan, fontOverride, accentOverride, motionLevel]);
+
+  const toggleMixPreset = (presetId: string) => {
+    const has = kinetic.manualMix.some((m) => m.presetId === presetId);
+    setKinetic({
+      manualMix: has
+        ? kinetic.manualMix.filter((m) => m.presetId !== presetId)
+        : [...kinetic.manualMix, { presetId, weight: 20 }],
+    });
+  };
+
+  const setMixWeight = (presetId: string, weight: number) => {
+    const clamped = Math.max(0, Math.min(100, Math.round(weight)));
+    setKinetic({
+      manualMix: kinetic.manualMix.map((m) =>
+        m.presetId === presetId ? { ...m, weight: clamped } : m,
+      ),
+    });
+  };
+
+  if (!hasWords) return null;
+
+  return (
+    <div
+      className="mb-3 rounded-lg border p-2.5"
+      style={{ borderColor: "#27272a", backgroundColor: "#18181b" }}
+    >
+      {/* ── Engine switch ── */}
+      <Toggle
+        checked={kinetic.enabled}
+        onChange={(v) =>
+          setKinetic(
+            v
+              ? // Turning ON: sync the font override to the picked caption font.
+                { enabled: true, fontOverride: captionSettings.fontId }
+              : { enabled: false },
+          )
+        }
+        label="Kinetic typography engine"
+      />
+      <p className="mt-1.5 text-[10px] leading-relaxed text-zinc-500">
+        Semantic compositions — phrase hierarchy, emphasis and motion follow
+        the narration. Replaces the word-mode + animation pickers below.
+      </p>
+
+      {kinetic.enabled && (
+        <div className="mt-2.5">
+          {/* ── Typography mode ── */}
+          <Field
+            label="Typography mode"
+            hint="How the engine picks the style for each composition."
+          >
+            <Segmented
+              size="sm"
+              options={[
+                {
+                  value: "auto",
+                  label: "Auto Mix",
+                  title:
+                    "The engine scores all 24 presets per composition (semantic fit, intensity, variety)",
+                },
+                {
+                  value: "single",
+                  label: "Single",
+                  title: "One pinned preset for every composition",
+                },
+                {
+                  value: "manual",
+                  label: "Manual Mix",
+                  title: "Your weighted preset mix biases the scoring",
+                },
+                {
+                  value: "all",
+                  label: "All Styles",
+                  title: "Full library, engine scoring decides",
+                },
+              ]}
+              value={kinetic.mode}
+              onChange={(v) => setKinetic({ mode: v })}
+            />
+          </Field>
+
+          {/* ── Single mode: the pinned preset ── */}
+          {kinetic.mode === "single" && (
+            <Field
+              label="Style preset"
+              hint={getKineticPreset(kinetic.presetId).description}
+            >
+              <select
+                value={kinetic.presetId}
+                onChange={(e) => setKinetic({ presetId: e.target.value })}
+                className="w-full rounded border bg-zinc-900 px-2 py-1.5 text-[11px] text-zinc-200"
+                style={{ borderColor: "#3f3f46" }}
+                aria-label="Kinetic style preset"
+              >
+                {KINETIC_FAMILY_ORDER.map((fam) => (
+                  <optgroup key={fam} label={KINETIC_FAMILY_LABELS[fam]}>
+                    {KINETIC_PRESETS.filter((p) => p.family === fam).map((p) => (
+                      <option key={p.id} value={p.id} title={p.description}>
+                        {p.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                ))}
+              </select>
+            </Field>
+          )}
+
+          {/* ── Manual mode: weighted mix of every preset ── */}
+          {kinetic.mode === "manual" && (
+            <Field
+              label="Style mix"
+              hint="Check the presets the engine may use; weights bias the roulette."
+            >
+              <div
+                className="max-h-64 overflow-y-auto rounded-md border"
+                style={{ borderColor: "#27272a" }}
+              >
+                {KINETIC_PRESETS.map((p) => {
+                  const entry = kinetic.manualMix.find(
+                    (m) => m.presetId === p.id,
+                  );
+                  return (
+                    <div
+                      key={p.id}
+                      className="flex items-center gap-2 bg-zinc-800/50 px-2 py-1.5"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={!!entry}
+                        onChange={() => toggleMixPreset(p.id)}
+                        className="size-3 shrink-0 accent-emerald-500"
+                        aria-label={`Include ${p.name} in the style mix`}
+                      />
+                      <span
+                        className="min-w-0 flex-1 truncate text-[11px] text-zinc-200"
+                        title={p.description}
+                      >
+                        {p.name}
+                        <span className="ml-1.5 text-[9px] text-zinc-500">
+                          {KINETIC_FAMILY_LABELS[p.family]}
+                        </span>
+                      </span>
+                      <input
+                        type="number"
+                        min={0}
+                        max={100}
+                        value={entry?.weight ?? 0}
+                        disabled={!entry}
+                        onChange={(e) =>
+                          setMixWeight(p.id, Number(e.target.value))
+                        }
+                        className="w-14 rounded border bg-zinc-900 px-1.5 py-1 text-[10px] tabular-nums text-zinc-200 disabled:opacity-40"
+                        style={{ borderColor: "#3f3f46" }}
+                        aria-label={`${p.name} weight`}
+                        title="Preference weight 0-100"
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+            </Field>
+          )}
+
+          {/* ── Variation ── */}
+          <Field
+            label="Variation"
+            hint="How often the engine switches styles."
+          >
+            <Segmented
+              size="sm"
+              options={[
+                {
+                  value: "low",
+                  label: "Low",
+                  title: "One style settles in — rare switches",
+                },
+                {
+                  value: "medium",
+                  label: "Medium",
+                  title: "Occasional switches",
+                },
+                {
+                  value: "high",
+                  label: "High",
+                  title: "Frequent style variety (default)",
+                },
+                {
+                  value: "extreme",
+                  label: "Extreme",
+                  title: "New style almost every composition",
+                },
+              ]}
+              value={kinetic.variation}
+              onChange={(v) => setKinetic({ variation: v })}
+            />
+          </Field>
+
+          {/* ── Intensity ── */}
+          <Field
+            label="Intensity"
+            hint="Narrative drama level the compositions aim for."
+          >
+            <Segmented
+              size="sm"
+              options={[
+                {
+                  value: "auto",
+                  label: "Auto",
+                  title: "Follow the semantic intensity scoring",
+                },
+                {
+                  value: "low",
+                  label: "Low",
+                  title: "Clamp to calm compositions",
+                },
+                {
+                  value: "medium",
+                  label: "Medium",
+                  title: "Clamp to mid drama",
+                },
+                {
+                  value: "high",
+                  label: "High",
+                  title: "Boost everything to high drama",
+                },
+              ]}
+              value={kinetic.intensity}
+              onChange={(v) => setKinetic({ intensity: v })}
+            />
+          </Field>
+
+          {/* ── Word density ── */}
+          <Field
+            label="Word density"
+            hint="Words per composition (phrase grouping target)."
+          >
+            <Segmented
+              size="sm"
+              options={[
+                {
+                  value: "auto",
+                  label: "Auto",
+                  title: "5-12 words normally; drama auto-shortens",
+                },
+                {
+                  value: "short",
+                  label: "Short",
+                  title: "3-6 word compositions",
+                },
+                {
+                  value: "medium",
+                  label: "Medium",
+                  title: "5-9 word compositions",
+                },
+                {
+                  value: "long",
+                  label: "Long",
+                  title: "8-14 word compositions",
+                },
+              ]}
+              value={kinetic.density}
+              onChange={(v) => setKinetic({ density: v })}
+            />
+          </Field>
+
+          {/* ── Motion ── */}
+          <Field label="Motion" hint="Motion energy of entrances + emphasis.">
+            <Segmented
+              size="sm"
+              options={[
+                {
+                  value: "subtle",
+                  label: "Subtle",
+                  title: "0.6× motion energy",
+                },
+                {
+                  value: "balanced",
+                  label: "Balanced",
+                  title: "1× motion energy",
+                },
+                {
+                  value: "dynamic",
+                  label: "Dynamic",
+                  title: "1.3× motion energy (default)",
+                },
+                {
+                  value: "extreme",
+                  label: "Extreme",
+                  title: "1.6× motion energy",
+                },
+              ]}
+              value={kinetic.motion}
+              onChange={(v) => setKinetic({ motion: v })}
+            />
+          </Field>
+
+          {/* ── Seed ── */}
+          <Field
+            label="Seed"
+            hint="Deterministic — the same seed always produces the same style sequence."
+          >
+            <div className="flex items-center gap-1.5">
+              <input
+                type="number"
+                min={1}
+                max={999999}
+                value={kinetic.seed}
+                onChange={(e) =>
+                  setKinetic({
+                    seed: Math.max(
+                      1,
+                      Math.min(999999, Math.round(Number(e.target.value) || 1)),
+                    ),
+                  })
+                }
+                className="w-24 rounded border bg-zinc-900 px-1.5 py-1 text-[10px] tabular-nums text-zinc-200"
+                style={{ borderColor: "#3f3f46" }}
+                aria-label="Kinetic engine seed"
+              />
+              <button
+                type="button"
+                onClick={() =>
+                  setKinetic({
+                    seed: 1 + Math.floor(Math.random() * 999999),
+                  })
+                }
+                className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-zinc-300 transition-colors hover:bg-zinc-800"
+                style={{ borderColor: "#3f3f46" }}
+                aria-label="Randomize seed"
+                title="Randomize seed"
+              >
+                <Dices size={10} /> Random
+              </button>
+            </div>
+          </Field>
+
+          {/* ── Live preview (through the real engine) ── */}
+          <Field
+            label="Live preview"
+            hint="Kinetic compositions render via the ASS compositor at export."
+          >
+            <div
+              className="overflow-hidden rounded-lg border"
+              style={{ borderColor: "#27272a" }}
+            >
+              <canvas
+                ref={canvasRef}
+                className="block w-full"
+                style={{
+                  aspectRatio: "16 / 9",
+                  maxHeight: 170,
+                  backgroundColor: "#0a0a0c",
+                }}
+                aria-label="Kinetic typography live preview"
+              />
+            </div>
+            <p className="mt-1 truncate text-[10px] text-zinc-500">
+              {previewInfo ? (
+                <>
+                  <span className="text-zinc-300">{previewInfo.name}</span> ·{" "}
+                  {previewInfo.family} · {previewInfo.classification} ·
+                  intensity {previewInfo.intensity}
+                </>
+              ) : (
+                "Cycling engine output…"
+              )}
+            </p>
+          </Field>
+        </div>
+      )}
+    </div>
   );
 }
 

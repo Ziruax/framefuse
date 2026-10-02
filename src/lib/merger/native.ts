@@ -45,6 +45,16 @@ import {
   type WordTransform,
 } from "./captionAnimations";
 import type { CaptionAnimation } from "./types";
+// v1.18 Kinetic Typography caption engine — the painter + plan cache + export
+// geometry measurement (renderer-side; the ASS twin lives in main).
+import { drawKineticCaption, measureKineticPlanDom } from "./kinetic/render";
+import { buildKineticPlan, type KineticCueInput } from "./kinetic/engine";
+import { KINETIC_PRESETS } from "./kinetic/presets";
+import type {
+  KineticCaptionSettings,
+  KineticCuePayload,
+  KineticGeoComposition,
+} from "./kinetic/types";
 import { renderSfxWav, sfxDurationMs } from "./sfx";
 import { sanitizeChromaKeySettings } from "./chroma";
 // v1.15.1 GPU-Shift + v1.15.2 worker migration: the revived WebCodecs/WebGL
@@ -549,6 +559,9 @@ async function exportViaFFmpeg(
   // 3. Build caption payload if captions are enabled.
   let ipcCaptionSettings: Record<string, unknown> | undefined = undefined;
   let ipcSubtitleCues: unknown[] | undefined = undefined;
+  // v1.18 Kinetic Typography: composition plan + measured geometry.
+  let ipcKineticCompositions: KineticCuePayload[] | undefined = undefined;
+  let ipcKineticGeometry: KineticGeoComposition[] | undefined = undefined;
 
   if (
     captionSettings?.enabled &&
@@ -609,6 +622,70 @@ async function exportViaFFmpeg(
           }))
         : undefined,
     }));
+
+    // v1.18 Kinetic Typography: ship the engine's full plan (per-composition
+    // semantic structure — the main process NEVER re-derives classification/
+    // selection, §36 determinism) + the measured geometry at the export
+    // resolution (canvas ↔ ASS parity). Kinetic rides the ASS/libass CLI
+    // compositor, exactly like v1.17 stack-text headlines.
+    if (captionSettings.kinetic?.enabled) {
+      const kineticSettings = captionSettings.kinetic;
+      const kineticCues: KineticCueInput[] = subtitles.cues.map((c) => ({
+        startMs: c.startMs,
+        endMs: c.endMs,
+        text: c.text,
+        words: c.words?.map((w) => ({
+          text: w.text,
+          startMs: w.startMs,
+          endMs: w.endMs,
+        })),
+      }));
+      const plan = buildKineticPlan(kineticCues, kineticSettings);
+      const kineticIpc: KineticCaptionSettings = { ...kineticSettings };
+      ipcCaptionSettings.kinetic = kineticIpc;
+      ipcKineticCompositions = plan.compositions.map<KineticCuePayload>((comp) => ({
+        presetId: comp.presetId,
+        classification: comp.classification,
+        intensity: comp.intensity,
+        startMs: comp.startMs,
+        endMs: comp.endMs,
+        words: comp.words.map((w) => ({
+          text: w.text,
+          startMs: w.startMs,
+          endMs: w.endMs,
+          role: w.role,
+          emphasis: w.emphasis,
+          phraseIndex: w.phraseIndex,
+        })),
+        phrases: comp.phrases.map((p) => ({
+          role: p.role,
+          scale: p.scale,
+          weight: p.weight,
+          align: p.align,
+          indentFrac: p.indentFrac,
+        })),
+      }));
+      // Optional font sanity: single-mode preset must exist.
+      if (
+        kineticSettings.mode === "single" &&
+        !KINETIC_PRESETS.some((p) => p.id === kineticSettings.presetId)
+      ) {
+        kineticIpc.presetId = "editorial-stack";
+      }
+      ipcKineticGeometry =
+        measureKineticPlanDom(
+          plan,
+          kineticSettings,
+          {
+            fontSizeScale: captionSettings.fontSizeScale || 1,
+            customColor: captionSettings.customColor,
+            fontOverride: kineticSettings.fontOverride,
+            accentOverride: kineticSettings.accentOverride,
+          },
+          dims.w,
+          dims.h,
+        ) ?? undefined;
+    }
   }
 
   // 3.5 Headline overlay payload (v4.2) — burned in via extra ASS lines.
@@ -685,6 +762,10 @@ async function exportViaFFmpeg(
       audio,
       captionSettings: ipcCaptionSettings,
       subtitleCues: ipcSubtitleCues,
+      // v1.18 Kinetic Typography: composition payloads + measured geometry
+      // (absent when the engine is off — main keeps the legacy path).
+      kineticCompositions: ipcKineticCompositions,
+      kineticGeometry: ipcKineticGeometry,
       headlines: ipcHeadlines,
       // v1.17 Stack Text: measured line/word geometry for the kinetic ASS
       // emitter (absent for legacy-only exports — main falls back safely).
@@ -887,6 +968,18 @@ interface CanvasCaptionCtx {
   cueStartMs?: number;
   /** Absolute endMs of the current cue (for whole-cue animation fallback). */
   cueEndMs?: number;
+  /**
+   * v1.18 Kinetic Typography: the full engine settings. When
+   * kinetic.enabled is true (and word timestamps exist), drawCaption
+   * dispatches to the kinetic painter instead of the wordMode paths.
+   */
+  kinetic?: KineticCaptionSettings;
+  /**
+   * v1.18: the FULL cue list (needed by the kinetic plan cache — style
+   * selection has memory across cues, §17). Reference-keyed: the preview
+   * and the export loop pass the same `subtitles.cues` array every frame.
+   */
+  kineticCues?: KineticCueInput[];
 }
 
 // The caption-render context shape is shared by the browser export path and
@@ -941,10 +1034,18 @@ export function drawCaption(
   const animation: CaptionAnimation =
     caption.animation || preset.animation || "none";
 
-  // ── Word-by-word modes short-circuit the standard flow ──
   const wordMode = caption.wordMode ?? "off";
   const words = caption.words;
   const hasWords = words && words.length > 0;
+
+  // ── v1.18 Kinetic Typography engine (§38: takes priority over the legacy
+  // wordMode paths when enabled + word timestamps exist; silently falls
+  // through when the plan has no composition at currentMs). ──
+  if (caption.kinetic?.enabled && hasWords && caption.kineticCues) {
+    if (drawKineticCaption(ctx, caption, cw, ch)) return;
+  }
+
+  // ── Word-by-word modes short-circuit the standard flow ──
   if (
     (wordMode === "word" || wordMode === "word-only" || wordMode === "stack") &&
     hasWords

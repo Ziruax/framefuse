@@ -15,12 +15,17 @@ import {
   type StackLayoutId,
   type StackStyleId,
 } from "./stackTextPresets";
+// v1.18 Kinetic Typography: CaptionSettings.kinetic settings block (pure
+// data + defaults from the kinetic engine — no runtime cycle).
+import { KINETIC_DEFAULTS, type KineticCaptionSettings } from "./kinetic/types";
 
 // Re-export the sibling-lib types so consumers can import the whole data
 // model from one place (type-only — no runtime dependency is created).
 export type { ChromaKeySettings, SfxItem };
 // v1.17: Stack Text ids are part of the headline data model surface.
 export type { StackLayoutId, StackStyleId };
+// v1.18: kinetic caption settings are part of the caption data model.
+export type { KineticCaptionSettings };
 
 export type TimelineMode = "absolute" | "sequential";
 
@@ -572,6 +577,15 @@ export interface CaptionSettings {
    * keep the user's choice instead of overriding it.
    */
   animationPinned?: boolean;
+  /**
+   * v1.18 Kinetic Typography engine (the professional stack-caption system:
+   * semantic segmentation → narrative classification → 24-preset library →
+   * style memory → motion choreography). When `kinetic.enabled` is true and
+   * word timestamps exist, drawCaption dispatches to the kinetic painter
+   * INSTEAD of the wordMode/animation paths (they resume when disabled —
+   * full backward compatibility, directive §38). Absent on legacy projects.
+   */
+  kinetic?: KineticCaptionSettings;
 }
 
 /**
@@ -645,6 +659,9 @@ export function defaultCaptionSettings(): CaptionSettings {
     balancedWrap: true,
     wordMode: "off",
     animation: null,
+    // v1.18: kinetic engine present-but-disabled by default (§38 — the
+    // legacy caption behavior is untouched until the user opts in).
+    kinetic: { ...KINETIC_DEFAULTS },
   };
 }
 

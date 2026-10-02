@@ -27,7 +27,8 @@
 //   ✓ v2 TRANSITIONS: dissolve (image↔image), dip-black, dip-white +
 //     fadeStartEnd bookends — the plan mirrors planBoundaryFades exactly
 //   ✗ slide/wipe/circleopen transitions, burn-in text removal, ASS
-//     captions/kinetic Stack Text, loudnorm, overlay motion keyframes → CLI
+//     captions/kinetic Stack Text/v1.18 kinetic typography captions,
+//     loudnorm, overlay motion keyframes → CLI
 
 "use strict";
 
@@ -129,6 +130,18 @@ function rustEligible(opts) {
   // headlines keep the Rust fast path.
   const headlineList = Array.isArray(opts.headlines) ? opts.headlines : [];
   if (headlineList.some((h) => h && h.stackStyle)) reasons.push("stack-text");
+
+  // v1.18 KINETIC CAPTIONS: kinetic typography captions ride the ASS/libass
+  // CLI compositor — the per-word override-tag choreography (entrances,
+  // emphasis punches, per-word \pos/\move geometry) has no Rust-engine
+  // equivalent (fontdue texts are static), same class as stack-text.
+  if (
+    opts.captionSettings &&
+    opts.captionSettings.kinetic &&
+    opts.captionSettings.kinetic.enabled
+  ) {
+    reasons.push("kinetic-captions");
+  }
 
   // overlay motion keyframes (≥2 = an actual path; 1 = pinned, fine)
   const overlays = Array.isArray(opts.overlays) ? opts.overlays : [];
