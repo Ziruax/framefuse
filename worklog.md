@@ -2180,3 +2180,23 @@ Stage Summary:
 - THE FLAGSHIP FIX: the transcription → captions ON → export flow (the app's default path) now runs the NATIVE Rust engine — burned-in captions with word modes, karaoke highlight, and all 24 kinetic animations render through fontdue + the compositor text layers (wgpu scales via dest rects; CPU got a bilinear text-scaling path). Only the v1.18 kinetic-TYPOGRAPHY engine (per-word override-tag choreography) still rides the CLI compositor, and the Header badge now SAYS SO ("FFmpeg CLI · kinetic-captions") instead of silently swapping engines.
 - Bonus: fixed the outline-suppresses-fill glyph bug in BOTH captions.rs and text.rs (headline text was rendering outline-colored since v1.16 — nobody noticed because CI checks were luma-only).
 - The Linux .node build + FFmpeg 7.1 shared libs in the sandbox gave REAL end-to-end verification for the first time (pixel-level frame checks).
+
+---
+Task ID: 7 (ship v1.20.0)
+Agent: main (Z.ai Code)
+Task: Ship v1.20.0 — build the NSIS installer + push to GitHub + publish the release.
+
+Work Log:
+- Version bump 1.19.0 → 1.20.0 (package.json, page.tsx BUILD_VERSION, layout.tsx title, Header.tsx). lint exit 0; tsc = the documented baseline (9 pre-existing, zero new).
+- Browser final pass: v1.20.0 title renders, zero page errors, Groq-only STT UI + 24 painted kinetic design tiles + tile-pinning verified interactively.
+- Committed eb8c081 "v1.20.0: native Rust captions + Groq-only STT + kinetic design gallery + single-voice dubbing + Gemini script writer" (46 files: rust-engine/* 6, router, main.js, preload, gemini-chat.js NEW, ScriptWriterSection.tsx NEW, kinetic gallery, dub single-voice, Groq-only removals ×9 files + 2 folders) → PUSHED to main.
+- CI run 37048284388 job 1 (windows-latest MSVC) GREEN: engine 0.2.0 built from the new captions source, smoke (150/150 h264+aac), v2 feature test, color test — all passed.
+- Artifact 11245905423 downloaded + staged: framefuse-engine.win32-x64.node (11,738,112 B; sha256 1c5b43a4…) — the installer ships EXACTLY this smoke-tested binary (sha verified inside app.asar.unpacked).
+- Local installer build (foreground): freed 2.2 GB of rust-engine/target first (the OOM SIGKILL on the first next-build attempt); then clean → next build --webpack → gpu-worker (356 KB) → fetch-ffmpeg (already staged) → build-rust-engine (linux .node, win32 untouched) → electron-builder --win nsis → dist/FrameFuse Setup 1.20.0.exe (218,625,646 B) + blockmap + latest.yml. rcedit: FrameFuse.exe 1.20.0.0, icon replaced.
+- ASAR verification: gemini-chat.js + rust-engine-router.js (buildRustCaptions + rustGateReason) + kinetic-ass.js present; whisper-core/child/faster-whisper GONE (only groq-whisper.js remains); renderer page chunk carries all 24 kinetic preset ids + gemini-3.5-flash-lite + the Script Writer; package.json 1.20.0.
+- PUBLISHED scripts/publish-release-1.20.0.js (curl uploads, dupe-aware, release notes describing all 5 features): release 402070986 created at eb8c081, assets FrameFuse-Setup-1.20.0.exe + latest.yml + blockmap all uploaded. THREE-WAY sha512 VERIFIED (L/HbDGR+… local == latest.yml == re-downloaded; size exact).
+
+Stage Summary:
+- v1.20.0 IS LIVE: https://github.com/Ziruax/framefuse/releases/tag/v1.20.0 (installer only — NSIS, per the standing directive).
+- Code PUSHED: main c83e183..eb8c081; CI job 1 green (job 2 best-effort).
+- This round: native Rust caption burn-in (the FFmpeg-fallback fix + the outline-fill glyph bug fix), Groq-only transcription, the 24-design kinetic gallery, single-voice dubbing, and the Gemini script writer.
