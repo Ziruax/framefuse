@@ -173,17 +173,19 @@ function getKineticPresetSpec(id) {
 }
 
 // ── mirror of captionPresets.ts FONT_OPTIONS (id → ffmpegName) ──────────────
-// The SAME mapping the renderer uses for caption font resolution — the ASS
-// Style Fontname must be a font libass can resolve on the target OS.
+// v1.21: the five web families ship as BUNDLED TTFs (fontsdir is passed to
+// the subtitles filter) — libass resolves the REAL names now; the old
+// "Segoe UI/Impact/Georgia" stand-ins produced the wrong typographic
+// identity (the reference designs are Bebas-condensed / Montserrat-geometric).
 const FONT_ASS_NAMES = {
-  inter: "Segoe UI",
-  roboto: "Segoe UI",
-  montserrat: "Segoe UI",
+  inter: "Inter",
+  roboto: "Roboto",
+  montserrat: "Montserrat",
   segoe: "Segoe UI",
   impact: "Impact",
   "arial-black": "Arial Black",
-  bebas: "Impact",
-  playfair: "Georgia",
+  bebas: "Bebas Neue",
+  playfair: "Playfair Display",
   georgia: "Georgia",
   arial: "Arial",
   trebuchet: "Trebuchet MS",

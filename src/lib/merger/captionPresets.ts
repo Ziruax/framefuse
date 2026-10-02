@@ -850,7 +850,7 @@ export interface FontOption {
   id: string;
   name: string;
   stack: string; // CSS font stack for canvas
-  ffmpegName: string; // Name libass should use (installed on Windows)
+  ffmpegName: string; // Font family the export resolves (bundled TTF first)
 }
 
 export const FONT_OPTIONS: FontOption[] = [
@@ -858,19 +858,19 @@ export const FONT_OPTIONS: FontOption[] = [
     id: "inter",
     name: "Inter",
     stack: 'Inter, "Segoe UI", Arial, sans-serif',
-    ffmpegName: "Segoe UI",
+    ffmpegName: "Inter",
   },
   {
     id: "roboto",
     name: "Roboto",
     stack: 'Roboto, "Segoe UI", Arial, sans-serif',
-    ffmpegName: "Segoe UI",
+    ffmpegName: "Roboto",
   },
   {
     id: "montserrat",
     name: "Montserrat",
     stack: 'Montserrat, "Segoe UI", Arial, sans-serif',
-    ffmpegName: "Segoe UI",
+    ffmpegName: "Montserrat",
   },
   {
     id: "segoe",
@@ -894,13 +894,13 @@ export const FONT_OPTIONS: FontOption[] = [
     id: "bebas",
     name: "Bebas Neue",
     stack: '"Bebas Neue", Impact, "Arial Black", sans-serif',
-    ffmpegName: "Impact",
+    ffmpegName: "Bebas Neue",
   },
   {
     id: "playfair",
     name: "Playfair Display",
     stack: '"Playfair Display", Georgia, serif',
-    ffmpegName: "Georgia",
+    ffmpegName: "Playfair Display",
   },
   {
     id: "georgia",

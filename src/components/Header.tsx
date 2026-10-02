@@ -24,7 +24,7 @@ import { cn } from "@/lib/utils";
 /** v1.12.1: the renderer's build constant — compared against the REAL exe
  *  version (app.getVersion()) so a stale/hybrid install is impossible to
  *  miss. Keep in sync with package.json on every release. */
-const BUILD_VERSION = "1.20.0";
+const BUILD_VERSION = "1.21.0";
 
 export interface LastExport {
   path: string;
@@ -158,6 +158,25 @@ function fmtElapsed(sec: number): string {
   if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
   const h = Math.floor(m / 60);
   return `${h}h ${String(m % 60).padStart(2, "0")}m`;
+}
+
+/** v1.21: router gate reasons → human words for the engine badge. The raw
+ * tokens ("stack-text", "transition:slide-left", …) are developer-speak;
+ * users get a plain-language line that says what to change. */
+const ENGINE_REASON_HINTS: [RegExp, string][] = [
+  [/^kinetic-no-geometry$/, "caption geometry unavailable"],
+  [/^stack-text$/, "stack-text headline"],
+  [/^transition:/, "geometric transition"],
+  [/^text-removal$/, "text removal"],
+  [/^loudnorm$/, "loudness normalization"],
+  [/^overlay-motion$/, "overlay motion path"],
+];
+function friendlyEngineReason(reason: string): string {
+  const r = String(reason || "");
+  for (const [re, label] of ENGINE_REASON_HINTS) {
+    if (re.test(r)) return label;
+  }
+  return r || "engine unavailable";
 }
 
 /** Parse an ffmpeg timemark "H:MM:SS.cc" into milliseconds.
@@ -510,7 +529,9 @@ export function Header({
                 v1.20: CLI badges now carry the ROUTING REASON
                 (engineReason) — kinetic captions, stack text, geometric
                 transitions… — so "why is the Rust engine not running" is
-                answered on the badge itself instead of a silent swap. */}
+                answered on the badge itself instead of a silent swap.
+                v1.21: kinetic typography captions are NATIVE — the badge
+                says "Rust engine" for them too; reasons are human words. */}
             {exportProgress?.engine ? (
               <span
                 className="hidden rounded-sm px-1.5 py-0.5 sm:inline"
@@ -521,9 +542,9 @@ export function Header({
                 }}
                 title={
                   exportProgress.engine === "rust"
-                    ? "Native Rust engine — wgpu GPU composite + direct FFmpeg library encode (pipelined)"
+                    ? "Native Rust engine — wgpu GPU composite + direct FFmpeg library encode (pipelined). Captions, kinetic typography, headlines, transitions and the audio bus all render natively."
                     : exportProgress.engineReason
-                      ? `FFmpeg CLI pipeline — Rust engine bypassed: ${exportProgress.engineReason}`
+                      ? `FFmpeg CLI pipeline — Rust engine bypassed: ${friendlyEngineReason(exportProgress.engineReason)}`
                       : "FFmpeg CLI pipeline (Safe Mode)"
                 }
               >
@@ -532,9 +553,9 @@ export function Header({
                   <span
                     className="ml-1.5"
                     style={{ color: "#fbbf24" }}
-                    title={`Rust engine bypassed: ${exportProgress.engineReason} (turn off kinetic typography captions / stack text / geometric transitions to use the native engine)`}
+                    title={`Rust engine bypassed: ${friendlyEngineReason(exportProgress.engineReason)} — switch to dissolve/dip transitions and plain (non-stack) headlines to use the native engine.`}
                   >
-                    · {exportProgress.engineReason}
+                    · {friendlyEngineReason(exportProgress.engineReason)}
                   </span>
                 ) : null}
               </span>

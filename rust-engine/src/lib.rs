@@ -21,6 +21,7 @@ mod compositor;
 mod export;
 mod ffmpeg_ffi;
 mod ffi_offsets;
+mod kinetic;
 mod text;
 mod timeline;
 

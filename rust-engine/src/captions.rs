@@ -542,7 +542,7 @@ impl PreparedCaptions {
     /// Strip height is IDENTICAL for every word (line height + padding) so
     /// baselines align when blitted at the same y.
     #[allow(clippy::too_many_arguments)]
-    fn rasterize_word(
+    pub(crate) fn rasterize_word(
         font: &fontdue::Font,
         text: &str,
         color: [u8; 4],

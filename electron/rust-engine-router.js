@@ -30,14 +30,22 @@
 //     (plain/word/word-only/stack modes, karaoke highlight, all 24
 //     CaptionAnimations) via rust-engine/src/captions.rs (fontdue +
 //     compositor text layers — animated word rect/alpha transforms)
+//   ✓ v1.21 NATIVE KINETIC TYPOGRAPHY: the v1.18 kinetic-typography engine
+//     (per-word choreography over renderer-measured geometry) via
+//     rust-engine/src/kinetic.rs — an exact math port of kinetic/motion.ts
 //   ✗ slide/wipe/circleopen transitions, burn-in text removal, v1.17
-//     kinetic Stack Text, v1.18 kinetic typography captions, loudnorm,
-//     overlay motion keyframes → CLI
+//     kinetic Stack Text, loudnorm, overlay motion keyframes → CLI
 
 "use strict";
 
 const path = require("path");
 const fs = require("fs");
+
+// v1.21: the kinetic preset motion/visual specs (the Electron mirror of
+// src/lib/merger/kinetic/presets.ts — emission-relevant subset, kept in sync
+// by kinetic-ass.js). Needed to EMBED each composition's spec into the Rust
+// kinetic timeline (Rust never looks presets up by id).
+const { getKineticPresetSpec } = require("./kinetic-ass.js");
 
 // ── engine load (DIRECTIVE 5: silent, probeable, never fatal) ─────────────
 let rustEngine = null;
@@ -137,17 +145,20 @@ function rustEligible(opts) {
   const headlineList = Array.isArray(opts.headlines) ? opts.headlines : [];
   if (headlineList.some((h) => h && h.stackStyle)) reasons.push("stack-text");
 
-  // v1.18 KINETIC CAPTIONS (typography engine): rides the ASS/libass CLI
-  // compositor — the per-word override-tag choreography (entrances,
-  // emphasis punches, per-word \pos/\move geometry) has no Rust-engine
-  // equivalent, same class as stack-text. (The legacy 24 CaptionAnimations
-  // and all word modes are NATIVE since v1.20.)
-  if (
+  // v1.18 KINETIC CAPTIONS (typography engine): NATIVE since v1.21 —
+  // rust-engine/src/kinetic.rs renders the per-word choreography (an exact
+  // port of kinetic/motion.ts) over the renderer-measured geometry with the
+  // SAME bundled TTFs. Only gated when the renderer could not measure
+  // geometry (no document — practically never in Electron): the CLI's
+  // libass emitter needs the geometry too, so the export degrades to the
+  // legacy pipeline rather than silently dropping captions.
+  const kineticOn =
     opts.captionSettings &&
     opts.captionSettings.kinetic &&
-    opts.captionSettings.kinetic.enabled
-  ) {
-    reasons.push("kinetic-captions");
+    opts.captionSettings.kinetic.enabled;
+  if (kineticOn) {
+    const geo = Array.isArray(opts.kineticGeometry) ? opts.kineticGeometry : [];
+    if (geo.length === 0) reasons.push("kinetic-no-geometry");
   }
 
   // overlay motion keyframes (≥2 = an actual path; 1 = pinned, fine)
@@ -249,6 +260,8 @@ function pickFont(family) {
 // kinetic-ass.js: web fonts that Windows never ships map to their closest
 // system face (Montserrat → Arial Bold, Bebas → Impact, …).
 const CAPTION_FONT_FILES = {
+  // (the OS fallback table — v1.21 prefers the BUNDLED TTFs for the five
+  // web families; these entries serve every other face + non-bundled runs)
   win32: {
     // [regular, bold] per family name.
     Arial: ["C:\\Windows\\Fonts\\arial.ttf", "C:\\Windows\\Fonts\\arialbd.ttf"],
@@ -288,8 +301,90 @@ const CAPTION_FONT_FILES = {
   },
 };
 
+// ── v1.21 BUNDLED FONTS ─────────────────────────────────────────────────────
+// The app ships the five caption/kinetic web families as static TTFs
+// (public/fonts → extraResources "fonts" in the packaged app; the renderer
+// loads the same files via @font-face, so preview-measure-export parity is
+// byte-identical). Family name → { file prefix, available weights }.
+
+const BUNDLED_FONT_FAMILIES = {
+  Inter: { prefix: "Inter", weights: [400, 500, 600, 700, 800, 900] },
+  Roboto: { prefix: "Roboto", weights: [400, 500, 700, 900] },
+  Montserrat: { prefix: "Montserrat", weights: [400, 500, 600, 700, 800, 900] },
+  "Bebas Neue": { prefix: "BebasNeue", weights: [400] },
+  Bebas: { prefix: "BebasNeue", weights: [400] },
+  "Playfair Display": { prefix: "PlayfairDisplay", weights: [400, 700, 900] },
+};
+
+let bundledFontsDirCache;
+/** The bundled-fonts directory (packaged resources/fonts, dev public/fonts),
+ *  or null when neither exists. */
+function bundledFontsDir() {
+  if (bundledFontsDirCache !== undefined) return bundledFontsDirCache;
+  let dir = null;
+  const candidates = [];
+  try {
+    if (process.versions && process.versions.electron) {
+      const electron = require("electron");
+      const app = electron && electron.app;
+      if (app) {
+        // packaged: resources/fonts (extraResources)
+        candidates.push(path.join(process.resourcesPath || "", "fonts"));
+        // dev: <repo>/public/fonts
+        try {
+          candidates.push(path.join(app.getAppPath(), "public", "fonts"));
+        } catch {}
+      }
+    }
+  } catch {}
+  // plain node (tests / smoke harness): repo-relative
+  candidates.push(path.join(__dirname, "..", "public", "fonts"));
+  for (const c of candidates) {
+    try {
+      if (c && fs.existsSync(c)) {
+        dir = c;
+        break;
+      }
+    } catch {}
+  }
+  bundledFontsDirCache = dir;
+  return dir;
+}
+
+/** Family + weight → a bundled TTF path (weight snapped to the closest
+ *  available), or null when the family is not bundled. */
+function resolveBundledFont(family, weight) {
+  const dir = bundledFontsDir();
+  if (!dir) return null;
+  const name = String(family || "").trim();
+  const spec = BUNDLED_FONT_FAMILIES[name];
+  if (!spec) return null;
+  const w = Number(weight) || 400;
+  let best = spec.weights[0];
+  let bestDist = Infinity;
+  for (const cand of spec.weights) {
+    const d = Math.abs(cand - w);
+    if (d < bestDist) {
+      bestDist = d;
+      best = cand;
+    }
+  }
+  const file = path.join(dir, `${spec.prefix}-${best}.ttf`);
+  try {
+    return fs.existsSync(file) ? file : null;
+  } catch {
+    return null;
+  }
+}
+
 /** captionSettings.fontName (ASS name) → an existing OS font file path. */
 function pickCaptionFont(fontName, fontWeight) {
+  // v1.21: BUNDLED FONTS FIRST. The app ships the exact TTFs the preview
+  // canvas measured with (public/fonts → resources/fonts) — "Montserrat"
+  // now renders as ACTUAL Montserrat instead of the old Arial-Bold
+  // stand-in (the "font selection does not match the preview" bug).
+  const bundled = resolveBundledFont(String(fontName || ""), fontWeight);
+  if (bundled) return bundled;
   const table = CAPTION_FONT_FILES[process.platform] || CAPTION_FONT_FILES.linux;
   const pair = table[fontName] || table.Arial;
   const wantBold = Number(fontWeight) >= 600;
@@ -361,8 +456,134 @@ function buildRustCaptions(opts, width, height) {
   };
 }
 
-/** 9-grid + free-form overlay geometry → normalized center rect (the exact
- * math of export-graph.overlayGeometryMirror, expressed in 0..1). */
+// ── v1.21 NATIVE KINETIC TYPOGRAPHY ──────────────────────────────────────────
+
+/** FONT_OPTIONS id → family display name (the captionPresets.ts mirror). */
+const KINETIC_FAMILY_NAMES = {
+  inter: "Inter",
+  roboto: "Roboto",
+  montserrat: "Montserrat",
+  segoe: "Segoe UI",
+  impact: "Impact",
+  "arial-black": "Arial Black",
+  bebas: "Bebas Neue",
+  playfair: "Playfair Display",
+  georgia: "Georgia",
+  arial: "Arial",
+  trebuchet: "Trebuchet MS",
+  tahoma: "Tahoma",
+  times: "Times New Roman",
+  courier: "Courier New",
+  verdana: "Verdana",
+};
+
+/** Resolve a kinetic word's font file (bundled TTF first, OS fallback) and
+ *  register it in the timeline fonts map. Returns the font KEY. */
+function kineticFontKey(family, weight, fontsMap) {
+  let file = resolveBundledFont(family, weight);
+  if (!file) file = pickCaptionFont(family, weight);
+  const key = "kinf:" + file;
+  if (!(key in fontsMap)) fontsMap[key] = file;
+  return key;
+}
+
+/**
+ * v1.21: the export-native payload's kinetic plan (renderer-measured)
+ * → the Rust `timeline.kinetic` block. Joins kineticCompositions (the
+ * semantic plan — §36: Rust never re-derives it) with kineticGeometry
+ * (matched by cueStartMs, exactly like the CLI emitter), embeds each
+ * composition's preset motion spec, and resolves per-word font files
+ * (family + effective weight → bundled TTF / OS face). Returns null when
+ * kinetic is off or nothing matched (caller keeps the plain captions).
+ */
+function buildRustKinetic(opts, fontsMap) {
+  const cs = opts.captionSettings;
+  const kinetic = cs && cs.kinetic;
+  if (!cs || !cs.enabled || !kinetic || !kinetic.enabled) return null;
+  const comps = Array.isArray(opts.kineticCompositions) ? opts.kineticCompositions : [];
+  const geoList = Array.isArray(opts.kineticGeometry) ? opts.kineticGeometry : [];
+  if (comps.length === 0 || geoList.length === 0) return null;
+
+  const baseColor = String(cs.customColor || "#FFFFFF");
+  const motionLevel = String(kinetic.motion || "dynamic");
+  const fontOverride = kinetic.fontOverride || null;
+  const accentOverride = kinetic.accentOverride || null;
+
+  const out = [];
+  for (const comp of comps) {
+    if (!comp || !(Number(comp.endMs) > Number(comp.startMs))) continue;
+    const g = geoList.find(
+      (x) => x && Number(x.cueStartMs) === Number(comp.startMs),
+    );
+    if (!g || !Array.isArray(g.words) || g.words.length === 0) continue;
+    const spec = getKineticPresetSpec(comp.presetId);
+    if (!spec) continue;
+
+    // The family the renderer measured with (fontOverride wins).
+    const family =
+      KINETIC_FAMILY_NAMES[fontOverride || spec.fontId] ||
+      KINETIC_FAMILY_NAMES[fontOverride] ||
+      "Inter";
+    const compAccent = String(accentOverride || spec.accentColor || "#FACC15");
+
+    const words = g.words
+      .filter((w) => w && w.text)
+      .map((w) => {
+        const weight = Math.max(
+          100,
+          Math.min(900, Math.round(Number(w.weight) || 400)),
+        );
+        return {
+          text: String(w.text),
+          startMs: Number(w.startMs) || 0,
+          endMs: Number(w.endMs) || 0,
+          x: Number(w.x) || 0,
+          y: Number(w.y) || 0,
+          w: Number(w.w) || 0,
+          h: Number(w.h) || 0,
+          fontPx: Number(w.fontPx) || 40,
+          weight,
+          emphasis: !!w.emphasis,
+          role: String(w.role || "supporting"),
+          phraseIndex: Math.max(0, Math.round(Number(w.phraseIndex) || 0)),
+          fontKey: kineticFontKey(family, weight, fontsMap),
+        };
+      });
+    if (words.length === 0) continue;
+
+    const phrases = (Array.isArray(comp.phrases) ? comp.phrases : []).map((p) => ({
+      role: String((p && p.role) || "supporting"),
+      align: String((p && p.align) || "center"),
+    }));
+
+    out.push({
+      startMs: Number(comp.startMs) || 0,
+      endMs: Number(comp.endMs) || 0,
+      preset: {
+        entrance: String(spec.entrance || "fade-rise"),
+        entranceMs: Number(spec.entranceMs) || 300,
+        staggerMs: Number(spec.staggerMs) || 110,
+        overshoot: Number(spec.overshoot) || 0,
+        emphasisMotion: String(spec.emphasisMotion || "hold"),
+        hold: String(spec.hold || "none"),
+        exit: String(spec.exit || "fade"),
+        exitMs: Number(spec.exitMs) || 300,
+        shadow: spec.shadow !== false,
+        supportAlpha: Number(spec.supportAlpha) || 0.78,
+      },
+      accentColor: compAccent,
+      words,
+      phrases,
+    });
+  }
+  if (out.length === 0) return null;
+  return {
+    baseColor,
+    accentColor: String(accentOverride || "#FACC15"),
+    motionLevel,
+    comps: out,
+  };
+}
 function overlayGeometryNorm(videoW, videoH, overlay) {
   if (!overlay) return { x: 0.5, y: 0.5, w: 0.3, h: 0 };
   const sp = Number.isFinite(overlay.scalePercent)
@@ -613,6 +834,9 @@ function buildRustTimeline(opts) {
   }
 
   // ── v1.20 CAPTIONS: the native caption block + its font file ──
+  // ── v1.21 KINETIC: when kinetic typography is ON it REPLACES the plain
+  // captions (the preview painter dispatches the same way) — the kinetic
+  // timeline registers its per-word font files into fontsMap as it builds.
   const captions = buildRustCaptions(opts, width, height);
   const fontsMap = { sans: pickFont("sans"), mono: pickFont("mono") };
   if (captions) {
@@ -621,6 +845,7 @@ function buildRustTimeline(opts) {
       opts.captionSettings && opts.captionSettings.fontWeight,
     );
   }
+  const kinetic = buildRustKinetic(opts, fontsMap);
 
   // ── watermark (pixel coords, as the CLI chain consumes) ──
   const wm = opts.watermark;
@@ -658,7 +883,9 @@ function buildRustTimeline(opts) {
     texts,
     watermark,
     // v1.20 NATIVE CAPTIONS (null when off — the engine no-ops).
-    captions,
+    // v1.21: kinetic typography REPLACES the plain captions when present.
+    captions: kinetic ? null : captions,
+    kinetic,
   };
   return { timeline, slideshowFpsApplied, fps };
 }
@@ -718,6 +945,14 @@ async function runRustExport(opts, event, { ffmpegPath, cpuCount, sendCliProgres
         `, mode=${built.timeline.captions.wordMode}` +
         `, anim=${built.timeline.captions.animation}` +
         `, font=${built.timeline.fonts.caption}`,
+    );
+  }
+  if (built.timeline.kinetic) {
+    const kinFonts = new Set(built.timeline.kinetic.comps.flatMap((c) => c.words.map((w) => w.fontKey)));
+    console.log(
+      `[RustEngine] native KINETIC typography ON — ${built.timeline.kinetic.comps.length} composition(s)` +
+        `, motion=${built.timeline.kinetic.motionLevel}` +
+        `, ${kinFonts.size} font face(s)`,
     );
   }
 

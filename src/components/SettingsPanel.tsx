@@ -372,6 +372,166 @@ function Segmented<T extends string | number>({
   );
 }
 
+// v1.21 LIVE-PREVIEW FONT PICKER ─────────────────────────────────────────────
+// Every option renders in its OWN typeface (the bundled @font-face families
+// — Inter/Montserrat/Bebas Neue/Playfair Display/Roboto ship with the app
+// and the export burns the exact same TTFs). Users SEE the real caption
+// font before picking it; the old native <select> could not style options
+// per-family, so "which font is which" was guesswork.
+// Full keyboard support (↑/↓, Home/End, Enter, Escape) + click-outside.
+function FontPicker({
+  value,
+  onChange,
+  options,
+}: {
+  value: string;
+  onChange: (fontId: string) => void;
+  options: { id: string; name: string; stack: string }[];
+}) {
+  const [open, setOpen] = useState(false);
+  const [highlight, setHighlight] = useState(0);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+
+  const activeIdx = Math.max(
+    0,
+    options.findIndex((o) => o.id === value),
+  );
+  const current = options.find((o) => o.id === value) ?? options[0];
+
+  // click-outside + Escape close
+  useEffect(() => {
+    if (!open) return;
+    const onDoc = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
+  const choose = (id: string) => {
+    onChange(id);
+    setOpen(false);
+  };
+
+  const onKey = (e: React.KeyboardEvent) => {
+    if (e.key === "Escape") {
+      setOpen(false);
+      return;
+    }
+    if (!open && (e.key === "Enter" || e.key === " " || e.key === "ArrowDown")) {
+      setOpen(true);
+      e.preventDefault();
+      return;
+    }
+    if (!open) return;
+    if (e.key === "ArrowDown") {
+      setHighlight((h) => Math.min(options.length - 1, h + 1));
+      e.preventDefault();
+    } else if (e.key === "ArrowUp") {
+      setHighlight((h) => Math.max(0, h - 1));
+      e.preventDefault();
+    } else if (e.key === "Home") {
+      setHighlight(0);
+      e.preventDefault();
+    } else if (e.key === "End") {
+      setHighlight(options.length - 1);
+      e.preventDefault();
+    } else if (e.key === "Enter") {
+      choose(options[highlight]?.id ?? value);
+      e.preventDefault();
+    }
+  };
+
+  return (
+    <div
+      ref={wrapRef}
+      className="relative"
+      onKeyDown={onKey}
+    >
+      <button
+        type="button"
+        onClick={() => {
+          if (!open) setHighlight(activeIdx);
+          setOpen(!open);
+        }}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-label="Caption font"
+        className="flex w-full items-center justify-between rounded border bg-zinc-900 px-2.5 py-2 text-left transition-colors hover:border-zinc-500"
+        style={{
+          borderColor: open ? "#67e8f9" : "#3f3f46",
+        }}
+      >
+        <span
+          className="truncate text-zinc-100"
+          style={{ fontFamily: current.stack, fontSize: 14 }}
+        >
+          {current.name}
+        </span>
+        <ChevronDown
+          size={13}
+          className="ml-2 shrink-0 text-zinc-500 transition-transform"
+          style={{ transform: open ? "rotate(180deg)" : undefined }}
+        />
+      </button>
+      {open && (
+        <div
+          role="listbox"
+          aria-label="Font options"
+          className="absolute z-40 mt-1 w-full overflow-hidden rounded border shadow-2xl"
+          style={{ borderColor: "#3f3f46", backgroundColor: "#111113" }}
+        >
+          <div className="max-h-72 overflow-y-auto ff-font-scroll">
+            {options.map((o, i) => {
+              const active = o.id === value;
+              const hl = i === highlight;
+              return (
+                <button
+                  key={o.id}
+                  type="button"
+                  role="option"
+                  aria-selected={active}
+                  onMouseEnter={() => setHighlight(i)}
+                  onClick={() => choose(o.id)}
+                  className="flex w-full items-center justify-between px-2.5 py-2 text-left transition-colors"
+                  style={{
+                    backgroundColor: active
+                      ? "rgba(34, 211, 238, 0.14)"
+                      : hl
+                        ? "rgba(255, 255, 255, 0.05)"
+                        : "transparent",
+                  }}
+                >
+                  <span
+                    className="truncate"
+                    style={{
+                      fontFamily: o.stack,
+                      fontSize: 15,
+                      lineHeight: 1.35,
+                      color: active ? "#67e8f9" : "#e4e4e7",
+                    }}
+                  >
+                    {o.name}
+                  </span>
+                  {active ? (
+                    <Check
+                      size={12}
+                      className="ml-2 shrink-0"
+                      style={{ color: "#67e8f9" }}
+                    />
+                  ) : null}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Row({
   label,
   children,
@@ -515,6 +675,13 @@ const TAB_PANEL_CSS = `
   .ff-settings-tabs button[role="tab"] { padding-top: 10px; padding-bottom: 10px; }
   .ff-settings-tabs button[role="tab"] svg { width: 17px; height: 17px; }
 }
+/* v1.21 FontPicker list — slim custom scrollbar (the long font list
+ * deserves better than the default chunky one) */
+.ff-font-scroll { scrollbar-width: thin; scrollbar-color: #3f3f46 transparent; }
+.ff-font-scroll::-webkit-scrollbar { width: 8px; }
+.ff-font-scroll::-webkit-scrollbar-track { background: transparent; }
+.ff-font-scroll::-webkit-scrollbar-thumb { background: #3f3f46; border-radius: 4px; border: 2px solid #111113; }
+.ff-font-scroll::-webkit-scrollbar-thumb:hover { background: #52525b; }
 `;
 
 // ---------------------------------------------------------------------------
@@ -3450,12 +3617,12 @@ function CaptionsSection(props: CaptionsSectionProps) {
       {/* ── Font ── */}
       <Field
         label="Font"
-        hint="Windows-safe stacks — preview matches the export."
+        hint="Every option previews in its real typeface — the bundled fonts render identically in preview and export."
       >
-        <select
+        <FontPicker
           value={captionSettings.fontId}
-          onChange={(e) => {
-            const fontId = e.target.value;
+          options={FONT_OPTIONS}
+          onChange={(fontId) => {
             if (kineticOn) {
               // v1.18: while the kinetic engine is active the Font picker also
               // drives kinetic.fontOverride so preview + export typography
@@ -3473,16 +3640,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
               set({ fontId });
             }
           }}
-          className="w-full rounded border bg-zinc-900 px-2 py-1.5 text-[11px] text-zinc-200"
-          style={{ borderColor: "#3f3f46" }}
-          aria-label="Caption font"
-        >
-          {FONT_OPTIONS.map((f) => (
-            <option key={f.id} value={f.id}>
-              {f.name}
-            </option>
-          ))}
-        </select>
+        />
       </Field>
 
       {/* ── Color override ── */}

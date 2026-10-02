@@ -40,6 +40,34 @@ const GQ = require("./groq-whisper");
 const RUST = require("./rust-engine-router");
 console.log("[RustEngine]", JSON.stringify(RUST.rustEngineStatus()));
 
+// v1.21 BUNDLED FONTS: the caption/kinetic web families ship as static TTFs
+// (public/fonts → extraResources "fonts" in the packaged app). libass gets
+// them via the subtitles filter's fontsdir option; the Rust engine resolves
+// the same files by path (rust-engine-router BUNDLED_FONT_FAMILIES).
+let _bundledFontsDirCache;
+function bundledFontsDirForAss() {
+  if (_bundledFontsDirCache !== undefined) return _bundledFontsDirCache;
+  let dir = null;
+  const candidates = [];
+  try {
+    candidates.push(path.join(process.resourcesPath || "", "fonts"));
+  } catch {}
+  try {
+    candidates.push(path.join(app.getAppPath(), "public", "fonts"));
+  } catch {}
+  candidates.push(path.join(__dirname, "..", "public", "fonts"));
+  for (const c of candidates) {
+    try {
+      if (c && fs.existsSync(c)) {
+        dir = c;
+        break;
+      }
+    } catch {}
+  }
+  _bundledFontsDirCache = dir;
+  return dir;
+}
+
 // v1.18 ICON FIX (taskbar): Windows groups + icons the RUNNING app by its
 // AppUserModelID. Without this call Electron windows fall back to a
 // process-derived AUMID, and Windows 10/11 then renders a BLANK/WHITE
@@ -4176,7 +4204,22 @@ ipcMain.handle("export-native", async (event, opts) => {
         .replace(/:/g, "\\:")
         .replace(/'/g, "\\'")
         .replace(/,/g, "\\,");
-      return `subtitles=filename='${escapedAssPath}'`;
+      // v1.21: fontsdir → the BUNDLED TTFs (resources/fonts in the packaged
+      // app, public/fonts in dev). Without it libass resolves only SYSTEM
+      // fonts — Montserrat/Inter/Bebas Neue/Playfair fell back to Arial and
+      // the burned captions lost their typographic identity (the "fonts
+      // don't match the reference/preview" bug).
+      let fontsSuffix = "";
+      const fontsDir = bundledFontsDirForAss();
+      if (fontsDir) {
+        const escapedFontsDir = fontsDir
+          .replace(/\\/g, "/")
+          .replace(/:/g, "\\:")
+          .replace(/'/g, "\\'")
+          .replace(/,/g, "\\,");
+        fontsSuffix = `:fontsdir='${escapedFontsDir}'`;
+      }
+      return `subtitles=filename='${escapedAssPath}'${fontsSuffix}`;
     };
 
     // v1.4.2: overlay specs for ANY window (segment OR chunk). The chunked

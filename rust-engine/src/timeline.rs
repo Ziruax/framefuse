@@ -92,6 +92,9 @@ pub struct KineticComp {
     /// The preset motion/visual spec (embedded by Electron from its mirror
     /// of kinetic/presets.ts — Rust never looks presets up by id).
     pub preset: KineticPresetSpec,
+    /// Per-comp accent color (accentOverride ?? the preset's accentColor).
+    /// Empty → the timeline-level accent.
+    pub accent_color: String,
     /// Renderer-measured word rects (absolute px at the output dims), each
     /// carrying its own timing + semantics + weight.
     pub words: Vec<KineticGeoWordR>,

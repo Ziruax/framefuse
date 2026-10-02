@@ -292,18 +292,37 @@ fn word_transform(
 pub struct PreparedKinetic {
     style: crate::timeline::KineticTimeline,
     comps: Vec<PreparedComp>,
-    /// (font_key, text, is_accent, font_px) → strip. Sizes vary per phrase
-    /// scale, so the cache key carries the size (a handful per comp).
-    bitmaps: HashMap<(String, String, bool, u32), Bitmap>,
-    strip_dims: HashMap<(String, String, bool, u32), (u32, u32)>,
+    /// (resolved font key, text, FILL COLOR hex, size) → strip. The color is
+    /// part of the key because accent colors are PER COMPOSITION (each
+    /// preset carries its own accentColor — auto-mode mixes need distinct
+    /// strips for the same word text).
+    bitmaps: HashMap<(String, String, String, u32), Bitmap>,
+    /// Same key → (strip_w, strip_h, baseline_from_top, pad). The placement
+    /// math needs to know where rasterize_word put the baseline inside the
+    /// strip (pad + ceil(line_h)) and the side padding (exact ink parity:
+    /// canvas fillText(wx, wy) with textBaseline="top" ⇒ ink-left at
+    /// strip_x + pad + xmin₀ == wx + xmin₀ ⇒ strip_x = wx − pad, and the
+    /// baseline lands at wy + ascent ⇒ strip_y = wy + ascent − baseline_top).
+    strip_meta: HashMap<(String, String, String, u32), (u32, u32, i32, i32)>,
 }
 
 struct PreparedComp {
     comp: KineticComp,
-    /// Per-word: (strip_w, strip_h) resolved from the bitmap cache.
+    /// Per-word rasterization references (cache key + the canvas ascent at
+    /// this word's size — captured from the SAME TTF the renderer measured
+    /// with, so the vertical anchor is metric-exact).
+    words: Vec<PreparedWord>,
     /// phrase align + last word end (push-out grouping).
     phrase_align: Vec<String>,
     phrase_last_end: Vec<f64>,
+}
+
+struct PreparedWord {
+    gw: KineticGeoWordR,
+    /// The exact bitmap-cache key (resolved font + fill color + size).
+    key: (String, String, String, u32),
+    /// Font ascent at this word's size (px) — the textBaseline="top" offset.
+    ascent_px: f32,
 }
 
 /// Load a font file from the timeline's font table by key.
@@ -330,7 +349,8 @@ pub fn prepare(timeline: &Timeline, cw: u32, ch: u32) -> Result<Option<PreparedK
         _ => return Ok(None),
     };
 
-    let _ = (cw, ch); // rasterization uses per-word font_px (already scaled)
+    let _ = cw; // rasterization uses per-word font_px (already scaled)
+    let ch = ch.max(16);
 
     // Distinct font keys → fontdue fonts.
     let mut fonts: HashMap<String, fontdue::Font> = HashMap::new();
@@ -360,15 +380,13 @@ pub fn prepare(timeline: &Timeline, cw: u32, ch: u32) -> Result<Option<PreparedK
     }
     let fallback_key = fallback_key.unwrap_or_default();
 
-    let base_col = parse_hex_color(&style.base_color);
-    let accent_col = parse_hex_color(&style.accent_color);
     // Shadow: canvas shadow rgba(0,0,0,0.55) blur 7·scaleRef — baked as the
     // caption-style offset shadow (documented approximation).
     let shadow_col = [10u8, 10, 12, 150];
     let shadow_px = ((ch as f64 / 1080.0) * 3.0).round().max(2.0) as i32;
 
-    let mut bitmaps: HashMap<(String, String, bool, u32), Bitmap> = HashMap::new();
-    let mut strip_dims: HashMap<(String, String, bool, u32), (u32, u32)> = HashMap::new();
+    let mut bitmaps: HashMap<(String, String, String, u32), Bitmap> = HashMap::new();
+    let mut strip_meta: HashMap<(String, String, String, u32), (u32, u32, i32, i32)> = HashMap::new();
 
     let mut comps_out: Vec<PreparedComp> = Vec::with_capacity(style.comps.len());
     for comp in &style.comps {
@@ -393,52 +411,82 @@ pub fn prepare(timeline: &Timeline, cw: u32, ch: u32) -> Result<Option<PreparedK
             }
         }
 
+        let mut words_out: Vec<PreparedWord> = Vec::with_capacity(comp.words.len());
         for w in &comp.words {
-            let key = if fonts.contains_key(&w.font_key) {
+            let resolved_key = if fonts.contains_key(&w.font_key) {
                 w.font_key.clone()
             } else {
                 fallback_key.clone()
             };
-            let font = match fonts.get(&key) {
-                Some(f) => f,
-                None => continue,
+            let Some(font) = fonts.get(&resolved_key) else { continue };
+            // Per-comp accent (accentOverride ?? preset accentColor); the
+            // timeline-level accent is the fallback for empty.
+            let accent_hex = if comp.accent_color.is_empty() {
+                style.accent_color.clone()
+            } else {
+                comp.accent_color.clone()
             };
-            let is_accent = w.emphasis;
+            let fill_hex = if w.emphasis { accent_hex } else { style.base_color.clone() };
+            let fill_col = parse_hex_color(&fill_hex);
             let size = w.font_px.max(8.0) as f32;
-            let ck = (key.clone(), w.text.clone(), is_accent, size as u32);
+            let line_h = w.h.max(1.0) as f32;
+            let ck = (resolved_key.clone(), w.text.clone(), fill_hex, size as u32);
             if !bitmaps.contains_key(&ck) {
-                let color = if is_accent { accent_col } else { base_col };
+                let spx = if comp.preset.shadow { shadow_px } else { 0 };
                 let (bmp, sw, sh) = PreparedCaptions::rasterize_word(
                     font,
                     &w.text,
-                    color,
+                    fill_col,
                     [0u8, 0, 0, 0],
                     0, // no outline (all kinetic presets: outline false)
                     shadow_col,
-                    if comp.preset.shadow { shadow_px } else { 0 },
+                    spx,
                     size,
                     0.0, // canvas painter draws without letterSpacing
-                    w.h.max(1.0) as f32,
+                    line_h,
                 );
+                // rasterize_word's internals (keep in sync):
+                //   pad = max(outline_w, shadow_px).max(2) + 2
+                //   baseline = pad + ceil(line_h)
+                let pad = 0i32.max(spx).max(2) + 2;
+                let baseline_top = pad + line_h.ceil() as i32;
                 bitmaps.insert(ck.clone(), bmp);
-                strip_dims.insert(ck, (sw, sh));
+                strip_meta.insert(ck.clone(), (sw, sh, baseline_top, pad));
             }
+            // The ascent at this size — the textBaseline="top" offset the
+            // canvas painter used when it measured/drew at wy.
+            let ascent_px = font
+                .horizontal_line_metrics(size)
+                .map(|m| m.ascent)
+                .unwrap_or(size * 0.9);
+            words_out.push(PreparedWord { gw: w.clone(), key: ck, ascent_px });
+        }
+        if words_out.is_empty() {
+            continue;
         }
 
         comps_out.push(PreparedComp {
             comp: comp.clone(),
+            words: words_out,
             phrase_align,
             phrase_last_end,
         });
     }
 
-    Ok(Some(PreparedKinetic { style, comps: comps_out, bitmaps, strip_dims }))
+    Ok(Some(PreparedKinetic { style, comps: comps_out, bitmaps, strip_meta }))
 }
 
 /// Per-frame layer emission (the compositor's scaled TextLayer path).
+///
+/// Placement is EXACT canvas parity with drawKineticComposition:
+///   * unscaled strip rect: fillText(wx, wy), textBaseline="top"
+///     → strip_x = wx − pad, strip_y = wy + ascent − baseline_top;
+///   * the word transform (scale around the word-box center + 1080p-scaled
+///     offsets) maps the strip rect exactly like the painter's
+///     translate(cx,cy)/scale/translate(−cx,−cy).
 pub fn layers_at(pk: &PreparedKinetic, now_ms: f64, ch: u32) -> Vec<TextLayer> {
     let mut out: Vec<TextLayer> = Vec::new();
-    let ch_f = ch as f64;
+    let ch_f = ch.max(16) as f64;
     let scale_ref = ch_f / 1080.0;
 
     for pc in &pk.comps {
@@ -448,7 +496,8 @@ pub fn layers_at(pk: &PreparedKinetic, now_ms: f64, ch: u32) -> Vec<TextLayer> {
         }
         let preset = &comp.preset;
 
-        for (idx, w) in comp.words.iter().enumerate() {
+        for (idx, pw) in pc.words.iter().enumerate() {
+            let w = &pw.gw;
             let phrase_align = pc
                 .phrase_align
                 .get(w.phrase_index)
@@ -471,52 +520,29 @@ pub fn layers_at(pk: &PreparedKinetic, now_ms: f64, ch: u32) -> Vec<TextLayer> {
                 continue;
             }
 
-            let is_accent = w.emphasis;
-            let size = w.font_px.max(8.0) as f32;
-            // NOTE the fallback font key must match the one baked in prepare.
-            let cks: Vec<(String, u32)> = {
-                let mut v = Vec::with_capacity(2);
-                v.push((w.font_key.clone(), size as u32));
-                v
-            };
-            let mut bmp: Option<&Bitmap> = None;
-            let mut dims: Option<(u32, u32)> = None;
-            for (k, sz) in &cks {
-                if let Some(b) = pk.bitmaps.get(&(k.clone(), w.text.clone(), is_accent, *sz)) {
-                    bmp = Some(b);
-                    dims = pk.strip_dims.get(&(k.clone(), w.text.clone(), is_accent, *sz)).copied();
-                    break;
-                }
-            }
-            // Fallback: any size/accent variant of this exact text+key (the
-            // prepare pass guaranteed at least one entry per rendered word).
-            if bmp.is_none() {
-                for ((k, txt, _acc, _sz), b) in pk.bitmaps.iter() {
-                    if k == &w.font_key && txt == &w.text {
-                        bmp = Some(b);
-                        dims = pk.strip_dims
-                            .get(&(k.clone(), txt.clone(), *_acc, *_sz))
-                            .copied();
-                        break;
-                    }
-                }
-            }
-            let Some(bmp) = bmp else { continue };
-            let (sw, sh) = dims.unwrap_or((bmp.w, bmp.h));
+            let Some(bmp) = pk.bitmaps.get(&pw.key) else { continue };
+            let Some(&(sw, sh, baseline_top, pad)) = pk.strip_meta.get(&pw.key) else { continue };
 
-            // The strip is anchored at the word box center (same math as
-            // captions.rs push_word_layer, per-word anchor always).
-            let sw_s = sw as f64 * t.scale;
-            let sh_s = sh as f64 * t.scale;
-            let gcx = w.x + w.w / 2.0 + t.offset_x * scale_ref;
-            let gcy = w.y + w.h / 2.0 + t.offset_y * scale_ref;
+            // ── unscaled strip rect (canvas ink parity) ──
+            let strip_x = w.x - pad as f64;
+            let strip_y = w.y + pw.ascent_px as f64 - baseline_top as f64;
+
+            // ── transform around the word-box center (painter math) ──
+            let cx = w.x + w.w / 2.0;
+            let cy = w.y + w.h / 2.0;
+            let s = t.scale;
+            let mx = cx + t.offset_x * scale_ref + s * (strip_x - cx);
+            let my = cy + t.offset_y * scale_ref + s * (strip_y - cy);
+            let mw = (s * sw as f64).max(1.0);
+            let mh = (s * sh as f64).max(1.0);
+
             out.push(TextLayer {
                 bitmap: bmp.clone(),
                 dest_px: (
-                    (gcx - sw_s / 2.0).round().max(0.0) as u32,
-                    (gcy - sh_s / 2.0).round().max(0.0) as u32,
-                    sw_s.round().max(1.0) as u32,
-                    sh_s.round().max(1.0) as u32,
+                    mx.round().max(0.0) as u32,
+                    my.round().max(0.0) as u32,
+                    mw.round().max(1.0) as u32,
+                    mh.round().max(1.0) as u32,
                 ),
                 alpha: t.alpha.clamp(0.0, 1.0) as f32,
             });
@@ -554,6 +580,7 @@ mod tests {
             start_ms: 1000.0,
             end_ms: 4000.0,
             preset,
+            accent_color: "#FACC15".into(),
             words: (0..6).map(|i| word("w", i, 1100.0 + i as f64 * 300.0, 1350.0 + i as f64 * 300.0)).collect(),
             phrases: vec![
                 KineticPhraseSpec { role: "primary".into(), align: "center".into() },
@@ -589,7 +616,7 @@ mod tests {
         assert!(t1.alpha > 0.05 && t1.alpha < 1.0);
         assert!(t1.offset_y > 0.5);
         // settled
-        let t2 = word_transform(&c, &c.perset.clone(), w, 0, 2600.0, "dynamic", 1080.0, Some("center"), Some(2050.0));
+        let t2 = word_transform(&c, &c.preset.clone(), w, 0, 2600.0, "dynamic", 1080.0, Some("center"), Some(2050.0));
         assert!((t2.alpha - 1.0).abs() < 1e-6);
         assert!(t2.offset_y.abs() < 1e-6);
     }
@@ -598,7 +625,8 @@ mod tests {
     fn exit_fades_out() {
         let c = comp(preset("word-pop", "fade", "none"));
         let w = &c.words[0];
-        let t = word_transform(&c, &c.preset, w, 0, 3850.0, "balanced", 1080.0, Some("center"), Some(2050.0));
+        // 3980ms = 280ms into the 300ms exit window (comp end 4000).
+        let t = word_transform(&c, &c.preset, w, 0, 3980.0, "balanced", 1080.0, Some("center"), Some(2050.0));
         assert!(t.alpha < 0.2);
         let t2 = word_transform(&c, &c.preset, w, 0, 2600.0, "balanced", 1080.0, Some("center"), Some(2050.0));
         assert!(t2.alpha > 0.9);
@@ -626,21 +654,23 @@ mod tests {
         let mut c = comp(preset("fade-rise", "fade", "none"));
         c.words[5].role = "supporting".into();
         let w = &c.words[5];
-        let t = word_transform(&c, &c.preset, w, 5, 2600.0, "dynamic", 1080.0, Some("center"), Some(2950.0));
+        // 3100ms: word 5's entrance settled (enterEnd 2950), pre-exit.
+        let t = word_transform(&c, &c.preset, w, 5, 3100.0, "dynamic", 1080.0, Some("center"), Some(2950.0));
         assert!((t.alpha - 0.82).abs() < 1e-6);
     }
 
     #[test]
     fn emphasis_punch_on_spoken_word() {
         let c = comp(preset("fade-rise", "fade", "none"));
-        let w = &c.words[2]; // emphasis, spoken at 1700
-        let t = word_transform(&c, &c.preset, w, 2, 1720.0, "dynamic", 1080.0, Some("center"), Some(2050.0));
+        let w = &c.words[2]; // emphasis, spoken 1700..1950
+        // 1850ms = 60% through the emphasis window: the scale-punch peak.
+        let t = word_transform(&c, &c.preset, w, 2, 1850.0, "dynamic", 1080.0, Some("center"), Some(2050.0));
         assert!(t.scale > 1.0);
     }
 
     #[test]
     fn timeline_deserializes() {
-        let json = r#"{
+        let json = r##"{
             "baseColor": "#FFFFFF", "accentColor": "#FACC15", "motionLevel": "dynamic",
             "comps": [{ "startMs": 0, "endMs": 3000,
               "preset": { "entrance": "fade-rise", "entranceMs": 300, "staggerMs": 110,
@@ -649,8 +679,9 @@ mod tests {
               "words": [{ "text": "HELLO", "startMs": 0, "endMs": 400, "x": 10, "y": 20,
                           "w": 100, "h": 90, "fontPx": 84, "weight": 700, "emphasis": true,
                           "role": "primary", "phraseIndex": 0, "fontKey": "kin-700" }],
+              "accentColor": "#FACC15",
               "phrases": [{ "role": "primary", "align": "center" }] }]
-        }"#;
+        }"##;
         let k: KineticTimeline = serde_json::from_str(json).unwrap();
         assert_eq!(k.comps.len(), 1);
         assert_eq!(k.comps[0].words[0].text, "HELLO");

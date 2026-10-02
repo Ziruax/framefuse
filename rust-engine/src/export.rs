@@ -27,6 +27,7 @@ use crate::compositor::{self, Bitmap, Compositor, Layer, OutputFormat, TextLayer
 use crate::captions::{self, PreparedCaptions};
 use crate::ffmpeg_ffi::*;
 use crate::ffi_offsets::*;
+use crate::kinetic::{self, PreparedKinetic};
 use crate::text::TextRenderer;
 use crate::timeline::{Segment, Timeline};
 use rayon::prelude::*;
@@ -691,15 +692,37 @@ pub fn run_pipeline(
     // ── v1.20 NATIVE CAPTIONS: prepare once (font load + layout + word
     // bitmap cache). None when the timeline carries no caption cues —
     // painting is then a no-op. ─────────────────────────────────────
-    let prepared_captions: Option<Arc<PreparedCaptions>> = match captions::prepare(&timeline, cw, ch) {
-        Ok(p) => p.map(Arc::new),
-        Err(e) => {
-            // A caption failure must never kill the export — degrade to
-            // captions-less output (the router logs it; parity with the
-            // CLI pipeline's error tolerance).
-            log::warn!("[rust-engine] captions unavailable ({}): exporting without burn-in", e);
-            None
+    // v1.21 NATIVE KINETIC: when the kinetic timeline is present it
+    // REPLACES plain captions (the preview painter dispatches the same
+    // way — kinetic.enabled wins over the legacy cue path).
+    let kinetic_first = timeline.kinetic.as_ref().map(|k| !k.comps.is_empty()).unwrap_or(false);
+    let prepared_captions: Option<Arc<PreparedCaptions>> = if kinetic_first {
+        None
+    } else {
+        match captions::prepare(&timeline, cw, ch) {
+            Ok(p) => p.map(Arc::new),
+            Err(e) => {
+                // A caption failure must never kill the export — degrade to
+                // captions-less output (the router logs it; parity with the
+                // CLI pipeline's error tolerance).
+                log::warn!("[rust-engine] captions unavailable ({}): exporting without burn-in", e);
+                None
+            }
         }
+    };
+
+    // ── v1.21 NATIVE KINETIC TYPOGRAPHY: prepare once (fonts + strip
+    // rasterization). Same degrade-to-none tolerance as captions. ────
+    let prepared_kinetic: Option<Arc<PreparedKinetic>> = if kinetic_first {
+        match kinetic::prepare(&timeline, cw, ch) {
+            Ok(p) => p.map(Arc::new),
+            Err(e) => {
+                log::warn!("[rust-engine] kinetic unavailable ({}): exporting without kinetic captions", e);
+                None
+            }
+        }
+    } else {
+        None
     };
 
     // ── watermark ────────────────────────────────────────────────────────
@@ -968,6 +991,7 @@ pub fn run_pipeline(
         let image_bitmaps = image_bitmaps.clone();
         let texts = texts.clone();
         let prepared_captions = prepared_captions.clone();
+        let prepared_kinetic = prepared_kinetic.clone();
         let watermark = watermark.clone();
         std::thread::Builder::new()
             .name("framefuse-producer".into())
@@ -1010,6 +1034,7 @@ pub fn run_pipeline(
                         &mut video_sources,
                         &texts,
                         &prepared_captions,
+                        &prepared_kinetic,
                         &watermark,
                         &mut decode_ms,
                         cw,
@@ -1359,6 +1384,7 @@ fn build_frame_job(
     video_sources: &mut std::collections::HashMap<usize, VideoSource>,
     texts: &[(usize, TextLayer, f64, f64, f64)],
     captions: &Option<Arc<PreparedCaptions>>,
+    kinetic: &Option<Arc<PreparedKinetic>>,
     watermark: &Option<TextLayer>,
     decode_ms: &mut i64,
     cw: u32,
@@ -1546,9 +1572,12 @@ fn build_frame_job(
         text_layers.push(tl);
     }
 
-    // ── v1.20 CAPTIONS: burned-in cue layers (above texts, below the
-    //    watermark — the ASS emission order: headline < kinetic < cue).
-    if let Some(pc) = captions {
+    // ── v1.20 CAPTIONS / v1.21 KINETIC: burned-in layers (above texts,
+    //    below the watermark — the ASS emission order: headline < kinetic
+    //    < cue). The kinetic timeline REPLACES plain cues when present.
+    if let Some(pk) = kinetic {
+        text_layers.extend(kinetic::layers_at(pk, now_ms, ch));
+    } else if let Some(pc) = captions {
         text_layers.extend(captions::layers_at(pc, now_ms, cw, ch));
     }
 
