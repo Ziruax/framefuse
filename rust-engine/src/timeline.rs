@@ -49,6 +49,83 @@ pub struct Timeline {
     /// absolute-timeline, never ducked, never looped.
     #[serde(default)]
     pub extra_audio: Vec<ExtraAudio>,
+    /// v1.20 NATIVE CAPTIONS: burned-in subtitle cues with the full v4.1
+    /// style vocabulary (word modes, karaoke highlight, per-word kinetic
+    /// animations). Electron precomputes every concrete style number (the
+    /// renderer resolved the CaptionPreset before the payload shipped), so
+    /// this is a pure paint contract — no preset knowledge lives in Rust.
+    /// Kinetic-typography-engine captions and Stack Text headlines still
+    /// ride the CLI/libass compositor (gated Electron-side).
+    #[serde(default)]
+    pub captions: Option<CaptionsTimeline>,
+}
+
+/// v1.20: the native caption system's resolved style + cue list.
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CaptionsTimeline {
+    /// Key into `timeline.fonts` (Electron resolves the preset fontId to an
+    /// OS font file, preferring a bold face when fontWeight >= 600).
+    pub font_key: String,
+    /// Font size in px, ALREADY scaled to the output height.
+    pub font_size_px: f64,
+    /// "#rrggbb".
+    pub text_color: String,
+    /// Karaoke / active-word color ("#rrggbb"), when the preset defines one.
+    pub highlight_color: Option<String>,
+    /// "#rrggbb" stroke color (used when no background box).
+    pub border_color: String,
+    /// Stroke width in px at the output height.
+    pub border_width_px: f64,
+    /// Background box color ("#rrggbb") or None for no box.
+    pub bg_color: Option<String>,
+    /// 0..1 background opacity.
+    pub bg_alpha: f64,
+    /// Box padding in px at the output height.
+    pub bg_padding_px: f64,
+    /// Solid offset shadow on/off.
+    pub shadow: bool,
+    /// "#rrggbb".
+    pub shadow_color: String,
+    /// Shadow offset in px at the output height.
+    pub shadow_px: f64,
+    /// "none" | "uppercase" | "lowercase".
+    pub text_transform: String,
+    /// Extra tracking between glyphs in px at the output height.
+    pub letter_spacing_px: f64,
+    /// "left" | "center" | "right".
+    pub alignment: String,
+    /// "top" | "center" | "bottom".
+    pub position: String,
+    /// Inset from the position anchor, px at the output height (positive =
+    /// inward).
+    pub position_y: f64,
+    /// Wrap width as a fraction of canvas width (e.g. 0.84).
+    pub max_width_frac: f64,
+    /// "off" | "word" | "word-only" | "stack" (the v4.1 word modes).
+    pub word_mode: String,
+    /// CaptionAnimation id ("none" | "pop-in" | "slam" | ... — the full
+    /// 24-animation vocabulary, mirrored from assAnimTags timings).
+    pub animation: String,
+    pub cues: Vec<CaptionCue>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CaptionCue {
+    pub start_ms: f64,
+    pub end_ms: f64,
+    pub text: String,
+    /// Per-word timestamps (absolute timeline ms). Empty = full-text mode.
+    pub words: Vec<CaptionWord>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CaptionWord {
+    pub text: String,
+    pub start_ms: f64,
+    pub end_ms: f64,
 }
 
 /// v2: a placed audio source outside the segment/music lanes.

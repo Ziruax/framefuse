@@ -28,7 +28,6 @@ import {
   Download,
   Check,
   Cloud,
-  HardDrive,
   KeyRound,
   ExternalLink,
   Eraser,
@@ -37,6 +36,9 @@ import {
   Languages,
   Play,
   Square,
+  User,
+  Users,
+  Shuffle,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type {
@@ -93,6 +95,8 @@ import {
   KINETIC_DEFAULTS,
   type KineticCaptionSettings,
   type KineticFamily,
+  type KineticPlan,
+  type KineticPresetSpec,
 } from "@/lib/merger/kinetic/types";
 import {
   KINETIC_PRESETS,
@@ -105,14 +109,12 @@ import {
 } from "@/lib/merger/kinetic/engine";
 import { drawKineticComposition } from "@/lib/merger/kinetic/render";
 import { ANIMATION_LABELS } from "@/lib/merger/captionAnimations";
-import {
-  preloadWhisper,
-  preloadFasterWhisperModel,
-  type WhisperModelStatus,
-  type WhisperProgress,
-} from "@/lib/merger/whisper";
+import type { WhisperProgress } from "@/lib/merger/whisper";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
+// v1.20: AI Script Writer (Gemini default + Groq chat models) — mounted in
+// the Audio tab, right after Voiceover.
+import ScriptWriterSection from "./ScriptWriterSection";
 // v1.15: burn-in text detection (tesseract.js) + STT engine routing.
 import { detectTextRegions } from "@/lib/merger/textDetect";
 // v1.15: STT engine routing (Groq cloud vs local) — an app-level device
@@ -202,7 +204,8 @@ interface SettingsPanelProps {
   whisperProgress: WhisperProgress | null;
   whisperLanguage: string;
   onWhisperLanguageChange: (lang: string) => void;
-  /** v1.3: faster-whisper model size + whether a video clip can supply speech. */
+  /** v1.20: transcription model (Groq whisper model id — kept wired for the
+   *  app-level STT preference; the local size picker is gone with the engines). */
   whisperModel: string;
   onWhisperModelChange: (model: string) => void;
   hasVideoClip: boolean;
@@ -1455,6 +1458,9 @@ export function SettingsPanel(props: SettingsPanelProps) {
             <VoiceoverSection onAddVoiceover={onAddVoiceover} voCount={voCount} />
           )}
 
+          {/* ── v1.20: AI Script Writer (Gemini default + Groq, Electron only) ── */}
+          {inElectron && <ScriptWriterSection />}
+
           {/* ── v1.17: Translate & Dub (Groq Whisper → LLM → Edge TTS) ──── */}
           {inElectron && (
             <DubSection
@@ -2618,7 +2624,8 @@ interface CaptionsSectionProps {
   whisperProgress: WhisperProgress | null;
   whisperLanguage: string;
   onWhisperLanguageChange: (lang: string) => void;
-  /** v1.3: faster-whisper model size (tiny/base/small/medium). */
+  /** v1.20: transcription model (Groq whisper model id — kept wired for the
+   *  app-level STT preference; the local size picker is gone with the engines). */
   whisperModel: string;
   onWhisperModelChange: (model: string) => void;
   /** v1.3: transcription source available (audio track OR a video clip). */
@@ -2644,8 +2651,6 @@ function CaptionsSection(props: CaptionsSectionProps) {
     whisperProgress,
     whisperLanguage,
     onWhisperLanguageChange,
-    whisperModel,
-    onWhisperModelChange,
     hasSpeechSource,
   } = props;
 
@@ -2705,96 +2710,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
   // per-word animation pickers, so those two fields hide.
   const kineticOn = hasWords && !!captionSettings.kinetic?.enabled;
 
-  // ── v5.2 Whisper model status + pre-download (desktop only) ──────────────
-  // The status row only renders when the Electron bridge exists; in the
-  // browser fallback the model lives in opaque Cache API storage.
-  const whisperStatusApi =
-    typeof window !== "undefined" && window.electronAPI
-      ? (window.electronAPI as unknown as {
-          whisperStatus?: () => Promise<WhisperModelStatus>;
-        })
-      : undefined;
-  const [modelStatus, setModelStatus] = useState<WhisperModelStatus | null>(
-    null,
-  );
-  const [statusChecking, setStatusChecking] = useState(false);
-  const [predownloading, setPredownloading] = useState(false);
-  const [predownloadProgress, setPredownloadProgress] = useState<
-    WhisperProgress | null
-  >(null);
-
-  const checkWhisperStatus = useCallback(async () => {
-    if (!whisperStatusApi?.whisperStatus || statusChecking) return;
-    setStatusChecking(true);
-    try {
-      const s = await whisperStatusApi.whisperStatus();
-      if (s) setModelStatus(s);
-    } catch (err) {
-      toast.error("Could not read Whisper model status", {
-        description: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      setStatusChecking(false);
-    }
-  }, [whisperStatusApi, statusChecking]);
-
-  // Auto-check once on mount (async setState — safe under the
-  // react-hooks/set-state-in-effect rule).
-  useEffect(() => {
-    const api = whisperStatusApi?.whisperStatus;
-    if (!api) return;
-    let cancelled = false;
-    api()
-      .then((s) => {
-        if (!cancelled && s) setModelStatus(s);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [whisperStatusApi]);
-
-  const handlePredownload = useCallback(async () => {
-    if (predownloading || whisperBusy) return;
-    setPredownloading(true);
-    setPredownloadProgress({
-      progress: 0,
-      status: `Downloading Whisper-${whisperModel || "tiny"} model…`,
-    });
-    try {
-      // v1.3.1: prefer the faster-whisper engine's model pre-download (the
-      // SELECTED size); fall back to the classic tiny pre-download when the
-      // sidecar bridge is unavailable (browser / old preload builds).
-      const fwDone = await preloadFasterWhisperModel(
-        whisperModel || "tiny",
-        (p) => setPredownloadProgress(p),
-      );
-      if (!fwDone) {
-        await preloadWhisper((p) => setPredownloadProgress(p));
-      }
-      toast.success("Whisper model ready", {
-        description: "Captions can now be generated offline.",
-      });
-      // Refresh the status row with the freshly cached files.
-      const api = whisperStatusApi?.whisperStatus;
-      if (api) {
-        api()
-          .then((s) => {
-            if (s) setModelStatus(s);
-          })
-          .catch(() => {});
-      }
-    } catch (err) {
-      toast.error("Could not download the Whisper model", {
-        description: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      setPredownloading(false);
-      setPredownloadProgress(null);
-    }
-  }, [predownloading, whisperBusy, whisperStatusApi, whisperModel]);
-
-  // ── v1.15 STT engine routing (Groq cloud vs this device) ──────────────
+  // ── v1.15 STT engine routing (Groq Cloud — the only engine) ──────────────
   // App-level preference (localStorage, never in project files). The Groq
   // API key itself lives in the MAIN process (userData/groq.json, 0600) and
   // only a MASKED form ever crosses the bridge.
@@ -2811,9 +2727,6 @@ function CaptionsSection(props: CaptionsSectionProps) {
           }) => Promise<{ ok: boolean; message: string; whisperModels: string[] }>;
         })
       : undefined;
-  const [sttEngine, setSttEngine] = useState<"groq" | "local">(
-    () => loadSttSettings().engine,
-  );
   const [groqCfg, setGroqCfg] = useState<GroqConfigPayload | null>(null);
   const [groqKeyInput, setGroqKeyInput] = useState("");
   const [groqKeyEditing, setGroqKeyEditing] = useState(false);
@@ -2841,11 +2754,6 @@ function CaptionsSection(props: CaptionsSectionProps) {
     };
   }, []);
 
-  const pickEngine = useCallback((next: "groq" | "local") => {
-    setSttEngine(next);
-    saveSttSettings({ ...loadSttSettings(), engine: next });
-  }, []);
-
   const saveGroqKey = useCallback(async () => {
     const set = groqApi?.whisperGroqSet;
     const key = groqKeyInput.trim();
@@ -2862,10 +2770,6 @@ function CaptionsSection(props: CaptionsSectionProps) {
       setGroqCfg(cfg);
       setGroqKeyInput("");
       setGroqKeyEditing(false);
-      // Saving a key implies the user wants the cloud engine.
-      if (!loadSttSettings() || loadSttSettings().engine !== "groq") {
-        pickEngine("groq");
-      }
       toast.success("Groq API key saved on this device", {
         description: "whisper-large-v3-turbo is now the default captions engine.",
       });
@@ -2876,7 +2780,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
     } finally {
       setGroqBusy("");
     }
-  }, [groqApi, groqKeyInput, pickEngine]);
+  }, [groqApi, groqKeyInput]);
 
   const clearGroqKey = useCallback(async () => {
     const set = groqApi?.whisperGroqSet;
@@ -2885,10 +2789,10 @@ function CaptionsSection(props: CaptionsSectionProps) {
     try {
       const cfg = await set({ apiKey: "" });
       setGroqCfg(cfg);
-      // No key → the cloud engine can't run; move the preference to local.
-      pickEngine("local");
+      // v1.20: Groq is the ONLY engine — clearing the key does NOT switch
+      // any preference; the card simply returns to the "add key" state.
       toast.success("API key removed", {
-        description: "Captions now use the built-in offline engine.",
+        description: "Paste a Groq API key to transcribe again.",
       });
     } catch (err) {
       toast.error("Could not remove the key", {
@@ -2897,7 +2801,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
     } finally {
       setGroqBusy("");
     }
-  }, [groqApi, pickEngine]);
+  }, [groqApi]);
 
   const testGroqKey = useCallback(async () => {
     const test = groqApi?.whisperGroqTest;
@@ -2959,7 +2863,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
           </span>
         </div>
 
-        {/* ── v1.15: Speech-to-text ENGINE (Groq cloud vs this device) ── */}
+        {/* ── v1.15/v1.20: Speech-to-text ENGINE — Groq Cloud (only) ── */}
         <div
           className="mb-2.5 rounded-lg border p-2.5"
           style={{ borderColor: "#3f3f46", backgroundColor: "#141416" }}
@@ -2968,7 +2872,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
             <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
               Engine
             </span>
-            {sttEngine === "groq" && groqCfg?.hasKey && (
+            {groqCfg?.hasKey && (
               <span
                 className="flex items-center gap-1 text-[10px] font-medium text-emerald-400"
                 title="Groq key saved on this device"
@@ -2977,53 +2881,28 @@ function CaptionsSection(props: CaptionsSectionProps) {
               </span>
             )}
           </div>
-          <div className="grid grid-cols-2 gap-1">
-            <button
-              type="button"
-              onClick={() => pickEngine("groq")}
-              className={cn(
-                "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
-                sttEngine === "groq"
-                  ? "border-cyan-500/60 bg-cyan-500/15 text-cyan-300"
-                  : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200",
-              )}
-              aria-pressed={sttEngine === "groq"}
-            >
-              <Cloud size={12} />
-              Groq Cloud
-              <span
-                className={cn(
-                  "rounded-full px-1.5 py-px text-[8px] font-semibold uppercase",
-                  sttEngine === "groq"
-                    ? "bg-cyan-500/25 text-cyan-200"
-                    : "bg-zinc-800 text-zinc-500",
-                )}
-              >
-                Fast
-              </span>
-            </button>
-            <button
-              type="button"
-              onClick={() => pickEngine("local")}
-              className={cn(
-                "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
-                sttEngine === "local"
-                  ? "border-amber-500/60 bg-amber-500/15 text-amber-300"
-                  : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200",
-              )}
-              aria-pressed={sttEngine === "local"}
-            >
-              <HardDrive size={12} />
-              This device
-            </button>
+          {/* v1.20: Groq Cloud is the ONLY engine — a fixed badge, no toggle. */}
+          <div
+            className="flex items-center justify-center gap-1.5 rounded border border-cyan-500/60 bg-cyan-500/15 px-2 py-1.5 text-[11px] font-medium text-cyan-300"
+            aria-label="Groq Cloud — the only transcription engine"
+            title="Groq Cloud — the only transcription engine (cloud transcription with your own free API key)"
+          >
+            <Cloud size={12} />
+            Groq Cloud
+            <span className="rounded-full bg-cyan-500/25 px-1.5 py-px text-[8px] font-semibold uppercase">
+              Only engine
+            </span>
           </div>
+          <p className="mt-1.5 text-[9px] leading-relaxed text-zinc-600">
+            Groq Cloud is the only transcription engine — a free API key is
+            all it needs.
+          </p>
 
-          {sttEngine === "groq" ? (
-            <div className="mt-2">
+          <div className="mt-2">
               {!inElectron || !groqApi?.whisperGroqGet ? (
                 <p className="text-[10px] leading-relaxed text-zinc-500">
-                  Cloud captions run in the desktop app — the browser preview
-                  uses the local engine.
+                  Transcription runs in the FrameFuse desktop app — add your
+                  free Groq API key there (Settings → Captions).
                 </p>
               ) : groqCfg?.hasKey && !groqKeyEditing ? (
                 <div className="space-y-2">
@@ -3179,15 +3058,6 @@ function CaptionsSection(props: CaptionsSectionProps) {
                 for transcription only.
               </p>
             </div>
-          ) : (
-            <p className="mt-2 text-[10px] leading-relaxed text-zinc-500">
-              {groqCfg?.fwAvailable
-                ? "faster-whisper runtime detected — local transcription runs on your CPU."
-                : modelStatus?.bundled?.available
-                  ? "Offline Whisper-tiny is bundled with the installer — works without internet."
-                  : "Offline Whisper runs locally (model downloads once on first use)."}
-            </p>
-          )}
         </div>
         <div className="mb-2 flex gap-2">
           <select
@@ -3204,47 +3074,6 @@ function CaptionsSection(props: CaptionsSectionProps) {
             ))}
           </select>
         </div>
-        {/* v1.3: model quality selector — LOCAL engine sizes (tiny…medium).
-            v1.15: only relevant when the device engine is selected; the
-            Groq cloud path picks its model above. */}
-        {sttEngine === "local" && (
-        <div className="mb-2">
-          <div className="mb-1 flex items-center justify-between">
-            <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
-              Model
-            </span>
-            <span className="text-[10px] text-zinc-600">
-              {whisperModel === "tiny" && "fastest"}
-              {whisperModel === "base" && "balanced"}
-              {whisperModel === "small" && "accurate"}
-              {whisperModel === "medium" && "most accurate"}
-            </span>
-          </div>
-          <div className="grid grid-cols-4 gap-1">
-            {([
-              ["tiny", "Tiny"],
-              ["base", "Base"],
-              ["small", "Small"],
-              ["medium", "Med"],
-            ] as const).map(([value, label]) => (
-              <button
-                key={value}
-                type="button"
-                onClick={() => onWhisperModelChange(value)}
-                className={cn(
-                  "rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
-                  whisperModel === value
-                    ? "border-amber-500/60 bg-amber-500/15 text-amber-300"
-                    : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200",
-                )}
-                aria-pressed={whisperModel === value}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-        </div>
-        )}
         <button
           type="button"
           onClick={onGenerateCaptions}
@@ -3281,156 +3110,6 @@ function CaptionsSection(props: CaptionsSectionProps) {
           track is loaded.
         </p>
 
-        {/* ── v5.2: model cache status + pre-download (desktop only) ── */}
-        {inElectron && whisperStatusApi?.whisperStatus && (
-          <div
-            className="mt-2 rounded border p-2"
-            style={{ borderColor: "#27272a", backgroundColor: "#111113" }}
-          >
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
-                Whisper model
-              </span>
-              <div className="flex gap-1">
-                <button
-                  type="button"
-                  onClick={checkWhisperStatus}
-                  disabled={statusChecking}
-                  className="rounded border px-2 py-1 text-[10px] font-medium text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
-                  style={{ borderColor: "#3f3f46" }}
-                  aria-label="Check Whisper model download status"
-                >
-                  {statusChecking ? "Checking…" : "Check status"}
-                </button>
-                <button
-                  type="button"
-                  onClick={handlePredownload}
-                  disabled={predownloading || whisperBusy}
-                  className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
-                  style={{ borderColor: "#3f3f46" }}
-                  aria-label="Pre-download the Whisper model now"
-                  title={`Pre-download the ${whisperModel || "tiny"} model into the persistent cache — the first transcription then runs fully offline`}
-                >
-                  {predownloading ? (
-                    <Loader2 size={10} className="animate-spin" />
-                  ) : (
-                    <Download size={10} />
-                  )}
-                  {predownloading
-                    ? "Downloading…"
-                    : `Pre-download ${whisperModel || "tiny"}`}
-                </button>
-              </div>
-            </div>
-
-            {modelStatus && (
-              <div className="mt-1.5 space-y-1">
-                <div className="flex items-center gap-1.5 text-[10px]">
-                  <span
-                    className={cn(
-                      "inline-block h-1.5 w-1.5 shrink-0 rounded-full",
-                      modelStatus.modelReady
-                        ? "bg-emerald-400"
-                        : "bg-amber-400",
-                    )}
-                    aria-hidden
-                  />
-                  <span className="truncate text-zinc-300">
-                    {modelStatus.bundled?.available
-                      ? `Bundled with installer · ${(
-                          (modelStatus.bundled.totalBytes || 0) / 1048576
-                        ).toFixed(0)} MB — works offline`
-                      : modelStatus.modelReady
-                        ? `Model cached · ${(modelStatus.totalCacheBytes / 1048576).toFixed(1)} MB`
-                        : "Not downloaded yet"}
-                    {!modelStatus.bundled?.available &&
-                      modelStatus.hostUsed
-                      ? ` · via ${
-                          modelStatus.hostUsed.includes("hf-mirror")
-                            ? "hf-mirror.com"
-                            : "huggingface.co"
-                        }`
-                      : ""}
-                  </span>
-                  {modelStatus.activeRuns > 0 && (
-                    <span className="shrink-0 text-zinc-500">
-                      · {modelStatus.activeRuns} active
-                    </span>
-                  )}
-                </div>
-                {/* v1.3: active engine chip + faster-whisper cache line. */}
-                {modelStatus.engine && (
-                  <div className="flex items-center gap-1.5">
-                    <span
-                      className={cn(
-                        "rounded px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide",
-                        modelStatus.engine === "faster-whisper"
-                          ? "bg-amber-500/15 text-amber-300"
-                          : "bg-zinc-700/40 text-zinc-400",
-                      )}
-                      title={
-                        modelStatus.engine === "faster-whisper"
-                          ? "CTranslate2 int8 sidecar — ~4× faster, VAD silence skipping"
-                          : "onnxruntime utility process (fallback engine)"
-                      }
-                    >
-                      {modelStatus.engine === "faster-whisper"
-                        ? "⚡ faster-whisper"
-                        : "onnxruntime"}
-                    </span>
-                    {modelStatus.engine === "faster-whisper" &&
-                      typeof modelStatus.fwCacheBytes === "number" &&
-                      modelStatus.fwCacheBytes > 0 && (
-                        <span className="truncate text-[9px] text-zinc-500">
-                          {modelStatus.fwCacheFiles?.length ?? 0} files ·{" "}
-                          {(modelStatus.fwCacheBytes / 1048576).toFixed(1)} MB
-                          {modelStatus.fwCacheFiles?.some((f) =>
-                            f.name.includes(`models--Systran--faster-whisper-${whisperModel || "tiny"}`),
-                          )
-                            ? ` · ${whisperModel || "tiny"} ready`
-                            : ""}
-                        </span>
-                      )}
-                  </div>
-                )}
-                <p
-                  className="truncate text-[9px] text-zinc-600"
-                  title={
-                    modelStatus.engine === "faster-whisper"
-                      ? modelStatus.fwCacheDir || modelStatus.cacheDir
-                      : modelStatus.cacheDir
-                  }
-                >
-                  {modelStatus.engine === "faster-whisper"
-                    ? modelStatus.fwCacheDir || modelStatus.cacheDir
-                    : modelStatus.cacheDir}
-                </p>
-                {modelStatus.lastError && (
-                  <p
-                    className="text-[9px] leading-relaxed text-red-400"
-                    title={modelStatus.lastError}
-                  >
-                    Last error: {modelStatus.lastError}
-                  </p>
-                )}
-              </div>
-            )}
-
-            {predownloadProgress && (
-              <div className="mt-1.5">
-                <div className="h-1 w-full overflow-hidden rounded-full bg-zinc-800">
-                  <div
-                    className="h-full bg-amber-500 transition-all"
-                    style={{ width: `${predownloadProgress.progress}%` }}
-                  />
-                </div>
-                <p className="mt-1 truncate text-[10px] text-zinc-500">
-                  {predownloadProgress.status}
-                </p>
-              </div>
-            )}
-          </div>
-        )}
       </div>
 
       {/* ── Burn-in toggle + source status ── */}
@@ -3690,7 +3369,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
       )}
 
       {/* ── v1.18 Kinetic Typography engine (semantic compositions) —
-          renders only when word timing exists ── */}
+          always rendered (v1.20): the design library shows the 24 presets
+          even before word timing exists (dimmed until then) ── */}
       <KineticTypographySection
         captionSettings={captionSettings}
         onCaptionSettingsChange={onCaptionSettingsChange}
@@ -4048,6 +3728,293 @@ const KINETIC_PREVIEW_CUES: KineticCueInput[] = [
   kineticPreviewCue(5600, 6800, "seventeen years of secrets"),
 ];
 
+// ---------------------------------------------------------------------------
+// v1.20 — DESIGN LIBRARY: the visible 24-preset gallery. The designs existed
+// since v1.18 but were only reachable through a plain <select> in Single
+// mode — invisible in the default Auto state and before word-timed captions
+// existed. The gallery renders one static mini-canvas per preset (grouped by
+// family) through the REAL engine: buildKineticPlan on a fixed sample cue →
+// drawKineticComposition once at 85% of the composition (every word entered,
+// before the exit fade). No rAF loops — 24 static snapshots, redrawn only on
+// mount / tile resize / webfont load.
+// ---------------------------------------------------------------------------
+
+/**
+ * Sample cue for the tile snapshots: 6 words in 2 semantic phrases with
+ * "truth" as the emphasis word (semantic score 7 — above the emphasis bar),
+ * so every preset's accent color + hierarchy pattern shows in the thumbnail.
+ * Words are spoken over 0-2600ms; the cue carries a 600ms hold tail so a
+ * snapshot at 85% of the composition lands after every entrance and before
+ * every exit.
+ */
+const KINETIC_GALLERY_CUES: KineticCueInput[] = (() => {
+  const text = "but the truth was worth it";
+  const words = text.split(/\s+/).filter(Boolean);
+  const span = 2600 / words.length;
+  return [
+    {
+      startMs: 0,
+      endMs: 3200,
+      text,
+      words: words.map((w, i) => ({
+        text: w,
+        startMs: Math.round(i * span),
+        endMs: Math.round((i + 1) * span),
+      })),
+    },
+  ];
+})();
+
+/** Snapshot position inside the sample composition. */
+const KINETIC_GALLERY_T_FRAC = 0.85;
+
+/** Snapshot canvas height (px) — full tile width × ~72px. */
+const KINETIC_TILE_CANVAS_H = 72;
+
+/**
+ * Mini-canvas font scale — the same floor-dominated regime the live preview
+ * runs in (KINETIC_PREVIEW_FONT_SCALE), so thumbnails match what the engine
+ * actually draws.
+ */
+const KINETIC_TILE_FONT_SCALE = 0.42;
+
+interface KineticPresetTileProps {
+  preset: KineticPresetSpec;
+  plan: KineticPlan;
+  selected: boolean;
+  disabled: boolean;
+  motionLevel: string;
+  onSelect: (presetId: string) => void;
+}
+
+/** One design tile: static snapshot canvas + preset name. */
+function KineticPresetTile(props: KineticPresetTileProps) {
+  const { preset, plan, selected, disabled, motionLevel, onSelect } = props;
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  // Static snapshot: drawn once per (plan, motion) change and re-drawn on
+  // tile resize (splitter drag / drawer open) and webfont load. Deliberately
+  // NO animation loop — 24 tiles × rAF would burn the main thread.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const comp = plan.compositions[0];
+
+    const render = () => {
+      const dpr = window.devicePixelRatio || 1;
+      const cssW = canvas.clientWidth;
+      const cssH = canvas.clientHeight;
+      if (cssW < 4 || cssH < 4) return; // not laid out yet (hidden tab/drawer)
+      const bw = Math.max(1, Math.round(cssW * dpr));
+      const bh = Math.max(1, Math.round(cssH * dpr));
+      if (canvas.width !== bw || canvas.height !== bh) {
+        canvas.width = bw;
+        canvas.height = bh;
+      }
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.fillStyle = "#0a0a0c";
+      ctx.fillRect(0, 0, cssW, cssH);
+      if (!comp) return;
+      // Thumbnails render each preset's OWN font + accent (the design's
+      // identity); user overrides apply to the live preview, not the library.
+      // Same measure contract as the live preview / drawKineticCaption.
+      const stack = getFontOption(preset.fontId).stack;
+      const currentMs =
+        comp.startMs + (comp.endMs - comp.startMs) * KINETIC_GALLERY_T_FRAC;
+      drawKineticComposition(
+        ctx,
+        comp,
+        preset,
+        {
+          fontSizeScale: KINETIC_TILE_FONT_SCALE,
+          customColor: null,
+          fontOverride: null,
+          accentOverride: null,
+          motionLevel,
+          currentMs,
+        },
+        cssW,
+        cssH,
+        (text, weight, fontPx) => {
+          ctx.font = `${weight} ${fontPx}px ${stack}`;
+          return ctx.measureText(text).width;
+        },
+      );
+    };
+
+    render();
+    const ro = new ResizeObserver(render);
+    ro.observe(canvas);
+    // First paint may measure with fallback fonts — redraw once they settle.
+    let alive = true;
+    document.fonts.ready
+      .then(() => {
+        if (alive) render();
+      })
+      .catch(() => {
+        /* fonts unavailable — the initial render stands */
+      });
+    return () => {
+      alive = false;
+      ro.disconnect();
+    };
+  }, [plan, preset, motionLevel]);
+
+  return (
+    <button
+      type="button"
+      onClick={() => onSelect(preset.id)}
+      disabled={disabled}
+      aria-pressed={selected}
+      title={`${preset.name} — ${preset.description}`}
+      className={cn(
+        "rounded-lg border bg-zinc-900/80 p-1.5 text-left transition-colors",
+        selected
+          ? "border-cyan-400 shadow-[0_0_12px_rgba(34,211,238,0.3)]"
+          : "border-zinc-800 hover:border-zinc-600",
+        disabled && "cursor-not-allowed",
+      )}
+    >
+      <canvas
+        ref={canvasRef}
+        className="block w-full rounded-md"
+        style={{ height: KINETIC_TILE_CANVAS_H, backgroundColor: "#0a0a0c" }}
+        aria-hidden="true"
+      />
+      <span className="mt-1 block truncate text-[11px] leading-tight text-zinc-300">
+        {preset.name}
+      </span>
+    </button>
+  );
+}
+
+interface KineticPresetGalleryProps {
+  /** Raw persisted settings — stable identity drives the memoized plans. */
+  kineticRaw: KineticCaptionSettings | undefined;
+  hasWords: boolean;
+  onSelectPreset: (presetId: string) => void;
+  onSelectAuto: () => void;
+}
+
+/**
+ * The design library: "Auto mix" + the 24 preset tiles grouped by family.
+ * Rendered whenever the kinetic engine is ON — dimmed + inert (but fully
+ * visible) until word-timed captions exist, so the designs are discoverable
+ * from the very first project open.
+ */
+function KineticPresetGallery(props: KineticPresetGalleryProps) {
+  const { kineticRaw, hasWords, onSelectPreset, onSelectAuto } = props;
+  const kinetic: KineticCaptionSettings = {
+    ...KINETIC_DEFAULTS,
+    ...kineticRaw,
+  };
+
+  // One plan per preset (single mode pins it; deterministic given the seed) —
+  // rebuilt only when the persisted settings object identity changes.
+  const galleryPlans = useMemo(
+    () =>
+      KINETIC_PRESETS.map((preset) => ({
+        preset,
+        plan: buildKineticPlan(KINETIC_GALLERY_CUES, {
+          ...KINETIC_DEFAULTS,
+          ...kineticRaw,
+          enabled: true,
+          mode: "single",
+          presetId: preset.id,
+        }),
+      })),
+    [kineticRaw],
+  );
+
+  const autoSelected = kinetic.mode === "auto";
+
+  return (
+    <Field
+      label="Design library"
+      hint={
+        hasWords
+          ? "24 designs across 5 families — click one to pin it (Single mode); Auto mix lets the engine pick per scene."
+          : undefined
+      }
+    >
+      <div
+        className={cn(
+          "@container max-h-[26rem] overflow-y-auto rounded-lg border p-1.5",
+          !hasWords && "pointer-events-none opacity-50",
+        )}
+        style={{ borderColor: "#27272a" }}
+        role="group"
+        aria-label="Kinetic typography design library"
+      >
+        {/* ── Auto mix — the engine picks per scene ── */}
+        <button
+          type="button"
+          onClick={onSelectAuto}
+          disabled={!hasWords}
+          aria-pressed={autoSelected}
+          title="The engine scores all 24 presets for every composition — semantic fit, intensity, style memory"
+          className={cn(
+            "flex w-full items-center gap-2.5 rounded-lg border bg-zinc-900/80 p-2 text-left transition-colors",
+            autoSelected
+              ? "border-amber-400 shadow-[0_0_12px_rgba(251,191,36,0.25)]"
+              : "border-zinc-800 hover:border-zinc-600",
+            !hasWords && "cursor-not-allowed",
+          )}
+        >
+          <span
+            className={cn(
+              "flex size-9 shrink-0 items-center justify-center rounded-md border",
+              autoSelected
+                ? "border-amber-400/60 text-amber-300"
+                : "border-zinc-700 text-zinc-400",
+            )}
+          >
+            <Shuffle size={16} />
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block text-[11px] font-medium leading-tight text-zinc-200">
+              Auto mix
+            </span>
+            <span className="block truncate text-[10px] leading-tight text-zinc-500">
+              Engine picks per scene — all 24 presets scored
+            </span>
+          </span>
+        </button>
+
+        {/* ── The 24 presets, grouped by family ── */}
+        {KINETIC_FAMILY_ORDER.map((fam) => (
+          <div key={fam} className="mt-2.5">
+            <div className="mb-1 px-0.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+              {KINETIC_FAMILY_LABELS[fam] ?? fam}
+            </div>
+            <div className="grid grid-cols-2 gap-1.5 @min-[420px]:grid-cols-3 @min-[560px]:grid-cols-4">
+              {galleryPlans
+                .filter(({ preset }) => preset.family === fam)
+                .map(({ preset, plan }) => (
+                  <KineticPresetTile
+                    key={preset.id}
+                    preset={preset}
+                    plan={plan}
+                    selected={
+                      kinetic.mode === "single" &&
+                      kinetic.presetId === preset.id
+                    }
+                    disabled={!hasWords}
+                    motionLevel={kinetic.motion}
+                    onSelect={onSelectPreset}
+                  />
+                ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </Field>
+  );
+}
+
 interface KineticTypographySectionProps {
   captionSettings: CaptionSettings;
   onCaptionSettingsChange: (cs: CaptionSettings) => void;
@@ -4188,7 +4155,9 @@ function KineticTypographySection(props: KineticTypographySectionProps) {
     });
   };
 
-  if (!hasWords) return null;
+  // v1.20: no early return when word timing is missing — the section (engine
+  // toggle + design library) renders regardless so the 24 designs are always
+  // discoverable; the gallery is dimmed + inert until hasWords flips true.
 
   return (
     <div
@@ -4215,6 +4184,27 @@ function KineticTypographySection(props: KineticTypographySectionProps) {
 
       {kinetic.enabled && (
         <div className="mt-2.5">
+          {/* ── v1.20 Design library: the 24-preset gallery — ALWAYS visible
+              while the engine is on (the designs were previously hidden
+              behind the Single-mode <select>). It stays visible — dimmed and
+              inert — until word timing exists, so users can SEE the designs
+              before transcribing. ── */}
+          <KineticPresetGallery
+            kineticRaw={captionSettings.kinetic}
+            hasWords={hasWords}
+            onSelectPreset={(presetId) =>
+              setKinetic({ mode: "single", presetId })
+            }
+            onSelectAuto={() => setKinetic({ mode: "auto" })}
+          />
+          {!hasWords && (
+            <p className="-mt-2 mb-3 text-[10px] leading-relaxed text-amber-400/90">
+              Generate captions with word timing (transcribe your audio) to
+              unlock kinetic typography.
+            </p>
+          )}
+          {hasWords && (
+            <>
           {/* ── Typography mode ── */}
           <Field
             label="Typography mode"
@@ -4250,31 +4240,8 @@ function KineticTypographySection(props: KineticTypographySectionProps) {
             />
           </Field>
 
-          {/* ── Single mode: the pinned preset ── */}
-          {kinetic.mode === "single" && (
-            <Field
-              label="Style preset"
-              hint={getKineticPreset(kinetic.presetId).description}
-            >
-              <select
-                value={kinetic.presetId}
-                onChange={(e) => setKinetic({ presetId: e.target.value })}
-                className="w-full rounded border bg-zinc-900 px-2 py-1.5 text-[11px] text-zinc-200"
-                style={{ borderColor: "#3f3f46" }}
-                aria-label="Kinetic style preset"
-              >
-                {KINETIC_FAMILY_ORDER.map((fam) => (
-                  <optgroup key={fam} label={KINETIC_FAMILY_LABELS[fam]}>
-                    {KINETIC_PRESETS.filter((p) => p.family === fam).map((p) => (
-                      <option key={p.id} value={p.id} title={p.description}>
-                        {p.name}
-                      </option>
-                    ))}
-                  </optgroup>
-                ))}
-              </select>
-            </Field>
-          )}
+          {/* ── Single mode: the pinned preset is chosen in the Design
+              library gallery above (v1.20 — replaced the plain <select>). ── */}
 
           {/* ── Manual mode: weighted mix of every preset ── */}
           {kinetic.mode === "manual" && (
@@ -4537,6 +4504,8 @@ function KineticTypographySection(props: KineticTypographySectionProps) {
               )}
             </p>
           </Field>
+          </>
+        )}
         </div>
       )}
     </div>
@@ -4942,26 +4911,84 @@ function DubSection(props: DubSectionProps) {
   }, []);
 
   // Keep the effective locale + default voices in sync with the language.
+  // v1.20: once the voice catalog has loaded, a single-voice pick the
+  // (new) locale doesn't offer resets to auto — the locale pair's default
+  // female takes over on the main side.
   useEffect(() => {
     const locale = dubLocaleFor(dubSettings.targetLanguage, pairs);
     const pair = pairs[locale];
+    const catalog = voices ?? [];
+    const localeNames = new Set(
+      catalog.filter((v) => v.locale === locale).map((v) => v.shortName),
+    );
+    const singleStale =
+      !!dubSettings.singleVoice &&
+      catalog.length > 0 &&
+      !localeNames.has(dubSettings.singleVoice);
     if (
       locale !== dubSettings.targetLocale ||
       (pair?.female && dubSettings.femaleVoice !== pair.female) ||
-      (pair?.male && dubSettings.maleVoice !== pair.male)
+      (pair?.male && dubSettings.maleVoice !== pair.male) ||
+      singleStale
     ) {
       onDubSettingsChange({
         ...dubSettings,
         targetLocale: locale,
         femaleVoice: pair?.female ?? dubSettings.femaleVoice,
         maleVoice: pair?.male ?? dubSettings.maleVoice,
+        singleVoice: singleStale ? null : (dubSettings.singleVoice ?? null),
       });
     }
-  }, [dubSettings.targetLanguage, pairs]);
+  }, [dubSettings.targetLanguage, pairs, voices]);
 
   const localeVoices = useMemo(
     () => (voices ?? []).filter((v) => v.locale === dubSettings.targetLocale),
     [voices, dubSettings.targetLocale],
+  );
+
+  // v1.20 voice mode: "single" = ONE voice reads the whole dub (the main
+  // process skips speaker detection entirely); "multi" = the classic
+  // per-speaker female/male pair. Old persisted prefs read as "multi".
+  const singleMode = (dubSettings.voiceMode ?? "multi") === "single";
+
+  /** The voice the single-mode select shows as selected: the explicit pick
+   *  when the locale offers it, else the locale's default (femaleVoice →
+   *  pair female → first locale voice). null/auto resolves to the SAME
+   *  voice in the main process (pickVoiceForSpeaker's even-id rule). */
+  const singleVoiceValue = useMemo(() => {
+    const sv = dubSettings.singleVoice;
+    if (sv && localeVoices.some((v) => v.shortName === sv)) return sv;
+    if (
+      dubSettings.femaleVoice &&
+      localeVoices.some((v) => v.shortName === dubSettings.femaleVoice)
+    ) {
+      return dubSettings.femaleVoice;
+    }
+    const pair = pairs[dubSettings.targetLocale];
+    if (pair?.female && localeVoices.some((v) => v.shortName === pair.female)) {
+      return pair.female;
+    }
+    return localeVoices[0]?.shortName ?? "";
+  }, [
+    dubSettings.singleVoice,
+    dubSettings.femaleVoice,
+    dubSettings.targetLocale,
+    localeVoices,
+    pairs,
+  ]);
+
+  const setVoiceMode = useCallback(
+    (mode: "single" | "multi") => {
+      if (mode === (dubSettings.voiceMode ?? "multi")) return;
+      onDubSettingsChange({
+        ...dubSettings,
+        voiceMode: mode,
+        // Leaving single mode drops the pick so multi stays byte-identical
+        // to ≤ v1.19 on the dubbing pipeline.
+        singleVoice: mode === "single" ? (dubSettings.singleVoice ?? null) : null,
+      });
+    },
+    [dubSettings, onDubSettingsChange],
   );
 
   const changeLanguage = useCallback(
@@ -4974,6 +5001,8 @@ function DubSection(props: DubSectionProps) {
         targetLocale: locale,
         femaleVoice: pair?.female ?? "",
         maleVoice: pair?.male ?? "",
+        // Language switch: the single-voice pick belongs to the old locale.
+        singleVoice: null,
       });
     },
     [dubSettings, pairs, onDubSettingsChange],
@@ -5075,6 +5104,83 @@ function DubSection(props: DubSectionProps) {
           </select>
         </div>
       </div>
+      {/* v1.20: voice mode — one narrator for the whole dub vs per-speaker
+          voices. Pill styling mirrors the STT engine toggle. */}
+      <div className="mb-2">
+        <label className="mb-0.5 block text-[10px] font-medium text-zinc-400">
+          Voice mode
+        </label>
+        <div className="grid grid-cols-2 gap-1" role="group" aria-label="Voice mode">
+          <button
+            type="button"
+            onClick={() => setVoiceMode("single")}
+            className={cn(
+              "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
+              singleMode
+                ? "border-cyan-500/60 bg-cyan-500/15 text-cyan-300"
+                : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200",
+            )}
+            aria-pressed={singleMode}
+            title="One voice reads every line — speaker detection is skipped"
+          >
+            <User size={12} /> One voice
+          </button>
+          <button
+            type="button"
+            onClick={() => setVoiceMode("multi")}
+            className={cn(
+              "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
+              !singleMode
+                ? "border-cyan-500/60 bg-cyan-500/15 text-cyan-300"
+                : "border-zinc-700 bg-zinc-900 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200",
+            )}
+            aria-pressed={!singleMode}
+            title="Detect speakers and alternate female/male voices"
+          >
+            <Users size={12} /> Multi-speaker
+          </button>
+        </div>
+      </div>
+      {singleMode ? (
+        <div className="mb-2">
+          <label className="mb-0.5 block text-[10px] font-medium text-zinc-400">
+            Dubbing voice
+          </label>
+          <div className="flex items-center gap-1">
+            <select
+              value={singleVoiceValue}
+              onChange={(e) =>
+                onDubSettingsChange({ ...dubSettings, singleVoice: e.target.value })
+              }
+              className={cn(selectCls, "flex-1")}
+              style={{ borderColor: "#3f3f46" }}
+              aria-label="Dubbing voice"
+            >
+              {localeVoices.length === 0 && (
+                <option value={singleVoiceValue}>
+                  {singleVoiceValue || "auto"}
+                </option>
+              )}
+              {localeVoices.map((v) => (
+                <option key={v.shortName} value={v.shortName}>
+                  {v.displayName}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={() => void playPreview(singleVoiceValue)}
+              disabled={!singleVoiceValue}
+              title="Listen to this voice"
+              className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded border text-cyan-300 transition-colors hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-40"
+              style={{ borderColor: "#3f3f46" }}
+              aria-label="Preview dubbing voice"
+            >
+              <Play size={11} />
+            </button>
+          </div>
+        </div>
+      ) : (
       <div className="mb-2 grid grid-cols-2 gap-1.5">
         {(
           [
@@ -5127,6 +5233,7 @@ function DubSection(props: DubSectionProps) {
           </div>
         ))}
       </div>
+      )}
       <Field
         label="Original audio"
         hint={`${Math.round(dubSettings.originalVolume * 100)}%`}

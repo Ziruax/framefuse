@@ -186,7 +186,15 @@ impl Compositor for CpuCompositor {
         }
         for t in texts {
             let (dx, dy, dw, dh) = (t.dest_px.0 as i64, t.dest_px.1 as i64, t.dest_px.2, t.dest_px.3);
-            self.blit(&t.bitmap.data, dw, dh, dx, dy, t.alpha.clamp(0.0, 1.0), None, 0.0, 0.0);
+            // v1.20 CAPTIONS: text strips may be SCALED (animated words,
+            // 1×1 solid fills for bg boxes). The blit path indexes the
+            // source by dest dims — pre-scale when they differ.
+            if t.bitmap.w == dw && t.bitmap.h == dh {
+                self.blit(&t.bitmap.data, dw, dh, dx, dy, t.alpha.clamp(0.0, 1.0), None, 0.0, 0.0);
+            } else {
+                let scaled = scale_rgba(&t.bitmap.data, t.bitmap.w, t.bitmap.h, dw, dh);
+                self.blit(&scaled, dw, dh, dx, dy, t.alpha.clamp(0.0, 1.0), None, 0.0, 0.0);
+            }
         }
         Ok(())
     }
@@ -205,6 +213,14 @@ impl Compositor for CpuCompositor {
 /// Fallback nearest-neighbor RGBA scale (when fast_image_resize rejects the
 /// buffer alignment).
 fn nearest_scale(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    // 1×1 solid fills (caption bg boxes) — straight memset-style fill.
+    if sw == 1 && sh == 1 {
+        let mut out = vec![0u8; dw as usize * dh as usize * 4];
+        for px in out.chunks_exact_mut(4) {
+            px.copy_from_slice(&src[0..4]);
+        }
+        return out;
+    }
     let mut out = vec![0u8; dw as usize * dh as usize * 4];
     for y in 0..dh as usize {
         let sy = (y * sh as usize / dh.max(1) as usize).min(sh.saturating_sub(1) as usize);
@@ -219,4 +235,34 @@ fn nearest_scale(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Scale an RGBA bitmap to (dw, dh) — bilinear via fast_image_resize when
+/// the buffers align, nearest (or solid fill) otherwise. Used by the v1.20
+/// caption text path (animated word scaling + bg-box fills).
+fn scale_rgba(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
+    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return Vec::new();
+    }
+    if sw == dw && sh == dh {
+        return src.to_vec();
+    }
+    use fast_image_resize::{Image, PixelType};
+    use std::num::NonZeroU32;
+    let nw = NonZeroU32::new(sw).unwrap_or(NonZeroU32::MIN);
+    let nh = NonZeroU32::new(sh).unwrap_or(NonZeroU32::MIN);
+    let dww = NonZeroU32::new(dw).unwrap_or(NonZeroU32::MIN);
+    let dhh = NonZeroU32::new(dh).unwrap_or(NonZeroU32::MIN);
+    let mut resizer = fast_image_resize::Resizer::new(fast_image_resize::ResizeAlg::Convolution(
+        fast_image_resize::FilterType::Bilinear,
+    ));
+    if let (Ok(src_img), Ok(mut dst_img)) = (
+        Image::from_vec_u8(nw, nh, src.to_vec(), PixelType::U8x4),
+        Image::from_vec_u8(dww, dhh, vec![0u8; dw as usize * dh as usize * 4], PixelType::U8x4),
+    ) {
+        if resizer.resize(&src_img.view(), &mut dst_img.view_mut()).is_ok() {
+            return dst_img.into_vec();
+        }
+    }
+    nearest_scale(src, sw, sh, dw, dh)
 }

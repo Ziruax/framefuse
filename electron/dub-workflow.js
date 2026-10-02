@@ -584,6 +584,12 @@ function translateUserPrompt(utts, idxs, langName) {
  * @param {string} [o.whisperModel]           Groq Whisper model id
  *        (normalized; default whisper-large-v3-turbo).
  * @param {Object} [o.speakerVoices]          { 0: "hi-IN-SwaraNeural", … } overrides.
+ * @param {string} [o.voiceMode="multi"]      "single" = ONE voice for every line
+ *        (the speakers phase skips detection entirely); "multi" (or
+ *        absent) = per-speaker voices (legacy behavior).
+ * @param {string} [o.singleVoice]            Edge-TTS ShortName for single
+ *        mode. Non-empty → it overrides the voice of EVERY speaker id;
+ *        empty/null + voiceMode "single" → the locale pair's female.
  * @param {number} [o.ttsRatePct=0] [o.ttsPitchHz=0] [o.ttsVolumePct=0]  (Edge TTS prosody DELTAS)
  * @param {number} [o.fitSpeedMax=1.35]       atempo clamp (1–2).
  * @param {string} o.tempDir                  Caller-provided temp dir; all
@@ -635,6 +641,17 @@ async function runDub(opts) {
   );
   fs.mkdirSync(dubDir, { recursive: true });
 
+  // ---- v1.20 single-voice mode ----
+  // voiceMode "single" OR any non-empty singleVoice collapses the dub onto
+  // ONE voice: the speakers phase skips detection entirely (no LLM call,
+  // no heuristic — every utterance is speaker 0). A non-empty singleVoice
+  // overrides the speakerVoices map for ids 0-3 so EVERY speaker resolves
+  // to it; an empty one falls back to the locale pair's female via
+  // pickVoiceForSpeaker's even-id rule. Multi mode with no singleVoice is
+  // byte-identical to ≤ v1.19.
+  const singleVoice = typeof o.singleVoice === "string" ? o.singleVoice.trim() : "";
+  const singleMode = o.voiceMode === "single" || singleVoice.length > 0;
+
   const ctx = {
     segments: segs,
     apiKey,
@@ -646,7 +663,10 @@ async function runDub(opts) {
     targetLocale: String(o.targetLocale || o.targetLanguage || "en").trim(),
     groqModel: GC.normalizeTextModel(o.groqModel),
     whisperModel: GW.normalizeGroqModel(o.whisperModel),
-    speakerVoices: o.speakerVoices && typeof o.speakerVoices === "object" ? o.speakerVoices : null,
+    speakerVoices: singleMode && singleVoice
+      ? { 0: singleVoice, 1: singleVoice, 2: singleVoice, 3: singleVoice }
+      : (o.speakerVoices && typeof o.speakerVoices === "object" ? o.speakerVoices : null),
+    singleMode,
     ttsRatePct: Number.isFinite(Number(o.ttsRatePct)) ? Number(o.ttsRatePct) : 0,
     ttsPitchHz: Number.isFinite(Number(o.ttsPitchHz)) ? Number(o.ttsPitchHz) : 0,
     // Edge TTS prosody values are DELTAS (0 = neutral), per the 57-b contract.
@@ -718,7 +738,8 @@ function report(ctx, phaseName, progress, status, detail) {
 async function runPipeline(ctx) {
   const prep = await phase(ctx, "prepare", () => prepareSource(ctx));
   const trans = await phase(ctx, "transcribe", () => transcribeSource(ctx, prep));
-  const speakerInfo = await phase(ctx, "speakers", () => detectSpeakers(ctx, trans));
+  const speakerInfo = await phase(ctx, "speakers", () =>
+    ctx.singleMode ? singleVoiceSpeakers(ctx, trans) : detectSpeakers(ctx, trans));
   const warnings = [...speakerInfo.warnings];
   const translations = await phase(ctx, "translate", () => translateSegments(ctx, trans, warnings));
   const synth = await phase(ctx, "synthesize", () => synthesizeVoices(ctx, trans, translations, speakerInfo));
@@ -923,6 +944,41 @@ async function transcribeSource(ctx, prep) {
 }
 
 // ---- phase 3: speakers -----------------------------------------------------
+
+/** v1.20 single-voice variant: ONE voice reads the whole dub. Speaker
+ *  detection is skipped entirely — no LLM call, no heuristic — every
+ *  utterance is speaker 0 (speakerCount = 1). Voice resolution keeps the
+ *  exact machinery of detectSpeakers (pickVoicePair + the speakerVoices
+ *  override map; runDub pre-fills ids 0-3 with the chosen single voice),
+ *  so an EMPTY singleVoice falls back to the locale pair's default
+ *  female via pickVoiceForSpeaker's even-id rule. */
+async function singleVoiceSpeakers(ctx, trans) {
+  report(ctx, "speakers", 5, "Single voice mode — skipping speaker detection");
+
+  // Same locale-pair resolution as detectSpeakers (kept duplicated so the
+  // multi-speaker path stays byte-identical).
+  const pairPick = (() => {
+    let pairs;
+    try {
+      pairs = ttsDeps().voicePairsByLocale();
+    } catch (err) {
+      throw new Error(`Could not load Edge TTS voices: ${err.message}`);
+    }
+    return pickVoicePair(pairs, ctx.targetLocale, ctx.targetLanguage);
+  })();
+  if (!pairPick.ok) {
+    throw new Error(`No Edge TTS voices available for ${ctx.targetLocale} — cannot dub into this language`);
+  }
+
+  const { voice, gender } = pickVoiceForSpeaker(0, pairPick, ctx.speakerVoices);
+  report(ctx, "speakers", 100, "Single voice — one narrator for every line");
+  return {
+    speakerCount: 1,
+    voiceList: [{ id: 0, voice, gender }],
+    ids: new Array(trans.utts.length).fill(0),
+    warnings: [...pairPick.warnings],
+  };
+}
 
 async function detectSpeakers(ctx, trans) {
   const utts = trans.utts;

@@ -1,29 +1,26 @@
-// src/lib/merger/whisper.ts — OpenAI Whisper-tiny ASR (v5.1 dual-engine).
+// src/lib/merger/whisper.ts — Groq Whisper transcription (Electron desktop).
 //
-// NATIVE PATH (Electron desktop — the default):
-//   The v5.0 renderer Web Worker broke in the PACKAGED app — webpack's
-//   worker chunk loader resolved chunk URLs relative to the worker script
-//   location and duplicated the `_next/static/chunks` prefix
-//   ("…app.asar/out/_next/static/chunks/_next/static/chunks/590caa2a….js"),
-//   so importScripts failed and every transcription errored.
-//   v5.1 moves ALL inference to the main process: audio is decoded with
-//   ffmpeg (native, streamed) and Whisper runs in a utilityProcess with
-//   onnxruntime-node (multi-threaded native CPU — several times faster than
-//   the single-threaded WASM worker). The model downloads ONCE to
-//   <userData>/whisper-models and stays on disk forever.
+// v1.20 — GROQ CLOUD ONLY:
+//   ALL local transcription engines are REMOVED (the onnxruntime
+//   utilityProcess service, the faster-whisper Python sidecar, and the
+//   browser web worker with @xenova/transformers). Transcription runs in
+//   the FrameFuse desktop app's MAIN process via the whisper:transcribe
+//   IPC, which calls the Groq Whisper API (electron/groq-whisper.js) with
+//   the user's own on-device key. No key saved → a clear actionable error;
+//   API failure → the real error message. There is NO fallback chain.
 //
-// BROWSER PATH (dev server fallback, unchanged from v5.0):
-//   Pure in-browser transcription via the persistent Web Worker
-//   (whisper-worker.ts) — this main thread decodes the audio to mono 16 kHz
-//   PCM (AudioContext) and TRANSFERS it to the worker.
+// ELECTRON PATH (the only path):
+//   transcribeWithWhisper ships the audio (bytes, or a zero-copy on-disk
+//   sourcePath) to the main process and relays the Groq run's progress
+//   events. The RAW chunks come back over IPC and are parsed HERE into
+//   cues with REAL per-word timestamps so the word-by-word caption modes
+//   highlight the currently-spoken word exactly when it is spoken.
 //
-// Both paths return cues with REAL per-word timestamps (Whisper's
-// cross-attention alignment, `return_timestamps: "word"`) so the viral
-// "word-by-word" caption mode highlights the currently-spoken word exactly
-// when it is spoken.
+// BROWSER (non-Electron) MODE:
+//   Throws — transcription requires the desktop app + a Groq API key.
 //
 // Node-safety: this module is importable in Node/bun with no side effects —
-// every bridge/worker is resolved lazily inside function calls.
+// every bridge is resolved lazily inside function calls.
 
 import {
   groupWordsIntoCues,
@@ -36,12 +33,20 @@ import {
 // path); re-exported here so the historical public surface is unchanged.
 export { groupWordsIntoCues } from "./subtitles";
 export type { RawWord } from "./subtitles";
-import type {
-  RawWhisperChunk,
-  WhisperWorkerResponse,
-} from "./whisper-worker";
-// v1.15: app-level STT engine routing (Groq cloud vs local).
+// v1.15: app-level STT routing (Groq model preference — groq is the only
+// engine since v1.20).
 import { sttRouting } from "./sttSettings";
+
+/**
+ * One raw chunk of Whisper output — the exact `{ chunks }` shape the Groq
+ * transcription result returns (previously imported from whisper-worker.ts,
+ * which no longer exists).
+ */
+export interface RawWhisperChunk {
+  text: string;
+  /** [start, end] in seconds — either may be null (unknown). */
+  timestamp: [number | null, number | null];
+}
 
 // ---------------------------------------------------------------------------
 // Public API (unchanged since v4 — page.tsx imports these exact signatures).
@@ -50,12 +55,12 @@ import { sttRouting } from "./sttSettings";
 export interface WhisperProgress {
   /** 0-100 progress for the entire transcription run. */
   progress: number;
-  /** Current status message ("Loading model…", "Transcribing…"). */
+  /** Current status message ("Preparing audio…", "Transcribing…"). */
   status: string;
 }
 
 export interface WhisperOptions {
-  /** Source audio file — any format the browser can decode. */
+  /** Source audio file — any format ffmpeg can decode. */
   audioFile: File;
   /** Optional progress callback. */
   onProgress?: (p: WhisperProgress) => void;
@@ -67,13 +72,9 @@ export interface WhisperOptions {
    */
   language?: string;
   /** v1.3 ZERO-COPY: absolute on-disk path of the source (Electron app,
-   * local file). When set, the native path is shipped to the main process
-   * instead of the whole file's bytes over IPC. */
+   *  local file). When set, the native path is shipped to the main process
+   *  instead of the whole file's bytes over IPC. */
   sourcePath?: string | null;
-  /** v1.3: faster-whisper model size ("tiny" | "base" | "small" | "medium").
-   * Default "tiny" (v5.x behavior). Only the faster-whisper engine uses
-   * larger models — the onnxruntime fallback always runs tiny. */
-  model?: string;
 }
 
 export interface WhisperResult {
@@ -88,64 +89,13 @@ export interface WhisperResult {
 }
 
 // ---------------------------------------------------------------------------
-// Audio decoding (main thread only — AudioContext/OfflineAudioContext are
-// not available inside workers).
-// ---------------------------------------------------------------------------
-
-/**
- * Decode an arbitrary audio File into mono 16 kHz Float32Array PCM
- * suitable for Whisper.
- */
-async function decodeAudioToMono16k(
-  file: File,
-): Promise<{ data: Float32Array; sampleRate: number }> {
-  const arrayBuf = await file.arrayBuffer();
-  const AudioCtx =
-    (typeof window !== "undefined" && (window as any).AudioContext) ||
-    (typeof window !== "undefined" && (window as any).webkitAudioContext);
-  if (!AudioCtx) throw new Error("NO_AUDIO_CONTEXT");
-
-  const tmpCtx = new AudioCtx();
-  const audioBuf = await tmpCtx.decodeAudioData(arrayBuf.slice(0));
-  tmpCtx.close?.();
-
-  const srcChannels = audioBuf.numberOfChannels;
-  const srcRate = audioBuf.sampleRate;
-  const srcLen = audioBuf.length;
-  const targetRate = 16000;
-
-  // Mix down to mono first.
-  const mono = new Float32Array(srcLen);
-  for (let ch = 0; ch < srcChannels; ch++) {
-    const data = audioBuf.getChannelData(ch);
-    for (let i = 0; i < srcLen; i++) mono[i] += data[i] / srcChannels;
-  }
-
-  // Resample to 16 kHz with an OfflineAudioContext.
-  const offline = new OfflineAudioContext(
-    1,
-    Math.ceil(srcLen * (targetRate / srcRate)),
-    targetRate,
-  );
-  const buffer = offline.createBuffer(1, srcLen, srcRate);
-  buffer.copyToChannel(mono, 0);
-  const src = offline.createBufferSource();
-  src.buffer = buffer;
-  src.connect(offline.destination);
-  src.start();
-
-  const rendered = await offline.startRendering();
-  return { data: rendered.getChannelData(0), sampleRate: targetRate };
-}
-
-// ---------------------------------------------------------------------------
-// Raw-output parsing — converts the worker's raw Transformers.js output
+// Raw-output parsing — converts the Groq run's raw `{ chunks }` output
 // into SubtitleCue[]. (Pure, exported for the harness.)
 // ---------------------------------------------------------------------------
 
 /**
- * Parse the raw Whisper output (`{ chunks }` — the exact shape the worker
- * returns) into display cues.
+ * Parse the raw Whisper output (`{ chunks }` — the exact shape the Groq
+ * bridge returns) into display cues.
  *
  * wordLevel=true  → each chunk is (usually) one word with exact timing;
  *                   multiple tokens inside one chunk (CJK / compact scripts)
@@ -227,93 +177,34 @@ export function parseWhisperOutput(
   return cues;
 }
 
-// ---------------------------------------------------------------------------
-// Progress curve mapping (pure, exported for the harness).
-//
-// Overall curve: decode 2 % → model download 10–25 % → transcribing 25–80 %
-// → parsing 80–100 %. Worker "model" events carry the raw file-download
-// percent; worker "transcribe" events already carry absolute 25–80 values.
-// ---------------------------------------------------------------------------
-
 /** Clamp a raw percentage into 0–100 (NaN → 0). */
 export function clampPercent(progress: number): number {
   const p = Number.isFinite(progress) ? progress : 0;
   return Math.min(100, Math.max(0, Math.round(p)));
 }
 
-/** Map a worker progress event onto the overall transcribeWithWhisper curve.
- *  v5.2: "download" events (per-file, emitted alongside the paired "model"
- *  event with the same percent) share the model 10–25 % band so the bar
- *  never jitters — the file name rides along in the status message. */
-export function mapWorkerProgress(
-  stage: "model" | "download" | "transcribe",
-  progress: number,
-): number {
-  const pct = clampPercent(progress);
-  if (stage === "model" || stage === "download") {
-    // Model download occupies the 10–25 % band.
-    return Math.round(10 + 15 * (pct / 100));
-  }
-  // Transcription-stage events already carry absolute 25–80 % values.
-  return Math.min(80, Math.max(25, pct));
-}
-
 // ---------------------------------------------------------------------------
-// v5.1 NATIVE branch — Electron desktop: Whisper behind IPC.
+// Electron IPC branch — the Groq Whisper API behind the bridge.
 // ---------------------------------------------------------------------------
-
-/** v5.2 model-cache diagnostics (main-process whisper:status handler). */
-export interface WhisperModelStatus {
-  /** Absolute path of the persistent model cache folder. */
-  cacheDir: string;
-  /** Host that served the model files ("https://huggingface.co/" or the
-   *  "https://hf-mirror.com/" mirror) — null before the first build. */
-  hostUsed: string | null;
-  /** Heuristic: ONNX encoder+decoder + config/tokenizer files present. */
-  modelReady: boolean;
-  /** Files currently in the cache (posix-relative names + sizes). */
-  cacheFiles: Array<{ name: string; sizeBytes: number }>;
-  /** Sum of all cached file sizes. */
-  totalCacheBytes: number;
-  /** Last error message recorded by the main process (null = healthy). */
-  lastError: string | null;
-  /** True when the whisper utilityProcess is alive. */
-  childAlive: boolean;
-  /** Number of transcription/preload runs currently in flight. */
-  activeRuns: number;
-  /** v1.3: active engine — "faster-whisper" when the Python sidecar runtime
-   *  is staged, else "onnxruntime". */
-  engine?: string;
-  /** v1.5: installer-shipped model report — the captions panel shows this
-   *  first ("works offline out of the box"). */
-  bundled?: {
-    available: boolean;
-    dir: string;
-    files: Array<{ name: string; sizeBytes: number }>;
-    totalBytes: number;
-  };
-  /** v1.3: faster-whisper model cache report (same shape as the primary). */
-  fwCacheDir?: string;
-  fwCacheFiles?: Array<{ name: string; sizeBytes: number }>;
-  fwCacheBytes?: number;
-}
 
 /**
  * Local view of the whisper slice of the Electron bridge. The global Window
- * augmentation lives in types.ts (owned by the data-model layer) — the v5.2
- * additions (runId-targeted cancel, status) are declared here so this module
- * stays self-contained and backward-compatible with old preloads.
+ * augmentation lives in types.ts (owned by the data-model layer); the v5.2
+ * additions (runId-targeted cancel) are declared here so this module stays
+ * self-contained and backward-compatible with old preloads.
  */
 interface NativeWhisperBridge {
   whisperTranscribe: (p: {
     name: string;
     bytes?: ArrayBuffer;
     /** v1.3 ZERO-COPY: original on-disk path (Electron, local file) — skips
-     * the renderer→main byte upload entirely. */
+     *  the renderer→main byte upload entirely. */
     sourcePath?: string;
     language?: string;
-    /** v1.3: faster-whisper model size. */
-    model?: string;
+    /** v1.20: always "groq" — the only engine. */
+    engine?: "groq";
+    /** Groq model id (whisper-large-v3-turbo | whisper-large-v3). */
+    groqModel?: string;
     /** v5.2 client run id — lets whisperCancel target THIS run only. */
     runId?: string;
   }) => Promise<{
@@ -323,14 +214,8 @@ interface NativeWhisperBridge {
     durationMs: number;
     engine?: string;
   }>;
-  whisperPreload: () => Promise<{ ok: boolean }>;
-  /** v1.3.1: pre-download a faster-whisper model (tiny/base/small/medium)
-   * into the persistent cache — first transcription is then offline. */
-  whisperFwPreload?: (p: { model: string }) => Promise<{ ok: boolean; model: string }>;
   /** v5.2: no argument = cancel all (legacy); { runId } = cancel one. */
   whisperCancel: (p?: { runId: string }) => Promise<number>;
-  /** Present since the v5.2 preload — optional so old builds still typecheck. */
-  whisperStatus?: () => Promise<WhisperModelStatus>;
   onWhisperProgress: (cb: (d: {
     progress: number;
     status: string;
@@ -341,9 +226,7 @@ interface NativeWhisperBridge {
   }) => void) => () => void;
 }
 
-/** The v5.1 Electron bridge (present only in the packaged/dev app with the
- *  whisper service wired). Also guards against OLD packaged builds: an app
- *  whose preload lacks whisperTranscribe falls through to the worker path. */
+/** The Electron bridge (present only in the desktop app). */
 function nativeWhisperBridge(): NativeWhisperBridge | null {
   if (typeof window === "undefined") return null;
   const api = window.electronAPI;
@@ -367,9 +250,8 @@ function newClientRunId(): string {
     .slice(2, 10)}`;
 }
 
-/** Transcribe via the main-process Whisper service (ffmpeg decode +
- *  utilityProcess inference). The parse/grouping still happens HERE — the
- *  service returns the RAW chunks (same shape as the web worker). */
+/** Transcribe via the main-process Groq engine. The parse/grouping still
+ *  happens HERE — the main process returns the RAW chunks. */
 async function transcribeWithWhisperNative(
   opts: WhisperOptions,
 ): Promise<WhisperResult> {
@@ -397,13 +279,11 @@ async function transcribeWithWhisperNative(
   }
 
   // v5.2: a client run id lets the cancel below target THIS run only —
-  // other queued runs (e.g. a parallel pre-download) are unaffected.
+  // other queued runs are unaffected.
   const runId = newClientRunId();
 
-  // Progress events already carry the mapped overall curve (decode 2 →
-  // model/download 10–25 → transcribe 25–80) — relay them verbatim
-  // (clamped). The v5.2 stage/file passthrough is consumed by
-  // preloadWhisper for the standalone pre-download UI.
+  // Progress events already carry the mapped overall curve (prep 2–12 →
+  // transcribe → align 80) — relay them verbatim (clamped).
   const unsubscribe = api.onWhisperProgress((d) => {
     if (d && typeof d.progress === "number") {
       onProgress?.({ progress: clampPercent(d.progress), status: d.status || "" });
@@ -411,9 +291,10 @@ async function transcribeWithWhisperNative(
   });
 
   // v5.2 snappy cancel: the signal rejects the await IMMEDIATELY (no
-  // "Working…" zombie while a hung download eventually resolves), and the
-  // main process cancels exactly this runId. The in-flight IPC promise is
-  // raced — its late result is simply discarded.
+  // "Working…" zombie while a hung upload eventually resolves), and the
+  // main process cancels exactly this runId (aborting the in-flight Groq
+  // HTTPS request). The in-flight IPC promise is raced — its late result
+  // is simply discarded.
   let rejectOnAbort: ((err: Error) => void) | null = null;
   const abortPromise = signal
     ? new Promise<never>((_, reject) => {
@@ -432,16 +313,14 @@ async function transcribeWithWhisperNative(
       ...(bytes ? { bytes } : {}),
       ...(sourcePath ? { sourcePath } : {}),
       language: opts.language || "auto",
-      model: opts.model || "tiny",
       runId,
-      // v1.15: engine routing — Groq cloud (user's own on-device key) vs
-      // local engines. sttSettings reads the app-level preference; the main
-      // process decides cloud-vs-local based on the SAVED key (auto).
+      // v1.15/v1.20: engine routing — always "groq" (the only engine); the
+      // Groq model comes from the app-level preference / saved config.
       ...sttRouting(),
     });
-    // Classified/native error messages propagate VERBATIM — page.tsx shows
-    // them in the failure toast, so users see the actionable text from
-    // whisper-core's error classification, not a generic wrapper.
+    // Error messages propagate VERBATIM — page.tsx shows them in the
+    // failure toast, so users see the actionable text from the Groq
+    // engine (missing key, invalid key, rate limit, file too large…).
     const raw = abortPromise
       ? await Promise.race([invoke, abortPromise])
       : await invoke;
@@ -476,353 +355,30 @@ async function transcribeWithWhisperNative(
 }
 
 // ---------------------------------------------------------------------------
-// Persistent worker singleton + run bookkeeping (browser fallback path).
-// ---------------------------------------------------------------------------
-
-interface WorkerTranscription {
-  chunks: RawWhisperChunk[] | null;
-  language: string | null;
-  wordLevel: boolean;
-}
-
-interface PendingRun {
-  mode: "transcribe" | "preload";
-  resolve: (result: WorkerTranscription) => void;
-  reject: (error: Error) => void;
-  onProgress?: (p: WhisperProgress) => void;
-}
-
-/** One persistent worker for the whole app lifetime (created lazily). */
-let workerInstance: Worker | null = null;
-
-const pendingRuns = new Map<number, PendingRun>();
-let runCounter = 0;
-
-function getWorker(): Worker {
-  if (typeof window === "undefined") {
-    throw new Error("Whisper is only available in the browser");
-  }
-  if (typeof Worker === "undefined") {
-    throw new Error("Web Workers are not available in this environment");
-  }
-  if (workerInstance) return workerInstance;
-  try {
-    // webpack 5 (next build --webpack) and the Next 16 dev server both
-    // compile this exact pattern into a separately-loadable worker chunk.
-    workerInstance = new Worker(
-      new URL("./whisper-worker.ts", import.meta.url),
-      { type: "module" },
-    );
-  } catch (err) {
-    throw new Error(
-      `Could not start the Whisper worker: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
-  }
-  workerInstance.addEventListener("message", onWorkerMessage);
-  workerInstance.addEventListener("error", onWorkerError);
-  workerInstance.addEventListener("messageerror", onWorkerMessageError);
-  return workerInstance;
-}
-
-function failAllPending(message: string): void {
-  for (const [runId, run] of pendingRuns) {
-    pendingRuns.delete(runId);
-    run.reject(new Error(message));
-  }
-}
-
-function disposeWorker(): void {
-  if (!workerInstance) return;
-  workerInstance.removeEventListener("message", onWorkerMessage);
-  workerInstance.removeEventListener("error", onWorkerError);
-  workerInstance.removeEventListener("messageerror", onWorkerMessageError);
-  workerInstance.terminate();
-  workerInstance = null;
-}
-
-function onWorkerMessage(event: MessageEvent): void {
-  const data = event.data as WhisperWorkerResponse | null | undefined;
-  if (!data || typeof data !== "object" || typeof data.type !== "string") {
-    return; // unknown message — ignore
-  }
-  if (typeof data.runId !== "number") return;
-  const run = pendingRuns.get(data.runId);
-  if (!run) return; // stale (aborted or already settled) — discard
-
-  switch (data.type) {
-    case "progress": {
-      const progress =
-        run.mode === "transcribe"
-          ? mapWorkerProgress(data.stage, data.progress)
-          : clampPercent(data.progress);
-      run.onProgress?.({ progress, status: data.status });
-      break;
-    }
-    case "result":
-      pendingRuns.delete(data.runId);
-      run.resolve({
-        chunks: data.chunks ?? null,
-        language: data.language ?? null,
-        wordLevel: !!data.wordLevel,
-      });
-      break;
-    case "error":
-      pendingRuns.delete(data.runId);
-      run.reject(new Error(data.message || "Whisper worker failed"));
-      break;
-    default:
-      break; // unknown type — ignore (forward compatible)
-  }
-}
-
-/**
- * The worker itself failed to load or crashed with an uncaught error: no
- * result will ever arrive for pending runs, so reject them all (the UI must
- * never hang) and drop the dead worker so the next call spawns a fresh one
- * (the model itself is re-read from the persistent cache, not re-downloaded).
- */
-function onWorkerError(): void {
-  failAllPending("Whisper worker crashed or failed to load");
-  disposeWorker();
-}
-
-/** Structured-clone failure: the protocol only sends plain objects — if
- * deserialization ever breaks, fail fast instead of hanging forever. */
-function onWorkerMessageError(): void {
-  failAllPending("Whisper worker sent an unreadable message");
-}
-
-// ---------------------------------------------------------------------------
 // Public functions.
 // ---------------------------------------------------------------------------
 
 /**
- * Transcribe the given audio file with Whisper-tiny and return cues
- * with per-word timestamps.
+ * Transcribe the given audio file with the Groq Whisper API (the ONLY
+ * engine since v1.20) and return cues with per-word timestamps.
  *
- * v5.0: the audio is decoded here (main thread) and the PCM is TRANSFERRED
- * to the persistent Whisper Web Worker, which runs all inference off the UI
- * thread (chunk_length_s 30 / stride_length_s 5, word-level timestamps via
- * `return_timestamps: "word"` with a chunk-level fallback — identical
- * pipeline options to v4). Raw output chunks come back and are parsed into
- * display cues (max ~7 words / sentence punctuation / natural pauses) while
- * preserving exact per-word timing.
- *
- * Aborting rejects immediately and marks the run stale (late worker results
- * are discarded); the worker is NOT terminated so the model stays warm.
+ * Runs entirely in the desktop app's main process (ffmpeg audio extraction
+ * + the Groq HTTPS call); progress streams back over the bridge. In the
+ * browser (non-Electron) this throws — transcription needs the desktop app.
  */
 export async function transcribeWithWhisper(
   opts: WhisperOptions,
 ): Promise<WhisperResult> {
-  const { audioFile, onProgress, signal } = opts;
-
-  // v5.1: the desktop app ALWAYS takes the native service path (ffmpeg
-  // decode + utilityProcess inference) — no renderer worker exists there.
-  if (nativeWhisperBridge()) {
-    return transcribeWithWhisperNative(opts);
-  }
-
-  if (typeof window === "undefined") {
-    throw new Error("Whisper transcription is only available in the browser");
-  }
-
-  onProgress?.({ progress: 2, status: "Decoding audio…" });
-  if (signal?.aborted) throw new Error("Transcription cancelled");
-
-  let pcm: Float32Array;
-  let sampleRate = 16000;
-  try {
-    const decoded = await decodeAudioToMono16k(audioFile);
-    pcm = decoded.data;
-    sampleRate = decoded.sampleRate;
-  } catch (err) {
+  if (!nativeWhisperBridge()) {
     throw new Error(
-      `Could not decode audio: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
+      "Transcription runs in the FrameFuse desktop app with a Groq API key.",
     );
   }
-  if (pcm.length === 0) throw new Error("Audio file is empty or silent");
-
-  // Computed BEFORE the transfer — the transfer neuters this buffer.
-  const pcmDurationMs = Math.round((pcm.length / sampleRate) * 1000);
-
-  onProgress?.({ progress: 10, status: "Loading Whisper-tiny model…" });
-  if (signal?.aborted) throw new Error("Transcription cancelled");
-
-  const worker = getWorker();
-  const runId = ++runCounter;
-  const lang = opts.language || "auto";
-
-  const onAbort = () => {
-    const run = pendingRuns.get(runId);
-    if (!run) return;
-    pendingRuns.delete(runId);
-    // Best-effort: lets the worker skip this run if it has not started yet.
-    // A run already mid-inference finishes in the background and its result
-    // is discarded here (stale runId). The worker is NOT terminated.
-    try {
-      worker.postMessage({ type: "cancel", runId });
-    } catch {
-      // Worker already gone — nothing to cancel.
-    }
-    run.reject(new Error("Transcription cancelled"));
-  };
-
-  try {
-    const raw = await new Promise<WorkerTranscription>((resolve, reject) => {
-      pendingRuns.set(runId, { resolve, reject, onProgress, mode: "transcribe" });
-      signal?.addEventListener("abort", onAbort, { once: true });
-      try {
-        // Zero-copy: transfer the PCM buffer to the worker.
-        worker.postMessage(
-          { type: "transcribe", runId, pcm, sampleRate, language: lang },
-          [pcm.buffer],
-        );
-      } catch (err) {
-        pendingRuns.delete(runId);
-        reject(
-          new Error(
-            `Could not send audio to the Whisper worker: ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          ),
-        );
-      }
-    });
-
-    if (signal?.aborted) throw new Error("Transcription cancelled");
-
-    onProgress?.({ progress: 80, status: "Aligning word timestamps…" });
-
-    const cues = parseWhisperOutput(
-      { chunks: raw.chunks ?? [] },
-      raw.wordLevel,
-    );
-    const detectedLang = raw.language;
-
-    onProgress?.({ progress: 100, status: "Done" });
-
-    return {
-      cues,
-      language: detectedLang,
-      durationMs: cues.length ? cues[cues.length - 1].endMs : pcmDurationMs,
-      wordLevel: raw.wordLevel,
-    };
-  } finally {
-    signal?.removeEventListener("abort", onAbort);
-    pendingRuns.delete(runId);
-  }
+  return transcribeWithWhisperNative(opts);
 }
 
-/**
- * Pre-load the Whisper-tiny model into the persistent worker. Call this on
- * app idle to avoid the model-download latency on the first "Generate" click.
- * The model is stored in the browser's persistent cache — download once,
- * reuse forever.
- */
-export async function preloadWhisper(
-  onProgress?: (p: WhisperProgress) => void,
-): Promise<void> {
-  // v5.1 native path: warm the service + disk model cache.
-  const api = nativeWhisperBridge();
-  if (api) {
-    onProgress?.({ progress: 0, status: "Loading Whisper-tiny model…" });
-    const unsubscribe = api.onWhisperProgress((d) => {
-      if (d && typeof d.progress === "number") {
-        // Standalone pre-download: the main process maps model/download
-        // events onto the 10–25 % band of the TRANSCRIPTION curve — rescale
-        // onto 0–100 so the pre-download button's own bar reflects the
-        // download itself.
-        const p = clampPercent(d.progress);
-        const scaled =
-          d.stage === "model" || d.stage === "download"
-            ? clampPercent(((p - 10) / 15) * 100)
-            : p;
-        onProgress?.({ progress: scaled, status: d.status || "" });
-      }
-    });
-    try {
-      await api.whisperPreload();
-      onProgress?.({ progress: 100, status: "Ready" });
-    } finally {
-      unsubscribe?.();
-    }
-    return;
-  }
-
-  onProgress?.({ progress: 0, status: "Loading Whisper-tiny model…" });
-  const worker = getWorker(); // throws a clear error outside the browser
-  const runId = ++runCounter;
-
-  try {
-    await new Promise<void>((resolve, reject) => {
-      pendingRuns.set(runId, {
-        mode: "preload",
-        resolve: () => resolve(),
-        reject,
-        onProgress,
-      });
-      try {
-        worker.postMessage({ type: "preload", runId });
-      } catch (err) {
-        pendingRuns.delete(runId);
-        reject(
-          new Error(
-            `Could not reach the Whisper worker: ${
-              err instanceof Error ? err.message : String(err)
-            }`,
-          ),
-        );
-      }
-    });
-    onProgress?.({ progress: 100, status: "Ready" });
-  } finally {
-    pendingRuns.delete(runId);
-  }
-}
-
-/** True if Whisper transcription is available in this environment. */
+/** True if Whisper transcription is available in this environment (the
+ *  Electron bridge exists — Groq runs main-side). */
 export function isWhisperAvailable(): boolean {
-  if (nativeWhisperBridge()) return true;
-  return (
-    typeof window !== "undefined" &&
-    !!(window as any).AudioContext &&
-    typeof OfflineAudioContext !== "undefined" &&
-    typeof Worker !== "undefined"
-  );
-}
-
-/**
- * v1.3.1: pre-download a faster-whisper MODEL (tiny/base/small/medium) via
- * the Python sidecar's --preload mode. Returns false when the bridge/engine
- * is unavailable (caller falls back to the classic tiny pre-download).
- */
-export async function preloadFasterWhisperModel(
-  model: string,
-  onProgress?: (p: WhisperProgress) => void,
-): Promise<boolean> {
-  const api = nativeWhisperBridge();
-  if (!api || typeof api.whisperFwPreload !== "function") return false;
-  const safeModel = ["tiny", "base", "small", "medium"].includes(model)
-    ? model
-    : "tiny";
-  onProgress?.({
-    progress: 0,
-    status: `Downloading faster-whisper ${safeModel} model…`,
-  });
-  const unsubscribe = api.onWhisperProgress((d) => {
-    if (d && typeof d.progress === "number") {
-      onProgress?.({ progress: clampPercent(d.progress), status: d.status || "" });
-    }
-  });
-  try {
-    await api.whisperFwPreload({ model: safeModel });
-    onProgress?.({ progress: 100, status: "Model cached" });
-    return true;
-  } finally {
-    unsubscribe?.();
-  }
+  return !!nativeWhisperBridge();
 }

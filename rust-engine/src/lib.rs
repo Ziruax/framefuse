@@ -16,6 +16,7 @@
 #![deny(clippy::all)]
 
 mod audio;
+mod captions;
 mod compositor;
 mod export;
 mod ffmpeg_ffi;

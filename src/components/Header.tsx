@@ -24,7 +24,7 @@ import { cn } from "@/lib/utils";
 /** v1.12.1: the renderer's build constant — compared against the REAL exe
  *  version (app.getVersion()) so a stale/hybrid install is impossible to
  *  miss. Keep in sync with package.json on every release. */
-const BUILD_VERSION = "1.19.0";
+const BUILD_VERSION = "1.20.0";
 
 export interface LastExport {
   path: string;
@@ -506,7 +506,11 @@ export function Header({
             )}
             {/* v1.18: WHICH engine is running — the native Rust engine
                 (wgpu + dlopen'd FFmpeg, no CLI children) or the FFmpeg-CLI
-                Safe Mode pipeline. Honest telemetry, live. */}
+                Safe Mode pipeline. Honest telemetry, live.
+                v1.20: CLI badges now carry the ROUTING REASON
+                (engineReason) — kinetic captions, stack text, geometric
+                transitions… — so "why is the Rust engine not running" is
+                answered on the badge itself instead of a silent swap. */}
             {exportProgress?.engine ? (
               <span
                 className="hidden rounded-sm px-1.5 py-0.5 sm:inline"
@@ -518,10 +522,21 @@ export function Header({
                 title={
                   exportProgress.engine === "rust"
                     ? "Native Rust engine — wgpu GPU composite + direct FFmpeg library encode (pipelined)"
-                    : "FFmpeg CLI pipeline (Safe Mode)"
+                    : exportProgress.engineReason
+                      ? `FFmpeg CLI pipeline — Rust engine bypassed: ${exportProgress.engineReason}`
+                      : "FFmpeg CLI pipeline (Safe Mode)"
                 }
               >
                 {exportProgress.engine === "rust" ? "Rust engine" : "FFmpeg CLI"}
+                {exportProgress.engine !== "rust" && exportProgress.engineReason ? (
+                  <span
+                    className="ml-1.5"
+                    style={{ color: "#fbbf24" }}
+                    title={`Rust engine bypassed: ${exportProgress.engineReason} (turn off kinetic typography captions / stack text / geometric transitions to use the native engine)`}
+                  >
+                    · {exportProgress.engineReason}
+                  </span>
+                ) : null}
               </span>
             ) : null}
             {exportProgress?.fps ? (

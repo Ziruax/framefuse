@@ -26,9 +26,13 @@
 //     native audio bus mixes them with the dub duck applied Electron-side)
 //   ✓ v2 TRANSITIONS: dissolve (image↔image), dip-black, dip-white +
 //     fadeStartEnd bookends — the plan mirrors planBoundaryFades exactly
-//   ✗ slide/wipe/circleopen transitions, burn-in text removal, ASS
-//     captions/kinetic Stack Text/v1.18 kinetic typography captions,
-//     loudnorm, overlay motion keyframes → CLI
+//   ✓ v1.20 NATIVE CAPTIONS: burned-in cues with the full v4.1 vocabulary
+//     (plain/word/word-only/stack modes, karaoke highlight, all 24
+//     CaptionAnimations) via rust-engine/src/captions.rs (fontdue +
+//     compositor text layers — animated word rect/alpha transforms)
+//   ✗ slide/wipe/circleopen transitions, burn-in text removal, v1.17
+//     kinetic Stack Text, v1.18 kinetic typography captions, loudnorm,
+//     overlay motion keyframes → CLI
 
 "use strict";
 
@@ -94,10 +98,12 @@ function rustEligible(opts) {
     reasons.push("text-removal");
   }
 
-  const captionsOn =
-    opts.captionSettings && opts.captionSettings.enabled &&
-    Array.isArray(opts.subtitleCues) && opts.subtitleCues.length > 0;
-  if (captionsOn) reasons.push("captions");
+  // v1.20 NATIVE CAPTIONS: burned-in captions NO LONGER gate the Rust
+  // engine — the native caption renderer (rust-engine/src/captions.rs)
+  // paints the full v4.1 vocabulary (word modes + karaoke highlight + the
+  // 24 kinetic animations) through fontdue + the compositor text path.
+  // ONLY the v1.18 kinetic-TYPOGRAPHY engine still rides the CLI's ASS/
+  // libass compositor (per-word override-tag choreography) — gated below.
 
   // v2 TRANSITIONS: dissolve/dips are native; the geometric xfade styles
   // (slide/wipe/circleopen) ride the CLI's xfade filter. Per-boundary
@@ -131,10 +137,11 @@ function rustEligible(opts) {
   const headlineList = Array.isArray(opts.headlines) ? opts.headlines : [];
   if (headlineList.some((h) => h && h.stackStyle)) reasons.push("stack-text");
 
-  // v1.18 KINETIC CAPTIONS: kinetic typography captions ride the ASS/libass
-  // CLI compositor — the per-word override-tag choreography (entrances,
+  // v1.18 KINETIC CAPTIONS (typography engine): rides the ASS/libass CLI
+  // compositor — the per-word override-tag choreography (entrances,
   // emphasis punches, per-word \pos/\move geometry) has no Rust-engine
-  // equivalent (fontdue texts are static), same class as stack-text.
+  // equivalent, same class as stack-text. (The legacy 24 CaptionAnimations
+  // and all word modes are NATIVE since v1.20.)
   if (
     opts.captionSettings &&
     opts.captionSettings.kinetic &&
@@ -234,6 +241,124 @@ function pickFont(family) {
   } catch {
     return table.sans;
   }
+}
+
+// ── v1.20 CAPTION FONTS: the export payload's captionSettings.fontName is
+// the ASS/ffmpeg name (e.g. "Montserrat", "Impact") — the native renderer
+// needs an OS FONT FILE. Same resolution philosophy as FONT_ASS_NAMES in
+// kinetic-ass.js: web fonts that Windows never ships map to their closest
+// system face (Montserrat → Arial Bold, Bebas → Impact, …).
+const CAPTION_FONT_FILES = {
+  win32: {
+    // [regular, bold] per family name.
+    Arial: ["C:\\Windows\\Fonts\\arial.ttf", "C:\\Windows\\Fonts\\arialbd.ttf"],
+    Montserrat: ["C:\\Windows\\Fonts\\arial.ttf", "C:\\Windows\\Fonts\\arialbd.ttf"],
+    Inter: ["C:\\Windows\\Fonts\\arial.ttf", "C:\\Windows\\Fonts\\arialbd.ttf"],
+    Roboto: ["C:\\Windows\\Fonts\\arial.ttf", "C:\\Windows\\Fonts\\arialbd.ttf"],
+    "Segoe UI": ["C:\\Windows\\Fonts\\segoeui.ttf", "C:\\Windows\\Fonts\\segoeuib.ttf"],
+    Tahoma: ["C:\\Windows\\Fonts\\tahoma.ttf", "C:\\Windows\\Fonts\\tahomabd.ttf"],
+    Verdana: ["C:\\Windows\\Fonts\\verdana.ttf", "C:\\Windows\\Fonts\\verdanab.ttf"],
+    "Trebuchet MS": ["C:\\Windows\\Fonts\\trebuc.ttf", "C:\\Windows\\Fonts\\trebucbd.ttf"],
+    Impact: ["C:\\Windows\\Fonts\\impact.ttf", "C:\\Windows\\Fonts\\impact.ttf"],
+    Bebas: ["C:\\Windows\\Fonts\\impact.ttf", "C:\\Windows\\Fonts\\impact.ttf"],
+    "Arial Black": ["C:\\Windows\\Fonts\\ariblk.ttf", "C:\\Windows\\Fonts\\ariblk.ttf"],
+    Georgia: ["C:\\Windows\\Fonts\\georgia.ttf", "C:\\Windows\\Fonts\\georgiab.ttf"],
+    "Times New Roman": ["C:\\Windows\\Fonts\\times.ttf", "C:\\Windows\\Fonts\\timesbd.ttf"],
+    "Courier New": ["C:\\Windows\\Fonts\\cour.ttf", "C:\\Windows\\Fonts\\courbd.ttf"],
+    Consolas: ["C:\\Windows\\Fonts\\consola.ttf", "C:\\Windows\\Fonts\\consolab.ttf"],
+    "Playfair Display": ["C:\\Windows\\Fonts\\georgia.ttf", "C:\\Windows\\Fonts\\georgiab.ttf"],
+  },
+  linux: {
+    Arial: ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
+    Montserrat: ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
+    Inter: ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
+    Roboto: ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
+    "Segoe UI": ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
+    Tahoma: ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
+    Verdana: ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
+    "Trebuchet MS": ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
+    Impact: ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
+    Bebas: ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
+    "Arial Black": ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"],
+    Georgia: ["/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf"],
+    "Times New Roman": ["/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf"],
+    "Courier New": ["/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"],
+    Consolas: ["/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"],
+    "Playfair Display": ["/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf"],
+  },
+};
+
+/** captionSettings.fontName (ASS name) → an existing OS font file path. */
+function pickCaptionFont(fontName, fontWeight) {
+  const table = CAPTION_FONT_FILES[process.platform] || CAPTION_FONT_FILES.linux;
+  const pair = table[fontName] || table.Arial;
+  const wantBold = Number(fontWeight) >= 600;
+  const candidates = wantBold ? [pair[1], pair[0]] : [pair[0], pair[1]];
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(c)) return c;
+    } catch {}
+  }
+  return pickFont("sans");
+}
+
+/**
+ * v1.20: export-native payload's captionSettings + subtitleCues → the
+ * Rust `timeline.captions` block. Every px value is pre-scaled to the
+ * OUTPUT canvas (the engine works in output px, hScale = height/1080).
+ * Returns null when captions are off / no cues.
+ */
+function buildRustCaptions(opts, width, height) {
+  const cs = opts.captionSettings;
+  const cues = Array.isArray(opts.subtitleCues) ? opts.subtitleCues : [];
+  if (!cs || !cs.enabled || cues.length === 0) return null;
+  // The kinetic-typography engine never reaches here (rustEligible gates
+  // it to the CLI compositor), but guard anyway — belt and braces.
+  if (cs.kinetic && cs.kinetic.enabled) return null;
+
+  const h = Math.max(16, height);
+  const hScale = h / 1080;
+  const fontPx = Math.max(
+    8,
+    Math.round(Number(cs.fontSize) * h * (Number(cs.fontSizeScale) || 1)),
+  );
+
+  return {
+    fontKey: "caption",
+    fontSizePx: fontPx,
+    textColor: String(cs.textColor || "#FFFFFF"),
+    highlightColor: cs.highlightColor ? String(cs.highlightColor) : null,
+    borderColor: String(cs.borderColor || "#000000"),
+    borderWidthPx: Math.max(0, Math.round(Number(cs.borderWidth) || 0) * hScale),
+    bgColor: cs.bgColor ? String(cs.bgColor) : null,
+    bgAlpha: Math.max(0, Math.min(1, Number(cs.bgAlpha != null ? cs.bgAlpha : 1))),
+    bgPaddingPx: Math.max(0, Math.round(Number(cs.bgPadding != null ? cs.bgPadding : 12) * hScale)),
+    shadow: !!(cs.shadow),
+    shadowColor: String(cs.shadowColor || "#000000"),
+    shadowPx: Math.max(1, Math.round((Number(cs.shadowBlur != null ? cs.shadowBlur : 3) || 3) * hScale)),
+    textTransform: String(cs.textTransform || "none"),
+    letterSpacingPx: Math.max(0, Math.round(Number(cs.letterSpacing) || 0) * hScale),
+    alignment: String(cs.alignment || "center"),
+    position: String(cs.customPosition || cs.position || "bottom"),
+    positionY: Math.max(0, Math.round((cs.positionY != null ? Number(cs.positionY) : 50) * hScale)),
+    maxWidthFrac: Math.max(0.1, Math.min(1, Number(cs.maxWidth) || 0.84)),
+    wordMode: String(cs.wordMode || "off"),
+    animation: String(cs.animation || "none"),
+    cues: cues
+      .filter((c) => c && Number(c.endMs) > Number(c.startMs))
+      .map((c) => ({
+        startMs: Number(c.startMs) || 0,
+        endMs: Number(c.endMs) || 0,
+        text: String(c.text || ""),
+        words: Array.isArray(c.words) && c.words.length > 0
+          ? c.words.map((w) => ({
+              text: String(w.text || ""),
+              startMs: Number(w.startMs) || 0,
+              endMs: Number(w.endMs) || 0,
+            }))
+          : [],
+      })),
+  };
 }
 
 /** 9-grid + free-form overlay geometry → normalized center rect (the exact
@@ -487,6 +612,16 @@ function buildRustTimeline(opts) {
     );
   }
 
+  // ── v1.20 CAPTIONS: the native caption block + its font file ──
+  const captions = buildRustCaptions(opts, width, height);
+  const fontsMap = { sans: pickFont("sans"), mono: pickFont("mono") };
+  if (captions) {
+    fontsMap.caption = pickCaptionFont(
+      opts.captionSettings && opts.captionSettings.fontName,
+      opts.captionSettings && opts.captionSettings.fontWeight,
+    );
+  }
+
   // ── watermark (pixel coords, as the CLI chain consumes) ──
   const wm = opts.watermark;
   const watermark =
@@ -516,12 +651,14 @@ function buildRustTimeline(opts) {
     totalMs: Math.max(1, totalMs),
     fadeInMs: Math.max(0, Number(audio.fadeInMs) || 0),
     fadeOutMs: Math.max(0, Number(audio.fadeOutMs) || 0),
-    fonts: { sans: pickFont("sans"), mono: pickFont("mono") },
+    fonts: fontsMap,
     segments: rustSegments,
     music,
     extraAudio,
     texts,
     watermark,
+    // v1.20 NATIVE CAPTIONS (null when off — the engine no-ops).
+    captions,
   };
   return { timeline, slideshowFpsApplied, fps };
 }
@@ -561,6 +698,14 @@ async function runRustExport(opts, event, { ffmpegPath, cpuCount, sendCliProgres
   if (built.error) {
     console.log(`[RustEngine] timeline build refused: ${built.error}`);
     return null;
+  }
+  if (built.timeline.captions) {
+    console.log(
+      `[RustEngine] native captions ON — ${built.timeline.captions.cues.length} cue(s)` +
+        `, mode=${built.timeline.captions.wordMode}` +
+        `, anim=${built.timeline.captions.animation}` +
+        `, font=${built.timeline.fonts.caption}`,
+    );
   }
 
   const dllDir = ffmpegDllDir(ffmpegPath);
@@ -661,6 +806,19 @@ function requestRustCancel() {
   } catch {}
 }
 
+/**
+ * v1.20: WHY the CLI pipeline was chosen for this export (null when the
+ * Rust engine is eligible or not loaded at all). The main process threads
+ * this into the export-progress payload so the UI can show the routing
+ * reason instead of a silent "FFmpeg CLI" badge.
+ */
+function rustGateReason(opts) {
+  if (!rustEngine) return null;
+  const gate = rustEligible(opts);
+  if (gate.ok) return null;
+  return gate.reason;
+}
+
 module.exports = {
   rustEngine,
   rustEngineStatus,
@@ -668,4 +826,5 @@ module.exports = {
   buildRustTimeline,
   runRustExport,
   requestRustCancel,
+  rustGateReason,
 };

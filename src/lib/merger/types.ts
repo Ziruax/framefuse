@@ -373,6 +373,12 @@ export interface ExportProgress {
    *  wgpu + dlopen-FFI engine) or "cli" (the FFmpeg-CLI Safe Mode
    *  pipeline). The Header's engine badge renders it live. */
   engine?: "rust" | "cli";
+  /** v1.20: WHY the CLI pipeline was chosen ("kinetic-captions",
+   *  "stack-text", "transition:slide-left", …) — the router's gate
+   *  reason, threaded so the badge can explain the routing instead of a
+   *  silent "FFmpeg CLI". Undefined when the engine is eligible or not
+   *  installed. */
+  engineReason?: string;
   /** v1.15.1 GPU-Shift: the WebCodecs engine's heartbeat frame counters
    *  (framesEncoded of totalFrames — the frame-exact law's live view). */
   framesEncoded?: number;
@@ -817,6 +823,13 @@ export interface DubSettings {
   groqModel: string;
   femaleVoice: string;
   maleVoice: string;
+  /** v1.20: "single" = one voice reads the whole dub (speaker detection
+   *  is skipped entirely); "multi" = per-speaker voices (legacy behavior).
+   *  Absent (old persisted prefs) reads as "multi" at the call sites. */
+  voiceMode: "single" | "multi";
+  /** v1.20 single-voice mode: the Edge-TTS voice ShortName that reads
+   *  every line. null = auto (the locale pair's default female voice). */
+  singleVoice: string | null;
   /** Original-audio level under the dub (0..1) — the duck. */
   originalVolume: number;
 }
@@ -1185,7 +1198,26 @@ export interface GroqConfigPayload {
   maskedKey: string;
   model: string;
   models: Array<{ id: string; label: string; hint: string }>;
-  fwAvailable: boolean;
+}
+
+/** v1.20: masked Gemini key state (the same discipline as
+ *  GroqConfigPayload — hasKey + maskedKey only, never the raw key). */
+export interface GeminiConfigPayload {
+  hasKey: boolean;
+  maskedKey: string;
+}
+
+/** v1.20: one selectable text model in the Script Writer picker. */
+export interface ScriptModelInfo {
+  id: string;
+  label: string;
+  hint?: string;
+}
+
+/** v1.20: the Script Writer's provider/model catalog (script:models IPC). */
+export interface ScriptModelCatalog {
+  gemini: { models: ScriptModelInfo[]; default: string; hasKey: boolean };
+  groq: { models: ScriptModelInfo[]; default: string; hasKey: boolean };
 }
 
 // Augment the window with the Electron bridge (optional, only present in app).
@@ -1277,21 +1309,19 @@ declare global {
         encoderName: string;
         error?: string;
       }>;
-      /** ── v5.1 Native Whisper (utilityProcess service) ──
-       * transcribe: main decodes via ffmpeg + runs onnxruntime-node; progress
-       * streams via onWhisperProgress. v1.3: `sourcePath` (zero-copy local
-       * file), `model` (faster-whisper size) and the result's `engine` field
-       * were added — bytes stays optional for browser-side media. */
+      /** ── v1.20 Whisper (Groq Cloud — the ONLY transcription engine) ──
+       * transcribe: main extracts compact audio via ffmpeg and calls the Groq
+       * Whisper API (user's on-device key); progress streams via
+       * onWhisperProgress. v1.3: `sourcePath` (zero-copy local file). No key
+       * saved → a clear actionable error (no local fallback exists). */
       whisperTranscribe: (p: {
         name: string;
         bytes?: ArrayBuffer;
         sourcePath?: string;
         language?: string;
-        model?: string;
         runId?: string;
-        /** v1.15: STT routing — "groq" (cloud, user's key), "local"
-         *  (offline engines), or "auto" (cloud when a key is saved). */
-        engine?: "groq" | "local" | "auto";
+        /** v1.20: STT routing — always "groq" (the only engine). */
+        engine?: "groq";
         /** v1.15: Groq model override (whisper-large-v3-turbo | whisper-large-v3). */
         groqModel?: string;
       }) => Promise<{
@@ -1301,10 +1331,6 @@ declare global {
         durationMs: number;
         engine?: string;
       }>;
-      whisperPreload: () => Promise<{ ok: boolean }>;
-      /** v1.3.1: pre-download a faster-whisper model (tiny/base/small/medium)
-       * into the persistent cache — first transcription is then offline. */
-      whisperFwPreload?: (p: { model: string }) => Promise<{ ok: boolean; model: string }>;
       whisperCancel: () => Promise<number>;
       onWhisperProgress: (cb: (d: { progress: number; status: string }) => void) => () => void;
       /** v1.15: Groq Whisper API configuration. The key is the USER'S OWN and
@@ -1354,6 +1380,12 @@ declare global {
         groqModel?: string;
         femaleVoice?: string;
         maleVoice?: string;
+        /** v1.20: "single" = one voice for every line (skips speaker
+         *  detection); "multi"/absent = per-speaker voices. */
+        voiceMode?: "single" | "multi";
+        /** v1.20 single-voice mode: Edge-TTS ShortName for the one voice
+         *  (empty/null = the locale pair's default female). */
+        singleVoice?: string | null;
         ttsRatePct?: number;
       }) => Promise<DubTrackResult>;
       dubCancel?: () => Promise<{ ok: boolean; running: boolean }>;
@@ -1368,6 +1400,35 @@ declare global {
         progress: number;
         status: string;
       }) => void) => () => void;
+      /** ── v1.20 AI script writing (Gemini default + Groq) ── */
+      /** Masked Gemini key state — the raw key never crosses the bridge
+       *  (userData/gemini.json, 0600, device-local only). */
+      geminiGet?: () => Promise<GeminiConfigPayload>;
+      /** Stores the key on-device → the masked payload. */
+      geminiSet?: (p: { apiKey: string }) => Promise<GeminiConfigPayload>;
+      /** { apiKey? } → { ok, message, modelCount } — key check (saved or
+       *  candidate) against GET /v1beta/models. */
+      geminiTest?: (p: {
+        apiKey?: string;
+      }) => Promise<{ ok: boolean; message: string; modelCount: number }>;
+      /** Removes the stored Gemini key → { ok }. */
+      geminiClear?: () => Promise<{ ok: boolean }>;
+      /** Generates one narration script with the selected provider/model.
+       *  Never rejects with a user-facing failure — { ok:false, error } is
+       *  the failure path and the renderer shows `error` inline. */
+      scriptGenerate?: (p: {
+        provider: "gemini" | "groq";
+        model: string;
+        prompt: string;
+        tone?: string;
+        durationSec?: number;
+        language?: string;
+      }) => Promise<
+        | { ok: true; text: string; model: string; provider: "gemini" | "groq" }
+        | { ok: false; error: string }
+      >;
+      /** Script Writer model picker data (both providers + key presence). */
+      scriptModels?: () => Promise<ScriptModelCatalog>;
       /** ── v5.1 native project files (dialog-backed) ── */
       saveProject: (p: { doc: unknown; currentPath?: string | null }) => Promise<{ path: string; name: string } | null>;
       saveProjectAs: (p: { doc: unknown }) => Promise<{ path: string; name: string } | null>;

@@ -52,27 +52,24 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   cancelExport: () => ipcRenderer.invoke("cancel-export"),
 
-  // ── v5.1 NATIVE WHISPER (utilityProcess service) ──────────────────────────
+  // ── v1.20 WHISPER (Groq Cloud — the ONLY transcription engine) ────────────
   // transcribe: ({ name, bytes: ArrayBuffer, language, runId? }) →
-  //   { chunks, language, wordLevel, durationMs } — the main process decodes
-  //   the audio with ffmpeg and runs Whisper in a utility process; the UI
-  //   never blocks. Progress arrives via onWhisperProgress. `runId` (v5.2) is
-  //   the renderer's client run id (crypto.randomUUID) used for per-run
-  //   cancellation.
+  //   { chunks, language, wordLevel, durationMs } — the main process extracts
+  //   compact audio with ffmpeg and calls the Groq Whisper API; the UI never
+  //   blocks. Progress arrives via onWhisperProgress. `runId` (v5.2) is the
+  //   renderer's client run id (crypto.randomUUID) used for per-run
+  //   cancellation. No key saved → a clear actionable error (no local engine
+  //   fallback exists anymore).
   whisperTranscribe: (payload) => ipcRenderer.invoke("whisper:transcribe", payload),
-  whisperPreload: () => ipcRenderer.invoke("whisper:preload"),
-  // v1.3.1: pre-download a faster-whisper model (tiny/base/small/medium).
-  whisperFwPreload: (p) => ipcRenderer.invoke("whisper:fw-preload", p),
   // v5.2: cancel ALL runs (legacy, no argument) or exactly ONE run
   // ({ runId }) — returns the number of runs rejected.
   whisperCancel: (payload) => ipcRenderer.invoke("whisper:cancel", payload),
-  // v5.2: model cache diagnostics for the Captions settings panel →
-  //   { cacheDir, hostUsed, modelReady, cacheFiles, totalCacheBytes,
-  //     lastError, childAlive, activeRuns, groq, fwAvailable }.
+  // v1.20: Groq engine config — { hasKey, maskedKey, model, models } (the
+  //   local model-cache diagnostics are gone with the local engines).
   whisperStatus: () => ipcRenderer.invoke("whisper:status"),
   // v1.15 GROQ WHISPER API — the user's own key, stored ONLY on this device
   // (userData/groq.json). The bridge NEVER returns the raw key — only a
-  // masked form. { hasKey, maskedKey, model, models, fwAvailable }.
+  // masked form. { hasKey, maskedKey, model, models }.
   whisperGroqGet: () => ipcRenderer.invoke("whisper:groq-get"),
   // { apiKey?: string ("" clears), model?: string } → same payload as get.
   whisperGroqSet: (p) => ipcRenderer.invoke("whisper:groq-set", p),
@@ -100,8 +97,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
   //   timeline voiceover lane.
   ttsSynthesize: (p) => ipcRenderer.invoke("tts:synthesize", p),
   // dubStart: ({ segments, sourceLanguage, targetLanguage, targetLocale,
-  //   groqModel, femaleVoice, maleVoice }) → dub result (segments carry wav
-  //   BYTES). Progress arrives via onDubProgress. Reuses the Captions-tab
+  //   groqModel, femaleVoice, maleVoice, voiceMode, singleVoice }) → dub
+  //   result (segments carry wav BYTES). voiceMode "single" + singleVoice =
+  //   one Edge-TTS voice for every line (speaker detection skipped).
+  //   Progress arrives via onDubProgress. Reuses the Captions-tab
   //   Groq key — there is no second key UI.
   dubStart: (p) => ipcRenderer.invoke("dub:start", p),
   // dubCancel: () → { ok, running } — aborts the active dub run.
@@ -114,6 +113,27 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on("dub:progress", handler);
     return () => ipcRenderer.removeListener("dub:progress", handler);
   },
+
+  // ── v1.20 AI SCRIPT WRITING (Gemini default + Groq) ──────────────────────
+  // geminiGet: () → { hasKey, maskedKey } — the key lives ONLY on this
+  //   device (userData/gemini.json, 0600); the bridge NEVER returns the raw
+  //   key, only the masked form.
+  geminiGet: () => ipcRenderer.invoke("gemini:get"),
+  // geminiSet: ({ apiKey }) → same masked payload — stores the key on-device.
+  geminiSet: (p) => ipcRenderer.invoke("gemini:set", p),
+  // geminiTest: ({ apiKey? }) → { ok, message, modelCount } — validates the
+  //   candidate (or the saved key) against GET /v1beta/models.
+  geminiTest: (p) => ipcRenderer.invoke("gemini:test", p),
+  // geminiClear: () → { ok } — removes the stored key entirely.
+  geminiClear: () => ipcRenderer.invoke("gemini:clear"),
+  // scriptGenerate: ({ provider: "gemini"|"groq", model, prompt, tone?,
+  //   durationSec?, language? }) → { ok: true, text, model, provider } |
+  //   { ok: false, error } — never rejects with a user-facing failure; the
+  //   renderer shows `error` inline.
+  scriptGenerate: (p) => ipcRenderer.invoke("script:generate", p),
+  // scriptModels: () → { gemini: { models, default, hasKey }, groq: { models,
+  //   default, hasKey } } — the Script Writer model picker data.
+  scriptModels: () => ipcRenderer.invoke("script:models"),
 
   // ── v5.1 NATIVE PROJECT FILES ─────────────────────────────────────────────
   // saveProject: ({ doc, currentPath? }) → { path, name } | null (canceled)

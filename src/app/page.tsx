@@ -156,7 +156,7 @@ const DISCLAIMER_DEFAULT_MS = 2000;
 /** v1.14.2: renderer build stamp — the desktop-only landing carries it so a
  * browser visitor sees which build is live (in Electron, Header separately
  * cross-checks it against the exe's app.getVersion()). */
-const BUILD_VERSION = "1.19.0";
+const BUILD_VERSION = "1.20.0";
 
 /** Effective lead-in duration of a disclaimer clip (ms, min 200). */
 function disclaimerDurationOf(d: DisclaimerClip | null): number {
@@ -224,6 +224,8 @@ const DEFAULT_DUB_SETTINGS: DubSettings = {
   groqModel: "llama-3.3-70b-versatile",
   femaleVoice: "",
   maleVoice: "",
+  voiceMode: "multi",
+  singleVoice: null,
   originalVolume: 0.15,
 };
 
@@ -248,6 +250,14 @@ function loadDubSettings(): DubSettings {
           : DEFAULT_DUB_SETTINGS.groqModel,
       femaleVoice: typeof j.femaleVoice === "string" ? j.femaleVoice : "",
       maleVoice: typeof j.maleVoice === "string" ? j.maleVoice : "",
+      // v1.20: absent fields (prefs saved by ≤ v1.19) read as the legacy
+      // multi-speaker behavior; multi mode also drops any stale single
+      // voice so the multi pipeline stays byte-identical.
+      voiceMode: j.voiceMode === "single" ? "single" : "multi",
+      singleVoice:
+        j.voiceMode === "single" && typeof j.singleVoice === "string" && j.singleVoice
+          ? j.singleVoice
+          : null,
       originalVolume:
         typeof j.originalVolume === "number" && Number.isFinite(j.originalVolume)
           ? Math.max(0, Math.min(1, j.originalVolume))
@@ -284,7 +294,7 @@ interface PersistedSettings {
   captionSettings: CaptionSettings;
   audio: AudioSettings;
   whisperLanguage: string;
-  /** v1.3: whisper model size ("tiny" | "base" | "small" | "medium"). */
+  /** v1.20: transcription model (Groq whisper model id; legacy local sizes are ignored). */
   whisperModel?: string;
   headlines?: HeadlineItem[];
   /** Segment transitions (v4.3). */
@@ -392,9 +402,10 @@ export default function Page() {
 
   // Whisper language: "auto" = auto-detect, or a 2-letter code like "en".
   const [whisperLanguage, setWhisperLanguage] = useState<string>("auto");
-  // v1.3: faster-whisper model size — tiny (fastest) / base / small / medium
-  // (most accurate). The bundled faster-whisper engine makes small/medium
-  // practical on CPU; the onnxruntime fallback always runs tiny.
+  // v1.3/v1.20: transcription model. Historically the faster-whisper size
+  // (tiny/base/small/medium); since v1.20 Groq is the only engine — the
+  // value is kept for project-doc compatibility and the Settings panel
+  // drives the Groq model via the app-level STT preference.
   const [whisperModel, setWhisperModel] = useState<string>("tiny");
 
   // v4.7: beat-snap strength — boundaries land on every Nth beat (1/2/4/8).
@@ -516,8 +527,9 @@ export default function Page() {
     if (p.whisperLanguage && p.whisperLanguage !== "auto") {
       setWhisperLanguage(p.whisperLanguage);
     }
-    // v1.3: persisted whisper model choice (tiny default = v5.x behavior).
-    if (p.whisperModel && ["tiny", "base", "small", "medium"].includes(p.whisperModel)) {
+    // v1.3: persisted whisper model choice (legacy local sizes are tolerated
+    // for old project docs; Groq is the only engine since v1.20).
+    if (p.whisperModel) {
       setWhisperModel(p.whisperModel);
     }
     // v4.7 prefs: beat-snap strength + starred presets.
@@ -850,7 +862,7 @@ export default function Page() {
     audioSettings: AudioSettings;
     audioTrack: AudioTrack | null;
     whisperLanguage: string;
-    /** v1.3: whisper model size ("tiny" | "base" | "small" | "medium"). */
+    /** v1.20: transcription model (Groq whisper model id; legacy local sizes are ignored). */
     whisperModel?: string;
     transition: TransitionSettings;
     watermarkImage: MediaItem | null;
@@ -1489,6 +1501,8 @@ export default function Page() {
         groqModel: dubSettings.groqModel,
         femaleVoice: dubSettings.femaleVoice || undefined,
         maleVoice: dubSettings.maleVoice || undefined,
+        voiceMode: dubSettings.voiceMode ?? "multi",
+        singleVoice: dubSettings.singleVoice ?? null,
       });
       setDubResult(result);
       toast.success("Dub track ready", {
@@ -2856,7 +2870,10 @@ export default function Page() {
       return;
     }
     if (!isWhisperAvailable()) {
-      toast.error("Audio decoding is not supported in this browser");
+      toast.error("Transcription runs in the FrameFuse desktop app", {
+        description:
+          "Open the project in the FrameFuse desktop app and add your free Groq API key (Settings → Captions).",
+      });
       return;
     }
     if (whisperBusy) return;
@@ -2869,7 +2886,6 @@ export default function Page() {
       const result = await transcribeWithWhisper({
         audioFile: sourceFile,
         sourcePath,
-        model: whisperModel,
         signal: ac.signal,
         language: whisperLanguage,
         onProgress: (p) => setWhisperProgress(p),

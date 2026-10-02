@@ -14,7 +14,7 @@
 //     color-cycle, spotlight, swing, squash, zoom-words)
 //   - .ass sidecar export IPC
 const {
-  app, BrowserWindow, ipcMain, dialog, Menu, shell, utilityProcess,
+  app, BrowserWindow, ipcMain, dialog, Menu, shell,
 } = require("electron");
 const path = require("path");
 const fs = require("fs");
@@ -29,9 +29,9 @@ const G = require("./export-graph");
 // v6: the SINGLE-PASS whole-timeline graph builder (pure — shared with the
 // bun verification harness exactly like export-graph).
 const SP = require("./export-singlepass");
-// v1.15: Groq Whisper API engine (cloud STT, user's own key stored on-device
-// in userData/groq.json — never in project files). PREFERed engine chain head
-// when a key is saved; local engines remain as fallbacks.
+// v1.15/v1.20: Groq Whisper API — the ONLY transcription engine (cloud STT,
+// user's own key stored on-device in userData/groq.json — never in project
+// files).
 const GQ = require("./groq-whisper");
 // v1.16 RUST NATIVE ENGINE (runtime-FFI): wgpu compositor + dlopen'ed FFmpeg
 // encode, replacing the CLI IPC hop. The router module owns eligibility,
@@ -66,6 +66,12 @@ const KineticASS = require("./kinetic-ass");
 // as whisper — there is no second key UI).
 const TTS = require("./edge-tts");
 const DUB = require("./dub-workflow");
+// v1.20 SCRIPT WRITING: the Google Gemini generateContent client (userData/
+// gemini.json key storage — the same 0600 on-device discipline as groq.json)
+// + direct access to the Groq chat client: script:generate routes to either
+// provider, script:models serves both catalogs.
+const GM = require("./gemini-chat");
+const GC = require("./groq-chat");
 
 // Resolve the FFmpeg binary path. v1.5: a FULL bundled build (staged by
 // scripts/fetch-windows-ffmpeg.js into resources/ffmpeg/<plat>/) is PREFERRED
@@ -823,105 +829,26 @@ ipcMain.handle("gpu-export-end", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// v5.1 NATIVE WHISPER SERVICE (utilityProcess).
+// v1.20 WHISPER — GROQ CLOUD ONLY.
 //
-// The v5.0 renderer Web Worker broke in the PACKAGED app — webpack's worker
-// chunk loader resolved chunk URLs relative to the worker script location
-// and duplicated the `_next/static/chunks` prefix
-// ("…app.asar/out/_next/static/chunks/_next/static/chunks/590caa2a….js"),
-// so importScripts failed and every transcription errored. The native
-// service fixes this at the root: NO renderer worker at all. Transformers.js
-// + onnxruntime-node run in a utility process (native threads, disk model
-// cache in userData — downloaded once, available forever).
+// ALL local transcription engines are REMOVED (the onnxruntime
+// utilityProcess service, the faster-whisper Python sidecar, and the
+// renderer web worker). electron/groq-whisper.js — the Groq Whisper API
+// with the user's own on-device key (userData/groq.json, 0600) — is the
+// ONLY engine. No key saved -> a clear actionable error; API failure ->
+// the real error message surfaces (no silent fallback chain). The run
+// bookkeeping below still serves the Groq run's progress events, per-run
+// cancellation and diagnostics.
 // ---------------------------------------------------------------------------
-const whisperChild = { proc: null, dead: true };
-const whisperRuns = new Map(); // runId → { resolve, reject, sender, clientRunId? }
+const whisperRuns = new Map(); // runId -> { resolve, reject, sender, clientRunId? }
 let whisperRunSeq = 0;
 
 /** v5.2 whisper diagnostics state — surfaced by the whisper:status IPC so
- *  the Captions settings panel can show model/cache health at a glance. */
+ *  the settings panel can show engine health at a glance. */
 const whisperState = {
   lastError: null,
   lastErrorAt: 0,
-  hostUsed: null,
 };
-
-function whisperCacheDir() {
-  return path.join(app.getPath("userData"), "whisper-models");
-}
-
-/** v1.5: models root shipped INSIDE the installer — stage-whisper-model.js
- *  fills whisper-service/models/Xenova/whisper-tiny at build time and
- *  electron-builder's extraResources places it next to the staged service
- *  (outside app.asar). The whisper pipeline builds from here FIRST (fully
- *  offline); the runtime download path remains the fallback. */
-function whisperBundledModelsRoot() {
-  if (app.isPackaged) {
-    return path.join(process.resourcesPath, "whisper-service", "models");
-  }
-  return path.join(__dirname, "..", "whisper-service", "models");
-}
-
-function whisperChildEntry() {
-  // Packaged: staged service at <resources>/whisper-service (extraResources,
-  // outside asar so ESM imports + the native onnxruntime binding load).
-  return app.isPackaged
-    ? path.join(process.resourcesPath, "whisper-service", "whisper-child.js")
-    : path.join(__dirname, "whisper-child.js");
-}
-
-function getWhisperChild() {
-  if (whisperChild.proc && !whisperChild.dead) return whisperChild.proc;
-  // v5.2: a cache-dir creation failure must NOT be silent — it is the #1
-  // cause of "model downloaded but never reused" confusion.
-  try {
-    fs.mkdirSync(whisperCacheDir(), { recursive: true });
-  } catch (err) {
-    const message = `Could not create the Whisper model cache folder (${whisperCacheDir()}): ${
-      err instanceof Error ? err.message : String(err)
-    }`;
-    whisperState.lastError = message;
-    whisperState.lastErrorAt = Date.now();
-    console.error("[whisper]", message);
-  }
-  const proc = utilityProcess.fork(whisperChildEntry(), [], {
-    serviceName: "framefuse-whisper",
-    stdio: "pipe",
-  });
-  whisperChild.proc = proc;
-  whisperChild.dead = false;
-  if (proc.stdout) proc.stdout.on("data", (d) => console.log("[whisper]", String(d).trim()));
-  if (proc.stderr) proc.stderr.on("data", (d) => console.error("[whisper]", String(d).trim()));
-  proc.on("message", onWhisperChildMessage);
-  proc.on("exit", () => {
-    whisperChild.proc = null;
-    whisperChild.dead = true;
-    const hadRuns = whisperRuns.size > 0;
-    // Every pending run must fail fast — the UI can never hang.
-    for (const [runId, run] of Array.from(whisperRuns)) {
-      whisperRuns.delete(runId);
-      run.reject(new Error("The Whisper service stopped unexpectedly. Please try again."));
-    }
-    // Only record a crash as lastError when work was actually in flight —
-    // normal app-quit kills must not pollute the diagnostics view.
-    if (hadRuns) {
-      whisperState.lastError = "The Whisper service stopped unexpectedly. Please try again.";
-      whisperState.lastErrorAt = Date.now();
-    }
-  });
-  return proc;
-}
-
-/** Same curve the renderer's mapWorkerProgress applies (model/download
- *  10–25 %, transcribe 25–80 %) — computed here so the renderer stays a dumb
- *  relay. "download" events carry the same per-file percent as the paired
- *  "model" event (the child emits both), so they share the model band — no
- *  bar jitter, and the file name rides along in the status message. */
-function mapWhisperProgress(stage, progress) {
-  const p = Number.isFinite(progress) ? Math.min(100, Math.max(0, Math.round(progress))) : 0;
-  if (stage === "model" || stage === "download") return Math.round(10 + 15 * (p / 100));
-  return Math.min(80, Math.max(25, p));
-}
 
 function sendWhisperProgress(runId, progress, status, extra) {
   const run = whisperRuns.get(runId);
@@ -931,320 +858,10 @@ function sendWhisperProgress(runId, progress, status, extra) {
   }
 }
 
-function onWhisperChildMessage(msg) {
-  if (!msg || typeof msg !== "object" || typeof msg.type !== "string") return;
-  // v5.2 diagnostics: which host/mirror served the model (has no runId).
-  if (msg.type === "model-info") {
-    if (typeof msg.host === "string") whisperState.hostUsed = msg.host;
-    return;
-  }
-  if (msg.runId === -1) return; // "service-ready" ping from the child
-  if (typeof msg.runId !== "number") return;
-  const run = whisperRuns.get(msg.runId);
-  if (!run) return; // stale (cancelled) — discard
-  // v7 FIX A: activity + phase tracking for the ENGINE 2 watchdog (the
-  // utilityProcess can hang inside a stalled model download with no further
-  // messages — the run bookkeeping now records when it was last heard from).
-  run.lastMsgAt = Date.now();
-  if (msg.type === "progress" && msg.stage === "transcribe") run.phase = "infer";
-  else if (msg.type === "progress") run.phase = "load";
-  switch (msg.type) {
-    case "progress": {
-      const raw = msg.stage === "download" ? msg.percent : msg.progress;
-      const progress = mapWhisperProgress(msg.stage, raw);
-      // Pass the new download stage through so the renderer can show the
-      // file name and rescale the band for standalone pre-downloads.
-      const extra =
-        msg.stage === "download"
-          ? {
-              stage: "download",
-              file: typeof msg.file === "string" ? msg.file : undefined,
-            }
-          : { stage: typeof msg.stage === "string" ? msg.stage : undefined };
-      sendWhisperProgress(msg.runId, progress, msg.status || "", extra);
-      break;
-    }
-    case "result":
-      whisperRuns.delete(msg.runId);
-      // A successful run means the service is healthy again — clear stale
-      // error diagnostics so the status row does not cry wolf.
-      whisperState.lastError = null;
-      whisperState.lastErrorAt = 0;
-      run.resolve({
-        chunks: msg.chunks ?? null,
-        language: msg.language ?? null,
-        wordLevel: !!msg.wordLevel,
-      });
-      break;
-    case "error":
-      whisperRuns.delete(msg.runId);
-      whisperState.lastError = msg.message || "Whisper service failed";
-      whisperState.lastErrorAt = Date.now();
-      run.reject(new Error(msg.message || "Whisper service failed"));
-      break;
-    default:
-      break;
-  }
-}
-
-/** Decode any audio/video file to mono 16 kHz f32le PCM with ffmpeg —
- *  async + streamed, so the main process NEVER blocks. */
-function decodeAudioToPcm16k(filePath) {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(ffmpegPath, [
-      "-hide_banner", "-loglevel", "error",
-      "-i", filePath,
-      "-vn", "-ac", "1", "-ar", "16000",
-      "-f", "f32le", "pipe:1",
-    ], { windowsHide: true });
-    const chunks = [];
-    let stderrTail = "";
-    proc.stdout.on("data", (d) => chunks.push(d));
-    proc.stderr.on("data", (d) => { stderrTail = (stderrTail + d.toString()).slice(-2000); });
-    proc.on("error", (err) => reject(new Error(err.message)));
-    proc.on("exit", (code) => {
-      if (code === 0) {
-        const buf = Buffer.concat(chunks);
-        const pcm = new Float32Array(Math.floor(buf.length / 4));
-        for (let i = 0; i < pcm.length; i++) pcm[i] = buf.readFloatLE(i * 4);
-        resolve(pcm);
-      } else {
-        const detail = stderrTail.trim().split("\n").slice(-3).join(" ");
-        reject(new Error(`Audio decode failed: ${detail || `ffmpeg exit ${code}`}`));
-      }
-    });
-  });
-}
-
-// ── v1.3 FASTER-WHISPER SIDECAR (CTranslate2 int8) ─────────────────────────
-// The user-reported pain: "whisper is very slow". The v5.x engine runs
-// whisper-tiny through onnxruntime — decent, but CTranslate2's int8
-// reimplementation (faster-whisper) is ~4× faster on the same CPU, gets
-// exact word timestamps for free, and VAD-filters silence (long videos
-// transcribe in a fraction of the wall time). It ships as a self-contained
-// embeddable Python runtime (extraResources) — PyAV decodes the audio, so
-// the ORIGINAL source path is passed straight through (zero-copy) with no
-// ffmpeg pre-decode. Engine chain: faster-whisper → onnxruntime utility
-// process → renderer web worker. FRAMEFUSE_FW_PYTHON=<exe> overrides the
-// interpreter for Linux dev boxes.
-const fwRuntime = { available: null };
-
-function fasterWhisperRuntimeDir() {
-  return app.isPackaged
-    ? path.join(process.resourcesPath, "faster-whisper-runtime")
-    : path.join(__dirname, "..", "faster-whisper-runtime");
-}
-
-function fasterWhisperTranscriberPath() {
-  return path.join(fasterWhisperRuntimeDir(), "transcriber.py");
-}
-
-function fasterWhisperPython() {
-  if (process.env.FRAMEFUSE_FW_PYTHON) return process.env.FRAMEFUSE_FW_PYTHON;
-  return path.join(fasterWhisperRuntimeDir(), "python", "python.exe");
-}
-
-function fasterWhisperAvailable() {
-  if (fwRuntime.available != null) return fwRuntime.available;
-  let ok = false;
-  try {
-    if (process.env.FRAMEFUSE_FW_PYTHON) {
-      ok = fs.existsSync(process.env.FRAMEFUSE_FW_PYTHON);
-    } else {
-      ok =
-        fs.existsSync(fasterWhisperPython()) &&
-        fs.existsSync(fasterWhisperTranscriberPath());
-    }
-  } catch (_) { ok = false; }
-  fwRuntime.available = ok;
-  return ok;
-}
-
-function fasterWhisperCacheDir() {
-  return path.join(app.getPath("userData"), "faster-whisper-models");
-}
-
-/** v1.7: the installer BUNDLES the CTranslate2 tiny model inside the
- * faster-whisper runtime (staged by scripts/stage-faster-whisper-model.js,
- * shipped via extraResources). Passing this DIRECTORY as --model makes
- * WhisperModel() load straight from disk — no first-run HuggingFace
- * download (the root cause of both "very slow first transcription" and
- * the load-phase watchdog kills that fell users back to the slower ONNX
- * engine). Non-tiny sizes still download on demand (watchdog-bounded).
- * Returns null when the bundle is absent (dev boxes, partial installs) —
- * the sidecar then keeps the historical name-based download path. */
-function fasterWhisperBundledModelDir() {
-  try {
-    const dir = path.join(fasterWhisperRuntimeDir(), "models", "faster-whisper-tiny");
-    return fs.existsSync(path.join(dir, "model.bin")) ? dir : null;
-  } catch (_) {
-    return null;
-  }
-}
-
-/** Spawn the sidecar and stream its JSON-lines to the run bookkeeping.
- * Progress mapping mirrors the existing UI curve: load 10–25 %, transcribe
- * 25–80 %, align 80+ stays in the renderer. Returns the raw result payload
- * ({ chunks, language, wordLevel, durationMs }) — chunk shape is the SAME
- * contract the onnxruntime child returns.
- *
- * v7 FIX A — WATCHDOG (the "working for hours" hang): WhisperModel() can
- * sit forever inside huggingface_hub's model download — a stalled socket
- * with NO read timeout and NO stdout output — which used to leave the
- * transcription promise pending forever (the UI showed "Working…" for
- * hours with nothing happening). Three guards now bound the sidecar:
- *   • STALL: no stdout JSON line for 120 s → the process is dead/hung →
- *     kill + reject → the engine chain falls through to onnxruntime;
- *   • LOAD CAP: the load phase (model download included) gets 300 s total —
- *     a healthy connection downloads whisper-tiny in well under that; a
- *     trickling one is not worth waiting for when the BUNDLED onnx model
- *     is the next engine;
- *   • TOTAL CAP: 30 min hard ceiling (long-video transcription included).
- * The spawn env also sets HF_HUB_DOWNLOAD_TIMEOUT=30 so huggingface_hub's
- * own requests fail fast on dead connections instead of hanging reads. */
-const FW_STALL_TIMEOUT_MS = 120000;
-const FW_LOAD_TIMEOUT_MS = 300000;
-const FW_TOTAL_TIMEOUT_MS = 30 * 60000;
-
-function transcribeWithFasterWhisper(runId, { inputPath, language, model }) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const t0 = Date.now();
-    let lastActivity = Date.now();
-    let phase = "load"; // load → transcribe
-    const args = [
-      fasterWhisperTranscriberPath(),
-      "--audio", inputPath,
-      // v1.7: bundled CT2 tiny → local dir path (no download, instant
-      // load). Other sizes keep the name-based download (watchdog-bounded).
-      "--model", fasterWhisperBundledModelDir() ??
-        (["tiny", "base", "small", "medium"].includes(model) ? model : "tiny"),
-      "--language", typeof language === "string" && language ? language : "auto",
-      "--cache", fasterWhisperCacheDir(),
-      "--cpu-threads", String(Math.max(1, os.cpus().length)),
-    ];
-    const child = spawn(fasterWhisperPython(), args, {
-      windowsHide: true,
-      env: {
-        ...process.env,
-        PYTHONIOENCODING: "utf-8",
-        // v7 FIX A: bounded network ops inside the sidecar.
-        HF_HUB_DOWNLOAD_TIMEOUT: "30",
-        HF_HUB_DISABLE_PROGRESS_BARS: "1",
-      },
-    });
-    const run = whisperRuns.get(runId);
-    if (run) run.python = child;
-
-    let stdoutBuf = "";
-    let stderrTail = "";
-    const watchdog = setInterval(() => {
-      if (settled) { clearInterval(watchdog); return; }
-      const now = Date.now();
-      const idle = now - lastActivity;
-      if (idle > FW_STALL_TIMEOUT_MS) {
-        try { child.kill(); } catch (_) {}
-        finish(new Error(
-          `faster-whisper produced no output for ${Math.round(idle / 1000)}s — the sidecar hung and was killed`,
-        ));
-        return;
-      }
-      if (phase === "load" && now - t0 > FW_LOAD_TIMEOUT_MS) {
-        try { child.kill(); } catch (_) {}
-        finish(new Error(
-          "faster-whisper model load exceeded 5 minutes (slow or stalled download) — falling back to the bundled Whisper engine",
-        ));
-        return;
-      }
-      if (now - t0 > FW_TOTAL_TIMEOUT_MS) {
-        try { child.kill(); } catch (_) {}
-        finish(new Error("faster-whisper exceeded the 30-minute ceiling and was killed"));
-      }
-    }, 5000);
-
-    const finish = (err, result) => {
-      if (settled) return;
-      settled = true;
-      clearInterval(watchdog);
-      const r = whisperRuns.get(runId);
-      if (r) r.python = null;
-      if (err) reject(err);
-      else resolve(result);
-    };
-
-    child.stdout.on("data", (d) => {
-      lastActivity = Date.now();
-      stdoutBuf += d.toString("utf8");
-      let nl;
-      while ((nl = stdoutBuf.indexOf("\n")) >= 0) {
-        const line = stdoutBuf.slice(0, nl).trim();
-        stdoutBuf = stdoutBuf.slice(nl + 1);
-        if (!line) continue;
-        let msg;
-        try { msg = JSON.parse(line); } catch (_) { continue; }
-        if (!msg || typeof msg.type !== "string") continue;
-        switch (msg.type) {
-          case "stage":
-            sendWhisperProgress(runId, 10, "Loading faster-whisper model…");
-            break;
-          case "info":
-            phase = "transcribe";
-            sendWhisperProgress(runId, 25, `Transcribing (model ready, ${(Math.round((msg.durationMs || 0) / 60000))} min audio)…`);
-            break;
-          case "progress": {
-            phase = "transcribe";
-            const p = Number(msg.progress);
-            if (Number.isFinite(p)) {
-              sendWhisperProgress(runId, Math.min(80, 25 + Math.round(p * 0.55)), "Transcribing…");
-            }
-            break;
-          }
-          case "result":
-            child.kill();
-            finish(null, {
-              chunks: Array.isArray(msg.chunks) ? msg.chunks : null,
-              language: typeof msg.language === "string" ? msg.language : null,
-              wordLevel: !!msg.wordLevel,
-              durationMs: Number(msg.durationMs) || 0,
-            });
-            break;
-          case "error":
-            child.kill();
-            finish(new Error(String(msg.message || "faster-whisper failed")));
-            break;
-          default:
-            break;
-        }
-      }
-    });
-    child.stderr.on("data", (d) => {
-      lastActivity = Date.now(); // stderr chatter (tqdm, warnings) = alive
-      stderrTail = (stderrTail + d.toString()).slice(-1500);
-    });
-    child.on("error", (err) => finish(new Error(`Could not start faster-whisper: ${err.message}`)));
-    child.on("exit", (code, signal) => {
-      if (settled) return;
-      if (signal === "SIGTERM" || signal === "SIGKILL") {
-        finish(new Error("Transcription cancelled"));
-      } else {
-        finish(new Error(`faster-whisper exited (${code})${stderrTail ? `: ${stderrTail.trim().split("\n").slice(-2).join(" ")}` : ""}`));
-      }
-    });
-  });
-}
-
 ipcMain.handle("whisper:transcribe", async (event, payload) => {
   const { name, bytes, language } = payload || {};
   const sourcePath =
     payload && typeof payload.sourcePath === "string" ? payload.sourcePath : null;
-  const model =
-    payload && typeof payload.model === "string" ? payload.model : "tiny";
-  // v5.2: the renderer passes a client runId (crypto.randomUUID) so a cancel
-  // can target THIS run without killing other queued runs.
-  const clientRunId =
-    payload && typeof payload.runId === "string" && payload.runId
-      ? payload.runId
-      : null;
   // v1.3 ZERO-COPY: a local on-disk source (webUtils path from the renderer)
   // is addressed DIRECTLY — no renderer→main byte upload, no temp copy. The
   // byte path remains for browser-side media / project-restored blobs.
@@ -1261,355 +878,110 @@ ipcMain.handle("whisper:transcribe", async (event, payload) => {
     inputPath = tmpUploaded;
   }
   const runId = ++whisperRunSeq;
+  // v5.2: the renderer passes a client runId (crypto.randomUUID) so a cancel
+  // can target THIS run without killing other queued runs.
+  const clientRunId =
+    payload && typeof payload.runId === "string" && payload.runId
+      ? payload.runId
+      : null;
   try {
-    // ── v1.15 ENGINE 0: Groq Whisper API (cloud, user's own key) ────────
-    // The user directive: whisper-large-v3(-turbo) via Groq when the user
-    // pasted their own API key (default), falling back to the local engines
-    // on any failure so transcription never goes down. Engine selection:
-    //   "groq" — force cloud (errors if no key)
-    //   "local" — skip cloud entirely
-    //   "auto"/undefined — cloud when a key is saved, else local.
+    // ── GROQ WHISPER API — the ONLY transcription engine (v1.20) ────────
+    // No local fallback exists anymore: a missing key or an API failure
+    // throws with the real, actionable message (the renderer shows it in
+    // the failure toast) instead of silently degrading the result.
     const groqCfg = GQ.loadGroqConfig(app.getPath("userData"));
-    const enginePref =
-      payload && typeof payload.engine === "string" ? payload.engine : "auto";
-    const wantGroq =
-      enginePref === "groq" ||
-      (enginePref !== "local" && groqCfg.apiKey);
-    if (wantGroq) {
-      if (!groqCfg.apiKey) {
-        throw new Error(
-          "No Groq API key saved — open Settings → Captions, paste your key from console.groq.com (free), or switch the engine to “This device”.",
-        );
-      }
-      const groqModel = GQ.normalizeGroqModel(
-        payload && typeof payload.groqModel === "string" && payload.groqModel
-          ? payload.groqModel
-          : groqCfg.model,
+    if (!groqCfg.apiKey) {
+      throw new Error(
+        "No Groq API key saved. Open Settings → Captions → Transcription and paste your free Groq API key (console.groq.com).",
       );
-      // Register the run for whisper:cancel BEFORE any await — the abort
-      // hook kills the in-flight HTTPS upload.
-      let cancelReject = null;
-      const cancelled = new Promise((_res, rej) => { cancelReject = rej; });
-      const runEntry = {
-        resolve: () => {},
-        reject: (e) => cancelReject(e),
-        sender: event.sender,
-        clientRunId,
-        lastMsgAt: Date.now(),
-        phase: "transcribe",
-        groqAbort: null,
+    }
+    const groqModel = GQ.normalizeGroqModel(
+      payload && typeof payload.groqModel === "string" && payload.groqModel
+        ? payload.groqModel
+        : groqCfg.model,
+    );
+    // Register the run for whisper:cancel BEFORE any await — the abort
+    // hook kills the in-flight HTTPS upload.
+    let cancelReject = null;
+    const cancelled = new Promise((_res, rej) => { cancelReject = rej; });
+    const runEntry = {
+      resolve: () => {},
+      reject: (e) => cancelReject(e),
+      sender: event.sender,
+      clientRunId,
+      lastMsgAt: Date.now(),
+      phase: "transcribe",
+      groqAbort: null,
+    };
+    whisperRuns.set(runId, runEntry);
+    let compactAudio = null;
+    try {
+      const groqResult = await Promise.race([
+        (async () => {
+          sendWhisperProgress(
+            runId, 8,
+            `Groq ${groqModel} — preparing audio…`,
+          );
+          compactAudio = await GQ.extractAudioForGroq(
+            ffmpegPath,
+            inputPath,
+            ensureTempDir(),
+            (s) => sendWhisperProgress(runId, 12, s),
+          );
+          const abortRef = { abort: null };
+          runEntry.groqAbort = () => { try { abortRef.abort(); } catch (_) {} };
+          const result = await GQ.groqTranscribe({
+            apiKey: groqCfg.apiKey,
+            model: groqModel,
+            filePath: compactAudio.filePath,
+            language,
+            onProgress: (p) => sendWhisperProgress(runId, p.progress, p.status),
+            abortRef,
+          });
+          sendWhisperProgress(runId, 80, "Aligning word timestamps…");
+          return result;
+        })(),
+        cancelled,
+      ]);
+      whisperState.lastError = null;
+      whisperState.lastErrorAt = 0;
+      return {
+        chunks: groqResult.chunks,
+        language: groqResult.language,
+        wordLevel: groqResult.wordLevel,
+        durationMs: groqResult.durationMs,
+        engine: "groq",
       };
-      whisperRuns.set(runId, runEntry);
-      let compactAudio = null;
-      const groqWork = (async () => {
-        sendWhisperProgress(
-          runId, 8,
-          `Groq ${groqModel} — preparing audio…`,
-        );
-        compactAudio = await GQ.extractAudioForGroq(
-          ffmpegPath,
-          inputPath,
-          ensureTempDir(),
-          (s) => sendWhisperProgress(runId, 12, s),
-        );
-        const abortRef = { abort: null };
-        runEntry.groqAbort = () => { try { abortRef.abort(); } catch (_) {} };
-        const result = await GQ.groqTranscribe({
-          apiKey: groqCfg.apiKey,
-          model: groqModel,
-          filePath: compactAudio.filePath,
-          language,
-          onProgress: (p) => sendWhisperProgress(runId, p.progress, p.status),
-          abortRef,
-        });
-        sendWhisperProgress(runId, 80, "Aligning word timestamps…");
-        return result;
-      })();
-      try {
-        const groqResult = await Promise.race([groqWork, cancelled]);
-        whisperRuns.delete(runId);
-        try { if (compactAudio) fs.unlinkSync(compactAudio.filePath); } catch (_) {}
-        whisperState.lastError = null;
-        whisperState.lastErrorAt = 0;
-        return {
-          chunks: groqResult.chunks,
-          language: groqResult.language,
-          wordLevel: groqResult.wordLevel,
-          durationMs: groqResult.durationMs,
-          engine: "groq",
-        };
-      } catch (err) {
-        whisperRuns.delete(runId);
-        try { if (compactAudio) fs.unlinkSync(compactAudio.filePath); } catch (_) {}
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg.includes("cancelled")) throw err;
-        // Engine failure — surface it, then fall through to the local chain
-        // (a broken key/network must never take transcription down).
-        console.warn(`[whisper] Groq engine failed, falling back to local: ${msg}`);
-        whisperState.lastError = `groq: ${msg}`;
-        whisperState.lastErrorAt = Date.now();
-        sendWhisperProgress(
-          runId, 15,
-          `Groq unavailable (${msg.split(" [")[0].slice(0, 90)}) — using the local engine…`,
-        );
-      }
+    } catch (err) {
+      // v1.20: NO fallback chain — the real Groq error (invalid key, rate
+      // limit, file too large, network…) propagates to the renderer.
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("cancelled")) throw err;
+      whisperState.lastError = `groq: ${msg}`;
+      whisperState.lastErrorAt = Date.now();
+      throw err;
+    } finally {
+      whisperRuns.delete(runId);
+      try { if (compactAudio) fs.unlinkSync(compactAudio.filePath); } catch (_) {}
     }
-
-    // ── v1.3 ENGINE 1: faster-whisper sidecar (CTranslate2 int8) ──────
-    // ~4× faster than the onnxruntime path, exact word timestamps, VAD
-    // silence filtering, and base/small/medium models become practical.
-    // Any failure that is NOT a cancellation falls through to engine 2 so
-    // a broken runtime never takes transcription down with it.
-    if (fasterWhisperAvailable()) {
-      try {
-        const fw = await transcribeWithFasterWhisper(runId, {
-          inputPath,
-          language,
-          model,
-        });
-        whisperState.lastError = null;
-        whisperState.lastErrorAt = 0;
-        return { ...fw, engine: "faster-whisper" };
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg.includes("cancelled")) throw err;
-        console.warn(`[whisper] faster-whisper failed, falling back to onnxruntime: ${msg}`);
-        whisperState.lastError = `faster-whisper: ${msg}`;
-        whisperState.lastErrorAt = Date.now();
-      }
-    }
-
-    // ── ENGINE 2: onnxruntime utility process (v5.x path) ────────────
-    sendWhisperProgress(runId, 2, "Decoding audio…");
-    const pcm = await decodeAudioToPcm16k(inputPath);
-    if (pcm.length === 0) throw new Error("Audio file is empty or silent");
-    const durationMs = Math.round((pcm.length / 16000) * 1000);
-    sendWhisperProgress(runId, 10, "Loading Whisper-tiny model…");
-
-    const child = getWhisperChild();
-    // v7 FIX A — ENGINE 2 watchdog: a stalled model download (or a hung
-    // utilityProcess) used to leave this await pending FOREVER. Guards:
-    //   • LOAD phase: no child message for 240 s → kill the service, reject
-    //     with an actionable message (the child normally emits frequent
-    //     model/download progress; the bundled-model load is silent but
-    //     finishes in seconds).
-    //   • TOTAL: 10 min + 45× the audio duration — generous for slow-CPU
-    //     inference of long videos, but bounded (whisper-tiny at worst runs
-    //     ~0.5× real time on one core).
-    const ONNX_LOAD_STALL_MS = 240000;
-    const onnxTotalCapMs = 600000 + 45 * durationMs;
-    const onnxWatchdog = setInterval(() => {
-      const run = whisperRuns.get(runId);
-      if (!run) { clearInterval(onnxWatchdog); return; }
-      const idle = Date.now() - (run.lastMsgAt || Date.now());
-      if (idle > ONNX_LOAD_STALL_MS && run.phase !== "infer") {
-        clearInterval(onnxWatchdog);
-        try { if (whisperChild.proc) whisperChild.proc.kill(); } catch (_) {}
-        whisperRuns.delete(runId);
-        run.reject(new Error(
-          "The Whisper service stopped responding while loading the model (no progress for 4 minutes). It was restarted — please try again.",
-        ));
-        return;
-      }
-      if (Date.now() - onnxE0 > onnxTotalCapMs) {
-        clearInterval(onnxWatchdog);
-        try { if (whisperChild.proc) whisperChild.proc.kill(); } catch (_) {}
-        whisperRuns.delete(runId);
-        run.reject(new Error(
-          `Whisper transcription exceeded ${Math.round(onnxTotalCapMs / 60000)} minutes and was stopped — try a shorter clip or check CPU load.`,
-        ));
-      }
-    }, 5000);
-    const onnxE0 = Date.now();
-    const result = await new Promise((resolve, reject) => {
-      whisperRuns.set(runId, { resolve, reject, sender: event.sender, clientRunId, lastMsgAt: Date.now(), phase: "load" });
-      try {
-        // v1 fix: Electron's utilityProcess.postMessage accepts ONLY
-        // MessagePortMain objects in its transfer list — transferring the PCM
-        // ArrayBuffer threw "Invalid value for transfer" and killed every
-        // transcription ("Could not reach the Whisper service"). The message
-        // is now plain structured-clone: the Float32Array is copied (one
-        // memcpy of 64 KB per second of audio — negligible next to
-        // inference) and arrives as a real Float32Array in the child.
-        child.postMessage({
-          type: "transcribe",
-          runId,
-          pcm,
-          sampleRate: 16000,
-          language: language || "auto",
-          cacheDir: whisperCacheDir(),
-          // v1.5: installer-bundled model — local-first, offline transcription.
-          bundledModelDir: whisperBundledModelsRoot(),
-        });
-      } catch (err) {
-        whisperRuns.delete(runId);
-        reject(new Error(`Could not reach the Whisper service: ${err.message}`));
-      }
-    }).finally(() => {
-      clearInterval(onnxWatchdog);
-    });
-    sendWhisperProgress(runId, 80, "Aligning word timestamps…");
-    return { ...result, durationMs, engine: "onnxruntime" };
   } finally {
-    whisperRuns.delete(runId);
     if (tmpUploaded) { try { fs.unlinkSync(tmpUploaded); } catch (_) {} }
   }
 });
 
-ipcMain.handle("whisper:preload", async (event) => {
-  const runId = ++whisperRunSeq;
-  const child = getWhisperChild();
-  // v7 FIX A: preload watchdog — the model download can stall silently; no
-  // child message for 4 minutes kills the service and rejects (the next
-  // call respawns it). The bundled-model preload is local + instant.
-  const t0 = Date.now();
-  const watchdog = setInterval(() => {
-    const run = whisperRuns.get(runId);
-    if (!run) { clearInterval(watchdog); return; }
-    if (Date.now() - (run.lastMsgAt || t0) > 240000) {
-      clearInterval(watchdog);
-      try { if (whisperChild.proc) whisperChild.proc.kill(); } catch (_) {}
-      whisperRuns.delete(runId);
-      run.reject(new Error(
-        "The Whisper model download stopped responding (no progress for 4 minutes) and was cancelled. Check your connection and try again.",
-      ));
-    }
-  }, 5000);
-  return await new Promise((resolve, reject) => {
-    whisperRuns.set(runId, { resolve: () => resolve({ ok: true }), reject, sender: event.sender, lastMsgAt: Date.now(), phase: "load" });
-    try {
-      child.postMessage({
-        type: "preload",
-        runId,
-        cacheDir: whisperCacheDir(),
-        bundledModelDir: whisperBundledModelsRoot(),
-      });
-    } catch (err) {
-      whisperRuns.delete(runId);
-      clearInterval(watchdog);
-      reject(new Error(`Could not reach the Whisper service: ${err.message}`));
-    }
-  }).finally(() => {
-    clearInterval(watchdog);
-  });
-});
-
-// v1.3.1: pre-download a faster-whisper MODEL (tiny/base/small/medium) —
-// spawns the sidecar with --preload, which loads (and caches) the model
-// then exits. First real transcription is then fully offline. Progress
-// rides the same whisper:progress channel (load band 10–25 %).
-ipcMain.handle("whisper:fw-preload", async (event, payload) => {
-  if (!fasterWhisperAvailable()) {
-    throw new Error("faster-whisper runtime not staged on this machine");
-  }
-  const model =
-    payload && typeof payload.model === "string" &&
-    ["tiny", "base", "small", "medium"].includes(payload.model)
-      ? payload.model
-      : "tiny";
-  const runId = ++whisperRunSeq;
-  return await new Promise((resolve, reject) => {
-    let settled = false;
-    const args = [
-      fasterWhisperTranscriberPath(),
-      "--preload",
-      // v1.7: bundled CT2 tiny → preload is a local disk verification
-      // (instant); other sizes still download into the cache dir.
-      "--model", fasterWhisperBundledModelDir() ?? model,
-      "--cache", fasterWhisperCacheDir(),
-      "--cpu-threads", String(Math.max(1, os.cpus().length)),
-    ];
-    const child = spawn(fasterWhisperPython(), args, {
-      windowsHide: true,
-      env: {
-        ...process.env,
-        PYTHONIOENCODING: "utf-8",
-        // v7 FIX A: bounded hub downloads + clean stderr (no tqdm noise).
-        HF_HUB_DOWNLOAD_TIMEOUT: "30",
-        HF_HUB_DISABLE_PROGRESS_BARS: "1",
-      },
-    });
-    const run = { resolve: () => { if (!settled) { settled = true; resolve({ ok: true, model }); } }, reject, sender: event.sender, python: child };
-    whisperRuns.set(runId, run);
-    let stderrTail = "";
-    // v7 FIX A: preload watchdog — stall (no stdout activity for 2 min) or a
-    // 15-minute total cap kills the sidecar and rejects with a clear message
-    // (previously a dead download left the pre-download UI spinning forever).
-    const t0 = Date.now();
-    let lastActivity = Date.now();
-    const watchdog = setInterval(() => {
-      if (settled) { clearInterval(watchdog); return; }
-      const now = Date.now();
-      if (now - lastActivity > 120000 || now - t0 > 15 * 60000) {
-        try { child.kill(); } catch (_) {}
-        finish(
-          (e) => reject(new Error(String(e))),
-          now - lastActivity > 120000
-            ? `faster-whisper pre-download produced no output for ${Math.round((now - lastActivity) / 1000)}s — killed`
-            : "faster-whisper pre-download exceeded 15 minutes — killed",
-        );
-      }
-    }, 5000);
-    const finish = (fn, arg) => {
-      if (settled) return;
-      settled = true;
-      clearInterval(watchdog);
-      const r = whisperRuns.get(runId);
-      if (r) r.python = null;
-      whisperRuns.delete(runId);
-      fn(arg);
-    };
-    child.stdout.on("data", (d) => {
-      lastActivity = Date.now();
-      for (const line of d.toString("utf8").split("\n")) {
-        const t = line.trim();
-        if (!t) continue;
-        let msg;
-        try { msg = JSON.parse(t); } catch (_) { continue; }
-        if (msg && msg.type === "stage") {
-          sendWhisperProgress(runId, 12, `Downloading faster-whisper ${model} model…`);
-        } else if (msg && msg.type === "result" && msg.preloaded) {
-          try { child.kill(); } catch (_) {}
-          finish(run.resolve);
-        } else if (msg && msg.type === "error") {
-          try { child.kill(); } catch (_) {}
-          finish((e) => reject(new Error(String(e))), msg.message || "faster-whisper preload failed");
-        }
-      }
-    });
-    child.stderr.on("data", (d) => {
-      lastActivity = Date.now(); // stderr chatter = process alive
-      stderrTail = (stderrTail + d.toString()).slice(-1200);
-    });
-    child.on("error", (err) => finish((e) => reject(new Error(String(e))), `Could not start faster-whisper: ${err.message}`));
-    child.on("exit", (code, signal) => {
-      if (settled) return;
-      if (signal === "SIGTERM" || signal === "SIGKILL") {
-        finish((e) => reject(new Error(String(e))), "Transcription cancelled");
-      } else {
-        finish((e) => reject(new Error(String(e))), `faster-whisper exited (${code})${stderrTail ? `: ${stderrTail.trim().split("\n").slice(-2).join(" ")}` : ""}`);
-      }
-    });
-  });
-});
-
 ipcMain.handle("whisper:cancel", async (_event, payload) => {
-  const child = whisperChild.proc;
   const target =
     payload && typeof payload === "object" && typeof payload.runId === "string"
       ? payload.runId
       : null;
   if (target) {
     // v5.2: cancel ONE renderer run (by its client runId) — other queued
-    // runs keep going. v1.3: faster-whisper python runs are killed via the
-    // tracked child handle (the sidecar exits on SIGTERM/SIGKILL and its
-    // promise rejects with "Transcription cancelled").
+    // runs keep going. The in-flight Groq HTTPS upload is aborted via the
+    // tracked abort hook.
     for (const [runId, run] of Array.from(whisperRuns)) {
       if (run.clientRunId === target) {
         whisperRuns.delete(runId);
-        try { if (run.python) run.python.kill(); } catch (_) {}
         try { if (run.groqAbort) run.groqAbort(); } catch (_) {}
-        try { if (child) child.postMessage({ type: "cancel", runId }); } catch (_) {}
         run.reject(new Error("Transcription cancelled"));
         return 1;
       }
@@ -1620,136 +992,23 @@ ipcMain.handle("whisper:cancel", async (_event, payload) => {
   let cancelled = 0;
   for (const [runId, run] of Array.from(whisperRuns)) {
     whisperRuns.delete(runId);
-    try { if (run.python) run.python.kill(); } catch (_) {}
     try { if (run.groqAbort) run.groqAbort(); } catch (_) {}
-    try { if (child) child.postMessage({ type: "cancel", runId }); } catch (_) {}
     run.reject(new Error("Transcription cancelled"));
     cancelled++;
   }
   return cancelled;
 });
 
-// ── v5.2 whisper:status — model cache diagnostics for the Captions panel ──
-
-/** Recursive cache scan: [{ name (posix-relative), sizeBytes }] — the
- *  whisper cache holds ~7 small entries, so an unbounded walk is fine. */
-function scanWhisperCache(root) {
-  const files = [];
-  const walk = (dir) => {
-    let entries;
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch (_) {
-      return; // missing dir → empty cache
-    }
-    for (const entry of entries) {
-      const p = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        walk(p);
-        continue;
-      }
-      if (!entry.isFile()) continue;
-      try {
-        files.push({
-          name: path.relative(root, p).split(path.sep).join("/"),
-          sizeBytes: fs.statSync(p).size,
-        });
-      } catch (_) {
-        /* raced deletion — skip */
-      }
-    }
-  };
-  walk(root);
-  files.sort((a, b) => a.name.localeCompare(b.name));
-  return files;
-}
-
-/** modelReady heuristic: quantized (or fp32) ONNX encoder + merged decoder
- *  plus the config/tokenizer/preprocessor files transformers.js needs.
- *  Measured file set (verified by the 3-a sandbox smoke test):
- *    Xenova/whisper-tiny/config.json
- *    Xenova/whisper-tiny/generation_config.json
- *    Xenova/whisper-tiny/preprocessor_config.json
- *    Xenova/whisper-tiny/tokenizer.json + tokenizer_config.json
- *    Xenova/whisper-tiny/onnx/encoder_model_quantized.onnx     (~10.1 MB)
- *    Xenova/whisper-tiny/onnx/decoder_model_merged_quantized.onnx (~30.7 MB) */
-function whisperModelReady(files) {
-  const names = new Set(files.map((f) => f.name));
-  const base = "Xenova/whisper-tiny";
-  const has = (n) => names.has(`${base}/${n}`);
-  const encoder =
-    has("onnx/encoder_model_quantized.onnx") || has("onnx/encoder_model.onnx");
-  const decoder =
-    has("onnx/decoder_model_merged_quantized.onnx") ||
-    has("onnx/decoder_model_merged.onnx");
-  if (!encoder || !decoder) return false;
-  // Guard against truncated/partial downloads: the ONNX pair must be
-  // substantive (> 1 MB combined).
-  const onnxBytes = files
-    .filter((f) => f.name.startsWith(`${base}/onnx/`) && f.name.endsWith(".onnx"))
-    .reduce((n, f) => n + f.sizeBytes, 0);
-  if (onnxBytes < 1024 * 1024) return false;
-  return (
-    has("config.json") &&
-    has("preprocessor_config.json") &&
-    (has("tokenizer.json") || has("vocab.json"))
-  );
-}
-
-ipcMain.handle("whisper:status", async () => {
-  const cacheDir = whisperCacheDir();
-  const cacheFiles = scanWhisperCache(cacheDir);
-  const totalCacheBytes = cacheFiles.reduce((n, f) => n + f.sizeBytes, 0);
-  // v1.3: engine report — the sidecar wins when its runtime is staged;
-  // its model cache lives in a sibling folder of userData.
-  let fwCacheFiles = [];
-  try { fwCacheFiles = scanWhisperCache(fasterWhisperCacheDir()); } catch (_) {}
-  // v1.5: the installer-shipped model — bundled availability is the fact the
-  // captions panel cares about first ("works offline out of the box").
-  let bundledFiles = [];
-  try { bundledFiles = scanWhisperCache(path.join(whisperBundledModelsRoot(), "Xenova")); } catch (_) {}
-  const bundledReady = whisperModelReady(
-    bundledFiles.map((f) => ({ ...f, name: `Xenova/${f.name}` })),
-  );
-  return {
-    cacheDir,
-    hostUsed: whisperState.hostUsed,
-    modelReady: bundledReady || whisperModelReady(cacheFiles),
-    bundled: {
-      available: bundledReady,
-      dir: whisperBundledModelsRoot(),
-      files: bundledFiles,
-      totalBytes: bundledFiles.reduce((n, f) => n + f.sizeBytes, 0),
-    },
-    cacheFiles,
-    totalCacheBytes,
-    lastError: whisperState.lastError,
-    childAlive: !!(whisperChild.proc && !whisperChild.dead),
-    activeRuns: whisperRuns.size,
-    engine: fasterWhisperAvailable() ? "faster-whisper" : "onnxruntime",
-    fwCacheDir: fasterWhisperCacheDir(),
-    fwCacheFiles,
-    fwCacheBytes: fwCacheFiles.reduce((n, f) => n + f.sizeBytes, 0),
-    // v1.15: Groq engine state (key presence only — the raw key NEVER
-    // crosses the bridge) + faster-whisper runtime availability (no longer
-    // bundled with the installer — present only when staged/opt-in).
-    groq: (() => {
-      try {
-        const cfg = GQ.loadGroqConfig(app.getPath("userData"));
-        return { hasKey: !!cfg.apiKey, maskedKey: GQ.maskApiKey(cfg.apiKey), model: cfg.model };
-      } catch (_) {
-        return { hasKey: false, maskedKey: "", model: GQ.DEFAULT_GROQ_MODEL };
-      }
-    })(),
-    fwAvailable: fasterWhisperAvailable(),
-  };
-});
+// ── v1.20 whisper:status — Groq engine config (the only engine) ───────────
+// Same payload shape the settings panel consumes (hasKey/maskedKey/model/
+// models) — the local model-cache diagnostics are gone with the engines.
+ipcMain.handle("whisper:status", async () => groqConfigPayload());
 
 // ── v1.15 Groq Whisper API configuration IPC ────────────────────────────
 // The API key is the USER'S OWN, stored ONLY on this device (userData/
 // groq.json, mode 0600, never inside project files, never rendered raw —
-// the bridge returns a masked form). The renderer keeps an app-level
-// ENGINE preference in localStorage (groq when a key exists, else local).
+// the bridge returns a masked form). The renderer keeps an app-level cloud
+// MODEL preference in localStorage (groq is the only engine since v1.20).
 
 function groqConfigPayload() {
   const cfg = GQ.loadGroqConfig(app.getPath("userData"));
@@ -1758,7 +1017,6 @@ function groqConfigPayload() {
     maskedKey: GQ.maskApiKey(cfg.apiKey),
     model: cfg.model,
     models: GQ.GROQ_MODELS,
-    fwAvailable: fasterWhisperAvailable(),
   };
 }
 
@@ -1794,6 +1052,179 @@ ipcMain.handle("whisper:groq-test", async (_event, payload) => {
     };
   }
   return GQ.groqTestKey(candidate);
+});
+
+// ── v1.20 GEMINI SCRIPT WRITING ──────────────────────────────────────────
+// The AI Script Writer generates narration scripts with a cloud text model.
+// DEFAULT provider is Google Gemini (gemini-3.5-flash-lite — fast + generous
+// free tier), with the wider Gemini family AND the existing Groq chat models
+// selectable in the UI. The Gemini key is the USER'S OWN, stored ONLY on
+// this device (userData/gemini.json, mode 0600, never inside project files)
+// — the bridge returns a masked form only, exactly like groq.json. The Groq
+// provider reuses the SAME key the Captions tab manages (GQ.loadGroqConfig)
+// — there is no second Groq key UI.
+
+/** Masked Gemini config for the renderer (never the raw key). */
+function geminiConfigPayloadMain() {
+  return GM.geminiConfigPayload(app.getPath("userData"));
+}
+
+ipcMain.handle("gemini:get", async () => geminiConfigPayloadMain());
+
+/** { apiKey } — a non-empty string is required (removal is gemini:clear).
+ *  Returns the masked payload after saving. */
+ipcMain.handle("gemini:set", async (_event, payload) => {
+  const p = payload || {};
+  if (typeof p.apiKey !== "string" || !p.apiKey.trim()) {
+    throw new Error("gemini:set expects a non-empty apiKey string");
+  }
+  GM.saveGeminiConfig(app.getPath("userData"), { apiKey: p.apiKey.trim() });
+  return geminiConfigPayloadMain();
+});
+
+/** Verify a key (the saved one, or a candidate passed in for validation
+ *  BEFORE saving) via GET /v1beta/models → { ok, message, modelCount }. */
+ipcMain.handle("gemini:test", async (_event, payload) => {
+  const p = payload || {};
+  const saved = GM.loadGeminiConfig(app.getPath("userData"));
+  const candidate =
+    typeof p.apiKey === "string" && p.apiKey.trim() ? p.apiKey.trim() : saved.apiKey;
+  if (!candidate) {
+    return {
+      ok: false,
+      message: "No API key yet — paste a key from aistudio.google.com/apikey first",
+      modelCount: 0,
+    };
+  }
+  return GM.geminiTestKey({ apiKey: candidate });
+});
+
+/** Remove gemini.json → { ok } (ok=false: there was no key to remove). */
+ipcMain.handle("gemini:clear", async () => {
+  return { ok: GM.removeGeminiConfig(app.getPath("userData")) };
+});
+
+/** Build the scriptwriter system prompt — ONE place, both providers.
+ *  Professional short-form scriptwriter: first-line hook, spoken-word style
+ *  (contractions, short sentences), explicit [pause] + EMPHASIS cues on key
+ *  beats, narration-ready plain text (NO markdown headings), length-aware
+ *  (~2.5 words per second of the target duration), tone + language aware. */
+function buildScriptSystemPrompt({ tone, durationSec, language }) {
+  const toneWord =
+    typeof tone === "string" && tone.trim() ? tone.trim() : "energetic";
+  const dur =
+    Number.isFinite(Number(durationSec)) && Number(durationSec) > 0
+      ? Math.round(Number(durationSec))
+      : 60;
+  const lang =
+    typeof language === "string" && language.trim() ? language.trim() : "English";
+  const targetWords = Math.round(dur * 2.5);
+  return [
+    "You are a professional short-form video scriptwriter.",
+    `Write ONE narration script for a ${dur}-second video, in a ${toneWord} tone.`,
+    "Requirements:",
+    "1. Hook the viewer in the very FIRST line — a bold claim, a question, or a vivid image that stops the scroll.",
+    "2. Spoken-word style: contractions, short punchy sentences, plain everyday vocabulary. It must sound natural when read aloud.",
+    "3. Mark dramatic beats with an explicit [pause] on its own line, and write the key words in CAPITALS for emphasis.",
+    "4. Narration-ready PLAIN TEXT only — no markdown headings, no bullet points, no scene directions, no timestamps, no labels.",
+    `5. Length-aware: aim for roughly ${targetWords} words total (about 2.5 words per second of the ${dur}-second runtime).`,
+    `6. Write the entire script in ${lang}.`,
+    "Return ONLY the script text — nothing before or after it.",
+  ].join("\n");
+}
+
+/** { provider: "gemini"|"groq", model, prompt, tone?, durationSec?, language? }
+ *  → { ok: true, text, model, provider } | { ok: false, error }. NEVER
+ *  throws — the renderer displays `error` inline. Gemini (the default) uses
+ *  the saved gemini.json key; Groq uses the saved groq.json key (the one
+ *  the Captions tab manages). */
+ipcMain.handle("script:generate", async (_event, payload) => {
+  const p = payload || {};
+  const provider = p.provider === "groq" ? "groq" : "gemini";
+  const prompt = typeof p.prompt === "string" ? p.prompt.trim() : "";
+  if (!prompt) {
+    return { ok: false, error: "Describe the video first — the prompt is empty" };
+  }
+  if (prompt.length > 2000) {
+    return { ok: false, error: `The prompt is ${prompt.length} characters — keep it under 2000` };
+  }
+  const model = typeof p.model === "string" ? p.model : "";
+  const systemPrompt = buildScriptSystemPrompt({
+    tone: p.tone,
+    durationSec: p.durationSec,
+    language: p.language,
+  });
+  const temperature = 0.8; // creative writing, not classification
+  try {
+    if (provider === "groq") {
+      const groqCfg = GQ.loadGroqConfig(app.getPath("userData"));
+      if (!groqCfg.apiKey) {
+        return {
+          ok: false,
+          error:
+            "No Groq API key saved — open Settings → Captions, paste your key from console.groq.com (free), then pick the Groq model here again.",
+        };
+      }
+      const res = await GC.groqChat({
+        apiKey: groqCfg.apiKey,
+        model,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: prompt },
+        ],
+        temperature,
+        maxTokens: 2048,
+      });
+      const text = typeof res.content === "string" ? res.content.trim() : "";
+      if (!text) {
+        return {
+          ok: false,
+          error: "The model returned an empty script — try again or pick another model",
+        };
+      }
+      return { ok: true, text, model: GC.normalizeTextModel(model), provider };
+    }
+    // Default provider: Google Gemini (saved key from userData/gemini.json).
+    const geminiCfg = GM.loadGeminiConfig(app.getPath("userData"));
+    if (!geminiCfg.apiKey) {
+      return {
+        ok: false,
+        error:
+          "No Gemini API key saved — get a free key at aistudio.google.com/apikey and paste it above.",
+      };
+    }
+    const res = await GM.geminiChat({
+      apiKey: geminiCfg.apiKey,
+      model,
+      systemPrompt,
+      userPrompt: prompt,
+      temperature,
+      maxOutputTokens: 4096, // generous: newer Gemini models spend part of
+      // the budget on internal thinking.
+    });
+    return { ok: true, text: res.text, model: GM.normalizeTextModel(model), provider };
+  } catch (err) {
+    return { ok: false, error: err && err.message ? err.message : String(err) };
+  }
+});
+
+/** Both providers' model catalogs + whether a key is saved for each —
+ *  picker data, no key needed. */
+ipcMain.handle("script:models", async () => {
+  const geminiCfg = GM.loadGeminiConfig(app.getPath("userData"));
+  const groqCfg = GQ.loadGroqConfig(app.getPath("userData"));
+  return {
+    gemini: {
+      models: GM.GEMINI_TEXT_MODELS,
+      default: GM.GEMINI_DEFAULT_TEXT_MODEL,
+      hasKey: !!geminiCfg.apiKey,
+    },
+    groq: {
+      models: GC.GROQ_TEXT_MODELS,
+      default: GC.DEFAULT_TEXT_MODEL,
+      hasKey: !!groqCfg.apiKey,
+    },
+  };
 });
 
 // ---------------------------------------------------------------------------
@@ -1895,7 +1326,8 @@ const dubState = {
 };
 
 /** Payload: { segments:[{videoPath,startMs,endMs?}], sourceLanguage,
- *  targetLanguage, targetLocale, groqModel, femaleVoice, maleVoice }.
+ *  targetLanguage, targetLocale, groqModel, femaleVoice, maleVoice,
+ *  voiceMode ("single"|"multi"), singleVoice }.
  *  Progress streams on "dub:progress" ({ phase, progress, status }).
  *  On success every result segment carries its wav BYTES (ArrayBuffer) —
  *  the renderer holds them in memory; the temp wav dir is deleted right
@@ -1946,6 +1378,10 @@ ipcMain.handle("dub:start", async (event, payload) => {
         ...(typeof p.femaleVoice === "string" && p.femaleVoice ? { 0: p.femaleVoice } : {}),
         ...(typeof p.maleVoice === "string" && p.maleVoice ? { 1: p.maleVoice } : {}),
       },
+      // v1.20 single-voice mode: one Edge-TTS voice reads every line and
+      // speaker detection is skipped entirely ("multi"/absent = legacy).
+      voiceMode: p.voiceMode === "single" ? "single" : "multi",
+      singleVoice: typeof p.singleVoice === "string" ? p.singleVoice.trim() : "",
       tempDir: ensureTempDir(),
       ffmpegPath,
       ffprobePath: (await ffprobeAvailable()) || "ffprobe",
@@ -4297,6 +3733,22 @@ ipcMain.handle("export-native", async (event, opts) => {
     }
   }
 
+  // v1.20: WHY the CLI pipeline runs (kinetic-typography captions, stack
+  // text, geometric transitions, …) — threaded into every export-progress
+  // event so the Header badge can show the routing reason instead of a
+  // silent "FFmpeg CLI" (the #1 "why is the rust engine not working"
+  // support question).
+  const cliEngineReason = (() => {
+    try {
+      return RUST.rustGateReason ? RUST.rustGateReason(opts) : null;
+    } catch {
+      return null;
+    }
+  })();
+  if (cliEngineReason) {
+    console.log(`[Export] FFmpeg CLI pipeline — Rust engine bypassed: ${cliEngineReason}`);
+  }
+
   // v4.4 watermark: { imagePath, x, y, w, h, opacity } — geometry computed
   // ONCE in the renderer process (watermarkGeometry) so preview + export
   // can never disagree. The chain (scale → setsar → rgba →
@@ -4400,6 +3852,9 @@ ipcMain.handle("export-native", async (event, opts) => {
         // v1.18: WHICH engine is running — the Header badge renders it
         // ("FFmpeg CLI" vs the Rust router's engine: "rust" events).
         engine: "cli",
+        // v1.20: WHY the CLI pipeline was chosen (kinetic-captions,
+        // stack-text, …) — null when the engine simply isn't installed.
+        engineReason: cliEngineReason || undefined,
         // Overall ×-realtime: content-seconds processed per wall-second
         // (the timemark is the aggregated content position; this is the
         // same number ffmpeg prints as speed=, measured across the pool).
@@ -6726,11 +6181,6 @@ app.whenReady().then(() => {
 });
 
 app.on("window-all-closed", () => { if (process.platform !== "darwin") app.quit(); });
-
-// v5.1: the Whisper utility process must not outlive the app.
-app.on("will-quit", () => {
-  try { if (whisperChild.proc) whisperChild.proc.kill(); } catch (_) {}
-});
 
 // Test hook — exposes the ASS builder + the v1.4.2 hw-decode probe to the
 // dev verification harness (scripts/verify-chunked-encode.js stubs the

@@ -24,6 +24,7 @@
 
 use crate::audio::{self, PcmBuffer, Track};
 use crate::compositor::{self, Bitmap, Compositor, Layer, OutputFormat, TextLayer, YuvMode};
+use crate::captions::{self, PreparedCaptions};
 use crate::ffmpeg_ffi::*;
 use crate::ffi_offsets::*;
 use crate::text::TextRenderer;
@@ -687,6 +688,20 @@ pub fn run_pipeline(
     }
     let texts = Arc::new(texts);
 
+    // ── v1.20 NATIVE CAPTIONS: prepare once (font load + layout + word
+    // bitmap cache). None when the timeline carries no caption cues —
+    // painting is then a no-op. ─────────────────────────────────────
+    let prepared_captions: Option<Arc<PreparedCaptions>> = match captions::prepare(&timeline, cw, ch) {
+        Ok(p) => p.map(Arc::new),
+        Err(e) => {
+            // A caption failure must never kill the export — degrade to
+            // captions-less output (the router logs it; parity with the
+            // CLI pipeline's error tolerance).
+            log::warn!("[rust-engine] captions unavailable ({}): exporting without burn-in", e);
+            None
+        }
+    };
+
     // ── watermark ────────────────────────────────────────────────────────
     let mut watermark: Option<TextLayer> = None;
     if let Some(wm) = &timeline.watermark {
@@ -952,6 +967,7 @@ pub fn run_pipeline(
         let overlays = overlays.clone();
         let image_bitmaps = image_bitmaps.clone();
         let texts = texts.clone();
+        let prepared_captions = prepared_captions.clone();
         let watermark = watermark.clone();
         std::thread::Builder::new()
             .name("framefuse-producer".into())
@@ -993,6 +1009,7 @@ pub fn run_pipeline(
                         &image_bitmaps,
                         &mut video_sources,
                         &texts,
+                        &prepared_captions,
                         &watermark,
                         &mut decode_ms,
                         cw,
@@ -1341,6 +1358,7 @@ fn build_frame_job(
     image_bitmaps: &std::collections::HashMap<usize, Bitmap>,
     video_sources: &mut std::collections::HashMap<usize, VideoSource>,
     texts: &[(usize, TextLayer, f64, f64, f64)],
+    captions: &Option<Arc<PreparedCaptions>>,
     watermark: &Option<TextLayer>,
     decode_ms: &mut i64,
     cw: u32,
@@ -1527,10 +1545,29 @@ fn build_frame_job(
         tl.alpha = alpha;
         text_layers.push(tl);
     }
+
+    // ── v1.20 CAPTIONS: burned-in cue layers (above texts, below the
+    //    watermark — the ASS emission order: headline < kinetic < cue).
+    if let Some(pc) = captions {
+        text_layers.extend(captions::layers_at(pc, now_ms, cw, ch));
+    }
+
     if let Some(wm) = watermark {
         text_layers.push(wm.clone());
     }
 
+    if std::env::var("FF_DEBUG_CAPTIONS").is_ok() && !text_layers.is_empty() {
+        eprintln!(
+            "[captions-dbg] frame {} ({}ms): {} text layers: {:?}",
+            k,
+            now_ms as i64,
+            text_layers.len(),
+            text_layers
+                .iter()
+                .map(|t| format!("{}x{}@{},{} a={:.2} bmp={}x{}", t.dest_px.2, t.dest_px.3, t.dest_px.0, t.dest_px.1, t.alpha, t.bitmap.w, t.bitmap.h))
+                .collect::<Vec<_>>()
+        );
+    }
     Ok(FrameJob { k, layers, texts: text_layers, background })
 }
 

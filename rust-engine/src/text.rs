@@ -87,7 +87,13 @@ impl TextRenderer {
         let strip_h = (line_h.ceil() as i32 + pad * 2 + 4).max(1) as u32;
         let mut rgba = vec![0u8; strip_w as usize * strip_h as usize * 4];
 
-        let place = |rgba: &mut Vec<u8>, ox: i32, oy: i32, col: [u8; 4], use_alpha: bool| {
+        // `is_fill` marks the TOPMOST glyph pass: it owns its pixels
+        // unconditionally. The under-passes (outline offsets) max-blend so
+        // the strongest outline coverage wins — but an alpha-equality
+        // comparison would let the outline's identical coverage suppress
+        // the fill and render the glyph body in the OUTLINE color (the
+        // v1.20 caption shadow/outline-only render bug, same class here).
+        let place = |rgba: &mut Vec<u8>, ox: i32, oy: i32, col: [u8; 4], use_alpha: bool, is_fill: bool| {
             let mut x = pad as i32;
             for (i, &ch) in chars.iter().enumerate() {
                 let (m, cov) = font.rasterize(ch, size);
@@ -110,8 +116,7 @@ impl TextRenderer {
                         } else {
                             c
                         };
-                        // max-blend (outline under glyph)
-                        if a > rgba[d + 3] {
+                        if is_fill || a > rgba[d + 3] {
                             rgba[d] = col[0];
                             rgba[d + 1] = col[1];
                             rgba[d + 2] = col[2];
@@ -135,10 +140,10 @@ impl TextRenderer {
                 (-outline_w, outline_w),
                 (outline_w, outline_w),
             ] {
-                place(&mut rgba, ox, oy, outline, false);
+                place(&mut rgba, ox, oy, outline, false, false);
             }
         }
-        place(&mut rgba, 0, 0, color, true);
+        place(&mut rgba, 0, 0, color, true, true);
 
         // dest rect: anchor from position preset / explicit x
         let y_frac = match text.position.as_str() {

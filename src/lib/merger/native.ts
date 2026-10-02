@@ -601,6 +601,10 @@ async function exportViaFFmpeg(
       position: preset.position,
       positionY: preset.positionY,
       customPosition: captionSettings.customPosition,
+      // v1.20: wrap width (fraction of canvas) — the NATIVE Rust caption
+      // renderer consumes it for the balanced wrap (the ASS path derives
+      // it from Style margins; Rust needs the explicit fraction).
+      maxWidth: preset.maxWidth,
       // Word-by-word mode (renderer → main process)
       wordMode: captionSettings.wordMode || "off",
       // Kinetic typography animation (renderer → main process)

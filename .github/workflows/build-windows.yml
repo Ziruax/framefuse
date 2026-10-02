@@ -295,9 +295,10 @@ jobs:
           node -e "const e=require('./rust-engine/index.js'); if(!e.available()){console.error('LOAD FAILED:', e.loadError()); process.exit(1);} console.log('probe ok:', e.engineVersion(), e.loadedFrom)"
 
       # Full chain: clean → next build → gpu-worker → copy-wasm →
-      # fetch-windows-ffmpeg → stage-whisper(-service/-model) →
-      # build-rust-engine (SKIPPED — binary already staged above) →
-      # electron-builder --win nsis --publish never.
+      # fetch-windows-ffmpeg → build-rust-engine (SKIPPED — binary already
+      # staged above) → electron-builder --win nsis --publish never.
+      # v1.20: no whisper staging steps — Groq Cloud (user's API key) is the
+      # only transcription engine; nothing local ships with the installer.
       # scripts/clean.js only removes .next/out/dist — the staged .node is
       # safe. rust-engine/** ships asar-unpacked (package.json build config).
       - name: Build Electron installer (reuses the smoke-tested .node)

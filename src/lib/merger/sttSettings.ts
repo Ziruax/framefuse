@@ -1,19 +1,21 @@
 /**
- * v1.15 — app-level speech-to-text settings (ENGINE preference + Groq model).
+ * v1.15/v1.20 — app-level speech-to-text settings (Groq model preference).
  *
  * These are DEVICE/App preferences, not project settings: they live in
  * localStorage (the browser) and are respected by the Electron main process
  * via the whisper:transcribe payload. The Groq API key itself is stored by
  * the MAIN process in userData/groq.json (0600, device-local, never in
- * project files) — this module only stores the *preference* of which engine
- * to use and the preferred cloud model.
+ * project files) — this module only stores the preferred cloud model.
+ *
+ * v1.20: Groq Cloud is the ONLY transcription engine — the "local" engine
+ * option no longer exists (stored "local" preferences migrate to "groq"
+ * on read).
  */
 
-export type SttEngine = "groq" | "local";
+export type SttEngine = "groq";
 
 export interface SttSettings {
-  /** "groq" — use the Groq Whisper API when a key is saved on this device
-   *  (falls back to local engines on failure). "local" — always offline. */
+  /** "groq" — the Groq Whisper API (the ONLY engine; requires a saved key). */
   engine: SttEngine;
   /** Groq model id: whisper-large-v3-turbo (default, faster) or
    *  whisper-large-v3. */
@@ -57,7 +59,9 @@ export function loadSttSettings(): SttSettings {
     if (!raw) return { ...DEFAULT_STT_SETTINGS };
     const j = JSON.parse(raw) as Partial<SttSettings>;
     return {
-      engine: j.engine === "local" ? "local" : "groq",
+      // v1.20: the local engines are gone — a stored "local" preference
+      // migrates to "groq" on read.
+      engine: "groq",
       groqModel: normalizeSttModel(j.groqModel),
     };
   } catch {
@@ -71,7 +75,8 @@ export function saveSttSettings(s: SttSettings): void {
     window.localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({
-        engine: s.engine === "local" ? "local" : "groq",
+        // v1.20: groq is the only engine — always persisted as "groq".
+        engine: "groq" as const,
         groqModel: normalizeSttModel(s.groqModel),
       }),
     );
@@ -82,11 +87,10 @@ export function saveSttSettings(s: SttSettings): void {
 
 /**
  * The routing object whisper.ts forwards to the main process on every
- * transcription call. With no saved Groq key the main process ignores the
- * cloud routing and uses the local engines — the renderer stays honest
- * about what actually runs via the result's `engine` field.
+ * transcription call. v1.20: the engine is always "groq" — a missing key
+ * produces a clear actionable error main-side (no local fallback exists).
  */
-export function sttRouting(): { engine: "groq" | "local" | "auto"; groqModel: string } {
+export function sttRouting(): { engine: "groq"; groqModel: string } {
   const s = loadSttSettings();
   return { engine: s.engine, groqModel: s.groqModel };
 }
