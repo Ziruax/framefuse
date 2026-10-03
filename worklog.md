@@ -2288,3 +2288,20 @@ Stage Summary:
 - Groq transcription survives the two known API failure modes (turbo word-timestamp 400s, model deprecation 404s) with auto-retries; language hints can never 400.
 - Dubbing can run its AI phases on Gemini (user's key + model pick) or Groq; Gemini model ids self-heal on 404.
 - The frontend is the new warm Ember Studio theme.
+
+---
+Task ID: 2 (ship v1.22.0)
+Agent: main (Z.ai Code)
+Task: Ship v1.22.0 — build the NSIS installer + push to GitHub + publish the release.
+
+Work Log:
+- Commit 5cb6ba5 pushed to main ("v1.22.0: engine diagnostics + self-test, Groq whisper resilience, Gemini dubbing, Ember Studio redesign").
+- CI run 37110935239 job 1 (windows-latest MSVC) GREEN: engine build → E2E smoke PASSED (h264 + 150 frames + aac 48kHz, engineUsed rust-gpu, ffmpegDir resources/ffmpeg/win/dll) → v2 feature + color tests.
+- Artifact 11269552947 downloaded + staged: framefuse-engine.win32-x64.node (11,842,048 B; sha256 55fe552a4d5e…) — the installer ships EXACTLY this smoke-tested binary (sha VERIFIED inside app.asar.unpacked).
+- next build --webpack → gpu-worker (356 KB) → fetch-windows-ffmpeg (BtbN master drifted past 7.1 again → the tag-pinned gyan-mirror 7.1.1 shared build supplied the DLLs; BtbN master supplied the CLI exes) → electron-builder --win nsis → dist/FrameFuse Setup 1.22.0.exe (221,192,343 B) + blockmap + latest.yml. rcedit: FrameFuse.exe 1.22.0.0.
+- ASAR verification: rust-engine-router.js carries runRustSelfTest/recordRustFailure (8 markers); groq-whisper.js groqTranscribeOnce ×6 + normalizeLanguageCode ×3; dub-workflow.js chatComplete/geminiChat ×7; preload.js engineSelfTest/engineStatus ×4; renderer page chunk carries "Run engine test" + "AI model provider"; resources/ffmpeg/win/dll has the 5 pinned-family DLLs; resources/fonts has the TTFs; package.json 1.22.0.
+- PUBLISHED scripts/publish-release-1.22.0.js: release 402429839 created at 5cb6ba5, assets FrameFuse-Setup-1.22.0.exe + latest.yml + blockmap uploaded. THREE-WAY sha512 VERIFIED (ZuSgJVawh2Ez… local == latest.yml == re-downloaded; size exact).
+
+Stage Summary:
+- v1.22.0 IS LIVE: https://github.com/Ziruax/framefuse/releases/tag/v1.22.0 (installer only — NSIS, per the standing directive).
+- This round: the engine can no longer silently fall back (live diagnostics + real self-test + runtime-failure reasons in the badge), Groq transcription survives word-timestamp 400s / model 404s / bad language hints, dubbing runs on Gemini or Groq, and the whole UI is the new Ember Studio theme.
