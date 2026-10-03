@@ -70,6 +70,32 @@ function normalizeGroqModel(id) {
   return GROQ_MODELS.some((m) => m.id === id) ? id : DEFAULT_GROQ_MODEL;
 }
 
+/** The OTHER whisper model (404/deprecation auto-fallback). */
+function alternateGroqModel(id) {
+  return id === "whisper-large-v3" ? "whisper-large-v3-turbo" : "whisper-large-v3";
+}
+
+/** Normalize a language hint into a STRICT ISO-639-1 code the Groq API
+ * accepts, or null (omit → auto-detect). Accepts "auto", "en", "en-US",
+ * "EN", "english" (common full names) — anything unrecognizable is
+ * dropped rather than 400-ing the whole request (v1.22 fix). */
+const LANGUAGE_FULL_NAMES = {
+  english: "en", spanish: "es", french: "fr", german: "de", italian: "it",
+  portuguese: "pt", russian: "ru", chinese: "zh", japanese: "ja", korean: "ko",
+  hindi: "hi", urdu: "ur", arabic: "ar", bengali: "bn", tamil: "ta",
+  telugu: "te", marathi: "mr", punjabi: "pa", gujarati: "gu", dutch: "nl",
+  turkish: "tr", indonesian: "id", vietnamese: "vi", thai: "th", ukrainian: "uk",
+  persian: "fa", hebrew: "he", polish: "pl", swedish: "sv", czech: "cs",
+};
+function normalizeLanguageCode(input) {
+  const raw = String(input || "").trim().toLowerCase();
+  if (!raw || raw === "auto" || raw === "unknown") return null;
+  if (/^[a-z]{2}$/.test(raw)) return raw;
+  if (/^[a-z]{2}[-_]/.test(raw)) return raw.slice(0, 2);
+  if (LANGUAGE_FULL_NAMES[raw]) return LANGUAGE_FULL_NAMES[raw];
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Config storage — userData/groq.json, NEVER inside project files, never
 // synced anywhere. The key stays on the user's device.
@@ -243,9 +269,77 @@ function classifyGroqError(status, bodyText) {
  * @returns {Promise<{chunks:Array,language:string,wordLevel:boolean,durationMs:number,text:string}>}
  */
 function groqTranscribe(o) {
+  const requestedModel = normalizeGroqModel(o.model);
+  const language = normalizeLanguageCode(o.language);
+
+  const isCancelErr = (err) =>
+    err && /cancel/i.test(String(err.message || err));
+
+  /** 400 that names timestamp granularities / word-level output — the
+   *  known turbo-model limitation; retry once WITHOUT the granularities. */
+  const isTimestamp400 = (err) =>
+    err && err.status === 400 &&
+    /timestamp|granularit|word[-_ ]level/i.test(String(err.apiMessage || err.message || ""));
+
+  /** 404 model-not-found / decommisioned-model — swap to the other whisper. */
+  const isModel404 = (err) =>
+    err && err.status === 404 &&
+    /model|decommission/i.test(String(err.apiMessage || err.message || ""));
+
+  // v1.22 RESILIENCE (the "error while transcribing" fixes):
+  //   A) the turbo model has rejected word-level timestamps for some
+  //      accounts/periods — a 400 naming timestamps retries once with plain
+  //      verbose_json (segment-level cues still parse + even-distribute).
+  //   B) a 404/decommissioned model id retries once with the OTHER whisper
+  //      model (turbo ↔ v3) — silent, logged through the status message.
+  //   Everything else propagates VERBATIM (the classified, actionable text).
+  return (async () => {
+    try {
+      return await groqTranscribeOnce(o, requestedModel, true, language);
+    } catch (err) {
+      if (isCancelErr(err)) throw err;
+      if (isTimestamp400(err)) {
+        o.onProgress?.({
+          progress: 65,
+          status: "Word timestamps unavailable on this model — retrying with segment timing…",
+        });
+        try {
+          return await groqTranscribeOnce(o, requestedModel, false, language);
+        } catch (err2) {
+          if (isCancelErr(err2)) throw err2;
+          if (isModel404(err2)) {
+            return await groqTranscribeOnce(
+              o, alternateGroqModel(requestedModel), false, language,
+            );
+          }
+          throw err2;
+        }
+      }
+      if (isModel404(err)) {
+        const alt = alternateGroqModel(requestedModel);
+        o.onProgress?.({
+          progress: 65,
+          status: `${requestedModel} is unavailable on this key — retrying with ${alt}…`,
+        });
+        try {
+          return await groqTranscribeOnce(o, alt, true, language);
+        } catch (err2) {
+          if (isCancelErr(err2)) throw err2;
+          if (isTimestamp400(err2)) {
+            return await groqTranscribeOnce(o, alt, false, language);
+          }
+          throw err2;
+        }
+      }
+      throw err;
+    }
+  })();
+}
+
+/** One raw multipart request (no retries — groqTranscribe owns those). */
+function groqTranscribeOnce(o, modelId, wantWordTimestamps, language) {
   return new Promise((resolve, reject) => {
-    const { apiKey, model, filePath } = o;
-    const modelId = normalizeGroqModel(model);
+    const { apiKey, filePath } = o;
     const onProgress = typeof o.onProgress === "function" ? o.onProgress : null;
     const fileName = path.basename(filePath) || "audio.mp3";
     const fileBytes = fs.statSync(filePath).size;
@@ -263,9 +357,15 @@ function groqTranscribe(o) {
     };
     field("model", modelId);
     field("response_format", "verbose_json");
-    field("timestamp_granularities[]", "word");
-    field("timestamp_granularities[]", "segment");
-    if (o.language && o.language !== "auto") field("language", o.language);
+    // Word-level timestamps are requested when the caller wants them AND
+    // the model supports them; the segment granularity rides along. When
+    // the timestamp set is omitted entirely Groq defaults to segments —
+    // still parseable, just evenly-distributed word timing.
+    if (wantWordTimestamps) {
+      field("timestamp_granularities[]", "word");
+      field("timestamp_granularities[]", "segment");
+    }
+    if (language) field("language", language);
 
     const fileHeader =
       `--${boundary}${crlf}` +
@@ -304,7 +404,17 @@ function groqTranscribe(o) {
         res.on("end", () => {
           const body = Buffer.concat(chunks).toString("utf8");
           if (res.statusCode !== 200) {
-            reject(new Error(classifyGroqError(res.statusCode, body)));
+            // v1.22: attach the machine-readable facts so groqTranscribe's
+            // retry layer can classify (400 timestamps / 404 model).
+            let apiMessage = "";
+            try {
+              const j = JSON.parse(body);
+              apiMessage = j?.error?.message || j?.message || "";
+            } catch (_) { /* non-JSON body */ }
+            const err = new Error(classifyGroqError(res.statusCode, body));
+            err.status = res.statusCode;
+            err.apiMessage = apiMessage;
+            reject(err);
             return;
           }
           try {
@@ -469,6 +579,8 @@ module.exports = {
   GROQ_MODELS,
   DEFAULT_GROQ_MODEL,
   normalizeGroqModel,
+  alternateGroqModel,
+  normalizeLanguageCode,
   groqConfigPath,
   loadGroqConfig,
   saveGroqConfig,

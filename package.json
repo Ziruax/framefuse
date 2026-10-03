@@ -1,11 +1,29 @@
 {
   "name": "framefuse",
-  "version": "1.21.0",
+  "version": "1.22.0",
   "private": true,
   "description": "Multi-track Windows video studio with fast native export.",
   "main": "electron/main.js",
   "author": "FrameFuse",
   "license": "MIT",
+  "scripts": {
+    "dev": "next dev -p 3000 2>&1 | tee dev.log",
+    "clean": "node scripts/clean.js",
+    "build": "npm run clean && next build --webpack && node scripts/build-gpu-worker.js && node scripts/copy-wasm.js",
+    "start": "next start",
+    "lint": "eslint .",
+    "test:export-parity": "bun scripts/test-export-parity.ts",
+    "bench:export": "node scripts/bench-export.js",
+    "bench:ab": "node scripts/ab-export-bench.js",
+    "build:gpu-worker": "node scripts/build-gpu-worker.js",
+    "verify:kenburns": "node scripts/verify-kenburns-parity.js",
+    "electron": "electron electron/main.js",
+    "electron:dev": "concurrently -k \"npm run dev\" \"wait-on http://localhost:3000 && electron electron/main.js\"",
+    "fetch:ffmpeg": "node scripts/fetch-windows-ffmpeg.js",
+    "postinstall": "node scripts/patch-electron-builder.js",
+    "electron:build": "npm run clean && next build --webpack && node scripts/build-gpu-worker.js && node scripts/copy-wasm.js && node scripts/fetch-windows-ffmpeg.js && node scripts/build-rust-engine.js && electron-builder --win nsis --publish never",
+    "build:rust": "node scripts/build-rust-engine.js"
+  },
   "trustedDependencies": [
     "electron",
     "ffmpeg-static",
@@ -24,5 +42,84 @@
     "react-dom": "^19.0.0",
     "tailwind-merge": "^3.3.1",
     "tesseract.js": "^7.0.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "concurrently": "^9.1.2",
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8",
+    "eslint": "^9",
+    "eslint-config-next": "^16.1.1",
+    "tailwindcss": "^4",
+    "typescript": "^5",
+    "wait-on": "^8.0.3"
+  },
+  "build": {
+    "appId": "com.framefuse.app",
+    "productName": "FrameFuse",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "out/**/*",
+      "electron/**/*",
+      "build/**/*",
+      "package.json",
+      "!node_modules",
+      "rust-engine/**/*",
+      "!rust-engine/target",
+      "!rust-engine/*.log",
+      "!rust-engine/engine-info.json"
+    ],
+    "extraResources": [
+      {
+        "from": "node_modules/ffmpeg-static",
+        "to": "ffmpeg-static",
+        "filter": [
+          "ffmpeg.exe",
+          "ffmpeg.LICENSE",
+          "ffmpeg.README"
+        ]
+      },
+      {
+        "from": "resources/ffmpeg",
+        "to": "ffmpeg"
+      },
+      {
+        "from": "build/icon.ico",
+        "to": "icon.ico"
+      },
+      {
+        "from": "public/fonts",
+        "to": "fonts"
+      }
+    ],
+    "asarUnpack": [
+      "rust-engine/**"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "build/icon.ico",
+      "signtoolOptions": null,
+      "signAndEditExecutable": true,
+      "forceCodeSigning": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "FrameFuse",
+      "perMachine": false,
+      "uninstallDisplayName": "FrameFuse v1",
+      "deleteAppDataOnUninstall": false,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico"
+    },
+    "npmRebuild": false
   }
 }

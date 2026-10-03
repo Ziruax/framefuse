@@ -188,12 +188,12 @@ const KIND_STYLES: Record<
   string,
   { border: string; bg: string; text: string }
 > = {
-  absolute: { border: "#0e7490", bg: "rgba(8, 51, 68, 0.5)", text: "#67e8f9" },
+  absolute: { border: "#115e59", bg: "rgba(19, 78, 74, 0.5)", text: "#5eead4" },
   beat: { border: "#047857", bg: "rgba(6, 78, 59, 0.5)", text: "#6ee7b7" },
   duration: {
-    border: "#6d28d9",
-    bg: "rgba(76, 29, 149, 0.5)",
-    text: "#c4b5fd",
+    border: "#b45309",
+    bg: "rgba(120, 53, 15, 0.5)",
+    text: "#fcd34d",
   },
 };
 
@@ -519,7 +519,7 @@ export function MediaPanelBase({
               <button
                 type="button"
                 onClick={onRemoveDisclaimer}
-                className="shrink-0 rounded p-1 transition-colors hover:bg-red-500/15"
+                className="shrink-0 rounded p-1 transition-colors hover:bg-rose-500/15"
                 style={{ color: "#a8a29e" }}
                 title="Remove the disclaimer — the video starts at your first clip again"
               >
@@ -547,7 +547,7 @@ export function MediaPanelBase({
                 aria-label="Disclaimer duration"
                 style={{
                   borderColor: "rgba(217, 119, 6, 0.3)",
-                  backgroundColor: "rgba(9, 9, 11, 0.5)",
+                  backgroundColor: "rgba(12, 10, 9, 0.5)",
                 }}
               >
                 {DISCLAIMER_PRESETS_MS.map((ms) => {
@@ -564,7 +564,7 @@ export function MediaPanelBase({
                         "flex-1 rounded px-1 py-1 text-[9px] font-semibold tabular-nums transition-all",
                         active
                           ? "hover:brightness-110"
-                          : "text-zinc-500 hover:text-zinc-300",
+                          : "text-stone-500 hover:text-stone-300",
                       )}
                       style={
                         active
@@ -590,7 +590,7 @@ export function MediaPanelBase({
                       "flex-1 rounded px-1 py-1 text-[9px] font-semibold transition-all",
                       disclaimer.videoFull === true
                         ? "hover:brightness-110"
-                        : "text-zinc-500 hover:text-zinc-300",
+                        : "text-stone-500 hover:text-stone-300",
                     )}
                     style={
                       disclaimer.videoFull === true
@@ -653,14 +653,14 @@ export function MediaPanelBase({
   return (
     <div
       className="flex h-full flex-col overflow-hidden"
-      style={{ backgroundColor: "#111113" }}
+      style={{ backgroundColor: "#12100e" }}
     >
       {/* Toolbar — v1.11: one quiet style for every import action (the
           green/cyan per-kind borders read as a rainbow; the + icons carry
           the add affordance now). Wraps on narrow drawers. */}
       <div
         className="flex flex-wrap items-center gap-1.5 border-b px-3 py-2.5"
-        style={{ borderColor: "#27272a" }}
+        style={{ borderColor: "#292524" }}
       >
         <button
           type="button"
@@ -697,8 +697,8 @@ export function MediaPanelBase({
             <span
               className="ml-0.5 rounded-full px-1.5 py-0.5 text-[9px] font-bold"
               style={{
-                backgroundColor: "rgba(124, 58, 237, 0.35)",
-                color: "#ddd6fe",
+                backgroundColor: "rgba(245, 158, 11, 0.35)",
+                color: "#fde68a",
               }}
             >
               {subtitles.cues.length}
@@ -709,7 +709,7 @@ export function MediaPanelBase({
         {/* v4.8: library layout toggle — rich rows vs compact tiles. */}
         <div
           className="flex items-center rounded-md border p-0.5"
-          style={{ borderColor: "#27272a" }}
+          style={{ borderColor: "#292524" }}
           role="radiogroup"
           aria-label="Media library view"
         >
@@ -722,8 +722,8 @@ export function MediaPanelBase({
             className={cn(
               "flex items-center justify-center rounded-[4px] p-1.5 transition-all duration-150",
               mediaView === "list"
-                ? "bg-cyan-500/20 text-cyan-200 shadow-[inset_0_0_0_1px_rgba(34,211,238,0.4)]"
-                : "text-zinc-500 hover:bg-white/5 hover:text-zinc-300",
+                ? "bg-amber-400/15 text-amber-200 shadow-[inset_0_0_0_1px_rgba(251,191,36,0.4)]"
+                : "text-stone-500 hover:bg-white/5 hover:text-stone-300",
             )}
           >
             <List className="size-3.5" />
@@ -737,8 +737,8 @@ export function MediaPanelBase({
             className={cn(
               "flex items-center justify-center rounded-[4px] p-1.5 transition-all duration-150",
               mediaView === "grid"
-                ? "bg-cyan-500/20 text-cyan-200 shadow-[inset_0_0_0_1px_rgba(34,211,238,0.4)]"
-                : "text-zinc-500 hover:bg-white/5 hover:text-zinc-300",
+                ? "bg-amber-400/15 text-amber-200 shadow-[inset_0_0_0_1px_rgba(251,191,36,0.4)]"
+                : "text-stone-500 hover:bg-white/5 hover:text-stone-300",
             )}
           >
             <LayoutGrid className="size-3.5" />
@@ -774,7 +774,7 @@ export function MediaPanelBase({
           tabs with content) — "n of m" result count while a query is active. */}
       <div
         className="flex flex-wrap items-center gap-1 border-b px-2.5 py-1.5"
-        style={{ borderColor: "#27272a", backgroundColor: "#0e0e10" }}
+        style={{ borderColor: "#292524", backgroundColor: "#12100e" }}
         role="tablist"
         aria-label="Media library tabs"
       >
@@ -799,15 +799,15 @@ export function MediaPanelBase({
               className={cn(
                 "flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-semibold transition-all duration-150",
                 active
-                  ? "bg-cyan-500/20 text-cyan-100 shadow-[inset_0_0_0_1px_rgba(34,211,238,0.35)]"
-                  : "text-zinc-500 hover:bg-white/5 hover:text-zinc-300",
+                  ? "bg-amber-400/15 text-amber-100 shadow-[inset_0_0_0_1px_rgba(251,191,36,0.35)]"
+                  : "text-stone-500 hover:bg-white/5 hover:text-stone-300",
               )}
               title={`${label} library${tab === "all" ? " — every clip in the project" : ""}`}
             >
               <Icon
                 className={cn(
                   "size-3 transition-colors",
-                  active ? "text-cyan-300" : "text-zinc-600 group-hover:text-zinc-400",
+                  active ? "text-amber-300" : "text-stone-600 group-hover:text-stone-400",
                 )}
               />
               {label}
@@ -815,10 +815,10 @@ export function MediaPanelBase({
                 className={cn(
                   "rounded-full px-1.5 py-0.5 text-[9px] font-bold tabular-nums transition-colors",
                   active
-                    ? "bg-cyan-500/30 text-cyan-50"
+                    ? "bg-amber-400/30 text-amber-50"
                     : empty
-                      ? "bg-zinc-800 text-zinc-600"
-                      : "bg-zinc-800 text-zinc-400",
+                      ? "bg-stone-800 text-stone-600"
+                      : "bg-stone-800 text-stone-400",
                 )}
               >
                 {count}
@@ -832,16 +832,16 @@ export function MediaPanelBase({
       {showMediaList && segments.length > 0 && (
         <div
           className="flex items-center gap-1.5 border-b px-2.5 py-1.5"
-          style={{ borderColor: "#27272a" }}
+          style={{ borderColor: "#292524" }}
         >
           <div
-            className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md border px-2 py-1 transition-colors focus-within:border-cyan-500/50"
-            style={{ borderColor: "#27272a", backgroundColor: "#131316" }}
+            className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md border px-2 py-1 transition-colors focus-within:border-amber-500/50"
+            style={{ borderColor: "#292524", backgroundColor: "#151310" }}
           >
             <Search
               className={cn(
                 "size-3 shrink-0 transition-colors",
-                queryActive ? "text-cyan-300" : "text-zinc-600",
+                queryActive ? "text-amber-300" : "text-stone-600",
               )}
             />
             <input
@@ -851,12 +851,12 @@ export function MediaPanelBase({
                 if (e.key === "Escape") setMediaQuery("");
               }}
               placeholder={`Search ${mediaTab === "all" ? "clips" : mediaTab} by name…`}
-              className="min-w-0 flex-1 bg-transparent text-[11px] text-zinc-200 outline-none placeholder:text-zinc-600"
+              className="min-w-0 flex-1 bg-transparent text-[11px] text-stone-200 outline-none placeholder:text-stone-600"
               aria-label="Search media library by filename"
               spellCheck={false}
             />
             {queryActive && (
-              <span className="shrink-0 text-[9px] font-semibold tabular-nums text-zinc-500">
+              <span className="shrink-0 text-[9px] font-semibold tabular-nums text-stone-500">
                 {renderableSegs.length}/{segments.length}
               </span>
             )}
@@ -864,7 +864,7 @@ export function MediaPanelBase({
               <button
                 type="button"
                 onClick={() => setMediaQuery("")}
-                className="shrink-0 rounded p-0.5 text-zinc-500 transition-colors hover:bg-white/5 hover:text-zinc-300"
+                className="shrink-0 rounded p-0.5 text-stone-500 transition-colors hover:bg-white/5 hover:text-stone-300"
                 aria-label="Clear search"
                 title="Clear search (Esc)"
               >
@@ -890,12 +890,12 @@ export function MediaPanelBase({
               onDrop={handleDrop}
               onClick={mediaTab === "videos" ? openVideoPicker : openImagePicker}
               data-dragging={dragOver ? "true" : undefined}
-              className="ff-dropzone ff-grid-bg flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-10 text-center transition-all duration-200 hover:border-cyan-500/60 hover:bg-cyan-950/20"
+              className="ff-dropzone ff-grid-bg flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-10 text-center transition-all duration-200 hover:border-amber-500/60 hover:bg-amber-950/20"
               style={{
-                borderColor: "#333338",
+                borderColor: "#36322d",
                 ...(dragOver
                   ? {
-                      borderColor: "#06b6d4",
+                      borderColor: "#f59e0b",
                       backgroundColor: "rgba(8, 51, 68, 0.25)",
                       boxShadow: "0 0 32px rgba(6, 182, 212, 0.25) inset",
                     }
@@ -905,18 +905,18 @@ export function MediaPanelBase({
               <div
                 className="mb-3 flex size-12 items-center justify-center rounded-full transition-transform duration-200"
                 style={{
-                  backgroundColor: dragOver ? "rgba(6, 182, 212, 0.22)" : "#232327",
+                  backgroundColor: dragOver ? "rgba(245, 158, 11, 0.2)" : "#262220",
                   transform: dragOver ? "scale(1.08)" : "scale(1)",
                 }}
               >
                 <Upload
                   className="size-5"
-                  style={{ color: dragOver ? "#67e8f9" : "#a1a1aa" }}
+                  style={{ color: dragOver ? "#fcd34d" : "#a8a29e" }}
                 />
               </div>
               <p
                 className="text-[13px] font-semibold"
-                style={{ color: "#e4e4e7" }}
+                style={{ color: "#e7e5e4" }}
               >
                 {mediaTab === "videos"
                   ? "Drop video clips here"
@@ -924,8 +924,8 @@ export function MediaPanelBase({
                     ? "Drop files here to import"
                     : "Drop images here to import"}
               </p>
-              <p className="mt-1 text-[11px]" style={{ color: "#8b8b94" }}>
-                or <span style={{ color: "#22d3ee", textDecoration: "underline", textUnderlineOffset: 2 }}>click to browse</span>
+              <p className="mt-1 text-[11px]" style={{ color: "#78716c" }}>
+                or <span style={{ color: "#fbbf24", textDecoration: "underline", textUnderlineOffset: 2 }}>click to browse</span>
                 {v5MediaReady
                   ? " — images · videos · audio · subtitles · projects"
                   : " — images · audio · subtitles · projects"}
@@ -963,13 +963,13 @@ export function MediaPanelBase({
               <button
                 type="button"
                 onClick={openAudioPicker}
-                className="ff-dropzone ff-grid-bg flex w-full cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-[#3f3f46] px-6 py-10 text-center transition-all duration-200 hover:border-fuchsia-500/60 hover:bg-fuchsia-950/20"
+                className="ff-dropzone ff-grid-bg flex w-full cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-[#44403c] px-6 py-10 text-center transition-all duration-200 hover:border-teal-400/60 hover:bg-teal-950/20"
               >
-                <Music className="mb-2 size-5" style={{ color: "#a1a1aa" }} />
-                <span className="text-[12px] font-medium" style={{ color: "#e4e4e7" }}>
+                <Music className="mb-2 size-5" style={{ color: "#a8a29e" }} />
+                <span className="text-[12px] font-medium" style={{ color: "#e7e5e4" }}>
                   Attach an audio track
                 </span>
-                <span className="mt-1 text-[10px]" style={{ color: "#71717a" }}>
+                <span className="mt-1 text-[10px]" style={{ color: "#78716c" }}>
                   MP3 · WAV · M4A · OGG — music or voiceover, mixed into the export
                 </span>
               </button>
@@ -992,13 +992,13 @@ export function MediaPanelBase({
             <button
               type="button"
               onClick={openSubtitlePicker}
-              className="ff-dropzone ff-grid-bg flex w-full cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-[#3f3f46] px-6 py-10 text-center transition-all duration-200 hover:border-violet-500/60 hover:bg-violet-950/20"
+              className="ff-dropzone ff-grid-bg flex w-full cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-[#44403c] px-6 py-10 text-center transition-all duration-200 hover:border-amber-500/60 hover:bg-amber-950/20"
             >
-              <Captions className="mb-2 size-5" style={{ color: "#a1a1aa" }} />
-              <span className="text-[12px] font-medium" style={{ color: "#e4e4e7" }}>
+              <Captions className="mb-2 size-5" style={{ color: "#a8a29e" }} />
+              <span className="text-[12px] font-medium" style={{ color: "#e7e5e4" }}>
                 Load an .srt subtitle file
               </span>
-              <span className="mt-1 text-[10px]" style={{ color: "#71717a" }}>
+              <span className="mt-1 text-[10px]" style={{ color: "#78716c" }}>
                 Or generate word-by-word AI captions from the Captions settings tab
               </span>
             </button>
@@ -1024,12 +1024,12 @@ export function MediaPanelBase({
               onDrop={handleDrop}
               onClick={mediaTab === "videos" ? openVideoPicker : openImagePicker}
               data-dragging={dragOver ? "true" : undefined}
-              className="ff-dropzone mb-2 flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-dashed border-[#2e2e33] py-2.5 text-[11px] font-semibold text-[#a8a8b0] transition-all duration-200 hover:border-cyan-500/60 hover:bg-cyan-950/20 hover:text-zinc-200 active:scale-[0.98]"
+              className="ff-dropzone mb-2 flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-dashed border-[#33302b] py-2.5 text-[11px] font-semibold text-[#a8a29e] transition-all duration-200 hover:border-amber-500/60 hover:bg-amber-950/20 hover:text-stone-200 active:scale-[0.98]"
               style={
                 dragOver
                   ? {
-                      borderColor: "#06b6d4",
-                      color: "#67e8f9",
+                      borderColor: "#f59e0b",
+                      color: "#fcd34d",
                       backgroundColor: "rgba(8, 51, 68, 0.25)",
                     }
                   : undefined
@@ -1107,16 +1107,16 @@ export function MediaPanelBase({
             {/* v1.3.1: search no-match state — keeps the dropzone/summaries
                 above but replaces the library with a hint. */}
             {queryActive && renderableSegs.length === 0 && (
-              <div className="flex flex-col items-center justify-center rounded-lg border border-dashed py-8 text-center" style={{ borderColor: "#27272a" }}>
-                <Search className="mb-2 size-4" style={{ color: "#52525b" }} />
-                <p className="text-[11px] font-medium" style={{ color: "#a1a1aa" }}>
+              <div className="flex flex-col items-center justify-center rounded-lg border border-dashed py-8 text-center" style={{ borderColor: "#292524" }}>
+                <Search className="mb-2 size-4" style={{ color: "#57534e" }} />
+                <p className="text-[11px] font-medium" style={{ color: "#a8a29e" }}>
                   No {mediaTab === "all" ? "clips" : mediaTab} match “{mediaQuery.trim()}”
                 </p>
                 <button
                   type="button"
                   onClick={() => setMediaQuery("")}
-                  className="mt-2 rounded border px-2 py-1 text-[10px] font-medium text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-200"
-                  style={{ borderColor: "#3f3f46" }}
+                  className="mt-2 rounded border px-2 py-1 text-[10px] font-medium text-stone-400 transition-colors hover:bg-stone-800 hover:text-stone-200"
+                  style={{ borderColor: "#44403c" }}
                 >
                   Clear search
                 </button>
@@ -1193,16 +1193,16 @@ export function MediaPanelBase({
                         // v5.3: 16:9 tiles (was square) — footage reads
                         // undistorted, matching the list-view thumbnails.
                         "group/tile relative aspect-video cursor-pointer overflow-hidden rounded-lg border outline-none transition-all duration-150 hover:-translate-y-0.5 active:scale-[0.96]",
-                        "focus-visible:ring-2 focus-visible:ring-violet-400/80",
+                        "focus-visible:ring-2 focus-visible:ring-amber-400/80",
                         activeId === seg.id || settingsOpen
-                          ? "border-violet-400/70 shadow-[0_0_0_1px_rgba(167,139,250,0.5),0_4px_16px_rgba(0,0,0,0.4)]"
-                          : "border-[#27272a] hover:border-zinc-600",
+                          ? "border-amber-400/70 shadow-[0_0_0_1px_rgba(251,191,36,0.5),0_4px_16px_rgba(0,0,0,0.4)]"
+                          : "border-[#292524] hover:border-stone-600",
                         dropTargetIdx === idx &&
                           draggedId &&
                           draggedId !== seg.id &&
-                          "ring-1 ring-violet-400/70",
+                          "ring-1 ring-amber-400/70",
                       )}
-                      style={{ backgroundColor: "#18181b" }}
+                      style={{ backgroundColor: "#1c1917" }}
                       title={`${seg.fileName}\n${fmtTimecode(seg.startMs)} – ${fmtTimecode(seg.endMs)} · motion ${seg.direction}${motionPinned ? " (custom)" : ""}${isVideo ? ` · video${sourceDurMs != null ? ` (source ${fmtTimecode(sourceDurMs)})` : ""}` : ""}\nclick to jump`}
                     >
                       {thumbSrc != null ? (
@@ -1218,7 +1218,7 @@ export function MediaPanelBase({
                           className="flex size-full items-center justify-center"
                           aria-hidden
                         >
-                          <FileVideo className="size-6" style={{ color: "#52525b" }} />
+                          <FileVideo className="size-6" style={{ color: "#57534e" }} />
                         </span>
                       )}
                       {/* Scrim + labels */}
@@ -1231,7 +1231,7 @@ export function MediaPanelBase({
                       />
                       <span
                         className="pointer-events-none absolute bottom-1 left-1 rounded bg-black/70 px-1 text-[8px] font-semibold tabular-nums backdrop-blur-sm"
-                        style={{ color: "#e4e4e7" }}
+                        style={{ color: "#e7e5e4" }}
                       >
                         {idx + 1}
                       </span>
@@ -1240,10 +1240,10 @@ export function MediaPanelBase({
                           "pointer-events-none absolute bottom-1 right-1 rounded bg-black/70 px-1 text-[8px] tabular-nums backdrop-blur-sm",
                           isVideo && "flex items-center gap-0.5",
                         )}
-                        style={{ color: "#d4d4d8" }}
+                        style={{ color: "#d6d3d1" }}
                       >
                         {isVideo && (
-                          <FileVideo className="size-2" style={{ color: "#67e8f9" }} />
+                          <FileVideo className="size-2" style={{ color: "#fcd34d" }} />
                         )}
                         {(seg.durationMs / 1000).toFixed(1)}s
                       </span>
@@ -1277,8 +1277,8 @@ export function MediaPanelBase({
                             aria-expanded={settingsOpen}
                             aria-label={`Clip settings for segment ${idx + 1}`}
                             title="Clip settings — track, volume, trim & chroma key"
-                            className="flex items-center justify-center rounded bg-black/70 p-1 backdrop-blur-sm transition-colors hover:bg-violet-500/40"
-                            style={{ color: settingsOpen ? "#c4b5fd" : "#d4d4d8" }}
+                            className="flex items-center justify-center rounded bg-black/70 p-1 backdrop-blur-sm transition-colors hover:bg-amber-500/40"
+                            style={{ color: settingsOpen ? "#fcd34d" : "#d6d3d1" }}
                           >
                             <SlidersHorizontal className="size-3" />
                           </button>
@@ -1289,8 +1289,8 @@ export function MediaPanelBase({
                             e.stopPropagation();
                             onRemove(seg.id);
                           }}
-                          className="flex items-center justify-center rounded bg-black/70 p-1 backdrop-blur-sm transition-colors hover:bg-red-500/40"
-                          style={{ color: "#d4d4d8" }}
+                          className="flex items-center justify-center rounded bg-black/70 p-1 backdrop-blur-sm transition-colors hover:bg-rose-500/40"
+                          style={{ color: "#d6d3d1" }}
                           aria-label={`Remove segment ${idx + 1}`}
                           title="Remove"
                         >
@@ -1318,8 +1318,8 @@ export function MediaPanelBase({
                 <button
                   type="button"
                   onClick={openImagePicker}
-                  className="flex aspect-square items-center justify-center rounded-lg border border-dashed transition-all duration-150 hover:border-violet-500/50 hover:bg-violet-500/5"
-                  style={{ borderColor: "#27272a", color: "#52525b" }}
+                  className="flex aspect-square items-center justify-center rounded-lg border border-dashed transition-all duration-150 hover:border-amber-500/50 hover:bg-amber-500/5"
+                  style={{ borderColor: "#292524", color: "#57534e" }}
                   title={v5MediaReady ? "Add more media" : "Add more images"}
                 >
                   <Plus className="size-5" />
@@ -1394,8 +1394,8 @@ export function MediaPanelBase({
                               boxShadow: "inset 0 0 0 1px rgba(251, 191, 36, 0.28)",
                             }
                           : effStyle !== "none"
-                            ? { color: "#d8b4fe" }
-                            : { color: "#71717a" }
+                            ? { color: "#fde68a" }
+                            : { color: "#78716c" }
                       }
                       title={`${TRANSITION_STYLE_INFO[effStyle].label} into segment ${idx + 1}${isPinned ? " (custom)" : ""} · ${headDurSec.toFixed(1)}s · click to customize`}
                     >
@@ -1404,16 +1404,16 @@ export function MediaPanelBase({
                         style={
                           effStyle === "none"
                             ? {
-                                backgroundColor: "#3f3f46",
+                                backgroundColor: "#44403c",
                               }
                             : {
                                 backgroundImage:
-                                  "linear-gradient(135deg, #8b5cf6, #d946ef)",
+                                  "linear-gradient(135deg, #fbbf24, #2dd4bf)",
                                 boxShadow: "0 0 6px rgba(139, 92, 246, 0.45)",
                               }
                         }
                       >
-                        <ArrowLeftRight className="size-2" style={{ color: effStyle === "none" ? "#a1a1aa" : "#fff" }} />
+                        <ArrowLeftRight className="size-2" style={{ color: effStyle === "none" ? "#a8a29e" : "#fff" }} />
                       </span>
                       {isPinned && effStyle === "none" ? "hard cut" : effStyle.replace("-", " ")}
                       {isPinned && effStyle !== "none" ? " ✦" : ""}
@@ -1429,7 +1429,7 @@ export function MediaPanelBase({
                     {/* v4.5 boundary style picker. */}
                     {boundaryOpen && (
                       <div className="ff-pop absolute left-5 top-full z-[22] mt-1 w-56 rounded-lg border p-2 shadow-xl">
-                        <p className="mb-1.5 px-0.5 text-[9px] font-semibold uppercase tracking-wider" style={{ color: "#71717a" }}>
+                        <p className="mb-1.5 px-0.5 text-[9px] font-semibold uppercase tracking-wider" style={{ color: "#78716c" }}>
                           Boundary {idx} → {idx + 1}
                         </p>
                         <div className="grid grid-cols-2 gap-1">
@@ -1444,18 +1444,18 @@ export function MediaPanelBase({
                               className={cn(
                                 "rounded px-1.5 py-1 text-left text-[9px] font-medium transition-all duration-150",
                                 effStyle === st
-                                  ? "bg-violet-500/25 ring-1 ring-violet-400/50"
+                                  ? "bg-amber-500/25 ring-1 ring-amber-400/50"
                                   : "hover:bg-white/5",
                               )}
-                              style={{ color: effStyle === st ? "#d8b4fe" : "#a1a1aa" }}
+                              style={{ color: effStyle === st ? "#fde68a" : "#a8a29e" }}
                               title={TRANSITION_STYLE_INFO[st].hint}
                             >
                               {TRANSITION_STYLE_INFO[st].label}
                             </button>
                           ))}
                         </div>
-                        <div className="mt-1.5 flex items-center justify-between border-t pt-1.5" style={{ borderColor: "#27272a" }}>
-                          <span className="text-[8px] tabular-nums" style={{ color: "#52525b" }}>
+                        <div className="mt-1.5 flex items-center justify-between border-t pt-1.5" style={{ borderColor: "#292524" }}>
+                          <span className="text-[8px] tabular-nums" style={{ color: "#57534e" }}>
                             {headDurSec.toFixed(1)}s · global: {transition.style.replace("-", " ")}
                           </span>
                           {isPinned && (
@@ -1510,15 +1510,15 @@ export function MediaPanelBase({
                     setDropTargetIdx(null);
                   }}
                   className={cn(
-                    // v5.1 CapCut: card row — #1a1a1e hover fill (was inline
-                    // #18181b, moved to classes so the hover state can win).
-                    "group relative flex items-center gap-2.5 rounded-lg border border-[#27272a] bg-[#18181b] p-2 transition-all duration-150 hover:-translate-y-px hover:bg-[#1a1a1e]",
-                    draggedId === seg.id && "bg-[#0f0f11] opacity-40",
-                    dropTargetIdx === idx && draggedId && draggedId !== seg.id && "ring-1 ring-violet-400/70",
+                    // v5.1 CapCut: card row — #201d18 hover fill (was inline
+                    // #1c1917, moved to classes so the hover state can win).
+                    "group relative flex items-center gap-2.5 rounded-lg border border-[#292524] bg-[#1c1917] p-2 transition-all duration-150 hover:-translate-y-px hover:bg-[#201d18]",
+                    draggedId === seg.id && "bg-[#12100e] opacity-40",
+                    dropTargetIdx === idx && draggedId && draggedId !== seg.id && "ring-1 ring-amber-400/70",
                   )}
                   style={{
                     ...(dropTargetIdx === idx && draggedId
-                      ? { borderColor: "#8b5cf6" }
+                      ? { borderColor: "#fbbf24" }
                       : {}),
                     cursor: draggedId ? "grabbing" : undefined,
                   }}
@@ -1550,12 +1550,12 @@ export function MediaPanelBase({
                         className="flex size-full items-center justify-center"
                         aria-hidden
                       >
-                        <FileVideo className="size-4" style={{ color: "#52525b" }} />
+                        <FileVideo className="size-4" style={{ color: "#57534e" }} />
                       </span>
                     )}
                     <span
                       className="absolute bottom-0 right-0 rounded-tl bg-black/75 px-1 text-[9px] font-semibold tabular-nums"
-                      style={{ color: "#e4e4e7" }}
+                      style={{ color: "#e7e5e4" }}
                     >
                       {idx + 1}
                     </span>
@@ -1579,9 +1579,9 @@ export function MediaPanelBase({
                         <span
                           className="flex items-center gap-1 rounded border px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wide"
                           style={{
-                            borderColor: "#0e7490",
-                            backgroundColor: "rgba(8, 51, 68, 0.5)",
-                            color: "#67e8f9",
+                            borderColor: "#115e59",
+                            backgroundColor: "rgba(19, 78, 74, 0.5)",
+                            color: "#fcd34d",
                           }}
                           title="Video clip"
                         >
@@ -1594,7 +1594,7 @@ export function MediaPanelBase({
                           style={{
                             borderColor: "rgba(14, 116, 144, 0.45)",
                             backgroundColor: "rgba(8, 51, 68, 0.35)",
-                            color: "#a5f3fc",
+                            color: "#fde68a",
                           }}
                           title={`Source duration — ${fmtTimecode(sourceDurMs)}`}
                         >
@@ -1607,7 +1607,7 @@ export function MediaPanelBase({
                           style={{
                             borderColor: "rgba(139, 92, 246, 0.5)",
                             backgroundColor: "rgba(76, 29, 149, 0.4)",
-                            color: "#c4b5fd",
+                            color: "#fcd34d",
                           }}
                           title="Overlay track — drag it on the timeline to position"
                         >
@@ -1627,14 +1627,14 @@ export function MediaPanelBase({
                               if (e.key === "Enter") commitEdit();
                               if (e.key === "Escape") setEditingId(null);
                             }}
-                            className="w-14 rounded border px-1 py-0.5 text-[11px] outline-none focus:border-violet-500"
+                            className="w-14 rounded border px-1 py-0.5 text-[11px] outline-none focus:border-amber-500"
                             style={{
-                              borderColor: "#3f3f46",
-                              backgroundColor: "#09090b",
-                              color: "#e4e4e7",
+                              borderColor: "#44403c",
+                              backgroundColor: "#0c0a09",
+                              color: "#e7e5e4",
                             }}
                           />
-                          <span className="text-[10px]" style={{ color: "#71717a" }}>
+                          <span className="text-[10px]" style={{ color: "#78716c" }}>
                             s
                           </span>
                           <button
@@ -1651,7 +1651,7 @@ export function MediaPanelBase({
                             type="button"
                             onClick={() => setEditingId(null)}
                             className="rounded p-0.5 transition-colors hover:bg-white/10"
-                            style={{ color: "#71717a" }}
+                            style={{ color: "#78716c" }}
                             aria-label="Cancel duration edit"
                             title="Cancel"
                           >
@@ -1667,7 +1667,7 @@ export function MediaPanelBase({
                             backgroundColor: overridden
                               ? "rgba(120, 53, 15, 0.4)"
                               : "transparent",
-                            color: overridden ? "#fcd34d" : "#a1a1aa",
+                            color: overridden ? "#fcd34d" : "#a8a29e",
                           }}
                           title="Edit duration (seconds)"
                         >
@@ -1695,7 +1695,7 @@ export function MediaPanelBase({
                         differentiating half of storyboard filenames. */}
                     <div
                       className="mt-0.5 flex items-baseline text-[11px] font-medium"
-                      style={{ color: "#d4d4d8" }}
+                      style={{ color: "#d6d3d1" }}
                       title={seg.fileName}
                     >
                       {(() => {
@@ -1716,13 +1716,13 @@ export function MediaPanelBase({
                     </div>
                     <div
                       className="relative mt-0.5 flex items-center gap-2 text-[9px]"
-                      style={{ color: "#b1b1b8" }}
+                      style={{ color: "#a8a29e" }}
                       title={`Duration ${(seg.durationMs / 1000).toFixed(1)}s · Ken Burns ${seg.direction} — click the motion to customize`}
                     >
                       <span className="tabular-nums">
                         dur {(seg.durationMs / 1000).toFixed(1)}s
                       </span>
-                      <span style={{ color: "#52525b" }}>·</span>
+                      <span style={{ color: "#57534e" }}>·</span>
                       {/* v4.8: per-segment motion popover — click to pin this
                           segment's Ken Burns direction (or aim it on the
                           preview canvas). */}
@@ -1770,7 +1770,7 @@ export function MediaPanelBase({
                         <div className="ff-pop absolute bottom-full left-0 z-[22] mb-1 w-44 rounded-lg border p-2 shadow-xl">
                           <p
                             className="mb-1.5 px-0.5 text-[9px] font-semibold uppercase tracking-wider"
-                            style={{ color: "#71717a" }}
+                            style={{ color: "#78716c" }}
                           >
                             Motion · segment {idx + 1}
                           </p>
@@ -1795,7 +1795,7 @@ export function MediaPanelBase({
                                     motionPinned &&
                                     motionOverrides[seg.id] === m.value
                                       ? "#6ee7b7"
-                                      : "#a1a1aa",
+                                      : "#a8a29e",
                                 }}
                                 title={`${m.label} for this segment only`}
                               >
@@ -1811,9 +1811,9 @@ export function MediaPanelBase({
                           </div>
                           <div
                             className="mt-1.5 flex items-center justify-between border-t pt-1.5"
-                            style={{ borderColor: "#27272a" }}
+                            style={{ borderColor: "#292524" }}
                           >
-                            <span className="text-[8px]" style={{ color: "#52525b" }}>
+                            <span className="text-[8px]" style={{ color: "#57534e" }}>
                               tip: aim on the canvas
                             </span>
                             {motionPinned && (
@@ -1842,7 +1842,7 @@ export function MediaPanelBase({
                       onClick={() => onReorder(seg.id, -1)}
                       disabled={idx === 0 || !dragEnabled}
                       className="rounded-md p-1.5 transition-colors hover:bg-white/10 disabled:opacity-30"
-                      style={{ color: "#8a8a93" }}
+                      style={{ color: "#78716c" }}
                       title={
                         dragEnabled
                           ? "Move up"
@@ -1861,7 +1861,7 @@ export function MediaPanelBase({
                     >
                       <GripVertical
                         className="size-3"
-                        style={{ color: dragEnabled ? "#3f3f46" : "#27272a" }}
+                        style={{ color: dragEnabled ? "#44403c" : "#292524" }}
                       />
                     </span>
                     <button
@@ -1869,7 +1869,7 @@ export function MediaPanelBase({
                       onClick={() => onReorder(seg.id, 1)}
                       disabled={idx === segments.length - 1 || !dragEnabled}
                       className="rounded-md p-1.5 transition-colors hover:bg-white/10 disabled:opacity-30"
-                      style={{ color: "#8a8a93" }}
+                      style={{ color: "#78716c" }}
                       title={
                         dragEnabled
                           ? "Move down"
@@ -1889,12 +1889,12 @@ export function MediaPanelBase({
                         aria-expanded={settingsOpen}
                         aria-label={`Clip settings for segment ${idx + 1}`}
                         className={cn(
-                          "rounded-md p-1.5 transition-all duration-150 hover:bg-violet-500/15",
+                          "rounded-md p-1.5 transition-all duration-150 hover:bg-amber-500/15",
                           settingsOpen
-                            ? "bg-violet-500/25 opacity-100"
+                            ? "bg-amber-500/25 opacity-100"
                             : "opacity-40 group-hover:opacity-100",
                         )}
-                        style={{ color: settingsOpen ? "#c4b5fd" : "#a1a1aa" }}
+                        style={{ color: settingsOpen ? "#fcd34d" : "#a8a29e" }}
                         title="Clip settings — track, volume, trim & chroma key"
                       >
                         <SlidersHorizontal className="size-3.5" />
@@ -1903,8 +1903,8 @@ export function MediaPanelBase({
                     <button
                       type="button"
                       onClick={() => onDuplicate(seg.id)}
-                      className="rounded-md p-1.5 opacity-40 transition-all hover:bg-violet-500/15 hover:opacity-100 group-hover:opacity-100"
-                      style={{ color: "#c4b5fd" }}
+                      className="rounded-md p-1.5 opacity-40 transition-all hover:bg-amber-500/15 hover:opacity-100 group-hover:opacity-100"
+                      style={{ color: "#fcd34d" }}
                       aria-label={`Duplicate segment ${idx + 1}`}
                       title="Duplicate segment"
                     >
@@ -1913,8 +1913,8 @@ export function MediaPanelBase({
                     <button
                       type="button"
                       onClick={() => onRemove(seg.id)}
-                      className="rounded-md p-1.5 opacity-40 transition-all hover:bg-red-500/15 hover:text-red-400 group-hover:opacity-100"
-                      style={{ color: "#a1a1aa" }}
+                      className="rounded-md p-1.5 opacity-40 transition-all hover:bg-rose-500/15 hover:text-rose-400 group-hover:opacity-100"
+                      style={{ color: "#a8a29e" }}
                       aria-label={`Remove segment ${idx + 1}`}
                       title="Remove"
                     >
@@ -1952,7 +1952,7 @@ export function MediaPanelBase({
                 className="flex items-center gap-2.5 rounded-lg border p-2 transition-colors"
                 style={{
                   borderColor: "rgba(112, 26, 117, 0.45)",
-                  backgroundColor: "#18181b",
+                  backgroundColor: "#1c1917",
                 }}
               >
                 <div
@@ -1962,17 +1962,17 @@ export function MediaPanelBase({
                     boxShadow: "0 0 12px rgba(217, 70, 239, 0.15)",
                   }}
                 >
-                  <Music className="size-4" style={{ color: "#f0abfc" }} />
+                  <Music className="size-4" style={{ color: "#2dd4bf" }} />
                 </div>
                 <div className="min-w-0 flex-1">
                   <div
                     className="truncate text-[11px] font-medium"
-                    style={{ color: "#d4d4d8" }}
+                    style={{ color: "#d6d3d1" }}
                     title={audioTrack.fileName}
                   >
                     {audioTrack.fileName}
                   </div>
-                  <div className="text-[9px]" style={{ color: "#a1a1ab" }}>
+                  <div className="text-[9px]" style={{ color: "#a8a29e" }}>
                     audio track
                     {audioTrack.durationMs
                       ? ` · ${fmtTimecode(audioTrack.durationMs)}`
@@ -1982,8 +1982,8 @@ export function MediaPanelBase({
                 <button
                   type="button"
                   onClick={onRemoveAudio}
-                  className="shrink-0 rounded p-1 transition-colors hover:bg-red-500/15"
-                  style={{ color: "#71717a" }}
+                  className="shrink-0 rounded p-1 transition-colors hover:bg-rose-500/15"
+                  style={{ color: "#78716c" }}
                   title="Remove audio"
                 >
                   <Trash2 className="size-3.5" />
@@ -2008,12 +2008,12 @@ export function MediaPanelBase({
                       boxShadow: "0 0 10px rgba(34, 211, 238, 0.12)",
                     }}
                   >
-                    <Activity className="size-3.5" style={{ color: "#67e8f9" }} />
+                    <Activity className="size-3.5" style={{ color: "#fcd34d" }} />
                   </div>
-                  <span className="text-[11px] font-semibold" style={{ color: "#a5f3fc" }}>
+                  <span className="text-[11px] font-semibold" style={{ color: "#fde68a" }}>
                     Beat sync
                   </span>
-                  <span className="ml-auto text-[9px] tabular-nums" style={{ color: "#67e8f9" }}>
+                  <span className="ml-auto text-[9px] tabular-nums" style={{ color: "#fcd34d" }}>
                     {beatBusy
                       ? "listening…"
                       : beatInfo && beatInfo.beatMs.length >= 2
@@ -2030,7 +2030,7 @@ export function MediaPanelBase({
                       <div className="mt-2 flex items-center gap-1.5">
                         <span
                           className="text-[9px] font-medium"
-                          style={{ color: "#67e8f9" }}
+                          style={{ color: "#fcd34d" }}
                           title="How frequently cuts land — a bar assumes 4/4 time"
                         >
                           Cut every
@@ -2039,7 +2039,7 @@ export function MediaPanelBase({
                           className="flex flex-1 items-center rounded-md border p-0.5"
                           style={{
                             borderColor: "rgba(34, 211, 238, 0.25)",
-                            backgroundColor: "rgba(9, 9, 11, 0.5)",
+                            backgroundColor: "rgba(12, 10, 9, 0.5)",
                           }}
                           role="radiogroup"
                           aria-label="Beat snap strength"
@@ -2063,13 +2063,13 @@ export function MediaPanelBase({
                                   "flex-1 rounded px-1 py-1 text-[9px] font-semibold tabular-nums transition-all",
                                   active
                                     ? "hover:brightness-110"
-                                    : "text-zinc-500 hover:text-zinc-300",
+                                    : "text-stone-500 hover:text-stone-300",
                                 )}
                                 style={
                                   active
                                     ? {
                                         backgroundColor: "rgba(34, 211, 238, 0.2)",
-                                        color: "#a5f3fc",
+                                        color: "#fde68a",
                                         boxShadow: "inset 0 0 0 1px rgba(34, 211, 238, 0.35)",
                                       }
                                     : undefined
@@ -2096,7 +2096,7 @@ export function MediaPanelBase({
                       style={{
                         borderColor: "rgba(34, 211, 238, 0.4)",
                         backgroundColor: "rgba(34, 211, 238, 0.1)",
-                        color: "#a5f3fc",
+                        color: "#fde68a",
                       }}
                       title="Analyze the audio for beats + tempo (runs locally, ~1s)"
                     >
@@ -2116,7 +2116,7 @@ export function MediaPanelBase({
                       style={{
                         borderColor: "rgba(34, 211, 238, 0.4)",
                         backgroundColor: "rgba(34, 211, 238, 0.1)",
-                        color: "#a5f3fc",
+                        color: "#fde68a",
                       }}
                       title="Retiming every cut to land exactly on a beat — undo with Ctrl+Z"
                     >
@@ -2135,7 +2135,7 @@ export function MediaPanelBase({
                       style={{
                         borderColor: "rgba(34, 211, 238, 0.4)",
                         backgroundColor: "rgba(34, 211, 238, 0.1)",
-                        color: "#a5f3fc",
+                        color: "#fde68a",
                       }}
                       title="Scale segment durations so the video ends with the music"
                     >
@@ -2146,7 +2146,7 @@ export function MediaPanelBase({
                 ) : (
                   <div
                     className="mt-2 flex items-center gap-1.5 rounded-md px-2 py-1.5 text-[9px]"
-                    style={{ backgroundColor: "rgba(113, 113, 122, 0.15)", color: "#a1a1aa" }}
+                    style={{ backgroundColor: "rgba(120, 113, 108, 0.15)", color: "#a8a29e" }}
                     title="Timestamped filenames drive absolute timelines"
                   >
                     <Lock className="size-3 shrink-0" />
@@ -2167,7 +2167,7 @@ export function MediaPanelBase({
                 className="flex items-center gap-2.5 rounded-lg border p-2 transition-colors"
                 style={{
                   borderColor: "rgba(76, 29, 149, 0.45)",
-                  backgroundColor: "#18181b",
+                  backgroundColor: "#1c1917",
                 }}
               >
                 <div
@@ -2177,17 +2177,17 @@ export function MediaPanelBase({
                     boxShadow: "0 0 12px rgba(124, 58, 237, 0.15)",
                   }}
                 >
-                  <Captions className="size-4" style={{ color: "#c4b5fd" }} />
+                  <Captions className="size-4" style={{ color: "#fcd34d" }} />
                 </div>
                 <div className="min-w-0 flex-1">
                   <div
                     className="truncate text-[11px] font-medium"
-                    style={{ color: "#d4d4d8" }}
+                    style={{ color: "#d6d3d1" }}
                     title={subtitles.fileName}
                   >
                     {subtitles.fileName}
                   </div>
-                  <div className="text-[9px]" style={{ color: "#a1a1ab" }}>
+                  <div className="text-[9px]" style={{ color: "#a8a29e" }}>
                     subtitles · {subtitles.cues.length} cue
                     {subtitles.cues.length === 1 ? "" : "s"}
                     {subtitles.cues.length > 0
@@ -2198,8 +2198,8 @@ export function MediaPanelBase({
                 <button
                   type="button"
                   onClick={onRemoveSubtitles}
-                  className="shrink-0 rounded p-1 transition-colors hover:bg-red-500/15"
-                  style={{ color: "#71717a" }}
+                  className="shrink-0 rounded p-1 transition-colors hover:bg-rose-500/15"
+                  style={{ color: "#78716c" }}
                   title="Remove subtitles"
                 >
                   <Trash2 className="size-3.5" />
@@ -2212,10 +2212,10 @@ export function MediaPanelBase({
               <button
                 type="button"
                 onClick={openSubtitlePicker}
-                className="flex w-full items-center gap-2 rounded-lg border border-dashed p-2 text-[11px] transition-all hover:border-violet-500/50 hover:bg-violet-500/5"
+                className="flex w-full items-center gap-2 rounded-lg border border-dashed p-2 text-[11px] transition-all hover:border-amber-500/50 hover:bg-amber-500/5"
                 style={{
-                  borderColor: "#27272a",
-                  color: "#71717a",
+                  borderColor: "#292524",
+                  color: "#78716c",
                   backgroundColor: "transparent",
                 }}
               >
@@ -2264,7 +2264,7 @@ export function MediaPanelBase({
               <div
                 className="mt-2 space-y-1 rounded-lg border p-2"
                 style={{
-                  borderColor: "#27272a",
+                  borderColor: "#292524",
                   backgroundColor: "rgba(24, 24, 27, 0.5)",
                 }}
               >
@@ -2272,7 +2272,7 @@ export function MediaPanelBase({
                   <div
                     key={i}
                     className="flex items-start gap-1.5 text-[10px]"
-                    style={{ color: "#71717a" }}
+                    style={{ color: "#78716c" }}
                   >
                     <Info className="mt-0.5 size-3 shrink-0" />
                     <span className="truncate" title={s}>
@@ -2516,16 +2516,16 @@ function ClipSettings({
       className="ff-pop rounded-lg border p-2.5 shadow-xl"
     >
       <div className="mb-2 flex items-center gap-1.5">
-        <SlidersHorizontal className="size-3.5 shrink-0" style={{ color: "#c4b5fd" }} />
+        <SlidersHorizontal className="size-3.5 shrink-0" style={{ color: "#fcd34d" }} />
         <span
           className="shrink-0 text-[9px] font-bold uppercase tracking-[0.12em]"
-          style={{ color: "#a1a1aa" }}
+          style={{ color: "#a8a29e" }}
         >
           Clip settings
         </span>
         <span
           className="ml-1 min-w-0 flex-1 truncate text-[10px]"
-          style={{ color: "#71717a" }}
+          style={{ color: "#78716c" }}
           title={seg.fileName}
         >
           {seg.fileName}
@@ -2535,7 +2535,7 @@ function ClipSettings({
           onClick={onClose}
           aria-label="Close clip settings"
           className="shrink-0 rounded p-1 transition-colors hover:bg-white/10"
-          style={{ color: "#71717a" }}
+          style={{ color: "#78716c" }}
           title="Close"
         >
           <X className="size-3" />
@@ -2547,7 +2547,7 @@ function ClipSettings({
         <div>
           <p
             className="mb-1 flex items-center gap-1 text-[8px] font-semibold uppercase tracking-[0.12em]"
-            style={{ color: "#71717a" }}
+            style={{ color: "#78716c" }}
           >
             <Layers className="size-2.5" /> Track
           </p>
@@ -2555,7 +2555,7 @@ function ClipSettings({
             className="flex rounded-md border p-0.5"
             role="radiogroup"
             aria-label={`Track for ${seg.fileName}`}
-            style={{ borderColor: "#27272a", backgroundColor: "rgba(9, 9, 11, 0.5)" }}
+            style={{ borderColor: "#292524", backgroundColor: "rgba(12, 10, 9, 0.5)" }}
           >
             {[0, 1].map((v) => {
               const active = onOverlay ? v === 1 : v === 0;
@@ -2573,19 +2573,19 @@ function ClipSettings({
                   }
                   className={cn(
                     "flex-1 rounded px-1.5 py-1 text-[9px] font-semibold transition-all duration-150",
-                    !active && "text-zinc-500 hover:text-zinc-300",
+                    !active && "text-stone-500 hover:text-stone-300",
                   )}
                   style={
                     active
                       ? v === 1
                         ? {
                             backgroundColor: "rgba(139, 92, 246, 0.2)",
-                            color: "#c4b5fd",
+                            color: "#fcd34d",
                             boxShadow: "inset 0 0 0 1px rgba(139, 92, 246, 0.4)",
                           }
                         : {
                             backgroundColor: "rgba(113, 113, 122, 0.2)",
-                            color: "#e4e4e7",
+                            color: "#e7e5e4",
                             boxShadow: "inset 0 0 0 1px rgba(113, 113, 122, 0.35)",
                           }
                       : undefined
@@ -2597,7 +2597,7 @@ function ClipSettings({
             })}
           </div>
           {onOverlay && (
-            <p className="mt-1 px-0.5 text-[9px]" style={{ color: "#71717a" }}>
+            <p className="mt-1 px-0.5 text-[9px]" style={{ color: "#78716c" }}>
               ⟶ Drag it on the timeline to position
             </p>
           )}
@@ -2608,7 +2608,7 @@ function ClipSettings({
           <div className="mb-1 flex items-center justify-between">
             <span
               className="flex items-center gap-1 text-[8px] font-semibold uppercase tracking-[0.12em]"
-              style={{ color: "#71717a" }}
+              style={{ color: "#78716c" }}
             >
               {volumePct === 0 ? (
                 <VolumeX className="size-2.5" />
@@ -2617,7 +2617,7 @@ function ClipSettings({
               )}
               Volume
             </span>
-            <span className="text-[9px] font-semibold tabular-nums" style={{ color: "#a1a1aa" }}>
+            <span className="text-[9px] font-semibold tabular-nums" style={{ color: "#a8a29e" }}>
               {volumePct}%
             </span>
           </div>
@@ -2633,7 +2633,7 @@ function ClipSettings({
             className="w-full disabled:cursor-not-allowed"
           />
           {!isVideo && (
-            <p className="mt-0.5 px-0.5 text-[9px]" style={{ color: "#52525b" }}>
+            <p className="mt-0.5 px-0.5 text-[9px]" style={{ color: "#57534e" }}>
               Video only — images have no audio.
             </p>
           )}
@@ -2644,13 +2644,13 @@ function ClipSettings({
           <div className="mb-1 flex items-center justify-between">
             <span
               className="flex items-center gap-1 text-[8px] font-semibold uppercase tracking-[0.12em]"
-              style={{ color: "#71717a" }}
+              style={{ color: "#78716c" }}
             >
               <Gauge className="size-2.5" /> Speed
             </span>
             <span
               className="text-[9px] font-semibold tabular-nums"
-              style={{ color: speedVal !== 1 ? "#67e8f9" : "#a1a1aa" }}
+              style={{ color: speedVal !== 1 ? "#fcd34d" : "#a8a29e" }}
             >
               {speedVal === 1 ? "normal" : `${speedVal}×`}
               {isVideo && !onOverlay ? ` · ${fmtSec(speedDurMs)}` : ""}
@@ -2660,7 +2660,7 @@ function ClipSettings({
             className="flex rounded-md border p-0.5"
             role="radiogroup"
             aria-label={`Playback speed for ${seg.fileName}`}
-            style={{ borderColor: "#27272a", backgroundColor: "rgba(9, 9, 11, 0.5)" }}
+            style={{ borderColor: "#292524", backgroundColor: "rgba(12, 10, 9, 0.5)" }}
           >
             {[0.5, 1, 1.5, 2].map((v) => {
               const active = Math.abs(speedVal - v) < 0.001;
@@ -2681,13 +2681,13 @@ function ClipSettings({
                   }
                   className={cn(
                     "flex-1 rounded px-1 py-1 text-[9px] font-semibold tabular-nums transition-all duration-150 disabled:cursor-not-allowed",
-                    !active && "text-zinc-500 hover:text-zinc-300",
+                    !active && "text-stone-500 hover:text-stone-300",
                   )}
                   style={
                     active
                       ? {
                           backgroundColor: "rgba(8, 51, 68, 0.55)",
-                          color: "#67e8f9",
+                          color: "#fcd34d",
                           boxShadow: "inset 0 0 0 1px rgba(34, 211, 238, 0.4)",
                         }
                       : undefined
@@ -2713,10 +2713,10 @@ function ClipSettings({
               );
             }}
             aria-label={`Custom playback speed for ${seg.fileName}`}
-            className="mt-1 w-full accent-cyan-500 disabled:cursor-not-allowed"
+            className="mt-1 w-full accent-amber-400 disabled:cursor-not-allowed"
           />
           {!speedEnabled && (
-            <p className="mt-0.5 px-0.5 text-[9px]" style={{ color: "#52525b" }}>
+            <p className="mt-0.5 px-0.5 text-[9px]" style={{ color: "#57534e" }}>
               {isVideo
                 ? "Speed works on the Video track — overlays play at native rate."
                 : "Video only — images have no speed."}
@@ -2729,11 +2729,11 @@ function ClipSettings({
           <div className="mb-1 flex items-center justify-between">
             <span
               className="flex items-center gap-1 text-[8px] font-semibold uppercase tracking-[0.12em]"
-              style={{ color: "#71717a" }}
+              style={{ color: "#78716c" }}
             >
               <Scissors className="size-2.5" /> Trim start
             </span>
-            <span className="text-[9px] font-semibold tabular-nums" style={{ color: "#a1a1aa" }}>
+            <span className="text-[9px] font-semibold tabular-nums" style={{ color: "#a8a29e" }}>
               {fmtSec(trimVal)}
             </span>
           </div>
@@ -2750,7 +2750,7 @@ function ClipSettings({
             aria-label={`Trim start for ${seg.fileName} (seconds into the source)`}
             className="w-full disabled:cursor-not-allowed"
           />
-          <p className="mt-0.5 px-0.5 text-[9px]" style={{ color: "#52525b" }}>
+          <p className="mt-0.5 px-0.5 text-[9px]" style={{ color: "#57534e" }}>
             {isVideo
               ? sourceDurMs != null
                 ? `source ${fmtSec(sourceDurMs)} · window ${fmtSec(trimVal)} → ${fmtSec(
@@ -2778,15 +2778,15 @@ function ClipSettings({
             Green-screen clips are rarely the same length as the edit; this
             makes an overlay cover the WHOLE timeline in one click. */}
         {onOverlay && (
-          <div className="rounded-md border p-2" style={{ borderColor: "#27272a", backgroundColor: "rgba(9, 9, 11, 0.5)" }}>
+          <div className="rounded-md border p-2" style={{ borderColor: "#292524", backgroundColor: "rgba(12, 10, 9, 0.5)" }}>
             <div className="mb-1.5 flex items-center justify-between">
               <span
                 className="flex items-center gap-1 text-[8px] font-semibold uppercase tracking-[0.12em]"
-                style={{ color: "#71717a" }}
+                style={{ color: "#78716c" }}
               >
                 <Repeat className="size-2.5" /> Overlay window
               </span>
-              <span className="text-[9px] tabular-nums" style={{ color: "#a1a1aa" }}>
+              <span className="text-[9px] tabular-nums" style={{ color: "#a8a29e" }}>
                 {fmtSec(seg.durationMs)}
               </span>
             </div>
@@ -2806,7 +2806,7 @@ function ClipSettings({
                 }}
                 disabled={baseTotalMs <= 0}
                 className="flex flex-1 cursor-pointer items-center justify-center gap-1 rounded border px-2 py-1 text-[9px] font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40"
-                style={{ borderColor: "rgba(56, 189, 248, 0.45)", backgroundColor: "rgba(14, 165, 233, 0.12)", color: "#bae6fd" }}
+                style={{ borderColor: "rgba(45, 212, 191, 0.45)", backgroundColor: "rgba(13, 148, 136, 0.12)", color: "#99f6e4" }}
                 title="Extend this overlay to cover the ENTIRE video (loops the source when it is shorter)"
               >
                 <Repeat className="size-2.5" />
@@ -2826,8 +2826,8 @@ function ClipSettings({
                   )}
                   style={
                     edit?.overlayLoop === true
-                      ? { borderColor: "rgba(56, 189, 248, 0.7)", backgroundColor: "rgba(14, 165, 233, 0.25)", color: "#e0f2fe" }
-                      : { borderColor: "#27272a", backgroundColor: "rgba(9, 9, 11, 0.6)", color: "#a1a1aa" }
+                      ? { borderColor: "rgba(45, 212, 191, 0.7)", backgroundColor: "rgba(13, 148, 136, 0.25)", color: "#ccfbf1" }
+                      : { borderColor: "#292524", backgroundColor: "rgba(12, 10, 9, 0.6)", color: "#a8a29e" }
                   }
                   title="Loop this overlay's source — it repeats to fill its whole timeline window (drag its right edge on the timeline to extend)"
                 >
@@ -2836,7 +2836,7 @@ function ClipSettings({
                 </button>
               )}
             </div>
-            <p className="mt-1 px-0.5 text-[9px]" style={{ color: "#52525b" }}>
+            <p className="mt-1 px-0.5 text-[9px]" style={{ color: "#57534e" }}>
               {isVideo
                 ? "Green-screen clips rarely match the edit length — span the whole video and the source loops to fill it."
                 : "Still images loop automatically; Span sets the window to the full video."}
@@ -2876,21 +2876,21 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
   return (
     <div
       className="ff-fade-up rounded-lg border p-2.5"
-      style={{ borderColor: "#27272a", backgroundColor: "rgba(24, 24, 27, 0.45)" }}
+      style={{ borderColor: "#292524", backgroundColor: "rgba(28, 25, 23, 0.45)" }}
     >
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
-        className="flex w-full items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.12em] transition-colors hover:text-cyan-200"
-        style={{ color: "#a1a1aa" }}
+        className="flex w-full items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.12em] transition-colors hover:text-amber-200"
+        style={{ color: "#a8a29e" }}
       >
         <AudioLines className="size-3.5 shrink-0" />
         Sound effects
         {sfxItems != null && sfxItems.length > 0 && (
           <span
             className="rounded-full px-1.5 py-0.5 text-[8px] font-bold"
-            style={{ backgroundColor: "rgba(34, 211, 238, 0.16)", color: "#a5f3fc" }}
+            style={{ backgroundColor: "rgba(251, 191, 36, 0.16)", color: "#fde68a" }}
           >
             {sfxItems.length}
           </span>
@@ -2913,7 +2913,7 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
               <div key={cat}>
                 <p
                   className="mb-1 text-[8px] font-semibold uppercase tracking-wider"
-                  style={{ color: "#71717a" }}
+                  style={{ color: "#78716c" }}
                 >
                   {SFX_CATEGORY_LABELS[cat]}
                 </p>
@@ -2951,7 +2951,7 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
                         </span>
                         <span
                           className="min-w-0 flex-1 truncate text-[10px] font-medium"
-                          style={{ color: "#d4d4d8" }}
+                          style={{ color: "#d6d3d1" }}
                         >
                           {def.label}
                         </span>
@@ -2983,12 +2983,12 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
             <div className="border-t pt-1.5" style={{ borderColor: "rgba(245, 158, 11, 0.2)" }}>
               <p
                 className="mb-1 text-[8px] font-semibold uppercase tracking-wider"
-                style={{ color: "#71717a" }}
+                style={{ color: "#78716c" }}
               >
                 On timeline
               </p>
               {sfxItems.length === 0 ? (
-                <p className="px-0.5 text-[9px]" style={{ color: "#71717a" }}>
+                <p className="px-0.5 text-[9px]" style={{ color: "#78716c" }}>
                   No effects placed yet — hit <span className="font-semibold">+</span> on an effect
                   to drop it at the playhead.
                 </p>
@@ -3014,7 +3014,7 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
                         </span>
                         <span
                           className="w-14 shrink-0 truncate text-[9px] font-medium"
-                          style={{ color: "#d4d4d8" }}
+                          style={{ color: "#d6d3d1" }}
                           title={def?.label ?? item.sfxId}
                         >
                           {def?.label ?? "Unknown"}
@@ -3044,7 +3044,7 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
                         {onUpdateSfx != null && (
                           <span
                             className="w-7 shrink-0 text-right text-[8px] tabular-nums"
-                            style={{ color: "#a1a1aa" }}
+                            style={{ color: "#a8a29e" }}
                           >
                             {volPct}%
                           </span>
@@ -3067,8 +3067,8 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
                             onClick={() => onRemoveSfx(item.id)}
                             aria-label={`Remove ${def?.label ?? "effect"}`}
                             title="Remove"
-                            className="flex size-5 shrink-0 items-center justify-center rounded transition-colors hover:bg-red-500/25"
-                            style={{ color: "#71717a" }}
+                            className="flex size-5 shrink-0 items-center justify-center rounded transition-colors hover:bg-rose-500/25"
+                            style={{ color: "#78716c" }}
                           >
                             <Trash2 className="size-3" />
                           </button>
@@ -3081,7 +3081,7 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
                           <div className="mt-1 flex items-center gap-1.5">
                             <Timer
                               className="size-2.5 shrink-0"
-                              style={{ color: "#71717a" }}
+                              style={{ color: "#78716c" }}
                               aria-hidden
                             />
                             <input
@@ -3101,7 +3101,7 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
                             />
                             <span
                               className="w-11 shrink-0 text-right text-[8px] tabular-nums"
-                              style={{ color: "#a1a1aa" }}
+                              style={{ color: "#a8a29e" }}
                             >
                               {(sfxDurationMs(item) / 1000).toFixed(2)}s
                             </span>
@@ -3113,8 +3113,8 @@ function SfxPalette({ onAddSfx, sfxItems, onUpdateSfx, onRemoveSfx, currentMs }:
                               disabled={sfxDurationMs(item) === def.defaultDurMs}
                               aria-label={`Reset ${def.label} duration to default`}
                               title={`Reset to default (${def.defaultDurMs}ms)`}
-                              className="flex size-4 shrink-0 items-center justify-center rounded transition-colors hover:bg-zinc-500/25 disabled:opacity-30"
-                              style={{ color: "#71717a" }}
+                              className="flex size-4 shrink-0 items-center justify-center rounded transition-colors hover:bg-stone-500/25 disabled:opacity-30"
+                              style={{ color: "#78716c" }}
                             >
                               <RotateCcw className="size-2.5" />
                             </button>
@@ -3139,7 +3139,7 @@ function NamingGuide() {
   const examples = [
     {
       label: "Absolute",
-      color: "#22d3ee",
+      color: "#5eead4",
       pattern: "[00:00:00 - 00:00:06] beach.jpg",
       desc: "Explicit start → end timecode",
     },
@@ -3151,7 +3151,7 @@ function NamingGuide() {
     },
     {
       label: "Duration",
-      color: "#a78bfa",
+      color: "#fbbf24",
       pattern: "10s_beach.jpg",
       desc: "Sequential 10-second clip",
     },
@@ -3160,15 +3160,15 @@ function NamingGuide() {
     <div
       className="m-3 rounded-lg border p-3"
       style={{
-        borderColor: "#27272a",
+        borderColor: "#292524",
         backgroundColor: "rgba(24, 24, 27, 0.5)",
       }}
     >
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex w-full items-center gap-1.5 text-[10px] font-semibold uppercase tracking-[0.12em] transition-colors hover:text-zinc-400"
-        style={{ color: "#71717a" }}
+        className="flex w-full items-center gap-1.5 text-[10px] font-semibold uppercase tracking-[0.12em] transition-colors hover:text-stone-400"
+        style={{ color: "#78716c" }}
       >
         {open ? (
           <ChevronDown className="size-3" />
@@ -3191,19 +3191,19 @@ function NamingGuide() {
                 <code
                   className="rounded px-1.5 py-0.5 font-mono text-[10px]"
                   style={{
-                    backgroundColor: "#09090b",
-                    color: "#d4d4d8",
+                    backgroundColor: "#0c0a09",
+                    color: "#d6d3d1",
                   }}
                 >
                   {ex.pattern}
                 </code>
               </div>
-              <div className="mt-0.5 pl-1 text-[10px]" style={{ color: "#71717a" }}>
+              <div className="mt-0.5 pl-1 text-[10px]" style={{ color: "#78716c" }}>
                 {ex.desc}
               </div>
             </div>
           ))}
-          <div className="mt-2 text-[9px]" style={{ color: "#52525b" }}>
+          <div className="mt-2 text-[9px]" style={{ color: "#57534e" }}>
             Timecodes accept SS, MM:SS, or HH:MM:SS.
           </div>
         </div>

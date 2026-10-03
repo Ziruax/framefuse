@@ -51,6 +51,10 @@ const crypto = require("crypto");
 const { spawn } = require("child_process");
 const GW = require("./groq-whisper");
 const GC = require("./groq-chat");
+// v1.22: Gemini as an ALTERNATE text-model provider for dubbing (speaker
+// labelling + translation). The user picks per-run: Groq (default) or their
+// Gemini key. Whisper stays Groq-only (it IS the transcription engine).
+const GM = require("./gemini-chat");
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -121,6 +125,7 @@ const deps = {
   groqTranscribe: GW.groqTranscribe,
   extractAudioForGroq: GW.extractAudioForGroq,
   groqChat: GC.groqChat,
+  geminiChat: GM.geminiChat,
   ttsSynthesize: null,
   voicePairsByLocale: null,
 };
@@ -583,6 +588,12 @@ function translateUserPrompt(utts, idxs, langName) {
  * @param {string} [o.groqModel]              Chat model id (normalized).
  * @param {string} [o.whisperModel]           Groq Whisper model id
  *        (normalized; default whisper-large-v3-turbo).
+ * @param {string} [o.textProvider="groq"]    v1.22: which cloud LLM runs the
+ *        speakers + translate phases — "groq" (default) or "gemini".
+ * @param {string} [o.geminiModel]            v1.22: Gemini model id when
+ *        textProvider="gemini" (normalized against GEMINI_TEXT_MODELS).
+ * @param {string} [o.geminiApiKey]           v1.22: the Gemini key (caller
+ *        loads it from userData/gemini.json). REQUIRED for gemini runs.
  * @param {Object} [o.speakerVoices]          { 0: "hi-IN-SwaraNeural", … } overrides.
  * @param {string} [o.voiceMode="multi"]      "single" = ONE voice for every line
  *        (the speakers phase skips detection entirely); "multi" (or
@@ -631,6 +642,17 @@ async function runDub(opts) {
   if (!apiKey) {
     throw new Error("runDub: no Groq API key — dubbing needs a key with Whisper + chat model access");
   }
+  // v1.22 text provider: "groq" (default, unchanged behavior) or "gemini"
+  // (the speakers + translate phases ride the Gemini generateContent client
+  // with the user's Gemini key; Whisper transcription stays Groq).
+  const textProvider = o.textProvider === "gemini" ? "gemini" : "groq";
+  const geminiApiKey =
+    typeof o.geminiApiKey === "string" ? o.geminiApiKey.trim() : "";
+  if (textProvider === "gemini" && !geminiApiKey) {
+    throw new Error(
+      "runDub: no Gemini API key — open Settings → Script Writer, paste your Gemini key (aistudio.google.com/apikey), or switch dubbing back to the Groq model",
+    );
+  }
   if (typeof o.tempDir !== "string" || !o.tempDir) {
     throw new Error("runDub: tempDir is required");
   }
@@ -663,6 +685,9 @@ async function runDub(opts) {
     targetLocale: String(o.targetLocale || o.targetLanguage || "en").trim(),
     groqModel: GC.normalizeTextModel(o.groqModel),
     whisperModel: GW.normalizeGroqModel(o.whisperModel),
+    textProvider,
+    geminiModel: GM.normalizeTextModel(o.geminiModel),
+    geminiApiKey,
     speakerVoices: singleMode && singleVoice
       ? { 0: singleVoice, 1: singleVoice, 2: singleVoice, 3: singleVoice }
       : (o.speakerVoices && typeof o.speakerVoices === "object" ? o.speakerVoices : null),
@@ -980,6 +1005,41 @@ async function singleVoiceSpeakers(ctx, trans) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// v1.22 chatComplete — the provider-dispatching text-model call.
+// Both call shapes (Groq chat-completions / Gemini generateContent) funnel
+// through here so the phases stay provider-agnostic. Returns
+// { content: string } (the Groq call-site shape). Both clients' internal
+// retry/abort handling is reused verbatim.
+// ---------------------------------------------------------------------------
+
+async function chatComplete(ctx, { systemPrompt, userPrompt, temperature, maxTokens }) {
+  if (ctx.textProvider === "gemini") {
+    const res = await deps.geminiChat({
+      apiKey: ctx.geminiApiKey,
+      model: ctx.geminiModel,
+      systemPrompt,
+      userPrompt,
+      temperature,
+      maxOutputTokens: Math.max(1024, Number(maxTokens) || 8192),
+      abortRef: ctx.childAbortRef(),
+    });
+    return { content: res.text, provider: "gemini", model: ctx.geminiModel };
+  }
+  const res = await deps.groqChat({
+    apiKey: ctx.apiKey,
+    model: ctx.groqModel,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    jsonMode: true,
+    temperature,
+    abortRef: ctx.childAbortRef(),
+  });
+  return { content: res.content, provider: "groq", model: ctx.groqModel };
+}
+
 async function detectSpeakers(ctx, trans) {
   const utts = trans.utts;
   report(ctx, "speakers", 5, utts.length >= 2 ? `Detecting speakers across ${utts.length} segments…` : "One segment — single speaker…");
@@ -987,16 +1047,10 @@ async function detectSpeakers(ctx, trans) {
   let assign = null;
   if (utts.length >= 2) {
     try {
-      const res = await deps.groqChat({
-        apiKey: ctx.apiKey,
-        model: ctx.groqModel,
-        messages: [
-          { role: "system", content: SPEAKER_SYSTEM },
-          { role: "user", content: speakerUserPrompt(utts) },
-        ],
-        jsonMode: true,
+      const res = await chatComplete(ctx, {
+        systemPrompt: SPEAKER_SYSTEM,
+        userPrompt: speakerUserPrompt(utts),
         temperature: 0.2, // classification wants determinism, not creativity
-        abortRef: ctx.childAbortRef(),
       });
       const parsed = GC.parseJsonish(res.content);
       const candidate = parseSpeakerAssignment(parsed, utts.length);
@@ -1056,16 +1110,10 @@ async function translateSegments(ctx, trans, warnings) {
   const translations = new Array(n).fill(null);
 
   const runBatch = async (idxs) => {
-    const res = await deps.groqChat({
-      apiKey: ctx.apiKey,
-      model: ctx.groqModel,
-      messages: [
-        { role: "system", content: translateSystemPrompt(langName) },
-        { role: "user", content: translateUserPrompt(utts, idxs, langName) },
-      ],
-      jsonMode: true,
+    const res = await chatComplete(ctx, {
+      systemPrompt: translateSystemPrompt(langName),
+      userPrompt: translateUserPrompt(utts, idxs, langName),
       temperature: 0.3,
-      abortRef: ctx.childAbortRef(),
     });
     const parsed = GC.parseJsonish(res.content);
     if (!parsed || !Array.isArray(parsed.segments)) return 0;
@@ -1323,4 +1371,9 @@ module.exports = {
   GROQ_TEXT_MODELS: GC.GROQ_TEXT_MODELS,
   DEFAULT_TEXT_MODEL: GC.DEFAULT_TEXT_MODEL,
   normalizeTextModel: GC.normalizeTextModel,
+  // v1.22: the Gemini picker data for dub:models
+  GEMINI_TEXT_MODELS: GM.GEMINI_TEXT_MODELS,
+  GEMINI_DEFAULT_TEXT_MODEL: GM.GEMINI_DEFAULT_TEXT_MODEL,
+  normalizeGeminiTextModel: GM.normalizeTextModel,
+  chatComplete,
 };

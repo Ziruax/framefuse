@@ -80,9 +80,9 @@ function Kbd({ children }: { children: React.ReactNode }) {
     <kbd
       className="inline-flex h-5 min-w-5 items-center justify-center rounded border px-1.5 font-mono text-[10px] font-medium leading-none"
       style={{
-        borderColor: "#3f3f46",
-        backgroundColor: "#18181b",
-        color: "#e4e4e7",
+        borderColor: "#44403c",
+        backgroundColor: "#1c1917",
+        color: "#e7e5e4",
         boxShadow: "0 1px 0 rgba(0,0,0,0.6), inset 0 -1px 0 rgba(0,0,0,0.45)",
       }}
     >
@@ -119,8 +119,8 @@ export function ShortcutsOverlay({ onClose }: { onClose: () => void }) {
         aria-label="Keyboard shortcuts"
         className="ff-shortcuts-card flex max-h-[86vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border"
         style={{
-          borderColor: "#3f3f46",
-          backgroundColor: "#111113",
+          borderColor: "#44403c",
+          backgroundColor: "#12100e",
           boxShadow:
             "0 24px 64px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.04)",
         }}
@@ -129,24 +129,24 @@ export function ShortcutsOverlay({ onClose }: { onClose: () => void }) {
         <div
           className="flex shrink-0 items-center gap-3 border-b px-5 py-3.5"
           style={{
-            borderColor: "#27272a",
-            background: "linear-gradient(180deg, #17171a 0%, #121214 100%)",
+            borderColor: "#292524",
+            background: "linear-gradient(180deg, #191613 0%, #14110e 100%)",
           }}
         >
           <div
             className="flex size-8 items-center justify-center rounded-lg"
             style={{
-              backgroundImage: "linear-gradient(135deg, #8b5cf6, #c026d3)",
+              backgroundImage: "linear-gradient(135deg, #f59e0b, #2dd4bf)",
               boxShadow: "0 4px 14px rgba(124, 58, 237, 0.35)",
             }}
           >
             <Keyboard className="size-4 text-white" aria-hidden />
           </div>
           <div className="flex-1">
-            <div className="text-[13px] font-semibold" style={{ color: "#e4e4e7" }}>
+            <div className="text-[13px] font-semibold" style={{ color: "#e7e5e4" }}>
               Keyboard shortcuts
             </div>
-            <div className="text-[11px]" style={{ color: "#71717a" }}>
+            <div className="text-[11px]" style={{ color: "#78716c" }}>
               FrameFuse works fastest from the keyboard
             </div>
           </div>
@@ -156,7 +156,7 @@ export function ShortcutsOverlay({ onClose }: { onClose: () => void }) {
             onClick={onClose}
             title="Close (Esc)"
             aria-label="Close shortcuts"
-            className="flex size-7 items-center justify-center rounded-md text-zinc-400 transition-colors hover:bg-white/10 hover:text-white"
+            className="flex size-7 items-center justify-center rounded-md text-stone-400 transition-colors hover:bg-white/10 hover:text-white"
           >
             <X className="size-4" />
           </button>
@@ -168,9 +168,9 @@ export function ShortcutsOverlay({ onClose }: { onClose: () => void }) {
             <section key={g.title} aria-label={g.title} className="mb-4 last:mb-0">
               <h3
                 className="mb-2 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider"
-                style={{ color: "#a1a1aa" }}
+                style={{ color: "#a8a29e" }}
               >
-                <span style={{ color: "#a78bfa" }} aria-hidden>
+                <span style={{ color: "#fbbf24" }} aria-hidden>
                   {g.icon}
                 </span>
                 {g.title}
@@ -181,7 +181,7 @@ export function ShortcutsOverlay({ onClose }: { onClose: () => void }) {
                     key={`${g.title}-${i}-${r.action}`}
                     className="flex items-center justify-between gap-3 rounded-md px-2 py-1.5 transition-colors hover:bg-white/[0.04]"
                   >
-                    <span className="text-[12px]" style={{ color: "#d4d4d8" }}>
+                    <span className="text-[12px]" style={{ color: "#d6d3d1" }}>
                       {r.action}
                     </span>
                     <span className="flex shrink-0 items-center gap-1">
@@ -190,7 +190,7 @@ export function ShortcutsOverlay({ onClose }: { onClose: () => void }) {
                           <Kbd key={k}>{k}</Kbd>
                         ) : (
                           <span key={k} className="flex items-center gap-1">
-                            <span className="text-[9px]" style={{ color: "#52525b" }}>
+                            <span className="text-[9px]" style={{ color: "#57534e" }}>
                               +
                             </span>
                             <Kbd>{k}</Kbd>
@@ -208,12 +208,12 @@ export function ShortcutsOverlay({ onClose }: { onClose: () => void }) {
         {/* Footer */}
         <div
           className="flex shrink-0 items-center justify-between border-t px-5 py-2.5"
-          style={{ borderColor: "#27272a", backgroundColor: "#0f0f11" }}
+          style={{ borderColor: "#292524", backgroundColor: "#12100e" }}
         >
-          <span className="text-[10px]" style={{ color: "#71717a" }}>
+          <span className="text-[10px]" style={{ color: "#78716c" }}>
             On macOS use ⌘ instead of Ctrl
           </span>
-          <span className="flex items-center gap-1.5 text-[10px]" style={{ color: "#a1a1aa" }}>
+          <span className="flex items-center gap-1.5 text-[10px]" style={{ color: "#a8a29e" }}>
             <Kbd>Esc</Kbd> to close
           </span>
         </div>

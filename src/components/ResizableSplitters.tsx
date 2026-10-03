@@ -259,9 +259,9 @@ export function Splitter({
       onFocus={() => setFocused(true)}
       onBlur={() => setFocused(false)}
     >
-      {/* 1px visible line (zinc-700 → cyan on hover/drag — see globals.css) */}
+      {/* 1px visible line (stone-700 → cyan on hover/drag — see globals.css) */}
       <span className="ff-splitter-line" aria-hidden="true" />
-      {/* grip texture: 3 dots, zinc-500 */}
+      {/* grip texture: 3 dots, stone-500 */}
       <span className="ff-splitter-grip" aria-hidden="true">
         <i />
         <i />

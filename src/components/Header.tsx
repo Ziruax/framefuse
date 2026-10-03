@@ -24,7 +24,7 @@ import { cn } from "@/lib/utils";
 /** v1.12.1: the renderer's build constant — compared against the REAL exe
  *  version (app.getVersion()) so a stale/hybrid install is impossible to
  *  miss. Keep in sync with package.json on every release. */
-const BUILD_VERSION = "1.21.0";
+const BUILD_VERSION = "1.22.0";
 
 export interface LastExport {
   path: string;
@@ -280,9 +280,9 @@ export function Header({
     <header
       className="no-select flex h-14 shrink-0 items-center gap-2 border-b px-3 sm:gap-4 sm:px-5"
       style={{
-        borderColor: "#27272a",
+        borderColor: "#292524",
         background:
-          "linear-gradient(180deg, #121215 0%, #0d0d0d 100%)",
+          "linear-gradient(180deg, #17140f 0%, #0c0a09 100%)",
         boxShadow: "0 1px 0 rgba(255,255,255,0.03) inset, 0 8px 24px rgba(0,0,0,0.35)",
       }}
     >
@@ -290,19 +290,19 @@ export function Header({
           Native FFmpeg" told a TikTok editor nothing). */}
       <div className="flex items-center gap-3">
         <div
-          className="flex size-8 shrink-0 items-center justify-center rounded-[8px] transition-transform duration-200 hover:scale-105"
+          className="flex size-8 shrink-0 items-center justify-center rounded-lg transition-transform duration-200 hover:scale-105"
           style={{
-            backgroundImage: "linear-gradient(135deg, #22d3ee 0%, #06b6d4 45%, #0891b2 100%",
-            boxShadow: "0 4px 14px rgba(6, 182, 212, 0.35)",
+            backgroundImage: "linear-gradient(135deg, #fcd34d 0%, #fbbf24 45%, #f59e0b 100%)",
+            boxShadow: "0 4px 14px rgba(245, 158, 11, 0.35)",
           }}
         >
-          <Film className="size-4" style={{ color: "#04222b" }} />
+          <Film className="size-4" style={{ color: "#1c1917" }} />
         </div>
         <div className="leading-tight">
           <div className="flex items-center gap-2">
             <span
               className="text-[15px] font-semibold tracking-tight"
-              style={{ color: "#f4f4f5" }}
+              style={{ color: "#fafaf9" }}
             >
               FrameFuse
             </span>
@@ -316,9 +316,9 @@ export function Header({
                 "hidden items-center gap-1 whitespace-nowrap rounded border px-1.5 py-0.5 font-mono text-[10px] font-medium md:inline-flex",
               )}
               style={{
-                borderColor: versionStale ? "rgba(245, 158, 11, 0.55)" : "#27272a",
-                backgroundColor: versionStale ? "rgba(245, 158, 11, 0.10)" : "#18181b",
-                color: versionStale ? "#fbbf24" : "#a1a1aa",
+                borderColor: versionStale ? "rgba(245, 158, 11, 0.55)" : "#292524",
+                backgroundColor: versionStale ? "rgba(245, 158, 11, 0.10)" : "#1c1917",
+                color: versionStale ? "#fbbf24" : "#a8a29e",
               }}
               title={
                 versionStale
@@ -334,18 +334,18 @@ export function Header({
               <span
                 className="flex max-w-[220px] items-center gap-1 truncate rounded border px-1.5 py-0.5 text-[10px] font-medium"
                 style={{
-                  borderColor: "#27272a",
-                  backgroundColor: "#18181b",
-                  color: "#a1a1aa",
+                  borderColor: "#292524",
+                  backgroundColor: "#1c1917",
+                  color: "#a8a29e",
                 }}
                 title={`Saved project — ${projectName}`}
               >
-                <FileJson className="size-2.5 shrink-0 text-zinc-500" aria-hidden />
+                <FileJson className="size-2.5 shrink-0 text-stone-500" aria-hidden />
                 <span className="truncate">{projectName}</span>
               </span>
             )}
           </div>
-          <div className="hidden text-[11px] sm:block" style={{ color: "#8b8b94" }}>
+          <div className="hidden text-[11px] sm:block" style={{ color: "#78716c" }}>
             Video Studio
           </div>
         </div>
@@ -361,14 +361,14 @@ export function Header({
             style={
               mode === "absolute"
                 ? {
-                    borderColor: "rgba(14, 116, 144, 0.55)",
-                    backgroundColor: "rgba(8, 51, 68, 0.35)",
-                    color: "#67e8f9",
+                    borderColor: "rgba(45, 212, 191, 0.4)",
+                    backgroundColor: "rgba(19, 78, 74, 0.25)",
+                    color: "#5eead4",
                   }
                 : {
-                    borderColor: "rgba(14, 116, 144, 0.55)",
-                    backgroundColor: "rgba(8, 51, 68, 0.35)",
-                    color: "#67e8f9",
+                    borderColor: "#292524",
+                    backgroundColor: "rgba(41, 37, 36, 0.5)",
+                    color: "#d6d3d1",
                   }
             }
             title={
@@ -388,9 +388,9 @@ export function Header({
           <span
             className="rounded-md border px-2.5 py-1 text-[11px] font-semibold"
             style={{
-              borderColor: "#27272a",
-              backgroundColor: "#18181b",
-              color: "#71717a",
+              borderColor: "#292524",
+              backgroundColor: "#1c1917",
+              color: "#78716c",
             }}
             title="Import a few clips to build your first timeline"
           >
@@ -400,9 +400,9 @@ export function Header({
         <span
           className="flex items-center gap-1 rounded-md border px-2 py-1 text-[11px]"
           style={{
-            borderColor: "#27272a",
-            backgroundColor: "#18181b",
-            color: "#a1a1aa",
+            borderColor: "#292524",
+            backgroundColor: "#1c1917",
+            color: "#a8a29e",
           }}
           title={`${imageCount} clip${imageCount === 1 ? "" : "s"} in the project`}
         >
@@ -417,7 +417,7 @@ export function Header({
           below sm (keyboard-oriented controls — phones have no Ctrl+Z;
           this also un-crowds the header so the Export button never
           truncates). */}
-      <div className="hidden items-center gap-1 rounded-lg border p-0.5 sm:flex" style={{ borderColor: "#27272a", backgroundColor: "#131316" }}>
+      <div className="hidden items-center gap-1 rounded-lg border p-0.5 sm:flex" style={{ borderColor: "#292524", backgroundColor: "#17140f" }}>
         <button
           type="button"
           onClick={onUndo}
@@ -427,13 +427,13 @@ export function Header({
           className={cn(
             "flex size-7 items-center justify-center rounded-md transition-all active:scale-90",
             canUndo
-              ? "text-zinc-300 hover:bg-white/10 hover:text-white"
-              : "cursor-not-allowed text-zinc-600 opacity-40",
+              ? "text-stone-300 hover:bg-white/10 hover:text-white"
+              : "cursor-not-allowed text-stone-600 opacity-40",
           )}
         >
           <Undo2 className="size-4" />
         </button>
-        <div className="h-4 w-px" style={{ backgroundColor: "#27272a" }} />
+        <div className="h-4 w-px" style={{ backgroundColor: "#292524" }} />
         <button
           type="button"
           onClick={onRedo}
@@ -443,20 +443,20 @@ export function Header({
           className={cn(
             "flex size-7 items-center justify-center rounded-md transition-all active:scale-90",
             canRedo
-              ? "text-zinc-300 hover:bg-white/10 hover:text-white"
-              : "cursor-not-allowed text-zinc-600 opacity-40",
+              ? "text-stone-300 hover:bg-white/10 hover:text-white"
+              : "cursor-not-allowed text-stone-600 opacity-40",
           )}
         >
           <Redo2 className="size-4" />
         </button>
         {/* v1.2: shortcuts overlay toggle */}
-        <div className="h-4 w-px" style={{ backgroundColor: "#27272a" }} />
+        <div className="h-4 w-px" style={{ backgroundColor: "#292524" }} />
         <button
           type="button"
           onClick={onShowShortcuts}
           title="Keyboard shortcuts (?)"
           aria-label="Keyboard shortcuts"
-          className="flex size-7 items-center justify-center rounded-md text-zinc-400 transition-all hover:bg-white/10 hover:text-white active:scale-90"
+          className="flex size-7 items-center justify-center rounded-md text-stone-400 transition-all hover:bg-white/10 hover:text-white active:scale-90"
         >
           <Keyboard className="size-4" />
         </button>
@@ -473,7 +473,7 @@ export function Header({
         <div className="flex items-center gap-2 sm:gap-3">
           <div
             className="flex items-center gap-2 text-[11px]"
-            style={{ color: "#a1a1aa" }}
+            style={{ color: "#a8a29e" }}
             title={
               exportProgress?.phase
                 ? `Export phase: ${PHASE_LABEL[exportProgress.phase] ?? exportProgress.phase}`
@@ -482,21 +482,21 @@ export function Header({
           >
             <Timer
               className="size-3.5 animate-pulse"
-              style={{ color: "#22d3ee" }}
+              style={{ color: "#fbbf24" }}
             />
             <span
               className="font-mono tabular-nums"
-              style={{ color: "#e4e4e7" }}
+              style={{ color: "#e7e5e4" }}
             >
               {pctLabel}%
             </span>
             {exportProgress?.phase && (
-              <span className="hidden sm:inline" style={{ color: "#71717a" }}>
+              <span className="hidden sm:inline" style={{ color: "#78716c" }}>
                 {PHASE_LABEL[exportProgress.phase] ?? exportProgress.phase}
               </span>
             )}
             {exportProgress?.timemark ? (
-              <span className="hidden sm:inline" style={{ color: "#71717a" }}>
+              <span className="hidden sm:inline" style={{ color: "#78716c" }}>
                 @ {fmtTimecode(parseTimemark(exportProgress.timemark))}
                 {exportProgress?.total
                   ? ` / ${fmtTimecode(exportProgress.total * 1000)}`
@@ -509,7 +509,7 @@ export function Header({
             Number.isFinite(exportProgress.eta) ? (
               <span
                 className="tabular-nums"
-                style={{ color: "#67e8f9" }}
+                style={{ color: "#fcd34d" }}
                 title="Estimated time remaining"
               >
                 ETA {fmtElapsed(exportProgress.eta)}
@@ -517,7 +517,7 @@ export function Header({
             ) : (
               <span
                 className="animate-pulse"
-                style={{ color: "#71717a" }}
+                style={{ color: "#78716c" }}
                 title="Measuring the encode rate…"
               >
                 estimating…
@@ -534,11 +534,17 @@ export function Header({
                 says "Rust engine" for them too; reasons are human words. */}
             {exportProgress?.engine ? (
               <span
-                className="hidden rounded-sm px-1.5 py-0.5 sm:inline"
+                className="hidden items-center gap-1.5 rounded-full border px-2 py-0.5 sm:inline-flex"
                 style={{
-                  color: exportProgress.engine === "rust" ? "#67e8f9" : "#a1a1aa",
+                  borderColor:
+                    exportProgress.engine === "rust"
+                      ? "rgba(52, 211, 153, 0.35)"
+                      : "rgba(245, 158, 11, 0.35)",
                   backgroundColor:
-                    exportProgress.engine === "rust" ? "rgba(8, 145, 178, 0.18)" : "rgba(63, 63, 70, 0.35)",
+                    exportProgress.engine === "rust"
+                      ? "rgba(6, 78, 59, 0.25)"
+                      : "rgba(120, 53, 15, 0.18)",
+                  color: exportProgress.engine === "rust" ? "#6ee7b7" : "#a8a29e",
                 }}
                 title={
                   exportProgress.engine === "rust"
@@ -548,6 +554,20 @@ export function Header({
                       : "FFmpeg CLI pipeline (Safe Mode)"
                 }
               >
+                {/* v1.22: status dot — emerald for the native Rust engine,
+                    amber for the FFmpeg CLI fallback. */}
+                <span
+                  className="size-1.5 shrink-0 rounded-full"
+                  style={{
+                    backgroundColor:
+                      exportProgress.engine === "rust" ? "#34d399" : "#fbbf24",
+                    boxShadow:
+                      exportProgress.engine === "rust"
+                        ? "0 0 6px rgba(52, 211, 153, 0.8)"
+                        : "0 0 6px rgba(251, 191, 36, 0.8)",
+                  }}
+                  aria-hidden
+                />
                 {exportProgress.engine === "rust" ? "Rust engine" : "FFmpeg CLI"}
                 {exportProgress.engine !== "rust" && exportProgress.engineReason ? (
                   <span
@@ -561,7 +581,7 @@ export function Header({
               </span>
             ) : null}
             {exportProgress?.fps ? (
-              <span className="hidden sm:inline" style={{ color: "#71717a" }}>
+              <span className="hidden sm:inline" style={{ color: "#78716c" }}>
                 {exportProgress.fps.toFixed(0)} fps
               </span>
             ) : exportProgress?.rate != null &&
@@ -569,7 +589,7 @@ export function Header({
               exportProgress.rate > 0 ? (
               <span
                 className="hidden tabular-nums sm:inline"
-                style={{ color: "#71717a" }}
+                style={{ color: "#78716c" }}
                 title="Timeline seconds processed per wall-clock second"
               >
                 {exportProgress.rate.toFixed(1)}×
@@ -578,14 +598,14 @@ export function Header({
           </div>
           <div
             className="h-1.5 w-24 overflow-hidden rounded-full sm:w-40"
-            style={{ backgroundColor: "#27272a" }}
+            style={{ backgroundColor: "#292524" }}
           >
             <div
               className="h-full rounded-full transition-[width] duration-200"
               style={{
                 width: `${pct}%`,
                 backgroundImage:
-                  "linear-gradient(to right, #22d3ee, #06b6d4)",
+                  "linear-gradient(to right, #fcd34d, #f59e0b)",
               }}
             />
           </div>
@@ -594,9 +614,9 @@ export function Header({
             onClick={onCancel}
             className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-[12px] font-medium transition-colors"
             style={{
-              borderColor: "#7f1d1d",
-              backgroundColor: "rgba(127, 29, 29, 0.4)",
-              color: "#fca5a5",
+              borderColor: "rgba(159, 18, 57, 0.6)",
+              backgroundColor: "rgba(159, 18, 57, 0.35)",
+              color: "#fda4af",
             }}
           >
             <X className="size-3.5" /> Cancel
@@ -610,9 +630,9 @@ export function Header({
         <div
           className="hidden shrink-0 items-center gap-2 whitespace-nowrap rounded-md border px-2.5 py-1 text-[11px] md:flex"
           style={{
-            borderColor: "#27272a",
-            backgroundColor: "rgba(24, 24, 27, 0.6)",
-            color: "#a1a1aa",
+            borderColor: "#292524",
+            backgroundColor: "rgba(28, 25, 23, 0.6)",
+            color: "#a8a29e",
           }}
           title={
             lastExport.elapsedSec != null
@@ -686,15 +706,15 @@ export function Header({
               : undefined
           }
         >
-          <Clock className="size-3" style={{ color: "#71717a" }} />
-          <span className="font-medium" style={{ color: "#d4d4d8" }}>
+          <Clock className="size-3" style={{ color: "#78716c" }} />
+          <span className="font-medium" style={{ color: "#d6d3d1" }}>
             {fmtBytes(lastExport.size)}
           </span>
-          <span style={{ color: "#52525b" }}>·</span>
+          <span style={{ color: "#57534e" }}>·</span>
           <span>{lastExport.method}</span>
           {lastExport.elapsedSec != null && (
             <>
-              <span style={{ color: "#52525b" }}>·</span>
+              <span style={{ color: "#57534e" }}>·</span>
               <span
                 className="flex items-center gap-1 tabular-nums"
                 style={{ color: "#f59e0b" }}
@@ -707,15 +727,15 @@ export function Header({
           )}
           {lastExport.totalChunks != null && lastExport.totalChunks > 1 && (
             <>
-              <span style={{ color: "#52525b" }}>·</span>
+              <span style={{ color: "#57534e" }}>·</span>
               <span
                 className="rounded px-1 py-px font-medium"
                 style={{
                   backgroundColor:
                     lastExport.poolWorkers != null && lastExport.poolWorkers > 1
-                      ? "rgba(6, 182, 212, 0.12)"
+                      ? "rgba(45, 212, 191, 0.12)"
                       : "rgba(245, 158, 11, 0.12)",
-                  color: lastExport.poolWorkers != null && lastExport.poolWorkers > 1 ? "#67e8f9" : "#fbbf24",
+                  color: lastExport.poolWorkers != null && lastExport.poolWorkers > 1 ? "#5eead4" : "#fbbf24",
                 }}
                 title={
                   lastExport.mode === "smart-render"
@@ -740,7 +760,7 @@ export function Header({
           )}
           {lastExport.copiedClips != null && lastExport.copiedClips > 0 && (
             <>
-              <span style={{ color: "#52525b" }}>·</span>
+              <span style={{ color: "#57534e" }}>·</span>
               <span
                 className="rounded px-1 py-px font-medium"
                 style={{ backgroundColor: "rgba(16, 185, 129, 0.12)", color: "#34d399" }}
@@ -756,7 +776,7 @@ export function Header({
               </span>
             </>
           )}
-          <span style={{ color: "#52525b" }}>·</span>
+          <span style={{ color: "#57534e" }}>·</span>
           <span>{timeAgo(lastExport.at)}</span>
         </div>
       )}

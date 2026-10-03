@@ -68,9 +68,44 @@ function rustEngineStatus() {
       version: safeCall(() => rustEngine.engineVersion()),
       binary: rustEngine.binaryName,
       from: rustEngine.loadedFrom,
+      diagnostics: safeCall(() => rustEngine.loadDiagnostics()),
+      lastFailure: lastRustFailure,
     };
   }
-  return { loaded: false, error: rustEngineError };
+  return {
+    loaded: false,
+    error: rustEngineError,
+    diagnostics: safeCall(() => {
+      try {
+        const loader = require(path.join(__dirname, "..", "rust-engine"));
+        return loader.loadDiagnostics ? loader.loadDiagnostics() : undefined;
+      } catch {
+        return undefined;
+      }
+    }),
+    lastFailure: lastRustFailure,
+  };
+}
+
+/** v1.22 TRANSPARENCY: the LAST reason a Rust export was bypassed — the
+ * gate refusal, the timeline-build failure, or the RUNTIME exportVideo
+ * error (previously runtime failures silently became "FFmpeg CLI" with no
+ * explanation — the #1 "why is the engine not working" complaint).
+ * Shape: { at: epochMs, stage: "gate"|"timeline"|"runtime", reason: string } */
+let lastRustFailure = null;
+
+function recordRustFailure(stage, reason) {
+  lastRustFailure = {
+    at: Date.now(),
+    stage,
+    reason: String(reason || "").slice(0, 500),
+  };
+  return null;
+}
+
+/** The last bypass reason (null when the last Rust attempt succeeded). */
+function rustFailureReason() {
+  return lastRustFailure ? lastRustFailure.reason : null;
 }
 
 function safeCall(fn) {
@@ -919,6 +954,7 @@ async function runRustExport(opts, event, { ffmpegPath, cpuCount, sendCliProgres
     if (rustEngine) {
       console.log(`[RustEngine] CLI path chosen (v0.1 unsupported: ${gate.reason})`);
     }
+    recordRustFailure("gate", `unsupported feature: ${gate.reason}`);
     return null;
   }
   // v1.20.1 SAFE-MODE HARDENING: buildRustTimeline runs INSIDE the guard —
@@ -933,10 +969,12 @@ async function runRustExport(opts, event, { ffmpegPath, cpuCount, sendCliProgres
     console.log(
       `[RustEngine] timeline build failed (${(err && err.message) || err}) — Safe Mode: CLI pipeline`,
     );
+    recordRustFailure("timeline", `timeline build failed: ${(err && err.message) || err}`);
     return null;
   }
   if (built.error) {
     console.log(`[RustEngine] timeline build refused: ${built.error}`);
+    recordRustFailure("timeline", `timeline build refused: ${built.error}`);
     return null;
   }
   if (built.timeline.captions) {
@@ -987,6 +1025,9 @@ async function runRustExport(opts, event, { ffmpegPath, cpuCount, sendCliProgres
     const size = (() => {
       try { return fs.statSync(opts.outputPath).size; } catch { return 0; }
     })();
+    // v1.22: a SUCCESSFUL Rust run clears the bypass trace — the badge and
+    // the diagnostics card must report the CURRENT truth, not history.
+    lastRustFailure = null;
     const gpu = res.engineUsed === "rust-gpu";
     return {
       path: opts.outputPath,
@@ -1032,6 +1073,10 @@ async function runRustExport(opts, event, { ffmpegPath, cpuCount, sendCliProgres
       `[RustEngine] export failed after ${Date.now() - startedAt}ms — falling back to FFmpeg CLI:`,
       (err && err.message) || err,
     );
+    // v1.22: RUNTIME failures (DLL family mismatch, wgpu adapter error,
+    // encode failure…) now LEAVE A TRACE — the Header badge + the Engine
+    // diagnostics card show this reason instead of a silent "FFmpeg CLI".
+    recordRustFailure("runtime", `engine run failed: ${(err && err.message) || err}`);
     return null;
   }
 }
@@ -1059,12 +1104,181 @@ function requestRustCancel() {
  * Rust engine is eligible or not loaded at all). The main process threads
  * this into the export-progress payload so the UI can show the routing
  * reason instead of a silent "FFmpeg CLI" badge.
+ * v1.22: ALSO consults the runtime failure trace — a gate pass that then
+ * failed INSIDE the engine (DLLs, wgpu) is reported with the real reason.
  */
 function rustGateReason(opts) {
   if (!rustEngine) return null;
   const gate = rustEligible(opts);
-  if (gate.ok) return null;
+  if (gate.ok) {
+    // The gate passed but the engine may still have failed at RUNTIME on
+    // the last attempt — that reason outranks "eligible" for the badge.
+    return lastRustFailure ? lastRustFailure.reason : null;
+  }
   return gate.reason;
+}
+
+// ── v1.22 SELF-TEST (the "why is it ALWAYS falling back" answer) ───────────
+// A REAL end-to-end mini export through the ACTUAL engine in the ACTUAL
+// runtime (same load path, same DLL dir resolution, same wgpu adapter) —
+// 36 frames of a generated solid-color image + a text layer, 640×360.
+// Returns the whole story: load status, engine used, encoder, adapter, wall
+// time, or the exact error. Writes a tiny PNG via zlib (zero deps) so the
+// test never depends on repo sample files that don't ship in the package.
+
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const typeBuf = Buffer.from(type, "ascii");
+  const crcTable = [];
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    crcTable[n] = c >>> 0;
+  }
+  let crc = 0xffffffff;
+  for (const b of Buffer.concat([typeBuf, data])) crc = crcTable[(crc ^ b) & 0xff] ^ (crc >>> 8);
+  const crcBuf = Buffer.alloc(4);
+  crcBuf.writeUInt32BE((crc ^ 0xffffffff) >>> 0, 0);
+  return Buffer.concat([len, typeBuf, data, crcBuf]);
+}
+
+/** Write a solid-color PNG (w×h, [r,g,b]) — dependency-free. */
+function writeSolidPng(filePath, w, h, rgb) {
+  const zlib = require("zlib");
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0);
+  ihdr.writeUInt32BE(h, 4);
+  ihdr[8] = 8;  // bit depth
+  ihdr[9] = 2;  // color type: truecolor
+  const raw = Buffer.alloc((w * 3 + 1) * h);
+  let o = 0;
+  for (let y = 0; y < h; y++) {
+    raw[o++] = 0; // filter: none
+    for (let x = 0; x < w; x++) {
+      raw[o++] = rgb[0]; raw[o++] = rgb[1]; raw[o++] = rgb[2];
+    }
+  }
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", zlib.deflateSync(raw)),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+  fs.writeFileSync(filePath, png);
+  return filePath;
+}
+
+async function runRustSelfTest(ffmpegPath, outDir) {
+  const status = rustEngineStatus();
+  if (!rustEngine) {
+    return {
+      ok: false,
+      stage: "load",
+      error: status.error || "engine not loaded",
+      status,
+    };
+  }
+  let outPath;
+  let imgPath;
+  try {
+    fs.mkdirSync(outDir, { recursive: true });
+    outPath = path.join(outDir, `engine-selftest-${Date.now()}.mp4`);
+    imgPath = writeSolidPng(path.join(outDir, `engine-selftest-${Date.now()}.png`), 320, 180, [32, 35, 43]);
+  } catch (err) {
+    return { ok: false, stage: "temp", error: String(err.message || err), status };
+  }
+  // A real font file for the text layer: the bundled Inter (packaged
+  // resources/fonts or dev public/fonts), OS fallback resolved by the
+  // engine's own font search when empty.
+  let fontFile = "";
+  try {
+    const fontsDir = bundledFontsDir();
+    if (fontsDir) {
+      const cand = path.join(fontsDir, "Inter-700.ttf");
+      if (fs.existsSync(cand)) fontFile = cand;
+    }
+  } catch (_) { /* engine falls back to the OS font search */ }
+  const timeline = {
+    version: 2,
+    width: 640,
+    height: 360,
+    fps: 12,
+    backgroundColor: "#0c0a09",
+    totalMs: 3000,
+    fadeInMs: 0,
+    fadeOutMs: 0,
+    fonts: { sans: fontFile },
+    segments: [
+      {
+        id: "selftest",
+        mediaType: "image",
+        path: imgPath,
+        startMs: 0,
+        endMs: 3000,
+        durationMs: 3000,
+        trimInMs: 0,
+        speed: 1,
+        track: 0,
+        volume: 1,
+      },
+    ],
+    texts: [
+      {
+        text: "FrameFuse engine test",
+        startMs: 0,
+        endMs: 3000,
+        font: "sans",
+        size: 44,
+        color: "#fbbf24",
+        outlineColor: "#000000",
+        position: "center",
+        x: 0.5,
+        fadeMs: 0,
+      },
+    ],
+    extraAudio: [],
+  };
+  const dllDir = ffmpegDllDir(ffmpegPath);
+  const startedAt = Date.now();
+  try {
+    const res = await rustEngine.exportVideo(
+      JSON.stringify(timeline),
+      outPath,
+      dllDir,
+      () => {}, // no progress relay for a 36-frame test
+    );
+    let size = 0;
+    try { size = fs.statSync(outPath).size; } catch (_) { /* best effort */ }
+    const cleanup = () => {
+      try { fs.unlinkSync(outPath); } catch (_) {}
+      try { fs.unlinkSync(imgPath); } catch (_) {}
+    };
+    cleanup();
+    return {
+      ok: true,
+      engineUsed: res.engineUsed,
+      encoderName: res.encoderName,
+      adapter: res.adapter,
+      ffmpegFamily: res.ffmpegFamily,
+      frames: res.frames,
+      wallMs: Date.now() - startedAt,
+      outputBytes: size,
+      dllDir,
+      status,
+    };
+  } catch (err) {
+    try { fs.unlinkSync(outPath); } catch (_) { /* best effort */ }
+    try { fs.unlinkSync(imgPath); } catch (_) { /* best effort */ }
+    recordRustFailure("runtime", `self-test failed: ${(err && err.message) || err}`);
+    return {
+      ok: false,
+      stage: "run",
+      error: String((err && err.message) || err),
+      dllDir,
+      status: rustEngineStatus(),
+    };
+  }
 }
 
 module.exports = {
@@ -1075,4 +1289,6 @@ module.exports = {
   runRustExport,
   requestRustCancel,
   rustGateReason,
+  rustFailureReason,
+  runRustSelfTest,
 };

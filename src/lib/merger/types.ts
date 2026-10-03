@@ -821,6 +821,13 @@ export interface DubSettings {
   targetLanguage: string;
   targetLocale: string;
   groqModel: string;
+  /** v1.22: which cloud LLM runs the dub's speaker-detection + translation
+   *  phases — "groq" (default) or "gemini" (needs the Gemini key saved in
+   *  Settings → Script Writer; Whisper transcription stays Groq either
+   *  way). Absent (old persisted prefs) reads as "groq". */
+  textProvider: "groq" | "gemini";
+  /** v1.22: the Gemini model id used when textProvider === "gemini". */
+  geminiModel: string;
   femaleVoice: string;
   maleVoice: string;
   /** v1.20: "single" = one voice reads the whole dub (speaker detection
@@ -1291,13 +1298,51 @@ declare global {
         cpuModel?: string;
         optimizeSubtitles?: boolean;
         /** v1.18: the native Rust engine's load status (version/binary or
-         *  the load error) — the engine badge + diagnostics line. */
+         *  the load error) — the engine badge + diagnostics line. v1.22:
+         *  lastFailure = the most recent reason an export bypassed the
+         *  engine (gate / timeline / runtime). */
         rustEngine?: {
           loaded: boolean;
           version?: string | null;
           binary?: string | null;
           error?: string | null;
+          lastFailure?: { at: number; stage: string; reason: string } | null;
         };
+      }>;
+      /** ── v1.22 NATIVE ENGINE DIAGNOSTICS ── */
+      /** The Rust engine's load state + the LAST bypass reason + the loader's
+       *  candidate-path diagnostics — the "why is it falling back" answer. */
+      engineStatus?: () => Promise<{
+        loaded: boolean;
+        version?: string | null;
+        binary?: string | null;
+        from?: string | null;
+        error?: string | null;
+        lastFailure?: { at: number; stage: string; reason: string } | null;
+        diagnostics?: {
+          binary: string;
+          platform: string;
+          electron: boolean;
+          attempts: Array<{ path: string; ok: boolean; error?: string }>;
+          loadError: string | null;
+        } | null;
+      }>;
+      /** Runs a REAL 36-frame mini export through the Rust engine in THIS
+       *  runtime — the definitive health check (engineUsed/encoder/adapter
+       *  + wall time on pass, the exact error + stage on fail). */
+      engineSelfTest?: () => Promise<{
+        ok: boolean;
+        stage?: string;
+        error?: string;
+        engineUsed?: string;
+        encoderName?: string;
+        adapter?: string;
+        ffmpegFamily?: string;
+        frames?: number;
+        wallMs?: number;
+        outputBytes?: number;
+        dllDir?: string;
+        status?: unknown;
       }>;
       /** v8.1 (Task 27-b): force-encoder probe bypass (diagnostics).
        *  key ∈ null | "nvenc" | "qsv" | "amf" | "x264"; null restores the
@@ -1378,6 +1423,11 @@ declare global {
         targetLanguage: string;
         targetLocale: string;
         groqModel?: string;
+        /** v1.22: "gemini" routes the speaker/translation phases through
+         *  the Gemini key (geminiModel); "groq" (default) uses groqModel.
+         *  Whisper transcription is always Groq. */
+        textProvider?: "groq" | "gemini";
+        geminiModel?: string;
         femaleVoice?: string;
         maleVoice?: string;
         /** v1.20: "single" = one voice for every line (skips speaker
@@ -1389,11 +1439,17 @@ declare global {
         ttsRatePct?: number;
       }) => Promise<DubTrackResult>;
       dubCancel?: () => Promise<{ ok: boolean; running: boolean }>;
-      /** Free-tier chat model list + defaults (no key needed). */
+      /** Free-tier chat model list + defaults (no key needed). v1.22 adds
+       *  the Gemini list + key presence for the provider picker. */
       dubModels?: () => Promise<{
         models: Array<{ id: string; label: string; hint: string }>;
         default: string;
         langNames: Record<string, string>;
+        gemini?: {
+          models: Array<{ id: string; label: string; hint: string }>;
+          default: string;
+          hasKey: boolean;
+        };
       }>;
       onDubProgress?: (cb: (d: {
         phase: string;
@@ -1406,11 +1462,17 @@ declare global {
       geminiGet?: () => Promise<GeminiConfigPayload>;
       /** Stores the key on-device → the masked payload. */
       geminiSet?: (p: { apiKey: string }) => Promise<GeminiConfigPayload>;
-      /** { apiKey? } → { ok, message, modelCount } — key check (saved or
-       *  candidate) against GET /v1beta/models. */
+      /** { apiKey? } → { ok, message, modelCount, models? } — key check
+       *  (saved or candidate) against GET /v1beta/models. v1.22: `models`
+       *  is the LIVE generateContent-capable list the key can see. */
       geminiTest?: (p: {
         apiKey?: string;
-      }) => Promise<{ ok: boolean; message: string; modelCount: number }>;
+      }) => Promise<{
+        ok: boolean;
+        message: string;
+        modelCount: number;
+        models?: Array<{ id: string; label: string }>;
+      }>;
       /** Removes the stored Gemini key → { ok }. */
       geminiClear?: () => Promise<{ ok: boolean }>;
       /** Generates one narration script with the selected provider/model.

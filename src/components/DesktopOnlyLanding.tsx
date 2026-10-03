@@ -9,28 +9,33 @@
  * cannot do. The landing states that plainly and points at the installer.
  *
  * The only other thing this page can do is hand the session over to the
- * studio UI ("Open studio preview") for development/verification — the
+ * studio UI ("Launch the Studio") for development/verification — the
  * studio in a browser is a UI preview, exports intentionally refuse to run.
+ *
+ * v1.22 "Ember Studio" redesign: warm dark studio palette (stone-950 base,
+ * amber honey accents), radial amber glow behind the hero, feature-card
+ * grid with icon tiles, and a bold amber CTA.
  */
 
 import { useCallback, useState } from "react";
 import {
   ArrowRight,
   Captions,
-  Cpu,
-  Download,
-  Film,
   Layers,
+  Mic,
   MonitorSmartphone,
-  Sparkles,
+  PenLine,
+  Rocket,
   TerminalSquare,
+  Type,
   Zap,
 } from "lucide-react";
 
 const RELEASES_URL = "https://github.com/Ziruax/framefuse/releases/latest";
 
-/** Matches the app icon (Task 43): deep-cyan rounded badge, white play
- * triangle, sprocket dots. Inline so the landing has zero asset deps. */
+/** Matches the app icon identity (recolored v1.22: warm amber rounded
+ * badge, stone play triangle, sprocket dots). Inline so the landing has
+ * zero asset deps. */
 function LogoMark({ size = 44 }: { size?: number }) {
   return (
     <svg
@@ -43,19 +48,19 @@ function LogoMark({ size = 44 }: { size?: number }) {
     >
       <defs>
         <linearGradient id="ff-landing-badge" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0%" stopColor="#0891b2" />
-          <stop offset="100%" stopColor="#0e7490" />
+          <stop offset="0%" stopColor="#fcd34d" />
+          <stop offset="100%" stopColor="#f59e0b" />
         </linearGradient>
       </defs>
       <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#ff-landing-badge)" />
       {/* sprocket holes — film reel nod */}
-      <circle cx="15" cy="16" r="2.6" fill="#164e63" />
-      <circle cx="15" cy="32" r="2.6" fill="#164e63" />
-      <circle cx="15" cy="48" r="2.6" fill="#164e63" />
+      <circle cx="15" cy="16" r="2.6" fill="#78350f" />
+      <circle cx="15" cy="32" r="2.6" fill="#78350f" />
+      <circle cx="15" cy="48" r="2.6" fill="#78350f" />
       <path
         d="M29 20.5 L47 32 L29 43.5 Z"
-        fill="#ffffff"
-        stroke="#ffffff"
+        fill="#1c1917"
+        stroke="#1c1917"
         strokeWidth="2"
         strokeLinejoin="round"
       />
@@ -69,39 +74,39 @@ const FEATURES: Array<{
   body: string;
 }> = [
   {
-    icon: Zap,
-    title: "True Smart Rendering",
-    body: "Untouched cuts are stream-copied at disk speed — only the ranges you actually edited get re-encoded.",
-  },
-  {
-    icon: Cpu,
-    title: "Parallel native FFmpeg export",
-    body: "The timeline is sliced across your CPU's physical cores, with the audio bus mixed in one global pass.",
-  },
-  {
     icon: Captions,
-    title: "Offline Whisper captions",
-    body: "AI transcription and burned-in animated captions run entirely on your machine — nothing leaves it.",
+    title: "Captions",
+    body: "Groq Whisper transcription with burned-in animated captions — styled, timed, and fully offline after upload.",
+  },
+  {
+    icon: Type,
+    title: "Kinetic typography",
+    body: "24 choreographed caption designs — per-word entrances, emphasis pops and exits that dance with the beat.",
+  },
+  {
+    icon: Mic,
+    title: "AI dubbing",
+    body: "Turn any script into a natural voice track, ducked against your music, in a single click.",
+  },
+  {
+    icon: PenLine,
+    title: "AI script writer",
+    body: "A built-in writer that drafts hooks and scripts for your video, ready to send straight to the dubbing studio.",
+  },
+  {
+    icon: Rocket,
+    title: "Rust GPU export",
+    body: "The native engine composites and encodes on your GPU — smart-rendered exports finish at multiples of realtime.",
   },
   {
     icon: Layers,
-    title: "Chroma key & picture-in-picture",
-    body: "Green/white/black screen removal with on-canvas PiP and a multi-track overlay lane.",
-  },
-  {
-    icon: Sparkles,
-    title: "SFX & music bus",
-    body: "Synthesized sound effects, looping background music, loudness normalization on the master bus.",
-  },
-  {
-    icon: Film,
-    title: "Native project files",
-    body: "Save/open .framefuse projects with your recent files list — a real desktop workflow, not browser tabs.",
+    title: "Multi-track timeline",
+    body: "Video, overlays, music, SFX and voice lanes with drag-trim, multi-select, motion paths and beat snapping.",
   },
 ];
 
 export function DesktopOnlyLanding({
-  version = "1.14.2",
+  version = "1.22.0",
   onEnterPreview,
 }: {
   version?: string;
@@ -115,16 +120,23 @@ export function DesktopOnlyLanding({
   }, [previewRequested, onEnterPreview]);
 
   return (
-    <div
-      className="flex min-h-screen w-full flex-col"
-      style={{ backgroundColor: "#0a0a0a", color: "#e4e4e7" }}
-    >
+    <div className="relative flex min-h-screen w-full flex-col bg-stone-950 text-stone-200">
+      {/* v1.22: subtle radial amber glow behind the hero */}
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-x-0 top-0 h-[560px]"
+        style={{
+          background:
+            "radial-gradient(60% 55% at 50% 0%, rgba(245, 158, 11, 0.10) 0%, rgba(245, 158, 11, 0.03) 45%, rgba(12, 10, 9, 0) 75%)",
+        }}
+      />
+
       {/* Top bar */}
-      <header className="flex items-center gap-3 px-5 py-4 sm:px-10">
+      <header className="relative z-10 flex items-center gap-3 px-5 py-4 sm:px-10">
         <LogoMark size={38} />
         <div className="min-w-0">
-          <div className="text-[15px] font-semibold leading-tight">FrameFuse</div>
-          <div className="text-[11px] leading-tight" style={{ color: "#71717a" }}>
+          <div className="text-[15px] font-semibold leading-tight text-stone-50">FrameFuse</div>
+          <div className="text-[11px] leading-tight text-stone-500">
             v{version} · Windows desktop app
           </div>
         </div>
@@ -132,12 +144,7 @@ export function DesktopOnlyLanding({
           href={RELEASES_URL}
           target="_blank"
           rel="noreferrer"
-          className="ml-auto hidden items-center gap-1.5 rounded-md border px-3 py-1.5 text-[12px] font-medium transition-colors sm:flex"
-          style={{
-            borderColor: "#27272a",
-            backgroundColor: "rgba(24,24,27,0.6)",
-            color: "#a1a1aa",
-          }}
+          className="ml-auto hidden items-center gap-1.5 rounded-lg border border-stone-800 bg-stone-900/60 px-3 py-1.5 text-[12px] font-medium text-stone-300 transition-colors hover:bg-stone-800/70 hover:text-stone-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/60 sm:flex"
         >
           Releases
           <ArrowRight className="size-3.5" />
@@ -145,102 +152,82 @@ export function DesktopOnlyLanding({
       </header>
 
       {/* Hero */}
-      <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col px-5 py-10 sm:px-10 sm:py-16">
-        <div
-          className="mb-5 inline-flex w-fit items-center gap-2 rounded-full border px-3 py-1 text-[11px] font-medium uppercase tracking-wider"
-          style={{
-            borderColor: "rgba(34, 211, 238, 0.35)",
-            backgroundColor: "rgba(8, 145, 178, 0.1)",
-            color: "#67e8f9",
-          }}
-        >
+      <main className="relative z-10 mx-auto flex w-full max-w-5xl flex-1 flex-col px-5 py-10 sm:px-10 sm:py-16">
+        <div className="mb-6 inline-flex w-fit items-center gap-2 rounded-full border border-amber-500/25 bg-amber-500/10 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.14em] text-amber-300">
           <MonitorSmartphone className="size-3.5" />
           Built for Windows — not the browser
         </div>
 
-        <h1 className="max-w-3xl text-3xl font-bold leading-tight tracking-tight sm:text-5xl">
-          FrameFuse is a{" "}
+        <h1 className="max-w-3xl text-3xl font-bold leading-tight tracking-tight text-stone-50 sm:text-5xl">
+          Make scroll-stopping videos,{" "}
           <span
             style={{
-              backgroundImage: "linear-gradient(to right, #22d3ee, #67e8f9)",
+              backgroundImage: "linear-gradient(to right, #fcd34d, #fbbf24)",
               WebkitBackgroundClip: "text",
               backgroundClip: "text",
               color: "transparent",
             }}
           >
-            desktop video studio
+            fast
           </span>
           .
         </h1>
 
-        <p className="mt-5 max-w-2xl text-[15px] leading-relaxed sm:text-lg" style={{ color: "#a1a1aa" }}>
-          The full studio — timeline editing, native-speed export, offline
-          Whisper captions — runs as a Windows desktop app. Install it to
-          create and export videos.
+        <p className="mt-5 max-w-2xl text-[15px] leading-relaxed text-stone-400 sm:text-lg">
+          FrameFuse is a warm little video studio with a cold-fast engine —
+          captions, kinetic typography, AI dubbing and GPU-native export, all
+          in one calm, focused timeline.
         </p>
 
         {/* CTA */}
         <div className="mt-8 flex flex-col gap-3 sm:flex-row sm:items-center">
+          <button
+            type="button"
+            onClick={handleEnterPreview}
+            disabled={previewRequested || !onEnterPreview}
+            className="flex h-12 items-center justify-center gap-2 rounded-lg bg-amber-400 px-6 text-[14px] font-semibold text-stone-950 shadow-[0_4px_18px_rgba(245,158,11,0.35)] transition-all duration-150 hover:bg-amber-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/60 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
+            title="Open the FrameFuse studio UI in this browser (UI preview — exports run in the Windows app)"
+          >
+            {previewRequested ? "Opening…" : "Launch the Studio"}
+            {!previewRequested && <ArrowRight className="size-4" />}
+          </button>
           <a
             href={RELEASES_URL}
             target="_blank"
             rel="noreferrer"
-            className="ff-btn-export flex h-12 items-center justify-center gap-2 rounded-lg px-6 text-[14px] font-semibold transition-all active:scale-[0.97] active:brightness-90"
+            className="flex h-12 items-center justify-center gap-2 rounded-lg border border-stone-800 bg-stone-900/60 px-6 text-[14px] font-medium text-stone-300 transition-colors duration-150 hover:bg-stone-800/70 hover:text-stone-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/60"
             title="Download the FrameFuse installer from the latest GitHub release"
           >
-            <Download className="size-4.5" />
             Download for Windows
           </a>
-          <div
-            className="flex flex-wrap items-center gap-2 text-[11px]"
-            style={{ color: "#71717a" }}
-          >
-            <span
-              className="rounded-full border px-2.5 py-1"
-              style={{ borderColor: "#27272a" }}
-            >
+          <div className="flex flex-wrap items-center gap-2 text-[11px] text-stone-500">
+            <span className="rounded-full border border-stone-800 px-2.5 py-1">
               Windows 10 / 11 · 64-bit
             </span>
-            <span
-              className="rounded-full border px-2.5 py-1"
-              style={{ borderColor: "#27272a" }}
-            >
+            <span className="rounded-full border border-stone-800 px-2.5 py-1">
               FFmpeg bundled
-            </span>
-            <span
-              className="rounded-full border px-2.5 py-1"
-              style={{ borderColor: "#27272a" }}
-            >
-              ~380 MB installer
             </span>
           </div>
         </div>
 
         {/* Feature grid */}
-        <section aria-label="What the desktop app includes" className="mt-14">
-          <h2 className="text-[13px] font-semibold uppercase tracking-wider" style={{ color: "#a1a1aa" }}>
-            What&rsquo;s inside the desktop app
+        <section aria-label="What the studio includes" className="mt-14">
+          <h2 className="text-[10px] font-semibold uppercase tracking-[0.14em] text-stone-500">
+            Everything in the studio
           </h2>
           <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
             {FEATURES.map((f) => (
               <div
                 key={f.title}
-                className="rounded-xl border p-4 transition-colors sm:p-5"
-                style={{
-                  borderColor: "#27272a",
-                  backgroundColor: "rgba(18,18,21,0.65)",
-                }}
+                className="rounded-xl border border-stone-800/70 bg-stone-900/60 p-4 transition-colors duration-150 hover:border-amber-500/40 hover:bg-stone-900/80 sm:p-5"
               >
                 <div className="flex items-center gap-2.5">
-                  <span
-                    className="flex size-8 items-center justify-center rounded-lg"
-                    style={{ backgroundColor: "rgba(8,145,178,0.14)", color: "#22d3ee" }}
-                  >
+                  <span className="flex size-8 items-center justify-center rounded-lg bg-amber-500/10 text-amber-300">
                     <f.icon className="size-4" />
                   </span>
-                  <span className="text-[13.5px] font-semibold">{f.title}</span>
+                  <span className="text-sm font-semibold text-stone-200">{f.title}</span>
                 </div>
-                <p className="mt-2.5 text-[12.5px] leading-relaxed" style={{ color: "#a1a1aa" }}>
+                <p className="mt-2.5 text-[12.5px] leading-relaxed text-stone-400">
                   {f.body}
                 </p>
               </div>
@@ -250,17 +237,13 @@ export function DesktopOnlyLanding({
 
         {/* Why desktop-only */}
         <section
-          className="mt-10 rounded-xl border p-5 sm:p-6"
-          style={{
-            borderColor: "rgba(34, 211, 238, 0.22)",
-            backgroundColor: "rgba(8, 145, 178, 0.06)",
-          }}
+          className="mt-10 rounded-xl border border-teal-500/20 bg-teal-500/5 p-5 sm:p-6"
           aria-label="Why FrameFuse is desktop-only"
         >
-          <h2 className="text-[14px] font-semibold" style={{ color: "#e4e4e7" }}>
-            Why not the browser?
+          <h2 className="text-sm font-semibold text-stone-200">
+            Why a desktop app?
           </h2>
-          <p className="mt-2 text-[13px] leading-relaxed" style={{ color: "#a1a1aa" }}>
+          <p className="mt-2 text-[13px] leading-relaxed text-stone-400">
             Fast exports, offline captions and real video processing need
             desktop power a web page can&rsquo;t provide.
           </p>
@@ -269,18 +252,17 @@ export function DesktopOnlyLanding({
         {/* Development preview entry */}
         {onEnterPreview && (
           <section
-            className="mt-10 rounded-xl border border-dashed p-4 sm:p-5"
-            style={{ borderColor: "#3f3f46", backgroundColor: "rgba(12,12,14,0.6)" }}
+            className="mt-10 rounded-xl border border-dashed border-stone-700 bg-stone-950/60 p-4 sm:p-5"
             aria-label="Development preview"
           >
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex items-start gap-3">
-                <TerminalSquare className="mt-0.5 size-4 shrink-0" style={{ color: "#71717a" }} />
+                <TerminalSquare className="mt-0.5 size-4 shrink-0 text-stone-500" />
                 <div>
-                  <div className="text-[12.5px] font-medium" style={{ color: "#d4d4d8" }}>
+                  <div className="text-[12.5px] font-medium text-stone-300">
                     Development: open the studio UI in this browser
                   </div>
-                  <div className="mt-0.5 text-[11.5px] leading-relaxed" style={{ color: "#71717a" }}>
+                  <div className="mt-0.5 text-[11.5px] leading-relaxed text-stone-500">
                     UI preview only — exporting is disabled outside the Windows
                     app by design.
                   </div>
@@ -290,12 +272,7 @@ export function DesktopOnlyLanding({
                 type="button"
                 onClick={handleEnterPreview}
                 disabled={previewRequested}
-                className="flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-md border px-4 text-[12px] font-medium transition-colors disabled:opacity-60"
-                style={{
-                  borderColor: "#3f3f46",
-                  backgroundColor: "rgba(24,24,27,0.8)",
-                  color: "#d4d4d8",
-                }}
+                className="flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-700 bg-stone-900/60 px-4 text-[12px] font-medium text-stone-300 transition-colors duration-150 hover:bg-stone-800/70 hover:text-stone-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/60 disabled:opacity-60"
               >
                 {previewRequested ? "Opening…" : "Open studio preview"}
                 {!previewRequested && <ArrowRight className="size-3.5" />}
@@ -306,10 +283,7 @@ export function DesktopOnlyLanding({
       </main>
 
       {/* Sticky footer (mt-auto keeps it pinned on short viewports) */}
-      <footer
-        className="mt-auto border-t px-5 py-5 text-[11px] sm:px-10"
-        style={{ borderColor: "#27272a", color: "#71717a" }}
-      >
+      <footer className="relative z-10 mt-auto border-t border-stone-800 px-5 py-5 text-[11px] text-stone-500 sm:px-10">
         <div className="mx-auto flex max-w-5xl flex-wrap items-center gap-x-3 gap-y-1">
           <span>FrameFuse v{version}</span>
           <span aria-hidden>·</span>
@@ -317,7 +291,7 @@ export function DesktopOnlyLanding({
             href={RELEASES_URL}
             target="_blank"
             rel="noreferrer"
-            className="underline-offset-2 transition-colors hover:text-[#a1a1aa] hover:underline"
+            className="underline-offset-2 transition-colors hover:text-stone-300 hover:underline"
           >
             Download the Windows installer
           </a>

@@ -384,8 +384,43 @@ ipcMain.handle("export-info", async () => {
       version: rust.version || null,
       binary: rust.binary || null,
       error: rust.error || null,
+      // v1.22: the LAST bypass reason (gate/timeline/runtime) — the Export
+      // tab shows it instead of a silent "FFmpeg CLI".
+      lastFailure: rust.lastFailure || null,
     },
   };
+});
+
+// ── v1.22 ENGINE DIAGNOSTICS ───────────────────────────────────────────────
+// The "why is the Rust engine always falling back" answer, on demand:
+//   engine:status  → the load status + candidate paths + the last failure.
+//   engine:selftest→ a REAL 36-frame mini export through the engine in THIS
+//                    runtime (load path + DLL dir + wgpu adapter) — the
+//                    definitive health check with the exact error on failure.
+ipcMain.handle("engine:status", async () => {
+  const s = RUST.rustEngineStatus();
+  return {
+    loaded: !!s.loaded,
+    version: s.version || null,
+    binary: s.binary || null,
+    from: s.from || null,
+    error: s.error || null,
+    lastFailure: s.lastFailure || null,
+    diagnostics: s.diagnostics || null,
+  };
+});
+
+ipcMain.handle("engine:selftest", async () => {
+  try {
+    return await RUST.runRustSelfTest(ffmpegPath, ensureTempDir());
+  } catch (err) {
+    return {
+      ok: false,
+      stage: "ipc",
+      error: String((err && err.message) || err),
+      status: RUST.rustEngineStatus(),
+    };
+  }
 });
 
 // v8.1: force-encoder override (Export tab diagnostics). key ∈
@@ -1372,6 +1407,17 @@ ipcMain.handle("dub:start", async (event, payload) => {
       "No Groq API key saved — open Settings → Captions, paste your key from console.groq.com (free), or add it before dubbing.",
     );
   }
+  // v1.22: the Gemini text provider (speaker detection + translation).
+  // Whisper transcription stays Groq regardless; a Gemini run additionally
+  // requires the Gemini key (shared with the Script Writer).
+  const textProvider = p.textProvider === "gemini" ? "gemini" : "groq";
+  const geminiApiKey =
+    textProvider === "gemini" ? GM.loadGeminiConfig(app.getPath("userData")).apiKey : "";
+  if (textProvider === "gemini" && !geminiApiKey) {
+    throw new Error(
+      "No Gemini API key saved — open Settings → Script Writer and paste your Gemini key (aistudio.google.com/apikey), or switch the dubbing AI model back to Groq.",
+    );
+  }
   const segs = (Array.isArray(p.segments) ? p.segments : [])
     .map((s) => ({
       videoPath: String((s && s.videoPath) || ""),
@@ -1401,6 +1447,13 @@ ipcMain.handle("dub:start", async (event, payload) => {
         typeof p.targetLocale === "string" && p.targetLocale ? p.targetLocale : "hi-IN",
       groqModel:
         typeof p.groqModel === "string" && p.groqModel ? p.groqModel : DUB.DEFAULT_TEXT_MODEL,
+      // v1.22 Gemini provider pass-through.
+      textProvider,
+      geminiModel:
+        typeof p.geminiModel === "string" && p.geminiModel
+          ? p.geminiModel
+          : DUB.GEMINI_DEFAULT_TEXT_MODEL,
+      geminiApiKey,
       // speakerVoices: {0: female, 1: male} — absent entries stay "auto".
       speakerVoices: {
         ...(typeof p.femaleVoice === "string" && p.femaleVoice ? { 0: p.femaleVoice } : {}),
@@ -1458,6 +1511,14 @@ ipcMain.handle("dub:models", async () => ({
   models: DUB.GROQ_TEXT_MODELS,
   default: DUB.DEFAULT_TEXT_MODEL,
   langNames: DUB.LANG_NAMES,
+  // v1.22: the Gemini option — models + whether a key is on this device
+  // (the dub provider picker uses it; the Gemini key is shared with the
+  // Script Writer and lives in userData/gemini.json).
+  gemini: {
+    models: DUB.GEMINI_TEXT_MODELS,
+    default: DUB.GEMINI_DEFAULT_TEXT_MODEL,
+    hasKey: !!GM.loadGeminiConfig(app.getPath("userData")).apiKey,
+  },
 }));
 
 // ---------------------------------------------------------------------------

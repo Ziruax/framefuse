@@ -4,7 +4,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   // v1.14.2: the title states what the product is — a Windows desktop app
   // (the browser route is a landing page / dev preview, not the product).
-  title: "FrameFuse v1.21.0 — Windows Desktop Video Studio",
+  title: "FrameFuse v1.22.0 — Windows Desktop Video Studio",
   description:
     "Multi-track Windows desktop video studio: video clips, green-screen chroma key with on-canvas PiP, background music with volume & loop, SFX, native Whisper captions, and fast native export.",
   applicationName: "FrameFuse",
@@ -15,7 +15,7 @@ export const metadata: Metadata = {
 export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
-  themeColor: "#0a0a0a",
+  themeColor: "#0c0a09",
 };
 
 export default function RootLayout({
@@ -28,8 +28,8 @@ export default function RootLayout({
       <body
         className="antialiased"
         style={{
-          backgroundColor: "#0a0a0a",
-          color: "#e4e4e7",
+          backgroundColor: "#0c0a09",
+          color: "#e7e5e4",
           fontFamily:
             'ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif',
         }}

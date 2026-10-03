@@ -1263,7 +1263,7 @@ export function PreviewPanel({
         );
       }
     } else {
-      ctx.fillStyle = "#0a0a0a";
+      ctx.fillStyle = "#0c0a09";
       ctx.fillRect(0, 0, dims.w, dims.h);
     }
 
@@ -1461,7 +1461,7 @@ export function PreviewPanel({
     // Center guides while a drag is snapped to the canvas center.
     if (dragTransform && (dragTransform.snapX || dragTransform.snapY)) {
       ctx.save();
-      ctx.strokeStyle = "rgba(34, 211, 238, 0.8)";
+      ctx.strokeStyle = "rgba(251, 191, 36, 0.8)";
       ctx.lineWidth = 1;
       ctx.setLineDash([4, 4]);
       ctx.beginPath();
@@ -1510,16 +1510,16 @@ export function PreviewPanel({
     const rh = g.dh * k;
 
     // Backdrop tint (cyan 6%).
-    ctx.fillStyle = "rgba(34, 211, 238, 0.06)";
+    ctx.fillStyle = "rgba(251, 191, 36, 0.08)";
     ctx.fillRect(rx, ry, rw, rh);
 
     // Rect border (cyan 1.5px, kept inside the rect).
-    ctx.strokeStyle = "#22d3ee";
+    ctx.strokeStyle = "#fbbf24";
     ctx.lineWidth = 1.5;
     ctx.strokeRect(rx + 0.75, ry + 0.75, Math.max(1, rw - 1.5), Math.max(1, rh - 1.5));
 
     // Corner handles — cyan fill, dark border, centered on the corners.
-    ctx.fillStyle = "#22d3ee";
+    ctx.fillStyle = "#fbbf24";
     ctx.strokeStyle = "rgba(12, 12, 14, 0.9)";
     ctx.lineWidth = 1;
     const half = HANDLE_DRAW_PX / 2;
@@ -1646,7 +1646,7 @@ export function PreviewPanel({
     <div
       ref={rootRef}
       className="flex h-full flex-col overflow-hidden"
-      style={{ backgroundColor: "#0c0c0e" }}
+      style={{ backgroundColor: "#12100e" }}
     >
       {/* Canvas stage — v5.2: the wrapper is measured (ResizeObserver) and
           the stage letterboxes the aspect buffer into the available space.
@@ -1676,19 +1676,19 @@ export function PreviewPanel({
               className="mb-4 flex size-14 items-center justify-center rounded-2xl"
               style={{
                 backgroundImage:
-                  "linear-gradient(135deg, #22d3ee 0%, #06b6d4 55%, #0891b2 100%)",
+                  "linear-gradient(135deg, #fcd34d 0%, #fbbf24 55%, #f59e0b 100%)",
                 boxShadow: "0 8px 24px rgba(6, 182, 212, 0.3)",
               }}
             >
-              <Film className="size-7" style={{ color: "#04222b" }} aria-hidden />
+              <Film className="size-7" style={{ color: "#1c1917" }} aria-hidden />
             </div>
             <h1
               className="text-[22px] font-semibold tracking-tight"
-              style={{ color: "#f4f4f5" }}
+              style={{ color: "#fafaf9" }}
             >
               Let&rsquo;s make a video
             </h1>
-            <p className="mt-1.5 max-w-md text-[13px] leading-relaxed" style={{ color: "#8b8b94" }}>
+            <p className="mt-1.5 max-w-md text-[13px] leading-relaxed" style={{ color: "#78716c" }}>
               Import your clips, arrange them on the timeline below, and export —
               untouched footage keeps its original quality.
             </p>
@@ -1705,12 +1705,12 @@ export function PreviewPanel({
                     className="flex size-10 items-center justify-center rounded-xl transition-transform duration-150 group-hover:scale-105"
                     style={{ backgroundColor: "rgba(6, 182, 212, 0.16)" }}
                   >
-                    <Upload className="size-5" style={{ color: "#22d3ee" }} aria-hidden />
+                    <Upload className="size-5" style={{ color: "#fbbf24" }} aria-hidden />
                   </span>
-                  <span className="text-[13px] font-semibold" style={{ color: "#e4e4e7" }}>
+                  <span className="text-[13px] font-semibold" style={{ color: "#e7e5e4" }}>
                     Import media
                   </span>
-                  <span className="text-[11px] leading-snug" style={{ color: "#71717a" }}>
+                  <span className="text-[11px] leading-snug" style={{ color: "#78716c" }}>
                     Videos and images from your computer
                   </span>
                 </button>
@@ -1725,12 +1725,12 @@ export function PreviewPanel({
                     className="flex size-10 items-center justify-center rounded-xl transition-transform duration-150 group-hover:scale-105"
                     style={{ backgroundColor: "rgba(6, 182, 212, 0.16)" }}
                   >
-                    <Sparkles className="size-5" style={{ color: "#22d3ee" }} aria-hidden />
+                    <Sparkles className="size-5" style={{ color: "#fbbf24" }} aria-hidden />
                   </span>
-                  <span className="text-[13px] font-semibold" style={{ color: "#e4e4e7" }}>
+                  <span className="text-[13px] font-semibold" style={{ color: "#e7e5e4" }}>
                     Try the sample
                   </span>
-                  <span className="text-[11px] leading-snug" style={{ color: "#71717a" }}>
+                  <span className="text-[11px] leading-snug" style={{ color: "#78716c" }}>
                     A 9-beat storyboard to explore the editor
                   </span>
                 </button>
@@ -1745,12 +1745,12 @@ export function PreviewPanel({
                     className="flex size-10 items-center justify-center rounded-xl transition-transform duration-150 group-hover:scale-105"
                     style={{ backgroundColor: "rgba(6, 182, 212, 0.16)" }}
                   >
-                    <FolderOpen className="size-5" style={{ color: "#22d3ee" }} aria-hidden />
+                    <FolderOpen className="size-5" style={{ color: "#fbbf24" }} aria-hidden />
                   </span>
-                  <span className="text-[13px] font-semibold" style={{ color: "#e4e4e7" }}>
+                  <span className="text-[13px] font-semibold" style={{ color: "#e7e5e4" }}>
                     Open a project
                   </span>
-                  <span className="text-[11px] leading-snug" style={{ color: "#71717a" }}>
+                  <span className="text-[11px] leading-snug" style={{ color: "#78716c" }}>
                     Continue a saved .framefuse.json session
                   </span>
                 </button>
@@ -1760,7 +1760,7 @@ export function PreviewPanel({
             {/* 1-2-3 step strip */}
             <div
               className="mt-8 flex flex-wrap items-center justify-center gap-x-2 gap-y-1 text-[11px]"
-              style={{ color: "#71717a" }}
+              style={{ color: "#78716c" }}
             >
               {[
                 "1 · Import",
@@ -1768,8 +1768,8 @@ export function PreviewPanel({
                 "3 · Export",
               ].map((step, i) => (
                 <span key={step} className="flex items-center gap-2">
-                  {i > 0 && <ChevronRight className="size-3" style={{ color: "#3f3f46" }} aria-hidden />}
-                  <span className="rounded-full border px-2.5 py-1 font-medium" style={{ borderColor: "#27272a" }}>
+                  {i > 0 && <ChevronRight className="size-3" style={{ color: "#44403c" }} aria-hidden />}
+                  <span className="rounded-full border px-2.5 py-1 font-medium" style={{ borderColor: "#292524" }}>
                     {step}
                   </span>
                 </span>
@@ -1778,12 +1778,12 @@ export function PreviewPanel({
           </div>
         ) : (
           <div
-            className="relative rounded-lg border shadow-2xl transition-shadow duration-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/50"
+            className="relative rounded-lg border shadow-2xl transition-shadow duration-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/50"
             style={{
-              borderColor: "#27272a",
+              borderColor: "#292524",
               backgroundColor: "#000000",
               boxShadow:
-                "0 25px 50px -12px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(34, 211, 238, 0.08)",
+                "0 25px 50px -12px rgba(0, 0, 0, 0.8), 0 0 0 1px rgba(251, 191, 36, 0.08)",
               aspectRatio: `${dims.w} / ${dims.h}`,
               maxWidth: "100%",
               maxHeight: "100%",
@@ -1885,7 +1885,7 @@ export function PreviewPanel({
                 {/* Center bullseye (click = zoom in) + visible center dot
                     (v4.8 VLM: the center must read on busy video content). */}
                 <span
-                  className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border border-violet-300/40"
+                  className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border border-amber-300/40"
                   style={{
                     width: "24%",
                     aspectRatio: "1 / 1",
@@ -1897,7 +1897,7 @@ export function PreviewPanel({
                 <span
                   className="absolute left-1/2 top-1/2 size-2 -translate-x-1/2 -translate-y-1/2 rounded-full border-2"
                   style={{
-                    backgroundColor: "#c4b5fd",
+                    backgroundColor: "#fcd34d",
                     borderColor: "rgba(255, 255, 255, 0.75)",
                     boxShadow: "0 0 8px rgba(167, 139, 250, 0.9)",
                   }}
@@ -1909,7 +1909,7 @@ export function PreviewPanel({
                     left: `calc(${(aim.nx * 100).toFixed(1)}% + 12px)`,
                     top: `calc(${(aim.ny * 100).toFixed(1)}% + 12px)`,
                     backgroundColor: "rgba(0, 0, 0, 0.72)",
-                    color: "#c4b5fd",
+                    color: "#fcd34d",
                     border: "1px solid rgba(167, 139, 250, 0.4)",
                     maxWidth: "45%",
                     whiteSpace: "nowrap",
@@ -1928,7 +1928,7 @@ export function PreviewPanel({
                 className="pointer-events-none absolute bottom-2 left-1/2 -translate-x-1/2 flex items-center gap-1.5 rounded-md px-2 py-1 text-[9px] backdrop-blur-sm"
                 style={{
                   backgroundColor: "rgba(0, 0, 0, 0.62)",
-                  color: "#c4b5fd",
+                  color: "#fcd34d",
                   border: "1px solid rgba(167, 139, 250, 0.28)",
                 }}
               >
@@ -1951,12 +1951,12 @@ export function PreviewPanel({
               >
                 <div
                   className="max-w-[280px] truncate text-[11px] font-medium"
-                  style={{ color: "#e4e4e7" }}
+                  style={{ color: "#e7e5e4" }}
                   title={activeSegment.fileName}
                 >
                   {middleEllipsis(activeSegment.fileName, 42)}
                 </div>
-                <div className="text-[9px]" style={{ color: "#a1a1aa" }}>
+                <div className="text-[9px]" style={{ color: "#a8a29e" }}>
                   {fmtTimecode(activeSegment.startMs)} –{" "}
                   {fmtTimecode(activeSegment.endMs)}
                 </div>
@@ -1970,7 +1970,7 @@ export function PreviewPanel({
                 }`}
                 style={{
                   backgroundColor: "rgba(0, 0, 0, 0.6)",
-                  color: "#c4b5fd",
+                  color: "#fcd34d",
                   border: "1px solid rgba(196, 181, 253, 0.15)",
                 }}
               >
@@ -1985,7 +1985,7 @@ export function PreviewPanel({
                 }`}
                 style={{
                   backgroundColor: "rgba(0, 0, 0, 0.55)",
-                  color: "#67e8f9",
+                  color: "#fcd34d",
                   border: "1px solid rgba(103, 232, 249, 0.25)",
                 }}
                 title={
@@ -2008,7 +2008,7 @@ export function PreviewPanel({
                 }`}
                 style={{
                   backgroundColor: "rgba(0, 0, 0, 0.55)",
-                  color: "#f0abfc",
+                  color: "#2dd4bf",
                   border: "1px solid rgba(240, 171, 252, 0.25)",
                 }}
                 title={`Transition playing — ${(activeTxFx?.p ?? 0).toFixed(2)} progress`}
@@ -2025,7 +2025,7 @@ export function PreviewPanel({
               }`}
               style={{
                 backgroundColor: "rgba(0, 0, 0, 0.55)",
-                color: "#a5f3fc",
+                color: "#fde68a",
                 border: "1px solid rgba(103, 232, 249, 0.22)",
               }}
               title={`Preview aspect ratio ${aspect} — ${dims.w}×${dims.h} canvas, scaled to fit the panel`}
@@ -2040,7 +2040,7 @@ export function PreviewPanel({
                 }`}
                 style={{
                   backgroundColor: "rgba(0, 0, 0, 0.55)",
-                  color: "#86efac",
+                  color: "#6ee7b7",
                   border: "1px solid rgba(134, 239, 172, 0.22)",
                 }}
                 title={`Watermark active — ${watermarkSettings.position}, ${watermarkSettings.sizePercent}% width, ${watermarkSettings.opacity}% opacity`}
@@ -2107,16 +2107,16 @@ export function PreviewPanel({
               >
                 <span
                   className="flex select-none items-center gap-1 pl-1 pr-0.5 text-[9px]"
-                  style={{ color: "#a1a1aa" }}
+                  style={{ color: "#a8a29e" }}
                 >
                   <Move className="size-3" />
                   drag · corners resize · Esc deselect
                 </span>
-                <span className="mx-0.5 h-3 w-px" style={{ backgroundColor: "#27272a" }} />
+                <span className="mx-0.5 h-3 w-px" style={{ backgroundColor: "#292524" }} />
                 <button
                   type="button"
                   className="flex h-6 items-center gap-1 rounded-md px-1.5 font-semibold transition-all hover:bg-amber-400/15 hover:shadow-[0_0_10px_rgba(245,158,11,0.25)] active:scale-90"
-                  style={{ color: kfs.length > 0 ? "#fbbf24" : "#d4d4d8" }}
+                  style={{ color: kfs.length > 0 ? "#fbbf24" : "#d6d3d1" }}
                   title={
                     kfs.length > 0
                       ? `Keyframe the current position at ${fmtTimecode(currentMs)} (updates the nearest keyframe within ±350 ms)`
@@ -2152,7 +2152,7 @@ export function PreviewPanel({
                     <button
                       type="button"
                       className="flex size-6 items-center justify-center rounded-md transition-all hover:bg-white/10 active:scale-90 disabled:opacity-25 disabled:hover:bg-transparent"
-                      style={{ color: "#a1a1aa" }}
+                      style={{ color: "#a8a29e" }}
                       disabled={prevKf == null}
                       title={
                         prevKf
@@ -2167,7 +2167,7 @@ export function PreviewPanel({
                     <button
                       type="button"
                       className="flex size-6 items-center justify-center rounded-md transition-all hover:bg-white/10 active:scale-90 disabled:opacity-25 disabled:hover:bg-transparent"
-                      style={{ color: "#a1a1aa" }}
+                      style={{ color: "#a8a29e" }}
                       disabled={nextKf == null}
                       title={
                         nextKf
@@ -2181,8 +2181,8 @@ export function PreviewPanel({
                     </button>
                     <button
                       type="button"
-                      className="flex h-6 items-center gap-1 rounded-md px-1.5 transition-all hover:bg-red-400/15 hover:text-red-300 active:scale-90"
-                      style={{ color: "#a1a1aa" }}
+                      className="flex h-6 items-center gap-1 rounded-md px-1.5 transition-all hover:bg-rose-400/15 hover:text-rose-300 active:scale-90"
+                      style={{ color: "#a8a29e" }}
                       title="Remove every keyframe — the overlay returns to its static position"
                       aria-label="Clear motion path"
                       onClick={() => {
@@ -2205,8 +2205,8 @@ export function PreviewPanel({
       <div
         className="border-t px-4 py-3"
         style={{
-          borderColor: "#27272a",
-          backgroundColor: "#111113",
+          borderColor: "#292524",
+          backgroundColor: "#12100e",
           boxShadow: "0 -8px 24px rgba(0, 0, 0, 0.35)",
         }}
       >
@@ -2223,7 +2223,7 @@ export function PreviewPanel({
               onClick={() => setFitMode(fitMode === "contain" ? "cover" : "contain")}
               disabled={segments.length === 0}
               className="flex h-7 items-center gap-1 rounded-lg px-1.5 transition-all hover:bg-white/10 hover:shadow-[0_0_12px_rgba(103,232,249,0.12)] active:scale-90 disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:shadow-none"
-              style={{ color: fitMode === "contain" ? "#67e8f9" : "#a1a1aa" }}
+              style={{ color: fitMode === "contain" ? "#fcd34d" : "#a8a29e" }}
               title="Fit shows the whole frame with letterbox bars; Fill crops to cover (export behavior)"
               aria-label={
                 fitMode === "contain"
@@ -2247,8 +2247,8 @@ export function PreviewPanel({
                 if (canMatchAspect) onMatchAspect?.();
               }}
               disabled={!canMatchAspect}
-              className="flex size-7 items-center justify-center rounded-lg transition-all hover:bg-white/10 hover:text-zinc-200 hover:shadow-[0_0_12px_rgba(228,228,231,0.08)] active:scale-90 disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:shadow-none"
-              style={{ color: "#a1a1aa" }}
+              className="flex size-7 items-center justify-center rounded-lg transition-all hover:bg-white/10 hover:text-stone-200 hover:shadow-[0_0_12px_rgba(231,229,228,0.08)] active:scale-90 disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:shadow-none"
+              style={{ color: "#a8a29e" }}
               title="Set the project aspect to match this video's frame"
               aria-label="Match project aspect to source video"
             >
@@ -2260,8 +2260,8 @@ export function PreviewPanel({
             type="button"
             onClick={() => onStep(-1)}
             disabled={segments.length === 0}
-            className="flex size-7 items-center justify-center rounded-lg transition-all hover:bg-white/10 hover:text-zinc-200 hover:shadow-[0_0_12px_rgba(228,228,231,0.08)] active:scale-90 disabled:opacity-30 disabled:hover:shadow-none"
-            style={{ color: "#a1a1aa" }}
+            className="flex size-7 items-center justify-center rounded-lg transition-all hover:bg-white/10 hover:text-stone-200 hover:shadow-[0_0_12px_rgba(231,229,228,0.08)] active:scale-90 disabled:opacity-30 disabled:hover:shadow-none"
+            style={{ color: "#a8a29e" }}
             title="Previous segment (Shift+←)"
             aria-label="Previous segment"
           >
@@ -2273,7 +2273,7 @@ export function PreviewPanel({
             disabled={segments.length === 0}
             className="flex size-9 items-center justify-center rounded-full text-white shadow-lg transition-all duration-150 hover:scale-105 hover:brightness-110 hover:shadow-[0_6px_24px_rgba(6,182,212,0.6)] active:scale-95 disabled:opacity-30 disabled:hover:scale-100 disabled:hover:brightness-100"
             style={{
-              background: "linear-gradient(135deg, #22d3ee 0%, #0891b2 60%, #0e7490 100%)",
+              background: "linear-gradient(135deg, #fcd34d 0%, #f59e0b 60%, #d97706 100%)",
               boxShadow:
                 "0 4px 16px rgba(6, 182, 212, 0.45), inset 0 1px 0 rgba(255,255,255,0.25)",
             }}
@@ -2290,8 +2290,8 @@ export function PreviewPanel({
             type="button"
             onClick={() => onStep(1)}
             disabled={segments.length === 0}
-            className="flex size-7 items-center justify-center rounded-lg transition-all hover:bg-white/10 hover:text-zinc-200 hover:shadow-[0_0_12px_rgba(228,228,231,0.08)] active:scale-90 disabled:opacity-30 disabled:hover:shadow-none"
-            style={{ color: "#a1a1aa" }}
+            className="flex size-7 items-center justify-center rounded-lg transition-all hover:bg-white/10 hover:text-stone-200 hover:shadow-[0_0_12px_rgba(231,229,228,0.08)] active:scale-90 disabled:opacity-30 disabled:hover:shadow-none"
+            style={{ color: "#a8a29e" }}
             title="Next segment (Shift+→)"
             aria-label="Next segment"
           >
@@ -2310,7 +2310,7 @@ export function PreviewPanel({
                 }
                 disabled={segments.length === 0}
                 className="flex h-7 items-center gap-1 rounded-lg px-1.5 transition-all hover:bg-white/10 active:scale-90 disabled:opacity-30 disabled:hover:bg-transparent"
-                style={{ color: speedActive ? "#c4b5fd" : "#a1a1aa" }}
+                style={{ color: speedActive ? "#fcd34d" : "#a8a29e" }}
                 title="Playback speed — L speeds up, J slows down, K pauses (preview only; exports render at 1×)"
                 aria-label={`Playback speed ${fmtPreviewRate(previewRate)} — open speed menu`}
                 aria-haspopup="menu"
@@ -2327,15 +2327,15 @@ export function PreviewPanel({
                   aria-label="Playback speed"
                   className="absolute bottom-full right-0 z-40 mb-1.5 w-[188px] overflow-hidden rounded-lg border shadow-2xl"
                   style={{
-                    borderColor: "#2e2e33",
-                    backgroundColor: "#161618",
+                    borderColor: "#33302b",
+                    backgroundColor: "#191613",
                     boxShadow:
                       "0 12px 32px rgba(0,0,0,0.55), 0 0 0 1px rgba(139,92,246,0.08)",
                   }}
                 >
                   <div
                     className="border-b px-2.5 py-1.5 text-[8px] font-semibold uppercase tracking-[0.14em]"
-                    style={{ borderColor: "#27272a", color: "#71717a" }}
+                    style={{ borderColor: "#292524", color: "#78716c" }}
                   >
                     Preview speed
                   </div>
@@ -2354,11 +2354,11 @@ export function PreviewPanel({
                             onPreviewRateChange(r);
                             setSpeedOpen(false);
                           }}
-                          className="flex h-7 items-center justify-center rounded-md border text-[10px] font-semibold tabular-nums transition-all hover:border-violet-400/50 hover:bg-violet-400/10 active:scale-90"
+                          className="flex h-7 items-center justify-center rounded-md border text-[10px] font-semibold tabular-nums transition-all hover:border-amber-400/50 hover:bg-amber-400/10 active:scale-90"
                           style={{
-                            borderColor: active ? "rgba(167,139,250,0.55)" : "#27272a",
-                            backgroundColor: active ? "rgba(139,92,246,0.18)" : "#1b1b1e",
-                            color: active ? "#d6c7ff" : "#d4d4d8",
+                            borderColor: active ? "rgba(251,191,36,0.55)" : "#292524",
+                            backgroundColor: active ? "rgba(245,158,11,0.18)" : "#1f1c18",
+                            color: active ? "#fde68a" : "#d6d3d1",
                           }}
                         >
                           {fmtPreviewRate(r)}
@@ -2368,7 +2368,7 @@ export function PreviewPanel({
                   </div>
                   <div
                     className="border-t px-2.5 py-1.5 text-[8px] leading-snug"
-                    style={{ borderColor: "#27272a", color: "#71717a" }}
+                    style={{ borderColor: "#292524", color: "#78716c" }}
                   >
                     J / K / L shuttle · export renders 1×
                   </div>
@@ -2380,17 +2380,17 @@ export function PreviewPanel({
             <div
               className="rounded-md border px-2 py-0.5 font-mono text-[11px] tabular-nums"
               style={{
-                borderColor: "#27272a",
-                backgroundColor: "#18181b",
+                borderColor: "#292524",
+                backgroundColor: "#1c1917",
               }}
             >
-              <span style={{ color: "#e4e4e7" }}>
+              <span style={{ color: "#e7e5e4" }}>
                 {fmtTenths(currentMs)}
               </span>
-              <span className="mx-0.5" style={{ color: "#52525b" }}>
+              <span className="mx-0.5" style={{ color: "#57534e" }}>
                 /
               </span>
-              <span style={{ color: "#8b8b93" }}>
+              <span style={{ color: "#78716c" }}>
                 {fmtTenths(totalMs)}
               </span>
             </div>
@@ -2404,7 +2404,7 @@ export function PreviewPanel({
               }}
               disabled={segments.length === 0}
               className="flex size-7 items-center justify-center rounded-lg transition-all hover:bg-white/10 active:scale-90 disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:shadow-none"
-              style={{ color: isFullscreen ? "#67e8f9" : "#a1a1aa" }}
+              style={{ color: isFullscreen ? "#fcd34d" : "#a8a29e" }}
               title={
                 isFullscreen
                   ? "Exit full screen (F / Esc)"
@@ -2436,10 +2436,10 @@ export function PreviewPanel({
             disabled={segments.length === 0}
             className="w-full"
             style={{
-              background: `linear-gradient(to right, #22d3ee ${pct}%, #0891b2 ${Math.min(
+              background: `linear-gradient(to right, #fcd34d ${pct}%, #f59e0b ${Math.min(
                 100,
                 pct + 8,
-              )}%, #3f3f46 ${Math.min(100, pct + 8)}%)`,
+              )}%, #44403c ${Math.min(100, pct + 8)}%)`,
             }}
             aria-label="Timeline scrubber"
           />

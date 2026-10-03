@@ -52,7 +52,11 @@ const BACKOFF_DELAYS_MS = [1500, 4000];
 
 const CANCEL_MSG = "Gemini request cancelled";
 
-/** The script-writing chat models, in UI order. */
+/** The script-writing chat models, in UI order.
+ * v1.22 NOTE: the 3.x ids are the newest generation naming; the 2.5 family
+ * is the long-stable fallback. The list is a PREFERENCE — geminiChat
+ * auto-falls-back to GEMINI_FALLBACK_MODEL when the API 404s an id (models
+ * come and go), and geminiTestKey returns the LIVE list for the picker. */
 const GEMINI_TEXT_MODELS = [
   {
     id: "gemini-3.5-flash-lite",
@@ -65,14 +69,14 @@ const GEMINI_TEXT_MODELS = [
     hint: "Balanced speed and quality",
   },
   {
-    id: "gemini-3.1-flash-lite",
-    label: "Gemini 3.1 Flash Lite",
-    hint: "Lightweight previous generation",
-  },
-  {
     id: "gemini-2.5-flash",
     label: "Gemini 2.5 Flash",
-    hint: "Fast multimodal workhorse",
+    hint: "Fast multimodal workhorse (stable fallback)",
+  },
+  {
+    id: "gemini-2.5-flash-lite",
+    label: "Gemini 2.5 Flash Lite",
+    hint: "Lightweight previous generation",
   },
   {
     id: "gemini-2.5-pro",
@@ -81,6 +85,9 @@ const GEMINI_TEXT_MODELS = [
   },
 ];
 const GEMINI_DEFAULT_TEXT_MODEL = "gemini-3.5-flash-lite";
+/** The known-stable model a 404 ("model not found / not available to this
+ * key") auto-falls-back to — one retry, then the real error surfaces. */
+const GEMINI_FALLBACK_MODEL = "gemini-2.5-flash";
 
 function normalizeTextModel(id) {
   return GEMINI_TEXT_MODELS.some((m) => m.id === id) ? id : GEMINI_DEFAULT_TEXT_MODEL;
@@ -355,7 +362,13 @@ async function geminiChat(o) {
   if (!systemPrompt || !userPrompt) {
     throw makeChatError("geminiChat: systemPrompt and userPrompt are required");
   }
-  const modelId = normalizeTextModel(opts.model);
+  // v1.22: the requested model may 404 (decommissioned / not enabled for
+  // the key). ONE automatic retry lands on the known-stable fallback so a
+  // stale model id never hard-fails a generation; the result reports
+  // `modelUsed` + `fallbackFrom` so the caller can surface the swap.
+  const requestedModel = normalizeTextModel(opts.model);
+  let modelId = requestedModel;
+  let fellBackFrom = null;
   const temperature = Number.isFinite(Number(opts.temperature)) ? Number(opts.temperature) : 0.8;
   const maxOutputTokens = Number.isFinite(Number(opts.maxOutputTokens)) ? Math.max(1, Math.round(Number(opts.maxOutputTokens))) : 4096;
   const timeoutMs = Number.isFinite(Number(opts.timeoutMs)) ? Number(opts.timeoutMs) : 120000;
@@ -402,6 +415,16 @@ async function geminiChat(o) {
       } catch (err) {
         const msg = err && err.message ? err.message : String(err);
         if (ctl.aborted || msg === CANCEL_MSG) throw makeChatError(CANCEL_MSG);
+        // v1.22 model-404 auto-fallback (exactly once; not a retry attempt).
+        if (
+          err.status === 404 &&
+          fellBackFrom === null &&
+          modelId !== GEMINI_FALLBACK_MODEL
+        ) {
+          fellBackFrom = modelId;
+          modelId = GEMINI_FALLBACK_MODEL;
+          continue;
+        }
         if (!err.retryable || attempt >= retries) throw err;
         const delayMs = attempt < BACKOFF_DELAYS_MS.length
           ? BACKOFF_DELAYS_MS[attempt]
@@ -414,7 +437,13 @@ async function geminiChat(o) {
         attempt++;
         continue;
       }
-      return { text: result.text, finishReason: result.finishReason, usage: result.usage };
+      return {
+        text: result.text,
+        finishReason: result.finishReason,
+        usage: result.usage,
+        modelUsed: modelId,
+        ...(fellBackFrom !== null ? { fallbackFrom: fellBackFrom } : {}),
+      };
     }
   } finally {
     unhookSignal();
@@ -427,8 +456,9 @@ async function geminiChat(o) {
 
 /** Validate a Gemini key. Accepts `{ apiKey }` (the task contract) or a bare
  *  string (groqTestKey style). Resolves
- *  { ok:boolean, message:string, modelCount:number } — modelCount is the
- *  number of models visible to this key (informational, reported when ok). */
+ *  { ok:boolean, message:string, modelCount:number, models:Array<{id,label}> }
+ *  — v1.22: `models` is the LIVE generateContent-capable list this key can
+ *  actually see (pickers use it so a stale id can never be selected). */
 function geminiTestKey(input) {
   return new Promise((resolve) => {
     const apiKey =
@@ -442,6 +472,7 @@ function geminiTestKey(input) {
         ok: false,
         message: "No API key yet — paste a key from aistudio.google.com/apikey first",
         modelCount: 0,
+        models: [],
       });
       return;
     }
@@ -458,18 +489,33 @@ function geminiTestKey(input) {
         res.on("end", () => {
           const body = Buffer.concat(chunks).toString("utf8");
           if (res.statusCode !== 200) {
-            resolve({ ok: false, message: classifyGeminiError(res.statusCode, body), modelCount: 0 });
+            resolve({ ok: false, message: classifyGeminiError(res.statusCode, body), modelCount: 0, models: [] });
             return;
           }
-          let modelCount = 0;
+          // v1.22: ids this key can call generateContent on.
+          const liveIds = [];
           try {
             const j = JSON.parse(body);
-            modelCount = Array.isArray(j.models) ? j.models.length : 0;
+            for (const m of Array.isArray(j.models) ? j.models : []) {
+              const id = m && typeof m.name === "string" ? m.name.replace(/^models\//, "") : null;
+              const methods = Array.isArray(m && m.supportedGenerationMethods)
+                ? m.supportedGenerationMethods
+                : [];
+              if (
+                id &&
+                /generateContent/i.test(methods.join(",")) &&
+                !/embedding|aqa|image-generation|tts|imagen|veo|live|learnlm/i.test(id)
+              ) {
+                liveIds.push(id);
+              }
+            }
           } catch (_) { /* non-fatal */ }
+          liveIds.sort();
           resolve({
             ok: true,
-            message: `Key works — ${modelCount} models visible to this key`,
-            modelCount,
+            message: `Key works — ${liveIds.length} model${liveIds.length === 1 ? "" : "s"} visible to this key`,
+            modelCount: liveIds.length,
+            models: liveIds.map((id) => ({ id, label: id })),
           });
         });
       },
@@ -482,6 +528,7 @@ function geminiTestKey(input) {
         ok: false,
         message: err && err.message ? err.message : String(err),
         modelCount: 0,
+        models: [],
       }),
     );
     req.end();
@@ -492,6 +539,7 @@ module.exports = {
   GEMINI_API_HOST,
   GEMINI_TEXT_MODELS,
   GEMINI_DEFAULT_TEXT_MODEL,
+  GEMINI_FALLBACK_MODEL,
   normalizeTextModel,
   geminiConfigPath,
   loadGeminiConfig,

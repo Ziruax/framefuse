@@ -247,6 +247,17 @@ export default function ScriptWriterSection() {
       );
       if (r.ok) {
         toast.success("Gemini key works", { description: r.message });
+        // v1.22: absorb the LIVE generateContent-capable model list — the
+        // picker then offers exactly what this key can call, so a stale or
+        // region-unavailable id can never be selected against reality.
+        const live = Array.isArray(r.models) ? r.models : null;
+        if (live && live.length > 0) {
+          setCatalog((prev) =>
+            prev
+              ? { ...prev, gemini: { ...prev.gemini, models: live } }
+              : prev,
+          );
+        }
       } else {
         toast.error("Gemini key check failed", { description: r.message });
       }
@@ -349,17 +360,17 @@ export default function ScriptWriterSection() {
   // ── Render ───────────────────────────────────────────────────────────────
 
   const selectCls =
-    "w-full rounded border bg-zinc-900 px-2 py-1.5 text-[11px] text-zinc-200 focus:border-cyan-500 focus:outline-none";
+    "w-full rounded border bg-stone-900 px-2 py-1.5 text-[11px] text-stone-200 focus:border-amber-500 focus:outline-none";
   const canUseApi =
     typeof api?.scriptGenerate === "function" && typeof api?.geminiSet === "function";
 
   return (
     // Section card — the exact visual tokens of SettingsPanel's Section
-    // (rounded-lg, 1px #27272a border, #131316 body, uppercase zinc-500
+    // (rounded-lg, 1px #292524 border, #151310 body, uppercase stone-500
     // header with a rotating chevron).
     <div
       className="mx-2 mb-2 overflow-hidden rounded-lg border"
-      style={{ borderColor: "#27272a", backgroundColor: "#131316" }}
+      style={{ borderColor: "#292524", backgroundColor: "#151310" }}
     >
       <button
         type="button"
@@ -370,34 +381,34 @@ export default function ScriptWriterSection() {
         <ChevronDown
           size={14}
           className={cn(
-            "shrink-0 text-zinc-500 transition-transform duration-200",
+            "shrink-0 text-stone-500 transition-transform duration-200",
             open ? "rotate-0" : "-rotate-90",
           )}
         />
-        <span className="shrink-0 text-zinc-400">
+        <span className="shrink-0 text-stone-400">
           <Sparkles size={13} />
         </span>
-        <span className="flex-1 text-xs font-semibold uppercase tracking-wide text-zinc-500">
+        <span className="flex-1 text-xs font-semibold uppercase tracking-wide text-stone-500">
           AI Script Writer
         </span>
       </button>
       {open && (
         <div className="px-3 pb-3 pt-1">
-          <p className="mb-3 text-[10px] leading-relaxed text-zinc-500">
+          <p className="mb-3 text-[10px] leading-relaxed text-stone-500">
             Generate narration scripts with Gemini or Groq — then paste the
             result into the Voiceover narration field to synthesize it.
           </p>
 
           {/* ── Model picker (two optgroups; Gemini first, default first) ── */}
           <div className="mb-2.5">
-            <label className="mb-0.5 block text-[10px] font-medium text-zinc-400">
+            <label className="mb-0.5 block text-[10px] font-medium text-stone-400">
               Model
             </label>
             <select
               value={model}
               onChange={(e) => updatePrefs({ model: e.target.value })}
               className={selectCls}
-              style={{ borderColor: "#3f3f46" }}
+              style={{ borderColor: "#44403c" }}
               aria-label="Script model"
             >
               <optgroup label="Google Gemini">
@@ -421,10 +432,10 @@ export default function ScriptWriterSection() {
           {selectedIsGemini ? (
             <div
               className="mb-2.5 rounded-lg border p-2.5"
-              style={{ borderColor: "#3f3f46", backgroundColor: "#141416" }}
+              style={{ borderColor: "#44403c", backgroundColor: "#151310" }}
             >
               <div className="mb-1.5 flex items-center justify-between">
-                <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">
+                <span className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">
                   Gemini API key
                 </span>
                 {geminiCfg?.hasKey && (
@@ -437,16 +448,16 @@ export default function ScriptWriterSection() {
                 )}
               </div>
               {!canUseApi ? (
-                <p className="text-[10px] leading-relaxed text-zinc-500">
+                <p className="text-[10px] leading-relaxed text-stone-500">
                   AI script writing runs in the desktop app.
                 </p>
               ) : geminiCfg?.hasKey && !geminiKeyEditing ? (
                 <div className="space-y-2">
                   <div className="flex items-center gap-2">
-                    <KeyRound size={11} className="shrink-0 text-cyan-400" />
+                    <KeyRound size={11} className="shrink-0 text-amber-400" />
                     <span
-                      className="flex-1 truncate rounded border bg-zinc-900 px-2 py-1 font-mono text-[10px] text-zinc-300"
-                      style={{ borderColor: "#3f3f46" }}
+                      className="flex-1 truncate rounded border bg-stone-900 px-2 py-1 font-mono text-[10px] text-stone-300"
+                      style={{ borderColor: "#44403c" }}
                       title={geminiCfg.maskedKey}
                     >
                       {geminiCfg.maskedKey}
@@ -457,8 +468,8 @@ export default function ScriptWriterSection() {
                       type="button"
                       onClick={() => void testGeminiKey()}
                       disabled={geminiBusy !== ""}
-                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
-                      style={{ borderColor: "#3f3f46" }}
+                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-stone-300 transition-colors hover:bg-stone-800 disabled:cursor-not-allowed disabled:opacity-50"
+                      style={{ borderColor: "#44403c" }}
                     >
                       {geminiBusy === "test" ? (
                         <Loader2 size={10} className="animate-spin" />
@@ -474,8 +485,8 @@ export default function ScriptWriterSection() {
                         setGeminiKeyInput("");
                       }}
                       disabled={geminiBusy !== ""}
-                      className="rounded border px-2 py-1 text-[10px] font-medium text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
-                      style={{ borderColor: "#3f3f46" }}
+                      className="rounded border px-2 py-1 text-[10px] font-medium text-stone-300 transition-colors hover:bg-stone-800 disabled:cursor-not-allowed disabled:opacity-50"
+                      style={{ borderColor: "#44403c" }}
                     >
                       Replace
                     </button>
@@ -483,8 +494,8 @@ export default function ScriptWriterSection() {
                       type="button"
                       onClick={() => void removeGeminiKey()}
                       disabled={geminiBusy !== ""}
-                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-red-400/90 transition-colors hover:border-red-500/40 hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-50"
-                      style={{ borderColor: "#3f3f46" }}
+                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-rose-400/90 transition-colors hover:border-rose-500/40 hover:bg-rose-500/10 disabled:cursor-not-allowed disabled:opacity-50"
+                      style={{ borderColor: "#44403c" }}
                     >
                       {geminiBusy === "clear" ? (
                         <Loader2 size={10} className="animate-spin" />
@@ -504,8 +515,8 @@ export default function ScriptWriterSection() {
                     placeholder="AIza… paste your Gemini API key"
                     spellCheck={false}
                     autoComplete="off"
-                    className="w-full rounded border bg-zinc-900 px-2 py-1.5 font-mono text-[10px] text-zinc-200 placeholder:text-zinc-600 focus:border-cyan-500/60 focus:outline-none"
-                    style={{ borderColor: "#3f3f46" }}
+                    className="w-full rounded border bg-stone-900 px-2 py-1.5 font-mono text-[10px] text-stone-200 placeholder:text-stone-600 focus:border-amber-500/60 focus:outline-none"
+                    style={{ borderColor: "#44403c" }}
                     aria-label="Gemini API key"
                     onKeyDown={(e) => {
                       if (e.key === "Enter") {
@@ -519,7 +530,7 @@ export default function ScriptWriterSection() {
                       type="button"
                       onClick={() => void saveGeminiKey()}
                       disabled={geminiBusy !== "" || !geminiKeyInput.trim()}
-                      className="flex items-center gap-1 rounded bg-cyan-500 px-2.5 py-1 text-[10px] font-semibold text-zinc-900 transition-colors hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-40"
+                      className="flex items-center gap-1 rounded bg-amber-400 px-2.5 py-1 text-[10px] font-semibold text-stone-950 transition-colors hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       {geminiBusy === "save" ? (
                         <Loader2 size={10} className="animate-spin" />
@@ -532,8 +543,8 @@ export default function ScriptWriterSection() {
                       type="button"
                       onClick={() => void testGeminiKey()}
                       disabled={geminiBusy !== "" || !geminiKeyInput.trim()}
-                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
-                      style={{ borderColor: "#3f3f46" }}
+                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-stone-300 transition-colors hover:bg-stone-800 disabled:cursor-not-allowed disabled:opacity-50"
+                      style={{ borderColor: "#44403c" }}
                       title="Check the pasted key before saving"
                     >
                       {geminiBusy === "test" ? (
@@ -550,8 +561,8 @@ export default function ScriptWriterSection() {
                           setGeminiKeyEditing(false);
                           setGeminiKeyInput("");
                         }}
-                        className="rounded border px-2 py-1 text-[10px] font-medium text-zinc-400 transition-colors hover:bg-zinc-800"
-                        style={{ borderColor: "#3f3f46" }}
+                        className="rounded border px-2 py-1 text-[10px] font-medium text-stone-400 transition-colors hover:bg-stone-800"
+                        style={{ borderColor: "#44403c" }}
                       >
                         Cancel
                       </button>
@@ -560,7 +571,7 @@ export default function ScriptWriterSection() {
                       href={GEMINI_KEY_URL}
                       target="_blank"
                       rel="noreferrer"
-                      className="ml-auto flex items-center gap-1 text-[10px] font-medium text-cyan-400 underline-offset-2 hover:underline"
+                      className="ml-auto flex items-center gap-1 text-[10px] font-medium text-amber-400 underline-offset-2 hover:underline"
                     >
                       Get a free key
                       <ExternalLink size={9} />
@@ -572,9 +583,9 @@ export default function ScriptWriterSection() {
           ) : (
             <div
               className="mb-2.5 flex items-center justify-between gap-2 rounded border px-2.5 py-2"
-              style={{ borderColor: "#3f3f46", backgroundColor: "#141416" }}
+              style={{ borderColor: "#44403c", backgroundColor: "#151310" }}
             >
-              <span className="text-[10px] leading-relaxed text-zinc-500">
+              <span className="text-[10px] leading-relaxed text-stone-500">
                 Groq key is managed in Captions → Transcription.
               </span>
               {groqHasKey ? (
@@ -598,22 +609,22 @@ export default function ScriptWriterSection() {
             onChange={(e) => updatePrefs({ prompt: e.target.value })}
             rows={3}
             placeholder="What should the video be about? e.g. 'A 60-second video about why morning sunlight improves sleep'"
-            className="mb-2 w-full resize-y rounded border bg-zinc-900 px-2 py-1.5 text-[11px] text-zinc-200 placeholder:text-zinc-600 focus:border-cyan-500 focus:outline-none"
-            style={{ borderColor: "#3f3f46" }}
+            className="mb-2 w-full resize-y rounded border bg-stone-900 px-2 py-1.5 text-[11px] text-stone-200 placeholder:text-stone-600 focus:border-amber-500 focus:outline-none"
+            style={{ borderColor: "#44403c" }}
             aria-label="Script topic prompt"
           />
 
           {/* ── Tone / duration / language ── */}
           <div className="mb-2.5 grid grid-cols-3 gap-1.5">
             <div>
-              <label className="mb-0.5 block text-[10px] font-medium text-zinc-400">
+              <label className="mb-0.5 block text-[10px] font-medium text-stone-400">
                 Tone
               </label>
               <select
                 value={prefs.tone}
                 onChange={(e) => updatePrefs({ tone: e.target.value })}
                 className={selectCls}
-                style={{ borderColor: "#3f3f46" }}
+                style={{ borderColor: "#44403c" }}
                 aria-label="Script tone"
               >
                 {TONES.map((t) => (
@@ -624,7 +635,7 @@ export default function ScriptWriterSection() {
               </select>
             </div>
             <div>
-              <label className="mb-0.5 block text-[10px] font-medium text-zinc-400">
+              <label className="mb-0.5 block text-[10px] font-medium text-stone-400">
                 Duration
               </label>
               <select
@@ -633,7 +644,7 @@ export default function ScriptWriterSection() {
                   updatePrefs({ durationSec: Number(e.target.value) })
                 }
                 className={selectCls}
-                style={{ borderColor: "#3f3f46" }}
+                style={{ borderColor: "#44403c" }}
                 aria-label="Target script duration"
               >
                 {DURATIONS_SEC.map((d) => (
@@ -644,14 +655,14 @@ export default function ScriptWriterSection() {
               </select>
             </div>
             <div>
-              <label className="mb-0.5 block text-[10px] font-medium text-zinc-400">
+              <label className="mb-0.5 block text-[10px] font-medium text-stone-400">
                 Language
               </label>
               <select
                 value={prefs.language}
                 onChange={(e) => updatePrefs({ language: e.target.value })}
                 className={selectCls}
-                style={{ borderColor: "#3f3f46" }}
+                style={{ borderColor: "#44403c" }}
                 aria-label="Script language"
               >
                 {LANGUAGES.map((l) => (
@@ -668,7 +679,7 @@ export default function ScriptWriterSection() {
             type="button"
             onClick={() => void generate()}
             disabled={generating || !canUseApi}
-            className="flex w-full items-center justify-center gap-1.5 rounded bg-cyan-500 px-3 py-2 text-[11px] font-semibold text-zinc-900 transition-colors hover:bg-cyan-400 disabled:cursor-not-allowed disabled:opacity-40"
+            className="flex w-full items-center justify-center gap-1.5 rounded bg-amber-400 px-3 py-2 text-[11px] font-semibold text-stone-950 transition-colors hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-40"
           >
             {generating ? (
               <Loader2 size={12} className="animate-spin" />
@@ -680,8 +691,8 @@ export default function ScriptWriterSection() {
 
           {error && (
             <p
-              className="mt-2 rounded border px-2 py-1.5 text-[10px] leading-relaxed text-red-400"
-              style={{ borderColor: "#7f1d1d", backgroundColor: "#1a0d0d" }}
+              className="mt-2 rounded border px-2 py-1.5 text-[10px] leading-relaxed text-rose-400"
+              style={{ borderColor: "#9f1239", backgroundColor: "#22101a" }}
               role="alert"
             >
               {error}
@@ -696,11 +707,11 @@ export default function ScriptWriterSection() {
                 onChange={(e) => updatePrefs({ lastScript: e.target.value })}
                 rows={8}
                 aria-label="Generated script (editable)"
-                className="w-full resize-y rounded border bg-zinc-900 px-2 py-1.5 text-[11px] leading-relaxed text-zinc-200 focus:border-cyan-500 focus:outline-none"
-                style={{ borderColor: "#3f3f46" }}
+                className="w-full resize-y rounded border bg-stone-900 px-2 py-1.5 text-[11px] leading-relaxed text-stone-200 focus:border-amber-500 focus:outline-none"
+                style={{ borderColor: "#44403c" }}
               />
               <div className="mt-1 flex items-center justify-between gap-2">
-                <span className="text-[10px] text-zinc-500">
+                <span className="text-[10px] text-stone-500">
                   {scriptWords} words · ≈{estSec}s at{" "}
                   {WORDS_PER_SECOND} words/s
                 </span>
@@ -708,8 +719,8 @@ export default function ScriptWriterSection() {
                   type="button"
                   onClick={() => void copyScript()}
                   disabled={!script.trim()}
-                  className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
-                  style={{ borderColor: "#3f3f46" }}
+                  className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-stone-300 transition-colors hover:bg-stone-800 disabled:cursor-not-allowed disabled:opacity-50"
+                  style={{ borderColor: "#44403c" }}
                 >
                   {copied ? (
                     <Check size={10} className="text-emerald-400" />
@@ -722,7 +733,7 @@ export default function ScriptWriterSection() {
             </div>
           )}
 
-          <p className="mt-2 text-[10px] leading-relaxed text-zinc-500">
+          <p className="mt-2 text-[10px] leading-relaxed text-stone-500">
             Copy the script into the Voiceover narration field to synthesize
             it.
           </p>

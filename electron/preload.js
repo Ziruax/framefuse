@@ -14,6 +14,17 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // { ok, path, version, error }.
   ffmpegStatus: () => ipcRenderer.invoke("ffmpeg-status"),
 
+  // ── v1.22 NATIVE ENGINE DIAGNOSTICS ────────────────────────────────────
+  // engineStatus: () → { loaded, version, binary, from, error, lastFailure,
+  //   diagnostics } — the load state + the LAST reason an export bypassed
+  //   the Rust engine (gate / timeline / runtime).
+  engineStatus: () => ipcRenderer.invoke("engine:status"),
+  // engineSelfTest: () → { ok, engineUsed?, encoderName?, adapter?, error?,
+  //   stage?, wallMs?, frames?, dllDir?, status } — runs a REAL 36-frame
+  // mini export through the Rust engine in THIS runtime; the definitive
+  // "is the engine healthy" check with the exact error when it is not.
+  engineSelfTest: () => ipcRenderer.invoke("engine:selftest"),
+
   // v5.1: result of the async GPU-encoder probe (for the export badge).
   // { encoder: "NVIDIA NVENC" | "Intel QSV" | "AMD AMF" | "CPU (libx264)",
   //   encoderName: "h264_nvenc" | … | "libx264", forced: boolean,
@@ -97,16 +108,19 @@ contextBridge.exposeInMainWorld("electronAPI", {
   //   timeline voiceover lane.
   ttsSynthesize: (p) => ipcRenderer.invoke("tts:synthesize", p),
   // dubStart: ({ segments, sourceLanguage, targetLanguage, targetLocale,
-  //   groqModel, femaleVoice, maleVoice, voiceMode, singleVoice }) → dub
-  //   result (segments carry wav BYTES). voiceMode "single" + singleVoice =
-  //   one Edge-TTS voice for every line (speaker detection skipped).
-  //   Progress arrives via onDubProgress. Reuses the Captions-tab
-  //   Groq key — there is no second key UI.
+  //   groqModel, textProvider, geminiModel, femaleVoice, maleVoice,
+  //   voiceMode, singleVoice }) → dub result (segments carry wav BYTES).
+  //   voiceMode "single" + singleVoice = one Edge-TTS voice for every line
+  //   (speaker detection skipped). v1.22: textProvider "gemini" + geminiModel
+  //   routes the speaker/translation phases through the Gemini key (shared
+  //   with the Script Writer); "groq" (default) uses groqModel. Whisper
+  //   transcription is always Groq. Progress arrives via onDubProgress.
+  //   Reuses the Captions-tab Groq key — there is no second key UI.
   dubStart: (p) => ipcRenderer.invoke("dub:start", p),
   // dubCancel: () → { ok, running } — aborts the active dub run.
   dubCancel: (p) => ipcRenderer.invoke("dub:cancel", p),
-  // dubModels: () → { models, default, langNames } — picker data, no key
-  //   needed.
+  // dubModels: () → { models, default, langNames, gemini: { models, default,
+  //   hasKey } } — picker data, no key needed (v1.22: + the Gemini list).
   dubModels: () => ipcRenderer.invoke("dub:models"),
   onDubProgress: (callback) => {
     const handler = (_event, data) => callback(data);

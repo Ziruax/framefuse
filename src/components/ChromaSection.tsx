@@ -200,9 +200,9 @@ export function drawSnapshot(
 function drawCheckerboard(ctx: CanvasRenderingContext2D, w: number, h: number): void {
   const cell = 6;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.fillStyle = "#18181b";
+  ctx.fillStyle = "#1c1917";
   ctx.fillRect(0, 0, w, h);
-  ctx.fillStyle = "#27272a";
+  ctx.fillStyle = "#292524";
   for (let y = 0; y < h; y += cell) {
     for (let x = 0; x < w; x += cell) {
       if ((Math.floor(x / cell) + Math.floor(y / cell)) % 2 === 0) {
@@ -384,7 +384,7 @@ export function ChromaSection({ seg, edit, onSetItemEdit, isVideo, trimInMs, ove
             onClick={toggleChroma}
             title={enabled ? "Disable chroma key" : "Enable chroma key (green screen removal)"}
             className="relative h-4 w-7 rounded-full transition-colors duration-150"
-            style={{ backgroundColor: enabled ? "rgba(16, 185, 129, 0.55)" : "#3f3f46" }}
+            style={{ backgroundColor: enabled ? "rgba(16, 185, 129, 0.55)" : "#44403c" }}
           >
             <span
               className={cn(
@@ -394,14 +394,14 @@ export function ChromaSection({ seg, edit, onSetItemEdit, isVideo, trimInMs, ove
             />
           </button>
         ) : (
-          <span className="text-[8px] font-medium" style={{ color: "#71717a" }}>
+          <span className="text-[8px] font-medium" style={{ color: "#78716c" }}>
             overlay only
           </span>
         )}
       </div>
 
       {!overlayOn ? (
-        <p className="mt-1.5 flex items-center gap-1 text-[9px]" style={{ color: "#71717a" }}>
+        <p className="mt-1.5 flex items-center gap-1 text-[9px]" style={{ color: "#78716c" }}>
           <Lock className="size-2.5 shrink-0" />
           Move to Overlay track to key.
         </p>
@@ -424,7 +424,7 @@ export function ChromaSection({ seg, edit, onSetItemEdit, isVideo, trimInMs, ove
                     "flex items-center justify-center gap-1 rounded-md border px-1 py-1 text-[9px] font-semibold transition-all duration-150 active:scale-95",
                     active
                       ? "border-emerald-400/60 bg-emerald-400/15 text-emerald-200"
-                      : "border-zinc-700/70 text-zinc-400 hover:border-zinc-600 hover:bg-white/5 hover:text-zinc-200",
+                      : "border-stone-700/70 text-stone-400 hover:border-stone-600 hover:bg-white/5 hover:text-stone-200",
                   )}
                 >
                   <span
@@ -438,7 +438,7 @@ export function ChromaSection({ seg, edit, onSetItemEdit, isVideo, trimInMs, ove
           </div>
 
           {/* v1 keying-mode explainer — the two modes in one sentence each. */}
-          <p className="px-0.5 text-[9px] leading-relaxed" style={{ color: "#71717a" }}>
+          <p className="px-0.5 text-[9px] leading-relaxed" style={{ color: "#78716c" }}>
             {mode === "luma"
               ? "Luma key — removes pixels by brightness. Dark content stays on white screens (and vice versa)."
               : "Chroma key — removes pixels by color distance. Works best with a solid green/blue screen."}
@@ -466,7 +466,7 @@ export function ChromaSection({ seg, edit, onSetItemEdit, isVideo, trimInMs, ove
             {detected != null && (
               <span
                 className="flex min-w-0 items-center gap-1 text-[9px]"
-                style={{ color: "#a1a1aa" }}
+                style={{ color: "#a8a29e" }}
                 title={`Detected key color ${detected.color.toUpperCase()} with ${Math.round(detected.confidence * 100)}% confidence`}
               >
                 <span
@@ -480,14 +480,14 @@ export function ChromaSection({ seg, edit, onSetItemEdit, isVideo, trimInMs, ove
             )}
           </div>
           {detectWarn && (
-            <p className="flex items-center gap-1 text-[9px]" style={{ color: "#a1a1aa" }}>
+            <p className="flex items-center gap-1 text-[9px]" style={{ color: "#a8a29e" }}>
               <AlertTriangle className="size-2.5 shrink-0" style={{ color: "#d97706" }} />
               Couldn&apos;t find a clear key color — set it manually.
             </p>
           )}
 
           <div className="flex items-center gap-2">
-            <label className="w-14 shrink-0 text-[10px] font-medium" style={{ color: "#d4d4d8" }}>
+            <label className="w-14 shrink-0 text-[10px] font-medium" style={{ color: "#d6d3d1" }}>
               Key color
             </label>
             <input
@@ -503,9 +503,9 @@ export function ChromaSection({ seg, edit, onSetItemEdit, isVideo, trimInMs, ove
               aria-label={`Key color for ${seg.fileName}`}
               title="Key color — the color (chroma) or brightness (luma) removed by the keyer"
               className="size-6 shrink-0 cursor-pointer rounded-md border bg-transparent p-0.5"
-              style={{ borderColor: "#3f3f46" }}
+              style={{ borderColor: "#44403c" }}
             />
-            <span className="font-mono text-[9px] tabular-nums" style={{ color: "#a1a1aa" }}>
+            <span className="font-mono text-[9px] tabular-nums" style={{ color: "#a8a29e" }}>
               {toColorInputValue(chroma.color).toUpperCase()}
             </span>
           </div>
@@ -549,12 +549,12 @@ export function ChromaSection({ seg, edit, onSetItemEdit, isVideo, trimInMs, ove
                 ariaLabel={`Spill suppression for ${seg.fileName}`}
                 title="Green fringe suppression on kept pixels"
               />
-              <p className="mt-0.5 px-0.5 text-[9px]" style={{ color: "#71717a" }}>
+              <p className="mt-0.5 px-0.5 text-[9px]" style={{ color: "#78716c" }}>
                 Removes green fringe (preview only — export approximates).
               </p>
             </div>
           ) : (
-            <p className="px-0.5 text-[9px]" style={{ color: "#71717a" }}>
+            <p className="px-0.5 text-[9px]" style={{ color: "#78716c" }}>
               Spill suppression is green-screen only — off in luma mode.
             </p>
           )}
@@ -564,13 +564,13 @@ export function ChromaSection({ seg, edit, onSetItemEdit, isVideo, trimInMs, ove
             style={{ borderColor: "rgba(6, 78, 59, 0.3)" }}
           >
             <ChromaMiniPreview source={frameSource} settings={chroma} />
-            <p className="min-w-0 text-[9px]" style={{ color: "#71717a" }}>
+            <p className="min-w-0 text-[9px]" style={{ color: "#78716c" }}>
               {frameSource ? "Live key preview — checkerboard = removed." : "Loading frame…"}
             </p>
           </div>
         </div>
       ) : (
-        <p className="mt-1.5 px-0.5 text-[9px]" style={{ color: "#52525b" }}>
+        <p className="mt-1.5 px-0.5 text-[9px]" style={{ color: "#57534e" }}>
           Remove a solid background (green/blue/white/black). PNG frames key too.
         </p>
       )}
@@ -594,7 +594,7 @@ interface SliderRowProps {
 export function SliderRow({ label, value, min, max, step, onChange, format, ariaLabel, title }: SliderRowProps) {
   return (
     <div className="flex items-center gap-2" title={title}>
-      <span className="w-14 shrink-0 text-[10px] font-medium" style={{ color: "#d4d4d8" }}>
+      <span className="w-14 shrink-0 text-[10px] font-medium" style={{ color: "#d6d3d1" }}>
         {label}
       </span>
       <input
@@ -609,7 +609,7 @@ export function SliderRow({ label, value, min, max, step, onChange, format, aria
       />
       <span
         className="w-8 shrink-0 text-right text-[9px] font-semibold tabular-nums"
-        style={{ color: "#a1a1aa" }}
+        style={{ color: "#a8a29e" }}
       >
         {format(value)}
       </span>
@@ -661,7 +661,7 @@ function ChromaMiniPreview({ source, settings }: ChromaMiniPreviewProps) {
       role="img"
       aria-label="Chroma key live preview"
       className="h-[54px] w-[96px] shrink-0 rounded-md border"
-      style={{ borderColor: "#3f3f46", backgroundColor: "#18181b" }}
+      style={{ borderColor: "#44403c", backgroundColor: "#1c1917" }}
     />
   );
 }

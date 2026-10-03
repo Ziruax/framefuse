@@ -156,7 +156,7 @@ const DISCLAIMER_DEFAULT_MS = 2000;
 /** v1.14.2: renderer build stamp — the desktop-only landing carries it so a
  * browser visitor sees which build is live (in Electron, Header separately
  * cross-checks it against the exe's app.getVersion()). */
-const BUILD_VERSION = "1.21.0";
+const BUILD_VERSION = "1.22.0";
 
 /** Effective lead-in duration of a disclaimer clip (ms, min 200). */
 function disclaimerDurationOf(d: DisclaimerClip | null): number {
@@ -222,6 +222,8 @@ const DEFAULT_DUB_SETTINGS: DubSettings = {
   targetLanguage: "hi",
   targetLocale: "hi-IN",
   groqModel: "llama-3.3-70b-versatile",
+  textProvider: "groq",
+  geminiModel: "gemini-3.5-flash-lite",
   femaleVoice: "",
   maleVoice: "",
   voiceMode: "multi",
@@ -248,6 +250,13 @@ function loadDubSettings(): DubSettings {
         typeof j.groqModel === "string" && j.groqModel
           ? j.groqModel
           : DEFAULT_DUB_SETTINGS.groqModel,
+      // v1.22: the dub text-model provider ("groq" default; "gemini" rides
+      // the Script Writer's key + model list). Absent → groq (legacy prefs).
+      textProvider: j.textProvider === "gemini" ? "gemini" : "groq",
+      geminiModel:
+        typeof j.geminiModel === "string" && j.geminiModel
+          ? j.geminiModel
+          : DEFAULT_DUB_SETTINGS.geminiModel,
       femaleVoice: typeof j.femaleVoice === "string" ? j.femaleVoice : "",
       maleVoice: typeof j.maleVoice === "string" ? j.maleVoice : "",
       // v1.20: absent fields (prefs saved by ≤ v1.19) read as the legacy
@@ -1505,6 +1514,10 @@ export default function Page() {
         targetLanguage: dubSettings.targetLanguage,
         targetLocale: dubSettings.targetLocale,
         groqModel: dubSettings.groqModel,
+        // v1.22: the dub's AI model provider — Groq (default) or Gemini
+        // (the Script Writer's key + the Gemini model list).
+        textProvider: dubSettings.textProvider ?? "groq",
+        geminiModel: dubSettings.geminiModel,
         femaleVoice: dubSettings.femaleVoice || undefined,
         maleVoice: dubSettings.maleVoice || undefined,
         voiceMode: dubSettings.voiceMode ?? "multi",
@@ -4956,7 +4969,7 @@ const handleRandomTransitionMix = useCallback(() => {
   return (
     <div
       className="flex h-screen w-screen flex-col overflow-hidden"
-      style={{ backgroundColor: "#0a0a0a", color: "#e4e4e7" }}
+      style={{ backgroundColor: "#0c0a09", color: "#e7e5e4" }}
     >
       <Header
         mode={timeline.mode}
@@ -4992,7 +5005,7 @@ const handleRandomTransitionMix = useCallback(() => {
         )}
         style={{
           ...(layout.compact ? {} : { gridTemplateColumns: gridCols }),
-          backgroundColor: "#0a0a0a",
+          backgroundColor: "#0c0a09",
         }}
       >
         {/* v1.11: drawer scrim — tap anywhere outside to close. */}
@@ -5017,8 +5030,8 @@ const handleRandomTransitionMix = useCallback(() => {
               "absolute inset-y-0 left-0 z-40 flex w-[86vw] max-w-[350px] flex-col",
           )}
           style={{
-            borderColor: "#27272a",
-            backgroundColor: "#121214",
+            borderColor: "#292524",
+            backgroundColor: "#17140f",
             boxShadow: layout.compact
               ? "8px 0 40px rgba(0, 0, 0, 0.6)"
               : "inset 1px 0 0 rgba(255,255,255,0.02)",
@@ -5027,16 +5040,16 @@ const handleRandomTransitionMix = useCallback(() => {
           {layout.compact && (
             <div
               className="flex shrink-0 items-center justify-between border-b px-3 py-2"
-              style={{ borderColor: "#27272a", backgroundColor: "#121214" }}
+              style={{ borderColor: "#292524", backgroundColor: "#17140f" }}
             >
-              <span className="text-xs font-semibold text-zinc-300">Media library</span>
+              <span className="text-xs font-semibold text-stone-300">Media library</span>
               <button
                 type="button"
                 onClick={() => setMediaCollapsed(true)}
                 aria-label="Close media panel"
                 title="Close"
-                className="flex size-8 items-center justify-center rounded-md border text-zinc-400 transition-colors hover:bg-white/10 hover:text-white active:scale-90"
-                style={{ borderColor: "#3f3f46" }}
+                className="flex size-8 items-center justify-center rounded-md border text-stone-400 transition-colors hover:bg-white/10 hover:text-white active:scale-90"
+                style={{ borderColor: "#44403c" }}
               >
                 <X className="size-4" />
               </button>
@@ -5121,7 +5134,7 @@ const handleRandomTransitionMix = useCallback(() => {
             "relative flex min-h-0 flex-col overflow-hidden",
             layout.compact && "min-w-0 flex-1",
           )}
-          style={{ backgroundColor: "#0a0a0a" }}
+          style={{ backgroundColor: "#0c0a09" }}
         >
           {/* v1: floating collapse toggles pinned to the center column's
               edges — hide either side panel for a full-width timeline
@@ -5140,8 +5153,8 @@ const handleRandomTransitionMix = useCallback(() => {
                 ? "Show the media panel"
                 : "Hide the media panel — full-width timeline workspace"
             }
-            className="ff-edge-toggle absolute left-0 top-2 z-20 flex size-6 items-center justify-center rounded-md border text-zinc-400 transition-all duration-150 hover:text-white active:scale-90"
-            style={{ borderColor: "#3f3f46", backgroundColor: "rgba(24, 24, 27, 0.92)" }}
+            className="ff-edge-toggle absolute left-0 top-2 z-20 flex size-6 items-center justify-center rounded-md border text-stone-400 transition-all duration-150 hover:text-white active:scale-90"
+            style={{ borderColor: "#44403c", backgroundColor: "rgba(28, 25, 23, 0.92)" }}
           >
             {mediaCollapsed ? <ChevronRight className="size-3.5" /> : <ChevronLeft className="size-3.5" />}
           </button>
@@ -5157,8 +5170,8 @@ const handleRandomTransitionMix = useCallback(() => {
                 ? "Show the settings panel"
                 : "Hide the settings panel — full-width timeline workspace"
             }
-            className="ff-edge-toggle absolute right-0 top-2 z-20 flex size-6 items-center justify-center rounded-md border text-zinc-400 transition-all duration-150 hover:text-white active:scale-90"
-            style={{ borderColor: "#3f3f46", backgroundColor: "rgba(24, 24, 27, 0.92)" }}
+            className="ff-edge-toggle absolute right-0 top-2 z-20 flex size-6 items-center justify-center rounded-md border text-stone-400 transition-all duration-150 hover:text-white active:scale-90"
+            style={{ borderColor: "#44403c", backgroundColor: "rgba(28, 25, 23, 0.92)" }}
           >
             {settingsCollapsed ? <ChevronLeft className="size-3.5" /> : <ChevronRight className="size-3.5" />}
           </button>
@@ -5366,8 +5379,8 @@ const handleRandomTransitionMix = useCallback(() => {
               "absolute inset-y-0 right-0 z-40 flex w-[86vw] max-w-[350px] flex-col",
           )}
           style={{
-            borderColor: "#27272a",
-            backgroundColor: "#121214",
+            borderColor: "#292524",
+            backgroundColor: "#17140f",
             boxShadow: layout.compact
               ? "-8px 0 40px rgba(0, 0, 0, 0.6)"
               : "inset -1px 0 0 rgba(255,255,255,0.02)",
@@ -5376,16 +5389,16 @@ const handleRandomTransitionMix = useCallback(() => {
           {layout.compact && (
             <div
               className="flex shrink-0 items-center justify-between border-b px-3 py-2"
-              style={{ borderColor: "#27272a", backgroundColor: "#121214" }}
+              style={{ borderColor: "#292524", backgroundColor: "#17140f" }}
             >
-              <span className="text-xs font-semibold text-zinc-300">Edit &amp; export</span>
+              <span className="text-xs font-semibold text-stone-300">Edit &amp; export</span>
               <button
                 type="button"
                 onClick={() => setSettingsCollapsed(true)}
                 aria-label="Close settings panel"
                 title="Close"
-                className="flex size-8 items-center justify-center rounded-md border text-zinc-400 transition-colors hover:bg-white/10 hover:text-white active:scale-90"
-                style={{ borderColor: "#3f3f46" }}
+                className="flex size-8 items-center justify-center rounded-md border text-stone-400 transition-colors hover:bg-white/10 hover:text-white active:scale-90"
+                style={{ borderColor: "#44403c" }}
               >
                 <X className="size-4" />
               </button>
