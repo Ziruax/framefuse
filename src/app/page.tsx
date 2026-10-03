@@ -13,6 +13,7 @@ import {
   Captions as CaptionsIcon,
   FolderOpen,
   Frame,
+  Languages as LanguagesIcon,
   Music as MusicIcon,
   PanelLeftClose,
   PanelLeftOpen,
@@ -167,7 +168,7 @@ const DISCLAIMER_DEFAULT_MS = 2000;
 /** v1.14.2: renderer build stamp — the desktop-only landing carries it so a
  * browser visitor sees which build is live (in Electron, Header separately
  * cross-checks it against the exe's app.getVersion()). */
-const BUILD_VERSION = "1.23.0";
+const BUILD_VERSION = "1.24.0";
 
 // ---------------------------------------------------------------------------
 // v1.23 FLOW — the left navigation rail. One dock, six phases: the media
@@ -188,7 +189,10 @@ const DOCK_SECTIONS: {
   { id: "media", label: "Canvas", title: "Canvas & quality", icon: Frame },
   { id: "captions", label: "Captions", title: "Captions", icon: CaptionsIcon },
   { id: "effects", label: "Effects", title: "Effects & transitions", icon: SparklesIcon },
-  { id: "audio", label: "Audio", title: "Audio & voice", icon: MusicIcon },
+  { id: "audio", label: "Audio", title: "Audio & music", icon: MusicIcon },
+  // v1.24: dedicated DUBBING phase — voiceover, script writer, translate &
+  // dub and text removal moved out of Audio/Effects into one speech home.
+  { id: "dubbing", label: "Dubbing", title: "Dubbing & voice", icon: LanguagesIcon },
   { id: "export", label: "Export", title: "Export", icon: RocketIcon },
 ];
 
@@ -1722,6 +1726,17 @@ export default function Page() {
       let m = currentMsRef.current + dt * (previewRateRef.current || 1);
       const total = totalMsRef.current;
       if (m >= total) {
+        // v1.24: LOOP ENTIRE VIDEO — when the transport loop toggle is ON,
+        // reaching the end wraps the master clock (music + preview follow
+        // the existing sync paths) and playback continues seamlessly.
+        if (videoLoopRef.current && total > 0) {
+          m = m - total;
+          currentMsRef.current = m;
+          setCurrentMs(m);
+          syncMusicElement(m, true);
+          raf = requestAnimationFrame(tick);
+          return;
+        }
         m = total;
         currentMsRef.current = m;
         setCurrentMs(m);
@@ -4946,6 +4961,37 @@ const handleRandomTransitionMix = useCallback(() => {
     }
   }, [dockSection, dockOpen]);
 
+  // ---- v1.24: LOOP ENTIRE VIDEO --------------------------------------------
+  // A persisted preview-transport toggle: when ON, playback that reaches the
+  // end of the timeline restarts from 0 seamlessly (the master rAF clock in
+  // the isPlaying effect wraps instead of stopping). Pure preview behavior —
+  // exports always render one pass.
+  const [videoLoop, setVideoLoop] = useState(false);
+  useEffect(() => {
+    try {
+      if (window.localStorage.getItem("framefuse.videoLoop") === "1")
+        setVideoLoop(true);
+    } catch {
+      /* storage unavailable — default off */
+    }
+  }, []);
+  const toggleVideoLoop = useCallback(() => {
+    setVideoLoop((v) => {
+      const next = !v;
+      try {
+        window.localStorage.setItem("framefuse.videoLoop", next ? "1" : "0");
+      } catch {
+        /* ignore write failures */
+      }
+      return next;
+    });
+  }, []);
+  // Ref-synced so the rAF tick (which never re-binds) reads live values.
+  const videoLoopRef = useRef(videoLoop);
+  useEffect(() => {
+    videoLoopRef.current = videoLoop;
+  }, [videoLoop]);
+
   // Whisper busy → surface the transcription progress in the captions
   // section (once per busy→true edge; the user can navigate away freely).
   const whisperAutoSwitchedRef = useRef(false);
@@ -5014,7 +5060,7 @@ const handleRandomTransitionMix = useCallback(() => {
   return (
     <div
       className="flex h-screen w-screen flex-col overflow-hidden"
-      style={{ backgroundColor: "#f4f1ea", color: "#292524" }}
+      style={{ backgroundColor: "#100f0d", color: "#e7e5e4" }}
     >
       <Header
         mode={timeline.mode}
@@ -5038,12 +5084,12 @@ const handleRandomTransitionMix = useCallback(() => {
         projectName={currentProjectName}
       />
 
-      {/* v1.23 FLOW — a completely different shell: a slim toolbar on a warm
-          PAPER canvas; a left icon RAIL that owns the six studio phases
+      {/* v1.23 FLOW — a completely different shell: a slim toolbar on a dark
+          NIGHT canvas; a left icon RAIL that owns the six studio phases
           (media library + canvas/captions/effects/audio/export); ONE
           contextual dock panel next to the rail (resizable, a drawer on
           small screens); the preview as a dark CINEMA card floating on the
-          paper; the timeline as a white card below it. Nothing is
+          night canvas; the timeline as a dark card below it. Nothing is
           full-bleed — every surface is a floating rounded card. */}
       <main className="relative flex min-h-0 flex-1 gap-2.5 overflow-hidden p-2.5">
         {/* ── Left navigation rail ─────────────────────────────────────── */}
@@ -5088,8 +5134,8 @@ const handleRandomTransitionMix = useCallback(() => {
                   {/* Headline count badge (effects). */}
                   {s.id === "effects" && headlineItems.length > 0 && (
                     <span
-                      className="absolute -right-2.5 -top-1.5 rounded-full px-1 py-px text-[8px] font-bold leading-none tabular-nums text-orange-700"
-                      style={{ backgroundColor: "#fdeade" }}
+                      className="absolute -right-2.5 -top-1.5 rounded-full px-1 py-px text-[8px] font-bold leading-none tabular-nums text-orange-300"
+                      style={{ backgroundColor: "#2b1c10" }}
                       aria-hidden
                     >
                       {headlineItems.length}
@@ -5125,14 +5171,14 @@ const handleRandomTransitionMix = useCallback(() => {
         {/* v1.11 compact: drawer scrim — tap anywhere outside to close. */}
         {layout.compact && dockOpen && (
           <div
-            className="absolute inset-0 z-30 bg-stone-900/40"
+            className="absolute inset-0 z-30 bg-black/60"
             onClick={() => setDockOpen(false)}
             aria-hidden
           />
         )}
 
         {/* ── Contextual dock — the rail's selected section.
-            Desktop: resizable white card; compact: left slide-over drawer. */}
+            Desktop: resizable dark card; compact: left slide-over drawer. */}
         {dockOpen && (
           <aside
             className={cn(
@@ -5148,7 +5194,7 @@ const handleRandomTransitionMix = useCallback(() => {
               <div
                 className="ff-panel-header flex shrink-0 items-center justify-between px-3 py-2"
               >
-                <span className="text-xs font-semibold text-stone-700">
+                <span className="text-xs font-semibold text-stone-300">
                   {DOCK_SECTIONS.find((s) => s.id === dockSection)?.title ??
                     "Panel"}
                 </span>
@@ -5157,7 +5203,7 @@ const handleRandomTransitionMix = useCallback(() => {
                   onClick={() => setDockOpen(false)}
                   aria-label="Close panel"
                   title="Close"
-                  className="flex size-8 items-center justify-center rounded-md border border-stone-200 bg-white text-stone-500 transition-colors hover:bg-stone-100 hover:text-stone-700 active:scale-90"
+                  className="flex size-8 items-center justify-center rounded-md border border-[#332e28] bg-[#211e1a] text-stone-400 transition-colors hover:bg-white/[0.06] hover:text-stone-200 active:scale-90"
                 >
                   <X className="size-4" />
                 </button>
@@ -5260,6 +5306,18 @@ const handleRandomTransitionMix = useCallback(() => {
                   inElectron={inElectron}
                   subtitles={subtitles}
                   hasAudio={!!audioTrack}
+                  // v1.24: dedicated background-music card (picker + info +
+                  // remove) — reuses the page's pinned audioTrack + picker.
+                  musicTrack={
+                    audioTrack
+                      ? {
+                          fileName: audioTrack.fileName,
+                          durationMs: audioTrack.durationMs,
+                        }
+                      : null
+                  }
+                  openMusicPicker={openAudioPicker}
+                  onRemoveMusic={removeAudio}
                   onGenerateCaptions={generateCaptionsFromAudio}
                   whisperBusy={whisperBusy}
                   whisperProgress={whisperProgress}
@@ -5330,6 +5388,8 @@ const handleRandomTransitionMix = useCallback(() => {
               onSeek={seek}
               onTogglePlay={togglePlay}
               onStep={stepSegment}
+              videoLoop={videoLoop}
+              onVideoLoopChange={toggleVideoLoop}
               onSetMotion={(dir) => {
                 const seg = activeSegment;
                 if (!seg) return;
@@ -5372,7 +5432,7 @@ const handleRandomTransitionMix = useCallback(() => {
             </div>
           )}
 
-          {/* v5 4-lane timeline inside a white floating card. Compact gets a
+          {/* v5 4-lane timeline inside a dark floating card. Compact gets a
               viewport-proportional height; desktop keeps the splitter px. */}
           <div
             className={cn(

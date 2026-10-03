@@ -259,9 +259,9 @@ export function Splitter({
       onFocus={() => setFocused(true)}
       onBlur={() => setFocused(false)}
     >
-      {/* 1px visible line (warm gray → tangerine on hover/drag — see globals.css) */}
+      {/* 1px visible line (dark hairline → tangerine on hover/drag — see globals.css) */}
       <span className="ff-splitter-line" aria-hidden="true" />
-      {/* grip texture: 3 dots, warm gray */}
+      {/* grip texture: 3 dots, dark gray */}
       <span className="ff-splitter-grip" aria-hidden="true">
         <i />
         <i />

@@ -20,10 +20,10 @@ interface DesktopOnlyLandingProps {
 }
 
 /**
- * v1.23 FLOW landing — a completely new first-run surface: a bright paper
- * canvas, a split hero with a CSS-built studio mockup, and a feature bento.
- * The preview escape hatch ("Launch the Studio") is unchanged behavior —
- * same handler, same sessionStorage flag.
+ * v1.23 FLOW NIGHT landing — a completely new first-run surface: a dark
+ * studio canvas, a split hero with a CSS-built studio mockup, and a feature
+ * bento. The preview escape hatch ("Launch the Studio") is unchanged
+ * behavior — same handler, same sessionStorage flag.
  */
 export function DesktopOnlyLanding({
   version,
@@ -32,12 +32,12 @@ export function DesktopOnlyLanding({
   return (
     <div
       className="flex min-h-screen w-full flex-col"
-      style={{ backgroundColor: "#f4f1ea", color: "#292524" }}
+      style={{ backgroundColor: "#100f0d", color: "#e7e5e4" }}
     >
       {/* ── Top bar ─────────────────────────────────────────────────── */}
       <header
         className="flex h-16 shrink-0 items-center justify-between border-b px-6 sm:px-10"
-        style={{ borderColor: "#e8e1d4" }}
+        style={{ borderColor: "#2b2723" }}
       >
         <div className="flex items-center gap-3">
           <div
@@ -50,14 +50,14 @@ export function DesktopOnlyLanding({
             <Film className="size-[18px]" style={{ color: "#ffffff" }} />
           </div>
           <div className="leading-tight">
-            <div className="text-[15px] font-semibold tracking-tight text-stone-900">
+            <div className="text-[15px] font-semibold tracking-tight text-stone-100">
               FrameFuse
             </div>
             <div className="text-[11px] text-stone-400">Video Studio</div>
           </div>
           <span
             className="ml-1 hidden rounded-md border px-1.5 py-0.5 font-mono text-[10px] font-medium text-stone-400 sm:inline-flex"
-            style={{ borderColor: "#e8e1d4", backgroundColor: "#f6f2ea" }}
+            style={{ borderColor: "#2b2723", backgroundColor: "#26221e" }}
           >
             v{version}
           </span>
@@ -98,21 +98,21 @@ export function DesktopOnlyLanding({
             <span
               className="inline-flex items-center gap-2 rounded-full border px-3 py-1 text-[11px] font-semibold"
               style={{
-                borderColor: "rgba(234, 88, 12, 0.35)",
-                backgroundColor: "#fff3ea",
-                color: "#c2410c",
+                borderColor: "rgba(234, 88, 12, 0.4)",
+                backgroundColor: "#2b1c10",
+                color: "#fdba74",
               }}
             >
               <Zap className="size-3" />
               Native Rust engine · GPU composited
             </span>
-            <h1 className="mt-5 text-[40px] font-extrabold leading-[1.06] tracking-tight text-stone-900 sm:text-[54px]">
+            <h1 className="mt-5 text-[40px] font-extrabold leading-[1.06] tracking-tight text-stone-100 sm:text-[54px]">
               Edit videos at
               <br />
               the{" "}
               <span
                 style={{
-                  backgroundImage: "linear-gradient(100deg, #ea580c, #0d9488)",
+                  backgroundImage: "linear-gradient(100deg, #f97316, #2dd4bf)",
                   WebkitBackgroundClip: "text",
                   backgroundClip: "text",
                   color: "transparent",
@@ -121,7 +121,7 @@ export function DesktopOnlyLanding({
                 speed of thought
               </span>
             </h1>
-            <p className="mt-5 text-[15px] leading-relaxed text-stone-500 sm:text-[17px]">
+            <p className="mt-5 text-[15px] leading-relaxed text-stone-400 sm:text-[17px]">
               FrameFuse turns raw clips into finished videos — captions that
               dance, AI voiceovers in any language, beat-synced cuts — and
               exports through a native engine instead of waiting on a
@@ -165,7 +165,7 @@ export function DesktopOnlyLanding({
             {/* toolbar */}
             <div
               className="flex h-9 items-center gap-2 rounded-lg border px-2.5"
-              style={{ borderColor: "#eee8dc", backgroundColor: "#faf7f1" }}
+              style={{ borderColor: "#2b2723", backgroundColor: "#211e1a" }}
             >
               <div
                 className="size-4 rounded-[5px]"
@@ -173,7 +173,7 @@ export function DesktopOnlyLanding({
                   backgroundImage: "linear-gradient(135deg, #f06214, #ea580c)",
                 }}
               />
-              <div className="h-2 w-16 rounded-full bg-stone-200" />
+              <div className="h-2 w-16 rounded-full bg-[#3a352d]" />
               <div className="flex-1" />
               <div
                 className="h-5 w-16 rounded-[7px]"
@@ -184,7 +184,7 @@ export function DesktopOnlyLanding({
             <div className="mt-2.5 flex gap-2.5">
               <div
                 className="flex w-11 flex-col items-center gap-1.5 rounded-xl border py-2.5"
-                style={{ borderColor: "#eee8dc", backgroundColor: "#faf7f1" }}
+                style={{ borderColor: "#2b2723", backgroundColor: "#211e1a" }}
               >
                 {[0, 1, 2, 3, 4, 5].map((i) => (
                   <div
@@ -192,7 +192,7 @@ export function DesktopOnlyLanding({
                     className="flex h-7 w-8 items-center justify-center rounded-lg"
                     style={
                       i === 0
-                        ? { backgroundColor: "#fdeade", color: "#c2410c" }
+                        ? { backgroundColor: "#2b1c10", color: "#fdba74" }
                         : undefined
                     }
                   >
@@ -200,7 +200,7 @@ export function DesktopOnlyLanding({
                       className="h-2.5 w-2.5 rounded-[4px]"
                       style={{
                         backgroundColor:
-                          i === 0 ? "#ea580c" : "#d6cfc2",
+                          i === 0 ? "#ea580c" : "#57534e",
                       }}
                     />
                   </div>
@@ -246,7 +246,7 @@ export function DesktopOnlyLanding({
                 {/* timeline card */}
                 <div
                   className="rounded-xl border p-2"
-                  style={{ borderColor: "#eee8dc", backgroundColor: "#faf7f1" }}
+                  style={{ borderColor: "#2b2723", backgroundColor: "#211e1a" }}
                 >
                   <div className="flex gap-1.5">
                     <div
@@ -261,16 +261,16 @@ export function DesktopOnlyLanding({
                       className="h-5 w-24 rounded-md"
                       style={{ background: "linear-gradient(135deg, #fcd6b8, #fb923c)" }}
                     />
-                    <div className="h-5 flex-1 rounded-md bg-stone-200/70" />
+                    <div className="h-5 flex-1 rounded-md bg-[#3a352d]/70" />
                   </div>
                   <div className="mt-1.5 flex gap-1.5">
                     <div
                       className="h-3.5 w-16 rounded-md"
                       style={{ background: "linear-gradient(90deg, #99f6e4, #5eead4)" }}
                     />
-                    <div className="h-3.5 flex-1 rounded-md bg-stone-200/60" />
+                    <div className="h-3.5 flex-1 rounded-md bg-[#3a352d]/60" />
                   </div>
-                  <div className="mt-1.5 h-px w-full bg-stone-200" />
+                  <div className="mt-1.5 h-px w-full bg-[#2b2723]" />
                   <div className="relative mt-1.5 h-3.5">
                     <div
                       className="absolute left-[38%] top-[-3px] h-3.5 w-[2px] rounded-full"
@@ -284,9 +284,9 @@ export function DesktopOnlyLanding({
             <div
               className="absolute right-5 top-16 flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-semibold"
               style={{
-                borderColor: "rgba(5, 150, 105, 0.35)",
-                backgroundColor: "#ecfdf5",
-                color: "#047857",
+                borderColor: "rgba(5, 150, 105, 0.45)",
+                backgroundColor: "#0e211b",
+                color: "#6ee7b7",
                 boxShadow: "0 6px 18px rgba(5, 150, 105, 0.15)",
               }}
             >
@@ -303,43 +303,43 @@ export function DesktopOnlyLanding({
           {[
             {
               icon: Captions,
-              tint: "#fdeade",
-              fg: "#c2410c",
+              tint: "#2b1c10",
+              fg: "#fdba74",
               title: "Captions that dance",
               line: "Word-by-word karaoke, kinetic typography presets, real bundled fonts — burned in natively.",
             },
             {
               icon: Sparkles,
-              tint: "#fef3c7",
-              fg: "#b45309",
+              tint: "#2b2110",
+              fg: "#fbbf24",
               title: "Effects without the crawl",
               line: "Ken Burns motion, geometric transitions, watermarks and PiP overlays — all previewed live.",
             },
             {
               icon: PenLine,
-              tint: "#fae8ff",
-              fg: "#a21caf",
+              tint: "#2b1a33",
+              fg: "#e879f9",
               title: "AI script writer",
               line: "Draft your video with Gemini or Groq inside the studio, then voice it in one click.",
             },
             {
               icon: Languages,
-              tint: "#f0fdfa",
-              fg: "#0f766e",
+              tint: "#10201d",
+              fg: "#2dd4bf",
               title: "Translate & dub",
               line: "Multi-speaker dubs with speaker detection, per-speaker voices and studio ducking.",
             },
             {
               icon: Scissors,
-              tint: "#eff6ff",
-              fg: "#0369a1",
+              tint: "#131f2b",
+              fg: "#7dd3fc",
               title: "Beat-synced cuts",
               line: "Drop a track, detect beats, snap every clip to the rhythm automatically.",
             },
             {
               icon: Zap,
-              tint: "#ecfdf5",
-              fg: "#047857",
+              tint: "#0e211b",
+              fg: "#6ee7b7",
               title: "A native engine, not a tab",
               line: "The Rust core composites on your GPU and encodes through the FFmpeg libraries directly.",
             },
@@ -354,10 +354,10 @@ export function DesktopOnlyLanding({
               >
                 <f.icon className="size-5" />
               </div>
-              <h3 className="mt-3.5 text-[15px] font-bold tracking-tight text-stone-800">
+              <h3 className="mt-3.5 text-[15px] font-bold tracking-tight text-stone-200">
                 {f.title}
               </h3>
-              <p className="mt-1.5 text-[13px] leading-relaxed text-stone-500">
+              <p className="mt-1.5 text-[13px] leading-relaxed text-stone-400">
                 {f.line}
               </p>
             </div>
@@ -367,19 +367,19 @@ export function DesktopOnlyLanding({
         {/* Why desktop strip */}
         <div
           className="mx-auto mt-3.5 flex w-full max-w-6xl flex-col items-start gap-3 rounded-2xl border px-6 py-5 sm:flex-row sm:items-center"
-          style={{ borderColor: "#e8e1d4", backgroundColor: "#faf7f1" }}
+          style={{ borderColor: "#2b2723", backgroundColor: "#211e1a" }}
         >
           <div
             className="flex size-10 shrink-0 items-center justify-center rounded-xl"
-            style={{ backgroundColor: "#fff3ea", color: "#c2410c" }}
+            style={{ backgroundColor: "#2b1c10", color: "#fdba74" }}
           >
             <MonitorPlay className="size-5" />
           </div>
           <div className="flex-1">
-            <div className="text-[14px] font-bold text-stone-800">
+            <div className="text-[14px] font-bold text-stone-200">
               Why a desktop app?
             </div>
-            <p className="mt-0.5 text-[13px] leading-relaxed text-stone-500">
+            <p className="mt-0.5 text-[13px] leading-relaxed text-stone-400">
               GPU encoding, direct file access and the native Rust engine only
               exist outside the browser sandbox. This page is just the
               front door — the studio itself runs as a Windows app.
@@ -402,7 +402,7 @@ export function DesktopOnlyLanding({
             href="https://github.com/Ziruax/framefuse"
             target="_blank"
             rel="noreferrer"
-            className="transition-colors hover:text-stone-700"
+            className="transition-colors hover:text-stone-300"
           >
             github.com/Ziruax/framefuse
           </a>

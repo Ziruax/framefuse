@@ -2414,3 +2414,28 @@ Work Log:
 Stage Summary:
 - v1.23.0 IS LIVE: https://github.com/Ziruax/framefuse/releases/tag/v1.23.0 (installer only — NSIS, per the standing directive).
 - The Flow redesign shipped exactly as verified locally: light Paper Studio shell, rail + dock, cinema card, floating timeline card, new landing — no untested changes between verification and release (same working tree, same commit).
+
+---
+Task ID: 10 (v1.24.0 — dark mode, background music, video loop, Dubbing tab, toggle fix)
+Agent: main (Z.ai Code) + parallel agents 6-a/b/c/d
+Task: User round — dark mode UI; add background-music feature; loop entire video; fix toggle thumb escaping track; separate Dubbing tab with text-remove moved there.
+
+Work Log:
+- TOGGLE FIX (SettingsPanel): root cause was the thumb span had `absolute top-0.5` with NO left value — buttons default `text-align:center`, so the thumb's static position sat ~9px into the 34px track and `translate-x-4` pushed it OUT when ON. Fixed with explicit `left-0.5` + `translate-x-[14px]` (2px symmetric insets). Browser-verified with bounding boxes: OFF x=327, ON x=341 (track 324–360) — always inside.
+- DUBBING TAB: SETTINGS_TAB_IDS + "dubbing" (violet #7c3aed accent, Languages icon) between audio/export; tabRefs record updated; new `ff-settings-tabpanel-dubbing` panel; VoiceoverSection + ScriptWriterSection + DubSection moved out of the Audio tab and TextRemovalSection moved out of the Effects tab into it. page.tsx DOCK_SECTIONS + { id:"dubbing", title:"Dubbing & voice" }; Audio section renamed "Audio & music". During surgery one multi-line JSX comment was missing its closing `}` (`*/` instead of `*/}`) — caught via bun parse bisect and fixed.
+- BACKGROUND MUSIC (v1.24): dedicated Section in the Audio tab — new SettingsPanelProps musicTrack/openMusicPicker/onRemoveMusic (wired to the page's audioTrack/openAudioPicker/removeAudio); "Add background music" (teal solid) → "Replace music file" once loaded; track chip (name, duration, loops-to-fill note, Trash2 remove); music volume + loop-to-fill rows moved into the card.
+- LOOP ENTIRE VIDEO: page.tsx `videoLoop` state persisted at `framefuse.videoLoop`; the master rAF tick wraps `m -= total` + re-syncs music instead of stopping; PreviewPanel transport gets a Repeat button (amber armed / gray off, aria-pressed). Browser-verified both light + dark: playhead 39.8s → 4.9s wrap, transport kept playing, persisted across reload.
+- DARK MODE "Flow Night": 4 parallel agents swept disjoint files with a strict token map (paper #f4f1ea → #100f0d canvas; cards #1a1815 + #2b2723 borders; wells #211e1a/#26221e; text ramp #e7e5e4/#b5aea3/#a8a29e/#8f887f; tangerine #fb923c on #2b1c10 tints; teal #2dd4bf on #10201d; emerald #34d399; rose #fb7185; amber #fbbf24; violet #a78bfa; dark hovers white/[0.04-0.06]; shadows rgba(0,0,0,0.45)):
+  - 6-a: globals.css (108 rules — ff-card/ff-cinema/ff-rail-btn/sliders/scrollbars/selection/dropzones), layout.tsx, page.tsx shell (~9 spots), Header.tsx (60), DesktopOnlyLanding.tsx (45).
+  - 6-b: SettingsPanel.tsx (~470 swaps incl. the new bgm card + dubbing panel dark tokens).
+  - 6-c: MediaPanel.tsx (249), ScriptWriterSection.tsx (38), ChromaSection.tsx (25).
+  - 6-d: TimelineRuler.tsx (92), ShortcutsOverlay.tsx (16), ResizableSplitters.tsx (2 comments), PreviewPanel.tsx (1 — stage was already dark).
+  - Content firewall held: canvas fillStyles, chroma checkerboard, scrims over thumbnails, cyan scrub/playhead identity, amber play gradient, swatch values, toggle thumb white.
+- Version 1.23.0 → 1.24.0 (package.json, page.tsx, Header.tsx, layout title).
+- VERIFIED: tsc = exactly 9 baseline / 0 new; eslint src/ clean; agent-browser E2E — landing dark (VLM: coherent, no light leftovers), all 7 rail sections switch error-free, toggle geometry correct in dark, music file dispatch → name/volume/loop/replace/remove all shown, remove clears, sample storyboard + loop wrap at 40s→0 (continues playing), mobile 390px usable, zero page/console errors across the whole session; dev.log compiles clean.
+
+Stage Summary:
+- FrameFuse is now Flow Night: same rail+dock+cinema architecture, fully dark (v1.24.0).
+- New: dedicated Dubbing phase (VO + script writer + translate&dub + text removal), one-click background music card (picker/info/remove/replace), transport loop-entire-video toggle (persisted).
+- Fixed: toggle switch thumb escaping its track (missing left anchor + text-align:center static position).
+- All features browser-verified before this log entry; nothing shipped/committed yet (build+release is a separate user directive when requested).

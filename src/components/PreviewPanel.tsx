@@ -35,6 +35,7 @@ import {
   Upload,
   Maximize2,
   Minimize2,
+  Repeat,
 } from "lucide-react";
 import type {
   AspectRatio,
@@ -68,6 +69,7 @@ import { ChromaKeyer } from "@/lib/merger/chroma";
 import { overlaySegmentsAt } from "@/lib/merger/timeline";
 import { drawCaption, drawHeadline } from "@/lib/merger/native";
 import { cueAt } from "@/lib/merger/subtitles";
+import { cn } from "@/lib/utils";
 import {
   clampPreviewRate,
   fmtPreviewRate,
@@ -272,6 +274,12 @@ interface PreviewPanelProps {
   previewRate?: number;
   /** v1.4: fired when the user picks a new speed from the transport chip. */
   onPreviewRateChange?: (rate: number) => void;
+  /** v1.24: LOOP ENTIRE VIDEO — when true, playback that reaches the end
+   * wraps back to 0 and keeps playing (the page's master clock does the
+   * wrap; this prop only drives the transport toggle's pressed state). */
+  videoLoop?: boolean;
+  /** v1.24: fired when the user flips the transport loop toggle. */
+  onVideoLoopChange?: () => void;
   // ---- v1.11 welcome hero (center-canvas empty state) ----
   /** "Import media" quick-start card — opens the all-media picker
    *  (images + videos in one dialog). */
@@ -346,6 +354,8 @@ export function PreviewPanel({
   dubDuck = 1,
   previewRate = 1,
   onPreviewRateChange,
+  videoLoop = false,
+  onVideoLoopChange,
   onImportMedia,
   onLoadSample,
   onOpenProject,
@@ -2298,6 +2308,32 @@ export function PreviewPanel({
             <SkipForward className="size-3.5" />
           </button>
 
+          {/* v1.24: LOOP ENTIRE VIDEO — wraps playback back to 0 at the end
+              instead of stopping. Amber when armed; dim transport gray off. */}
+          {onVideoLoopChange && (
+            <button
+              type="button"
+              onClick={onVideoLoopChange}
+              disabled={segments.length === 0}
+              className={cn(
+                "flex size-7 items-center justify-center rounded-lg transition-all active:scale-90 disabled:opacity-30 disabled:hover:bg-transparent",
+                videoLoop
+                  ? "bg-orange-500/20 text-orange-300 shadow-[0_0_12px_rgba(249,115,22,0.35)] hover:bg-orange-500/30"
+                  : "hover:bg-white/10 hover:text-stone-200 hover:shadow-[0_0_12px_rgba(231,229,228,0.08)] disabled:hover:shadow-none",
+              )}
+              style={videoLoop ? undefined : { color: "#a8a29e" }}
+              title={
+                videoLoop
+                  ? "Loop: ON — playback restarts at the end (click to turn off)"
+                  : "Loop: OFF — turn on to restart playback at the end"
+              }
+              aria-label="Loop entire video"
+              aria-pressed={videoLoop}
+            >
+              <Repeat className="size-3.5" />
+            </button>
+          )}
+
           {/* v1.4: right cluster — playback SPEED chip + the timecode chip.
               The speed opens a ladder popover (0.25×–2×); J/K/L shuttle from
               the keyboard use the same ladder. Violet when not 1×. */}
@@ -2387,7 +2423,7 @@ export function PreviewPanel({
               <span style={{ color: "#e7e5e4" }}>
                 {fmtTenths(currentMs)}
               </span>
-              <span className="mx-0.5" style={{ color: "#a8a29e" }}>
+              <span className="mx-0.5" style={{ color: "#78716c" }}>
                 /
               </span>
               <span style={{ color: "#d6d3d1" }}>
