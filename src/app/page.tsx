@@ -9,7 +9,18 @@ import {
   type ChangeEvent,
 } from "react";
 import { toast } from "@/lib/toast";
-import { ChevronLeft, ChevronRight, X } from "lucide-react";
+import {
+  Captions as CaptionsIcon,
+  FolderOpen,
+  Frame,
+  Music as MusicIcon,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Rocket as RocketIcon,
+  Sparkles as SparklesIcon,
+  X,
+  type LucideIcon,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Header, type LastExport } from "@/components/Header";
 import { ShortcutsOverlay } from "@/components/ShortcutsOverlay";
@@ -17,8 +28,8 @@ import { DesktopOnlyLanding } from "@/components/DesktopOnlyLanding";
 import { MediaPanel } from "@/components/MediaPanel";
 import { PreviewPanel } from "@/components/PreviewPanel";
 import { MUSIC_SEL_ID, TimelineRuler } from "@/components/TimelineRuler";
-import { SettingsPanel } from "@/components/SettingsPanel";
-import { Splitter, SPLITTER_W, useResizableLayout } from "@/components/ResizableSplitters";
+import { SettingsPanel, type SettingsTabId } from "@/components/SettingsPanel";
+import { Splitter, useResizableLayout } from "@/components/ResizableSplitters";
 import {
   buildTimeline,
   fmtBytes,
@@ -156,7 +167,37 @@ const DISCLAIMER_DEFAULT_MS = 2000;
 /** v1.14.2: renderer build stamp — the desktop-only landing carries it so a
  * browser visitor sees which build is live (in Electron, Header separately
  * cross-checks it against the exe's app.getVersion()). */
-const BUILD_VERSION = "1.22.0";
+const BUILD_VERSION = "1.23.0";
+
+// ---------------------------------------------------------------------------
+// v1.23 FLOW — the left navigation rail. One dock, six phases: the media
+// library plus the five edit/export sections (the SettingsPanel's own tab
+// ids, driven by the shell in CONTROLLED mode — its internal tab rail is
+// not rendered). "library" shows the MediaPanel; the others mount the
+// SettingsPanel on that tab.
+// ---------------------------------------------------------------------------
+type DockSection = "library" | SettingsTabId;
+
+const DOCK_SECTIONS: {
+  id: DockSection;
+  label: string;
+  title: string;
+  icon: LucideIcon;
+}[] = [
+  { id: "library", label: "Media", title: "Media library", icon: FolderOpen },
+  { id: "media", label: "Canvas", title: "Canvas & quality", icon: Frame },
+  { id: "captions", label: "Captions", title: "Captions", icon: CaptionsIcon },
+  { id: "effects", label: "Effects", title: "Effects & transitions", icon: SparklesIcon },
+  { id: "audio", label: "Audio", title: "Audio & voice", icon: MusicIcon },
+  { id: "export", label: "Export", title: "Export", icon: RocketIcon },
+];
+
+function isDockSection(value: unknown): value is DockSection {
+  return (
+    typeof value === "string" &&
+    DOCK_SECTIONS.some((s) => s.id === value)
+  );
+}
 
 /** Effective lead-in duration of a disclaimer clip (ms, min 200). */
 function disclaimerDurationOf(d: DisclaimerClip | null): number {
@@ -4874,17 +4915,21 @@ const handleRandomTransitionMix = useCallback(() => {
   // 120/140px inside TimelineRuler) keeps its auto height via compact branch.
   const timelineIsV5 = true;
 
-  // ---- v1 FOCUS MODE: hide the left/right panels for a full-width timeline
-  // workspace (floating edge buttons restore them). Persisted per browser.
-  const [mediaCollapsed, setMediaCollapsed] = useState(false);
-  const [settingsCollapsed, setSettingsCollapsed] = useState(false);
+  // ---- v1.23 FLOW: the left navigation rail --------------------------------
+  // ONE contextual dock next to the rail replaces the v5 two-sided layout
+  // (left media library + right settings tabs). dockSection picks what the
+  // dock shows; dockOpen collapses it for a full-width cinema + timeline
+  // workspace. Persisted per browser — restored after hydration (no SSR
+  // mismatch), same pattern as every other persisted restore here.
+  const [dockSection, setDockSection] = useState<DockSection>("library");
+  const [dockOpen, setDockOpen] = useState(true);
   useEffect(() => {
     try {
-      const raw = window.localStorage.getItem("framefuse.v1.panels");
+      const raw = window.localStorage.getItem("framefuse.flow.dock");
       if (raw) {
-        const p = JSON.parse(raw) as { media?: unknown; settings?: unknown };
-        if (p && typeof p.media === "boolean") setMediaCollapsed(p.media);
-        if (p && typeof p.settings === "boolean") setSettingsCollapsed(p.settings);
+        const p = JSON.parse(raw) as { section?: unknown; open?: unknown };
+        if (p && isDockSection(p.section)) setDockSection(p.section);
+        if (p && typeof p.open === "boolean") setDockOpen(p.open);
       }
     } catch {
       /* storage unavailable — defaults */
@@ -4893,38 +4938,38 @@ const handleRandomTransitionMix = useCallback(() => {
   useEffect(() => {
     try {
       window.localStorage.setItem(
-        "framefuse.v1.panels",
-        JSON.stringify({ media: mediaCollapsed, settings: settingsCollapsed }),
+        "framefuse.flow.dock",
+        JSON.stringify({ section: dockSection, open: dockOpen }),
       );
     } catch {
       /* ignore write failures */
     }
-  }, [mediaCollapsed, settingsCollapsed]);
+  }, [dockSection, dockOpen]);
 
-  // v1: grid columns with the collapsed sides dropped (splitters go too).
-  const gridCols = useMemo(() => {
-    if (layout.compact) {
-      return `${mediaCollapsed ? "0px " : "300px "}1fr${settingsCollapsed ? "" : " 320px"}`;
+  // Whisper busy → surface the transcription progress in the captions
+  // section (once per busy→true edge; the user can navigate away freely).
+  const whisperAutoSwitchedRef = useRef(false);
+  useEffect(() => {
+    if (whisperBusy) {
+      if (!whisperAutoSwitchedRef.current) {
+        whisperAutoSwitchedRef.current = true;
+        setDockSection("captions");
+        setDockOpen(true);
+      }
+    } else {
+      whisperAutoSwitchedRef.current = false;
     }
-    const parts: string[] = [];
-    if (!mediaCollapsed) parts.push(`${layout.mediaW}px`, `${SPLITTER_W}px`);
-    parts.push("1fr");
-    if (!settingsCollapsed) parts.push(`${SPLITTER_W}px`, `${layout.settingsW}px`);
-    return parts.join(" ");
-  }, [layout, mediaCollapsed, settingsCollapsed]);
+  }, [whisperBusy]);
 
-  // ---- v1.11 SMALL-SCREEN LAYOUT: below 1024px the side panels become
-  // slide-over DRAWERS over a full-width center (the old compact fallback
-  // squeezed 300px + 320px columns and starved the preview). Entering
-  // compact auto-collapses both drawers once per transition so the
-  // preview + timeline own the screen; the floating edge toggles (and the
-  // drawer headers' close buttons) bring them back. Desktop is unchanged.
+  // v1.11 SMALL-SCREEN LAYOUT: below 1024px the dock becomes a slide-over
+  // drawer over the full-width center. Entering compact auto-closes it once
+  // per transition so the cinema + timeline own the screen; the rail and
+  // the drawer header bring it back.
   const compactEnteredRef = useRef(false);
   useEffect(() => {
     if (layout.compact && !compactEnteredRef.current) {
       compactEnteredRef.current = true;
-      setMediaCollapsed(true);
-      setSettingsCollapsed(true);
+      setDockOpen(false);
     } else if (!layout.compact) {
       compactEnteredRef.current = false;
     }
@@ -4969,7 +5014,7 @@ const handleRandomTransitionMix = useCallback(() => {
   return (
     <div
       className="flex h-screen w-screen flex-col overflow-hidden"
-      style={{ backgroundColor: "#0c0a09", color: "#e7e5e4" }}
+      style={{ backgroundColor: "#f4f1ea", color: "#292524" }}
     >
       <Header
         mode={timeline.mode}
@@ -4993,190 +5038,278 @@ const handleRandomTransitionMix = useCallback(() => {
         projectName={currentProjectName}
       />
 
-      {/* 3-column grid — v5.2 (task 3-b): columns resizable via splitters
-          (6px gutters), persisted in framefuse.layout.v52. v1.11 SMALL
-          SCREENS: below 1024px the grid is replaced by a full-width center
-          (preview + timeline) with the side panels as slide-over drawers
-          (scrim + close buttons); entering compact auto-collapses them. */}
-      <main
-        className={cn(
-          "min-h-0 flex-1 overflow-hidden",
-          layout.compact ? "relative flex" : "grid",
-        )}
-        style={{
-          ...(layout.compact ? {} : { gridTemplateColumns: gridCols }),
-          backgroundColor: "#0c0a09",
-        }}
-      >
-        {/* v1.11: drawer scrim — tap anywhere outside to close. */}
-        {layout.compact && (!mediaCollapsed || !settingsCollapsed) && (
+      {/* v1.23 FLOW — a completely different shell: a slim toolbar on a warm
+          PAPER canvas; a left icon RAIL that owns the six studio phases
+          (media library + canvas/captions/effects/audio/export); ONE
+          contextual dock panel next to the rail (resizable, a drawer on
+          small screens); the preview as a dark CINEMA card floating on the
+          paper; the timeline as a white card below it. Nothing is
+          full-bleed — every surface is a floating rounded card. */}
+      <main className="relative flex min-h-0 flex-1 gap-2.5 overflow-hidden p-2.5">
+        {/* ── Left navigation rail ─────────────────────────────────────── */}
+        <nav
+          className="ff-card flex w-[72px] shrink-0 flex-col items-center gap-1 py-3"
+          aria-label="Studio sections"
+        >
+          {DOCK_SECTIONS.map((s) => {
+            const active = dockOpen && dockSection === s.id;
+            return (
+              <button
+                key={s.id}
+                type="button"
+                className="ff-rail-btn"
+                data-active={active}
+                aria-pressed={active}
+                aria-label={s.title}
+                title={s.title}
+                onClick={() => {
+                  // Same section while open → collapse the dock (focus the
+                  // cinema + timeline). Any other click shows that section.
+                  if (dockSection === s.id && dockOpen) setDockOpen(false);
+                  else {
+                    setDockSection(s.id);
+                    setDockOpen(true);
+                  }
+                }}
+              >
+                <span className="relative flex items-center">
+                  <s.icon
+                    className="size-[19px]"
+                    strokeWidth={active ? 2.2 : 1.8}
+                  />
+                  {/* Live dot while Whisper is transcribing (captions). */}
+                  {s.id === "captions" && whisperBusy && (
+                    <span
+                      className="absolute -right-2 -top-1 size-1.5 animate-pulse rounded-full bg-orange-500"
+                      style={{ boxShadow: "0 0 6px rgba(234, 88, 12, 0.8)" }}
+                      aria-hidden
+                    />
+                  )}
+                  {/* Headline count badge (effects). */}
+                  {s.id === "effects" && headlineItems.length > 0 && (
+                    <span
+                      className="absolute -right-2.5 -top-1.5 rounded-full px-1 py-px text-[8px] font-bold leading-none tabular-nums text-orange-700"
+                      style={{ backgroundColor: "#fdeade" }}
+                      aria-hidden
+                    >
+                      {headlineItems.length}
+                    </span>
+                  )}
+                </span>
+                <span className="ff-rail-label">{s.label}</span>
+              </button>
+            );
+          })}
+          <div className="flex-1" />
+          {/* Dock collapse toggle — the one-click focus mode. */}
+          <button
+            type="button"
+            className="ff-rail-btn"
+            onClick={() => setDockOpen((v) => !v)}
+            aria-label={dockOpen ? "Hide the side panel" : "Show the side panel"}
+            title={
+              dockOpen
+                ? "Hide the side panel — full-width cinema + timeline"
+                : "Show the side panel"
+            }
+          >
+            {dockOpen ? (
+              <PanelLeftClose className="size-[19px]" strokeWidth={1.8} />
+            ) : (
+              <PanelLeftOpen className="size-[19px]" strokeWidth={1.8} />
+            )}
+            <span className="ff-rail-label">{dockOpen ? "Hide" : "Show"}</span>
+          </button>
+        </nav>
+
+        {/* v1.11 compact: drawer scrim — tap anywhere outside to close. */}
+        {layout.compact && dockOpen && (
           <div
-            className="absolute inset-0 z-30 bg-black/55"
-            onClick={() => {
-              setMediaCollapsed(true);
-              setSettingsCollapsed(true);
-            }}
+            className="absolute inset-0 z-30 bg-stone-900/40"
+            onClick={() => setDockOpen(false)}
             aria-hidden
           />
         )}
 
-        {/* Left column — Media Panel. Desktop: resizable grid column;
-            compact: left slide-over drawer. */}
-        {!mediaCollapsed && (
-        <section
-          className={cn(
-            "min-h-0 overflow-y-auto overflow-x-hidden border-r",
-            layout.compact &&
-              "absolute inset-y-0 left-0 z-40 flex w-[86vw] max-w-[350px] flex-col",
-          )}
-          style={{
-            borderColor: "#292524",
-            backgroundColor: "#17140f",
-            boxShadow: layout.compact
-              ? "8px 0 40px rgba(0, 0, 0, 0.6)"
-              : "inset 1px 0 0 rgba(255,255,255,0.02)",
-          }}
-        >
-          {layout.compact && (
-            <div
-              className="flex shrink-0 items-center justify-between border-b px-3 py-2"
-              style={{ borderColor: "#292524", backgroundColor: "#17140f" }}
-            >
-              <span className="text-xs font-semibold text-stone-300">Media library</span>
-              <button
-                type="button"
-                onClick={() => setMediaCollapsed(true)}
-                aria-label="Close media panel"
-                title="Close"
-                className="flex size-8 items-center justify-center rounded-md border text-stone-400 transition-colors hover:bg-white/10 hover:text-white active:scale-90"
-                style={{ borderColor: "#44403c" }}
+        {/* ── Contextual dock — the rail's selected section.
+            Desktop: resizable white card; compact: left slide-over drawer. */}
+        {dockOpen && (
+          <aside
+            className={cn(
+              "ff-card flex min-h-0 flex-col overflow-hidden",
+              layout.compact &&
+                "absolute bottom-2.5 left-[86px] top-2.5 z-40 w-[min(86vw,360px)]",
+            )}
+            style={
+              layout.compact ? undefined : { width: `${layout.mediaW}px` }
+            }
+          >
+            {layout.compact && (
+              <div
+                className="ff-panel-header flex shrink-0 items-center justify-between px-3 py-2"
               >
-                <X className="size-4" />
-              </button>
+                <span className="text-xs font-semibold text-stone-700">
+                  {DOCK_SECTIONS.find((s) => s.id === dockSection)?.title ??
+                    "Panel"}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setDockOpen(false)}
+                  aria-label="Close panel"
+                  title="Close"
+                  className="flex size-8 items-center justify-center rounded-md border border-stone-200 bg-white text-stone-500 transition-colors hover:bg-stone-100 hover:text-stone-700 active:scale-90"
+                >
+                  <X className="size-4" />
+                </button>
+              </div>
+            )}
+            <div className="min-h-0 flex-1">
+              {dockSection === "library" ? (
+                <MediaPanel
+                  segments={displaySegments}
+                  mode={timeline.mode}
+                  audioTrack={audioTrack}
+                  subtitles={subtitles}
+                  skipped={allSkipped}
+                  warnings={timeline.warnings}
+                  transition={transitionSettings}
+                  onAddFiles={addFiles}
+                  onAddAudioFile={addAudio}
+                  onAddSubtitleFile={addSubtitles}
+                  onLoadSamples={loadSamples}
+                  openImagePicker={openImagePicker}
+                  openVideoPicker={openVideoPicker}
+                  openAudioPicker={openAudioPicker}
+                  openSubtitlePicker={openSubtitlePicker}
+                  onRemoveAudio={removeAudio}
+                  onRemoveSubtitles={removeSubtitles}
+                  onRemove={removeItem}
+                  onOverride={overrideDuration}
+                  onClearOverride={clearOverride}
+                  onReorder={reorderItem}
+                  onMoveTo={moveItemTo}
+                  onDuplicate={duplicateItem}
+                  onBoundaryStyle={handleBoundaryStyle}
+                  onClearBoundaryOverrides={clearBoundaryOverrides}
+                  onSaveProject={saveProject}
+                  onOpenProject={handleOpenProject}
+                  onLoadProjectFile={loadProject}
+                  beatInfo={beatInfo}
+                  beatBusy={beatBusy}
+                  onDetectBeats={handleDetectBeats}
+                  onSnapToBeats={handleSnapToBeats}
+                  onFitToAudio={handleFitToAudio}
+                  beatStride={beatStride}
+                  onBeatStrideChange={(n) => setBeatStride(n as 1 | 2 | 4 | 8)}
+                  motionOverrides={motionOverrides}
+                  onSetMotion={setSegmentMotion}
+                  onClearMotionOverrides={clearAllMotionOverrides}
+                  mediaView={mediaView}
+                  onMediaViewChange={(v) => setMediaView(v)}
+                  activeId={activeSegment?.id ?? null}
+                  onSelectSegment={(id) => {
+                    // v1.14: display segments — seeking lands on the shifted clip.
+                    const s = displaySegments.find((x) => x.id === id);
+                    if (s) seek(s.startMs);
+                  }}
+                  itemEdits={itemEdits}
+                  videoDurations={videoDurations}
+                  onSetItemEdit={handleSetItemEdit}
+                  sfxItems={displaySfxItems}
+                  onAddSfx={handleAddSfx}
+                  onUpdateSfx={handleUpdateSfx}
+                  onRemoveSfx={handleRemoveSfx}
+                  currentMs={currentMs}
+                  // ---- v1.14: disclaimer / intro lead-in ----
+                  disclaimer={disclaimer}
+                  disclaimerOffsetMs={disclaimerOffsetMs}
+                  openDisclaimerPicker={openDisclaimerPicker}
+                  onSetDisclaimerDuration={setDisclaimerDuration}
+                  onRemoveDisclaimer={removeDisclaimer}
+                />
+              ) : (
+                <SettingsPanel
+                  activeTab={dockSection}
+                  onTabChange={(t) => setDockSection(t)}
+                  kenBurns={kenBurns}
+                  settings={settings}
+                  audioSettings={audioSettings}
+                  transition={transitionSettings}
+                  onKenBurnsChange={handleKenBurnsChange}
+                  onSettingsChange={handleSettingsChange}
+                  onAudioSettingsChange={handleAudioSettingsChange}
+                  onTransitionChange={handleTransitionChange}
+                  watermarkImage={
+                    watermarkImage
+                      ? { url: watermarkImage.url, fileName: watermarkImage.file.name }
+                      : null
+                  }
+                  watermarkSettings={watermarkSettings}
+                  onWatermarkFile={setWatermarkFile}
+                  onWatermarkSettingsChange={handleWatermarkSettingsChange}
+                  openWatermarkPicker={openWatermarkPicker}
+                  captionSettings={captionSettings}
+                  onCaptionSettingsChange={handleCaptionSettingsChange}
+                  onApplyPreset={applyCaptionPreset}
+                  favoritePresets={favoritePresets}
+                  onToggleFavorite={toggleFavoritePreset}
+                  onExportSrt={exportSrtSidecar}
+                  onExportAss={exportAssSidecar}
+                  onExportVtt={exportVttSidecar}
+                  onExportVttWords={exportVttWordsSidecar}
+                  inElectron={inElectron}
+                  subtitles={subtitles}
+                  hasAudio={!!audioTrack}
+                  onGenerateCaptions={generateCaptionsFromAudio}
+                  whisperBusy={whisperBusy}
+                  whisperProgress={whisperProgress}
+                  whisperLanguage={whisperLanguage}
+                  onWhisperLanguageChange={handleWhisperLanguageChange}
+                  whisperModel={whisperModel}
+                  onWhisperModelChange={setWhisperModel}
+                  hasVideoClip={timeline.segments.some(
+                    (s) => s.mediaType === "video" && (s.track ?? 0) === 0,
+                  )}
+                  headlineItems={headlineItems}
+                  onAddHeadline={addHeadline}
+                  onUpdateHeadline={updateHeadline}
+                  onRemoveHeadline={removeHeadline}
+                  totalMs={timeline.totalMs}
+                  textRemoval={textRemoval}
+                  onTextRemovalChange={setTextRemoval}
+                  videoSourceForDetect={videoSourceForDetect}
+                  onRandomMix={handleRandomTransitionMix}
+                  boundaryCount={boundaryCount}
+                  dubSettings={dubSettings}
+                  onDubSettingsChange={handleDubSettingsChange}
+                  onAddVoiceover={handleAddVoiceover}
+                  dubSourceCount={dubSources.length}
+                  dubBusy={dubBusy}
+                  dubProgress={dubProgress}
+                  dubResult={dubResult}
+                  onStartDub={() => void startDub()}
+                  onCancelDub={() => void cancelDub()}
+                  onApplyDubTrack={applyDubTrack}
+                  onDiscardDub={() => setDubResult(null)}
+                  voCount={displayVoItems.length}
+                />
+              )}
             </div>
-          )}
-          <div className="min-h-0 flex-1">
-          <MediaPanel
-            segments={displaySegments}
-            mode={timeline.mode}
-            audioTrack={audioTrack}
-            subtitles={subtitles}
-            skipped={allSkipped}
-            warnings={timeline.warnings}
-            transition={transitionSettings}
-            onAddFiles={addFiles}
-            onAddAudioFile={addAudio}
-            onAddSubtitleFile={addSubtitles}
-            onLoadSamples={loadSamples}
-            openImagePicker={openImagePicker}
-            openVideoPicker={openVideoPicker}
-            openAudioPicker={openAudioPicker}
-            openSubtitlePicker={openSubtitlePicker}
-            onRemoveAudio={removeAudio}
-            onRemoveSubtitles={removeSubtitles}
-            onRemove={removeItem}
-            onOverride={overrideDuration}
-            onClearOverride={clearOverride}
-            onReorder={reorderItem}
-            onMoveTo={moveItemTo}
-            onDuplicate={duplicateItem}
-            onBoundaryStyle={handleBoundaryStyle}
-            onClearBoundaryOverrides={clearBoundaryOverrides}
-            onSaveProject={saveProject}
-            onOpenProject={handleOpenProject}
-            onLoadProjectFile={loadProject}
-            beatInfo={beatInfo}
-            beatBusy={beatBusy}
-            onDetectBeats={handleDetectBeats}
-            onSnapToBeats={handleSnapToBeats}
-            onFitToAudio={handleFitToAudio}
-            beatStride={beatStride}
-            onBeatStrideChange={(n) => setBeatStride(n as 1 | 2 | 4 | 8)}
-            motionOverrides={motionOverrides}
-            onSetMotion={setSegmentMotion}
-            onClearMotionOverrides={clearAllMotionOverrides}
-            mediaView={mediaView}
-            onMediaViewChange={(v) => setMediaView(v)}
-            activeId={activeSegment?.id ?? null}
-            onSelectSegment={(id) => {
-              // v1.14: display segments — seeking lands on the shifted clip.
-              const s = displaySegments.find((x) => x.id === id);
-              if (s) seek(s.startMs);
-            }}
-            itemEdits={itemEdits}
-            videoDurations={videoDurations}
-            onSetItemEdit={handleSetItemEdit}
-            sfxItems={displaySfxItems}
-            onAddSfx={handleAddSfx}
-            onUpdateSfx={handleUpdateSfx}
-            onRemoveSfx={handleRemoveSfx}
-            currentMs={currentMs}
-            // ---- v1.14: disclaimer / intro lead-in ----
-            disclaimer={disclaimer}
-            disclaimerOffsetMs={disclaimerOffsetMs}
-            openDisclaimerPicker={openDisclaimerPicker}
-            onSetDisclaimerDuration={setDisclaimerDuration}
-            onRemoveDisclaimer={removeDisclaimer}
-          />
-          </div>
-        </section>
+          </aside>
         )}
 
-        {/* v5.2 (task 3-b): col splitter — drag to resize the media panel
-            (hidden while the panel is collapsed: v1 focus mode). */}
-        {!layout.compact && !mediaCollapsed && <Splitter {...layout.media} />}
+        {/* Dock width splitter (desktop, dock visible). */}
+        {!layout.compact && dockOpen && (
+          <div className="flex shrink-0">
+            <Splitter {...layout.media} />
+          </div>
+        )}
 
-        {/* Center column — Preview (flex-1) + resizable Timeline.
-            v1 FOCUS MODE: relative so the floating panel-collapse buttons
-            can pin to its edges. v1.11: owns the full width on compact. */}
-        <section
-          className={cn(
-            "relative flex min-h-0 flex-col overflow-hidden",
-            layout.compact && "min-w-0 flex-1",
-          )}
-          style={{ backgroundColor: "#0c0a09" }}
-        >
-          {/* v1: floating collapse toggles pinned to the center column's
-              edges — hide either side panel for a full-width timeline
-              workspace; the same button brings it back. v1.11 compact:
-              opening one drawer closes the other (one at a time on small
-              screens). */}
-          <button
-            type="button"
-            onClick={() => {
-              if (layout.compact && mediaCollapsed) setSettingsCollapsed(true);
-              setMediaCollapsed((v) => !v);
-            }}
-            aria-label={mediaCollapsed ? "Show media panel" : "Hide media panel"}
-            title={
-              mediaCollapsed
-                ? "Show the media panel"
-                : "Hide the media panel — full-width timeline workspace"
-            }
-            className="ff-edge-toggle absolute left-0 top-2 z-20 flex size-6 items-center justify-center rounded-md border text-stone-400 transition-all duration-150 hover:text-white active:scale-90"
-            style={{ borderColor: "#44403c", backgroundColor: "rgba(28, 25, 23, 0.92)" }}
-          >
-            {mediaCollapsed ? <ChevronRight className="size-3.5" /> : <ChevronLeft className="size-3.5" />}
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              if (layout.compact && settingsCollapsed) setMediaCollapsed(true);
-              setSettingsCollapsed((v) => !v);
-            }}
-            aria-label={settingsCollapsed ? "Show settings panel" : "Hide settings panel"}
-            title={
-              settingsCollapsed
-                ? "Show the settings panel"
-                : "Hide the settings panel — full-width timeline workspace"
-            }
-            className="ff-edge-toggle absolute right-0 top-2 z-20 flex size-6 items-center justify-center rounded-md border text-stone-400 transition-all duration-150 hover:text-white active:scale-90"
-            style={{ borderColor: "#44403c", backgroundColor: "rgba(28, 25, 23, 0.92)" }}
-          >
-            {settingsCollapsed ? <ChevronLeft className="size-3.5" /> : <ChevronRight className="size-3.5" />}
-          </button>
-
-          <div className="min-h-0 flex-1 overflow-hidden">
+        {/* ── Center column — the CINEMA preview card over the TIMELINE
+            card. relative so the (removed v1) edge affordances could pin;
+            kept for future floating overlays. */}
+        <section className="relative flex min-h-0 min-w-0 flex-1 flex-col gap-2.5">
+          <div className="ff-cinema relative min-h-0 flex-1 overflow-hidden">
             <PreviewPanel
               segments={previewSegments}
               images={images}
@@ -5231,22 +5364,21 @@ const handleRandomTransitionMix = useCallback(() => {
               onOpenProject={handleOpenProject}
             />
           </div>
-          {/* v5.2 (task 3-b): row splitter — drag to resize the timeline
-              (v1: the BIG-timeline button in the timeline toolbar is the
-              one-click version). */}
-          {!layout.compact && <Splitter {...layout.timeline} />}
 
-          {/* v5 4-lane timeline: explicit resizable height + custom scrollbar
-              so tall lane stacks scroll (timelineIsV5 mirrors TimelineRuler's
-              internal v5 gate — page.tsx always passes the v5 props). v1.11:
-              compact gets a viewport-proportional height (the legacy auto
-              height could swallow the whole screen); desktop keeps the
-              splitter-tuned px. */}
+          {/* Timeline height splitter (desktop). */}
+          {!layout.compact && (
+            <div className="flex shrink-0">
+              <Splitter {...layout.timeline} />
+            </div>
+          )}
+
+          {/* v5 4-lane timeline inside a white floating card. Compact gets a
+              viewport-proportional height; desktop keeps the splitter px. */}
           <div
-            className={
-              "min-h-0 shrink-0" +
-              (timelineIsV5 ? " ff-timeline-scroll" : "")
-            }
+            className={cn(
+              "min-h-0 shrink-0",
+              timelineIsV5 && "ff-card ff-timeline-scroll overflow-hidden",
+            )}
             style={
               timelineIsV5
                 ? {
@@ -5257,220 +5389,113 @@ const handleRandomTransitionMix = useCallback(() => {
                 : undefined
             }
           >
-          <TimelineRuler
-            segments={displaySegments}
-            totalMs={displayTotalMs}
-            currentMs={currentMs}
-            mode={timeline.mode}
-            activeId={activeSegment?.id ?? null}
-            headlines={displayHeadlines}
-            transition={transitionSettings}
-            beats={displayBeatMs}
-            waveform={waveform}
-            onSeek={seek}
-            onJumpToSegment={(id) => {
-              // v4.9: filmstrip double-click — jump + a light selection cue
-              // (the media card for this clip becomes active via the seek).
-              const s = displaySegments.find((x) => x.id === id);
-              if (s) {
-                seek(s.startMs + 5);
-                toast.info(`Jumped to clip ${s.order + 1}`, {
-                  description: `${fmtTimecode(s.startMs)} — ${s.fileName.slice(0, 48)}`,
-                });
+            <TimelineRuler
+              segments={displaySegments}
+              totalMs={displayTotalMs}
+              currentMs={currentMs}
+              mode={timeline.mode}
+              activeId={activeSegment?.id ?? null}
+              headlines={displayHeadlines}
+              transition={transitionSettings}
+              beats={displayBeatMs}
+              waveform={waveform}
+              onSeek={seek}
+              onJumpToSegment={(id) => {
+                // v4.9: filmstrip double-click — jump + a light selection cue
+                // (the media card for this clip becomes active via the seek).
+                const s = displaySegments.find((x) => x.id === id);
+                if (s) {
+                  seek(s.startMs + 5);
+                  toast.info(`Jumped to clip ${s.order + 1}`, {
+                    description: `${fmtTimecode(s.startMs)} — ${s.fileName.slice(0, 48)}`,
+                  });
+                }
+              }}
+              onEditItem={handleTimelineEdit}
+              sfxItems={displaySfxItems}
+              onMoveSfx={handleMoveSfx}
+              onEditSfx={handleUpdateSfx}
+              onRemoveSfx={handleRemoveSfx}
+              voItems={displayVoItems}
+              onMoveVo={handleMoveVo}
+              onRemoveVo={handleRemoveVo}
+              videoDurations={videoDurations}
+              onSplit={splitAtPlayhead}
+              onDuplicate={duplicateItem}
+              onRemove={removeItem}
+              activeSegment={activeSegment}
+              // ---- v5.4: multi-select (click / Ctrl / Shift / marquee) ----
+              selectedIds={selectedIds}
+              onSelectionChange={setSelectedIds}
+              onRemoveMany={removeItems}
+              // ---- v5.5: group move + clipboard ----
+              onGroupMove={handleGroupMove}
+              onCopySelection={copySelection}
+              onPasteClipboard={pasteClipboard}
+              clipboardCount={
+                clipboard
+                  ? clipboard.clips.length + clipboard.sfx.length
+                  : 0
               }
-            }}
-            onEditItem={handleTimelineEdit}
-            sfxItems={displaySfxItems}
-            onMoveSfx={handleMoveSfx}
-            onEditSfx={handleUpdateSfx}
-            onRemoveSfx={handleRemoveSfx}
-            voItems={displayVoItems}
-            onMoveVo={handleMoveVo}
-            onRemoveVo={handleRemoveVo}
-            videoDurations={videoDurations}
-            onSplit={splitAtPlayhead}
-            onDuplicate={duplicateItem}
-            onRemove={removeItem}
-            activeSegment={activeSegment}
-            // ---- v5.4: multi-select (click / Ctrl / Shift / marquee) ----
-            selectedIds={selectedIds}
-            onSelectionChange={setSelectedIds}
-            onRemoveMany={removeItems}
-            // ---- v5.5: group move + clipboard ----
-            onGroupMove={handleGroupMove}
-            onCopySelection={copySelection}
-            onPasteClipboard={pasteClipboard}
-            clipboardCount={
-              clipboard
-                ? clipboard.clips.length + clipboard.sfx.length
-                : 0
-            }
-            // ---- v5.2: music placement (draggable clip on the audio lane) ----
-            // v1.14: display-space start (strip coords); the commit
-            // translates back to base before storing.
-            musicStartMs={displayMusicStartMs}
-            musicLoop={audioSettings.musicLoop}
-            musicVolume={audioSettings.musicVolume}
-            musicDurationMs={audioTrack?.durationMs ?? null}
-            musicName={audioTrack?.fileName ?? null}
-            onMusicMove={(startMs) => {
-              // v5.5: music drags are now undoable (one push per gesture —
-              // the debounced flush coalesces pointerup bursts).
-              requestHistoryPush();
-              const ms = Math.max(
-                0,
-                Math.round(startMs - disclaimerOffsetRef.current),
-              );
-              setAudioSettings((prev) =>
-                prev.musicStartMs === ms ? prev : { ...prev, musicStartMs: ms },
-              );
-            }}
-            onMusicLoopChange={(loop) => {
-              setAudioSettings((prev) =>
-                prev.musicLoop === loop ? prev : { ...prev, musicLoop: loop },
-              );
-              toast.success(
-                loop
-                  ? "Music loops to fill the entire video"
-                  : "Music plays once from its start point",
-                {
-                  description: loop
-                    ? "The track repeats until the video ends — perfect for short edits over long background music."
-                    : "Turn it back on any time from the clip's hover controls.",
-                },
-              );
-            }}
-            onMusicVolumeChange={(volume) => {
-              setAudioSettings((prev) =>
-                prev.musicVolume === volume
-                  ? prev
-                  : { ...prev, musicVolume: Math.max(0, Math.min(2, volume)) },
-              );
-            }}
-            // ---- v1: BIG-TIMELINE mode (one-click 65% height toggle) ----
-            timelineBig={timelineBig}
-            onToggleTimelineBig={toggleTimelineBig}
-            // ---- v1.14: disclaimer lead-in (fixed block at [0, N)) ----
-            disclaimer={
-              disclaimer && disclaimerOffsetMs > 0
-                ? {
-                    durationMs: disclaimerOffsetMs,
-                    fileName: disclaimer.fileName,
-                    kind: disclaimer.kind,
-                    thumbnailUrl: disclaimer.thumbUrl || disclaimer.url,
-                  }
-                : null
-            }
-          />
+              // ---- v5.2: music placement (draggable clip on the audio lane) ----
+              // v1.14: display-space start (strip coords); the commit
+              // translates back to base before storing.
+              musicStartMs={displayMusicStartMs}
+              musicLoop={audioSettings.musicLoop}
+              musicVolume={audioSettings.musicVolume}
+              musicDurationMs={audioTrack?.durationMs ?? null}
+              musicName={audioTrack?.fileName ?? null}
+              onMusicMove={(startMs) => {
+                // v5.5: music drags are now undoable (one push per gesture —
+                // the debounced flush coalesces pointerup bursts).
+                requestHistoryPush();
+                const ms = Math.max(
+                  0,
+                  Math.round(startMs - disclaimerOffsetRef.current),
+                );
+                setAudioSettings((prev) =>
+                  prev.musicStartMs === ms ? prev : { ...prev, musicStartMs: ms },
+                );
+              }}
+              onMusicLoopChange={(loop) => {
+                setAudioSettings((prev) =>
+                  prev.musicLoop === loop ? prev : { ...prev, musicLoop: loop },
+                );
+                toast.success(
+                  loop
+                    ? "Music loops to fill the entire video"
+                    : "Music plays once from its start point",
+                  {
+                    description: loop
+                      ? "The track repeats until the video ends — perfect for short edits over long background music."
+                      : "Turn it back on any time from the clip's hover controls.",
+                  },
+                );
+              }}
+              onMusicVolumeChange={(volume) => {
+                setAudioSettings((prev) =>
+                  prev.musicVolume === volume
+                    ? prev
+                    : { ...prev, musicVolume: Math.max(0, Math.min(2, volume)) },
+                );
+              }}
+              // ---- v1: BIG-TIMELINE mode (one-click 65% height toggle) ----
+              timelineBig={timelineBig}
+              onToggleTimelineBig={toggleTimelineBig}
+              // ---- v1.14: disclaimer lead-in (fixed block at [0, N)) ----
+              disclaimer={
+                disclaimer && disclaimerOffsetMs > 0
+                  ? {
+                      durationMs: disclaimerOffsetMs,
+                      fileName: disclaimer.fileName,
+                      kind: disclaimer.kind,
+                      thumbnailUrl: disclaimer.thumbUrl || disclaimer.url,
+                    }
+                  : null
+              }
+            />
           </div>
         </section>
-
-        {/* v5.2 (task 3-b): col splitter — drag to resize the settings panel
-            (hidden while the panel is collapsed: v1 focus mode). */}
-        {!layout.compact && !settingsCollapsed && <Splitter {...layout.settings} />}
-
-        {/* Right column — Settings Panel. Desktop: resizable grid column
-            (default 320px); compact: right slide-over drawer. */}
-        {!settingsCollapsed && (
-        <section
-          className={cn(
-            "min-h-0 overflow-y-auto overflow-x-hidden border-l",
-            layout.compact &&
-              "absolute inset-y-0 right-0 z-40 flex w-[86vw] max-w-[350px] flex-col",
-          )}
-          style={{
-            borderColor: "#292524",
-            backgroundColor: "#17140f",
-            boxShadow: layout.compact
-              ? "-8px 0 40px rgba(0, 0, 0, 0.6)"
-              : "inset -1px 0 0 rgba(255,255,255,0.02)",
-          }}
-        >
-          {layout.compact && (
-            <div
-              className="flex shrink-0 items-center justify-between border-b px-3 py-2"
-              style={{ borderColor: "#292524", backgroundColor: "#17140f" }}
-            >
-              <span className="text-xs font-semibold text-stone-300">Edit &amp; export</span>
-              <button
-                type="button"
-                onClick={() => setSettingsCollapsed(true)}
-                aria-label="Close settings panel"
-                title="Close"
-                className="flex size-8 items-center justify-center rounded-md border text-stone-400 transition-colors hover:bg-white/10 hover:text-white active:scale-90"
-                style={{ borderColor: "#44403c" }}
-              >
-                <X className="size-4" />
-              </button>
-            </div>
-          )}
-          <div className="min-h-0 flex-1">
-          <SettingsPanel
-            kenBurns={kenBurns}
-            settings={settings}
-            audioSettings={audioSettings}
-            transition={transitionSettings}
-            onKenBurnsChange={handleKenBurnsChange}
-            onSettingsChange={handleSettingsChange}
-            onAudioSettingsChange={handleAudioSettingsChange}
-            onTransitionChange={handleTransitionChange}
-            watermarkImage={
-              watermarkImage
-                ? { url: watermarkImage.url, fileName: watermarkImage.file.name }
-                : null
-            }
-            watermarkSettings={watermarkSettings}
-            onWatermarkFile={setWatermarkFile}
-            onWatermarkSettingsChange={handleWatermarkSettingsChange}
-            openWatermarkPicker={openWatermarkPicker}
-            captionSettings={captionSettings}
-            onCaptionSettingsChange={handleCaptionSettingsChange}
-            onApplyPreset={applyCaptionPreset}
-            favoritePresets={favoritePresets}
-            onToggleFavorite={toggleFavoritePreset}
-            onExportSrt={exportSrtSidecar}
-            onExportAss={exportAssSidecar}
-            onExportVtt={exportVttSidecar}
-            onExportVttWords={exportVttWordsSidecar}
-            inElectron={inElectron}
-            subtitles={subtitles}
-            hasAudio={!!audioTrack}
-            onGenerateCaptions={generateCaptionsFromAudio}
-            whisperBusy={whisperBusy}
-            whisperProgress={whisperProgress}
-            whisperLanguage={whisperLanguage}
-            onWhisperLanguageChange={handleWhisperLanguageChange}
-            whisperModel={whisperModel}
-            onWhisperModelChange={setWhisperModel}
-            hasVideoClip={timeline.segments.some(
-              (s) => s.mediaType === "video" && (s.track ?? 0) === 0,
-            )}
-            headlineItems={headlineItems}
-            onAddHeadline={addHeadline}
-            onUpdateHeadline={updateHeadline}
-            onRemoveHeadline={removeHeadline}
-            totalMs={timeline.totalMs}
-            textRemoval={textRemoval}
-            onTextRemovalChange={setTextRemoval}
-            videoSourceForDetect={videoSourceForDetect}
-            onRandomMix={handleRandomTransitionMix}
-            boundaryCount={boundaryCount}
-            dubSettings={dubSettings}
-            onDubSettingsChange={handleDubSettingsChange}
-            onAddVoiceover={handleAddVoiceover}
-            dubSourceCount={dubSources.length}
-            dubBusy={dubBusy}
-            dubProgress={dubProgress}
-            dubResult={dubResult}
-            onStartDub={() => void startDub()}
-            onCancelDub={() => void cancelDub()}
-            onApplyDubTrack={applyDubTrack}
-            onDiscardDub={() => setDubResult(null)}
-            voCount={displayVoItems.length}
-          />
-          </div>
-        </section>
-        )}
       </main>
 
       {/* Hidden file inputs (inline style, not className hidden). v1: each

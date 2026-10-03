@@ -228,14 +228,14 @@ const SNAP_MS = 10;
 const MIN_DUR_MS = 200;
 const MAX_DUR_MS = 300000;
 
-const ROW_BORDER = "rgba(41, 37, 36, 0.55)";
-const GUTTER_BORDER = "rgba(39, 39, 42, 0.45)";
+const ROW_BORDER = "rgba(87, 66, 27, 0.16)";
+const GUTTER_BORDER = "rgba(87, 66, 27, 0.18)";
 /** v5.1 lane banding: subtle alternating #12100e / #0f0d0b so each lane
  *  reads as its own track without hard separators; the audio lane goes
  *  cyan-900/20-tinted while a waveform is loaded. */
-const LANE_BG_A = "#12100e";
-const LANE_BG_B = "#0f0d0b";
-const LANE_BG_WAVE = "rgba(22, 78, 99, 0.2)";
+const LANE_BG_A = "#ffffff";
+const LANE_BG_B = "#faf7f1";
+const LANE_BG_WAVE = "rgba(13, 148, 136, 0.08)";
 
 function niceStep(totalMs: number): number {
   const totalSec = totalMs / 1000;
@@ -644,8 +644,8 @@ function LegendDot({ color, gradient }: { color?: string; gradient?: string }) {
         backgroundColor: color,
         backgroundImage: gradient,
         // @ts-expect-error CSS custom prop for the ring tint
-        "--tw-ring-color": "rgba(255,255,255,0.18)",
-        boxShadow: "0 1px 2px rgba(0,0,0,0.5)",
+        "--tw-ring-color": "rgba(87, 66, 27, 0.2)",
+        boxShadow: "0 1px 2px rgba(87,66,27,0.25)",
       }}
     />
   );
@@ -825,11 +825,11 @@ function TickRow({
           >
           <div
             className="h-1.5 w-px"
-            style={{ backgroundColor: "#57534e" }}
+            style={{ backgroundColor: "#c7bfb0" }}
           />
           <span
             className="mt-0.5 block -translate-x-1/2 text-[10px] font-medium leading-none tabular-nums"
-            style={{ color: "#a8a29e" }}
+            style={{ color: "#78716c" }}
           >
             {fmtTimecode(t)}
           </span>
@@ -916,9 +916,9 @@ function HoverGhost({
       <div
         className="absolute left-0 top-0 h-full w-px"
         style={{
-          backgroundColor: "rgba(228, 228, 231, 0.35)",
+          backgroundColor: "rgba(87, 66, 27, 0.35)",
           backgroundImage:
-            "linear-gradient(to bottom, rgba(228,228,231,0.55) 40%, transparent 40%)",
+            "linear-gradient(to bottom, rgba(87,66,27,0.55) 40%, transparent 40%)",
           backgroundSize: "1px 5px",
         }}
       />
@@ -926,10 +926,10 @@ function HoverGhost({
         className="absolute -translate-x-1/2 whitespace-nowrap rounded px-1.5 py-0.5 text-[9px] font-semibold tabular-nums backdrop-blur-sm"
         style={{
           top,
-          backgroundColor: "rgba(0, 0, 0, 0.78)",
-          color: "#e7e5e4",
-          border: "1px solid rgba(228, 228, 231, 0.18)",
-          boxShadow: "0 2px 8px rgba(0,0,0,0.5)",
+          backgroundColor: "rgba(255, 255, 255, 0.97)",
+          color: "#44403c",
+          border: "1px solid #e0d8c9",
+          boxShadow: "0 2px 8px rgba(87,66,27,0.18)",
         }}
       >
         {label}
@@ -978,12 +978,12 @@ function HeadlineChips({
                 left: layout.pxOf(h.startMs),
                 width: w,
                 backgroundImage: inPlay
-                  ? "linear-gradient(90deg, #fbbf24, #f59e0b)"
-                  : "linear-gradient(90deg, rgba(251, 191, 36, 0.75), rgba(245, 158, 11, 0.55))",
-                color: "#422006",
+                  ? "linear-gradient(90deg, #f06214, #ea580c)"
+                  : "linear-gradient(90deg, rgba(234, 88, 12, 0.8), rgba(234, 88, 12, 0.55))",
+                color: "#ffffff",
                 boxShadow: inPlay
-                  ? "0 0 8px rgba(251, 191, 36, 0.7)"
-                  : "0 1px 2px rgba(0,0,0,0.4)",
+                  ? "0 0 8px rgba(234, 88, 12, 0.7)"
+                  : "0 1px 2px rgba(87,66,27,0.25)",
               }}
               title={`Title: "${h.text}" · ${fmtTimecode(h.startMs)}–${fmtTimecode(h.endMs)} (click to jump)`}
             >
@@ -1017,12 +1017,12 @@ function HeadlineChips({
               left: `${Math.max(0, Math.min(98, left))}%`,
               width: `${Math.min(99 - Math.max(0, left), Math.max(1, width))}%`,
               backgroundImage: inPlay
-                ? "linear-gradient(90deg, #fbbf24, #f59e0b)"
-                : "linear-gradient(90deg, rgba(251, 191, 36, 0.75), rgba(245, 158, 11, 0.55))",
-              color: "#422006",
+                ? "linear-gradient(90deg, #f06214, #ea580c)"
+                : "linear-gradient(90deg, rgba(234, 88, 12, 0.8), rgba(234, 88, 12, 0.55))",
+              color: "#ffffff",
               boxShadow: inPlay
-                ? "0 0 8px rgba(251, 191, 36, 0.7)"
-                : "0 1px 2px rgba(0,0,0,0.4)",
+                ? "0 0 8px rgba(234, 88, 12, 0.7)"
+                : "0 1px 2px rgba(87,66,27,0.25)",
             }}
             title={`Title: "${h.text}" · ${fmtTimecode(h.startMs)}–${fmtTimecode(h.endMs)} (click to jump)`}
           >
@@ -1072,8 +1072,8 @@ function BeatRail({
             style={{
               ...(layout ? { left } : { left: `${left}%` }),
               height: live ? "6px" : "4px",
-              backgroundColor: live ? "#fcd34d" : "rgba(34, 211, 238, 0.55)",
-              boxShadow: live ? "0 0 6px rgba(103, 232, 249, 0.9)" : "none",
+              backgroundColor: live ? "#f06214" : "rgba(34, 211, 238, 0.55)",
+              boxShadow: live ? "0 0 6px rgba(234, 88, 12, 0.9)" : "none",
             }}
           />
         );
@@ -1144,16 +1144,16 @@ function TransitionZones({
               ...zoneStyle,
               height: "30%",
               backgroundImage: pinned
-                ? "repeating-linear-gradient(135deg, rgba(251, 191, 36, 0.6) 0 3px, rgba(245, 158, 11, 0.28) 3px 6px)"
-                : "repeating-linear-gradient(135deg, rgba(217, 70, 239, 0.55) 0 3px, rgba(139, 92, 246, 0.25) 3px 6px)",
+                ? "repeating-linear-gradient(135deg, rgba(234, 88, 12, 0.55) 0 3px, rgba(234, 88, 12, 0.22) 3px 6px)"
+                : "repeating-linear-gradient(135deg, rgba(234, 88, 12, 0.4) 0 3px, rgba(234, 88, 12, 0.16) 3px 6px)",
               boxShadow: inPlay
                 ? pinned
-                  ? "0 0 8px rgba(251, 191, 36, 0.55)"
-                  : "0 0 8px rgba(217, 70, 239, 0.55)"
+                  ? "0 0 8px rgba(234, 88, 12, 0.55)"
+                  : "0 0 8px rgba(234, 88, 12, 0.45)"
                 : "none",
               border: pinned
-                ? "1px solid rgba(251, 191, 36, 0.4)"
-                : "1px solid rgba(217, 70, 239, 0.35)",
+                ? "1px solid rgba(234, 88, 12, 0.45)"
+                : "1px solid rgba(234, 88, 12, 0.35)",
             }}
             title={`${effStyle}${pinned ? " (custom)" : ""} transition · ${fmtTimecode(seg.startMs)}+${(durMs / 1000).toFixed(1)}s`}
           />
@@ -1171,15 +1171,15 @@ function TransitionZones({
  *  press-to-seek handlers (pressing a diamond jumps to the cut) and the
  *  title tooltip carries the boundary detail — zero new interaction code. */
 const DIAMOND_LOOK: Record<TransitionStyle, { bg: string; border: string; glow: string }> = {
-  none: { bg: "#292524", border: "#44403c", glow: "none" },
-  "dip-black": { bg: "#1c1917", border: "#78716c", glow: "none" },
-  "dip-white": { bg: "#f5f5f4", border: "#a8a29e", glow: "0 0 6px rgba(244, 244, 245, 0.35)" },
-  dissolve: { bg: "#f59e0b", border: "rgba(252, 211, 77, 0.9)", glow: "0 0 8px rgba(245, 158, 11, 0.65)" },
-  "slide-left": { bg: "#f59e0b", border: "rgba(252, 211, 77, 0.9)", glow: "0 0 8px rgba(245, 158, 11, 0.65)" },
-  "slide-right": { bg: "#f59e0b", border: "rgba(252, 211, 77, 0.9)", glow: "0 0 8px rgba(245, 158, 11, 0.65)" },
-  "wipe-left": { bg: "#f59e0b", border: "rgba(252, 211, 77, 0.9)", glow: "0 0 8px rgba(245, 158, 11, 0.65)" },
-  "wipe-right": { bg: "#f59e0b", border: "rgba(252, 211, 77, 0.9)", glow: "0 0 8px rgba(245, 158, 11, 0.65)" },
-  circleopen: { bg: "#f59e0b", border: "rgba(252, 211, 77, 0.9)", glow: "0 0 8px rgba(245, 158, 11, 0.65)" },
+  none: { bg: "#d6cfc2", border: "#b8b0a3", glow: "none" },
+  "dip-black": { bg: "#292524", border: "#44403c", glow: "none" },
+  "dip-white": { bg: "#ffffff", border: "#c7bfb0", glow: "0 0 6px rgba(87, 66, 27, 0.3)" },
+  dissolve: { bg: "#ea580c", border: "rgba(240, 98, 20, 0.9)", glow: "0 0 8px rgba(234, 88, 12, 0.55)" },
+  "slide-left": { bg: "#ea580c", border: "rgba(240, 98, 20, 0.9)", glow: "0 0 8px rgba(234, 88, 12, 0.55)" },
+  "slide-right": { bg: "#ea580c", border: "rgba(240, 98, 20, 0.9)", glow: "0 0 8px rgba(234, 88, 12, 0.55)" },
+  "wipe-left": { bg: "#ea580c", border: "rgba(240, 98, 20, 0.9)", glow: "0 0 8px rgba(234, 88, 12, 0.55)" },
+  "wipe-right": { bg: "#ea580c", border: "rgba(240, 98, 20, 0.9)", glow: "0 0 8px rgba(234, 88, 12, 0.55)" },
+  circleopen: { bg: "#ea580c", border: "rgba(240, 98, 20, 0.9)", glow: "0 0 8px rgba(234, 88, 12, 0.55)" },
 };
 
 function TransitionDiamonds({
@@ -1428,11 +1428,11 @@ function LaneLabel({
       )}
       style={{
         borderColor: GUTTER_BORDER,
-        ...(sticky ? { backgroundColor: "#12100e" } : {}),
+        ...(sticky ? { backgroundColor: "#f6f2ea" } : {}),
       }}
     >
       <Icon className="size-3 shrink-0" style={{ color: accent }} aria-hidden />
-      <span className="truncate text-[9px] font-bold uppercase tracking-wider text-stone-500">
+      <span className="truncate text-[9px] font-bold uppercase tracking-wider text-stone-600">
         {text}
       </span>
     </div>
@@ -1442,7 +1442,7 @@ function LaneLabel({
 /** Tiny centered muted hint for an empty lane — never blocks interaction. */
 function EmptyHint({ children }: { children: ReactNode }) {
   return (
-    <div className="pointer-events-none absolute inset-0 flex items-center justify-center px-2 text-center text-[9px] font-medium text-stone-400">
+    <div className="pointer-events-none absolute inset-0 flex items-center justify-center px-2 text-center text-[9px] font-medium text-stone-500">
       {children}
     </div>
   );
@@ -1504,11 +1504,11 @@ function DisclaimerBar({
         ...posStyle,
         height: "100%",
         backgroundImage: disclaimer.thumbnailUrl
-          ? `linear-gradient(180deg, rgba(255,255,255,0.08) 0%, rgba(0,0,0,0.26) 100%), linear-gradient(180deg, rgba(251, 146, 60, 0.24) 0%, rgba(120, 53, 15, 0.52) 100%), url(${disclaimer.thumbnailUrl})`
-          : "linear-gradient(180deg, rgba(251, 146, 60, 0.24) 0%, rgba(120, 53, 15, 0.52) 100%)",
+          ? `linear-gradient(180deg, rgba(255,255,255,0.08) 0%, rgba(0,0,0,0.26) 100%), linear-gradient(180deg, rgba(234, 88, 12, 0.22) 0%, rgba(234, 88, 12, 0.5) 100%), url(${disclaimer.thumbnailUrl})`
+          : "linear-gradient(180deg, rgba(234, 88, 12, 0.18) 0%, rgba(234, 88, 12, 0.4) 100%)",
         backgroundSize: "cover",
         backgroundPosition: "center",
-        boxShadow: isActive ? "inset 0 0 0 2px rgba(251, 146, 60, 0.8)" : "inset 0 0 0 1px rgba(251, 146, 60, 0.45)",
+        boxShadow: isActive ? "inset 0 0 0 2px rgba(234, 88, 12, 0.8)" : "inset 0 0 0 1px rgba(234, 88, 12, 0.45)",
       }}
       title={`${disclaimer.fileName} · DISCLAIMER · 0:00–${fmtTimecode(durMs)} (${(durMs / 1000).toFixed(1)}s)\nplays before everything — clips, music and captions shift after it\nclick to rewind to the very start`}
     >
@@ -2670,14 +2670,14 @@ export function TimelineRuler({
       ? {
           top: laneTop.base,
           height: BASE_H,
-          borderColor: "rgba(52, 211, 153, 0.55)",
-          backgroundColor: "rgba(16, 185, 129, 0.08)",
+          borderColor: "rgba(5, 150, 105, 0.55)",
+          backgroundColor: "rgba(5, 150, 105, 0.07)",
         }
       : {
           top: laneTop.overlay,
           height: overlayLaneH,
-          borderColor: "rgba(167, 139, 250, 0.55)",
-          backgroundColor: "rgba(139, 92, 246, 0.10)",
+          borderColor: "rgba(13, 148, 136, 0.55)",
+          backgroundColor: "rgba(13, 148, 136, 0.08)",
         };
   })();
 
@@ -2930,10 +2930,10 @@ export function TimelineRuler({
       className={cn(
         "flex size-7 items-center justify-center rounded-md transition-all active:scale-90",
         disabled || onClick == null
-          ? "cursor-not-allowed text-stone-600 opacity-40"
+          ? "cursor-not-allowed text-stone-400 opacity-40"
           : opts?.danger
-            ? "text-stone-300 hover:bg-rose-500/15 hover:text-rose-300"
-            : "text-stone-300 hover:bg-white/10 hover:text-white",
+            ? "text-stone-700 hover:bg-rose-100 hover:text-rose-600"
+            : "text-stone-700 hover:bg-stone-100 hover:text-stone-900",
       )}
     >
       {icon}
@@ -3313,8 +3313,8 @@ export function TimelineRuler({
     <div
       className="border-t px-4 py-3"
       style={{
-        borderColor: "#292524",
-        backgroundColor: "#12100e",
+        borderColor: "#e8e1d4",
+        backgroundColor: "#faf7f1",
         ...(isV5
           ? {}
           : {
@@ -3333,12 +3333,12 @@ export function TimelineRuler({
               style={
                 mode === "absolute"
                   ? {
-                      backgroundColor: "rgba(8, 51, 68, 0.5)",
-                      color: "#fcd34d",
+                      backgroundColor: "rgba(13, 148, 136, 0.12)",
+                      color: "#0f766e",
                     }
                   : {
-                      backgroundColor: "rgba(76, 29, 149, 0.5)",
-                      color: "#fcd34d",
+                      backgroundColor: "#f6f2ea",
+                      color: "#57534e",
                     }
               }
             >
@@ -3372,7 +3372,7 @@ export function TimelineRuler({
           {isV5 && activeSegment != null && (
             <span
               className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-bold tabular-nums normal-case"
-              style={{ backgroundColor: "rgba(41, 37, 36, 0.55)", color: "#a8a29e" }}
+              style={{ backgroundColor: "#f6f2ea", color: "#78716c" }}
               title={`Active clip — ${fmtTimecode(activeSegment.startMs)} to ${fmtTimecode(activeSegment.endMs)} · ${(activeSegment.durationMs / 1000).toFixed(2)}s`}
             >
               <Timer className="size-2.5" aria-hidden />
@@ -3389,7 +3389,7 @@ export function TimelineRuler({
             <span
               key={selCount}
               className="ff-sel-chip flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] font-bold tabular-nums normal-case"
-              style={{ backgroundColor: "rgba(69, 26, 3, 0.55)", color: "#fcd34d" }}
+              style={{ backgroundColor: "rgba(234, 88, 12, 0.12)", color: "#c2410c" }}
               title="Selected items — Del removes all of them, Esc clears · click, Ctrl-click, Shift-click or drag a band on any empty lane to select · drag any selected item to move the whole group"
             >
               <Layers className="size-2.5" aria-hidden />
@@ -3400,7 +3400,7 @@ export function TimelineRuler({
                   onClick={() => onSelectionChange([])}
                   aria-label="Clear selection (Esc)"
                   title="Clear selection (Esc)"
-                  className="-mr-0.5 rounded p-0.5 transition-colors hover:bg-amber-400/25"
+                  className="-mr-0.5 rounded p-0.5 transition-colors hover:bg-orange-100"
                 >
                   <X className="size-2.5" aria-hidden />
                 </button>
@@ -3410,23 +3410,23 @@ export function TimelineRuler({
         </div>
         <div className="flex items-center gap-3 text-[9px] text-stone-500">
           <span className="flex items-center gap-1">
-            <LegendDot color="#2dd4bf" /> absolute
+            <LegendDot color="#0d9488" /> absolute
           </span>
           <span className="flex items-center gap-1">
             <LegendDot color="#10b981" /> beat
           </span>
           <span className="flex items-center gap-1">
-            <LegendDot color="#f59e0b" /> duration
+            <LegendDot color="#ea580c" /> duration
           </span>
           {txActive && (
             <span className="flex items-center gap-1">
-              <LegendDot gradient="linear-gradient(135deg, #f59e0b, #2dd4bf)" />{" "}
+              <LegendDot gradient="linear-gradient(135deg, #ea580c, #0d9488)" />{" "}
               transition
             </span>
           )}
           {headlines.length > 0 && (
             <span className="flex items-center gap-1">
-              <LegendDot color="#fbbf24" /> title
+              <LegendDot color="#ea580c" /> title
             </span>
           )}
           {beats && beats.length > 0 && (
@@ -3441,13 +3441,13 @@ export function TimelineRuler({
           )}
           {isV5 && overlaySegs.length > 0 && (
             <span className="flex items-center gap-1">
-              <Layers className="size-2.5 text-violet-300" aria-hidden />{" "}
+              <Layers className="size-2.5 text-teal-600" aria-hidden />{" "}
               overlay
             </span>
           )}
           {isV5 && sfxList.length > 0 && (
             <span className="flex items-center gap-1">
-              <Zap className="size-2.5 text-amber-300" aria-hidden /> sfx
+              <Zap className="size-2.5 text-orange-600" aria-hidden /> sfx
             </span>
           )}
         </div>
@@ -3459,7 +3459,7 @@ export function TimelineRuler({
         <div className="mb-2 flex items-center justify-between gap-2">
           <div
             className="flex items-center gap-1 rounded-lg border p-0.5"
-            style={{ borderColor: "#292524", backgroundColor: "#1c1917" }}
+            style={{ borderColor: "#e8e1d4", backgroundColor: "#ffffff" }}
             role="group"
             aria-label="Clip tools"
           >
@@ -3469,7 +3469,7 @@ export function TimelineRuler({
               onSplit,
               !canSplit,
             )}
-            <div className="h-4 w-px" style={{ backgroundColor: "#292524" }} />
+            <div className="h-4 w-px" style={{ backgroundColor: "#eee8dc" }} />
             {toolBtn(
               <Copy className="size-4" />,
               "Duplicate clip",
@@ -3515,7 +3515,7 @@ export function TimelineRuler({
               stop always shows the complete timeline), and the Fit button. */}
           <div
             className="flex items-center gap-0.5 rounded-lg border p-0.5"
-            style={{ borderColor: "#292524", backgroundColor: "#1c1917" }}
+            style={{ borderColor: "#e8e1d4", backgroundColor: "#ffffff" }}
             role="group"
             aria-label="Timeline zoom"
           >
@@ -3524,7 +3524,7 @@ export function TimelineRuler({
               onClick={() => zoomTo(pxPerSec / 1.15, viewportW / 2)}
               title="Zoom out (Ctrl+scroll on the timeline) — stops at Fit, where the whole timeline is visible"
               aria-label="Zoom out"
-              className="flex size-7 items-center justify-center rounded-md text-stone-300 transition-all hover:bg-white/10 hover:text-white active:scale-90"
+              className="flex size-7 items-center justify-center rounded-md text-stone-700 transition-all hover:bg-stone-100 hover:text-stone-900 active:scale-90"
             >
               <ZoomOut className="size-3.5" />
             </button>
@@ -3537,14 +3537,14 @@ export function TimelineRuler({
               onChange={(e) => zoomTo(Number(e.target.value), viewportW / 2)}
               aria-label="Timeline zoom (pixels per second)"
               title={`Timeline zoom — ${Math.round(pxPerSec)} px/s · drag to the bottom to fit the whole timeline (Ctrl+scroll works too)`}
-              className="w-20 accent-amber-400"
+              className="w-20 accent-orange-500"
             />
             <button
               type="button"
               onClick={() => zoomTo(pxPerSec * 1.15, viewportW / 2)}
               title="Zoom in (Ctrl+scroll on the timeline)"
               aria-label="Zoom in"
-              className="flex size-7 items-center justify-center rounded-md text-stone-300 transition-all hover:bg-white/10 hover:text-white active:scale-90"
+              className="flex size-7 items-center justify-center rounded-md text-stone-700 transition-all hover:bg-stone-100 hover:text-stone-900 active:scale-90"
             >
               <ZoomIn className="size-3.5" />
             </button>
@@ -3557,7 +3557,7 @@ export function TimelineRuler({
               }}
               title="Fit timeline to the panel"
               aria-label="Fit timeline"
-              className="rounded-md px-1.5 py-1 text-[10px] font-semibold text-cyan-300 transition-all hover:bg-cyan-500/15 hover:text-cyan-200 active:scale-95"
+              className="rounded-md px-1.5 py-1 text-[10px] font-semibold text-orange-700 transition-all hover:bg-orange-100 hover:text-orange-800 active:scale-95"
             >
               Fit
             </button>
@@ -3579,7 +3579,7 @@ export function TimelineRuler({
                   "flex size-7 items-center justify-center rounded-md transition-all active:scale-90",
                   timelineBig
                     ? "bg-cyan-500/20 text-cyan-200 shadow-[inset_0_0_0_1px_rgba(34,211,238,0.45)]"
-                    : "text-stone-300 hover:bg-white/10 hover:text-white",
+                    : "text-stone-700 hover:bg-stone-100 hover:text-stone-900",
                 )}
               >
                 {timelineBig ? (
@@ -3596,9 +3596,9 @@ export function TimelineRuler({
       {empty ? (
         <div
           className="flex h-14 items-center justify-center gap-2 rounded-lg border border-dashed text-[11px]"
-          style={{ borderColor: "#292524", color: "#78716c" }}
+          style={{ borderColor: "#e8e1d4", color: "#a8a29e" }}
         >
-          <Clapperboard className="size-3.5" style={{ color: "#44403c" }} aria-hidden />
+          <Clapperboard className="size-3.5" style={{ color: "#78716c" }} aria-hidden />
           Import media above — your timeline builds here
         </div>
       ) : isV5 ? (
@@ -3613,8 +3613,8 @@ export function TimelineRuler({
         <div
           className="relative w-full touch-none select-none rounded-lg border"
           style={{
-            borderColor: "#292524",
-            backgroundColor: "rgba(9, 9, 11, 0.6)",
+            borderColor: "#e8e1d4",
+            backgroundColor: "#faf7f1",
           }}
           onPointerLeave={() => setHoverRatio(null)}
         >
@@ -3645,7 +3645,7 @@ export function TimelineRuler({
           >
             <div
               className="sticky left-0 z-[7] w-16 shrink-0 border-r"
-              style={{ borderColor: GUTTER_BORDER, backgroundColor: "#12100e" }}
+              style={{ borderColor: GUTTER_BORDER, backgroundColor: "#f6f2ea" }}
             />
             <div
               ref={trackRef}
@@ -3667,7 +3667,7 @@ export function TimelineRuler({
             <LaneLabel icon={Clapperboard} text="Video" accent="#22d3ee" sticky />
             <div
               ref={baseAxisRef}
-              className="relative min-w-0 shrink-0 transition-colors hover:bg-white/[0.02]"
+              className="relative min-w-0 shrink-0 transition-colors hover:bg-stone-900/[0.02]"
               style={{ width: axisW }}
               onContextMenu={openLaneMenu}
               {...laneMarqueeHandlers}
@@ -3787,10 +3787,10 @@ export function TimelineRuler({
               backgroundColor: LANE_BG_B,
             }}
           >
-            <LaneLabel icon={Layers} text="Overlay" accent="#fcd34d" sticky />
+            <LaneLabel icon={Layers} text="Overlay" accent="#ea580c" sticky />
             <div
               ref={overlayAxisRef}
-              className="relative min-w-0 shrink-0 transition-colors hover:bg-white/[0.02]"
+              className="relative min-w-0 shrink-0 transition-colors hover:bg-stone-900/[0.02]"
               style={{ width: axisW }}
               onContextMenu={openLaneMenu}
               {...laneMarqueeHandlers}
@@ -3831,9 +3831,9 @@ export function TimelineRuler({
                         // hairline outline, edge-trim zones (below) glow
                         // cyan on group hover. Transition killed while
                         // dragging (the preview must track 1:1).
-                        "group absolute flex select-none items-center gap-1 overflow-hidden rounded-md border pl-[2px] pr-2 text-[8px] font-semibold text-stone-200",
+                        "group absolute flex select-none items-center gap-1 overflow-hidden rounded-md border pl-[2px] pr-2 text-[8px] font-semibold text-stone-800",
                         draggable
-                          ? "cursor-grab touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-violet-300/70"
+                          ? "cursor-grab touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-orange-300/70"
                           : "cursor-pointer",
                         // v5.4: amber selection ring (outline — never fights the
                         // inline boxShadow states below).
@@ -3852,21 +3852,21 @@ export function TimelineRuler({
                         // v5.4: a SELECTED clip swaps its kind tint for the
                         // amber selection accent so the ring reads instantly.
                         backgroundColor: ovSelected
-                          ? "rgba(245, 158, 11, 0.22)"
+                          ? "rgba(234, 88, 12, 0.14)"
                           : isVideo
-                            ? "rgba(251, 191, 36, 0.15)"
-                            : "rgba(139, 92, 246, 0.20)",
+                            ? "rgba(234, 88, 12, 0.10)"
+                            : "rgba(13, 148, 136, 0.14)",
                         borderColor: ovSelected
-                          ? "rgba(245, 158, 11, 0.85)"
+                          ? "rgba(234, 88, 12, 0.8)"
                           : isVideo
-                            ? "rgba(251, 191, 36, 0.42)"
-                            : "rgba(139, 92, 246, 0.55)",
+                            ? "rgba(234, 88, 12, 0.42)"
+                            : "rgba(13, 148, 136, 0.55)",
                         boxShadow:
                           pv != null
-                            ? "0 0 0 1.5px rgba(255,255,255,0.65), 0 4px 12px rgba(0,0,0,0.6)"
+                            ? "0 0 0 1.5px rgba(234,88,12,0.7), 0 6px 16px rgba(87,66,27,0.25)"
                             : ovSelected
-                              ? "0 0 0 1px rgba(245,158,11,0.4), 0 0 12px rgba(245,158,11,0.22), 0 1px 3px rgba(0,0,0,0.45)"
-                              : "0 1px 3px rgba(0,0,0,0.45)",
+                              ? "0 0 0 1px rgba(234,88,12,0.4), 0 0 12px rgba(234,88,12,0.22), 0 1px 3px rgba(87,66,27,0.12)"
+                              : "0 1px 3px rgba(87,66,27,0.12)",
                       }}
                       title={`${seg.fileName} · overlay T${seg.track} · ${fmtTimecode(startMs)}–${fmtTimecode(startMs + durMs)} · ${(durMs / 1000).toFixed(1)}s${draggable ? "\ndrag to move · edges trim · drag down to the Video lane" : ""}\ndouble-click jumps to this clip's first frame\nright-click for actions`}
                       onContextMenu={(e) => openClipMenu(e, seg)}
@@ -3908,10 +3908,10 @@ export function TimelineRuler({
                           backgroundColor: "rgba(0,0,0,0.4)",
                         }}
                       />
-                      <span className="min-w-0 flex-1 truncate text-stone-100/90">
+                      <span className="min-w-0 flex-1 truncate text-stone-900">
                         {seg.fileName.replace(/\.[^.]+$/, "")}
                       </span>
-                      <span className="shrink-0 tabular-nums text-stone-300/80">
+                      <span className="shrink-0 tabular-nums text-stone-700/80">
                         {(durMs / 1000).toFixed(1)}s
                       </span>
                       {/* Trim handles — v5.1 CapCut: fixed 6px cyan zones that
@@ -3992,10 +3992,10 @@ export function TimelineRuler({
               backgroundColor: hasWave ? LANE_BG_WAVE : LANE_BG_A,
             }}
           >
-            <LaneLabel icon={AudioLines} text="Audio" accent="#fcd34d" sticky />
+            <LaneLabel icon={AudioLines} text="Audio" accent="#0d9488" sticky />
             <div
               ref={audioAxisRef}
-              className="relative min-w-0 shrink-0 transition-colors hover:bg-white/[0.02]"
+              className="relative min-w-0 shrink-0 transition-colors hover:bg-stone-900/[0.02]"
               style={{ width: axisW }}
               {...laneMarqueeHandlers}
             >
@@ -4048,7 +4048,7 @@ export function TimelineRuler({
                           // the waveform strip (later absolute sibling).
                           "group absolute top-1 bottom-1 flex select-none items-center gap-1 rounded-md border pl-1.5 text-[8px] font-semibold",
                           onMusicMove
-                            ? "cursor-grab touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sky-300/70"
+                            ? "cursor-grab touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-teal-500/70"
                             : "cursor-pointer",
                           musicDrag && "cursor-grabbing",
                           // v5.5: amber selection ring (clip parity).
@@ -4058,21 +4058,21 @@ export function TimelineRuler({
                           left,
                           width,
                           backgroundColor: musicSelected
-                            ? "rgba(245, 158, 11, 0.24)"
+                            ? "rgba(234, 88, 12, 0.16)"
                             : musicDrag
                               ? "rgba(13, 148, 136, 0.30)"
                               : "rgba(13, 148, 136, 0.16)",
                           borderColor: musicSelected
-                            ? "rgba(245, 158, 11, 0.9)"
+                            ? "rgba(234, 88, 12, 0.9)"
                             : musicLoop
-                              ? "rgba(45, 212, 191, 0.75)"
-                              : "rgba(45, 212, 191, 0.45)",
-                          color: musicSelected ? "#fde68a" : "#99f6e4",
+                              ? "rgba(13, 148, 136, 0.75)"
+                              : "rgba(13, 148, 136, 0.45)",
+                          color: musicSelected ? "#c2410c" : "#0f766e",
                           boxShadow: musicDrag
-                            ? "0 0 0 1.5px rgba(255,255,255,0.55), 0 3px 10px rgba(0,0,0,0.55)"
+                            ? "0 0 0 1.5px rgba(13,148,136,0.7), 0 4px 12px rgba(87,66,27,0.22)"
                             : musicSelected
-                              ? "0 0 0 2px rgba(245, 158, 11, 0.4), 0 0 12px rgba(245, 158, 11, 0.2)"
-                              : "0 1px 2px rgba(0,0,0,0.45)",
+                              ? "0 0 0 2px rgba(234, 88, 12, 0.4), 0 0 12px rgba(234, 88, 12, 0.2)"
+                              : "0 1px 2px rgba(87,66,27,0.12)",
                         }}
                         title={`Background music · starts ${fmtTimecode(musicStart)}${musicLoop ? " · loops to fill the video" : ` · ${fmtTimecode(durMs)} long`}${onMusicMove ? " · drag to reposition" : ""}\nright-click for actions`}
                         onContextMenu={openMusicMenu}
@@ -4100,8 +4100,8 @@ export function TimelineRuler({
                           <span
                             className="flex shrink-0 items-center gap-0.5 rounded px-1 py-px"
                             style={{
-                              backgroundColor: "rgba(56, 189, 248, 0.22)",
-                              border: "1px solid rgba(56, 189, 248, 0.4)",
+                              backgroundColor: "rgba(15, 118, 110, 0.18)",
+                              border: "1px solid rgba(15, 118, 110, 0.45)",
                             }}
                             title="Looping — the track repeats to cover the ENTIRE video"
                           >
@@ -4138,14 +4138,14 @@ export function TimelineRuler({
                             <div
                               className="flex items-center gap-2 rounded-lg border px-2.5 py-1.5 shadow-xl backdrop-blur-md"
                               style={{
-                                backgroundColor: "rgba(24, 24, 27, 0.96)",
-                                borderColor: "rgba(63, 63, 70, 0.9)",
+                                backgroundColor: "rgba(255, 255, 255, 0.97)",
+                                borderColor: "#e0d8c9",
                               }}
                               onPointerDown={(e) => e.stopPropagation()}
                             >
                               {onMusicVolumeChange && (
-                                <label className="flex items-center gap-1.5 text-[9px] font-medium text-stone-300">
-                                  <Volume2 className="size-3 text-sky-300" aria-hidden />
+                                <label className="flex items-center gap-1.5 text-[9px] font-medium text-stone-700">
+                                  <Volume2 className="size-3 text-teal-600" aria-hidden />
                                   <input
                                     type="range"
                                     min={0}
@@ -4153,7 +4153,7 @@ export function TimelineRuler({
                                     step={5}
                                     value={volPct}
                                     aria-label="Background music volume"
-                                    className="w-24 accent-teal-400"
+                                    className="w-24 accent-teal-600"
                                     onChange={(e) =>
                                       onMusicVolumeChange(
                                         Math.max(
@@ -4163,7 +4163,7 @@ export function TimelineRuler({
                                       )
                                     }
                                   />
-                                  <span className="w-8 tabular-nums text-stone-400">
+                                  <span className="w-8 tabular-nums text-stone-500">
                                     {volPct}%
                                   </span>
                                 </label>
@@ -4175,8 +4175,8 @@ export function TimelineRuler({
                                   className={cn(
                                     "flex cursor-pointer items-center gap-1 rounded-md border px-1.5 py-1 text-[9px] font-semibold transition-colors",
                                     musicLoop
-                                      ? "border-sky-400/70 bg-sky-500/25 text-sky-200"
-                                      : "border-stone-700 bg-stone-800/70 text-stone-300 hover:border-sky-400/50 hover:text-sky-200",
+                                      ? "border-teal-500/70 bg-teal-500/15 text-teal-700"
+                                      : "border-stone-200 bg-stone-100 text-stone-600 hover:border-teal-500/60 hover:text-teal-700",
                                   )}
                                   title={
                                     musicLoop
@@ -4211,10 +4211,10 @@ export function TimelineRuler({
             className="flex shrink-0"
             style={{ height: SFX_H, backgroundColor: LANE_BG_B }}
           >
-            <LaneLabel icon={Zap} text="SFX" accent="#fbbf24" sticky />
+            <LaneLabel icon={Zap} text="SFX" accent="#ea580c" sticky />
             <div
               ref={sfxAxisRef}
-              className="relative min-w-0 shrink-0 transition-colors hover:bg-white/[0.02]"
+              className="relative min-w-0 shrink-0 transition-colors hover:bg-stone-900/[0.02]"
               style={{ width: axisW }}
               {...laneMarqueeHandlers}
             >
@@ -4258,7 +4258,7 @@ export function TimelineRuler({
                       className={cn(
                         "group absolute select-none rounded-full border pl-1.5 pr-2 text-[8px] font-semibold",
                         onMoveSfx
-                          ? "cursor-grab touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-violet-300/70"
+                          ? "cursor-grab touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-orange-300/70"
                           : "cursor-pointer",
                         pv != null && "z-[3] cursor-grabbing",
                         // v5.5: amber selection ring (outline — never fights
@@ -4274,20 +4274,20 @@ export function TimelineRuler({
                         // hot-tracked while dragging; SELECTED swaps to the
                         // amber selection tint.
                         backgroundColor: pillSelected
-                          ? "rgba(245, 158, 11, 0.26)"
+                          ? "rgba(234, 88, 12, 0.16)"
                           : pv != null
-                            ? "rgba(245, 158, 11, 0.34)"
-                            : "rgba(245, 158, 11, 0.16)",
+                            ? "rgba(234, 88, 12, 0.24)"
+                            : "rgba(234, 88, 12, 0.10)",
                         borderColor: pillSelected
-                          ? "rgba(245, 158, 11, 0.9)"
-                          : "rgba(251, 191, 36, 0.5)",
-                        color: pillSelected ? "#fde68a" : "#fde68a",
+                          ? "rgba(234, 88, 12, 0.9)"
+                          : "rgba(234, 88, 12, 0.5)",
+                        color: pillSelected ? "#c2410c" : "#c2410c",
                         boxShadow:
                           pv != null
-                            ? "0 0 0 1.5px rgba(255,255,255,0.55), 0 3px 10px rgba(0,0,0,0.55)"
+                            ? "0 0 0 1.5px rgba(234,88,12,0.7), 0 4px 12px rgba(87,66,27,0.22)"
                             : pillSelected
-                              ? "0 0 0 2px rgba(245, 158, 11, 0.4), 0 0 12px rgba(245, 158, 11, 0.2)"
-                              : "0 1px 2px rgba(0,0,0,0.45)",
+                              ? "0 0 0 2px rgba(234, 88, 12, 0.4), 0 0 12px rgba(234, 88, 12, 0.2)"
+                              : "0 1px 2px rgba(87,66,27,0.12)",
                       }}
                       title={`${def?.label ?? item.sfxId} · ${fmtTimecode(startMs)} · ${(durMs / 1000).toFixed(2)}s · click to seek${onMoveSfx ? ", drag to move" : ""}${onEditSfx ? ", drag edges to resize" : ""}${onRemoveSfx ? ", Alt+click or x to remove" : ""}\nright-click for actions`}
                       onContextMenu={(e) => openSfxMenu(e, item.id)}
@@ -4333,7 +4333,7 @@ export function TimelineRuler({
                       {onEditSfx && (
                         <>
                           <div
-                            className="absolute inset-y-0 left-0 z-[2] w-[5px] cursor-ew-resize touch-none bg-amber-400/30 opacity-0 shadow-[inset_1px_0_0_rgba(251,191,36,0.7)] transition-opacity duration-100 group-hover:opacity-100"
+                            className="absolute inset-y-0 left-0 z-[2] w-[5px] cursor-ew-resize touch-none bg-orange-500/25 opacity-0 shadow-[inset_1px_0_0_rgba(234,88,12,0.7)] transition-opacity duration-100 group-hover:opacity-100"
                             title="Drag to lengthen/shorten the effect (start pinned)"
                             aria-hidden
                             onPointerDown={(e) =>
@@ -4342,7 +4342,7 @@ export function TimelineRuler({
                             onLostPointerCapture={handleDragAbort}
                           />
                           <div
-                            className="absolute inset-y-0 right-0 z-[2] w-[5px] cursor-ew-resize touch-none bg-amber-400/30 opacity-0 shadow-[inset_-1px_0_0_rgba(251,191,36,0.7)] transition-opacity duration-100 group-hover:opacity-100"
+                            className="absolute inset-y-0 right-0 z-[2] w-[5px] cursor-ew-resize touch-none bg-orange-500/25 opacity-0 shadow-[inset_-1px_0_0_rgba(234,88,12,0.7)] transition-opacity duration-100 group-hover:opacity-100"
                             title="Drag to lengthen/shorten the effect"
                             aria-hidden
                             onPointerDown={(e) =>
@@ -4358,9 +4358,9 @@ export function TimelineRuler({
                           aria-label={`Remove ${def?.label ?? "sound effect"}`}
                           className="absolute -right-1 -top-1 z-[2] flex size-[14px] cursor-pointer items-center justify-center rounded-full border opacity-0 transition-opacity hover:border-rose-400/60 hover:bg-rose-500/70 focus-visible:opacity-100 group-hover:opacity-100"
                           style={{
-                            borderColor: "rgba(63, 63, 70, 0.9)",
-                            backgroundColor: "#292524",
-                            color: "#d6d3d1",
+                            borderColor: "#e0d8c9",
+                            backgroundColor: "#ffffff",
+                            color: "#57534e",
                           }}
                           onPointerDown={(e) => {
                             // Don't start a pill drag / press-seek from the x.
@@ -4390,9 +4390,9 @@ export function TimelineRuler({
             className="flex shrink-0 rounded-b-[7px]"
             style={{ height: SFX_H, backgroundColor: LANE_BG_B }}
           >
-            <LaneLabel icon={Mic} text="VO" accent="#34d399" sticky />
+            <LaneLabel icon={Mic} text="VO" accent="#059669" sticky />
             <div
-              className="relative min-w-0 shrink-0 transition-colors hover:bg-white/[0.02]"
+              className="relative min-w-0 shrink-0 transition-colors hover:bg-stone-900/[0.02]"
               style={{ width: axisW }}
             >
               {voList.length === 0 ? (
@@ -4432,7 +4432,7 @@ export function TimelineRuler({
                       className={cn(
                         "group absolute select-none rounded-full border pl-1.5 pr-2 text-[8px] font-semibold",
                         onMoveVo
-                          ? "cursor-grab touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-300/70"
+                          ? "cursor-grab touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-emerald-600/70"
                           : "cursor-pointer",
                         pv != null && pv.didDrag && "z-[3] cursor-grabbing",
                       )}
@@ -4446,19 +4446,19 @@ export function TimelineRuler({
                         // two kinds apart at a glance.
                         backgroundColor: isDub
                           ? pv?.didDrag
-                            ? "rgba(251, 113, 133, 0.34)"
-                            : "rgba(251, 113, 133, 0.16)"
+                            ? "rgba(225, 29, 72, 0.24)"
+                            : "rgba(225, 29, 72, 0.12)"
                           : pv?.didDrag
-                            ? "rgba(52, 211, 153, 0.34)"
-                            : "rgba(52, 211, 153, 0.16)",
+                            ? "rgba(5, 150, 105, 0.24)"
+                            : "rgba(5, 150, 105, 0.12)",
                         borderColor: isDub
-                          ? "rgba(253, 164, 175, 0.5)"
-                          : "rgba(110, 231, 183, 0.5)",
-                        color: isDub ? "#fecdd3" : "#a7f3d0",
+                          ? "rgba(190, 18, 60, 0.5)"
+                          : "rgba(4, 120, 87, 0.5)",
+                        color: isDub ? "#be123c" : "#047857",
                         boxShadow:
                           pv?.didDrag
-                            ? "0 0 0 1.5px rgba(255,255,255,0.55), 0 3px 10px rgba(0,0,0,0.55)"
-                            : "0 1px 2px rgba(0,0,0,0.45)",
+                            ? "0 0 0 1.5px rgba(87,66,27,0.4), 0 3px 10px rgba(87,66,27,0.2)"
+                            : "0 1px 2px rgba(87,66,27,0.12)",
                       }}
                       title={`${isDub ? "Dub segment" : "Voiceover"} · ${fmtTimecode(startMs)} · ${(durMs / 1000).toFixed(1)}s · click to seek${onMoveVo ? ", drag to move" : ""}${onRemoveVo ? ", Alt+click or x to remove" : ""}`}
                       onPointerDown={(e) => beginVoDrag(e, item)}
@@ -4501,9 +4501,9 @@ export function TimelineRuler({
                           aria-label={`Remove ${isDub ? "dub segment" : "voiceover"}`}
                           className="absolute -right-1 -top-1 z-[2] flex size-[14px] cursor-pointer items-center justify-center rounded-full border opacity-0 transition-opacity hover:border-rose-400/60 hover:bg-rose-500/70 focus-visible:opacity-100 group-hover:opacity-100"
                           style={{
-                            borderColor: "rgba(63, 63, 70, 0.9)",
-                            backgroundColor: "#292524",
-                            color: "#d6d3d1",
+                            borderColor: "#e0d8c9",
+                            backgroundColor: "#ffffff",
+                            color: "#57534e",
                           }}
                           onPointerDown={(e) => {
                             // Don't start a chip drag / press-seek from the x.
@@ -4603,10 +4603,10 @@ export function TimelineRuler({
               <div
                 className="whitespace-nowrap rounded px-1.5 py-0.5 text-[9px] font-semibold tabular-nums backdrop-blur-sm"
                 style={{
-                  backgroundColor: "rgba(0, 0, 0, 0.78)",
-                  color: "#e7e5e4",
-                  border: "1px solid rgba(228, 228, 231, 0.18)",
-                  boxShadow: "0 2px 8px rgba(0,0,0,0.5)",
+                  backgroundColor: "rgba(255, 255, 255, 0.97)",
+                  color: "#44403c",
+                  border: "1px solid #e0d8c9",
+                  boxShadow: "0 2px 8px rgba(87,66,27,0.18)",
                 }}
               >
                 {dragPreview.kind === "clip" && dragPreview.gesture !== "move"
@@ -4637,8 +4637,8 @@ export function TimelineRuler({
             hasWave ? "h-[92px]" : "h-16",
           )}
           style={{
-            borderColor: "#292524",
-            backgroundColor: "rgba(9, 9, 11, 0.6)",
+            borderColor: "#e8e1d4",
+            backgroundColor: "#faf7f1",
             transition: "height 200ms ease",
           }}
         >

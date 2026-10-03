@@ -2223,7 +2223,7 @@ export function PreviewPanel({
               onClick={() => setFitMode(fitMode === "contain" ? "cover" : "contain")}
               disabled={segments.length === 0}
               className="flex h-7 items-center gap-1 rounded-lg px-1.5 transition-all hover:bg-white/10 hover:shadow-[0_0_12px_rgba(103,232,249,0.12)] active:scale-90 disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:shadow-none"
-              style={{ color: fitMode === "contain" ? "#fcd34d" : "#a8a29e" }}
+              style={{ color: fitMode === "contain" ? "#fcd34d" : "#d6d3d1" }}
               title="Fit shows the whole frame with letterbox bars; Fill crops to cover (export behavior)"
               aria-label={
                 fitMode === "contain"
@@ -2248,7 +2248,7 @@ export function PreviewPanel({
               }}
               disabled={!canMatchAspect}
               className="flex size-7 items-center justify-center rounded-lg transition-all hover:bg-white/10 hover:text-stone-200 hover:shadow-[0_0_12px_rgba(231,229,228,0.08)] active:scale-90 disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:shadow-none"
-              style={{ color: "#a8a29e" }}
+              style={{ color: "#d6d3d1" }}
               title="Set the project aspect to match this video's frame"
               aria-label="Match project aspect to source video"
             >
@@ -2310,7 +2310,7 @@ export function PreviewPanel({
                 }
                 disabled={segments.length === 0}
                 className="flex h-7 items-center gap-1 rounded-lg px-1.5 transition-all hover:bg-white/10 active:scale-90 disabled:opacity-30 disabled:hover:bg-transparent"
-                style={{ color: speedActive ? "#fcd34d" : "#a8a29e" }}
+                style={{ color: speedActive ? "#fcd34d" : "#d6d3d1" }}
                 title="Playback speed — L speeds up, J slows down, K pauses (preview only; exports render at 1×)"
                 aria-label={`Playback speed ${fmtPreviewRate(previewRate)} — open speed menu`}
                 aria-haspopup="menu"
@@ -2387,10 +2387,10 @@ export function PreviewPanel({
               <span style={{ color: "#e7e5e4" }}>
                 {fmtTenths(currentMs)}
               </span>
-              <span className="mx-0.5" style={{ color: "#57534e" }}>
+              <span className="mx-0.5" style={{ color: "#a8a29e" }}>
                 /
               </span>
-              <span style={{ color: "#78716c" }}>
+              <span style={{ color: "#d6d3d1" }}>
                 {fmtTenths(totalMs)}
               </span>
             </div>
@@ -2404,7 +2404,7 @@ export function PreviewPanel({
               }}
               disabled={segments.length === 0}
               className="flex size-7 items-center justify-center rounded-lg transition-all hover:bg-white/10 active:scale-90 disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:shadow-none"
-              style={{ color: isFullscreen ? "#fcd34d" : "#a8a29e" }}
+              style={{ color: isFullscreen ? "#fcd34d" : "#d6d3d1" }}
               title={
                 isFullscreen
                   ? "Exit full screen (F / Esc)"

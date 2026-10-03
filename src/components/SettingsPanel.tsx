@@ -257,6 +257,14 @@ interface SettingsPanelProps {
   onDiscardDub: () => void;
   /** Placements currently on the VO lane (narration + dub). */
   voCount: number;
+  /** ── v1.23 FLOW: CONTROLLED TAB MODE ──
+   * The new left navigation rail owns which section is visible. When
+   * activeTab + onTabChange are provided the panel runs CONTROLLED: the
+   * internal tab rail is NOT rendered (the rail replaces it) and every
+   * internal switch request (whisper auto-flip) routes to onTabChange.
+   * Uncontrolled (both undefined) keeps the legacy v5 tab rail intact. */
+  activeTab?: SettingsTabId;
+  onTabChange?: (tab: SettingsTabId) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -353,15 +361,15 @@ function EngineDiagnosticsCard() {
     );
   }
 
-  const okPill = "bg-emerald-500/15 text-emerald-300 border-emerald-500/40";
-  const badPill = "bg-amber-500/15 text-amber-300 border-amber-500/40";
+  const okPill = "bg-emerald-50 text-emerald-700 border-emerald-300";
+  const badPill = "bg-rose-50 text-rose-600 border-rose-300";
 
   return (
     <div className="space-y-2">
       {/* load state */}
       <div className="flex flex-wrap items-center gap-1.5">
         {status === null ? (
-          <span className="inline-flex items-center gap-1 rounded-md border border-stone-700 bg-stone-900 px-1.5 py-0.5 text-[10px] text-stone-400">
+          <span className="inline-flex items-center gap-1 rounded-md border border-amber-200 bg-amber-100 px-1.5 py-0.5 text-[10px] text-amber-800">
             <Loader2 size={10} className="animate-spin" /> checking engine…
           </span>
         ) : status.loaded ? (
@@ -380,7 +388,7 @@ function EngineDiagnosticsCard() {
           </span>
         )}
         {status?.loaded && status.from && (
-          <span className="max-w-full truncate text-[9px] text-stone-600" title={status.from}>
+          <span className="max-w-full truncate text-[9px] font-mono text-stone-500" title={status.from}>
             {status.binary}
           </span>
         )}
@@ -388,7 +396,7 @@ function EngineDiagnosticsCard() {
 
       {/* load error detail */}
       {status && !status.loaded && status.error && (
-        <p className="break-words rounded-md border border-amber-500/30 bg-amber-500/10 p-1.5 text-[10px] leading-relaxed text-amber-300/90">
+        <p className="break-words rounded-md border border-rose-200 bg-rose-50 p-1.5 text-[10px] leading-relaxed text-rose-700">
           {status.error}
           {status.lastFailure ? "" : " — exports will use the FFmpeg CLI pipeline until this is fixed."}
         </p>
@@ -396,8 +404,8 @@ function EngineDiagnosticsCard() {
 
       {/* last bypass reason */}
       {status?.lastFailure && (
-        <p className="break-words rounded-md border border-stone-700/70 bg-stone-900/70 p-1.5 text-[10px] leading-relaxed text-stone-400">
-          <span className="font-semibold text-stone-300">Last export used FFmpeg CLI: </span>
+        <p className="break-words rounded-md border border-stone-200 bg-stone-50 p-1.5 text-[10px] leading-relaxed text-stone-600">
+          <span className="font-semibold text-stone-700">Last export used FFmpeg CLI: </span>
           {status.lastFailure.reason}
         </p>
       )}
@@ -407,7 +415,7 @@ function EngineDiagnosticsCard() {
         type="button"
         onClick={runTest}
         disabled={testing}
-        className="flex w-full items-center justify-center gap-1.5 rounded-md border border-stone-700 bg-stone-900 px-2 py-1.5 text-[11px] font-medium text-stone-300 transition-colors hover:bg-stone-800 hover:text-stone-100 disabled:opacity-60"
+        className="flex w-full items-center justify-center gap-1.5 rounded-md border border-stone-200 bg-white px-2 py-1.5 text-[11px] font-medium text-stone-700 shadow-[0_1px_2px_rgba(87,66,27,0.05)] transition-colors hover:bg-stone-50 hover:text-stone-900 disabled:opacity-60"
       >
         {testing ? (
           <>
@@ -424,8 +432,8 @@ function EngineDiagnosticsCard() {
         <div
           className={`rounded-md border p-2 text-[10px] leading-relaxed ${
             testResult.ok
-              ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300/90"
-              : "border-amber-500/30 bg-amber-500/10 text-amber-300/90"
+              ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+              : "border-rose-200 bg-rose-50 text-rose-700"
           }`}
         >
           {testResult.ok ? (
@@ -468,17 +476,17 @@ function Section({
 }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    // v5.1 CapCut: uniform section CARD — rounded-lg, 1px #292524 border,
-    // #151310 body, 12px uppercase stone-500 header with tracking (was a
-    // full-width border-b list row). Logic (accordion state) unchanged.
+    // v5.1 CapCut: uniform section CARD — rounded-lg, 1px #e8e1d4 hairline,
+    // #faf7f1 warm body, 12px uppercase stone-600 header with tracking (was
+    // a full-width border-b list row). Logic (accordion state) unchanged.
     <div
       className="mx-2 mb-2 overflow-hidden rounded-lg border"
-      style={{ borderColor: "#292524", backgroundColor: "#151310" }}
+      style={{ borderColor: "#e8e1d4", backgroundColor: "#faf7f1" }}
     >
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-2 rounded-none px-3 py-2.5 text-left transition-colors hover:bg-white/5"
+        className="flex w-full items-center gap-2 rounded-none px-3 py-2.5 text-left transition-colors hover:bg-stone-100"
         aria-expanded={open}
       >
         {/* v4.8: one rotating chevron (was a two-icon swap) — the motion
@@ -490,8 +498,8 @@ function Section({
             open ? "rotate-0" : "-rotate-90",
           )}
         />
-        <span className="shrink-0 text-stone-400">{icon}</span>
-        <span className="flex-1 text-xs font-semibold uppercase tracking-wide text-stone-500">
+        <span className="shrink-0 text-stone-500">{icon}</span>
+        <span className="flex-1 text-xs font-semibold uppercase tracking-wide text-stone-600">
           {title}
         </span>
       </button>
@@ -512,7 +520,7 @@ function Field({
   return (
     <div className="mb-3">
       <div className="mb-1.5 flex items-baseline justify-between">
-        <label className="text-xs font-medium text-stone-300">{label}</label>
+        <label className="text-xs font-medium text-stone-700">{label}</label>
       </div>
       {children}
       {hint && (
@@ -538,7 +546,7 @@ function Segmented<T extends string | number>({
       className="grid gap-1 rounded-md p-1"
       style={{
         gridTemplateColumns: `repeat(${options.length}, minmax(0, 1fr))`,
-        backgroundColor: "#1c1917",
+        backgroundColor: "#faf7f1",
       }}
       role="radiogroup"
     >
@@ -556,8 +564,8 @@ function Segmented<T extends string | number>({
               "rounded transition-colors",
               size === "sm" ? "px-1.5 py-1 text-[10px]" : "px-2 py-1.5 text-xs",
               active
-                ? "bg-stone-200 font-semibold text-stone-900"
-                : "text-stone-400 hover:bg-white/5 hover:text-stone-200",
+                ? "bg-white font-semibold text-stone-900 shadow-[0_1px_2px_rgba(87,66,27,0.08)]"
+                : "text-stone-500 hover:bg-stone-100 hover:text-stone-700",
             )}
           >
             {o.label}
@@ -655,13 +663,13 @@ function FontPicker({
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-label="Caption font"
-        className="flex w-full items-center justify-between rounded border bg-stone-900 px-2.5 py-2 text-left transition-colors hover:border-stone-500"
+        className="flex w-full items-center justify-between rounded border bg-white px-2.5 py-2 text-left transition-colors hover:border-stone-300"
         style={{
-          borderColor: open ? "#fcd34d" : "#44403c",
+          borderColor: open ? "#f06214" : "#ddd5c6",
         }}
       >
         <span
-          className="truncate text-stone-100"
+          className="truncate text-stone-900"
           style={{ fontFamily: current.stack, fontSize: 14 }}
         >
           {current.name}
@@ -677,7 +685,7 @@ function FontPicker({
           role="listbox"
           aria-label="Font options"
           className="absolute z-40 mt-1 w-full overflow-hidden rounded border shadow-2xl"
-          style={{ borderColor: "#44403c", backgroundColor: "#12100e" }}
+          style={{ borderColor: "#e0d8c9", backgroundColor: "#ffffff" }}
         >
           <div className="max-h-72 overflow-y-auto ff-font-scroll">
             {options.map((o, i) => {
@@ -694,9 +702,9 @@ function FontPicker({
                   className="flex w-full items-center justify-between px-2.5 py-2 text-left transition-colors"
                   style={{
                     backgroundColor: active
-                      ? "rgba(251, 191, 36, 0.14)"
+                      ? "#ffedd5"
                       : hl
-                        ? "rgba(255, 255, 255, 0.05)"
+                        ? "#f6f2ea"
                         : "transparent",
                   }}
                 >
@@ -706,7 +714,7 @@ function FontPicker({
                       fontFamily: o.stack,
                       fontSize: 15,
                       lineHeight: 1.35,
-                      color: active ? "#fcd34d" : "#e7e5e4",
+                      color: active ? "#c2410c" : "#292524",
                     }}
                   >
                     {o.name}
@@ -715,7 +723,7 @@ function FontPicker({
                     <Check
                       size={12}
                       className="ml-2 shrink-0"
-                      style={{ color: "#fcd34d" }}
+                      style={{ color: "#c2410c" }}
                     />
                   ) : null}
                 </button>
@@ -737,7 +745,7 @@ function Row({
 }) {
   return (
     <div className="mb-3 flex items-center justify-between gap-3">
-      <span className="text-xs text-stone-300">{label}</span>
+      <span className="text-xs text-stone-700">{label}</span>
       {children}
     </div>
   );
@@ -763,8 +771,8 @@ function Toggle({
         className={cn(
           "relative h-5 w-9 shrink-0 rounded-full border transition-all duration-200 active:scale-95",
           checked
-            ? "border-amber-400/60 bg-amber-400 shadow-[0_0_10px_rgba(245,158,11,0.4)]"
-            : "border-stone-600 bg-stone-800 hover:bg-stone-700",
+            ? "border-orange-400/60 bg-orange-500 shadow-[0_0_10px_rgba(234,88,12,0.35)]"
+            : "border-stone-300 bg-stone-200 hover:bg-stone-300",
         )}
       >
         <span
@@ -774,7 +782,7 @@ function Toggle({
           )}
         />
       </button>
-      <span className="text-xs leading-tight text-stone-300">{label}</span>
+      <span className="text-xs leading-tight text-stone-700">{label}</span>
     </div>
   );
 }
@@ -793,6 +801,7 @@ const SETTINGS_TAB_IDS = [
 ] as const;
 
 type SettingsTabId = (typeof SETTINGS_TAB_IDS)[number];
+export type { SettingsTabId };
 
 /** Sanitizes the persisted value — anything unknown falls back to "media". */
 function isSettingsTabId(value: unknown): value is SettingsTabId {
@@ -805,8 +814,9 @@ function isSettingsTabId(value: unknown): value is SettingsTabId {
 /** Dedicated small key (sibling of framefuse.settings.v49/v50). */
 const TAB_STORAGE_KEY = "framefuse.settings.tab";
 
-/** Per-tab accent — v1.22 Ember Studio: emerald/amber/rose/teal/amber,
- *  a warm-family spread that keeps each section's identity. */
+/** Per-tab accent — v1.23 Flow: emerald/tangerine/rose/teal/amber
+ *  (light-theme values), a family spread that keeps each section's
+ *  identity on the paper canvas. */
 const SETTINGS_TABS: {
   id: SettingsTabId;
   label: string;
@@ -818,36 +828,36 @@ const SETTINGS_TABS: {
     id: "media",
     label: "Media",
     icon: Film,
-    accent: "#34d399",
-    glow: "rgba(52, 211, 153, 0.55)",
+    accent: "#059669",
+    glow: "rgba(5, 150, 105, 0.35)",
   },
   {
     id: "captions",
     label: "Captions",
     icon: Captions,
-    accent: "#fbbf24",
-    glow: "rgba(251, 191, 36, 0.55)",
+    accent: "#ea580c",
+    glow: "rgba(234, 88, 12, 0.35)",
   },
   {
     id: "effects",
     label: "Effects",
     icon: Sparkles,
-    accent: "#fb7185",
-    glow: "rgba(251, 113, 133, 0.55)",
+    accent: "#e11d48",
+    glow: "rgba(225, 29, 72, 0.35)",
   },
   {
     id: "audio",
     label: "Audio",
     icon: Music,
-    accent: "#2dd4bf",
-    glow: "rgba(45, 212, 191, 0.55)",
+    accent: "#0d9488",
+    glow: "rgba(13, 148, 136, 0.35)",
   },
   {
     id: "export",
     label: "Export",
     icon: Rocket,
-    accent: "#f59e0b",
-    glow: "rgba(245, 158, 11, 0.55)",
+    accent: "#d97706",
+    glow: "rgba(217, 119, 6, 0.35)",
   },
 ];
 
@@ -873,11 +883,11 @@ const TAB_PANEL_CSS = `
 }
 /* v1.21 FontPicker list — slim custom scrollbar (the long font list
  * deserves better than the default chunky one) */
-.ff-font-scroll { scrollbar-width: thin; scrollbar-color: #44403c transparent; }
+.ff-font-scroll { scrollbar-width: thin; scrollbar-color: #d3cabd transparent; }
 .ff-font-scroll::-webkit-scrollbar { width: 8px; }
 .ff-font-scroll::-webkit-scrollbar-track { background: transparent; }
-.ff-font-scroll::-webkit-scrollbar-thumb { background: #44403c; border-radius: 4px; border: 2px solid #12100e; }
-.ff-font-scroll::-webkit-scrollbar-thumb:hover { background: #57534e; }
+.ff-font-scroll::-webkit-scrollbar-thumb { background: #d3cabd; border-radius: 4px; border: 2px solid #ffffff; }
+.ff-font-scroll::-webkit-scrollbar-thumb:hover { background: #bdb2a1; }
 `;
 
 // ---------------------------------------------------------------------------
@@ -885,6 +895,8 @@ const TAB_PANEL_CSS = `
 // ---------------------------------------------------------------------------
 export function SettingsPanel(props: SettingsPanelProps) {
   const {
+    activeTab: activeTabProp,
+    onTabChange,
     kenBurns,
     settings,
     audioSettings,
@@ -1002,8 +1014,20 @@ export function SettingsPanel(props: SettingsPanelProps) {
     (kenBurns.directionPool.length > 1 &&
       kenBurns.directionPool.includes(kenBurns.direction));
 
-  // ── v5.0 tab state ──
-  const [tab, setTab] = useState<SettingsTabId>("media");
+  // ── v5.0 tab state ── v1.23 FLOW: controlled when the shell rail owns
+  // the section (activeTabProp + onTabChange); the internal rail is then
+  // hidden and every switch request is delegated to the shell.
+  const controlled = activeTabProp != null && onTabChange != null;
+  const [internalTab, setInternalTab] = useState<SettingsTabId>("media");
+  const tab: SettingsTabId = controlled ? activeTabProp : internalTab;
+  const switchTab = useCallback(
+    (t: SettingsTabId) => {
+      if (controlled) onTabChange?.(t);
+      else setInternalTab(t);
+    },
+    [controlled, onTabChange],
+  );
+  const setTab = switchTab;
   const [tabsHydrated, setTabsHydrated] = useState(false);
   const tabRefs = useRef<Record<SettingsTabId, HTMLButtonElement | null>>({
     media: null,
@@ -1021,24 +1045,29 @@ export function SettingsPanel(props: SettingsPanelProps) {
     // Restore the persisted tab after hydration (a lazy useState initializer
     // would mismatch SSR markup). One-shot sync with the localStorage
     // "external system" — same pattern as page.tsx's persisted-restore.
-    try {
-      const stored = window.localStorage.getItem(TAB_STORAGE_KEY);
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      if (isSettingsTabId(stored)) setTab(stored);
-    } catch {
-      /* storage unavailable (private mode) — keep the default */
+    // v1.23: skipped in controlled mode (the shell rail owns the section
+    // and persists it itself).
+    if (!controlled) {
+      try {
+        const stored = window.localStorage.getItem(TAB_STORAGE_KEY);
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        if (isSettingsTabId(stored)) setInternalTab(stored);
+      } catch {
+        /* storage unavailable (private mode) — keep the default */
+      }
     }
     setTabsHydrated(true);
-  }, []);
+  }, [controlled]);
 
   useEffect(() => {
-    if (!tabsHydrated) return;
-    try {
-      window.localStorage.setItem(TAB_STORAGE_KEY, tab);
-    } catch {
-      /* ignore write failures */
+    if (tabsHydrated && !controlled) {
+      try {
+        window.localStorage.setItem(TAB_STORAGE_KEY, tab);
+      } catch {
+        /* ignore write failures */
+      }
     }
-  }, [tab, tabsHydrated]);
+  }, [tab, tabsHydrated, controlled]);
 
   useEffect(() => {
     if (whisperBusy) {
@@ -1077,13 +1106,16 @@ export function SettingsPanel(props: SettingsPanelProps) {
         <style dangerouslySetInnerHTML={{ __html: TAB_PANEL_CSS }} />
 
         {/* ── tab bar — 6 equal segments (v1: + Chroma), roving tabindex,
-            sliding accent indicator. Sticky so it survives scrolling. ── */}
+            sliding accent indicator. Sticky so it survives scrolling.
+            v1.23 FLOW: NOT rendered in controlled mode — the shell's left
+            navigation rail owns section switching. ── */}
+        {!controlled && (
         <div
           role="tablist"
           aria-label="Settings sections"
           onKeyDown={handleTablistKeyDown}
           className="ff-settings-tabs sticky top-0 z-30 grid grid-cols-5 border-b"
-          style={{ borderColor: "#292524", backgroundColor: "#14110e" }}
+          style={{ borderColor: "#e8e1d4", backgroundColor: "#faf7f1" }}
         >
           {SETTINGS_TABS.map((t) => {
             const active = t.id === tab;
@@ -1102,7 +1134,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 onClick={() => setTab(t.id)}
                 className={cn(
                   "group relative flex flex-col items-center gap-1 px-1 py-2.5 transition-colors duration-150",
-                  active ? "bg-[#1c1917]" : "hover:bg-white/[0.03]",
+                  active ? "bg-[#f6f2ea]" : "hover:bg-stone-100/70",
                 )}
               >
                 <span className="relative flex items-center">
@@ -1110,23 +1142,23 @@ export function SettingsPanel(props: SettingsPanelProps) {
                     size={14}
                     className={cn(
                       "transition-colors duration-150",
-                      active ? "" : "text-stone-500 group-hover:text-stone-300",
+                      active ? "" : "text-stone-600 group-hover:text-stone-800",
                     )}
                     style={active ? { color: t.accent } : undefined}
                   />
                   {/* Live dot while Whisper is transcribing. */}
                   {t.id === "captions" && whisperBusy && (
                     <span
-                      className="absolute -right-2 -top-1 size-1.5 animate-pulse rounded-full bg-amber-400"
-                      style={{ boxShadow: "0 0 6px rgba(251, 191, 36, 0.9)" }}
+                      className="absolute -right-2 -top-1 size-1.5 animate-pulse rounded-full bg-orange-500"
+                      style={{ boxShadow: "0 0 6px rgba(234, 88, 12, 0.9)" }}
                       aria-hidden
                     />
                   )}
                   {/* Headline count badge. */}
                   {t.id === "effects" && headlineItems.length > 0 && (
                     <span
-                      className="absolute -right-2.5 -top-1.5 rounded-full px-1 py-px text-[8px] font-bold leading-none tabular-nums text-amber-300"
-                      style={{ backgroundColor: "rgba(251, 191, 36, 0.2)" }}
+                      className="absolute -right-2.5 -top-1.5 rounded-full px-1 py-px text-[8px] font-bold leading-none tabular-nums text-orange-700"
+                      style={{ backgroundColor: "rgba(234, 88, 12, 0.12)" }}
                       aria-hidden
                     >
                       {headlineItems.length}
@@ -1137,8 +1169,8 @@ export function SettingsPanel(props: SettingsPanelProps) {
                   className={cn(
                     "ff-tab-label text-[10px] font-semibold uppercase tracking-wider transition-colors duration-150",
                     active
-                      ? "text-stone-100"
-                      : "text-stone-500 group-hover:text-stone-400",
+                      ? "text-stone-900"
+                      : "text-stone-500 group-hover:text-stone-700",
                   )}
                 >
                   {t.label}
@@ -1146,20 +1178,21 @@ export function SettingsPanel(props: SettingsPanelProps) {
               </button>
             );
           })}
-          {/* v5.1 CapCut: the active tab's AMBER TOP BORDER — a sliding 2px
-              indicator along the rail's top edge (icon keeps its semantic
-              accent; the rail accent itself is the app's amber). v1: 6 tabs. */}
+          {/* v5.1 CapCut: the active tab's TANGERINE TOP BORDER — a sliding
+              2px indicator along the rail's top edge (icon keeps its semantic
+              accent; the rail accent itself is the app's tangerine). v1: 6 tabs. */}
           <span
             aria-hidden
             className="pointer-events-none absolute left-0 top-0 h-[2px] transition-all duration-200 ease-out"
             style={{
               width: `${100 / SETTINGS_TABS.length}%`,
               transform: `translateX(${activeTabIndex * 100}%)`,
-              backgroundColor: "#fbbf24",
-              boxShadow: "0 0 8px rgba(251, 191, 36, 0.55)",
+              backgroundColor: "#ea580c",
+              boxShadow: "0 0 8px rgba(234, 88, 12, 0.45)",
             }}
           />
         </div>
+        )}
 
         {/* ─── Media tab — Ken Burns motion ──────────────────────────── */}
         <div
@@ -1200,7 +1233,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                   })
                 }
                 disabled={!kenBurns.enabled}
-                className="w-full accent-amber-400"
+                className="w-full accent-orange-600"
                 aria-label="Ken Burns zoom intensity"
               />
             </Field>
@@ -1226,8 +1259,8 @@ export function SettingsPanel(props: SettingsPanelProps) {
                       className={cn(
                         "flex items-center gap-1.5 rounded-md px-1.5 py-1.5 text-[10px] font-medium transition-all duration-150 active:scale-[0.96]",
                         active
-                          ? "bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/35"
-                          : "bg-stone-800/60 text-stone-400 hover:bg-white/5 hover:-translate-y-px",
+                          ? "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-600/30"
+                          : "bg-stone-100 text-stone-500 hover:bg-stone-200/70 hover:-translate-y-px",
                         !kenBurns.enabled && "opacity-40",
                       )}
                     >
@@ -1244,8 +1277,8 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 className={cn(
                   "mt-1.5 flex w-full items-center justify-center gap-1.5 rounded-md border px-2 py-1.5 text-[10px] font-semibold transition-all active:scale-[0.98]",
                   isRandomMode && kenBurns.directionPool.length === 6
-                    ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
-                    : "border-stone-700 bg-transparent text-stone-400 hover:border-stone-600 hover:bg-white/5 hover:text-stone-200",
+                    ? "border-emerald-300 bg-emerald-50 text-emerald-700"
+                    : "border-stone-200 bg-transparent text-stone-500 hover:border-stone-300 hover:bg-stone-50 hover:text-stone-700",
                 )}
                 title="Randomize across all six effects"
               >
@@ -1313,27 +1346,27 @@ export function SettingsPanel(props: SettingsPanelProps) {
                         active
                           ? undefined
                           : {
-                              borderColor: "#292524",
-                              backgroundColor: "#151310",
+                              borderColor: "#e8e1d4",
+                              backgroundColor: "#ffffff",
                             }
                       }
                     >
                       <span
                         className="flex items-center gap-1 text-[11px] font-bold"
-                        style={{ color: active ? "#fde68a" : "#d6d3d1" }}
+                        style={{ color: active ? "#c2410c" : "#44403c" }}
                       >
                         {p.label}
                         {active && (
                           <Check
                             className="size-3 shrink-0"
-                            style={{ color: "#fbbf24" }}
+                            style={{ color: "#ea580c" }}
                             aria-hidden
                           />
                         )}
                       </span>
                       <span
                         className="text-[8px] tabular-nums"
-                        style={{ color: "#78716c" }}
+                        style={{ color: "#a8a29e" }}
                       >
                         {p.resolution} · {p.fps}fps
                       </span>
@@ -1347,15 +1380,15 @@ export function SettingsPanel(props: SettingsPanelProps) {
                               backgroundColor:
                                 d <= p.speed
                                   ? active
-                                    ? "#fbbf24"
-                                    : "#44403c"
-                                  : "#1d1a17",
+                                    ? "#ea580c"
+                                    : "#c7bfb0"
+                                  : "#eee8dc",
                             }}
                           />
                         ))}
                         <span
                           className="ml-1 text-[7px] uppercase tracking-wide"
-                          style={{ color: "#57534e" }}
+                          style={{ color: "#78716c" }}
                         >
                           {p.speed === 3
                             ? "fast"
@@ -1371,7 +1404,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
               {settings.quality === "custom" ? (
                 <p
                   className="mt-1.5 flex items-center gap-1 text-[9px]"
-                  style={{ color: "#fbbf24" }}
+                  style={{ color: "#c2410c" }}
                 >
                   <Wand2 className="size-2.5" /> Custom — fields below tuned
                   manually
@@ -1379,7 +1412,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
               ) : (
                 <p
                   className="mt-1.5 text-[9px] leading-relaxed"
-                  style={{ color: "#57534e" }}
+                  style={{ color: "#78716c" }}
                 >
                   {QUALITY_PROFILES.find((p) => p.id === settings.quality)
                     ?.hint ??
@@ -1445,7 +1478,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                   })
                 }
               />
-              <p className="mt-0.5 text-[9px]" style={{ color: "#57534e" }}>
+              <p className="mt-0.5 text-[9px]" style={{ color: "#78716c" }}>
                 On slow CPUs, long 1080p exports render at 720p-class (~2×
                 faster) — the toast says when.
               </p>
@@ -1471,7 +1504,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                   })
                 }
               />
-              <p className="mt-0.5 text-[9px]" style={{ color: "#57534e" }}>
+              <p className="mt-0.5 text-[9px]" style={{ color: "#78716c" }}>
                 Image-only timelines export at 24 fps — 20 % fewer frames.
               </p>
             </Field>
@@ -1506,7 +1539,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                     quality: "custom",
                   })
                 }
-                className="w-full accent-amber-400"
+                className="w-full accent-orange-600"
                 aria-label="Video bitrate"
               />
             </Field>
@@ -1531,10 +1564,10 @@ export function SettingsPanel(props: SettingsPanelProps) {
                     quality: "custom",
                   })
                 }
-                className="w-full accent-amber-400"
+                className="w-full accent-orange-600"
                 aria-label="Constant quality factor"
               />
-              <p className="mt-0.5 text-[9px]" style={{ color: "#57534e" }}>
+              <p className="mt-0.5 text-[9px]" style={{ color: "#78716c" }}>
                 Lower = better quality + larger files; 18–22 suits social.
               </p>
             </Field>
@@ -1563,8 +1596,8 @@ export function SettingsPanel(props: SettingsPanelProps) {
                       className={cn(
                         "flex-1 rounded-md border py-1 text-[10px] font-medium tabular-nums transition-colors",
                         active
-                          ? "border-amber-400/60 bg-amber-400/10 text-amber-200"
-                          : "border-stone-700 bg-stone-900 text-stone-400 hover:border-stone-600 hover:text-stone-200",
+                          ? "border-orange-300 bg-orange-100 text-orange-700"
+                          : "border-stone-200 bg-white text-stone-500 hover:border-stone-300 hover:text-stone-700",
                       )}
                     >
                       {k}
@@ -1572,7 +1605,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                   );
                 })}
               </div>
-              <p className="mt-0.5 text-[9px]" style={{ color: "#57534e" }}>
+              <p className="mt-0.5 text-[9px]" style={{ color: "#78716c" }}>
                 192 suits most social video; 320 for music projects.
               </p>
             </Field>
@@ -1666,10 +1699,10 @@ export function SettingsPanel(props: SettingsPanelProps) {
                       ),
                     })
                   }
-                  className="w-28 accent-amber-400"
+                  className="w-28 accent-orange-600"
                   aria-label="Master output volume"
                 />
-                <span className="w-9 text-right text-[10px] tabular-nums text-stone-400">
+                <span className="w-9 text-right text-[10px] tabular-nums text-stone-500">
                   {Math.round(
                     Math.max(0, Math.min(2, audioSettings.masterVolume ?? 1)) * 100,
                   )}
@@ -1703,10 +1736,10 @@ export function SettingsPanel(props: SettingsPanelProps) {
                           ),
                         })
                       }
-                      className="w-28 accent-teal-400"
+                      className="w-28 accent-teal-600"
                       aria-label="Background music volume"
                     />
-                    <span className="w-9 text-right text-[10px] tabular-nums text-stone-400">
+                    <span className="w-9 text-right text-[10px] tabular-nums text-stone-500">
                       {Math.round(
                         Math.max(0, Math.min(2, audioSettings.musicVolume)) * 100,
                       )}
@@ -1743,9 +1776,9 @@ export function SettingsPanel(props: SettingsPanelProps) {
                 <span
                   className="rounded border px-1 py-px font-mono text-[9px] font-semibold uppercase tracking-wide"
                   style={{
-                    borderColor: "#44403c",
-                    backgroundColor: "#1c1917",
-                    color: "#fcd34d",
+                    borderColor: "#e0d8c9",
+                    backgroundColor: "#f6f2ea",
+                    color: "#c2410c",
                   }}
                   title="Every source is measured first, then a single static gain is applied (no dynamic pumping)"
                 >
@@ -1784,7 +1817,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                     fadeInMs: Number(e.target.value),
                   })
                 }
-                className="w-full accent-amber-400"
+                className="w-full accent-orange-600"
                 aria-label="Audio fade in"
               />
             </Field>
@@ -1808,7 +1841,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
                     fadeOutMs: Number(e.target.value),
                   })
                 }
-                className="w-full accent-amber-400"
+                className="w-full accent-orange-600"
                 aria-label="Audio fade out"
               />
             </Field>
@@ -1997,10 +2030,10 @@ function TextRemovalSection({
         className={cn(
           "flex w-full items-center justify-center gap-2 rounded-md px-3 py-2 text-xs font-semibold transition-colors",
           detecting
-            ? "bg-stone-700 text-stone-200 hover:bg-stone-600"
+            ? "bg-stone-200 text-stone-700 hover:bg-stone-300"
             : !videoSourceForDetect
-              ? "cursor-not-allowed bg-stone-800 text-stone-500"
-              : "bg-amber-400 text-stone-950 hover:bg-amber-300",
+              ? "cursor-not-allowed bg-stone-100 text-stone-400"
+              : "bg-orange-500 text-white hover:bg-orange-400",
         )}
         title={
           videoSourceForDetect
@@ -2022,9 +2055,9 @@ function TextRemovalSection({
       </button>
       {detectProgress && (
         <div className="mt-2">
-          <div className="h-1 w-full overflow-hidden rounded-full bg-stone-800">
+          <div className="h-1 w-full overflow-hidden rounded-full bg-[#eee8dc]">
             <div
-              className="h-full bg-amber-400 transition-all"
+              className="h-full bg-gradient-to-r from-orange-400 to-orange-600 transition-all"
               style={{ width: `${detectProgress.progress}%` }}
             />
           </div>
@@ -2054,8 +2087,8 @@ function TextRemovalSection({
               className={cn(
                 "rounded border px-2 py-1.5 text-[10px] font-medium transition-colors",
                 textRemoval.mode === m.value
-                  ? "border-amber-500/60 bg-amber-500/15 text-amber-300"
-                  : "border-stone-700 bg-stone-900 text-stone-400 hover:bg-stone-800 hover:text-stone-200",
+                  ? "border-orange-300 bg-orange-100 text-orange-700"
+                  : "border-stone-200 bg-white text-stone-500 hover:bg-stone-50 hover:text-stone-700",
               )}
               aria-pressed={textRemoval.mode === m.value}
             >
@@ -2078,8 +2111,8 @@ function TextRemovalSection({
             <button
               type="button"
               onClick={() => set({ regions: [], enabled: false })}
-              className="rounded border px-1.5 py-0.5 text-[9px] font-medium text-stone-400 transition-colors hover:bg-stone-800 hover:text-stone-200"
-              style={{ borderColor: "#44403c" }}
+              className="rounded border px-1.5 py-0.5 text-[9px] font-medium text-stone-500 transition-colors hover:bg-stone-100 hover:text-stone-700"
+              style={{ borderColor: "#ddd5c6" }}
             >
               Clear all
             </button>
@@ -2089,16 +2122,17 @@ function TextRemovalSection({
               <div
                 key={r.id}
                 className="flex items-center gap-2 rounded border px-2 py-1.5"
-                style={{ borderColor: "#292524", backgroundColor: "#1c1917" }}
+                style={{ borderColor: "#e8e1d4", backgroundColor: "#f6f2ea" }}
               >
                 <span
                   className="size-2 shrink-0 rounded-sm"
                   style={{
-                    background: "repeating-linear-gradient(45deg, #f59e0b, #f59e0b 3px, #b45309 3px, #b45309 6px)",
+                    background:
+                      "repeating-linear-gradient(45deg, #f97316, #f97316 3px, #c2410c 3px, #c2410c 6px)",
                   }}
                   aria-hidden
                 />
-                <span className="min-w-0 flex-1 truncate text-[10px] text-stone-300">
+                <span className="min-w-0 flex-1 truncate text-[10px] text-stone-700">
                   {r.label
                     ? `“${r.label}”`
                     : `Region @ ${(r.x * 100).toFixed(0)}%, ${(r.y * 100).toFixed(0)}% · ${(r.w * 100).toFixed(0)}×${(r.h * 100).toFixed(0)}%`}
@@ -2109,7 +2143,7 @@ function TextRemovalSection({
                 <button
                   type="button"
                   onClick={() => removeRegion(r.id)}
-                  className="shrink-0 rounded p-1 text-stone-500 transition-colors hover:bg-rose-500/10 hover:text-rose-400"
+                  className="shrink-0 rounded p-1 text-stone-500 transition-colors hover:bg-rose-50 hover:text-rose-600"
                   aria-label="Remove this text-removal region"
                 >
                   <X size={11} />
@@ -2241,7 +2275,7 @@ function StackStylePreview({
         unit === "line" ? "flex-col" : "flex-row flex-wrap",
       )}
       style={{
-        borderColor: "#292524",
+        borderColor: "#e8e1d4",
         backgroundColor: "#12100e",
         maxHeight: STACK_PREVIEW_H,
         maxWidth: STACK_PREVIEW_W * 2,
@@ -2329,7 +2363,7 @@ function TransitionSection({
                 onClick={() => onTransitionChange({ ...transition, style })}
                 className={cn(
                   "ff-tx-tile group flex flex-col items-center gap-1 rounded-md p-1.5 transition-all duration-150",
-                  active ? "ff-tx-tile-active" : "hover:bg-white/5",
+                  active ? "ff-tx-tile-active" : "hover:bg-stone-100",
                 )}
               >
                 <div className="ff-tx-stage">
@@ -2352,7 +2386,7 @@ function TransitionSection({
                 <span
                   className={cn(
                     "text-[9px] font-medium leading-none",
-                    active ? "text-cyan-200" : "text-stone-400",
+                    active ? "text-teal-700" : "text-stone-500",
                   )}
                 >
                   {si.label}
@@ -2411,7 +2445,7 @@ function TransitionSection({
                 durationMs: Number(e.target.value),
               })
             }
-            className="w-full accent-amber-400"
+            className="w-full accent-orange-600"
             aria-label="Transition duration"
           />
         </Field>
@@ -2471,13 +2505,13 @@ function WatermarkSection({
         {image ? (
           <div
             className="flex items-center gap-2.5 rounded-lg border p-2"
-            style={{ borderColor: "#292524", backgroundColor: "#1c1917" }}
+            style={{ borderColor: "#e8e1d4", backgroundColor: "#ffffff" }}
           >
             <div
               className="flex size-10 shrink-0 items-center justify-center rounded-lg"
               style={{
-                backgroundColor: "#12100e",
-                boxShadow: "inset 0 0 0 1px rgba(255,255,255,0.06)",
+                backgroundColor: "#f6f2ea",
+                boxShadow: "inset 0 0 0 1px rgba(87, 66, 27, 0.08)",
               }}
             >
               <img
@@ -2489,7 +2523,7 @@ function WatermarkSection({
             </div>
             <div className="min-w-0 flex-1">
               <div
-                className="truncate text-[11px] font-medium text-stone-200"
+                className="truncate text-[11px] font-medium text-stone-800"
                 title={image.fileName}
               >
                 {image.fileName}
@@ -2501,8 +2535,8 @@ function WatermarkSection({
             <button
               type="button"
               onClick={() => onFile(null)}
-              className="shrink-0 rounded p-1 transition-colors hover:bg-rose-500/15 hover:text-rose-400"
-              style={{ color: "#78716c" }}
+              className="shrink-0 rounded p-1 transition-colors hover:bg-rose-50 hover:text-rose-600"
+              style={{ color: "#a8a29e" }}
               title="Remove watermark"
               aria-label="Remove watermark"
             >
@@ -2514,7 +2548,7 @@ function WatermarkSection({
             type="button"
             onClick={openPicker}
             className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed px-3 py-3 text-[11px] font-semibold transition-all hover:-translate-y-px"
-            style={{ borderColor: "#44403c", color: "#a8a29e" }}
+            style={{ borderColor: "#ddd5c6", color: "#78716c" }}
           >
             <Upload className="size-3.5" />
             Upload logo / watermark
@@ -2554,7 +2588,7 @@ function WatermarkSection({
                     }
                     className={cn(
                       "ff-wm-cell group flex size-7 items-center justify-center rounded transition-all active:scale-90",
-                      active ? "ff-wm-cell-active" : "hover:bg-white/5",
+                      active ? "ff-wm-cell-active" : "hover:bg-stone-200/60",
                     )}
                   >
                     <span
@@ -2562,7 +2596,7 @@ function WatermarkSection({
                         "size-1.5 rounded-sm transition-all",
                         active
                           ? "ff-wm-dot-active"
-                          : "bg-stone-600 group-hover:bg-stone-400",
+                          : "bg-stone-400 group-hover:bg-stone-500",
                       )}
                       style={
                         !active
@@ -2591,7 +2625,7 @@ function WatermarkSection({
                   sizePercent: Number(e.target.value),
                 })
               }
-              className="w-full accent-amber-400"
+              className="w-full accent-orange-600"
               aria-label="Watermark size"
             />
           </Field>
@@ -2609,7 +2643,7 @@ function WatermarkSection({
                   opacity: Number(e.target.value),
                 })
               }
-              className="w-full accent-amber-400"
+              className="w-full accent-orange-600"
               aria-label="Watermark opacity"
             />
           </Field>
@@ -2630,7 +2664,7 @@ function WatermarkSection({
                   marginPercent: Number(e.target.value),
                 })
               }
-              className="w-full accent-amber-400"
+              className="w-full accent-orange-600"
               aria-label="Watermark margin"
             />
           </Field>
@@ -2701,8 +2735,8 @@ function HeadlineSection({
               key={item.id}
               className="rounded-lg border p-2.5 transition-colors"
               style={{
-                borderColor: invalid ? "rgba(159, 18, 57, 0.5)" : "#292524",
-                backgroundColor: "#1c1917",
+                borderColor: invalid ? "rgba(225, 29, 72, 0.45)" : "#e8e1d4",
+                backgroundColor: "#ffffff",
               }}
             >
               {/* Header row: index + preset name + remove */}
@@ -2710,8 +2744,8 @@ function HeadlineSection({
                 <span
                   className="rounded px-1.5 py-0.5 text-[9px] font-bold tabular-nums"
                   style={{
-                    backgroundColor: "rgba(251, 191, 36, 0.15)",
-                    color: "#fbbf24",
+                    backgroundColor: "rgba(234, 88, 12, 0.15)",
+                    color: "#c2410c",
                   }}
                 >
                   {idx + 1}
@@ -2748,13 +2782,13 @@ function HeadlineSection({
                 >
                   Hook
                 </span>
-                <span className="flex-1 truncate text-[10px] text-stone-400">
+                <span className="flex-1 truncate text-[10px] text-stone-500">
                   {preset.name}
                 </span>
                 <button
                   type="button"
                   onClick={() => onRemove(item.id)}
-                  className="rounded p-1 text-stone-500 transition-colors hover:bg-rose-500/15 hover:text-rose-400"
+                  className="rounded p-1 text-stone-500 transition-colors hover:bg-rose-50 hover:text-rose-600"
                   title="Remove title"
                 >
                   <Trash2 size={12} />
@@ -2767,8 +2801,8 @@ function HeadlineSection({
                 rows={2}
                 onChange={(e) => onUpdate(item.id, { text: e.target.value })}
                 placeholder="YOUR HOOK HERE — keep it under 8 words"
-                className="mb-2 w-full resize-none rounded border bg-stone-900 px-2 py-1.5 text-[11px] text-stone-200 placeholder:text-stone-600 focus:border-amber-500"
-                style={{ borderColor: "#44403c" }}
+                className="mb-2 w-full resize-none rounded border bg-white px-2 py-1.5 text-[11px] text-stone-800 placeholder:text-stone-400 focus:border-orange-500"
+                style={{ borderColor: "#ddd5c6" }}
                 aria-label={`Headline ${idx + 1} text`}
               />
 
@@ -2788,8 +2822,8 @@ function HeadlineSection({
                         ),
                       })
                     }
-                    className="w-16 rounded border bg-stone-900 px-1.5 py-1 text-[10px] tabular-nums text-stone-200 focus:border-amber-500"
-                    style={{ borderColor: "#44403c" }}
+                    className="w-16 rounded border bg-white px-1.5 py-1 text-[10px] tabular-nums text-stone-800 focus:border-orange-500"
+                    style={{ borderColor: "#ddd5c6" }}
                     aria-label="Start time (seconds)"
                   />
                   s →
@@ -2805,8 +2839,8 @@ function HeadlineSection({
                         ),
                       })
                     }
-                    className="w-16 rounded border bg-stone-900 px-1.5 py-1 text-[10px] tabular-nums text-stone-200 focus:border-amber-500"
-                    style={{ borderColor: "#44403c" }}
+                    className="w-16 rounded border bg-white px-1.5 py-1 text-[10px] tabular-nums text-stone-800 focus:border-orange-500"
+                    style={{ borderColor: "#ddd5c6" }}
                     aria-label="End time (seconds)"
                   />
                   s
@@ -2815,8 +2849,8 @@ function HeadlineSection({
                   className={cn(
                     "ml-auto rounded px-1.5 py-0.5 text-[9px] tabular-nums",
                     invalid
-                      ? "bg-rose-500/20 text-rose-300"
-                      : "bg-stone-800 text-stone-400",
+                      ? "bg-rose-100 text-rose-600"
+                      : "bg-stone-100 text-stone-500",
                   )}
                 >
                   {invalid ? "end ≤ start" : `${dur.toFixed(1)}s`}
@@ -2829,8 +2863,8 @@ function HeadlineSection({
                 onChange={(e) =>
                   onUpdate(item.id, { presetId: e.target.value })
                 }
-                className="mb-2 w-full rounded border bg-stone-900 px-2 py-1.5 text-[11px] text-stone-200 focus:border-amber-500"
-                style={{ borderColor: "#44403c" }}
+                className="mb-2 w-full rounded border bg-white px-2 py-1.5 text-[11px] text-stone-800 focus:border-orange-500"
+                style={{ borderColor: "#ddd5c6" }}
                 aria-label={`Headline ${idx + 1} visual style`}
               >
                 {HEADLINE_PRESETS.map((p) => (
@@ -2842,7 +2876,7 @@ function HeadlineSection({
 
               {/* v1.17 Stack Text: Layout picker (geometry of the lines) */}
               <label
-                className="mb-0.5 block text-[10px] font-medium text-stone-400"
+                className="mb-0.5 block text-[10px] font-medium text-stone-500"
                 htmlFor={`stack-layout-${item.id}`}
               >
                 Layout
@@ -2855,8 +2889,8 @@ function HeadlineSection({
                     stackLayout: e.target.value as StackLayoutId,
                   })
                 }
-                className="mb-2 w-full rounded border bg-stone-900 px-2 py-1.5 text-[11px] text-stone-200 focus:border-amber-500"
-                style={{ borderColor: "#44403c" }}
+                className="mb-2 w-full rounded border bg-white px-2 py-1.5 text-[11px] text-stone-800 focus:border-orange-500"
+                style={{ borderColor: "#ddd5c6" }}
                 aria-label={`Headline ${idx + 1} layout`}
               >
                 {STACK_LAYOUTS.map((l) => (
@@ -2868,7 +2902,7 @@ function HeadlineSection({
 
               {/* v1.17 Stack Text: Style picker (8 kinetic + 4 simple) */}
               <label
-                className="mb-0.5 block text-[10px] font-medium text-stone-400"
+                className="mb-0.5 block text-[10px] font-medium text-stone-500"
                 htmlFor={`stack-style-${item.id}`}
               >
                 Style
@@ -2892,8 +2926,8 @@ function HeadlineSection({
                     });
                   }
                 }}
-                className="mb-1.5 w-full rounded border bg-stone-900 px-2 py-1.5 text-[11px] text-stone-200 focus:border-amber-500"
-                style={{ borderColor: "#44403c" }}
+                className="mb-1.5 w-full rounded border bg-white px-2 py-1.5 text-[11px] text-stone-800 focus:border-orange-500"
+                style={{ borderColor: "#ddd5c6" }}
                 aria-label={`Headline ${idx + 1} animation style`}
               >
                 <optgroup label="Kinetic">
@@ -2938,7 +2972,7 @@ function HeadlineSection({
                     onChange={(e) =>
                       onUpdate(item.id, { sizeScale: Number(e.target.value) })
                     }
-                    className="w-full accent-amber-400"
+                    className="w-full accent-orange-600"
                     aria-label={`Headline ${idx + 1} size`}
                   />
                 </Field>
@@ -2952,10 +2986,10 @@ function HeadlineSection({
       <button
         type="button"
         onClick={onAdd}
-        className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed py-2 text-[11px] font-medium transition-all hover:border-amber-500/50 hover:bg-amber-500/5"
-        style={{ borderColor: "#44403c", color: "#d6d3d1" }}
+        className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-dashed py-2 text-[11px] font-medium transition-all hover:border-orange-300 hover:bg-orange-50"
+        style={{ borderColor: "#ddd5c6", color: "#44403c" }}
       >
-        <Plus size={13} className="text-amber-400" /> Add title
+        <Plus size={13} className="text-orange-600" /> Add title
       </button>
     </Section>
   );
@@ -3215,11 +3249,11 @@ function CaptionsSection(props: CaptionsSectionProps) {
       {/* ── Whisper generation ── */}
       <div
         className="mb-4 rounded-lg border p-3"
-        style={{ borderColor: "#292524", backgroundColor: "#1c1917" }}
+        style={{ borderColor: "#e8e1d4", backgroundColor: "#ffffff" }}
       >
         <div className="mb-2 flex items-center gap-1.5">
-          <Sparkles size={12} className="text-amber-400" />
-          <span className="text-[11px] font-semibold text-stone-200">
+          <Sparkles size={12} className="text-orange-600" />
+          <span className="text-[11px] font-semibold text-stone-800">
             AI Captions (Whisper)
           </span>
         </div>
@@ -3227,7 +3261,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
         {/* ── v1.15/v1.20: Speech-to-text ENGINE — Groq Cloud (only) ── */}
         <div
           className="mb-2.5 rounded-lg border p-2.5"
-          style={{ borderColor: "#44403c", backgroundColor: "#151310" }}
+          style={{ borderColor: "#e8e1d4", backgroundColor: "#faf7f1" }}
         >
           <div className="mb-1.5 flex items-center justify-between">
             <span className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">
@@ -3235,7 +3269,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
             </span>
             {groqCfg?.hasKey && (
               <span
-                className="flex items-center gap-1 text-[10px] font-medium text-emerald-400"
+                className="flex items-center gap-1 text-[10px] font-medium text-emerald-700"
                 title="Groq key saved on this device"
               >
                 <Check size={10} /> Key saved
@@ -3244,13 +3278,13 @@ function CaptionsSection(props: CaptionsSectionProps) {
           </div>
           {/* v1.20: Groq Cloud is the ONLY engine — a fixed badge, no toggle. */}
           <div
-            className="flex items-center justify-center gap-1.5 rounded border border-amber-500/60 bg-amber-500/15 px-2 py-1.5 text-[11px] font-medium text-amber-300"
+            className="flex items-center justify-center gap-1.5 rounded border border-orange-300 bg-orange-100 px-2 py-1.5 text-[11px] font-medium text-orange-700"
             aria-label="Groq Cloud — the only transcription engine"
             title="Groq Cloud — the only transcription engine (cloud transcription with your own free API key)"
           >
             <Cloud size={12} />
             Groq Cloud
-            <span className="rounded-full bg-amber-500/25 px-1.5 py-px text-[8px] font-semibold uppercase">
+            <span className="rounded-full bg-orange-500/20 px-1.5 py-px text-[8px] font-semibold uppercase">
               Only engine
             </span>
           </div>
@@ -3268,10 +3302,10 @@ function CaptionsSection(props: CaptionsSectionProps) {
               ) : groqCfg?.hasKey && !groqKeyEditing ? (
                 <div className="space-y-2">
                   <div className="flex items-center gap-2">
-                    <KeyRound size={11} className="shrink-0 text-amber-400" />
+                    <KeyRound size={11} className="shrink-0 text-orange-600" />
                     <span
-                      className="flex-1 truncate rounded border bg-stone-900 px-2 py-1 font-mono text-[10px] text-stone-300"
-                      style={{ borderColor: "#44403c" }}
+                      className="flex-1 truncate rounded border bg-[#f6f2ea] px-2 py-1 font-mono text-[10px] text-stone-600"
+                      style={{ borderColor: "#e8e1d4" }}
                       title={groqCfg.maskedKey}
                     >
                       {groqCfg.maskedKey}
@@ -3282,8 +3316,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
                       type="button"
                       onClick={testGroqKey}
                       disabled={groqBusy !== ""}
-                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-stone-300 transition-colors hover:bg-stone-800 disabled:cursor-not-allowed disabled:opacity-50"
-                      style={{ borderColor: "#44403c" }}
+                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-stone-700 transition-colors hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-50"
+                      style={{ borderColor: "#ddd5c6" }}
                     >
                       {groqBusy === "test" ? (
                         <Loader2 size={10} className="animate-spin" />
@@ -3299,8 +3333,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
                         setGroqKeyInput("");
                       }}
                       disabled={groqBusy !== ""}
-                      className="rounded border px-2 py-1 text-[10px] font-medium text-stone-300 transition-colors hover:bg-stone-800 disabled:cursor-not-allowed disabled:opacity-50"
-                      style={{ borderColor: "#44403c" }}
+                      className="rounded border px-2 py-1 text-[10px] font-medium text-stone-700 transition-colors hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-50"
+                      style={{ borderColor: "#ddd5c6" }}
                     >
                       Replace
                     </button>
@@ -3308,8 +3342,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
                       type="button"
                       onClick={clearGroqKey}
                       disabled={groqBusy !== ""}
-                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-rose-400/90 transition-colors hover:bg-rose-500/10 hover:border-rose-500/40 disabled:cursor-not-allowed disabled:opacity-50"
-                      style={{ borderColor: "#44403c" }}
+                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-rose-600/90 transition-colors hover:bg-rose-50 hover:border-rose-300 disabled:cursor-not-allowed disabled:opacity-50"
+                      style={{ borderColor: "#ddd5c6" }}
                     >
                       {groqBusy === "clear" ? (
                         <Loader2 size={10} className="animate-spin" />
@@ -3329,8 +3363,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
                     placeholder="gsk_… paste your Groq API key"
                     spellCheck={false}
                     autoComplete="off"
-                    className="w-full rounded border bg-stone-900 px-2 py-1.5 font-mono text-[10px] text-stone-200 placeholder:text-stone-600 focus:border-amber-500/60 focus:outline-none"
-                    style={{ borderColor: "#44403c" }}
+                    className="w-full rounded border bg-white px-2 py-1.5 font-mono text-[10px] text-stone-800 placeholder:text-stone-400 focus:border-orange-500/60 focus:outline-none"
+                    style={{ borderColor: "#ddd5c6" }}
                     aria-label="Groq API key"
                     onKeyDown={(e) => {
                       if (e.key === "Enter") {
@@ -3344,7 +3378,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
                       type="button"
                       onClick={saveGroqKey}
                       disabled={groqBusy !== "" || !groqKeyInput.trim()}
-                      className="flex items-center gap-1 rounded bg-amber-400 px-2.5 py-1 text-[10px] font-semibold text-stone-950 transition-colors hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-40"
+                      className="flex items-center gap-1 rounded bg-orange-500 px-2.5 py-1 text-[10px] font-semibold text-white transition-colors hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       {groqBusy === "save" ? (
                         <Loader2 size={10} className="animate-spin" />
@@ -3360,8 +3394,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
                           setGroqKeyEditing(false);
                           setGroqKeyInput("");
                         }}
-                        className="rounded border px-2 py-1 text-[10px] font-medium text-stone-400 transition-colors hover:bg-stone-800"
-                        style={{ borderColor: "#44403c" }}
+                        className="rounded border px-2 py-1 text-[10px] font-medium text-stone-500 transition-colors hover:bg-stone-100"
+                        style={{ borderColor: "#ddd5c6" }}
                       >
                         Cancel
                       </button>
@@ -3370,7 +3404,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
                       href="https://console.groq.com/keys"
                       target="_blank"
                       rel="noreferrer"
-                      className="ml-auto flex items-center gap-1 text-[10px] font-medium text-amber-400 underline-offset-2 hover:underline"
+                      className="ml-auto flex items-center gap-1 text-[10px] font-medium text-orange-700 underline-offset-2 hover:underline"
                     >
                       Get a free key
                       <ExternalLink size={9} />
@@ -3402,8 +3436,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
                         className={cn(
                           "rounded border px-2 py-1.5 text-[10px] font-medium transition-colors",
                           active
-                            ? "border-amber-500/60 bg-amber-500/15 text-amber-300"
-                            : "border-stone-700 bg-stone-900 text-stone-400 hover:bg-stone-800 hover:text-stone-200",
+                            ? "border-orange-300 bg-orange-100 text-orange-700"
+                            : "border-stone-200 bg-white text-stone-500 hover:bg-stone-50 hover:text-stone-700",
                         )}
                         aria-pressed={active}
                       >
@@ -3424,8 +3458,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
           <select
             value={whisperLanguage}
             onChange={(e) => onWhisperLanguageChange(e.target.value)}
-            className="min-w-0 flex-1 rounded border bg-stone-900 px-2 py-1.5 text-[11px] text-stone-200"
-            style={{ borderColor: "#44403c" }}
+            className="min-w-0 flex-1 rounded border bg-white px-2 py-1.5 text-[11px] text-stone-800 focus:border-orange-500"
+            style={{ borderColor: "#ddd5c6" }}
             aria-label="Whisper language"
           >
             {WHISPER_LANGUAGES.map((l) => (
@@ -3442,8 +3476,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
           className={cn(
             "flex w-full items-center justify-center gap-2 rounded-md px-3 py-2 text-xs font-semibold transition-colors",
             whisperBusy || !hasSpeechSource
-              ? "cursor-not-allowed bg-stone-800 text-stone-500"
-              : "bg-amber-500 text-stone-900 hover:bg-amber-400",
+              ? "cursor-not-allowed bg-stone-100 text-stone-400"
+              : "bg-orange-600 text-white hover:bg-orange-500",
           )}
         >
           {whisperBusy ? (
@@ -3455,9 +3489,9 @@ function CaptionsSection(props: CaptionsSectionProps) {
         </button>
         {whisperProgress && (
           <div className="mt-2">
-            <div className="h-1 w-full overflow-hidden rounded-full bg-stone-800">
+            <div className="h-1 w-full overflow-hidden rounded-full bg-[#eee8dc]">
               <div
-                className="h-full bg-amber-500 transition-all"
+                className="h-full bg-gradient-to-r from-orange-400 to-orange-600 transition-all"
                 style={{ width: `${whisperProgress.progress}%` }}
               />
             </div>
@@ -3484,10 +3518,10 @@ function CaptionsSection(props: CaptionsSectionProps) {
       <div className="mb-3 text-[10px] text-stone-500">
         {subtitles ? (
           <>
-            <span className="text-stone-300">{subtitles.fileName}</span> ·{" "}
+            <span className="text-stone-700">{subtitles.fileName}</span> ·{" "}
             {subtitles.cues.length} cue{subtitles.cues.length === 1 ? "" : "s"}
             {hasWords && (
-              <span className="text-emerald-400"> · word timing ✓</span>
+              <span className="text-emerald-700"> · word timing ✓</span>
             )}
           </>
         ) : (
@@ -3511,15 +3545,15 @@ function CaptionsSection(props: CaptionsSectionProps) {
               value={presetQuery}
               onChange={(e) => setPresetQuery(e.target.value)}
               placeholder="Search 42 presets…"
-              className="w-full rounded-md border bg-stone-900 py-1 pl-6 pr-2 text-[10px] text-stone-200 placeholder:text-stone-600 focus:border-emerald-600/60"
-              style={{ borderColor: "#292524" }}
+              className="w-full rounded-md border bg-white py-1 pl-6 pr-2 text-[10px] text-stone-800 placeholder:text-stone-400 focus:border-orange-500"
+              style={{ borderColor: "#ddd5c6" }}
               aria-label="Search caption presets"
             />
             {presetQuery && (
               <button
                 type="button"
                 onClick={() => setPresetQuery("")}
-                className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-stone-500 hover:text-stone-200"
+                className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-stone-400 hover:text-stone-700"
                 title="Clear search"
               >
                 <X size={10} />
@@ -3530,8 +3564,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
             <select
               value={presetCat}
               onChange={(e) => setPresetCat(e.target.value as typeof presetCat)}
-              className="h-full appearance-none rounded-md border bg-stone-900 pl-2 pr-6 text-[10px] text-stone-200"
-              style={{ borderColor: "#292524" }}
+              className="h-full appearance-none rounded-md border bg-white pl-2 pr-6 text-[10px] text-stone-800 focus:border-orange-500"
+              style={{ borderColor: "#ddd5c6" }}
               aria-label="Filter presets by category"
               title="Filter by category"
             >
@@ -3556,14 +3590,14 @@ function CaptionsSection(props: CaptionsSectionProps) {
         {matchCount === 0 ? (
           <div
             className="rounded-md border border-dashed px-3 py-4 text-center text-[10px] text-stone-500"
-            style={{ borderColor: "#292524" }}
+            style={{ borderColor: "#ddd5c6" }}
           >
             No presets match “{presetQuery.trim()}”
           </div>
         ) : (
           <div
             className="max-h-72 overflow-y-auto rounded-md border"
-            style={{ borderColor: "#292524" }}
+            style={{ borderColor: "#e8e1d4" }}
           >
             {[favGroup, ...filteredCategories]
               .filter((g): g is NonNullable<typeof g> => !!g)
@@ -3571,9 +3605,9 @@ function CaptionsSection(props: CaptionsSectionProps) {
                 <div key={cat.category}>
                   <div
                     className={cn(
-                      "sticky top-0 z-10 bg-[#151310] px-2 py-1 text-[9px] font-bold uppercase tracking-widest",
+                      "sticky top-0 z-10 bg-[#faf7f1] px-2 py-1 text-[9px] font-bold uppercase tracking-widest",
                       cat.category === "favorites"
-                        ? "text-amber-400/90"
+                        ? "text-orange-700/90"
                         : "text-stone-500",
                     )}
                     title={cat.hint}
@@ -3590,7 +3624,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
                         onClick={() => onApplyPreset(p.id)}
                         className={cn(
                           "flex w-full items-center gap-2 px-2 py-1.5 text-left transition-colors",
-                          active ? "bg-emerald-500/15" : "hover:bg-white/5",
+                          active ? "bg-emerald-50" : "hover:bg-stone-50",
                         )}
                         aria-pressed={active}
                       >
@@ -3625,10 +3659,10 @@ function CaptionsSection(props: CaptionsSectionProps) {
                           Quick fox
                         </span>
                         <span className="min-w-0 flex-1">
-                          <span className="block truncate text-[11px] font-medium text-stone-200">
+                          <span className="block truncate text-[11px] font-medium text-stone-800">
                             {p.name}
                             {p.animation && p.animation !== "none" && (
-                              <span className="ml-1 text-[9px] text-emerald-400">
+                              <span className="ml-1 text-[9px] text-emerald-700">
                                 ✦
                               </span>
                             )}
@@ -3670,8 +3704,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
                           className={cn(
                             "shrink-0 rounded p-0.5 transition-all duration-150 hover:scale-125 active:scale-95",
                             fav
-                              ? "text-amber-400"
-                              : "text-stone-600 hover:text-amber-400/70",
+                              ? "text-orange-500"
+                              : "text-stone-400 hover:text-orange-500/70",
                           )}
                         >
                           <Star
@@ -3750,14 +3784,14 @@ function CaptionsSection(props: CaptionsSectionProps) {
         >
           <div
             className="max-h-56 overflow-y-auto rounded-md border"
-            style={{ borderColor: "#292524" }}
+            style={{ borderColor: "#e8e1d4" }}
           >
             {[
               { id: "classic", label: "Classic" },
               { id: "viral", label: "Viral pack ✦" },
             ].map((grp) => (
               <div key={grp.id}>
-                <div className="sticky top-0 z-10 bg-[#151310] px-2 py-1 text-[9px] font-bold uppercase tracking-widest text-stone-500">
+                <div className="sticky top-0 z-10 bg-[#faf7f1] px-2 py-1 text-[9px] font-bold uppercase tracking-widest text-stone-500">
                   {grp.label}
                 </div>
                 <div className="grid grid-cols-2 gap-1 p-1">
@@ -3780,8 +3814,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
                         className={cn(
                           "rounded px-1.5 py-1.5 text-left text-[10px] font-medium transition-colors",
                           active
-                            ? "bg-emerald-500/20 text-emerald-300 ring-1 ring-emerald-500/40"
-                            : "bg-stone-800/50 text-stone-400 hover:bg-white/5",
+                            ? "bg-emerald-100 text-emerald-700 ring-1 ring-emerald-600/30"
+                            : "bg-stone-100 text-stone-500 hover:bg-stone-200",
                         )}
                         aria-pressed={active}
                       >
@@ -3800,7 +3834,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
             <button
               type="button"
               onClick={() => set({ animation: null, animationPinned: false })}
-              className="mt-1 flex items-center gap-1 text-[10px] text-stone-500 hover:text-stone-300"
+              className="mt-1 flex items-center gap-1 text-[10px] text-stone-500 hover:text-stone-700"
             >
               <RotateCcw size={10} /> Follow preset default
             </button>
@@ -3842,7 +3876,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
         <div className="flex items-center gap-2">
           <label
             className="relative inline-flex h-7 w-10 cursor-pointer items-center justify-center overflow-hidden rounded border"
-            style={{ borderColor: "#44403c" }}
+            style={{ borderColor: "#ddd5c6" }}
           >
             <input
               type="color"
@@ -3859,14 +3893,14 @@ function CaptionsSection(props: CaptionsSectionProps) {
               }}
             />
           </label>
-          <span className="font-mono text-[10px] text-stone-400">
+          <span className="font-mono text-[10px] text-stone-500">
             {captionSettings.customColor || preset.textColor}
           </span>
           {captionSettings.customColor && (
             <button
               type="button"
               onClick={() => set({ customColor: null })}
-              className="ml-auto flex items-center gap-1 text-[10px] text-stone-500 hover:text-stone-300"
+              className="ml-auto flex items-center gap-1 text-[10px] text-stone-500 hover:text-stone-700"
             >
               <RotateCcw size={10} /> Preset
             </button>
@@ -3893,8 +3927,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
                 className={cn(
                   "flex-1 rounded px-2 py-1.5 text-[10px] font-medium capitalize transition-colors",
                   active
-                    ? "bg-stone-200 text-stone-900"
-                    : "bg-stone-800/60 text-stone-400 hover:bg-white/5",
+                    ? "bg-white text-stone-900 shadow-[0_1px_2px_rgba(87,66,27,0.08)]"
+                    : "bg-stone-100 text-stone-500 hover:bg-stone-200",
                 )}
                 aria-pressed={active}
               >
@@ -3910,7 +3944,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
           <button
             type="button"
             onClick={() => set({ customPosition: null })}
-            className="mt-1 flex items-center gap-1 text-[10px] text-stone-500 hover:text-stone-300"
+            className="mt-1 flex items-center gap-1 text-[10px] text-stone-500 hover:text-stone-700"
           >
             <RotateCcw size={10} /> Preset position
           </button>
@@ -3929,7 +3963,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
           step={0.05}
           value={captionSettings.fontSizeScale}
           onChange={(e) => set({ fontSizeScale: Number(e.target.value) })}
-          className="w-full accent-emerald-500"
+          className="w-full accent-emerald-600"
           aria-label="Caption font size scale"
         />
       </Field>
@@ -3957,8 +3991,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
             className={cn(
               "flex items-center justify-center gap-1 rounded px-2 py-1.5 text-[10px] font-semibold transition-colors",
               hasCues
-                ? "bg-stone-800 text-stone-200 hover:bg-stone-700"
-                : "cursor-not-allowed bg-stone-800/50 text-stone-600",
+                ? "bg-stone-100 text-stone-700 hover:bg-stone-200"
+                : "cursor-not-allowed bg-stone-100/60 text-stone-400",
             )}
           >
             <FileText size={11} /> .srt
@@ -3971,8 +4005,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
             className={cn(
               "flex items-center justify-center gap-1 rounded px-2 py-1.5 text-[10px] font-semibold transition-colors",
               hasCues
-                ? "bg-stone-800 text-stone-200 hover:bg-stone-700"
-                : "cursor-not-allowed bg-stone-800/50 text-stone-600",
+                ? "bg-stone-100 text-stone-700 hover:bg-stone-200"
+                : "cursor-not-allowed bg-stone-100/60 text-stone-400",
             )}
           >
             <FileText size={11} /> .vtt
@@ -3989,8 +4023,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
             className={cn(
               "flex items-center justify-center gap-1 rounded px-2 py-1.5 text-[10px] font-semibold transition-colors",
               hasCues && inElectron
-                ? "bg-stone-800 text-stone-200 hover:bg-stone-700"
-                : "cursor-not-allowed bg-stone-800/50 text-stone-600",
+                ? "bg-stone-100 text-stone-700 hover:bg-stone-200"
+                : "cursor-not-allowed bg-stone-100/60 text-stone-400",
             )}
           >
             <FileDown size={11} /> .ass
@@ -4007,8 +4041,8 @@ function CaptionsSection(props: CaptionsSectionProps) {
             className={cn(
               "flex items-center justify-center gap-1 rounded px-2 py-1.5 text-[10px] font-semibold transition-colors",
               hasWords
-                ? "bg-stone-800 text-stone-200 hover:bg-stone-700"
-                : "cursor-not-allowed bg-stone-800/50 text-stone-600",
+                ? "bg-stone-100 text-stone-700 hover:bg-stone-200"
+                : "cursor-not-allowed bg-stone-100/60 text-stone-400",
             )}
           >
             <AudioLines size={11} /> words .vtt
@@ -4223,10 +4257,10 @@ function KineticPresetTile(props: KineticPresetTileProps) {
       aria-pressed={selected}
       title={`${preset.name} — ${preset.description}`}
       className={cn(
-        "rounded-lg border bg-stone-900/80 p-1.5 text-left transition-colors",
+        "rounded-lg border bg-white p-1.5 text-left transition-colors",
         selected
           ? "border-cyan-400 shadow-[0_0_12px_rgba(34,211,238,0.3)]"
-          : "border-stone-800 hover:border-stone-600",
+          : "border-stone-200 hover:border-stone-300",
         disabled && "cursor-not-allowed",
       )}
     >
@@ -4236,7 +4270,7 @@ function KineticPresetTile(props: KineticPresetTileProps) {
         style={{ height: KINETIC_TILE_CANVAS_H, backgroundColor: "#0a0a0c" }}
         aria-hidden="true"
       />
-      <span className="mt-1 block truncate text-[11px] leading-tight text-stone-300">
+      <span className="mt-1 block truncate text-[11px] leading-tight text-stone-700">
         {preset.name}
       </span>
     </button>
@@ -4297,7 +4331,7 @@ function KineticPresetGallery(props: KineticPresetGalleryProps) {
           "@container max-h-[26rem] overflow-y-auto rounded-lg border p-1.5",
           !hasWords && "pointer-events-none opacity-50",
         )}
-        style={{ borderColor: "#292524" }}
+        style={{ borderColor: "#e8e1d4" }}
         role="group"
         aria-label="Kinetic typography design library"
       >
@@ -4309,10 +4343,10 @@ function KineticPresetGallery(props: KineticPresetGalleryProps) {
           aria-pressed={autoSelected}
           title="The engine scores all 24 presets for every composition — semantic fit, intensity, style memory"
           className={cn(
-            "flex w-full items-center gap-2.5 rounded-lg border bg-stone-900/80 p-2 text-left transition-colors",
+            "flex w-full items-center gap-2.5 rounded-lg border bg-white p-2 text-left transition-colors",
             autoSelected
-              ? "border-amber-400 shadow-[0_0_12px_rgba(251,191,36,0.25)]"
-              : "border-stone-800 hover:border-stone-600",
+              ? "border-orange-500 shadow-[0_0_12px_rgba(234,88,12,0.25)]"
+              : "border-stone-200 hover:border-stone-300",
             !hasWords && "cursor-not-allowed",
           )}
         >
@@ -4320,14 +4354,14 @@ function KineticPresetGallery(props: KineticPresetGalleryProps) {
             className={cn(
               "flex size-9 shrink-0 items-center justify-center rounded-md border",
               autoSelected
-                ? "border-amber-400/60 text-amber-300"
-                : "border-stone-700 text-stone-400",
+                ? "border-orange-200 bg-orange-50 text-orange-600"
+                : "border-stone-200 text-stone-500",
             )}
           >
             <Shuffle size={16} />
           </span>
           <span className="min-w-0 flex-1">
-            <span className="block text-[11px] font-medium leading-tight text-stone-200">
+            <span className="block text-[11px] font-medium leading-tight text-stone-800">
               Auto mix
             </span>
             <span className="block truncate text-[10px] leading-tight text-stone-500">
@@ -4514,7 +4548,7 @@ function KineticTypographySection(props: KineticTypographySectionProps) {
   return (
     <div
       className="mb-3 rounded-lg border p-2.5"
-      style={{ borderColor: "#292524", backgroundColor: "#1c1917" }}
+      style={{ borderColor: "#e8e1d4", backgroundColor: "#ffffff" }}
     >
       {/* ── Engine switch ── */}
       <Toggle
@@ -4550,7 +4584,7 @@ function KineticTypographySection(props: KineticTypographySectionProps) {
             onSelectAuto={() => setKinetic({ mode: "auto" })}
           />
           {!hasWords && (
-            <p className="-mt-2 mb-3 text-[10px] leading-relaxed text-amber-400/90">
+            <p className="-mt-2 mb-3 text-[10px] leading-relaxed text-orange-700/90">
               Generate captions with word timing (transcribe your audio) to
               unlock kinetic typography.
             </p>
@@ -4603,7 +4637,7 @@ function KineticTypographySection(props: KineticTypographySectionProps) {
             >
               <div
                 className="max-h-64 overflow-y-auto rounded-md border"
-                style={{ borderColor: "#292524" }}
+                style={{ borderColor: "#e8e1d4" }}
               >
                 {KINETIC_PRESETS.map((p) => {
                   const entry = kinetic.manualMix.find(
@@ -4612,17 +4646,17 @@ function KineticTypographySection(props: KineticTypographySectionProps) {
                   return (
                     <div
                       key={p.id}
-                      className="flex items-center gap-2 bg-stone-800/50 px-2 py-1.5"
+                      className="flex items-center gap-2 bg-stone-50 px-2 py-1.5"
                     >
                       <input
                         type="checkbox"
                         checked={!!entry}
                         onChange={() => toggleMixPreset(p.id)}
-                        className="size-3 shrink-0 accent-emerald-500"
+                        className="size-3 shrink-0 accent-emerald-600"
                         aria-label={`Include ${p.name} in the style mix`}
                       />
                       <span
-                        className="min-w-0 flex-1 truncate text-[11px] text-stone-200"
+                        className="min-w-0 flex-1 truncate text-[11px] text-stone-800"
                         title={p.description}
                       >
                         {p.name}
@@ -4639,8 +4673,8 @@ function KineticTypographySection(props: KineticTypographySectionProps) {
                         onChange={(e) =>
                           setMixWeight(p.id, Number(e.target.value))
                         }
-                        className="w-14 rounded border bg-stone-900 px-1.5 py-1 text-[10px] tabular-nums text-stone-200 disabled:opacity-40"
-                        style={{ borderColor: "#44403c" }}
+                        className="w-14 rounded border bg-white px-1.5 py-1 text-[10px] tabular-nums text-stone-800 disabled:opacity-40"
+                        style={{ borderColor: "#ddd5c6" }}
                         aria-label={`${p.name} weight`}
                         title="Preference weight 0-100"
                       />
@@ -4803,8 +4837,8 @@ function KineticTypographySection(props: KineticTypographySectionProps) {
                     ),
                   })
                 }
-                className="w-24 rounded border bg-stone-900 px-1.5 py-1 text-[10px] tabular-nums text-stone-200"
-                style={{ borderColor: "#44403c" }}
+                className="w-24 rounded border bg-white px-1.5 py-1 text-[10px] tabular-nums text-stone-800"
+                style={{ borderColor: "#ddd5c6" }}
                 aria-label="Kinetic engine seed"
               />
               <button
@@ -4814,8 +4848,8 @@ function KineticTypographySection(props: KineticTypographySectionProps) {
                     seed: 1 + Math.floor(Math.random() * 999999),
                   })
                 }
-                className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-stone-300 transition-colors hover:bg-stone-800"
-                style={{ borderColor: "#44403c" }}
+                className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-stone-700 transition-colors hover:bg-stone-100"
+                style={{ borderColor: "#ddd5c6" }}
                 aria-label="Randomize seed"
                 title="Randomize seed"
               >
@@ -4831,7 +4865,7 @@ function KineticTypographySection(props: KineticTypographySectionProps) {
           >
             <div
               className="overflow-hidden rounded-lg border"
-              style={{ borderColor: "#292524" }}
+              style={{ borderColor: "#e8e1d4" }}
             >
               <canvas
                 ref={canvasRef}
@@ -4847,7 +4881,7 @@ function KineticTypographySection(props: KineticTypographySectionProps) {
             <p className="mt-1 truncate text-[10px] text-stone-500">
               {previewInfo ? (
                 <>
-                  <span className="text-stone-300">{previewInfo.name}</span> ·{" "}
+                  <span className="text-stone-700">{previewInfo.name}</span> ·{" "}
                   {previewInfo.family} · {previewInfo.classification} ·
                   intensity {previewInfo.intensity}
                 </>
@@ -5056,7 +5090,7 @@ function VoiceoverSection({
   }, [text, voice, ratePct, pitchHz, volume, onAddVoiceover]);
 
   const selectCls =
-    "w-full rounded border bg-stone-900 px-2 py-1.5 text-[11px] text-stone-200 focus:border-amber-500";
+    "w-full rounded border bg-white px-2 py-1.5 text-[11px] text-stone-800 focus:border-orange-500";
 
   return (
     <Section icon={<Mic size={13} />} title="Voiceover (TTS)" defaultOpen={false}>
@@ -5065,20 +5099,20 @@ function VoiceoverSection({
         onChange={(e) => setText(e.target.value)}
         rows={3}
         placeholder="Narration text — one clip is placed at the playhead."
-        className="mb-2 w-full resize-y rounded border bg-stone-900 px-2 py-1.5 text-[11px] text-stone-200 placeholder:text-stone-600 focus:border-amber-500 focus:outline-none"
-        style={{ borderColor: "#44403c" }}
+        className="mb-2 w-full resize-y rounded border bg-white px-2 py-1.5 text-[11px] text-stone-800 placeholder:text-stone-400 focus:border-orange-500 focus:outline-none"
+        style={{ borderColor: "#ddd5c6" }}
         aria-label="Narration text"
       />
       <div className="mb-2 grid grid-cols-2 gap-1.5">
         <div>
-          <label className="mb-0.5 block text-[10px] font-medium text-stone-400">
+          <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
             Language
           </label>
           <select
             value={locale}
             onChange={(e) => changeLocale(e.target.value)}
             className={selectCls}
-            style={{ borderColor: "#44403c" }}
+            style={{ borderColor: "#ddd5c6" }}
             aria-label="Voiceover language"
           >
             {locales.length === 0 && <option value={locale}>{locale}</option>}
@@ -5090,7 +5124,7 @@ function VoiceoverSection({
           </select>
         </div>
         <div>
-          <label className="mb-0.5 block text-[10px] font-medium text-stone-400">
+          <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
             Voice
           </label>
           <div className="flex items-center gap-1">
@@ -5098,7 +5132,7 @@ function VoiceoverSection({
               value={voice}
               onChange={(e) => setVoice(e.target.value)}
               className={cn(selectCls, "flex-1")}
-              style={{ borderColor: "#44403c" }}
+              style={{ borderColor: "#ddd5c6" }}
               aria-label="Voiceover voice"
             >
               {localeVoices.length === 0 && <option value={voice}>{voice}</option>}
@@ -5113,8 +5147,8 @@ function VoiceoverSection({
               onClick={() => void playPreview()}
               disabled={previewBusy || !voice}
               title="Listen to this voice before using it"
-              className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded border text-amber-300 transition-colors hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-40"
-              style={{ borderColor: "#44403c" }}
+              className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded border text-orange-600 transition-colors hover:bg-orange-50 disabled:cursor-not-allowed disabled:opacity-40"
+              style={{ borderColor: "#ddd5c6" }}
               aria-label="Preview voice"
             >
               {previewBusy ? (
@@ -5135,7 +5169,7 @@ function VoiceoverSection({
             step={5}
             value={ratePct}
             onChange={(e) => setRatePct(Number(e.target.value))}
-            className="w-full accent-amber-400"
+            className="w-full accent-orange-600"
             aria-label="Speech rate"
           />
         </Field>
@@ -5147,7 +5181,7 @@ function VoiceoverSection({
             step={2}
             value={pitchHz}
             onChange={(e) => setPitchHz(Number(e.target.value))}
-            className="w-full accent-amber-400"
+            className="w-full accent-orange-600"
             aria-label="Pitch"
           />
         </Field>
@@ -5159,7 +5193,7 @@ function VoiceoverSection({
             step={5}
             value={Math.round(volume * 100)}
             onChange={(e) => setVolume(Number(e.target.value) / 100)}
-            className="w-full accent-amber-400"
+            className="w-full accent-orange-600"
             aria-label="Voiceover volume"
           />
         </Field>
@@ -5168,7 +5202,7 @@ function VoiceoverSection({
         type="button"
         onClick={() => void addVoiceover()}
         disabled={busy || !text.trim()}
-        className="flex w-full items-center justify-center gap-1.5 rounded bg-amber-400 px-2.5 py-1.5 text-[11px] font-semibold text-stone-950 transition-colors hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-40"
+        className="flex w-full items-center justify-center gap-1.5 rounded bg-orange-500 px-2.5 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-40"
       >
         {busy ? (
           <>
@@ -5409,7 +5443,7 @@ function DubSection(props: DubSectionProps) {
   );
 
   const selectCls =
-    "w-full rounded border bg-stone-900 px-2 py-1.5 text-[11px] text-stone-200 focus:border-amber-500";
+    "w-full rounded border bg-white px-2 py-1.5 text-[11px] text-stone-800 focus:border-orange-500";
   const startDisabled =
     dubBusy ||
     dubSourceCount === 0 ||
@@ -5419,14 +5453,14 @@ function DubSection(props: DubSectionProps) {
     <Section icon={<Languages size={13} />} title="Translate & Dub" defaultOpen={false}>
       <div className="mb-2 grid grid-cols-2 gap-1.5">
         <div>
-          <label className="mb-0.5 block text-[10px] font-medium text-stone-400">
+          <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
             Dub into
           </label>
           <select
             value={dubSettings.targetLanguage}
             onChange={(e) => changeLanguage(e.target.value)}
             className={selectCls}
-            style={{ borderColor: "#44403c" }}
+            style={{ borderColor: "#ddd5c6" }}
             aria-label="Target dub language"
           >
             {languages.length === 0 && (
@@ -5442,7 +5476,7 @@ function DubSection(props: DubSectionProps) {
           </select>
         </div>
         <div>
-          <label className="mb-0.5 block text-[10px] font-medium text-stone-400">
+          <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
             AI model provider
           </label>
           <div className="grid grid-cols-2 gap-1" role="group" aria-label="Dub AI model provider">
@@ -5455,8 +5489,8 @@ function DubSection(props: DubSectionProps) {
               className={cn(
                 "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
                 (dubSettings.textProvider ?? "groq") === "groq"
-                  ? "border-amber-500/60 bg-amber-500/15 text-amber-300"
-                  : "border-stone-700 bg-stone-900 text-stone-400 hover:bg-stone-800 hover:text-stone-200",
+                  ? "border-orange-300 bg-orange-100 text-orange-700"
+                  : "border-stone-200 bg-white text-stone-500 hover:bg-stone-50 hover:text-stone-700",
               )}
               aria-pressed={(dubSettings.textProvider ?? "groq") === "groq"}
               title="Groq chat models run the dub's speaker detection + translation (free tier)"
@@ -5472,8 +5506,8 @@ function DubSection(props: DubSectionProps) {
               className={cn(
                 "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
                 dubSettings.textProvider === "gemini"
-                  ? "border-amber-500/60 bg-amber-500/15 text-amber-300"
-                  : "border-stone-700 bg-stone-900 text-stone-400 hover:bg-stone-800 hover:text-stone-200",
+                  ? "border-orange-300 bg-orange-100 text-orange-700"
+                  : "border-stone-200 bg-white text-stone-500 hover:bg-stone-50 hover:text-stone-700",
               )}
               aria-pressed={dubSettings.textProvider === "gemini"}
               title="Gemini models run the dub's speaker detection + translation — needs your Gemini key (Settings → Script Writer)"
@@ -5482,7 +5516,7 @@ function DubSection(props: DubSectionProps) {
             </button>
           </div>
           {dubSettings.textProvider === "gemini" && geminiHasKey === false && (
-            <p className="mt-1 text-[10px] text-amber-400/90">
+            <p className="mt-1 text-[10px] text-orange-700/90">
               No Gemini key saved — add one in Settings → Script Writer (aistudio.google.com/apikey),
               or switch back to Groq.
             </p>
@@ -5492,7 +5526,7 @@ function DubSection(props: DubSectionProps) {
       <div className="mb-2 grid grid-cols-1 gap-1.5">
         {(dubSettings.textProvider ?? "groq") === "gemini" ? (
           <div>
-            <label className="mb-0.5 block text-[10px] font-medium text-stone-400">
+            <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
               Gemini model
             </label>
             <select
@@ -5501,7 +5535,7 @@ function DubSection(props: DubSectionProps) {
                 onDubSettingsChange({ ...dubSettings, geminiModel: e.target.value })
               }
               className={selectCls}
-              style={{ borderColor: "#44403c" }}
+              style={{ borderColor: "#ddd5c6" }}
               aria-label="Gemini dub model"
             >
               {geminiModels.length === 0 && (
@@ -5516,7 +5550,7 @@ function DubSection(props: DubSectionProps) {
           </div>
         ) : (
           <div>
-            <label className="mb-0.5 block text-[10px] font-medium text-stone-400">
+            <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
               Groq model (free tier)
             </label>
             <select
@@ -5525,7 +5559,7 @@ function DubSection(props: DubSectionProps) {
                 onDubSettingsChange({ ...dubSettings, groqModel: e.target.value })
               }
               className={selectCls}
-              style={{ borderColor: "#44403c" }}
+              style={{ borderColor: "#ddd5c6" }}
               aria-label="Groq text model"
             >
               {models.length === 0 && (
@@ -5543,7 +5577,7 @@ function DubSection(props: DubSectionProps) {
       {/* v1.20: voice mode — one narrator for the whole dub vs per-speaker
           voices. Pill styling mirrors the STT engine toggle. */}
       <div className="mb-2">
-        <label className="mb-0.5 block text-[10px] font-medium text-stone-400">
+        <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
           Voice mode
         </label>
         <div className="grid grid-cols-2 gap-1" role="group" aria-label="Voice mode">
@@ -5553,8 +5587,8 @@ function DubSection(props: DubSectionProps) {
             className={cn(
               "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
               singleMode
-                ? "border-amber-500/60 bg-amber-500/15 text-amber-300"
-                : "border-stone-700 bg-stone-900 text-stone-400 hover:bg-stone-800 hover:text-stone-200",
+                ? "border-orange-300 bg-orange-100 text-orange-700"
+                : "border-stone-200 bg-white text-stone-500 hover:bg-stone-50 hover:text-stone-700",
             )}
             aria-pressed={singleMode}
             title="One voice reads every line — speaker detection is skipped"
@@ -5567,8 +5601,8 @@ function DubSection(props: DubSectionProps) {
             className={cn(
               "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
               !singleMode
-                ? "border-amber-500/60 bg-amber-500/15 text-amber-300"
-                : "border-stone-700 bg-stone-900 text-stone-400 hover:bg-stone-800 hover:text-stone-200",
+                ? "border-orange-300 bg-orange-100 text-orange-700"
+                : "border-stone-200 bg-white text-stone-500 hover:bg-stone-50 hover:text-stone-700",
             )}
             aria-pressed={!singleMode}
             title="Detect speakers and alternate female/male voices"
@@ -5579,7 +5613,7 @@ function DubSection(props: DubSectionProps) {
       </div>
       {singleMode ? (
         <div className="mb-2">
-          <label className="mb-0.5 block text-[10px] font-medium text-stone-400">
+          <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
             Dubbing voice
           </label>
           <div className="flex items-center gap-1">
@@ -5589,7 +5623,7 @@ function DubSection(props: DubSectionProps) {
                 onDubSettingsChange({ ...dubSettings, singleVoice: e.target.value })
               }
               className={cn(selectCls, "flex-1")}
-              style={{ borderColor: "#44403c" }}
+              style={{ borderColor: "#ddd5c6" }}
               aria-label="Dubbing voice"
             >
               {localeVoices.length === 0 && (
@@ -5608,8 +5642,8 @@ function DubSection(props: DubSectionProps) {
               onClick={() => void playPreview(singleVoiceValue)}
               disabled={!singleVoiceValue}
               title="Listen to this voice"
-              className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded border text-amber-300 transition-colors hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-40"
-              style={{ borderColor: "#44403c" }}
+              className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded border text-orange-600 transition-colors hover:bg-orange-50 disabled:cursor-not-allowed disabled:opacity-40"
+              style={{ borderColor: "#ddd5c6" }}
               aria-label="Preview dubbing voice"
             >
               <Play size={11} />
@@ -5625,7 +5659,7 @@ function DubSection(props: DubSectionProps) {
           ] as const
         ).map(([label, key]) => (
           <div key={key}>
-            <label className="mb-0.5 block text-[10px] font-medium text-stone-400">
+            <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
               {label}
             </label>
             <div className="flex items-center gap-1">
@@ -5635,7 +5669,7 @@ function DubSection(props: DubSectionProps) {
                   onDubSettingsChange({ ...dubSettings, [key]: e.target.value })
                 }
                 className={cn(selectCls, "flex-1")}
-                style={{ borderColor: "#44403c" }}
+                style={{ borderColor: "#ddd5c6" }}
                 aria-label={label}
               >
                 {localeVoices.length === 0 && (
@@ -5659,8 +5693,8 @@ function DubSection(props: DubSectionProps) {
                 onClick={() => void playPreview(dubSettings[key])}
                 disabled={!dubSettings[key]}
                 title="Listen to this voice"
-                className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded border text-amber-300 transition-colors hover:bg-white/5 disabled:cursor-not-allowed disabled:opacity-40"
-                style={{ borderColor: "#44403c" }}
+                className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded border text-orange-600 transition-colors hover:bg-orange-50 disabled:cursor-not-allowed disabled:opacity-40"
+                style={{ borderColor: "#ddd5c6" }}
                 aria-label={`Preview ${label}`}
               >
                 <Play size={11} />
@@ -5686,7 +5720,7 @@ function DubSection(props: DubSectionProps) {
               originalVolume: Number(e.target.value) / 100,
             })
           }
-          className="w-full accent-amber-400"
+          className="w-full accent-orange-600"
           aria-label="Original audio level under the dub"
         />
       </Field>
@@ -5694,28 +5728,28 @@ function DubSection(props: DubSectionProps) {
       {dubBusy && dubProgress ? (
         <div className="mb-2">
           <div className="mb-1 flex items-center justify-between gap-2">
-            <span className="flex items-center gap-1 text-[10px] text-stone-300">
+            <span className="flex items-center gap-1 text-[10px] text-stone-700">
               <Loader2 size={10} className="animate-spin" /> {dubProgress.status}
             </span>
             <button
               type="button"
               onClick={onCancelDub}
-              className="flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] text-stone-400 transition-colors hover:bg-white/5"
-              style={{ borderColor: "#44403c" }}
+              className="flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] text-stone-600 transition-colors hover:bg-stone-100"
+              style={{ borderColor: "#ddd5c6" }}
             >
               <Square size={9} /> Cancel
             </button>
           </div>
           <div
             className="h-1 w-full overflow-hidden rounded-full"
-            style={{ backgroundColor: "#292524" }}
+            style={{ backgroundColor: "#eee8dc" }}
             role="progressbar"
             aria-valuenow={Math.round(dubProgress.progress)}
             aria-valuemin={0}
             aria-valuemax={100}
           >
             <div
-              className="h-full rounded-full bg-amber-400 transition-all"
+              className="h-full rounded-full bg-gradient-to-r from-orange-400 to-orange-600 transition-all"
               style={{ width: `${Math.max(3, Math.min(100, dubProgress.progress))}%` }}
             />
           </div>
@@ -5732,7 +5766,7 @@ function DubSection(props: DubSectionProps) {
                 ? "Add your free Groq API key in the Captions tab first"
                 : "Transcribe → translate → synthesize a full dub track"
           }
-          className="flex w-full items-center justify-center gap-1.5 rounded bg-amber-400 px-2.5 py-1.5 text-[11px] font-semibold text-stone-950 transition-colors hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-40"
+          className="flex w-full items-center justify-center gap-1.5 rounded bg-orange-500 px-2.5 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-40"
         >
           <Languages size={11} />
           {dubBusy ? "Dubbing…" : "Start dubbing"}
@@ -5740,9 +5774,9 @@ function DubSection(props: DubSectionProps) {
       )}
 
       {dubResult && (
-        <div className="mt-2 rounded border" style={{ borderColor: "#44403c" }}>
+        <div className="mt-2 rounded border" style={{ borderColor: "#ddd5c6" }}>
           <div className="flex items-center justify-between px-2 py-1.5">
-            <span className="text-[10px] font-semibold text-stone-300">
+            <span className="text-[10px] font-semibold text-stone-700">
               {dubResult.speakers.length} speaker
               {dubResult.speakers.length === 1 ? "" : "s"} ·{" "}
               {dubResult.segments.length} segments
@@ -5751,15 +5785,15 @@ function DubSection(props: DubSectionProps) {
               <button
                 type="button"
                 onClick={onApplyDubTrack}
-                className="flex items-center gap-1 rounded bg-amber-400 px-2 py-1 text-[10px] font-semibold text-stone-950 transition-colors hover:bg-amber-300"
+                className="flex items-center gap-1 rounded bg-orange-500 px-2 py-1 text-[10px] font-semibold text-white transition-colors hover:bg-orange-400"
               >
                 <Check size={10} /> Add to timeline
               </button>
               <button
                 type="button"
                 onClick={onDiscardDub}
-                className="flex items-center gap-1 rounded border px-1.5 py-1 text-[10px] text-stone-400 transition-colors hover:bg-white/5"
-                style={{ borderColor: "#44403c" }}
+                className="flex items-center gap-1 rounded border px-1.5 py-1 text-[10px] text-stone-600 transition-colors hover:bg-stone-100"
+                style={{ borderColor: "#ddd5c6" }}
               >
                 <Trash2 size={10} /> Discard
               </button>
@@ -5774,13 +5808,13 @@ function DubSection(props: DubSectionProps) {
               <div
                 key={i}
                 className="mb-1 rounded px-1.5 py-1 text-[10px] leading-relaxed"
-                style={{ backgroundColor: "#1c1917" }}
+                style={{ backgroundColor: "#f6f2ea" }}
               >
                 <span
                   className="mr-1 rounded px-1 py-px font-mono text-[9px] font-semibold"
                   style={{
-                    backgroundColor: s.speaker === 0 ? "#115e59" : "#78350f",
-                    color: "#e7e5e4",
+                    backgroundColor: s.speaker === 0 ? "#ccfbf1" : "#ffedd5",
+                    color: s.speaker === 0 ? "#0f766e" : "#c2410c",
                   }}
                 >
                   S{(s.speaker ?? 0) + 1}

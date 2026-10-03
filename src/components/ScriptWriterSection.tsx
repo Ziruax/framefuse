@@ -360,22 +360,22 @@ export default function ScriptWriterSection() {
   // ── Render ───────────────────────────────────────────────────────────────
 
   const selectCls =
-    "w-full rounded border bg-stone-900 px-2 py-1.5 text-[11px] text-stone-200 focus:border-amber-500 focus:outline-none";
+    "w-full rounded border bg-white px-2 py-1.5 text-[11px] text-stone-800 focus:border-orange-500 focus:outline-none";
   const canUseApi =
     typeof api?.scriptGenerate === "function" && typeof api?.geminiSet === "function";
 
   return (
     // Section card — the exact visual tokens of SettingsPanel's Section
-    // (rounded-lg, 1px #292524 border, #151310 body, uppercase stone-500
+    // (rounded-lg, 1px #e8e1d4 border, #ffffff body, uppercase stone-500
     // header with a rotating chevron).
     <div
       className="mx-2 mb-2 overflow-hidden rounded-lg border"
-      style={{ borderColor: "#292524", backgroundColor: "#151310" }}
+      style={{ borderColor: "#e8e1d4", backgroundColor: "#ffffff" }}
     >
       <button
         type="button"
         onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-2 rounded-none px-3 py-2.5 text-left transition-colors hover:bg-white/5"
+        className="flex w-full items-center gap-2 rounded-none px-3 py-2.5 text-left transition-colors hover:bg-stone-50"
         aria-expanded={open}
       >
         <ChevronDown
@@ -385,7 +385,7 @@ export default function ScriptWriterSection() {
             open ? "rotate-0" : "-rotate-90",
           )}
         />
-        <span className="shrink-0 text-stone-400">
+        <span className="shrink-0 text-stone-500">
           <Sparkles size={13} />
         </span>
         <span className="flex-1 text-xs font-semibold uppercase tracking-wide text-stone-500">
@@ -401,14 +401,14 @@ export default function ScriptWriterSection() {
 
           {/* ── Model picker (two optgroups; Gemini first, default first) ── */}
           <div className="mb-2.5">
-            <label className="mb-0.5 block text-[10px] font-medium text-stone-400">
+            <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
               Model
             </label>
             <select
               value={model}
               onChange={(e) => updatePrefs({ model: e.target.value })}
               className={selectCls}
-              style={{ borderColor: "#44403c" }}
+              style={{ borderColor: "#ddd5c6" }}
               aria-label="Script model"
             >
               <optgroup label="Google Gemini">
@@ -432,7 +432,7 @@ export default function ScriptWriterSection() {
           {selectedIsGemini ? (
             <div
               className="mb-2.5 rounded-lg border p-2.5"
-              style={{ borderColor: "#44403c", backgroundColor: "#151310" }}
+              style={{ borderColor: "#ddd5c6", backgroundColor: "#faf7f1" }}
             >
               <div className="mb-1.5 flex items-center justify-between">
                 <span className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">
@@ -440,7 +440,7 @@ export default function ScriptWriterSection() {
                 </span>
                 {geminiCfg?.hasKey && (
                   <span
-                    className="flex items-center gap-1 text-[10px] font-medium text-emerald-400"
+                    className="flex items-center gap-1 text-[10px] font-medium text-emerald-700"
                     title="Gemini key saved on this device"
                   >
                     <Check size={10} /> Key saved
@@ -454,10 +454,10 @@ export default function ScriptWriterSection() {
               ) : geminiCfg?.hasKey && !geminiKeyEditing ? (
                 <div className="space-y-2">
                   <div className="flex items-center gap-2">
-                    <KeyRound size={11} className="shrink-0 text-amber-400" />
+                    <KeyRound size={11} className="shrink-0 text-orange-600" />
                     <span
-                      className="flex-1 truncate rounded border bg-stone-900 px-2 py-1 font-mono text-[10px] text-stone-300"
-                      style={{ borderColor: "#44403c" }}
+                      className="flex-1 truncate rounded border bg-white px-2 py-1 font-mono text-[10px] text-stone-700"
+                      style={{ borderColor: "#ddd5c6" }}
                       title={geminiCfg.maskedKey}
                     >
                       {geminiCfg.maskedKey}
@@ -468,8 +468,8 @@ export default function ScriptWriterSection() {
                       type="button"
                       onClick={() => void testGeminiKey()}
                       disabled={geminiBusy !== ""}
-                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-stone-300 transition-colors hover:bg-stone-800 disabled:cursor-not-allowed disabled:opacity-50"
-                      style={{ borderColor: "#44403c" }}
+                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-stone-700 transition-colors hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-50"
+                      style={{ borderColor: "#ddd5c6" }}
                     >
                       {geminiBusy === "test" ? (
                         <Loader2 size={10} className="animate-spin" />
@@ -485,8 +485,8 @@ export default function ScriptWriterSection() {
                         setGeminiKeyInput("");
                       }}
                       disabled={geminiBusy !== ""}
-                      className="rounded border px-2 py-1 text-[10px] font-medium text-stone-300 transition-colors hover:bg-stone-800 disabled:cursor-not-allowed disabled:opacity-50"
-                      style={{ borderColor: "#44403c" }}
+                      className="rounded border px-2 py-1 text-[10px] font-medium text-stone-700 transition-colors hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-50"
+                      style={{ borderColor: "#ddd5c6" }}
                     >
                       Replace
                     </button>
@@ -494,8 +494,8 @@ export default function ScriptWriterSection() {
                       type="button"
                       onClick={() => void removeGeminiKey()}
                       disabled={geminiBusy !== ""}
-                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-rose-400/90 transition-colors hover:border-rose-500/40 hover:bg-rose-500/10 disabled:cursor-not-allowed disabled:opacity-50"
-                      style={{ borderColor: "#44403c" }}
+                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-rose-600/90 transition-colors hover:border-rose-500/40 hover:bg-rose-500/10 disabled:cursor-not-allowed disabled:opacity-50"
+                      style={{ borderColor: "#ddd5c6" }}
                     >
                       {geminiBusy === "clear" ? (
                         <Loader2 size={10} className="animate-spin" />
@@ -515,8 +515,8 @@ export default function ScriptWriterSection() {
                     placeholder="AIza… paste your Gemini API key"
                     spellCheck={false}
                     autoComplete="off"
-                    className="w-full rounded border bg-stone-900 px-2 py-1.5 font-mono text-[10px] text-stone-200 placeholder:text-stone-600 focus:border-amber-500/60 focus:outline-none"
-                    style={{ borderColor: "#44403c" }}
+                    className="w-full rounded border bg-white px-2 py-1.5 font-mono text-[10px] text-stone-800 placeholder:text-stone-700 focus:border-orange-400 focus:outline-none"
+                    style={{ borderColor: "#ddd5c6" }}
                     aria-label="Gemini API key"
                     onKeyDown={(e) => {
                       if (e.key === "Enter") {
@@ -530,7 +530,7 @@ export default function ScriptWriterSection() {
                       type="button"
                       onClick={() => void saveGeminiKey()}
                       disabled={geminiBusy !== "" || !geminiKeyInput.trim()}
-                      className="flex items-center gap-1 rounded bg-amber-400 px-2.5 py-1 text-[10px] font-semibold text-stone-950 transition-colors hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-40"
+                      className="flex items-center gap-1 rounded bg-orange-500 px-2.5 py-1 text-[10px] font-semibold text-white transition-colors hover:bg-orange-600 disabled:cursor-not-allowed disabled:opacity-40"
                     >
                       {geminiBusy === "save" ? (
                         <Loader2 size={10} className="animate-spin" />
@@ -543,8 +543,8 @@ export default function ScriptWriterSection() {
                       type="button"
                       onClick={() => void testGeminiKey()}
                       disabled={geminiBusy !== "" || !geminiKeyInput.trim()}
-                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-stone-300 transition-colors hover:bg-stone-800 disabled:cursor-not-allowed disabled:opacity-50"
-                      style={{ borderColor: "#44403c" }}
+                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-stone-700 transition-colors hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-50"
+                      style={{ borderColor: "#ddd5c6" }}
                       title="Check the pasted key before saving"
                     >
                       {geminiBusy === "test" ? (
@@ -561,8 +561,8 @@ export default function ScriptWriterSection() {
                           setGeminiKeyEditing(false);
                           setGeminiKeyInput("");
                         }}
-                        className="rounded border px-2 py-1 text-[10px] font-medium text-stone-400 transition-colors hover:bg-stone-800"
-                        style={{ borderColor: "#44403c" }}
+                        className="rounded border px-2 py-1 text-[10px] font-medium text-stone-500 transition-colors hover:bg-stone-100"
+                        style={{ borderColor: "#ddd5c6" }}
                       >
                         Cancel
                       </button>
@@ -571,7 +571,7 @@ export default function ScriptWriterSection() {
                       href={GEMINI_KEY_URL}
                       target="_blank"
                       rel="noreferrer"
-                      className="ml-auto flex items-center gap-1 text-[10px] font-medium text-amber-400 underline-offset-2 hover:underline"
+                      className="ml-auto flex items-center gap-1 text-[10px] font-medium text-orange-700 underline-offset-2 hover:underline"
                     >
                       Get a free key
                       <ExternalLink size={9} />
@@ -583,20 +583,20 @@ export default function ScriptWriterSection() {
           ) : (
             <div
               className="mb-2.5 flex items-center justify-between gap-2 rounded border px-2.5 py-2"
-              style={{ borderColor: "#44403c", backgroundColor: "#151310" }}
+              style={{ borderColor: "#ddd5c6", backgroundColor: "#faf7f1" }}
             >
               <span className="text-[10px] leading-relaxed text-stone-500">
                 Groq key is managed in Captions → Transcription.
               </span>
               {groqHasKey ? (
                 <span
-                  className="flex shrink-0 items-center gap-1 text-[10px] font-medium text-emerald-400"
+                  className="flex shrink-0 items-center gap-1 text-[10px] font-medium text-emerald-700"
                   title="Groq key saved on this device"
                 >
                   <Check size={10} /> Key saved
                 </span>
               ) : (
-                <span className="shrink-0 text-[10px] font-medium text-amber-400/90">
+                <span className="shrink-0 text-[10px] font-medium text-orange-700/90">
                   No key saved
                 </span>
               )}
@@ -609,22 +609,22 @@ export default function ScriptWriterSection() {
             onChange={(e) => updatePrefs({ prompt: e.target.value })}
             rows={3}
             placeholder="What should the video be about? e.g. 'A 60-second video about why morning sunlight improves sleep'"
-            className="mb-2 w-full resize-y rounded border bg-stone-900 px-2 py-1.5 text-[11px] text-stone-200 placeholder:text-stone-600 focus:border-amber-500 focus:outline-none"
-            style={{ borderColor: "#44403c" }}
+            className="mb-2 w-full resize-y rounded border bg-white px-2 py-1.5 text-[11px] text-stone-800 placeholder:text-stone-700 focus:border-orange-500 focus:outline-none"
+            style={{ borderColor: "#ddd5c6" }}
             aria-label="Script topic prompt"
           />
 
           {/* ── Tone / duration / language ── */}
           <div className="mb-2.5 grid grid-cols-3 gap-1.5">
             <div>
-              <label className="mb-0.5 block text-[10px] font-medium text-stone-400">
+              <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
                 Tone
               </label>
               <select
                 value={prefs.tone}
                 onChange={(e) => updatePrefs({ tone: e.target.value })}
                 className={selectCls}
-                style={{ borderColor: "#44403c" }}
+                style={{ borderColor: "#ddd5c6" }}
                 aria-label="Script tone"
               >
                 {TONES.map((t) => (
@@ -635,7 +635,7 @@ export default function ScriptWriterSection() {
               </select>
             </div>
             <div>
-              <label className="mb-0.5 block text-[10px] font-medium text-stone-400">
+              <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
                 Duration
               </label>
               <select
@@ -644,7 +644,7 @@ export default function ScriptWriterSection() {
                   updatePrefs({ durationSec: Number(e.target.value) })
                 }
                 className={selectCls}
-                style={{ borderColor: "#44403c" }}
+                style={{ borderColor: "#ddd5c6" }}
                 aria-label="Target script duration"
               >
                 {DURATIONS_SEC.map((d) => (
@@ -655,14 +655,14 @@ export default function ScriptWriterSection() {
               </select>
             </div>
             <div>
-              <label className="mb-0.5 block text-[10px] font-medium text-stone-400">
+              <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
                 Language
               </label>
               <select
                 value={prefs.language}
                 onChange={(e) => updatePrefs({ language: e.target.value })}
                 className={selectCls}
-                style={{ borderColor: "#44403c" }}
+                style={{ borderColor: "#ddd5c6" }}
                 aria-label="Script language"
               >
                 {LANGUAGES.map((l) => (
@@ -679,7 +679,7 @@ export default function ScriptWriterSection() {
             type="button"
             onClick={() => void generate()}
             disabled={generating || !canUseApi}
-            className="flex w-full items-center justify-center gap-1.5 rounded bg-amber-400 px-3 py-2 text-[11px] font-semibold text-stone-950 transition-colors hover:bg-amber-300 disabled:cursor-not-allowed disabled:opacity-40"
+            className="flex w-full items-center justify-center gap-1.5 rounded bg-orange-500 px-3 py-2 text-[11px] font-semibold text-white transition-colors hover:bg-orange-600 disabled:cursor-not-allowed disabled:opacity-40"
           >
             {generating ? (
               <Loader2 size={12} className="animate-spin" />
@@ -691,8 +691,8 @@ export default function ScriptWriterSection() {
 
           {error && (
             <p
-              className="mt-2 rounded border px-2 py-1.5 text-[10px] leading-relaxed text-rose-400"
-              style={{ borderColor: "#9f1239", backgroundColor: "#22101a" }}
+              className="mt-2 rounded border px-2 py-1.5 text-[10px] leading-relaxed text-rose-600"
+              style={{ borderColor: "#be123c", backgroundColor: "#fff1f2" }}
               role="alert"
             >
               {error}
@@ -707,8 +707,8 @@ export default function ScriptWriterSection() {
                 onChange={(e) => updatePrefs({ lastScript: e.target.value })}
                 rows={8}
                 aria-label="Generated script (editable)"
-                className="w-full resize-y rounded border bg-stone-900 px-2 py-1.5 text-[11px] leading-relaxed text-stone-200 focus:border-amber-500 focus:outline-none"
-                style={{ borderColor: "#44403c" }}
+                className="w-full resize-y rounded border bg-white px-2 py-1.5 text-[11px] leading-relaxed text-stone-800 focus:border-orange-500 focus:outline-none"
+                style={{ borderColor: "#ddd5c6" }}
               />
               <div className="mt-1 flex items-center justify-between gap-2">
                 <span className="text-[10px] text-stone-500">
@@ -719,11 +719,11 @@ export default function ScriptWriterSection() {
                   type="button"
                   onClick={() => void copyScript()}
                   disabled={!script.trim()}
-                  className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-stone-300 transition-colors hover:bg-stone-800 disabled:cursor-not-allowed disabled:opacity-50"
-                  style={{ borderColor: "#44403c" }}
+                  className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-stone-700 transition-colors hover:bg-stone-100 disabled:cursor-not-allowed disabled:opacity-50"
+                  style={{ borderColor: "#ddd5c6" }}
                 >
                   {copied ? (
-                    <Check size={10} className="text-emerald-400" />
+                    <Check size={10} className="text-emerald-700" />
                   ) : (
                     <Copy size={10} />
                   )}

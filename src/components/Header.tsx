@@ -24,7 +24,7 @@ import { cn } from "@/lib/utils";
 /** v1.12.1: the renderer's build constant — compared against the REAL exe
  *  version (app.getVersion()) so a stale/hybrid install is impossible to
  *  miss. Keep in sync with package.json on every release. */
-const BUILD_VERSION = "1.22.0";
+const BUILD_VERSION = "1.23.0";
 
 export interface LastExport {
   path: string;
@@ -161,8 +161,8 @@ function fmtElapsed(sec: number): string {
 }
 
 /** v1.21: router gate reasons → human words for the engine badge. The raw
- * tokens ("stack-text", "transition:slide-left", …) are developer-speak;
- * users get a plain-language line that says what to change. */
+ *  tokens ("stack-text", "transition:slide-left", …) are developer-speak;
+ *  users get a plain-language line that says what to change. */
 const ENGINE_REASON_HINTS: [RegExp, string][] = [
   [/^kinetic-no-geometry$/, "caption geometry unavailable"],
   [/^stack-text$/, "stack-text headline"],
@@ -180,11 +180,11 @@ function friendlyEngineReason(reason: string): string {
 }
 
 /** Parse an ffmpeg timemark "H:MM:SS.cc" into milliseconds.
- * v1.14.1 (user directive: "NaN:NaN in the frontend"): the v1.2-v1.14.0
- * payloads carried ASS-style comma decimals ("0:00:04,16") — Number() on
- * the comma produced NaN and the progress chip rendered "@ NaN:NaN" on
- * EVERY export. Old-format strings are normalized (comma → dot) and any
- * unparseable input collapses to 0 so a timecode can never render NaN. */
+ *  v1.14.1 (user directive: "NaN:NaN in the frontend"): the v1.2-v1.14.0
+ *  payloads carried ASS-style comma decimals ("0:00:04,16") — Number() on
+ *  the comma produced NaN and the progress chip rendered "@ NaN:NaN" on
+ *  EVERY export. Old-format strings are normalized (comma → dot) and any
+ *  unparseable input collapses to 0 so a timecode can never render NaN. */
 function parseTimemark(tm: string): number {
   const parts = String(tm)
     .replace(",", ".")
@@ -202,7 +202,7 @@ function parseTimemark(tm: string): number {
 }
 
 /** v1.14.2: friendly label for the export pipeline phase the backend
- * reports alongside progress (see ExportProgress.phase). */
+ *  reports alongside progress (see ExportProgress.phase). */
 const PHASE_LABEL: Record<string, string> = {
   prepare: "preparing",
   video: "rendering video",
@@ -280,45 +280,44 @@ export function Header({
     <header
       className="no-select flex h-14 shrink-0 items-center gap-2 border-b px-3 sm:gap-4 sm:px-5"
       style={{
-        borderColor: "#292524",
-        background:
-          "linear-gradient(180deg, #17140f 0%, #0c0a09 100%)",
-        boxShadow: "0 1px 0 rgba(255,255,255,0.03) inset, 0 8px 24px rgba(0,0,0,0.35)",
+        borderColor: "#e8e1d4",
+        background: "rgba(255, 255, 255, 0.82)",
+        backdropFilter: "blur(10px)",
+        WebkitBackdropFilter: "blur(10px)",
+        boxShadow: "0 1px 0 rgba(255,255,255,0.7) inset, 0 6px 20px rgba(87, 66, 27, 0.06)",
       }}
     >
-      {/* Brand — v1.11: friendly, jargon-free ("Multi-Track Video Studio ·
-          Native FFmpeg" told a TikTok editor nothing). */}
+      {/* Brand — v1.23 FLOW: tangerine tile on a bright glass toolbar. */}
       <div className="flex items-center gap-3">
         <div
-          className="flex size-8 shrink-0 items-center justify-center rounded-lg transition-transform duration-200 hover:scale-105"
+          className="flex size-8 shrink-0 items-center justify-center rounded-[10px] transition-transform duration-200 hover:scale-105"
           style={{
-            backgroundImage: "linear-gradient(135deg, #fcd34d 0%, #fbbf24 45%, #f59e0b 100%)",
-            boxShadow: "0 4px 14px rgba(245, 158, 11, 0.35)",
+            backgroundImage: "linear-gradient(135deg, #f06214 0%, #ea580c 55%, #d84e08 100%)",
+            boxShadow: "0 4px 14px rgba(234, 88, 12, 0.35)",
           }}
         >
-          <Film className="size-4" style={{ color: "#1c1917" }} />
+          <Film className="size-4" style={{ color: "#ffffff" }} />
         </div>
         <div className="leading-tight">
           <div className="flex items-center gap-2">
             <span
               className="text-[15px] font-semibold tracking-tight"
-              style={{ color: "#fafaf9" }}
+              style={{ color: "#292524" }}
             >
               FrameFuse
             </span>
-            {/* v1.2: quiet mono version chip (was a violet gradient badge).
-                v1.11: hidden below md (tight headers on small screens).
-                v1.12.1: shows the REAL exe version inside Electron
+            {/* v1.2: quiet mono version chip. Hidden below md. v1.12.1:
+                shows the REAL exe version inside Electron
                 (app.getVersion()) — amber + warning icon when it disagrees
                 with this renderer's build constant (stale/hybrid install). */}
             <span
               className={cn(
-                "hidden items-center gap-1 whitespace-nowrap rounded border px-1.5 py-0.5 font-mono text-[10px] font-medium md:inline-flex",
+                "hidden items-center gap-1 whitespace-nowrap rounded-md border px-1.5 py-0.5 font-mono text-[10px] font-medium md:inline-flex",
               )}
               style={{
-                borderColor: versionStale ? "rgba(245, 158, 11, 0.55)" : "#292524",
-                backgroundColor: versionStale ? "rgba(245, 158, 11, 0.10)" : "#1c1917",
-                color: versionStale ? "#fbbf24" : "#a8a29e",
+                borderColor: versionStale ? "rgba(217, 119, 6, 0.5)" : "#e8e1d4",
+                backgroundColor: versionStale ? "#fef3c7" : "#f6f2ea",
+                color: versionStale ? "#b45309" : "#78716c",
               }}
               title={
                 versionStale
@@ -332,43 +331,42 @@ export function Header({
             {/* v5.1: on-disk project file chip (native save/open sessions). */}
             {projectName && (
               <span
-                className="flex max-w-[220px] items-center gap-1 truncate rounded border px-1.5 py-0.5 text-[10px] font-medium"
+                className="flex max-w-[220px] items-center gap-1 truncate rounded-md border px-1.5 py-0.5 text-[10px] font-medium"
                 style={{
-                  borderColor: "#292524",
-                  backgroundColor: "#1c1917",
-                  color: "#a8a29e",
+                  borderColor: "#e8e1d4",
+                  backgroundColor: "#f6f2ea",
+                  color: "#78716c",
                 }}
                 title={`Saved project — ${projectName}`}
               >
-                <FileJson className="size-2.5 shrink-0 text-stone-500" aria-hidden />
+                <FileJson className="size-2.5 shrink-0 text-stone-400" aria-hidden />
                 <span className="truncate">{projectName}</span>
               </span>
             )}
           </div>
-          <div className="hidden text-[11px] sm:block" style={{ color: "#78716c" }}>
+          <div className="hidden text-[11px] sm:block" style={{ color: "#a8a29e" }}>
             Video Studio
           </div>
         </div>
       </div>
 
-      {/* Mode badge — v1.11: plain-language labels + tooltips ("SEQUENTIAL"
-          read as a processing term, not a timeline layout). Hidden below sm
+      {/* Mode badge — plain-language labels + tooltips. Hidden below sm
           (the mode is visible in the timeline toolbar too). */}
       <div className="ml-2 hidden items-center gap-2 sm:flex">
         {mode ? (
           <span
-            className="flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-[11px] font-semibold"
+            className="flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-semibold"
             style={
               mode === "absolute"
                 ? {
-                    borderColor: "rgba(45, 212, 191, 0.4)",
-                    backgroundColor: "rgba(19, 78, 74, 0.25)",
-                    color: "#5eead4",
+                    borderColor: "rgba(13, 148, 136, 0.4)",
+                    backgroundColor: "#f0fdfa",
+                    color: "#0f766e",
                   }
                 : {
-                    borderColor: "#292524",
-                    backgroundColor: "rgba(41, 37, 36, 0.5)",
-                    color: "#d6d3d1",
+                    borderColor: "#e8e1d4",
+                    backgroundColor: "#f6f2ea",
+                    color: "#57534e",
                   }
             }
             title={
@@ -386,11 +384,11 @@ export function Header({
           </span>
         ) : (
           <span
-            className="rounded-md border px-2.5 py-1 text-[11px] font-semibold"
+            className="rounded-full border px-2.5 py-1 text-[11px] font-semibold"
             style={{
-              borderColor: "#292524",
-              backgroundColor: "#1c1917",
-              color: "#78716c",
+              borderColor: "#e8e1d4",
+              backgroundColor: "#f6f2ea",
+              color: "#a8a29e",
             }}
             title="Import a few clips to build your first timeline"
           >
@@ -398,11 +396,11 @@ export function Header({
           </span>
         )}
         <span
-          className="flex items-center gap-1 rounded-md border px-2 py-1 text-[11px]"
+          className="flex items-center gap-1 rounded-full border px-2 py-1 text-[11px]"
           style={{
-            borderColor: "#292524",
-            backgroundColor: "#1c1917",
-            color: "#a8a29e",
+            borderColor: "#e8e1d4",
+            backgroundColor: "#ffffff",
+            color: "#78716c",
           }}
           title={`${imageCount} clip${imageCount === 1 ? "" : "s"} in the project`}
         >
@@ -413,11 +411,12 @@ export function Header({
 
       <div className="flex-1" />
 
-      {/* Undo / Redo (v4.3) — v5.1: 28px icon-only buttons. v1.11: hidden
-          below sm (keyboard-oriented controls — phones have no Ctrl+Z;
-          this also un-crowds the header so the Export button never
-          truncates). */}
-      <div className="hidden items-center gap-1 rounded-lg border p-0.5 sm:flex" style={{ borderColor: "#292524", backgroundColor: "#17140f" }}>
+      {/* Undo / Redo / shortcuts — a white pill group on the glass toolbar.
+          Hidden below sm (keyboard-oriented controls). */}
+      <div
+        className="hidden items-center gap-1 rounded-[10px] border p-0.5 sm:flex"
+        style={{ borderColor: "#e8e1d4", backgroundColor: "#ffffff", boxShadow: "0 1px 2px rgba(87, 66, 27, 0.06)" }}
+      >
         <button
           type="button"
           onClick={onUndo}
@@ -427,13 +426,13 @@ export function Header({
           className={cn(
             "flex size-7 items-center justify-center rounded-md transition-all active:scale-90",
             canUndo
-              ? "text-stone-300 hover:bg-white/10 hover:text-white"
-              : "cursor-not-allowed text-stone-600 opacity-40",
+              ? "text-stone-600 hover:bg-stone-100 hover:text-stone-900"
+              : "cursor-not-allowed text-stone-300 opacity-50",
           )}
         >
           <Undo2 className="size-4" />
         </button>
-        <div className="h-4 w-px" style={{ backgroundColor: "#292524" }} />
+        <div className="h-4 w-px" style={{ backgroundColor: "#eee8dc" }} />
         <button
           type="button"
           onClick={onRedo}
@@ -443,20 +442,20 @@ export function Header({
           className={cn(
             "flex size-7 items-center justify-center rounded-md transition-all active:scale-90",
             canRedo
-              ? "text-stone-300 hover:bg-white/10 hover:text-white"
-              : "cursor-not-allowed text-stone-600 opacity-40",
+              ? "text-stone-600 hover:bg-stone-100 hover:text-stone-900"
+              : "cursor-not-allowed text-stone-300 opacity-50",
           )}
         >
           <Redo2 className="size-4" />
         </button>
         {/* v1.2: shortcuts overlay toggle */}
-        <div className="h-4 w-px" style={{ backgroundColor: "#292524" }} />
+        <div className="h-4 w-px" style={{ backgroundColor: "#eee8dc" }} />
         <button
           type="button"
           onClick={onShowShortcuts}
           title="Keyboard shortcuts (?)"
           aria-label="Keyboard shortcuts"
-          className="flex size-7 items-center justify-center rounded-md text-stone-400 transition-all hover:bg-white/10 hover:text-white active:scale-90"
+          className="flex size-7 items-center justify-center rounded-md text-stone-500 transition-all hover:bg-stone-100 hover:text-stone-800 active:scale-90"
         >
           <Keyboard className="size-4" />
         </button>
@@ -465,15 +464,14 @@ export function Header({
       {/* Export progress (when exporting) — v1.11: percent always visible;
           fps/timemark/ETA and the wider bar join at sm.
           v1.14.2 (user directive: "not getting exact time"): the ETA is now
-          ALWAYS visible (it was hidden below sm and only unlocked after 4%
-          + 5 s — on fast exports it never appeared at all), with an
-          explicit "estimating…" state, the timeline position "@ 00:12 /
-          00:42", the live phase, and the overall ×-realtime rate. */}
+          ALWAYS visible, with an explicit "estimating…" state, the timeline
+          position "@ 00:12 / 00:42", the live phase, and the overall
+          ×-realtime rate. */}
       {isExporting && (
         <div className="flex items-center gap-2 sm:gap-3">
           <div
             className="flex items-center gap-2 text-[11px]"
-            style={{ color: "#a8a29e" }}
+            style={{ color: "#78716c" }}
             title={
               exportProgress?.phase
                 ? `Export phase: ${PHASE_LABEL[exportProgress.phase] ?? exportProgress.phase}`
@@ -482,21 +480,21 @@ export function Header({
           >
             <Timer
               className="size-3.5 animate-pulse"
-              style={{ color: "#fbbf24" }}
+              style={{ color: "#ea580c" }}
             />
             <span
               className="font-mono tabular-nums"
-              style={{ color: "#e7e5e4" }}
+              style={{ color: "#292524" }}
             >
               {pctLabel}%
             </span>
             {exportProgress?.phase && (
-              <span className="hidden sm:inline" style={{ color: "#78716c" }}>
+              <span className="hidden sm:inline" style={{ color: "#a8a29e" }}>
                 {PHASE_LABEL[exportProgress.phase] ?? exportProgress.phase}
               </span>
             )}
             {exportProgress?.timemark ? (
-              <span className="hidden sm:inline" style={{ color: "#78716c" }}>
+              <span className="hidden sm:inline" style={{ color: "#a8a29e" }}>
                 @ {fmtTimecode(parseTimemark(exportProgress.timemark))}
                 {exportProgress?.total
                   ? ` / ${fmtTimecode(exportProgress.total * 1000)}`
@@ -509,7 +507,7 @@ export function Header({
             Number.isFinite(exportProgress.eta) ? (
               <span
                 className="tabular-nums"
-                style={{ color: "#fcd34d" }}
+                style={{ color: "#c2410c", fontWeight: 600 }}
                 title="Estimated time remaining"
               >
                 ETA {fmtElapsed(exportProgress.eta)}
@@ -517,7 +515,7 @@ export function Header({
             ) : (
               <span
                 className="animate-pulse"
-                style={{ color: "#78716c" }}
+                style={{ color: "#a8a29e" }}
                 title="Measuring the encode rate…"
               >
                 estimating…
@@ -527,8 +525,7 @@ export function Header({
                 (wgpu + dlopen'd FFmpeg, no CLI children) or the FFmpeg-CLI
                 Safe Mode pipeline. Honest telemetry, live.
                 v1.20: CLI badges now carry the ROUTING REASON
-                (engineReason) — kinetic captions, stack text, geometric
-                transitions… — so "why is the Rust engine not running" is
+                (engineReason) so "why is the Rust engine not running" is
                 answered on the badge itself instead of a silent swap.
                 v1.21: kinetic typography captions are NATIVE — the badge
                 says "Rust engine" for them too; reasons are human words. */}
@@ -538,13 +535,11 @@ export function Header({
                 style={{
                   borderColor:
                     exportProgress.engine === "rust"
-                      ? "rgba(52, 211, 153, 0.35)"
-                      : "rgba(245, 158, 11, 0.35)",
+                      ? "rgba(5, 150, 105, 0.35)"
+                      : "rgba(217, 119, 6, 0.4)",
                   backgroundColor:
-                    exportProgress.engine === "rust"
-                      ? "rgba(6, 78, 59, 0.25)"
-                      : "rgba(120, 53, 15, 0.18)",
-                  color: exportProgress.engine === "rust" ? "#6ee7b7" : "#a8a29e",
+                    exportProgress.engine === "rust" ? "#ecfdf5" : "#fffbeb",
+                  color: exportProgress.engine === "rust" ? "#047857" : "#a16207",
                 }}
                 title={
                   exportProgress.engine === "rust"
@@ -560,11 +555,7 @@ export function Header({
                   className="size-1.5 shrink-0 rounded-full"
                   style={{
                     backgroundColor:
-                      exportProgress.engine === "rust" ? "#34d399" : "#fbbf24",
-                    boxShadow:
-                      exportProgress.engine === "rust"
-                        ? "0 0 6px rgba(52, 211, 153, 0.8)"
-                        : "0 0 6px rgba(251, 191, 36, 0.8)",
+                      exportProgress.engine === "rust" ? "#10b981" : "#d97706",
                   }}
                   aria-hidden
                 />
@@ -572,7 +563,7 @@ export function Header({
                 {exportProgress.engine !== "rust" && exportProgress.engineReason ? (
                   <span
                     className="ml-1.5"
-                    style={{ color: "#fbbf24" }}
+                    style={{ color: "#b45309" }}
                     title={`Rust engine bypassed: ${friendlyEngineReason(exportProgress.engineReason)} — switch to dissolve/dip transitions and plain (non-stack) headlines to use the native engine.`}
                   >
                     · {friendlyEngineReason(exportProgress.engineReason)}
@@ -581,7 +572,7 @@ export function Header({
               </span>
             ) : null}
             {exportProgress?.fps ? (
-              <span className="hidden sm:inline" style={{ color: "#78716c" }}>
+              <span className="hidden sm:inline" style={{ color: "#a8a29e" }}>
                 {exportProgress.fps.toFixed(0)} fps
               </span>
             ) : exportProgress?.rate != null &&
@@ -589,7 +580,7 @@ export function Header({
               exportProgress.rate > 0 ? (
               <span
                 className="hidden tabular-nums sm:inline"
-                style={{ color: "#78716c" }}
+                style={{ color: "#a8a29e" }}
                 title="Timeline seconds processed per wall-clock second"
               >
                 {exportProgress.rate.toFixed(1)}×
@@ -598,25 +589,25 @@ export function Header({
           </div>
           <div
             className="h-1.5 w-24 overflow-hidden rounded-full sm:w-40"
-            style={{ backgroundColor: "#292524" }}
+            style={{ backgroundColor: "#eee8dc" }}
           >
             <div
               className="h-full rounded-full transition-[width] duration-200"
               style={{
                 width: `${pct}%`,
                 backgroundImage:
-                  "linear-gradient(to right, #fcd34d, #f59e0b)",
+                  "linear-gradient(to right, #f06214, #ea580c)",
               }}
             />
           </div>
           <button
             type="button"
             onClick={onCancel}
-            className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-[12px] font-medium transition-colors"
+            className="flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-[12px] font-medium transition-colors"
             style={{
-              borderColor: "rgba(159, 18, 57, 0.6)",
-              backgroundColor: "rgba(159, 18, 57, 0.35)",
-              color: "#fda4af",
+              borderColor: "rgba(225, 29, 72, 0.35)",
+              backgroundColor: "#fff1f2",
+              color: "#be123c",
             }}
           >
             <X className="size-3.5" /> Cancel
@@ -624,15 +615,15 @@ export function Header({
         </div>
       )}
 
-      {/* Last export summary — v1.11: hidden below md (badge soup on
-          narrow headers; the export toast already reports the result). */}
+      {/* Last export summary — hidden below md (badge soup on narrow
+          headers; the export toast already reports the result). */}
       {!isExporting && lastExport && (
         <div
-          className="hidden shrink-0 items-center gap-2 whitespace-nowrap rounded-md border px-2.5 py-1 text-[11px] md:flex"
+          className="hidden shrink-0 items-center gap-2 whitespace-nowrap rounded-lg border px-2.5 py-1 text-[11px] md:flex"
           style={{
-            borderColor: "#292524",
-            backgroundColor: "rgba(28, 25, 23, 0.6)",
-            color: "#a8a29e",
+            borderColor: "#e8e1d4",
+            backgroundColor: "#ffffff",
+            color: "#78716c",
           }}
           title={
             lastExport.elapsedSec != null
@@ -706,18 +697,18 @@ export function Header({
               : undefined
           }
         >
-          <Clock className="size-3" style={{ color: "#78716c" }} />
-          <span className="font-medium" style={{ color: "#d6d3d1" }}>
+          <Clock className="size-3" style={{ color: "#a8a29e" }} />
+          <span className="font-medium" style={{ color: "#44403c" }}>
             {fmtBytes(lastExport.size)}
           </span>
-          <span style={{ color: "#57534e" }}>·</span>
+          <span style={{ color: "#d6cfc2" }}>·</span>
           <span>{lastExport.method}</span>
           {lastExport.elapsedSec != null && (
             <>
-              <span style={{ color: "#57534e" }}>·</span>
+              <span style={{ color: "#d6cfc2" }}>·</span>
               <span
                 className="flex items-center gap-1 tabular-nums"
-                style={{ color: "#f59e0b" }}
+                style={{ color: "#c2410c" }}
                 title="Wall-clock export time"
               >
                 <Gauge className="size-3" />
@@ -727,15 +718,15 @@ export function Header({
           )}
           {lastExport.totalChunks != null && lastExport.totalChunks > 1 && (
             <>
-              <span style={{ color: "#57534e" }}>·</span>
+              <span style={{ color: "#d6cfc2" }}>·</span>
               <span
                 className="rounded px-1 py-px font-medium"
                 style={{
                   backgroundColor:
                     lastExport.poolWorkers != null && lastExport.poolWorkers > 1
-                      ? "rgba(45, 212, 191, 0.12)"
-                      : "rgba(245, 158, 11, 0.12)",
-                  color: lastExport.poolWorkers != null && lastExport.poolWorkers > 1 ? "#5eead4" : "#fbbf24",
+                      ? "#f0fdfa"
+                      : "#fffbeb",
+                  color: lastExport.poolWorkers != null && lastExport.poolWorkers > 1 ? "#0f766e" : "#b45309",
                 }}
                 title={
                   lastExport.mode === "smart-render"
@@ -760,10 +751,10 @@ export function Header({
           )}
           {lastExport.copiedClips != null && lastExport.copiedClips > 0 && (
             <>
-              <span style={{ color: "#57534e" }}>·</span>
+              <span style={{ color: "#d6cfc2" }}>·</span>
               <span
                 className="rounded px-1 py-px font-medium"
-                style={{ backgroundColor: "rgba(16, 185, 129, 0.12)", color: "#34d399" }}
+                style={{ backgroundColor: "#ecfdf5", color: "#047857" }}
                 title={
                   "Turbo export: these clips were remuxed without decoding or re-encoding" +
                   (lastExport.keyframeCuts
@@ -776,7 +767,7 @@ export function Header({
               </span>
             </>
           )}
-          <span style={{ color: "#57534e" }}>·</span>
+          <span style={{ color: "#d6cfc2" }}>·</span>
           <span>{timeAgo(lastExport.at)}</span>
         </div>
       )}
@@ -784,33 +775,32 @@ export function Header({
       {/* v4.5: live export estimate — what the Export button will produce. */}
       {!isExporting && imageCount > 0 && totalMs > 0 && settings && (
         <div
-          className="hidden shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border px-2.5 py-1 text-[10px] font-medium tabular-nums md:flex"
+          className="hidden shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border px-2.5 py-1 text-[10px] font-medium tabular-nums md:flex"
           style={{
-            borderColor: "rgba(52, 211, 153, 0.25)",
-            backgroundColor: "rgba(6, 78, 59, 0.14)",
-            color: "#6ee7b7",
+            borderColor: "rgba(5, 150, 105, 0.3)",
+            backgroundColor: "#ecfdf5",
+            color: "#047857",
           }}
           title={`${qualityLabel} profile · ${settings.resolution} · ${settings.fps}fps · CRF ${settings.crf ?? 20} — the size is a bitrate cap; CRF encodes usually land smaller`}
         >
           <Gauge className="size-3" />
           {settings.resolution} · {settings.fps}fps · {(totalMs / 1000).toFixed(0)}s
-          <span style={{ color: "#34d399" }}>≲{estLabel}</span>
+          <span style={{ color: "#059669" }}>≲{estLabel}</span>
         </div>
       )}
 
-      {/* Export button — v5.1 CapCut: cyan gradient primary action
-          (hover brightness, desaturated while disabled). v1.11: the method
-          (native FFmpeg vs browser preview) rides the button tooltip — the
-          trailing CPU badge was removed (header badge-soup). */}
+      {/* Export button — v1.23 FLOW: the tangerine primary action (hover
+          brightness, desaturated while disabled). The method rides the
+          button tooltip. */}
       {!isExporting && (
         <button
           type="button"
           onClick={onExport}
           disabled={imageCount === 0}
           className={cn(
-            "ff-btn-export flex h-10 items-center gap-2 rounded-lg px-4 text-[13px] font-semibold transition-all",
+            "ff-btn-export flex h-10 items-center gap-2 rounded-[10px] px-4 text-[13px] font-semibold transition-all",
             "active:scale-[0.97] active:brightness-90",
-            imageCount === 0 && "cursor-not-allowed opacity-50 grayscale",
+            imageCount === 0 && "cursor-not-allowed opacity-40 grayscale",
           )}
           title={
             inElectron

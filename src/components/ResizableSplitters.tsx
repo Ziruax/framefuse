@@ -22,7 +22,7 @@
 //
 // Interaction contract:
 //   • Pointer drag via setPointerCapture — 6px hit gutter, centered 1px line
-//     that glows cyan (#22d3ee) on hover/drag.
+//     that glows tangerine (#ea580c) on hover/drag.
 //   • Snap: within 24px of the default → snap to default (highlighted while
 //     the snap is engaged). Double-click → reset to default.
 //   • Keyboard: arrows ±16px (Shift ±64px), Home = min, End = max,
@@ -259,9 +259,9 @@ export function Splitter({
       onFocus={() => setFocused(true)}
       onBlur={() => setFocused(false)}
     >
-      {/* 1px visible line (stone-700 → cyan on hover/drag — see globals.css) */}
+      {/* 1px visible line (warm gray → tangerine on hover/drag — see globals.css) */}
       <span className="ff-splitter-line" aria-hidden="true" />
-      {/* grip texture: 3 dots, stone-500 */}
+      {/* grip texture: 3 dots, warm gray */}
       <span className="ff-splitter-grip" aria-hidden="true">
         <i />
         <i />

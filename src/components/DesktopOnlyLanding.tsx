@@ -1,304 +1,413 @@
 "use client";
 
-/**
- * v1.14.2 (user directive: "make this desktop app only, no browser, so the
- * aim becomes clear — this is a Windows app"): when the studio is opened in
- * a plain browser (no Electron shell), it renders THIS landing page instead
- * of the editor. FrameFuse is a native Windows desktop application — its
- * export engine spawns real FFmpeg child processes, which a browser page
- * cannot do. The landing states that plainly and points at the installer.
- *
- * The only other thing this page can do is hand the session over to the
- * studio UI ("Launch the Studio") for development/verification — the
- * studio in a browser is a UI preview, exports intentionally refuse to run.
- *
- * v1.22 "Ember Studio" redesign: warm dark studio palette (stone-950 base,
- * amber honey accents), radial amber glow behind the hero, feature-card
- * grid with icon tiles, and a bold amber CTA.
- */
-
-import { useCallback, useState } from "react";
 import {
+  Film,
+  Download,
   ArrowRight,
   Captions,
-  Layers,
-  Mic,
-  MonitorSmartphone,
+  Sparkles,
   PenLine,
-  Rocket,
-  TerminalSquare,
-  Type,
+  Languages,
   Zap,
+  Scissors,
+  MonitorPlay,
+  Play,
 } from "lucide-react";
 
-const RELEASES_URL = "https://github.com/Ziruax/framefuse/releases/latest";
-
-/** Matches the app icon identity (recolored v1.22: warm amber rounded
- * badge, stone play triangle, sprocket dots). Inline so the landing has
- * zero asset deps. */
-function LogoMark({ size = 44 }: { size?: number }) {
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 64 64"
-      role="img"
-      aria-label="FrameFuse logo"
-      className="shrink-0"
-    >
-      <defs>
-        <linearGradient id="ff-landing-badge" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0%" stopColor="#fcd34d" />
-          <stop offset="100%" stopColor="#f59e0b" />
-        </linearGradient>
-      </defs>
-      <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#ff-landing-badge)" />
-      {/* sprocket holes — film reel nod */}
-      <circle cx="15" cy="16" r="2.6" fill="#78350f" />
-      <circle cx="15" cy="32" r="2.6" fill="#78350f" />
-      <circle cx="15" cy="48" r="2.6" fill="#78350f" />
-      <path
-        d="M29 20.5 L47 32 L29 43.5 Z"
-        fill="#1c1917"
-        stroke="#1c1917"
-        strokeWidth="2"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
+interface DesktopOnlyLandingProps {
+  version: string;
+  onEnterPreview: () => void;
 }
 
-const FEATURES: Array<{
-  icon: typeof Zap;
-  title: string;
-  body: string;
-}> = [
-  {
-    icon: Captions,
-    title: "Captions",
-    body: "Groq Whisper transcription with burned-in animated captions — styled, timed, and fully offline after upload.",
-  },
-  {
-    icon: Type,
-    title: "Kinetic typography",
-    body: "24 choreographed caption designs — per-word entrances, emphasis pops and exits that dance with the beat.",
-  },
-  {
-    icon: Mic,
-    title: "AI dubbing",
-    body: "Turn any script into a natural voice track, ducked against your music, in a single click.",
-  },
-  {
-    icon: PenLine,
-    title: "AI script writer",
-    body: "A built-in writer that drafts hooks and scripts for your video, ready to send straight to the dubbing studio.",
-  },
-  {
-    icon: Rocket,
-    title: "Rust GPU export",
-    body: "The native engine composites and encodes on your GPU — smart-rendered exports finish at multiples of realtime.",
-  },
-  {
-    icon: Layers,
-    title: "Multi-track timeline",
-    body: "Video, overlays, music, SFX and voice lanes with drag-trim, multi-select, motion paths and beat snapping.",
-  },
-];
-
+/**
+ * v1.23 FLOW landing — a completely new first-run surface: a bright paper
+ * canvas, a split hero with a CSS-built studio mockup, and a feature bento.
+ * The preview escape hatch ("Launch the Studio") is unchanged behavior —
+ * same handler, same sessionStorage flag.
+ */
 export function DesktopOnlyLanding({
-  version = "1.22.0",
+  version,
   onEnterPreview,
-}: {
-  version?: string;
-  onEnterPreview?: () => void;
-}) {
-  const [previewRequested, setPreviewRequested] = useState(false);
-  const handleEnterPreview = useCallback(() => {
-    if (previewRequested) return;
-    setPreviewRequested(true);
-    onEnterPreview?.();
-  }, [previewRequested, onEnterPreview]);
-
+}: DesktopOnlyLandingProps) {
   return (
-    <div className="relative flex min-h-screen w-full flex-col bg-stone-950 text-stone-200">
-      {/* v1.22: subtle radial amber glow behind the hero */}
-      <div
-        aria-hidden
-        className="pointer-events-none absolute inset-x-0 top-0 h-[560px]"
-        style={{
-          background:
-            "radial-gradient(60% 55% at 50% 0%, rgba(245, 158, 11, 0.10) 0%, rgba(245, 158, 11, 0.03) 45%, rgba(12, 10, 9, 0) 75%)",
-        }}
-      />
-
-      {/* Top bar */}
-      <header className="relative z-10 flex items-center gap-3 px-5 py-4 sm:px-10">
-        <LogoMark size={38} />
-        <div className="min-w-0">
-          <div className="text-[15px] font-semibold leading-tight text-stone-50">FrameFuse</div>
-          <div className="text-[11px] leading-tight text-stone-500">
-            v{version} · Windows desktop app
-          </div>
-        </div>
-        <a
-          href={RELEASES_URL}
-          target="_blank"
-          rel="noreferrer"
-          className="ml-auto hidden items-center gap-1.5 rounded-lg border border-stone-800 bg-stone-900/60 px-3 py-1.5 text-[12px] font-medium text-stone-300 transition-colors hover:bg-stone-800/70 hover:text-stone-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/60 sm:flex"
-        >
-          Releases
-          <ArrowRight className="size-3.5" />
-        </a>
-      </header>
-
-      {/* Hero */}
-      <main className="relative z-10 mx-auto flex w-full max-w-5xl flex-1 flex-col px-5 py-10 sm:px-10 sm:py-16">
-        <div className="mb-6 inline-flex w-fit items-center gap-2 rounded-full border border-amber-500/25 bg-amber-500/10 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.14em] text-amber-300">
-          <MonitorSmartphone className="size-3.5" />
-          Built for Windows — not the browser
-        </div>
-
-        <h1 className="max-w-3xl text-3xl font-bold leading-tight tracking-tight text-stone-50 sm:text-5xl">
-          Make scroll-stopping videos,{" "}
-          <span
+    <div
+      className="flex min-h-screen w-full flex-col"
+      style={{ backgroundColor: "#f4f1ea", color: "#292524" }}
+    >
+      {/* ── Top bar ─────────────────────────────────────────────────── */}
+      <header
+        className="flex h-16 shrink-0 items-center justify-between border-b px-6 sm:px-10"
+        style={{ borderColor: "#e8e1d4" }}
+      >
+        <div className="flex items-center gap-3">
+          <div
+            className="flex size-9 items-center justify-center rounded-[10px]"
             style={{
-              backgroundImage: "linear-gradient(to right, #fcd34d, #fbbf24)",
-              WebkitBackgroundClip: "text",
-              backgroundClip: "text",
-              color: "transparent",
+              backgroundImage: "linear-gradient(135deg, #f06214 0%, #ea580c 55%, #d84e08 100%)",
+              boxShadow: "0 4px 14px rgba(234, 88, 12, 0.3)",
             }}
           >
-            fast
+            <Film className="size-[18px]" style={{ color: "#ffffff" }} />
+          </div>
+          <div className="leading-tight">
+            <div className="text-[15px] font-semibold tracking-tight text-stone-900">
+              FrameFuse
+            </div>
+            <div className="text-[11px] text-stone-400">Video Studio</div>
+          </div>
+          <span
+            className="ml-1 hidden rounded-md border px-1.5 py-0.5 font-mono text-[10px] font-medium text-stone-400 sm:inline-flex"
+            style={{ borderColor: "#e8e1d4", backgroundColor: "#f6f2ea" }}
+          >
+            v{version}
           </span>
-          .
-        </h1>
-
-        <p className="mt-5 max-w-2xl text-[15px] leading-relaxed text-stone-400 sm:text-lg">
-          FrameFuse is a warm little video studio with a cold-fast engine —
-          captions, kinetic typography, AI dubbing and GPU-native export, all
-          in one calm, focused timeline.
-        </p>
-
-        {/* CTA */}
-        <div className="mt-8 flex flex-col gap-3 sm:flex-row sm:items-center">
+        </div>
+        <nav className="flex items-center gap-2">
           <button
             type="button"
-            onClick={handleEnterPreview}
-            disabled={previewRequested || !onEnterPreview}
-            className="flex h-12 items-center justify-center gap-2 rounded-lg bg-amber-400 px-6 text-[14px] font-semibold text-stone-950 shadow-[0_4px_18px_rgba(245,158,11,0.35)] transition-all duration-150 hover:bg-amber-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/60 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
-            title="Open the FrameFuse studio UI in this browser (UI preview — exports run in the Windows app)"
+            onClick={onEnterPreview}
+            className="ff-btn-ghost hidden items-center gap-2 rounded-[10px] px-4 py-2 text-[13px] font-semibold sm:flex"
           >
-            {previewRequested ? "Opening…" : "Launch the Studio"}
-            {!previewRequested && <ArrowRight className="size-4" />}
+            Try the interface
+            <ArrowRight className="size-4" />
           </button>
           <a
-            href={RELEASES_URL}
+            href="https://github.com/Ziruax/framefuse/releases/latest"
             target="_blank"
             rel="noreferrer"
-            className="flex h-12 items-center justify-center gap-2 rounded-lg border border-stone-800 bg-stone-900/60 px-6 text-[14px] font-medium text-stone-300 transition-colors duration-150 hover:bg-stone-800/70 hover:text-stone-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/60"
-            title="Download the FrameFuse installer from the latest GitHub release"
+            className="ff-btn-primary flex items-center gap-2 rounded-[10px] px-4 py-2 text-[13px]"
           >
-            Download for Windows
+            <Download className="size-4" />
+            Get the app
           </a>
-          <div className="flex flex-wrap items-center gap-2 text-[11px] text-stone-500">
-            <span className="rounded-full border border-stone-800 px-2.5 py-1">
-              Windows 10 / 11 · 64-bit
-            </span>
-            <span className="rounded-full border border-stone-800 px-2.5 py-1">
-              FFmpeg bundled
-            </span>
-          </div>
-        </div>
+        </nav>
+      </header>
 
-        {/* Feature grid */}
-        <section aria-label="What the studio includes" className="mt-14">
-          <h2 className="text-[10px] font-semibold uppercase tracking-[0.14em] text-stone-500">
-            Everything in the studio
-          </h2>
-          <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {FEATURES.map((f) => (
-              <div
-                key={f.title}
-                className="rounded-xl border border-stone-800/70 bg-stone-900/60 p-4 transition-colors duration-150 hover:border-amber-500/40 hover:bg-stone-900/80 sm:p-5"
+      {/* ── Hero ────────────────────────────────────────────────────── */}
+      <section
+        className="relative flex flex-1 flex-col items-center overflow-hidden px-6 pb-14 pt-16 sm:px-10 sm:pt-20"
+        style={{
+          backgroundImage:
+            "radial-gradient(900px 480px at 18% 8%, rgba(234, 88, 12, 0.10), transparent 62%)," +
+            "radial-gradient(700px 420px at 88% 0%, rgba(13, 148, 136, 0.08), transparent 60%)",
+        }}
+      >
+        <div className="grid w-full max-w-6xl items-center gap-12 lg:grid-cols-[1.05fr_1fr]">
+          {/* Copy */}
+          <div className="max-w-xl">
+            <span
+              className="inline-flex items-center gap-2 rounded-full border px-3 py-1 text-[11px] font-semibold"
+              style={{
+                borderColor: "rgba(234, 88, 12, 0.35)",
+                backgroundColor: "#fff3ea",
+                color: "#c2410c",
+              }}
+            >
+              <Zap className="size-3" />
+              Native Rust engine · GPU composited
+            </span>
+            <h1 className="mt-5 text-[40px] font-extrabold leading-[1.06] tracking-tight text-stone-900 sm:text-[54px]">
+              Edit videos at
+              <br />
+              the{" "}
+              <span
+                style={{
+                  backgroundImage: "linear-gradient(100deg, #ea580c, #0d9488)",
+                  WebkitBackgroundClip: "text",
+                  backgroundClip: "text",
+                  color: "transparent",
+                }}
               >
-                <div className="flex items-center gap-2.5">
-                  <span className="flex size-8 items-center justify-center rounded-lg bg-amber-500/10 text-amber-300">
-                    <f.icon className="size-4" />
-                  </span>
-                  <span className="text-sm font-semibold text-stone-200">{f.title}</span>
-                </div>
-                <p className="mt-2.5 text-[12.5px] leading-relaxed text-stone-400">
-                  {f.body}
-                </p>
-              </div>
-            ))}
-          </div>
-        </section>
-
-        {/* Why desktop-only */}
-        <section
-          className="mt-10 rounded-xl border border-teal-500/20 bg-teal-500/5 p-5 sm:p-6"
-          aria-label="Why FrameFuse is desktop-only"
-        >
-          <h2 className="text-sm font-semibold text-stone-200">
-            Why a desktop app?
-          </h2>
-          <p className="mt-2 text-[13px] leading-relaxed text-stone-400">
-            Fast exports, offline captions and real video processing need
-            desktop power a web page can&rsquo;t provide.
-          </p>
-        </section>
-
-        {/* Development preview entry */}
-        {onEnterPreview && (
-          <section
-            className="mt-10 rounded-xl border border-dashed border-stone-700 bg-stone-950/60 p-4 sm:p-5"
-            aria-label="Development preview"
-          >
-            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <div className="flex items-start gap-3">
-                <TerminalSquare className="mt-0.5 size-4 shrink-0 text-stone-500" />
-                <div>
-                  <div className="text-[12.5px] font-medium text-stone-300">
-                    Development: open the studio UI in this browser
-                  </div>
-                  <div className="mt-0.5 text-[11.5px] leading-relaxed text-stone-500">
-                    UI preview only — exporting is disabled outside the Windows
-                    app by design.
-                  </div>
-                </div>
-              </div>
+                speed of thought
+              </span>
+            </h1>
+            <p className="mt-5 text-[15px] leading-relaxed text-stone-500 sm:text-[17px]">
+              FrameFuse turns raw clips into finished videos — captions that
+              dance, AI voiceovers in any language, beat-synced cuts — and
+              exports through a native engine instead of waiting on a
+              browser tab.
+            </p>
+            <div className="mt-8 flex flex-wrap items-center gap-3">
               <button
                 type="button"
-                onClick={handleEnterPreview}
-                disabled={previewRequested}
-                className="flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-700 bg-stone-900/60 px-4 text-[12px] font-medium text-stone-300 transition-colors duration-150 hover:bg-stone-800/70 hover:text-stone-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400/60 disabled:opacity-60"
+                onClick={onEnterPreview}
+                className="ff-btn-primary flex h-12 items-center gap-2.5 rounded-xl px-6 text-[15px]"
               >
-                {previewRequested ? "Opening…" : "Open studio preview"}
-                {!previewRequested && <ArrowRight className="size-3.5" />}
+                <Play className="size-4" />
+                Launch the Studio
               </button>
+              <a
+                href="https://github.com/Ziruax/framefuse/releases/latest"
+                target="_blank"
+                rel="noreferrer"
+                className="ff-btn-ghost flex h-12 items-center gap-2.5 rounded-xl px-6 text-[15px] font-semibold"
+              >
+                <Download className="size-4" />
+                Download for Windows
+              </a>
             </div>
-          </section>
-        )}
-      </main>
+            <div className="mt-7 flex flex-wrap gap-x-6 gap-y-2 text-[12px] font-medium text-stone-400">
+              <span>Free during beta</span>
+              <span>·</span>
+              <span>No account, no upload</span>
+              <span>·</span>
+              <span>Everything stays on your PC</span>
+            </div>
+          </div>
 
-      {/* Sticky footer (mt-auto keeps it pinned on short viewports) */}
-      <footer className="relative z-10 mt-auto border-t border-stone-800 px-5 py-5 text-[11px] text-stone-500 sm:px-10">
-        <div className="mx-auto flex max-w-5xl flex-wrap items-center gap-x-3 gap-y-1">
-          <span>FrameFuse v{version}</span>
-          <span aria-hidden>·</span>
+          {/* CSS-built studio mockup — a miniature of the real Flow shell:
+              rail, cinema card, timeline card. No screenshots needed. */}
+          <div
+            className="ff-card relative mx-auto hidden w-full max-w-[520px] overflow-hidden rounded-2xl p-3 lg:block"
+            style={{ padding: 12 }}
+            aria-hidden
+          >
+            {/* toolbar */}
+            <div
+              className="flex h-9 items-center gap-2 rounded-lg border px-2.5"
+              style={{ borderColor: "#eee8dc", backgroundColor: "#faf7f1" }}
+            >
+              <div
+                className="size-4 rounded-[5px]"
+                style={{
+                  backgroundImage: "linear-gradient(135deg, #f06214, #ea580c)",
+                }}
+              />
+              <div className="h-2 w-16 rounded-full bg-stone-200" />
+              <div className="flex-1" />
+              <div
+                className="h-5 w-16 rounded-[7px]"
+                style={{ backgroundImage: "linear-gradient(135deg, #f06214, #d84e08)" }}
+              />
+            </div>
+            {/* rail + cinema + timeline */}
+            <div className="mt-2.5 flex gap-2.5">
+              <div
+                className="flex w-11 flex-col items-center gap-1.5 rounded-xl border py-2.5"
+                style={{ borderColor: "#eee8dc", backgroundColor: "#faf7f1" }}
+              >
+                {[0, 1, 2, 3, 4, 5].map((i) => (
+                  <div
+                    key={i}
+                    className="flex h-7 w-8 items-center justify-center rounded-lg"
+                    style={
+                      i === 0
+                        ? { backgroundColor: "#fdeade", color: "#c2410c" }
+                        : undefined
+                    }
+                  >
+                    <div
+                      className="h-2.5 w-2.5 rounded-[4px]"
+                      style={{
+                        backgroundColor:
+                          i === 0 ? "#ea580c" : "#d6cfc2",
+                      }}
+                    />
+                  </div>
+                ))}
+              </div>
+              <div className="flex flex-1 flex-col gap-2.5">
+                {/* cinema card */}
+                <div
+                  className="relative flex h-40 items-center justify-center overflow-hidden rounded-xl"
+                  style={{
+                    background:
+                      "linear-gradient(160deg, #2a2521 0%, #1b1815 70%)",
+                  }}
+                >
+                  <div
+                    className="absolute left-5 top-4 h-2.5 w-20 rounded-full"
+                    style={{ backgroundColor: "rgba(255,255,255,0.16)" }}
+                  />
+                  <div
+                    className="absolute left-5 top-9 h-2.5 w-32 rounded-full"
+                    style={{ backgroundColor: "rgba(255,255,255,0.10)" }}
+                  />
+                  <div
+                    className="flex size-11 items-center justify-center rounded-full"
+                    style={{
+                      background: "rgba(234, 88, 12, 0.92)",
+                      boxShadow: "0 6px 24px rgba(234, 88, 12, 0.55)",
+                    }}
+                  >
+                    <Play className="size-5" style={{ color: "#fff", fill: "#fff" }} />
+                  </div>
+                  <div
+                    className="absolute bottom-4 left-5 rounded-md px-2 py-1 text-[9px] font-bold tracking-wide"
+                    style={{
+                      background: "rgba(234, 88, 12, 0.25)",
+                      color: "#fdba74",
+                      border: "1px solid rgba(234, 88, 12, 0.45)",
+                    }}
+                  >
+                    KINETIC CAPTIONS
+                  </div>
+                </div>
+                {/* timeline card */}
+                <div
+                  className="rounded-xl border p-2"
+                  style={{ borderColor: "#eee8dc", backgroundColor: "#faf7f1" }}
+                >
+                  <div className="flex gap-1.5">
+                    <div
+                      className="h-5 w-20 rounded-md"
+                      style={{ background: "linear-gradient(135deg, #fdba74, #f97316)" }}
+                    />
+                    <div
+                      className="h-5 w-14 rounded-md"
+                      style={{ background: "linear-gradient(135deg, #5eead4, #14b8a6)" }}
+                    />
+                    <div
+                      className="h-5 w-24 rounded-md"
+                      style={{ background: "linear-gradient(135deg, #fcd6b8, #fb923c)" }}
+                    />
+                    <div className="h-5 flex-1 rounded-md bg-stone-200/70" />
+                  </div>
+                  <div className="mt-1.5 flex gap-1.5">
+                    <div
+                      className="h-3.5 w-16 rounded-md"
+                      style={{ background: "linear-gradient(90deg, #99f6e4, #5eead4)" }}
+                    />
+                    <div className="h-3.5 flex-1 rounded-md bg-stone-200/60" />
+                  </div>
+                  <div className="mt-1.5 h-px w-full bg-stone-200" />
+                  <div className="relative mt-1.5 h-3.5">
+                    <div
+                      className="absolute left-[38%] top-[-3px] h-3.5 w-[2px] rounded-full"
+                      style={{ backgroundColor: "#06b6d4", boxShadow: "0 0 6px rgba(6,182,212,0.8)" }}
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+            {/* floating badge */}
+            <div
+              className="absolute right-5 top-16 flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10px] font-semibold"
+              style={{
+                borderColor: "rgba(5, 150, 105, 0.35)",
+                backgroundColor: "#ecfdf5",
+                color: "#047857",
+                boxShadow: "0 6px 18px rgba(5, 150, 105, 0.15)",
+              }}
+            >
+              <span className="size-1.5 rounded-full bg-emerald-500" />
+              Rust engine · live
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* ── Feature bento ───────────────────────────────────────────── */}
+      <section className="shrink-0 px-6 pb-6 sm:px-10">
+        <div className="mx-auto grid w-full max-w-6xl gap-3.5 sm:grid-cols-2 lg:grid-cols-3">
+          {[
+            {
+              icon: Captions,
+              tint: "#fdeade",
+              fg: "#c2410c",
+              title: "Captions that dance",
+              line: "Word-by-word karaoke, kinetic typography presets, real bundled fonts — burned in natively.",
+            },
+            {
+              icon: Sparkles,
+              tint: "#fef3c7",
+              fg: "#b45309",
+              title: "Effects without the crawl",
+              line: "Ken Burns motion, geometric transitions, watermarks and PiP overlays — all previewed live.",
+            },
+            {
+              icon: PenLine,
+              tint: "#fae8ff",
+              fg: "#a21caf",
+              title: "AI script writer",
+              line: "Draft your video with Gemini or Groq inside the studio, then voice it in one click.",
+            },
+            {
+              icon: Languages,
+              tint: "#f0fdfa",
+              fg: "#0f766e",
+              title: "Translate & dub",
+              line: "Multi-speaker dubs with speaker detection, per-speaker voices and studio ducking.",
+            },
+            {
+              icon: Scissors,
+              tint: "#eff6ff",
+              fg: "#0369a1",
+              title: "Beat-synced cuts",
+              line: "Drop a track, detect beats, snap every clip to the rhythm automatically.",
+            },
+            {
+              icon: Zap,
+              tint: "#ecfdf5",
+              fg: "#047857",
+              title: "A native engine, not a tab",
+              line: "The Rust core composites on your GPU and encodes through the FFmpeg libraries directly.",
+            },
+          ].map((f) => (
+            <div
+              key={f.title}
+              className="ff-card rounded-2xl p-5 transition-transform duration-150 hover:-translate-y-0.5"
+            >
+              <div
+                className="flex size-10 items-center justify-center rounded-xl"
+                style={{ backgroundColor: f.tint, color: f.fg }}
+              >
+                <f.icon className="size-5" />
+              </div>
+              <h3 className="mt-3.5 text-[15px] font-bold tracking-tight text-stone-800">
+                {f.title}
+              </h3>
+              <p className="mt-1.5 text-[13px] leading-relaxed text-stone-500">
+                {f.line}
+              </p>
+            </div>
+          ))}
+        </div>
+
+        {/* Why desktop strip */}
+        <div
+          className="mx-auto mt-3.5 flex w-full max-w-6xl flex-col items-start gap-3 rounded-2xl border px-6 py-5 sm:flex-row sm:items-center"
+          style={{ borderColor: "#e8e1d4", backgroundColor: "#faf7f1" }}
+        >
+          <div
+            className="flex size-10 shrink-0 items-center justify-center rounded-xl"
+            style={{ backgroundColor: "#fff3ea", color: "#c2410c" }}
+          >
+            <MonitorPlay className="size-5" />
+          </div>
+          <div className="flex-1">
+            <div className="text-[14px] font-bold text-stone-800">
+              Why a desktop app?
+            </div>
+            <p className="mt-0.5 text-[13px] leading-relaxed text-stone-500">
+              GPU encoding, direct file access and the native Rust engine only
+              exist outside the browser sandbox. This page is just the
+              front door — the studio itself runs as a Windows app.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onEnterPreview}
+            className="ff-btn-ghost flex shrink-0 items-center gap-2 rounded-[10px] px-4 py-2.5 text-[13px] font-semibold"
+          >
+            Preview the UI anyway
+            <ArrowRight className="size-4" />
+          </button>
+        </div>
+
+        {/* Footer */}
+        <footer className="mx-auto mt-6 flex w-full max-w-6xl items-center justify-between text-[11px] text-stone-400">
+          <span>FrameFuse v{version} · built for Windows</span>
           <a
-            href={RELEASES_URL}
+            href="https://github.com/Ziruax/framefuse"
             target="_blank"
             rel="noreferrer"
-            className="underline-offset-2 transition-colors hover:text-stone-300 hover:underline"
+            className="transition-colors hover:text-stone-700"
           >
-            Download the Windows installer
+            github.com/Ziruax/framefuse
           </a>
-          <span aria-hidden>·</span>
-          <span>Video exports, captions and project files live in the desktop app.</span>
-        </div>
-      </footer>
+        </footer>
+      </section>
     </div>
   );
 }

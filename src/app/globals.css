@@ -42,15 +42,36 @@
   --radius: 0.5rem;
 }
 
+/* ══════════════════════════════════════════════════════════════════════════
+   v1.23 "FLOW" — a completely new light design system.
+   The v1.22 Ember Studio recolored the same dark pro-editor shell; Flow
+   replaces the FOUNDATION: a bright warm-paper workspace, white floating
+   cards with soft shadows (rounded-xl/2xl), one vivid tangerine accent,
+   and a dark "cinema" stage that frames the video like a screening room.
+   Palette:
+     paper  #f4f1ea   canvas
+     card   #ffffff   floating surfaces
+     line   #e8e1d4   hairlines
+     ink    #292524   primary text / stone-800
+     mute   #78716c   secondary text / stone-500
+     accent #ea580c   tangerine (orange-600) primary action
+     live   #0d9488   teal live/secondary
+     good   #059669   emerald success (Rust engine)
+     bad    #e11d48   rose danger
+   Cyan stays reserved for the timeline scrub identity (playhead), kinetic
+   gallery selection, and transition-tile active rings — those are CONTENT
+   semantics, not chrome.
+   ══════════════════════════════════════════════════════════════════════════ */
+
 @layer base {
   * {
-    border-color: #292524;
+    border-color: #e8e1d4;
   }
 
   html,
   body {
-    background-color: #0c0a09;
-    color: #e7e5e4;
+    background-color: #f4f1ea;
+    color: #292524;
     margin: 0;
     padding: 0;
     height: 100%;
@@ -72,10 +93,10 @@
   }
 }
 
-/* ===== Custom dark scrollbars (v1.22 Ember Studio: warm stone thumbs) ===== */
+/* ===== Custom LIGHT scrollbars (Flow: warm-gray thumbs on paper) ===== */
 * {
   scrollbar-width: thin;
-  scrollbar-color: #44403c transparent;
+  scrollbar-color: #d3cabd transparent;
 }
 
 *::-webkit-scrollbar {
@@ -88,24 +109,24 @@
 }
 
 *::-webkit-scrollbar-thumb {
-  background-color: #44403c;
+  background-color: #d3cabd;
   border-radius: 8px;
   border: 2px solid transparent;
   background-clip: content-box;
 }
 
 *::-webkit-scrollbar-thumb:hover {
-  background-color: #57534e;
+  background-color: #bdb2a1;
   background-clip: content-box;
 }
 
-/* ===== Range slider styling ===== */
+/* ===== Range slider styling (Flow: warm track, white knob, orange ring) ===== */
 input[type="range"] {
   -webkit-appearance: none;
   appearance: none;
   height: 5px;
   border-radius: 9999px;
-  background: #44403c;
+  background: #e8e1d4;
   outline: none;
   cursor: pointer;
 }
@@ -116,20 +137,19 @@ input[type="range"]::-webkit-slider-thumb {
   width: 15px;
   height: 15px;
   border-radius: 9999px;
-  background: #fbbf24;
+  background: #ea580c;
   cursor: pointer;
   border: 2px solid #ffffff;
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 1px 3px rgba(80, 60, 30, 0.35);
   transition: box-shadow 150ms ease, transform 150ms ease;
 }
 
-/* v4.8: thumb grows + glows on hover/drag so the handle reads as grabbable
-   (VLM: default and hover states were visually identical). */
+/* v4.8: thumb grows + glows on hover/drag so the handle reads as grabbable. */
 input[type="range"]:hover::-webkit-slider-thumb,
 input[type="range"]:active::-webkit-slider-thumb {
   box-shadow:
-    0 0 0 4px rgba(251, 191, 36, 0.35),
-    0 0 10px rgba(245, 158, 11, 0.55);
+    0 0 0 4px rgba(234, 88, 12, 0.18),
+    0 0 10px rgba(234, 88, 12, 0.35);
   transform: scale(1.18);
 }
 
@@ -137,7 +157,7 @@ input[type="range"]::-moz-range-thumb {
   width: 15px;
   height: 15px;
   border-radius: 9999px;
-  background: #fbbf24;
+  background: #ea580c;
   cursor: pointer;
   border: 2px solid #ffffff;
   transition: box-shadow 150ms ease, transform 150ms ease;
@@ -146,15 +166,15 @@ input[type="range"]::-moz-range-thumb {
 input[type="range"]:hover::-moz-range-thumb,
 input[type="range"]:active::-moz-range-thumb {
   box-shadow:
-    0 0 0 4px rgba(251, 191, 36, 0.35),
-    0 0 10px rgba(245, 158, 11, 0.55);
+    0 0 0 4px rgba(234, 88, 12, 0.18),
+    0 0 10px rgba(234, 88, 12, 0.35);
   transform: scale(1.18);
 }
 
-/* ===== Selection (v1.22: amber-400/30 — matches the Ember accent) ===== */
+/* ===== Selection (Flow: tangerine tint) ===== */
 ::selection {
-  background: rgba(251, 191, 36, 0.3);
-  color: #ffffff;
+  background: rgba(234, 88, 12, 0.22);
+  color: #292524;
 }
 
 /* Prevent text selection on UI chrome (desktop-app feel) */
@@ -163,11 +183,11 @@ input[type="range"]:active::-moz-range-thumb {
   -webkit-user-select: none;
 }
 
-/* Subtle grid background for empty preview */
+/* Subtle grid background for empty preview (light dots on the cinema stage) */
 .ff-grid-bg {
   background-image:
-    linear-gradient(rgba(255, 255, 255, 0.04) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+    linear-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.05) 1px, transparent 1px);
   background-size: 28px 28px;
 }
 
@@ -190,27 +210,95 @@ summary::-webkit-details-marker {
   display: none;
 }
 
+/* ════════════════════════════════════════════════════════════════════
+   FLOW SHELL PRIMITIVES — the new layout vocabulary
+   ════════════════════════════════════════════════════════════════════ */
+
+/* Floating white card — every surface in the new shell. */
+.ff-card {
+  background: #ffffff;
+  border: 1px solid #e8e1d4;
+  border-radius: 14px;
+  box-shadow:
+    0 1px 2px rgba(87, 66, 27, 0.04),
+    0 10px 30px rgba(87, 66, 27, 0.07);
+}
+
+/* Cinema stage — the dark screening room that frames the preview. */
+.ff-cinema {
+  background: #201d19;
+  border-radius: 14px;
+  box-shadow:
+    0 1px 2px rgba(87, 66, 27, 0.06),
+    0 18px 44px rgba(60, 44, 16, 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+
+/* Rail button — the left navigation rail's phase selector. */
+.ff-rail-btn {
+  position: relative;
+  width: 52px;
+  border-radius: 12px;
+  padding: 9px 0 7px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  color: #8a8175;
+  transition: background 130ms ease, color 130ms ease, transform 130ms ease;
+}
+.ff-rail-btn:hover {
+  background: #f4efe7;
+  color: #44403c;
+}
+.ff-rail-btn:active {
+  transform: scale(0.94);
+}
+.ff-rail-btn[data-active="true"] {
+  background: #fdeade;
+  color: #c2410c;
+  font-weight: 700;
+}
+.ff-rail-btn[data-active="true"]::before {
+  content: "";
+  position: absolute;
+  left: -10px;
+  top: 8px;
+  bottom: 8px;
+  width: 3px;
+  border-radius: 3px;
+  background: #ea580c;
+}
+.ff-rail-btn:focus-visible {
+  outline: 2px solid rgba(234, 88, 12, 0.55);
+  outline-offset: 1px;
+}
+.ff-rail-label {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
 /* ===== v4.2 UI component classes (shared button/panel styling) ===== */
 
-/* v1.22 — ONE ACCENT: amber is the app's single interactive accent
-   (Ember Studio — warm honey buttons on layered stone surfaces). */
+/* Flow — ONE ACCENT: tangerine. Solid, confident, high-contrast on paper. */
 
-/* Primary action — warm amber, soft glow shadow, hover lift. */
+/* Primary action — tangerine, warm shadow, hover lift. */
 .ff-btn-primary {
-  background-color: #fbbf24;
-  background-image: linear-gradient(180deg, #fcd34d 0%, #fbbf24 60%, #f59e0b 100%);
-  color: #1c1917;
+  background-color: #ea580c;
+  background-image: linear-gradient(180deg, #f06214 0%, #ea580c 60%, #d84e08 100%);
+  color: #ffffff;
   font-weight: 600;
   box-shadow:
-    0 1px 2px rgba(0, 0, 0, 0.4),
-    0 4px 14px rgba(245, 158, 11, 0.3);
+    0 1px 2px rgba(120, 53, 15, 0.25),
+    0 4px 14px rgba(234, 88, 12, 0.32);
   transition: all 160ms ease;
 }
 .ff-btn-primary:hover {
-  filter: brightness(1.07);
+  filter: brightness(1.06);
   box-shadow:
-    0 2px 4px rgba(0, 0, 0, 0.4),
-    0 6px 20px rgba(245, 158, 11, 0.45);
+    0 2px 4px rgba(120, 53, 15, 0.25),
+    0 6px 20px rgba(234, 88, 12, 0.4);
   transform: translateY(-1px);
 }
 .ff-btn-primary:active {
@@ -218,34 +306,35 @@ summary::-webkit-details-marker {
   filter: brightness(0.96);
 }
 
-/* Ghost/secondary — quiet stone that warms toward amber on hover. */
+/* Ghost/secondary — quiet white that warms toward tangerine on hover. */
 .ff-btn-ghost {
-  border: 1px solid #44403c;
-  background-color: rgba(41, 37, 36, 0.6);
-  color: #d6d3d1;
+  border: 1px solid #ddd5c6;
+  background-color: #ffffff;
+  color: #57534e;
+  box-shadow: 0 1px 2px rgba(87, 66, 27, 0.05);
   transition: all 150ms ease;
 }
 .ff-btn-ghost:hover {
-  border-color: rgba(120, 53, 15, 0.65);
-  background-color: rgba(68, 64, 60, 0.7);
-  color: #fde68a;
+  border-color: rgba(234, 88, 12, 0.45);
+  background-color: #fff8f2;
+  color: #c2410c;
 }
 .ff-btn-ghost:active {
   transform: translateY(0.5px);
 }
 
-/* v1.22: sample button — quiet secondary invite (stone that glows amber
-   on hover — an inviting, low-competition callout next to the dropzone). */
+/* Sample button — quiet secondary invite (white that glows orange on hover). */
 .ff-btn-sample {
-  border-color: #44403c;
-  background-color: rgba(41, 37, 36, 0.45);
-  color: #a8a29e;
+  border-color: #ddd5c6;
+  background-color: #ffffff;
+  color: #78716c;
+  box-shadow: 0 1px 2px rgba(87, 66, 27, 0.05);
 }
 .ff-btn-sample:hover {
-  border-color: rgba(245, 158, 11, 0.55);
-  background-color: rgba(120, 53, 15, 0.18);
-  color: #fcd34d;
-  box-shadow: 0 4px 18px rgba(245, 158, 11, 0.18);
+  border-color: rgba(234, 88, 12, 0.55);
+  background-color: #fff3ea;
+  color: #c2410c;
+  box-shadow: 0 4px 18px rgba(234, 88, 12, 0.16);
   transform: translateY(-1px);
 }
 
@@ -255,19 +344,19 @@ summary::-webkit-details-marker {
   font-weight: 600;
   letter-spacing: 0.14em;
   text-transform: uppercase;
-  color: #78716c;
+  color: #a8a29e;
 }
 
 /* Panel section header bar (used in settings) */
 .ff-panel-header {
-  border-bottom: 1px solid #292524;
-  background: linear-gradient(180deg, rgba(41, 37, 36, 0.5), rgba(28, 25, 23, 0));
+  border-bottom: 1px solid #efe9de;
+  background: linear-gradient(180deg, #faf7f1, #ffffff);
 }
 
 /* Beat-tag pulse for timeline segments (attention cue). */
 @keyframes ff-beat-pulse {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0); }
-  50% { box-shadow: 0 0 0 4px rgba(52, 211, 153, 0.18); }
+  0%, 100% { box-shadow: 0 0 0 0 rgba(13, 148, 136, 0); }
+  50% { box-shadow: 0 0 0 4px rgba(13, 148, 136, 0.22); }
 }
 .ff-beat-pulse {
   animation: ff-beat-pulse 2.4s ease-in-out infinite;
@@ -283,8 +372,7 @@ summary::-webkit-details-marker {
 }
 
 /* Focus-visible ring — consistent, keyboard-friendly.
-   v1.22: amber-400/60 across ALL interactive elements (buttons, inputs,
-   sliders, custom-widget roles, links, summaries). */
+   Flow: tangerine across ALL interactive elements. */
 button:focus-visible,
 input:focus-visible,
 select:focus-visible,
@@ -296,7 +384,7 @@ summary:focus-visible,
 [role="switch"]:focus-visible,
 [role="radio"]:focus-visible,
 [role="slider"]:focus-visible {
-  outline: 2px solid rgba(251, 191, 36, 0.6);
+  outline: 2px solid rgba(234, 88, 12, 0.55);
   outline-offset: 1px;
 }
 
@@ -306,8 +394,7 @@ summary:focus-visible,
   overscroll-behavior: contain;
 }
 
-/* v5.1 — subtle 150ms ease-out fade + 2px slide (cards / chips mount feel).
-   The heavier ff-tab-panel-in (220ms, 6px) stays the tab-switch signature. */
+/* v5.1 — subtle 150ms ease-out fade + 2px slide (cards / chips mount feel). */
 @keyframes ff-fade-up {
   from {
     opacity: 0;
@@ -322,8 +409,8 @@ summary:focus-visible,
   animation: ff-fade-up 150ms ease-out;
 }
 
-/* v5.1 — CapCut-grade motion off-switch: no transitions, no animations,
-   no smooth scroll for users who ask the OS for calm. */
+/* v5.1 — motion off-switch: no transitions, no animations for users who
+   ask the OS for calm. */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -344,8 +431,8 @@ summary:focus-visible,
   width: 100%;
   border-radius: 5px;
   overflow: hidden;
-  background: #14110e;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.04);
+  background: #ece6da;
+  box-shadow: inset 0 0 0 1px rgba(87, 66, 27, 0.08);
 }
 
 .ff-tx-rect {
@@ -354,11 +441,11 @@ summary:focus-visible,
 }
 
 .ff-tx-a {
-  background: linear-gradient(135deg, #b45309 0%, #f59e0b 100%);
+  background: linear-gradient(135deg, #ea580c 0%, #f97316 100%);
 }
 
 .ff-tx-b {
-  background: linear-gradient(135deg, #0f766e 0%, #2dd4bf 100%);
+  background: linear-gradient(135deg, #0f766e 0%, #14b8a6 100%);
 }
 
 .ff-tx-veil {
@@ -375,9 +462,9 @@ summary:focus-visible,
 }
 
 .ff-tx-tile-active {
-  border-color: rgba(34, 211, 238, 0.55);
-  background: rgba(34, 211, 238, 0.08);
-  box-shadow: 0 0 12px rgba(34, 211, 238, 0.18);
+  border-color: rgba(13, 148, 136, 0.6);
+  background: rgba(13, 148, 136, 0.08);
+  box-shadow: 0 0 12px rgba(13, 148, 136, 0.16);
 }
 
 .ff-tx-tile:active {
@@ -474,8 +561,7 @@ summary:focus-visible,
   100% { clip-path: inset(0 100% 0 0); }
 }
 
-/* Circle open (v5.1): B revealed by a circle expanding from the center —
-   the canvas painter + xfade circleopen twin. */
+/* Circle open (v5.1): B revealed by a circle expanding from the center. */
 .ff-anim-circleopen {
   clip-path: circle(0% at 50% 50%);
   animation: ff-tx-circle-open 2.4s ease-in-out infinite;
@@ -496,14 +582,14 @@ summary:focus-visible,
   50% { opacity: 1; }
 }
 .ff-tx-zone-live {
-  filter: brightness(1.35);
+  filter: brightness(1.08);
 }
 .ff-hl-live {
   animation: ff-hl-glow 1.6s ease-in-out infinite;
 }
 @keyframes ff-hl-glow {
-  0%, 100% { box-shadow: 0 0 6px rgba(251, 191, 36, 0.45); }
-  50% { box-shadow: 0 0 12px rgba(251, 191, 36, 0.9); }
+  0%, 100% { box-shadow: 0 0 6px rgba(234, 88, 12, 0.35); }
+  50% { box-shadow: 0 0 12px rgba(234, 88, 12, 0.6); }
 }
 
 /* Transition link between media cards: subtle center line. */
@@ -518,25 +604,25 @@ summary:focus-visible,
   top: 50%;
   bottom: -50%;
   width: 1px;
-  background: linear-gradient(180deg, rgba(245, 158, 11, 0.0), rgba(245, 158, 11, 0.35), rgba(245, 158, 11, 0.0));
+  background: linear-gradient(180deg, rgba(234, 88, 12, 0.0), rgba(234, 88, 12, 0.4), rgba(234, 88, 12, 0.0));
 }
 
 /* ===== v4.4 — Watermark position grid ===== */
 .ff-wm-cell {
   cursor: pointer;
-  border: 1px solid rgba(63, 63, 70, 0.6);
-  background: rgba(24, 24, 27, 0.6);
+  border: 1px solid rgba(87, 66, 27, 0.25);
+  background: rgba(244, 241, 234, 0.8);
 }
 
 .ff-wm-cell-active {
-  border-color: rgba(52, 211, 153, 0.6);
-  background: rgba(16, 185, 129, 0.12);
-  box-shadow: 0 0 10px rgba(52, 211, 153, 0.18);
+  border-color: rgba(5, 150, 105, 0.65);
+  background: rgba(5, 150, 105, 0.12);
+  box-shadow: 0 0 10px rgba(5, 150, 105, 0.18);
 }
 
 .ff-wm-dot-active {
-  background: #34d399;
-  box-shadow: 0 0 6px rgba(52, 211, 153, 0.7);
+  background: #059669;
+  box-shadow: 0 0 6px rgba(5, 150, 105, 0.7);
 }
 
 /* ===== v4.5 — Quality profile cards ===== */
@@ -544,20 +630,23 @@ summary:focus-visible,
   cursor: pointer;
 }
 .ff-profile-active {
-  border-color: rgba(251, 191, 36, 0.6) !important;
-  background: linear-gradient(160deg, rgba(251, 191, 36, 0.16), rgba(120, 53, 15, 0.22)) !important;
+  border-color: rgba(234, 88, 12, 0.65) !important;
+  background: linear-gradient(160deg, #fff3ea, #ffe6d5) !important;
   box-shadow:
-    0 0 14px rgba(245, 158, 11, 0.2),
-    inset 0 1px 0 rgba(254, 243, 199, 0.18);
+    0 0 14px rgba(234, 88, 12, 0.16),
+    inset 0 1px 0 rgba(255, 255, 255, 0.8);
 }
 .ff-profile-card:not(.ff-profile-active):hover {
-  border-color: rgba(251, 191, 36, 0.4) !important;
+  border-color: rgba(234, 88, 12, 0.4) !important;
 }
 
 /* ===== v4.5 — Boundary style picker popover ===== */
 .ff-pop {
-  border-color: #292524;
-  background: #1c1917;
+  border-color: #e8e1d4;
+  background: #ffffff;
+  box-shadow:
+    0 4px 10px rgba(87, 66, 27, 0.1),
+    0 16px 40px rgba(87, 66, 27, 0.16);
   animation: ff-pop-in 140ms ease-out;
 }
 @keyframes ff-pop-in {
@@ -571,69 +660,60 @@ summary:focus-visible,
   }
 }
 
-/* ===== v5.1 — CapCut polish: timeline clip chrome ===== */
+/* ===== v5.1 — timeline clip chrome ===== */
 
-/* Clip card chrome — the interactive edge-trim handles are real DOM children
-   rendered by FilmstripBar (v5.3), not pseudo-elements. */
+/* Clip card chrome — interactive edge-trim handles are real DOM children
+   rendered by FilmstripBar (v5.3). Flow: warm hairline + gentle resting
+   dim so the active clip pops. */
 .ff-clip {
-  /* v5.1 CapCut clip card: 1px stone hairline + resting dim/desat so the
-     active clip pops without extra chrome. v1.22: warm stone hairline. */
   box-shadow:
-    inset 0 0 0 1px #292524,
-    inset 0 -1px 0 rgba(0, 0, 0, 0.35),
-    0 1px 3px rgba(0, 0, 0, 0.4);
-  filter: saturate(0.78) brightness(0.82);
+    inset 0 0 0 1px rgba(255, 255, 255, 0.28),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.22),
+    0 1px 3px rgba(60, 44, 16, 0.25);
+  filter: saturate(0.82) brightness(0.9);
 }
 .ff-clip:hover {
-  filter: saturate(0.96) brightness(0.94);
+  filter: saturate(0.98) brightness(1);
   box-shadow:
-    inset 0 0 0 1px rgba(245, 158, 11, 0.5),
-    0 4px 12px rgba(0, 0, 0, 0.55);
+    inset 0 0 0 1px rgba(255, 255, 255, 0.4),
+    0 4px 12px rgba(60, 44, 16, 0.35);
   transform: translateY(-1px);
 }
-/* ACTIVE clip: 2px teal ring + slightly raised (declared after :hover so
-   the active treatment wins the specificity tie while hovered). Teal = the
-   v1.22 "live" secondary accent (the clip under the playhead). */
+/* ACTIVE clip: teal ring + slightly raised (declared after :hover so the
+   active treatment wins the specificity tie while hovered). Teal = live. */
 .ff-clip.ff-clip-active {
   z-index: 1;
-  filter: saturate(1.15) brightness(1.08);
+  filter: saturate(1.12) brightness(1.05);
   box-shadow:
-    inset 0 0 0 1px rgba(45, 212, 191, 0.65),
-    0 0 0 2px rgba(45, 212, 191, 0.55),
-    0 0 16px rgba(45, 212, 191, 0.3),
-    0 4px 12px rgba(0, 0, 0, 0.55);
+    inset 0 0 0 1px rgba(13, 148, 136, 0.75),
+    0 0 0 2px rgba(13, 148, 136, 0.55),
+    0 0 16px rgba(13, 148, 136, 0.25),
+    0 4px 12px rgba(60, 44, 16, 0.35);
   transform: translateY(-1px);
 }
-/* v5.4 SELECTED clip (multi-select): amber ring + tint — the user-intent
-   accent, deliberately distinct from the cyan PLAYHEAD-tracking active
-   ring. Source order: AFTER .ff-clip-active (a selected+active clip reads
-   selected), BEFORE .ff-clip-drag (an in-flight gesture still reads
-   hot-tracked white). Outline-based so it never fights inline shadows on
-   the overlay cards. */
+/* v5.4 SELECTED clip (multi-select): tangerine ring + tint. */
 .ff-clip-selected {
-  outline: 2px solid rgba(245, 158, 11, 0.95);
+  outline: 2px solid rgba(234, 88, 12, 0.95);
   outline-offset: -1px;
   z-index: 2;
 }
 .ff-clip.ff-clip-selected {
-  filter: saturate(1.05) brightness(0.95);
+  filter: saturate(1.05) brightness(0.98);
   box-shadow:
-    inset 0 0 0 1px rgba(245, 158, 11, 0.5),
-    0 0 0 2px rgba(245, 158, 11, 0.45),
-    0 0 14px rgba(245, 158, 11, 0.22);
+    inset 0 0 0 1px rgba(234, 88, 12, 0.5),
+    0 0 0 2px rgba(234, 88, 12, 0.45),
+    0 0 14px rgba(234, 88, 12, 0.22);
 }
-/* v5.4: marquee rubber band — amber tint to match the selection accent. */
+/* v5.4: marquee rubber band — tangerine tint. */
 .ff-marquee {
-  background: rgba(245, 158, 11, 0.12);
-  border: 1px solid rgba(245, 158, 11, 0.7);
+  background: rgba(234, 88, 12, 0.1);
+  border: 1px solid rgba(234, 88, 12, 0.65);
   border-radius: 3px;
   box-shadow:
-    0 0 0 1px rgba(0, 0, 0, 0.3),
-    inset 0 0 24px rgba(245, 158, 11, 0.06);
+    0 0 0 1px rgba(255, 255, 255, 0.5),
+    inset 0 0 24px rgba(234, 88, 12, 0.06);
 }
-/* v5.5: selection count chip — pops on every count change (the key={count}
-   remount restarts the animation). Reads as a live counter, not a static
-   label. */
+/* v5.5: selection count chip — pops on every count change. */
 .ff-sel-chip {
   animation: ff-sel-pop 180ms cubic-bezier(0.34, 1.56, 0.64, 1);
 }
@@ -647,9 +727,7 @@ summary:focus-visible,
     opacity: 1;
   }
 }
-/* v5.4.1: right-click context menu — dark glassy card, fixed-positioned
-   at the click point (viewport-clamped in a layout effect). */
-/* v1.22: warm stone context menu. */
+/* v5.4.1: right-click context menu — white glassy card. */
 .ff-ctx-menu {
   position: fixed;
   z-index: 91;
@@ -658,15 +736,14 @@ summary:focus-visible,
   padding: 4px;
   display: flex;
   flex-direction: column;
-  border-radius: 8px;
-  border: 1px solid rgba(68, 64, 60, 0.9);
-  background: rgba(28, 25, 23, 0.97);
+  border-radius: 10px;
+  border: 1px solid #e0d8c9;
+  background: rgba(255, 255, 255, 0.98);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
   box-shadow:
-    0 12px 32px rgba(0, 0, 0, 0.6),
-    0 0 0 1px rgba(0, 0, 0, 0.4),
-    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    0 12px 32px rgba(60, 44, 16, 0.18),
+    0 0 0 1px rgba(255, 255, 255, 0.7) inset;
   outline: none;
   animation: ff-ctx-pop 110ms ease-out;
 }
@@ -685,42 +762,42 @@ summary:focus-visible,
   align-items: center;
   gap: 8px;
   padding: 5px 8px;
-  border-radius: 5px;
+  border-radius: 6px;
   font-size: 11px;
   font-weight: 500;
-  color: #d6d3d1;
+  color: #44403c;
   cursor: pointer;
   transition: background 80ms ease, color 80ms ease;
 }
 .ff-ctx-item:disabled {
-  color: #57534e;
+  color: #b8b0a3;
   cursor: not-allowed;
-  opacity: 0.55;
+  opacity: 0.6;
 }
 .ff-ctx-item-active:not(:disabled) {
-  background: rgba(251, 191, 36, 0.14);
-  color: #fde68a;
+  background: #fdeade;
+  color: #c2410c;
 }
 .ff-ctx-item-danger:not(:disabled) {
-  color: #fb7185;
+  color: #e11d48;
 }
 .ff-ctx-item-danger:not(:disabled):hover,
 .ff-ctx-item-danger.ff-ctx-item-active:not(:disabled) {
-  background: rgba(244, 63, 94, 0.14);
-  color: #fecdd3;
+  background: rgba(225, 29, 72, 0.1);
+  color: #be123c;
 }
 .ff-ctx-sep {
   height: 1px;
   margin: 4px 6px;
-  background: rgba(68, 64, 60, 0.8);
+  background: #eee8dc;
 }
 .ff-ctx-kbd {
   margin-left: auto;
   padding: 1px 5px;
   border-radius: 4px;
-  border: 1px solid rgba(87, 83, 78, 0.7);
-  background: rgba(12, 10, 9, 0.8);
-  color: #a8a29e;
+  border: 1px solid #e0d8c9;
+  background: #f6f2ea;
+  color: #78716c;
   font-size: 9px;
   font-weight: 600;
   line-height: 1.2;
@@ -729,27 +806,26 @@ summary:focus-visible,
 
 /* ===== v5.6 MOTION PATHS ===== */
 
-/* Keyframe diamond on an overlay clip (timeline) — a 7×7px rotated square
-   riding a bottom strip. Amber = the selection-accent family; the dark
-   outline keeps it readable over any clip tint. Hover grows + glows. */
+/* Keyframe diamond on an overlay clip — tangerine, white outline keeps it
+   readable over any clip tint. Hover grows + glows. */
 .ff-kf {
   width: 7px;
   height: 7px;
-  background: #fbbf24;
+  background: #ea580c;
   transform: rotate(45deg);
   border-radius: 1px;
   box-shadow:
-    0 0 0 1px rgba(9, 9, 11, 0.85),
-    0 0 6px rgba(245, 158, 11, 0.45);
+    0 0 0 1px rgba(255, 255, 255, 0.9),
+    0 0 6px rgba(234, 88, 12, 0.45);
   transition: transform 100ms ease, box-shadow 100ms ease;
   animation: ff-kf-in 160ms cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 .ff-kf:hover {
   transform: rotate(45deg) scale(1.5);
   box-shadow:
-    0 0 0 1px rgba(9, 9, 11, 0.9),
-    0 0 0 3px rgba(245, 158, 11, 0.35),
-    0 0 10px rgba(245, 158, 11, 0.7);
+    0 0 0 1px rgba(255, 255, 255, 0.95),
+    0 0 0 3px rgba(234, 88, 12, 0.35),
+    0 0 10px rgba(234, 88, 12, 0.7);
 }
 @keyframes ff-kf-in {
   from {
@@ -762,8 +838,7 @@ summary:focus-visible,
   }
 }
 
-/* Motion HUD count chip — pops on every count change (key={count}
-   remount), same family as the v5.5 selection chip. */
+/* Motion HUD count chip — pops on every count change. */
 .ff-kf-count {
   animation: ff-sel-pop 180ms cubic-bezier(0.34, 1.56, 0.64, 1);
 }
@@ -786,64 +861,57 @@ summary:focus-visible,
 /* Drag-in-flight: lifted + hot-tracked (highest source order wins). */
 .ff-clip.ff-clip-drag {
   z-index: 2;
-  filter: saturate(1.2) brightness(1.12);
+  filter: saturate(1.2) brightness(1.1);
   box-shadow:
-    inset 0 0 0 1px rgba(245, 158, 11, 0.7),
-    0 0 0 2px rgba(255, 255, 255, 0.55),
-    0 6px 16px rgba(0, 0, 0, 0.6);
+    inset 0 0 0 1px rgba(234, 88, 12, 0.75),
+    0 0 0 2px rgba(255, 255, 255, 0.7),
+    0 6px 16px rgba(60, 44, 16, 0.4);
 }
-/* v5.3: the old ::before/::after VISUAL-ONLY edge zones were REMOVED —
-   base clips now render real interactive trim-handle divs (cursor-ew-resize,
-   group-hover fade-in) wired to the shared gesture machinery, exactly like
-   the overlay clips. No double chrome. */
 
 /* Playhead grabber glow — the cyan timeline scrub triangle that pulses
-   softly (v1.22: the playhead keeps its long-standing cyan identity —
-   the timeline's own scrub accent, distinct from amber selection). */
+   softly (cyan = the timeline scrub identity, kept from v5). */
 @keyframes ff-playhead-glow {
-  0%, 100% { filter: drop-shadow(0 0 2px rgba(34, 211, 238, 0.5)); }
-  50% { filter: drop-shadow(0 0 6px rgba(34, 211, 238, 0.95)); }
+  0%, 100% { filter: drop-shadow(0 0 2px rgba(6, 182, 212, 0.55)); }
+  50% { filter: drop-shadow(0 0 6px rgba(6, 182, 212, 0.95)); }
 }
 .ff-playhead-grab {
   animation: ff-playhead-glow 2.2s ease-in-out infinite;
 }
 
-/* Dropzone drag state — amber invite (border-amber-500/60 + amber-950/20 bg).
+/* Dropzone drag state — tangerine invite on paper.
    Toggled by the [data-dragging] attribute the MediaPanel sets. */
 .ff-dropzone[data-dragging="true"] {
-  border-color: rgba(245, 158, 11, 0.6) !important;
-  background-color: rgba(120, 53, 15, 0.2) !important;
+  border-color: rgba(234, 88, 12, 0.6) !important;
+  background-color: #fff3ea !important;
 }
 
-/* v1.22 — primary export action (Header): warm honey gradient — the Ember
-   Studio amber family, bold on stone. */
+/* Flow — primary export action (Header): tangerine gradient, white text. */
 .ff-btn-export {
-  background-image: linear-gradient(135deg, #fcd34d 0%, #fbbf24 52%, #f59e0b 100%);
-  color: #1c1917;
+  background-image: linear-gradient(135deg, #f06214 0%, #ea580c 52%, #d84e08 100%);
+  color: #ffffff;
   font-weight: 700;
   box-shadow:
-    0 1px 2px rgba(0, 0, 0, 0.4),
-    0 4px 16px rgba(245, 158, 11, 0.3);
+    0 1px 2px rgba(120, 53, 15, 0.25),
+    0 4px 16px rgba(234, 88, 12, 0.35);
   transition: all 160ms ease;
 }
 .ff-btn-export:hover:not(:disabled) {
-  filter: brightness(1.07);
+  filter: brightness(1.06);
   box-shadow:
-    0 2px 4px rgba(0, 0, 0, 0.4),
-    0 6px 22px rgba(245, 158, 11, 0.42);
+    0 2px 4px rgba(120, 53, 15, 0.25),
+    0 6px 22px rgba(234, 88, 12, 0.42);
 }
 .ff-btn-export:active:not(:disabled) {
   transform: translateY(0.5px);
   filter: brightness(0.95);
 }
 
-/* ===== v1.22 — WELCOME HERO (center canvas empty state) =====
-   Friendly first-run surface: greeting + three quick-start action cards
-   + a 1-2-3 step strip. One accent (amber), generous targets, keyboard
-   focusable. */
+/* ===== WELCOME HERO (cinema-stage empty state) =====
+   Friendly first-run surface inside the dark cinema card: glassy warm
+   tiles that brighten on hover. */
 .ff-hero-card {
-  border: 1px solid #292524;
-  background-color: rgba(28, 25, 23, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background-color: rgba(255, 255, 255, 0.06);
   border-radius: 12px;
   transition:
     border-color 150ms ease,
@@ -853,13 +921,13 @@ summary:focus-visible,
 }
 .ff-hero-card:hover,
 .ff-hero-card:focus-visible {
-  border-color: rgba(251, 191, 36, 0.55);
-  background-color: rgba(120, 53, 15, 0.16);
+  border-color: rgba(240, 98, 20, 0.6);
+  background-color: rgba(240, 98, 20, 0.14);
   transform: translateY(-2px);
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(251, 191, 36, 0.18);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(240, 98, 20, 0.25);
 }
 .ff-hero-card:focus-visible {
-  outline: 2px solid rgba(251, 191, 36, 0.7);
+  outline: 2px solid rgba(240, 98, 20, 0.7);
   outline-offset: 2px;
 }
 .ff-hero-card:active {
@@ -874,9 +942,8 @@ summary:focus-visible,
 }
 
 /* ===== Resizable panel splitters — v5.2 task 3-b =====
-   6px transparent gutter with a centered 1px stone-700 line that glows
-   amber (#fbbf24) on hover / drag / keyboard focus. While a drag is active
-   the splitter sets .ff-resizing (+ direction) on <body>. */
+   6px transparent gutter with a centered 1px warm-gray line that glows
+   tangerine on hover / drag / keyboard focus. */
 
 .ff-splitter {
   position: relative;
@@ -905,7 +972,7 @@ summary:focus-visible,
 .ff-splitter-line {
   position: absolute;
   border-radius: 1px;
-  background: #44403c; /* stone-700 */
+  background: #d3cabd;
   transition:
     background 120ms ease,
     box-shadow 120ms ease;
@@ -924,30 +991,30 @@ summary:focus-visible,
   height: 1px;
 }
 
-/* Hover / drag → amber line + soft glow */
+/* Hover / drag → tangerine line + soft glow */
 .ff-splitter:hover .ff-splitter-line,
 .ff-splitter[data-dragging] .ff-splitter-line {
-  background: #fbbf24;
-  box-shadow: 0 0 8px rgba(251, 191, 36, 0.55);
+  background: #ea580c;
+  box-shadow: 0 0 8px rgba(234, 88, 12, 0.45);
 }
 
 /* Keyboard focus ring (visible only for keyboard focus) */
 .ff-splitter:focus-visible {
   border-radius: 3px;
-  box-shadow: inset 0 0 0 1px rgba(251, 191, 36, 0.3);
+  box-shadow: inset 0 0 0 1px rgba(234, 88, 12, 0.3);
 }
 .ff-splitter:focus-visible .ff-splitter-line {
-  background: #fbbf24;
-  box-shadow: 0 0 8px rgba(251, 191, 36, 0.45);
+  background: #ea580c;
+  box-shadow: 0 0 8px rgba(234, 88, 12, 0.45);
 }
 
-/* Snap-to-default engaged (drag within 24px of the default) — brighter pulse */
+/* Snap-to-default engaged — brighter pulse */
 .ff-splitter[data-snap] .ff-splitter-line {
-  background: #fbbf24;
-  box-shadow: 0 0 14px rgba(251, 191, 36, 0.85);
+  background: #ea580c;
+  box-shadow: 0 0 14px rgba(234, 88, 12, 0.75);
 }
 
-/* Grip texture: 3 tiny stone-500 dots at the splitter midpoint */
+/* Grip texture: 3 tiny warm dots at the splitter midpoint */
 .ff-splitter-grip {
   position: absolute;
   top: 50%;
@@ -968,7 +1035,7 @@ summary:focus-visible,
   width: 2px;
   height: 2px;
   border-radius: 9999px;
-  background: #78716c; /* stone-500 */
+  background: #bdb2a1;
 }
 
 /* Live size chip while dragging / keyboard-focused */
@@ -979,9 +1046,9 @@ summary:focus-visible,
   transform: translateX(-50%);
   padding: 2px 6px;
   border-radius: 4px;
-  background: #1c1917;
-  border: 1px solid #44403c;
-  color: #a8a29e;
+  background: #ffffff;
+  border: 1px solid #e0d8c9;
+  color: #57534e;
   font-family: ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
   font-size: 10px;
   font-weight: 600;
@@ -989,7 +1056,7 @@ summary:focus-visible,
   white-space: nowrap;
   pointer-events: none;
   z-index: 40;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 2px 8px rgba(87, 66, 27, 0.14);
 }
 .ff-splitter-row .ff-splitter-chip {
   top: 50%;
@@ -997,9 +1064,9 @@ summary:focus-visible,
   transform: translateY(-50%);
 }
 .ff-splitter[data-snap] .ff-splitter-chip {
-  border-color: #fbbf24;
-  color: #fde68a;
-  background: rgba(251, 191, 36, 0.12);
+  border-color: #ea580c;
+  color: #c2410c;
+  background: #fff3ea;
 }
 
 /* Body state while a splitter drag is active (set from Splitter). */
@@ -1016,44 +1083,40 @@ body.ff-resizing-row * {
   cursor: row-resize !important;
 }
 
-/* v5.2 timeline viewport: explicit resizable height + custom scrollbar so
-   tall lane stacks (waveform + base + overlay + sfx) scroll instead of
-   stretching the center column. Applied only in non-compact v5 mode. */
+/* v5.2 timeline viewport: explicit resizable height + custom scrollbar. */
 .ff-timeline-scroll {
   overflow-y: auto;
   overflow-x: hidden;
   overscroll-behavior: contain;
   scrollbar-width: thin;
-  scrollbar-color: #44403c transparent;
+  scrollbar-color: #d3cabd transparent;
 }
 .ff-timeline-scroll::-webkit-scrollbar {
   width: 10px;
 }
 .ff-timeline-scroll::-webkit-scrollbar-track {
-  background: rgba(0, 0, 0, 0.25);
+  background: rgba(87, 66, 27, 0.05);
   border-radius: 8px;
 }
 .ff-timeline-scroll::-webkit-scrollbar-thumb {
-  background-color: #44403c;
+  background-color: #d3cabd;
   border-radius: 8px;
-  border: 2px solid #14110f;
+  border: 2px solid #ffffff;
   background-clip: content-box;
 }
 .ff-timeline-scroll::-webkit-scrollbar-thumb:hover {
-  background-color: #57534e;
+  background-color: #bdb2a1;
   background-clip: content-box;
 }
 
-/* v1 FOCUS MODE — floating panel-collapse toggles pinned to the center
-   column's edges. Semi-opaque chip that brightens on hover; a soft amber
-   ring signals the workspace-mode affordance. */
+/* Rail/dock focus mode — floating panel-collapse toggle. */
 .ff-edge-toggle:hover {
-  border-color: rgba(251, 191, 36, 0.55) !important;
-  background-color: rgba(41, 37, 36, 0.95) !important;
-  box-shadow: 0 0 10px rgba(245, 158, 11, 0.35);
+  border-color: rgba(234, 88, 12, 0.55) !important;
+  background-color: #ffffff !important;
+  box-shadow: 0 0 10px rgba(234, 88, 12, 0.25);
 }
 .ff-edge-toggle:focus-visible {
-  outline: 2px solid #fbbf24;
+  outline: 2px solid #ea580c;
   outline-offset: 1px;
 }
 @media (prefers-reduced-motion: reduce) {
@@ -1066,7 +1129,7 @@ body.ff-resizing-row * {
 /* ── v1.2: keyboard shortcuts overlay ───────────────────────────────── */
 
 .ff-shortcuts-backdrop {
-  background-color: rgba(0, 0, 0, 0.62);
+  background-color: rgba(41, 37, 36, 0.4);
   backdrop-filter: blur(3px);
   animation: ff-overlay-fade 160ms ease-out;
 }
@@ -1092,8 +1155,7 @@ body.ff-resizing-row * {
   }
 }
 
-/* The shortcuts sheet scrolls in place on short viewports — slim scrollbar
-   matching .ff-timeline-scroll. */
+/* The shortcuts sheet scrolls in place on short viewports. */
 .ff-shortcuts-scroll::-webkit-scrollbar {
   width: 8px;
 }
@@ -1101,13 +1163,13 @@ body.ff-resizing-row * {
   background: transparent;
 }
 .ff-shortcuts-scroll::-webkit-scrollbar-thumb {
-  background-color: #44403c;
+  background-color: #d3cabd;
   border-radius: 8px;
-  border: 2px solid #14110f;
+  border: 2px solid #ffffff;
   background-clip: content-box;
 }
 .ff-shortcuts-scroll::-webkit-scrollbar-thumb:hover {
-  background-color: #57534e;
+  background-color: #bdb2a1;
   background-clip: content-box;
 }
 
