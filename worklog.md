@@ -2396,3 +2396,21 @@ Work Log:
 Stage Summary:
 - The UI is now genuinely NEW: different information architecture (rail+dock vs two-sided panels), different visual system (light paper + floating cards vs full-bleed dark), different navigation model (phase rail vs tab strip), different landing. Logic, props, ids, a11y, and export behavior untouched.
 - Ready to ship as v1.23.0.
+
+---
+Task ID: 9 (ship v1.23.0)
+Agent: main (Z.ai Code)
+Task: Ship v1.23.0 — NSIS installer + GitHub release (after full local verification).
+
+Work Log:
+- Commit 3fa1544 pushed to main ("v1.23.0 Flow: complete from-scratch UI rebuild", 15 files, +2232/−1921).
+- CI run 37114756044 job 1 (windows-latest MSVC) GREEN: engine build → E2E smoke PASSED (engineUsed rust-gpu, 150 frames h264 + aac 48kHz, adapter Basic Render Driver, all assertions).
+- Artifact 11271233499 downloaded + staged: framefuse-engine.win32-x64.node (11,842,048 B; sha256 aebab2cf…) — the installer ships EXACTLY this smoke-tested binary (sha VERIFIED inside app.asar.unpacked).
+- clean → next build --webpack (5 routes) → gpu-worker (356 KB) → electron-builder --win nsis → dist/FrameFuse Setup 1.23.0.exe (221,181,923 B) + blockmap + latest.yml. rcedit: FrameFuse.exe 1.23.0.0, icon replaced.
+- ASAR verification: package.json 1.23.0; engine sha match; 20 TTFs + 5 FFmpeg DLLs in resources; the packaged page chunk carries the Flow shell (ff-rail-btn, ff-cinema, ff-card, speed of thought, Launch the Studio, Media library, activeTab controlled-tab) and the OLD shell markers are gone (edge toggles, old labels; the single remaining #0c0a09 is a canvas fillStyle = video backdrop CONTENT).
+- PUBLISHED scripts/publish-release-1.23.0.js: release 402453396 created at 3fa1544, assets FrameFuse-Setup-1.23.0.exe + latest.yml + blockmap uploaded. THREE-WAY sha512 VERIFIED (FGQ/eKChd4G2… local == latest.yml == re-downloaded; size exact).
+- Post-ship: dev server healthy (GET / 200, title v1.23.0, zero page errors).
+
+Stage Summary:
+- v1.23.0 IS LIVE: https://github.com/Ziruax/framefuse/releases/tag/v1.23.0 (installer only — NSIS, per the standing directive).
+- The Flow redesign shipped exactly as verified locally: light Paper Studio shell, rail + dock, cinema card, floating timeline card, new landing — no untested changes between verification and release (same working tree, same commit).
