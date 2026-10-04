@@ -1,20 +1,21 @@
 "use client";
 
 // ---------------------------------------------------------------------------
-// v1.25 — AI TEXT-TO-SPEECH STUDIO (Dubbing tab)
+// v1.26 — AI TEXT-TO-SPEECH STUDIO (its own "TTS" dock tab)
 //
-// A full Edge-TTS surface on top of the main-process long-form pipeline
-// (ttsSynthesizeLong / ttsCancelLong / ttsReadAudio / onTtsProgress):
+// A full Edge-TTS surface on top of the speech transport
+// (src/lib/speech-api.ts):
 //   • up to 200,000 words (1.5 M chars) chunked into ONE merged MP3
-//   • live chunk/char progress + cancel (hours-scale runs stay controllable)
+//   • live chunk/char progress + cancel (works in web AND desktop)
 //   • word-level timings → captions handoff, SRT/VTT/JSON sidecars
 //   • QWERTY (romanized) Hindi/Urdu input — auto-converts to native script
+//   • language picker grouped by language name + voice presets (built-in
+//     prosody presets + user-saved voice presets)
 //   • handoffs: VO lane (≤ 20 min), Audio lane (any length), captions
 //
-// Electron discipline: every IPC sits behind `window.electronAPI?.`; the
-// card itself renders in the web preview too (inert, Generate disabled) so
-// the surface is verifiable in the browser — synthesis simply refuses with
-// a "desktop app" toast when electronAPI is absent.
+// Electron discipline: synthesis goes IPC-first when the bridge exists;
+// in the web preview the /api/tts routes serve the same Edge-TTS engine
+// server-side, so Generate/preview work in the browser too.
 // ---------------------------------------------------------------------------
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -29,8 +30,11 @@ import {
   Mic,
   Music,
   Play,
+  Plus,
   Search,
   Square,
+  Star,
+  Trash2,
 } from "lucide-react";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
@@ -40,6 +44,11 @@ import {
   localeWantsTranslit,
   transliterateForLocale,
 } from "@/lib/translit";
+import {
+  regionLabel,
+  ttsPreviewVoice,
+  ttsSynthesize,
+} from "@/lib/speech-api";
 import { useTtsVoices, type TtsVoice } from "./use-tts-voices";
 
 // ---------------------------------------------------------------------------
@@ -239,6 +248,73 @@ export function VoiceGenderChips({
 }
 
 // ---------------------------------------------------------------------------
+// v1.26 VOICE PRESETS — prosody styles (built-in) + user-saved voice configs
+// ---------------------------------------------------------------------------
+/** A built-in prosody preset — applies speed/pitch/volume, keeps the voice. */
+interface BuiltInPreset {
+  id: string;
+  name: string;
+  hint: string;
+  ratePct: number;
+  pitchHz: number;
+  volumePct: number;
+}
+
+const BUILT_IN_PRESETS: BuiltInPreset[] = [
+  { id: "natural", name: "Natural", hint: "Default pace and tone", ratePct: 0, pitchHz: 0, volumePct: 100 },
+  { id: "narrator", name: "Narrator", hint: "Measured documentary narration", ratePct: -10, pitchHz: 0, volumePct: 100 },
+  { id: "audiobook", name: "Audiobook", hint: "Slow, warm, comfortable", ratePct: -18, pitchHz: -5, volumePct: 100 },
+  { id: "news", name: "News anchor", hint: "Crisp and confident", ratePct: 8, pitchHz: 0, volumePct: 100 },
+  { id: "promo", name: "Promo", hint: "Energetic advertisement read", ratePct: 18, pitchHz: 15, volumePct: 100 },
+  { id: "calm", name: "Calm", hint: "Soft meditation pacing", ratePct: -25, pitchHz: -10, volumePct: 95 },
+  { id: "podcast", name: "Podcast", hint: "Conversational host tone", ratePct: -5, pitchHz: 5, volumePct: 100 },
+];
+
+/** A user-saved preset — captures the FULL synthesis config (voice + prosody). */
+interface UserPreset {
+  id: string;
+  name: string;
+  voice: string;
+  locale: string;
+  ratePct: number;
+  pitchHz: number;
+  volumePct: number;
+}
+
+const PRESET_LS_KEY = "framefuse.tts.presets.v1";
+
+function loadUserPresets(): UserPreset[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(PRESET_LS_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw) as unknown;
+    if (!Array.isArray(arr)) return [];
+    return arr.filter(
+      (p): p is UserPreset =>
+        !!p &&
+        typeof (p as UserPreset).id === "string" &&
+        typeof (p as UserPreset).name === "string" &&
+        typeof (p as UserPreset).voice === "string" &&
+        typeof (p as UserPreset).locale === "string" &&
+        typeof (p as UserPreset).ratePct === "number" &&
+        typeof (p as UserPreset).pitchHz === "number" &&
+        typeof (p as UserPreset).volumePct === "number",
+    );
+  } catch {
+    return [];
+  }
+}
+
+function saveUserPresets(list: UserPreset[]) {
+  try {
+    window.localStorage.setItem(PRESET_LS_KEY, JSON.stringify(list));
+  } catch {
+    /* storage full / private mode — non-fatal */
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Local formatters / serializers (one cue per word for sidecars)
 // ---------------------------------------------------------------------------
 interface StudioWord {
@@ -410,10 +486,9 @@ export default function TtsStudioSection({
   onAddMusicAudio,
   onCreateWordCaptions,
 }: TtsStudioSectionProps) {
-  const { voices, pairs } = useTtsVoices();
+  const { voices, pairs, languages } = useTtsVoices();
 
   const [open, setOpen] = useState(true);
-  const [inElectron, setInElectron] = useState(false);
   // Script + settings (persisted to localStorage as one draft object).
   const [text, setText] = useState("");
   const [qwerty, setQwerty] = useState(true);
@@ -424,6 +499,9 @@ export default function TtsStudioSection({
   const [ratePct, setRatePct] = useState(0);
   const [pitchHz, setPitchHz] = useState(0);
   const [volumePct, setVolumePct] = useState(100);
+  // v1.26 presets: user-saved voice configs (built-ins are constants).
+  const [userPresets, setUserPresets] = useState<UserPreset[]>([]);
+  const [presetName, setPresetName] = useState("");
   // Preview / run / result.
   const [previewBusy, setPreviewBusy] = useState(false);
   const [running, setRunning] = useState(false);
@@ -437,13 +515,13 @@ export default function TtsStudioSection({
   const activeRunIdRef = useRef<string | null>(null);
   const runStartRef = useRef(0);
   const hydratedRef = useRef(false);
+  /** Web-mode abort handle for the active long synthesis. */
+  const synthAbortRef = useRef<AbortController | null>(null);
 
-  // Electron presence (web preview renders the card inert — see header note).
-  // Mount-time probe of a browser global — the codebase's established
-  // suppression pattern for one-shot hydration effects.
+  // v1.26: user presets load once on mount (plain read — hydration-safe).
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    setInElectron(Boolean(window.electronAPI));
+    setUserPresets(loadUserPresets());
   }, []);
 
   // ---- Draft persistence ---------------------------------------------------
@@ -535,10 +613,111 @@ export default function TtsStudioSection({
     return Array.from(set).sort();
   }, [voices]);
 
+  /** v1.26: the language picker's grouped options — every catalog locale,
+ *  grouped under its human language name ("Hindi" → hi-IN). Falls back to
+ *  the raw locale list while the catalog is loading. */
+  const languageGroups = useMemo(() => {
+    const catalog = languages ?? [];
+    const have = new Set(locales);
+    const groups = catalog
+      .map((lang) => ({
+        ...lang,
+        locales: lang.locales.filter((l) => have.size === 0 || have.has(l)),
+      }))
+      .filter((g) => g.locales.length > 0);
+    if (groups.length > 0) return groups;
+    // Catalog still loading — one flat group of the known locales.
+    return locales.length > 0
+      ? [{ code: "", name: "All languages", locales }]
+      : [{ code: "", name: "Loading…", locales: [locale] }];
+  }, [languages, locales, locale]);
+
+  /** Option label: "Hindi (India)" / "English (United States)". */
+  const localeLabel = useCallback(
+    (l: string) => {
+      const langPart = (l.split("-")[0] || l).toLowerCase();
+      const group = (languages ?? []).find((g) => g.code === langPart);
+      const langName = group?.name ?? langPart;
+      return l.includes("-") ? `${langName} (${regionLabel(l)})` : langName;
+    },
+    [languages],
+  );
+
   const filteredVoices = useMemo(
     () => filterTtsVoices(voices ?? [], { search, locale, gender }),
     [voices, search, locale, gender],
   );
+
+  /** The built-in preset that matches the CURRENT prosody (or null). */
+  const activeBuiltIn = useMemo(
+    () =>
+      BUILT_IN_PRESETS.find(
+        (p) => p.ratePct === ratePct && p.pitchHz === pitchHz && p.volumePct === volumePct,
+      ) ?? null,
+    [ratePct, pitchHz, volumePct],
+  );
+
+  /** Apply a built-in prosody preset (voice stays untouched). */
+  const applyBuiltIn = useCallback((p: BuiltInPreset) => {
+    setRatePct(p.ratePct);
+    setPitchHz(p.pitchHz);
+    setVolumePct(p.volumePct);
+  }, []);
+
+  /** Apply a user preset — voice, locale AND prosody. */
+  const applyUserPreset = useCallback(
+    (p: UserPreset) => {
+      setLocale(p.locale);
+      setSearch("");
+      setVoice(p.voice);
+      setRatePct(p.ratePct);
+      setPitchHz(p.pitchHz);
+      setVolumePct(p.volumePct);
+      toast.info(`Preset "${p.name}" applied`, {
+        description: `${p.voice} · speed ${p.ratePct > 0 ? "+" : ""}${p.ratePct}% · pitch ${p.pitchHz > 0 ? "+" : ""}${p.pitchHz}Hz`,
+      });
+    },
+    [],
+  );
+
+  /** Save the CURRENT config (voice + locale + prosody) as a user preset. */
+  const savePreset = useCallback(() => {
+    const name = presetName.trim();
+    if (!name) {
+      toast.error("Name the preset first");
+      return;
+    }
+    if (!voice) {
+      toast.error("Select a voice first");
+      return;
+    }
+    const next: UserPreset[] = [
+      ...userPresets.filter((p) => p.name.toLowerCase() !== name.toLowerCase()),
+      {
+        id: `p_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+        name,
+        voice,
+        locale,
+        ratePct,
+        pitchHz,
+        volumePct,
+      },
+    ];
+    setUserPresets(next);
+    saveUserPresets(next);
+    setPresetName("");
+    toast.success(`Preset "${name}" saved`, {
+      description: "It appears below the built-in style presets.",
+    });
+  }, [presetName, voice, userPresets, locale, ratePct, pitchHz, volumePct]);
+
+  const deleteUserPreset = useCallback((id: string) => {
+    setUserPresets((prev) => {
+      const next = prev.filter((p) => p.id !== id);
+      saveUserPresets(next);
+      return next;
+    });
+  }, []);
 
   // Locale switch → that locale's female pair default; clear the search so
   // the new locale's list isn't accidentally empty.
@@ -581,18 +760,16 @@ export default function TtsStudioSection({
   useEffect(() => stopPreview, [stopPreview]);
 
   const playPreview = useCallback(async () => {
-    const preview = window.electronAPI?.ttsPreview;
-    if (typeof preview !== "function") {
-      toast.error("Voice previews run in the FrameFuse desktop app");
-      return;
-    }
     stopPreview();
+    if (!voice) return;
     setPreviewBusy(true);
     try {
       const sample = (
         convertedText.trim() || previewFallback(activeLocale)
       ).slice(0, PREVIEW_MAX_CHARS);
-      const r = await preview({ voice, text: sample });
+      // v1.26 transport: IPC in the desktop app, /api/tts/synthesize in the
+      // web preview — previews work in both runtimes now.
+      const r = await ttsPreviewVoice({ voice, text: sample });
       const blob = new Blob([r.bytes], { type: "audio/mpeg" });
       const url = URL.createObjectURL(blob);
       const audio = new Audio(url);
@@ -631,16 +808,6 @@ export default function TtsStudioSection({
 
   // ---- GENERATE ------------------------------------------------------------
   const generate = useCallback(async () => {
-    const api = window.electronAPI;
-    const synth = api?.ttsSynthesizeLong;
-    const read = api?.ttsReadAudio;
-    if (typeof synth !== "function" || typeof read !== "function") {
-      toast.error("The TTS studio runs in the FrameFuse desktop app", {
-        description:
-          "Long-form synthesis (200,000 words, one file) is powered by the desktop app's Edge-TTS engine.",
-      });
-      return;
-    }
     const finalText = convertedText.trim();
     if (!finalText) {
       toast.error("Write the narration text first");
@@ -666,37 +833,39 @@ export default function TtsStudioSection({
       status: "starting",
     });
 
-    // Subscribe BEFORE invoking — the first progress event can beat the
-    // awaited reply (chunk completions stream over "tts:progress").
-    const unsub = api?.onTtsProgress?.((d) => {
-      if (!d || d.runId !== runId || activeRunIdRef.current !== runId) return;
-      setProgress({
-        phase: d.phase,
-        chunkIndex: d.chunkIndex ?? 0,
-        chunkCount: d.chunkCount ?? 0,
-        charsDone: d.charsDone ?? 0,
-        totalChars: d.totalChars ?? finalText.length,
-        status: d.status ?? "",
-      });
-    });
+    // Web-mode abort handle (the IPC path cancels via ttsCancelLong).
+    const abort = new AbortController();
+    synthAbortRef.current = abort;
 
     try {
-      const res = await synth({
-        runId,
+      // v1.26 transport — IPC-first (main-process chunking + progress
+      // channel), web fallback (client chunk loop against /api/tts/synthesize
+      // with the SAME progress/cancel contract).
+      const res = await ttsSynthesize({
         text: finalText,
         voice,
         ratePct,
         pitchHz,
-        // The UI slider is 0..100 (100 = unity); the engine takes -100..0.
-        volumePct: volumePct - 100,
+        volumePct,
+        signal: abort.signal,
+        onProgress: (d) => {
+          if (activeRunIdRef.current !== runId) return;
+          setProgress({
+            phase: "synth",
+            chunkIndex: d.chunkIndex,
+            chunkCount: d.chunkCount,
+            charsDone: d.charsDone,
+            totalChars: d.totalChars || finalText.length,
+            status: d.status,
+          });
+        },
       });
-      const rr = await read({ filePath: res.filePath });
-      const blob = new Blob([rr.bytes], { type: "audio/mpeg" });
+      const blob = new Blob([res.bytes as BlobPart], { type: "audio/mpeg" });
       const url = URL.createObjectURL(blob);
       if (resultUrlRef.current) URL.revokeObjectURL(resultUrlRef.current);
       resultUrlRef.current = url;
       setResult({
-        fileName: res.fileName,
+        fileName: `tts_${runId.slice(4)}.mp3`,
         text: finalText,
         blob,
         url,
@@ -711,10 +880,10 @@ export default function TtsStudioSection({
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (/cancel/i.test(msg)) toast.info("Synthesis cancelled");
+      if (/cancel|abort/i.test(msg)) toast.info("Synthesis cancelled");
       else toast.error("TTS synthesis failed", { description: msg });
     } finally {
-      unsub?.();
+      synthAbortRef.current = null;
       activeRunIdRef.current = null;
       setRunning(false);
       setProgress(null);
@@ -722,11 +891,12 @@ export default function TtsStudioSection({
   }, [convertedText, voice, overLimit, ratePct, pitchHz, volumePct]);
 
   // ---- CANCEL --------------------------------------------------------------
-  // The run promise rejects with the standard cancel error, so reset + toast
-  // happen in generate()'s catch/finally — this only triggers the abort.
+  // IPC runs reject via the main process's cancel error; web runs reject
+  // with AbortError — both reset + toast in generate()'s catch/finally.
   const cancelRun = useCallback(async () => {
     const runId = activeRunIdRef.current;
     if (!runId) return;
+    synthAbortRef.current?.abort();
     try {
       await window.electronAPI?.ttsCancelLong?.(runId);
     } catch {
@@ -874,11 +1044,6 @@ export default function TtsStudioSection({
               {wordCount.toLocaleString()} words ·{" "}
               {charCount.toLocaleString()} chars
             </span>
-            {!inElectron && (
-              <span className="text-[10px] text-amber-400/80">
-                Synthesis runs in the desktop app
-              </span>
-            )}
           </div>
           {overLimit && (
             <p className="mb-2 flex items-center gap-1 text-[10px] leading-relaxed text-rose-400">
@@ -925,7 +1090,7 @@ export default function TtsStudioSection({
             </div>
           )}
 
-          {/* ── 3. Voice picker ───────────────────────────────────────── */}
+          {/* ── 3. Language + voice picker ─────────────────────────── */}
           <div className="mb-1.5 flex items-center gap-1.5">
             <div className="relative min-w-0 flex-1">
               <Search
@@ -946,28 +1111,29 @@ export default function TtsStudioSection({
           <div className="mb-2 grid grid-cols-2 gap-1.5">
             <div>
               <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
-                Locale
+                Language
               </label>
               <select
                 value={locale}
                 onChange={(e) => changeLocale(e.target.value)}
                 className={selectCls}
                 style={{ borderColor: "#332e28" }}
-                aria-label="Voice locale"
+                aria-label="Speech language and locale"
               >
-                {locales.length === 0 && (
-                  <option value={locale}>{locale}</option>
-                )}
-                {locales.map((l) => (
-                  <option key={l} value={l}>
-                    {l}
-                  </option>
+                {languageGroups.map((g) => (
+                  <optgroup key={g.code || "all"} label={g.name}>
+                    {g.locales.map((l) => (
+                      <option key={l} value={l}>
+                        {g.code ? localeLabel(l) : l}
+                      </option>
+                    ))}
+                  </optgroup>
                 ))}
               </select>
             </div>
             <div>
               <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
-                Voice
+                Voice ({filteredVoices.length > 0 ? `${filteredVoices.length} in ${locale}` : "—"})
               </label>
               <div className="flex items-center gap-1">
                 <select
@@ -978,7 +1144,7 @@ export default function TtsStudioSection({
                   aria-label="Synthesis voice"
                 >
                   {filteredVoices.length === 0 && (
-                    <option value={voice}>{voice}</option>
+                    <option value={voice}>{voice || "— loading voices —"}</option>
                   )}
                   {filteredVoices.map((v) => (
                     <option key={v.shortName} value={v.shortName}>
@@ -1051,16 +1217,108 @@ export default function TtsStudioSection({
             </StudioField>
           </div>
 
-          {/* ── 5. Generate + live progress ──────────────────────────── */}
+          {/* ── 5. Voice presets (v1.26) ──────────────────────────── */}
+          <div
+            className="mb-2 rounded border p-2"
+            style={{ borderColor: "#332e28", backgroundColor: "#1a1815" }}
+          >
+            <div className="mb-1.5 flex items-center gap-1.5">
+              <Star size={10} className="shrink-0 text-teal-400" />
+              <span className="text-[10px] font-semibold uppercase tracking-wide text-stone-400">
+                Voice presets
+              </span>
+              <span className="text-[9px] text-stone-600">styles apply speed · pitch · volume</span>
+            </div>
+            <div className="mb-1.5 flex flex-wrap gap-1" role="group" aria-label="Built-in voice style presets">
+              {BUILT_IN_PRESETS.map((p) => {
+                const active = activeBuiltIn?.id === p.id;
+                return (
+                  <button
+                    key={p.id}
+                    type="button"
+                    onClick={() => applyBuiltIn(p)}
+                    title={p.hint}
+                    aria-pressed={active}
+                    className={cn(
+                      "rounded-full border px-2 py-[3px] text-[10px] font-medium transition-colors",
+                      active
+                        ? "border-teal-500/60 bg-[#10201d] text-teal-300"
+                        : "border-[#332e28] text-stone-400 hover:bg-white/[0.04] hover:text-stone-200",
+                    )}
+                  >
+                    {p.name}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* User-saved presets (voice + language + prosody). */}
+            {userPresets.length > 0 && (
+              <div className="mb-1.5 flex flex-wrap gap-1" role="group" aria-label="Saved voice presets">
+                {userPresets.map((p) => {
+                  const active = p.voice === voice && p.ratePct === ratePct && p.pitchHz === pitchHz;
+                  return (
+                    <span
+                      key={p.id}
+                      className={cn(
+                        "inline-flex items-center gap-1 rounded-full border px-2 py-[3px] text-[10px] font-medium transition-colors",
+                        active
+                          ? "border-orange-500/60 bg-orange-500/15 text-orange-300"
+                          : "border-[#3a2d20] bg-[#241c12] text-amber-200/90 hover:bg-[#2e2315]",
+                      )}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => applyUserPreset(p)}
+                        title={`${p.voice} · ${p.locale} · speed ${p.ratePct > 0 ? "+" : ""}${p.ratePct}% · pitch ${p.pitchHz > 0 ? "+" : ""}${p.pitchHz}Hz`}
+                        className="cursor-pointer"
+                      >
+                        {p.name}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => deleteUserPreset(p.id)}
+                        title="Delete this preset"
+                        aria-label={`Delete preset ${p.name}`}
+                        className="cursor-pointer text-stone-500 transition-colors hover:text-rose-400"
+                      >
+                        <Trash2 size={9} />
+                      </button>
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Save the current config as a preset. */}
+            <div className="flex items-center gap-1">
+              <input
+                value={presetName}
+                onChange={(e) => setPresetName(e.target.value)}
+                placeholder="Preset name — e.g. Hindi narrator"
+                maxLength={40}
+                className="min-w-0 flex-1 rounded border bg-[#211e1a] px-2 py-1 text-[10px] text-stone-300 placeholder:text-stone-500 focus:border-teal-500 focus:outline-none"
+                style={{ borderColor: "#332e28" }}
+                aria-label="New preset name"
+              />
+              <button
+                type="button"
+                onClick={savePreset}
+                disabled={!presetName.trim() || !voice}
+                title="Save the current voice, language and prosody as a reusable preset"
+                className="flex shrink-0 items-center gap-1 rounded border border-teal-500/40 bg-teal-500/10 px-2 py-1 text-[10px] font-semibold text-teal-300 transition-colors hover:bg-teal-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <Plus size={10} /> Save preset
+              </button>
+            </div>
+          </div>
+
+          {/* ── 6. Generate + live progress ──────────────────────────── */}
           <button
             type="button"
             onClick={() => void generate()}
             disabled={generateDisabled}
-            title={
-              !inElectron
-                ? "Long-form synthesis runs in the FrameFuse desktop app"
-                : "Synthesize the full script into one audio file"
-            }
+            title="Synthesize the full script into one audio file (works in the web preview and the desktop app)"
             className="flex w-full items-center justify-center gap-1.5 rounded bg-orange-500 px-2.5 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-40"
           >
             {running ? (

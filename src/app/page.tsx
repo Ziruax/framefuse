@@ -13,6 +13,7 @@ import { toast } from "@/lib/toast";
 // Roman Urdu → Nastaliq — for script writing, captions and TTS input.
 import { transliterate, isLikelyRomanized } from "@/lib/translit";
 import {
+  AudioLines as AudioLinesIcon,
   Captions as CaptionsIcon,
   FolderOpen,
   Frame,
@@ -57,6 +58,14 @@ import {
   nativeSourcePath,
 } from "@/lib/merger/native";
 import { installBenchExportListener } from "@/lib/merger/benchExport";
+// v1.26 SPEECH TRANSPORT — the dub stages + TTS calls run IPC-first in the
+// desktop app and fall back to the /api speech routes in the web preview.
+import {
+  dubScript as runDubScript,
+  dubSynthesize,
+  dubTranscribe as runDubTranscribe,
+  hasElectronBridge,
+} from "@/lib/speech-api";
 import {
   groupWordLevelCues,
   looksLikeWordLevelCues,
@@ -199,8 +208,11 @@ const DOCK_SECTIONS: {
   { id: "captions", label: "Captions", title: "Captions", icon: CaptionsIcon },
   { id: "effects", label: "Effects", title: "Effects & transitions", icon: SparklesIcon },
   { id: "audio", label: "Audio", title: "Audio & music", icon: MusicIcon },
-  // v1.24: dedicated DUBBING phase — voiceover, script writer, translate &
-  // dub and text removal moved out of Audio/Effects into one speech home.
+  // v1.26: SIMPLE text-to-speech gets its own dock tab (AI TTS Studio +
+  // Voiceover) — split out of the Dubbing phase.
+  { id: "tts", label: "TTS", title: "Text to speech", icon: AudioLinesIcon },
+  // v1.24: dedicated DUBBING phase — the Dub Studio (transcribe → script
+  // → voices & dub), script writer and text removal.
   { id: "dubbing", label: "Dubbing", title: "Dubbing & voice", icon: LanguagesIcon },
   { id: "export", label: "Export", title: "Export", icon: RocketIcon },
 ];
@@ -1579,6 +1591,9 @@ export default function Page() {
   >(null);
   const [dubScript, setDubScript] = useState<DubScriptResult | null>(null);
   const [dubSpeakerVoices, setDubSpeakerVoices] = useState<Record<number, string>>({});
+  /** v1.26: web-mode abort handle for the active dub run (the IPC legs
+ *  cancel through dubCancel). */
+  const dubAbortRef = useRef<AbortController | null>(null);
 
   // Progress events from the main process (same channel pattern as whisper).
   useEffect(() => {
@@ -1608,14 +1623,37 @@ export default function Page() {
     [timeline.segments],
   );
 
+  /** v1.26 WEB-PREVIEW dub sources — the same base-lane video clips, but as
+ *  browser File blobs (the /api/dub routes extract audio server-side).
+ *  Only used when the Electron bridge is absent. */
+  const webDubSources = useMemo(
+    () =>
+      !hasElectronBridge()
+        ? timeline.segments
+            .filter(
+              (s): s is MediaSegment & { file: File } =>
+                s.mediaType === "video" &&
+                (s.track ?? 0) === 0 &&
+                s.file instanceof File,
+            )
+            .map((s) => ({ file: s.file, startMs: s.startMs, endMs: s.endMs }))
+        : [],
+    [timeline.segments],
+  );
+
+  const dubSourceCount = hasElectronBridge() ? dubSources.length : webDubSources.length;
+
   const startDub = useCallback(async () => {
     if (dubBusy) return;
     const api = window.electronAPI;
-    if (!api || typeof api.dubStart !== "function") {
-      toast.error("Dubbing runs in the FrameFuse desktop app");
+    const ipcDub = typeof api?.dubStart === "function" ? api.dubStart : null;
+    if (ipcDub && dubSources.length === 0) {
+      toast.error("No local video clips on the timeline to dub", {
+        description: "Import a video from disk (not a restored project) first.",
+      });
       return;
     }
-    if (dubSources.length === 0) {
+    if (!ipcDub && webDubSources.length === 0) {
       toast.error("No local video clips on the timeline to dub", {
         description: "Import a video from disk (not a restored project) first.",
       });
@@ -1625,21 +1663,74 @@ export default function Page() {
     setDubProgress({ phase: "prepare", progress: 0, status: "Starting…" });
     setDubResult(null);
     try {
-      const result = await api.dubStart({
-        segments: dubSources,
-        sourceLanguage: "auto",
-        targetLanguage: dubSettings.targetLanguage,
-        targetLocale: dubSettings.targetLocale,
-        groqModel: dubSettings.groqModel,
-        // v1.22: the dub's AI model provider — Groq (default) or Gemini
-        // (the Script Writer's key + the Gemini model list).
-        textProvider: dubSettings.textProvider ?? "groq",
-        geminiModel: dubSettings.geminiModel,
-        femaleVoice: dubSettings.femaleVoice || undefined,
-        maleVoice: dubSettings.maleVoice || undefined,
-        voiceMode: dubSettings.voiceMode ?? "multi",
-        singleVoice: dubSettings.singleVoice ?? null,
-      });
+      let result: DubTrackResult;
+      if (ipcDub) {
+        // Electron — the one-shot main-process pipeline (byte-identical to
+        // ≤ v1.25).
+        result = await ipcDub({
+          segments: dubSources,
+          sourceLanguage: "auto",
+          targetLanguage: dubSettings.targetLanguage,
+          targetLocale: dubSettings.targetLocale,
+          groqModel: dubSettings.groqModel,
+          // v1.22: the dub's AI model provider — Groq (default) or Gemini
+          // (the Script Writer's key + the Gemini model list).
+          textProvider: dubSettings.textProvider ?? "groq",
+          geminiModel: dubSettings.geminiModel,
+          femaleVoice: dubSettings.femaleVoice || undefined,
+          maleVoice: dubSettings.maleVoice || undefined,
+          voiceMode: dubSettings.voiceMode ?? "multi",
+          singleVoice: dubSettings.singleVoice ?? null,
+        });
+      } else {
+        // Web preview — the same three stages chained through the speech
+        // transport (server-side ffmpeg + ASR + LLM + Edge-TTS).
+        const abort = new AbortController();
+        dubAbortRef.current = abort;
+        setDubProgress({ phase: "prepare", progress: 4, status: "Extracting + transcribing the timeline audio…" });
+        const transcript = await runDubTranscribe({
+          webSources: webDubSources,
+          sourceLanguage: "auto",
+          signal: abort.signal,
+        });
+        setDubTranscript({ ...transcript, sourceCount: webDubSources.length });
+        setDubProgress({ phase: "speakers", progress: 55, status: "Detecting speakers + writing the script…" });
+        const script = await runDubScript({
+          utterances: transcript.utterances,
+          sourceLanguage:
+            transcript.language && transcript.language !== "unknown"
+              ? transcript.language
+              : "auto",
+          targetLanguage: dubSettings.targetLanguage,
+          targetLocale: dubSettings.targetLocale,
+          voiceMode: dubSettings.voiceMode ?? "multi",
+          signal: abort.signal,
+        });
+        setDubScript(script);
+        setDubProgress({ phase: "synthesize", progress: 75, status: "Synthesizing the dub track…" });
+        result = await dubSynthesize({
+          scriptLines: script.lines.map((l) => ({
+            speaker: l.speaker,
+            sourceText: l.sourceText,
+            translatedText: l.translatedText,
+            startMs: l.startMs,
+            endMs: l.endMs,
+          })),
+          scriptVoices: {
+            ...(dubSettings.femaleVoice ? { 0: dubSettings.femaleVoice } : {}),
+            ...(dubSettings.maleVoice ? { 1: dubSettings.maleVoice } : {}),
+          },
+          scriptLanguage: script.targetLanguage,
+          scriptSpeakerCount: script.speakerCount,
+          targetLanguage: dubSettings.targetLanguage,
+          targetLocale: dubSettings.targetLocale,
+          voiceMode: dubSettings.voiceMode ?? "multi",
+          singleVoice: dubSettings.singleVoice ?? null,
+          femaleVoice: dubSettings.femaleVoice || undefined,
+          maleVoice: dubSettings.maleVoice || undefined,
+          signal: abort.signal,
+        });
+      }
       setDubResult(result);
       toast.success("Dub track ready", {
         description: `${result.segments.length} segments · ${result.speakers.length} speaker${
@@ -1647,16 +1738,21 @@ export default function Page() {
         } — review it, then add it to the timeline.`,
       });
     } catch (err) {
-      toast.error("Dubbing failed", {
-        description: err instanceof Error ? err.message : String(err),
-      });
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/cancel|abort/i.test(msg)) toast.info("Dubbing cancelled");
+      else
+        toast.error("Dubbing failed", {
+          description: msg,
+        });
     } finally {
+      dubAbortRef.current = null;
       setDubOp(null);
       setDubProgress(null);
     }
-  }, [dubBusy, dubSources, dubSettings]);
+  }, [dubBusy, dubSources, webDubSources, dubSettings]);
 
   const cancelDub = useCallback(async () => {
+    dubAbortRef.current?.abort();
     const api = window.electronAPI;
     if (typeof api?.dubCancel !== "function") return;
     try {
@@ -1668,15 +1764,14 @@ export default function Page() {
 
   // ---- v1.26 DUB STUDIO stages (same dub:progress channel + cancel) ----
 
-  /** Stage 1 — extract + transcribe the timeline audio at WORD level. */
+  /** Stage 1 — extract + transcribe the timeline audio at WORD level.
+ *  v1.26: runs through the speech transport — IPC in the desktop app
+ *  (Groq Whisper), /api/dub/transcribe in the web preview (server ffmpeg
+ *  + cloud ASR with word timings). */
   const startDubTranscribe = useCallback(async () => {
     if (dubBusy) return;
-    const api = window.electronAPI;
-    if (!api || typeof api.dubTranscribe !== "function") {
-      toast.error("Dubbing runs in the FrameFuse desktop app");
-      return;
-    }
-    if (dubSources.length === 0) {
+    const useWeb = !hasElectronBridge();
+    if ((useWeb ? webDubSources.length : dubSources.length) === 0) {
       toast.error("No local video clips on the timeline to transcribe", {
         description: "Import a video from disk (not a restored project) first.",
       });
@@ -1684,39 +1779,48 @@ export default function Page() {
     }
     setDubOp("transcribe");
     setDubProgress({ phase: "prepare", progress: 0, status: "Starting…" });
+    const abort = new AbortController();
+    dubAbortRef.current = abort;
     try {
-      const r = await api.dubTranscribe({
-        segments: dubSources,
+      const r = await runDubTranscribe({
+        segments: useWeb ? undefined : dubSources,
+        webSources: useWeb ? webDubSources : undefined,
         sourceLanguage: "auto",
+        signal: abort.signal,
       });
-      setDubTranscript({ ...r, sourceCount: dubSources.length });
+      setDubTranscript({
+        ...r,
+        sourceCount: useWeb ? webDubSources.length : dubSources.length,
+      });
       toast.success("Word-level transcript ready", {
         description: `${r.wordCount} words · ${r.utterances.length} lines · detected ${
           r.language || "speech"
         } — next: create the dubbing script.`,
       });
     } catch (err) {
-      toast.error("Transcription failed", {
-        description: err instanceof Error ? err.message : String(err),
-      });
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/cancel|abort/i.test(msg)) toast.info("Transcription cancelled");
+      else
+        toast.error("Transcription failed", {
+          description: msg,
+        });
     } finally {
+      dubAbortRef.current = null;
       setDubOp(null);
       setDubProgress(null);
     }
-  }, [dubBusy, dubSources]);
+  }, [dubBusy, dubSources, webDubSources]);
 
-  /** Stage 2 — transcript → speakers + translation → the editable script. */
+  /** Stage 2 — transcript → speakers + translation → the editable script.
+ *  v1.26: IPC-first, /api/dub/script (cloud LLM) in the web preview. */
   const startDubScript = useCallback(async () => {
     if (dubBusy || !dubTranscript) return;
-    const api = window.electronAPI;
-    if (!api || typeof api.dubScript !== "function") {
-      toast.error("Dubbing runs in the FrameFuse desktop app");
-      return;
-    }
     setDubOp("script");
     setDubProgress({ phase: "speakers", progress: 0, status: "Detecting speakers…" });
+    const abort = new AbortController();
+    dubAbortRef.current = abort;
     try {
-      const r = await api.dubScript({
+      const r = await runDubScript({
         utterances: dubTranscript.utterances,
         sourceLanguage:
           dubTranscript.language && dubTranscript.language !== "unknown"
@@ -1724,10 +1828,8 @@ export default function Page() {
             : "auto",
         targetLanguage: dubSettings.targetLanguage,
         targetLocale: dubSettings.targetLocale,
-        groqModel: dubSettings.groqModel,
-        textProvider: dubSettings.textProvider ?? "groq",
-        geminiModel: dubSettings.geminiModel,
         voiceMode: dubSettings.voiceMode ?? "multi",
+        signal: abort.signal,
       });
       setDubScript(r);
       toast.success("Dubbing script ready", {
@@ -1736,29 +1838,31 @@ export default function Page() {
         } — edit any line, then dub it.`,
       });
     } catch (err) {
-      toast.error("Script generation failed", {
-        description: err instanceof Error ? err.message : String(err),
-      });
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/cancel|abort/i.test(msg)) toast.info("Script generation cancelled");
+      else
+        toast.error("Script generation failed", {
+          description: msg,
+        });
     } finally {
+      dubAbortRef.current = null;
       setDubOp(null);
       setDubProgress(null);
     }
   }, [dubBusy, dubTranscript, dubSettings]);
 
-  /** Stage 4 — dub from the EDITED script (no re-transcription/translation,
-   *  no Groq key needed on this leg — Edge TTS + ffmpeg only). */
+  /** Stage 4 — dub from the EDITED script (no re-transcription/translation;
+ *  Edge TTS + ffmpeg only in the desktop app, /api/dub/synthesize in the
+ *  web preview). */
   const startDubFromScript = useCallback(async () => {
     if (dubBusy || !dubScript) return;
-    const api = window.electronAPI;
-    if (!api || typeof api.dubStart !== "function") {
-      toast.error("Dubbing runs in the FrameFuse desktop app");
-      return;
-    }
     setDubOp("dub");
     setDubProgress({ phase: "synthesize", progress: 0, status: "Starting…" });
     setDubResult(null);
+    const abort = new AbortController();
+    dubAbortRef.current = abort;
     try {
-      const result = await api.dubStart({
+      const result = await dubSynthesize({
         scriptLines: dubScript.lines.map((l) => ({
           speaker: l.speaker,
           sourceText: l.sourceText,
@@ -1779,6 +1883,7 @@ export default function Page() {
         singleVoice: dubSettings.singleVoice ?? null,
         femaleVoice: dubSettings.femaleVoice || undefined,
         maleVoice: dubSettings.maleVoice || undefined,
+        signal: abort.signal,
       });
       setDubResult(result);
       toast.success("Dub track ready", {
@@ -1787,10 +1892,14 @@ export default function Page() {
         } — review it, then add it to the timeline.`,
       });
     } catch (err) {
-      toast.error("Dubbing failed", {
-        description: err instanceof Error ? err.message : String(err),
-      });
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/cancel|abort/i.test(msg)) toast.info("Dubbing cancelled");
+      else
+        toast.error("Dubbing failed", {
+          description: msg,
+        });
     } finally {
+      dubAbortRef.current = null;
       setDubOp(null);
       setDubProgress(null);
     }
@@ -5954,7 +6063,7 @@ const handleConvertSubtitlesToNative = useCallback(() => {
                   onAddVoiceover={handleAddVoiceover}
                   onAddMusicAudio={handleAddTtsMusicAudio}
                   onCreateWordCaptions={handleCreateWordCaptions}
-                  dubSourceCount={dubSources.length}
+                  dubSourceCount={dubSourceCount}
                   dubBusy={dubBusy}
                   dubOp={dubOp}
                   dubProgress={dubProgress}

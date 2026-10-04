@@ -124,6 +124,14 @@ import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 // v1.25: QWERTY (romanized) Hindi/Urdu detection for the voice pickers.
 import { localeWantsTranslit } from "@/lib/translit";
+// v1.26: speech transport (IPC-first, /api routes in the web preview) —
+// the dub model catalog + the voice preview/synthesis calls below run in
+// BOTH runtimes now.
+import {
+  fetchDubModels,
+  ttsPreviewVoice,
+  ttsSynthesizeShort,
+} from "@/lib/speech-api";
 // v1.20: AI Script Writer (Gemini default + Groq chat models) — mounted in
 // the Audio tab, right after Voiceover.
 import ScriptWriterSection from "./ScriptWriterSection";
@@ -861,18 +869,22 @@ function Toggle({
 }
 
 // ---------------------------------------------------------------------------
-// v5.0 tabs — Media | Captions | Effects | Audio | Dubbing | Export
+// v5.0 tabs — Media | Captions | Effects | Audio | TTS | Dubbing | Export
 // (v1.11: Chroma tab REMOVED — its keyer + track switch already live in the
 // media panel's per-clip settings, one place, no duplicate surface.)
 // (v1.24: DUBBING tab ADDED — voiceover, script writer, translate & dub and
 // text removal moved out of Audio/Effects so every speech/voice tool lives
 // in one place.)
+// (v1.26: TTS tab SPLIT OUT — simple text-to-speech (the AI TTS Studio +
+// Voiceover) gets its own home; Dubbing keeps the Dub Studio + Script
+// Writer + Text Removal.)
 // ---------------------------------------------------------------------------
 const SETTINGS_TAB_IDS = [
   "media",
   "captions",
   "effects",
   "audio",
+  "tts",
   "dubbing",
   "export",
 ] as const;
@@ -928,6 +940,13 @@ const SETTINGS_TABS: {
     icon: Music,
     accent: "#2dd4bf",
     glow: "rgba(13, 148, 136, 0.35)",
+  },
+  {
+    id: "tts",
+    label: "TTS",
+    icon: AudioLines,
+    accent: "#a3e635",
+    glow: "rgba(132, 204, 22, 0.35)",
   },
   {
     id: "dubbing",
@@ -1136,6 +1155,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
     captions: null,
     effects: null,
     audio: null,
+    tts: null,
     dubbing: null,
     export: null,
   });
@@ -1993,20 +2013,18 @@ export function SettingsPanel(props: SettingsPanelProps) {
           </Section>
         </div>
 
-        {/* ─── Dubbing tab (v1.24) — every speech/voice tool in one place:
-            voiceover narration, AI script writer, translate & dub and
-            burn-in text removal. ───────────────────────────────────── */}
+        {/* ─── v1.26 TTS tab — SIMPLE text-to-speech gets its own home: the
+            AI TTS Studio (long-form Edge-TTS, language picker, voice
+            presets, word timings) + the classic one-clip Voiceover. Both
+            run IPC-first and fall back to the /api/tts routes in the web
+            preview, so everything below is live in a browser. ──────── */}
         <div
-          id="ff-settings-tabpanel-dubbing"
+          id="ff-settings-tabpanel-tts"
           role="tabpanel"
-          aria-labelledby="ff-settings-tab-dubbing"
-          tabIndex={tab === "dubbing" ? 0 : -1}
-          className={cn("pb-2 pt-2", tab === "dubbing" ? "ff-tab-panel-in" : "hidden")}
+          aria-labelledby="ff-settings-tab-tts"
+          tabIndex={tab === "tts" ? 0 : -1}
+          className={cn("pb-2 pt-2", tab === "tts" ? "ff-tab-panel-in" : "hidden")}
         >
-          {/* ── v1.25: AI TEXT-TO-SPEECH STUDIO — long-form Edge-TTS with
-              word timings + timeline handoffs. The card renders in the web
-              preview too (inert — every IPC sits behind
-              window.electronAPI?.), so the surface is browser-verifiable. ── */}
           <TtsStudioSection
             onAddVoiceover={onAddVoiceover}
             voCount={voCount}
@@ -2014,40 +2032,50 @@ export function SettingsPanel(props: SettingsPanelProps) {
             onCreateWordCaptions={onCreateWordCaptions}
           />
 
-          {/* ── v1.17: Voiceover (Edge TTS narration, Electron only) ────── */}
-          {inElectron && (
-            <VoiceoverSection onAddVoiceover={onAddVoiceover} voCount={voCount} />
-          )}
+          {/* ── v1.17: Voiceover (Edge TTS narration — web + desktop) ─── */}
+          <VoiceoverSection onAddVoiceover={onAddVoiceover} voCount={voCount} />
+        </div>
 
+        {/* ─── Dubbing tab (v1.24) — the full dub pipeline: Dub Studio
+            (transcribe → script → voices & dub), AI script writer and
+            burn-in text removal. v1.26: the Dub Studio is no longer
+            Electron-gated — it runs through the speech transport in the
+            web preview too. ────────────────────────────────────────── */}
+        <div
+          id="ff-settings-tabpanel-dubbing"
+          role="tabpanel"
+          aria-labelledby="ff-settings-tab-dubbing"
+          tabIndex={tab === "dubbing" ? 0 : -1}
+          className={cn("pb-2 pt-2", tab === "dubbing" ? "ff-tab-panel-in" : "hidden")}
+        >
           {/* ── v1.20: AI Script Writer (Gemini default + Groq, Electron only) ── */}
           {inElectron && <ScriptWriterSection />}
 
-          {/* ── v1.17: Translate & Dub (Groq Whisper → LLM → Edge TTS) ──── */}
-          {inElectron && (
-            <DubSection
-              dubSettings={dubSettings}
-              onDubSettingsChange={onDubSettingsChange}
-              dubSourceCount={dubSourceCount}
-              dubBusy={dubBusy}
-              dubOp={dubOp}
-              dubProgress={dubProgress}
-              dubResult={dubResult}
-              dubTranscript={dubTranscript}
-              dubScript={dubScript}
-              dubSpeakerVoices={dubSpeakerVoices}
-              onStartDub={onStartDub}
-              onCancelDub={onCancelDub}
-              onApplyDubTrack={onApplyDubTrack}
-              onDiscardDub={onDiscardDub}
-              onStartDubTranscribe={onStartDubTranscribe}
-              onDiscardTranscript={onDiscardTranscript}
-              onStartDubScript={onStartDubScript}
-              onDiscardScript={onDiscardScript}
-              onStartDubFromScript={onStartDubFromScript}
-              onDubScriptChange={onDubScriptChange}
-              onDubSpeakerVoicesChange={onDubSpeakerVoicesChange}
-            />
-          )}
+          {/* ── v1.17→v1.26: Translate & Dub (transcribe → LLM → Edge TTS) —
+              web preview runs it through the speech transport. ── */}
+          <DubSection
+            dubSettings={dubSettings}
+            onDubSettingsChange={onDubSettingsChange}
+            dubSourceCount={dubSourceCount}
+            dubBusy={dubBusy}
+            dubOp={dubOp}
+            dubProgress={dubProgress}
+            dubResult={dubResult}
+            dubTranscript={dubTranscript}
+            dubScript={dubScript}
+            dubSpeakerVoices={dubSpeakerVoices}
+            onStartDub={onStartDub}
+            onCancelDub={onCancelDub}
+            onApplyDubTrack={onApplyDubTrack}
+            onDiscardDub={onDiscardDub}
+            onStartDubTranscribe={onStartDubTranscribe}
+            onDiscardTranscript={onDiscardTranscript}
+            onStartDubScript={onStartDubScript}
+            onDiscardScript={onDiscardScript}
+            onStartDubFromScript={onStartDubFromScript}
+            onDubScriptChange={onDubScriptChange}
+            onDubSpeakerVoicesChange={onDubSpeakerVoicesChange}
+          />
 
           {/* ── v1.24: Text removal moved here from the Effects tab —
               strips burned-in dialogue/subtitles before re-dubbing. ── */}
@@ -5265,12 +5293,12 @@ function VoiceoverSection({
   useEffect(() => stopPreview, [stopPreview]);
 
   const playPreview = useCallback(async () => {
-    const preview = window.electronAPI?.ttsPreview;
-    if (typeof preview !== "function") return;
+    if (!voice) return;
     stopPreview();
     setPreviewBusy(true);
     try {
-      const r = await preview({
+      // v1.26 transport — previews work in the web preview too.
+      const r = await ttsPreviewVoice({
         voice,
         // v1.25: previews read the CONVERTED text (native script for hi/ur).
         text: voicePreviewSample(locale, qw.converted),
@@ -5291,8 +5319,6 @@ function VoiceoverSection({
   }, [voice, locale, qw, stopPreview]);
 
   const addVoiceover = useCallback(async () => {
-    const synth = window.electronAPI?.ttsSynthesize;
-    if (typeof synth !== "function") return;
     // v1.25: synthesize (and store) the CONVERTED text — hi/ur QWERTY input
     // reaches Edge TTS as native script, and export regeneration matches.
     const trimmed = qw.converted.trim();
@@ -5300,16 +5326,20 @@ function VoiceoverSection({
       toast.error("Write the narration text first");
       return;
     }
+    if (!voice) {
+      toast.error("Select a voice first");
+      return;
+    }
     setBusy(true);
     try {
-      const r = await synth({
+      // v1.26 transport — IPC in the desktop app, /api/tts/synthesize in
+      // the web preview (the volume slider maps to the engine convention).
+      const r = await ttsSynthesizeShort({
         text: trimmed,
         voice,
         ratePct,
         pitchHz,
-        // v1.25: the real slider value (UI 0..100 → engine -100..0; the
-        // old hardcoded 0 ignored the volume control entirely).
-        volumePct: Math.round(volume * 100) - 100,
+        volumePct: Math.round(volume * 100),
       });
       onAddVoiceover({
         text: trimmed,
@@ -5690,6 +5720,9 @@ function DubSection(props: DubSectionProps) {
     Array<{ id: string; label: string; hint: string }>
   >([]);
   const [geminiHasKey, setGeminiHasKey] = useState<boolean | null>(null);
+  /** v1.26: the web speech provider is active (no electronAPI bridge) —
+ *  the API routes run the transcription/translation, no keys needed. */
+  const [webProvider, setWebProvider] = useState(false);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
 
   // Stage navigation + the word-timing toggle (ephemeral UI state — fine to
@@ -5699,18 +5732,21 @@ function DubSection(props: DubSectionProps) {
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
+    // v1.26 transport: dubModels resolves IPC-first and falls back to
+    // /api/dub/models — the language dropdown (langNames) populates in the
+    // web preview too. provider === "web" marks the keyless cloud engine.
+    fetchDubModels()
+      .then((r) => {
+        if (!r) return;
+        setModels(r.models ?? []);
+        setLangNames(r.langNames ?? {});
+        setGeminiModels(r.gemini?.models ?? []);
+        setGeminiHasKey(r.gemini ? !!r.gemini.hasKey : null);
+        setWebProvider(r.provider === "web");
+        if (r.provider === "web") setGroqHasKey(true);
+      })
+      .catch(() => {});
     const api = window.electronAPI;
-    if (typeof api?.dubModels === "function") {
-      api
-        .dubModels()
-        .then((r) => {
-          setModels(r.models ?? []);
-          setLangNames(r.langNames ?? {});
-          setGeminiModels(r.gemini?.models ?? []);
-          setGeminiHasKey(r.gemini ? !!r.gemini.hasKey : null);
-        })
-        .catch(() => {});
-    }
     if (typeof api?.whisperGroqGet === "function") {
       api
         .whisperGroqGet()
@@ -5820,12 +5856,12 @@ function DubSection(props: DubSectionProps) {
 
   const playPreview = useCallback(
     async (voice: string) => {
-      const preview = window.electronAPI?.ttsPreview;
-      if (typeof preview !== "function") return;
+      if (!voice) return;
       const a = previewAudioRef.current;
       if (a) a.pause();
       try {
-        const r = await preview({
+        // v1.26 transport — previews also work in the web preview.
+        const r = await ttsPreviewVoice({
           voice,
           text: voicePreviewSample(dubSettings.targetLocale, ""),
         });
@@ -5995,8 +6031,9 @@ function DubSection(props: DubSectionProps) {
         <div className="mb-2 rounded border p-2" style={{ borderColor: "#332e28", backgroundColor: "#26221e" }}>
           <p className="mb-1.5 text-[10px] leading-relaxed text-stone-400">
             <span className="font-semibold text-stone-300">1 · Audio → transcript (word level).</span>{" "}
-            Extracts the timeline&apos;s audio and transcribes it with Groq Whisper — every line
-            keeps its per-word timings.
+            {webProvider
+              ? "Extracts the timeline's audio and transcribes it with the built-in cloud ASR — every line keeps its per-word timings."
+              : "Extracts the timeline's audio and transcribes it with Groq Whisper — every line keeps its per-word timings."}
           </p>
 
           {transcribeBusy ? (
@@ -6204,53 +6241,75 @@ function DubSection(props: DubSectionProps) {
               <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
                 AI model provider
               </label>
-              <div className="grid grid-cols-2 gap-1" role="group" aria-label="Dub AI model provider">
-                <button
-                  type="button"
-                  onClick={() =>
-                    dubSettings.textProvider !== "groq" &&
-                    onDubSettingsChange({ ...dubSettings, textProvider: "groq" })
-                  }
-                  className={cn(
-                    "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
-                    (dubSettings.textProvider ?? "groq") === "groq"
-                      ? "border-orange-500/50 bg-orange-500/15 text-orange-300"
-                      : "border-[#2b2723] bg-[#26221e] text-stone-500 hover:bg-white/[0.04] hover:text-stone-300",
-                  )}
-                  aria-pressed={(dubSettings.textProvider ?? "groq") === "groq"}
-                  title="Groq chat models run the dub's speaker detection + translation (free tier)"
+              {webProvider ? (
+                <div
+                  className="flex items-center justify-center gap-1.5 rounded border border-orange-500/50 bg-orange-500/15 px-2 py-1.5 text-[11px] font-medium text-orange-300"
+                  title="The web preview's built-in cloud AI runs the dub's speaker detection + translation — no key needed. The desktop app uses your Groq/Gemini key."
                 >
-                  <Sparkles size={12} /> Groq
-                </button>
-                <button
-                  type="button"
-                  onClick={() =>
-                    (dubSettings.textProvider ?? "groq") !== "gemini" &&
-                    onDubSettingsChange({ ...dubSettings, textProvider: "gemini" })
-                  }
-                  className={cn(
-                    "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
-                    dubSettings.textProvider === "gemini"
-                      ? "border-orange-500/50 bg-orange-500/15 text-orange-300"
-                      : "border-[#2b2723] bg-[#26221e] text-stone-500 hover:bg-white/[0.04] hover:text-stone-300",
+                  <Sparkles size={12} /> Cloud AI (built-in)
+                </div>
+              ) : (
+                <>
+                  <div className="grid grid-cols-2 gap-1" role="group" aria-label="Dub AI model provider">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        dubSettings.textProvider !== "groq" &&
+                        onDubSettingsChange({ ...dubSettings, textProvider: "groq" })
+                      }
+                      className={cn(
+                        "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
+                        (dubSettings.textProvider ?? "groq") === "groq"
+                          ? "border-orange-500/50 bg-orange-500/15 text-orange-300"
+                          : "border-[#2b2723] bg-[#26221e] text-stone-500 hover:bg-white/[0.04] hover:text-stone-300",
+                      )}
+                      aria-pressed={(dubSettings.textProvider ?? "groq") === "groq"}
+                      title="Groq chat models run the dub's speaker detection + translation (free tier)"
+                    >
+                      <Sparkles size={12} /> Groq
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        (dubSettings.textProvider ?? "groq") !== "gemini" &&
+                        onDubSettingsChange({ ...dubSettings, textProvider: "gemini" })
+                      }
+                      className={cn(
+                        "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
+                        dubSettings.textProvider === "gemini"
+                          ? "border-orange-500/50 bg-orange-500/15 text-orange-300"
+                          : "border-[#2b2723] bg-[#26221e] text-stone-500 hover:bg-white/[0.04] hover:text-stone-300",
+                      )}
+                      aria-pressed={dubSettings.textProvider === "gemini"}
+                      title="Gemini models run the dub's speaker detection + translation — needs your Gemini key (Settings → Script Writer)"
+                    >
+                      <PenLine size={12} /> Gemini
+                    </button>
+                  </div>
+                  {dubSettings.textProvider === "gemini" && geminiHasKey === false && (
+                    <p className="mt-1 text-[10px] text-orange-400/90">
+                      No Gemini key saved — add one in Settings → Script Writer (aistudio.google.com/apikey),
+                      or switch back to Groq.
+                    </p>
                   )}
-                  aria-pressed={dubSettings.textProvider === "gemini"}
-                  title="Gemini models run the dub's speaker detection + translation — needs your Gemini key (Settings → Script Writer)"
-                >
-                  <PenLine size={12} /> Gemini
-                </button>
-              </div>
-              {dubSettings.textProvider === "gemini" && geminiHasKey === false && (
-                <p className="mt-1 text-[10px] text-orange-400/90">
-                  No Gemini key saved — add one in Settings → Script Writer (aistudio.google.com/apikey),
-                  or switch back to Groq.
-                </p>
+                </>
               )}
             </div>
           </div>
 
           <div className="mb-2 grid grid-cols-2 gap-1.5">
-            {(dubSettings.textProvider ?? "groq") === "gemini" ? (
+            {webProvider ? (
+              <div>
+                <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
+                  AI model
+                </label>
+                <p className="rounded border border-[#2b2723] bg-[#26221e] px-2 py-1.5 text-[10px] leading-relaxed text-stone-400">
+                  Speaker detection + translation run on the built-in cloud
+                  model — nothing to configure (no key needed in the web
+                  preview).
+                </p>
+              </div>
+            ) : (dubSettings.textProvider ?? "groq") === "gemini" ? (
               <div>
                 <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
                   Gemini model
@@ -6641,7 +6700,9 @@ function DubSection(props: DubSectionProps) {
 
       <p className="mb-1 mt-1 text-[10px] leading-relaxed text-stone-500">
         {dubSourceCount > 0
-          ? `Source: ${dubSourceCount} timeline clip${dubSourceCount === 1 ? "" : "s"} — free Groq key required (Captions tab).`
+          ? webProvider
+            ? `Source: ${dubSourceCount} timeline clip${dubSourceCount === 1 ? "" : "s"} — cloud transcription, no key needed in the web preview.`
+            : `Source: ${dubSourceCount} timeline clip${dubSourceCount === 1 ? "" : "s"} — free Groq key required (Captions tab).`
           : "Import a local video clip on the timeline to dub it."}
       </p>
     </Section>

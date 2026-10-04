@@ -2,12 +2,20 @@
 
 // v1.25 — shared Edge-TTS voice-catalog hook, extracted from
 // SettingsPanel.tsx so the TTS Studio, Voiceover and Dub sections can share
-// ONE lazy loader without importing the whole panel. Behavior is identical
-// to the previous in-file hook (same fetch, same cancellation guard, same
-// return shape); only the optional `styleList` passthrough was typed in
-// (the main-process catalog already sends it — the free endpoint ships none).
+// ONE lazy loader without importing the whole panel.
+//
+// v1.26 — the loader now goes through src/lib/speech-api.ts (IPC-first,
+// /api/tts/voices fallback), so the catalog ALSO loads in the web preview
+// (previously the pickers were empty outside the desktop app — that was the
+// "can't select language / voices" complaint). It also exposes the grouped
+// language list used by the TTS tab's language picker.
 
 import { useEffect, useState } from "react";
+import {
+  fetchTtsVoices,
+  type SpeechLanguage,
+  type SpeechVoice,
+} from "@/lib/speech-api";
 
 /** One Edge-TTS catalog voice (the subset the pickers render). */
 export interface TtsVoice {
@@ -21,26 +29,27 @@ export interface TtsVoice {
 }
 
 /** Shared lazy voice-catalog loader (one fetch per mounted section; the
- *  main process caches too — repeated calls are cheap). */
+ *  main process AND the API route both cache — repeated calls are cheap). */
 export function useTtsVoices() {
   const [voices, setVoices] = useState<TtsVoice[] | null>(null);
   const [pairs, setPairs] = useState<
     Record<string, { female: string; male: string }>
   >({});
+  const [languages, setLanguages] = useState<SpeechLanguage[] | null>(null);
+
   useEffect(() => {
-    const get = window.electronAPI?.ttsVoices;
-    if (typeof get !== "function") return;
     let cancelled = false;
-    get()
+    fetchTtsVoices()
       .then((r) => {
         if (cancelled || !r) return;
         setVoices(r.voices ?? []);
         setPairs(r.pairs ?? {});
+        setLanguages(r.languages ?? []);
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
   }, []);
-  return { voices, pairs };
+  return { voices, pairs, languages };
 }
