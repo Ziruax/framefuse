@@ -1554,9 +1554,12 @@ ipcMain.handle("dub:start", async (event, payload) => {
     throw new Error("A dub run is already in progress");
   }
   const p = payload || {};
+  // v1.26: a script-dub (Dub Studio stage 4) synthesizes the EDITED script
+  // only — no Whisper, no LLM — so neither key is required on that leg.
+  const scriptLines = Array.isArray(p.scriptLines) ? p.scriptLines : null;
   // Same key + same friendly no-key message shape as the whisper handler.
   const groqCfg = GQ.loadGroqConfig(app.getPath("userData"));
-  if (!groqCfg.apiKey) {
+  if (!scriptLines && !groqCfg.apiKey) {
     throw new Error(
       "No Groq API key saved — open Settings → Captions, paste your key from console.groq.com (free), or add it before dubbing.",
     );
@@ -1567,7 +1570,7 @@ ipcMain.handle("dub:start", async (event, payload) => {
   const textProvider = p.textProvider === "gemini" ? "gemini" : "groq";
   const geminiApiKey =
     textProvider === "gemini" ? GM.loadGeminiConfig(app.getPath("userData")).apiKey : "";
-  if (textProvider === "gemini" && !geminiApiKey) {
+  if (!scriptLines && textProvider === "gemini" && !geminiApiKey) {
     throw new Error(
       "No Gemini API key saved — open Settings → Script Writer and paste your Gemini key (aistudio.google.com/apikey), or switch the dubbing AI model back to Groq.",
     );
@@ -1579,7 +1582,7 @@ ipcMain.handle("dub:start", async (event, payload) => {
       endMs: Number.isFinite(Number(s && s.endMs)) ? Math.round(Number(s.endMs)) : undefined,
     }))
     .filter((s) => s.videoPath);
-  if (segs.length === 0) {
+  if (segs.length === 0 && !scriptLines) {
     throw new Error("No video clips to dub — the timeline needs at least one video segment");
   }
   const abortRef = { abort: null };
@@ -1593,6 +1596,14 @@ ipcMain.handle("dub:start", async (event, payload) => {
   try {
     const result = await DUB.runDub({
       segments: segs,
+      // v1.26 Dub Studio stage-4 (script dub): the edited script + the
+      // per-speaker voice picks ride along; runDub skips the LLM leg.
+      scriptLines: scriptLines || undefined,
+      scriptVoices:
+        p.scriptVoices && typeof p.scriptVoices === "object" ? p.scriptVoices : undefined,
+      scriptLanguage:
+        typeof p.scriptLanguage === "string" && p.scriptLanguage ? p.scriptLanguage : undefined,
+      scriptSpeakerCount: Number.isInteger(p.scriptSpeakerCount) ? p.scriptSpeakerCount : undefined,
       sourceLanguage:
         typeof p.sourceLanguage === "string" && p.sourceLanguage ? p.sourceLanguage : "auto",
       targetLanguage:
@@ -1658,6 +1669,130 @@ ipcMain.handle("dub:cancel", async () => {
   }
   try { dubState.activeAbort.abort(); } catch (_) { /* best effort */ }
   return { ok: true, running: true };
+});
+
+// ---------------------------------------------------------------------------
+// v1.26 Dub Studio — the staged IPC surface. The three stages share the
+// dubState mutex, the dub:progress channel and dub:cancel with dub:start,
+// so exactly ONE dub-family operation runs at a time and every busy spinner
+// in the Dubbing tab is driven by the same progress events.
+//
+// dub:transcribe — stage 1: extract the timeline's audio + transcribe it at
+//   WORD level with Groq Whisper. Returns pure data (no files survive):
+//   { language, totalMs, wordCount, utterances:[{startMs,endMs,text,
+//   words:[{text,startMs,endMs}]}] }.
+// ---------------------------------------------------------------------------
+ipcMain.handle("dub:transcribe", async (event, payload) => {
+  if (dubState.running) {
+    throw new Error("A dub operation is already in progress");
+  }
+  const p = payload || {};
+  const groqCfg = GQ.loadGroqConfig(app.getPath("userData"));
+  if (!groqCfg.apiKey) {
+    throw new Error(
+      "No Groq API key saved — open Settings → Captions, paste your key from console.groq.com (free), or add it before dubbing.",
+    );
+  }
+  const segs = (Array.isArray(p.segments) ? p.segments : [])
+    .map((s) => ({
+      videoPath: String((s && s.videoPath) || ""),
+      startMs: Math.max(0, Math.round(Number(s && s.startMs) || 0)),
+      endMs: Number.isFinite(Number(s && s.endMs)) ? Math.round(Number(s.endMs)) : undefined,
+    }))
+    .filter((s) => s.videoPath);
+  if (segs.length === 0) {
+    throw new Error("No video clips to transcribe — the timeline needs at least one video segment");
+  }
+  const abortRef = { abort: null };
+  dubState.running = true;
+  dubState.activeAbort = abortRef;
+  const sendProgress = (info) => {
+    if (event.sender && !event.sender.isDestroyed()) {
+      event.sender.send("dub:progress", info || {});
+    }
+  };
+  try {
+    return await DUB.runDubTranscript({
+      segments: segs,
+      sourceLanguage:
+        typeof p.sourceLanguage === "string" && p.sourceLanguage ? p.sourceLanguage : "auto",
+      tempDir: ensureTempDir(),
+      ffmpegPath,
+      ffprobePath: (await ffprobeAvailable()) || "ffprobe",
+      apiKey: groqCfg.apiKey,
+      onProgress: sendProgress,
+      abortRef,
+    });
+  } finally {
+    dubState.running = false;
+    dubState.activeAbort = null;
+  }
+});
+
+/** dub:script — stage 2: transcript → speaker detection + translation → the
+ *  editable dubbing script ({ targetLanguage, targetLanguageName,
+ *  speakerCount, lines:[{i,startMs,endMs,speaker,sourceText,translatedText}],
+ *  warnings }). Groq provider needs the Groq key; Gemini needs the Gemini
+ *  key (no Whisper on this leg — the transcript already exists). */
+ipcMain.handle("dub:script", async (event, payload) => {
+  if (dubState.running) {
+    throw new Error("A dub operation is already in progress");
+  }
+  const p = payload || {};
+  const textProvider = p.textProvider === "gemini" ? "gemini" : "groq";
+  let apiKey = "";
+  if (textProvider === "gemini") {
+    const geminiApiKey = GM.loadGeminiConfig(app.getPath("userData")).apiKey;
+    if (!geminiApiKey) {
+      throw new Error(
+        "No Gemini API key saved — open Settings → Script Writer and paste your Gemini key (aistudio.google.com/apikey), or switch to a Groq model.",
+      );
+    }
+  } else {
+    apiKey = GQ.loadGroqConfig(app.getPath("userData")).apiKey;
+    if (!apiKey) {
+      throw new Error(
+        "No Groq API key saved — open Settings → Captions, paste your key from console.groq.com (free), or add it before dubbing.",
+      );
+    }
+  }
+  const abortRef = { abort: null };
+  dubState.running = true;
+  dubState.activeAbort = abortRef;
+  const sendProgress = (info) => {
+    if (event.sender && !event.sender.isDestroyed()) {
+      event.sender.send("dub:progress", info || {});
+    }
+  };
+  try {
+    return await DUB.runDubScript({
+      utterances: Array.isArray(p.utterances) ? p.utterances : [],
+      sourceLanguage:
+        typeof p.sourceLanguage === "string" && p.sourceLanguage ? p.sourceLanguage : "auto",
+      targetLanguage:
+        typeof p.targetLanguage === "string" && p.targetLanguage ? p.targetLanguage : "hi",
+      targetLocale:
+        typeof p.targetLocale === "string" && p.targetLocale ? p.targetLocale : "hi-IN",
+      groqModel:
+        typeof p.groqModel === "string" && p.groqModel ? p.groqModel : DUB.DEFAULT_TEXT_MODEL,
+      textProvider,
+      geminiModel:
+        typeof p.geminiModel === "string" && p.geminiModel
+          ? p.geminiModel
+          : DUB.GEMINI_DEFAULT_TEXT_MODEL,
+      geminiApiKey: textProvider === "gemini"
+        ? GM.loadGeminiConfig(app.getPath("userData")).apiKey
+        : "",
+      voiceMode: p.voiceMode === "single" ? "single" : "multi",
+      singleVoice: typeof p.singleVoice === "string" ? p.singleVoice.trim() : "",
+      apiKey,
+      onProgress: sendProgress,
+      abortRef,
+    });
+  } finally {
+    dubState.running = false;
+    dubState.activeAbort = null;
+  }
 });
 
 /** { models, default, langNames } — picker data, no key needed. */

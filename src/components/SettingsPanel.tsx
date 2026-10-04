@@ -27,6 +27,9 @@ import {
   Dices,
   AudioLines,
   Check,
+  ChevronRight,
+  Copy,
+  Download,
   Cloud,
   KeyRound,
   ExternalLink,
@@ -62,6 +65,9 @@ import type {
   TextRemovalRegion,
   DubSettings,
   DubTrackResult,
+  DubScriptLine,
+  DubScriptResult,
+  DubTranscriptResult,
 } from "@/lib/merger/types";
 import { TRANSITION_STYLE_INFO, QUALITY_PROFILES } from "@/lib/merger/types";
 import type { KenBurnsDirection } from "@/lib/merger/types";
@@ -299,6 +305,25 @@ interface SettingsPanelProps {
   onCancelDub: () => void;
   onApplyDubTrack: () => void;
   onDiscardDub: () => void;
+  /** v1.26 DUB STUDIO staged workflow. ALL state is page-owned — Section
+   *  unmounts its children when the accordion collapses, so the transcript,
+   *  the script and the speaker-voice picks must live above this file. */
+  /** Which stage is in flight (drives every stage's spinner + progress). */
+  dubOp: "transcribe" | "script" | "dub" | null;
+  /** Stage-1 word-level transcript (with the source count it was made from
+   *  — a mismatch shows the "timeline changed" staleness hint). */
+  dubTranscript: (DubTranscriptResult & { sourceCount?: number }) | null;
+  /** Stage-2 editable dubbing script (lines are edited in place). */
+  dubScript: DubScriptResult | null;
+  /** Per-speaker voice picks for speaker ids ≥ 2 (0/1 live in dubSettings). */
+  dubSpeakerVoices: Record<number, string>;
+  onStartDubTranscribe: () => void;
+  onDiscardTranscript: () => void;
+  onStartDubScript: () => void;
+  onDiscardScript: () => void;
+  onStartDubFromScript: () => void;
+  onDubScriptChange: (lines: DubScriptLine[]) => void;
+  onDubSpeakerVoicesChange: (voices: Record<number, string>) => void;
   /** Placements currently on the VO lane (narration + dub). */
   voCount: number;
   /** ── v1.23 FLOW: CONTROLLED TAB MODE ──
@@ -1011,12 +1036,23 @@ export function SettingsPanel(props: SettingsPanelProps) {
     onDubSettingsChange,
     dubSourceCount,
     dubBusy,
+    dubOp,
     dubProgress,
     dubResult,
+    dubTranscript,
+    dubScript,
+    dubSpeakerVoices,
     onStartDub,
     onCancelDub,
     onApplyDubTrack,
     onDiscardDub,
+    onStartDubTranscribe,
+    onDiscardTranscript,
+    onStartDubScript,
+    onDiscardScript,
+    onStartDubFromScript,
+    onDubScriptChange,
+    onDubSpeakerVoicesChange,
     voCount,
   } = props;
 
@@ -1993,12 +2029,23 @@ export function SettingsPanel(props: SettingsPanelProps) {
               onDubSettingsChange={onDubSettingsChange}
               dubSourceCount={dubSourceCount}
               dubBusy={dubBusy}
+              dubOp={dubOp}
               dubProgress={dubProgress}
               dubResult={dubResult}
+              dubTranscript={dubTranscript}
+              dubScript={dubScript}
+              dubSpeakerVoices={dubSpeakerVoices}
               onStartDub={onStartDub}
               onCancelDub={onCancelDub}
               onApplyDubTrack={onApplyDubTrack}
               onDiscardDub={onDiscardDub}
+              onStartDubTranscribe={onStartDubTranscribe}
+              onDiscardTranscript={onDiscardTranscript}
+              onStartDubScript={onStartDubScript}
+              onDiscardScript={onDiscardScript}
+              onStartDubFromScript={onStartDubFromScript}
+              onDubScriptChange={onDubScriptChange}
+              onDubSpeakerVoicesChange={onDubSpeakerVoicesChange}
             />
           )}
 
@@ -5470,13 +5517,29 @@ interface DubSectionProps {
   dubSettings: DubSettings;
   onDubSettingsChange: (s: DubSettings) => void;
   dubSourceCount: number;
+  /** Any dub-family op is in flight (transcribe | script | dub). */
   dubBusy: boolean;
+  /** Which stage is running — drives each stage's spinner + progress bar. */
+  dubOp: "transcribe" | "script" | "dub" | null;
   dubProgress: { phase: string; progress: number; status: string } | null;
   dubResult: DubTrackResult | null;
+  /** Stage-1 output (page-owned; survives accordion collapses). */
+  dubTranscript: (DubTranscriptResult & { sourceCount?: number }) | null;
+  /** Stage-2 output (page-owned; lines are edited in place). */
+  dubScript: DubScriptResult | null;
+  /** Per-speaker voice picks for speaker ids ≥ 2 (0/1 live in dubSettings). */
+  dubSpeakerVoices: Record<number, string>;
   onStartDub: () => void;
   onCancelDub: () => void;
   onApplyDubTrack: () => void;
   onDiscardDub: () => void;
+  onStartDubTranscribe: () => void;
+  onDiscardTranscript: () => void;
+  onStartDubScript: () => void;
+  onDiscardScript: () => void;
+  onStartDubFromScript: () => void;
+  onDubScriptChange: (lines: DubScriptLine[]) => void;
+  onDubSpeakerVoicesChange: (voices: Record<number, string>) => void;
 }
 
 const DUB_LOCALE_PREFERENCE = ["-IN", "-US", "-GB", "-CA", "-AU"];
@@ -5492,18 +5555,130 @@ function dubLocaleFor(lang: string, pairs: Record<string, { female: string; male
   return hit ?? `${lang}-IN`;
 }
 
+/** mm:ss.s timecode for transcript/script line headers. */
+function dubTimecode(ms: number): string {
+  const s = ms / 1000;
+  const m = Math.floor(s / 60);
+  const rest = s - m * 60;
+  return `${String(m).padStart(2, "0")}:${rest < 10 ? "0" : ""}${rest.toFixed(1)}`;
+}
+
+/** SRT timestamp (00:00:01,200) for the transcript sidecar export. */
+function dubSrtTime(ms: number): string {
+  const total = Math.max(0, Math.round(ms));
+  const h = Math.floor(total / 3600000);
+  const m = Math.floor((total % 3600000) / 60000);
+  const s = Math.floor((total % 60000) / 1000);
+  const f = total % 1000;
+  const p = (n: number, w = 2) => String(n).padStart(w, "0");
+  return `${p(h)}:${p(m)}:${p(s)},${p(f, 3)}`;
+}
+
+/** Anchor-download a text sidecar (same flow as the page's sidecar exports). */
+function dubDownloadText(fileName: string, text: string, mime: string) {
+  const blob = new Blob([text], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+type DubStage = "transcript" | "script" | "dub";
+
+const DUB_STAGES: Array<{ id: DubStage; label: string; icon: typeof ScanText }> = [
+  { id: "transcript", label: "Transcript", icon: ScanText },
+  { id: "script", label: "Script", icon: FileText },
+  { id: "dub", label: "Voices & dub", icon: AudioLines },
+];
+
+/** The shared busy row (status + cancel + bar) for every stage. */
+function DubProgressRow({
+  status,
+  progress,
+  onCancel,
+}: {
+  status: string;
+  progress: number;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="mb-2" role="status">
+      <div className="mb-1 flex items-center justify-between gap-2">
+        <span className="flex min-w-0 items-center gap-1 text-[10px] text-stone-400">
+          <Loader2 size={10} className="shrink-0 animate-spin" />
+          <span className="truncate">{status}</span>
+        </span>
+        <button
+          type="button"
+          onClick={onCancel}
+          className="flex shrink-0 items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] text-stone-400 transition-colors hover:bg-white/[0.06]"
+          style={{ borderColor: "#332e28" }}
+        >
+          <Square size={9} /> Cancel
+        </button>
+      </div>
+      <div
+        className="h-1 w-full overflow-hidden rounded-full"
+        style={{ backgroundColor: "#332e28" }}
+        role="progressbar"
+        aria-valuenow={Math.round(progress)}
+        aria-valuemin={0}
+        aria-valuemax={100}
+      >
+        <div
+          className="h-full rounded-full bg-gradient-to-r from-orange-400 to-orange-600 transition-all"
+          style={{ width: `${Math.max(3, Math.min(100, progress))}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
+/** Speaker chip — teal for S1, amber for S2, violet for S3+. */
+function SpeakerChip({ id }: { id: number }) {
+  const styles =
+    id === 0
+      ? { backgroundColor: "rgba(13, 148, 136, 0.35)", color: "#2dd4bf" }
+      : id === 1
+        ? { backgroundColor: "#2b1c10", color: "#fdba74" }
+        : { backgroundColor: "rgba(124, 58, 237, 0.25)", color: "#c4b5fd" };
+  return (
+    <span
+      className="mr-1 shrink-0 rounded px-1 py-px font-mono text-[9px] font-semibold"
+      style={styles}
+    >
+      S{id + 1}
+    </span>
+  );
+}
+
 function DubSection(props: DubSectionProps) {
   const {
     dubSettings,
     onDubSettingsChange,
     dubSourceCount,
     dubBusy,
+    dubOp,
     dubProgress,
     dubResult,
+    dubTranscript,
+    dubScript,
+    dubSpeakerVoices,
     onStartDub,
     onCancelDub,
     onApplyDubTrack,
     onDiscardDub,
+    onStartDubTranscribe,
+    onDiscardTranscript,
+    onStartDubScript,
+    onDiscardScript,
+    onStartDubFromScript,
+    onDubScriptChange,
+    onDubSpeakerVoicesChange,
   } = props;
 
   const { voices, pairs } = useTtsVoices();
@@ -5517,6 +5692,12 @@ function DubSection(props: DubSectionProps) {
   const [geminiHasKey, setGeminiHasKey] = useState<boolean | null>(null);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
 
+  // Stage navigation + the word-timing toggle (ephemeral UI state — fine to
+  // reset on accordion collapse; the DATA lives in page.tsx).
+  const [stage, setStage] = useState<DubStage>(dubScript ? "dub" : dubTranscript ? "script" : "transcript");
+  const [showWords, setShowWords] = useState(false);
+  const [copied, setCopied] = useState(false);
+
   useEffect(() => {
     const api = window.electronAPI;
     if (typeof api?.dubModels === "function") {
@@ -5525,8 +5706,6 @@ function DubSection(props: DubSectionProps) {
         .then((r) => {
           setModels(r.models ?? []);
           setLangNames(r.langNames ?? {});
-          // v1.22: the Gemini option — the curated list ships in the payload;
-          // a live list replaces it once the key is tested (see geminiTest).
           setGeminiModels(r.gemini?.models ?? []);
           setGeminiHasKey(r.gemini ? !!r.gemini.hasKey : null);
         })
@@ -5582,9 +5761,7 @@ function DubSection(props: DubSectionProps) {
   const singleMode = (dubSettings.voiceMode ?? "multi") === "single";
 
   /** The voice the single-mode select shows as selected: the explicit pick
-   *  when the locale offers it, else the locale's default (femaleVoice →
-   *  pair female → first locale voice). null/auto resolves to the SAME
-   *  voice in the main process (pickVoiceForSpeaker's even-id rule). */
+   *  when the locale offers it, else the locale's default. */
   const singleVoiceValue = useMemo(() => {
     const sv = dubSettings.singleVoice;
     if (sv && localeVoices.some((v) => v.shortName === sv)) return sv;
@@ -5621,8 +5798,10 @@ function DubSection(props: DubSectionProps) {
     [dubSettings, onDubSettingsChange],
   );
 
+  /** Language switch — the script is language-bound, so it is invalidated. */
   const changeLanguage = useCallback(
     (lang: string) => {
+      if (lang === dubSettings.targetLanguage) return;
       const locale = dubLocaleFor(lang, pairs);
       const pair = pairs[locale];
       onDubSettingsChange({
@@ -5634,8 +5813,9 @@ function DubSection(props: DubSectionProps) {
         // Language switch: the single-voice pick belongs to the old locale.
         singleVoice: null,
       });
+      if (dubScript) onDiscardScript();
     },
-    [dubSettings, pairs, onDubSettingsChange],
+    [dubSettings, pairs, onDubSettingsChange, dubScript, onDiscardScript],
   );
 
   const playPreview = useCallback(
@@ -5679,390 +5859,783 @@ function DubSection(props: DubSectionProps) {
 
   const selectCls =
     "w-full rounded border bg-[#211e1a] px-2 py-1.5 text-[11px] text-stone-300 focus:border-orange-500";
-  const startDisabled =
-    dubBusy ||
-    dubSourceCount === 0 ||
-    groqHasKey === false;
 
-  return (
-    <Section icon={<Languages size={13} />} title="Translate & Dub" defaultOpen={false}>
-      <div className="mb-2 grid grid-cols-2 gap-1.5">
-        <div>
-          <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
-            Dub into
-          </label>
+  const transcribeBusy = dubBusy && dubOp === "transcribe";
+  const scriptBusy = dubBusy && dubOp === "script";
+  const dubRunBusy = dubBusy && dubOp === "dub";
+
+  const transcriptStale =
+    !!dubTranscript &&
+    dubTranscript.sourceCount != null &&
+    dubTranscript.sourceCount !== dubSourceCount;
+
+  const scriptLines = dubScript?.lines ?? [];
+  const scriptSpeakerCount = dubScript?.speakerCount ?? 2;
+  const multiSpeakerCount = Math.max(2, Math.min(8, scriptSpeakerCount));
+
+  /** Copy the transcript as timecoded lines. */
+  const copyTranscript = useCallback(async () => {
+    if (!dubTranscript) return;
+    const text = dubTranscript.utterances
+      .map((u) => `${dubTimecode(u.startMs)} → ${dubTimecode(u.endMs)}  ${u.text}`)
+      .join("\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      toast.error("Copy failed", { description: "Clipboard access was blocked by the browser." });
+    }
+  }, [dubTranscript]);
+
+  /** Speaker label + voice picker row for one multi-mode speaker id. */
+  const speakerVoiceRow = (id: number) => {
+    const value =
+      id === 0 ? dubSettings.femaleVoice : id === 1 ? dubSettings.maleVoice : (dubSpeakerVoices[id] ?? "");
+    const label =
+      id === 0 ? "Speaker 1 · female" : id === 1 ? "Speaker 2 · male" : `Speaker ${id + 1}`;
+    const options =
+      id <= 1
+        ? localeVoices.filter(
+            (v) =>
+              (id === 0 ? v.gender === "Female" : v.gender === "Male") ||
+              localeVoices.length <= 2,
+          )
+        : localeVoices;
+    const onChange = (v: string) => {
+      if (id === 0) onDubSettingsChange({ ...dubSettings, femaleVoice: v });
+      else if (id === 1) onDubSettingsChange({ ...dubSettings, maleVoice: v });
+      else onDubSpeakerVoicesChange({ ...dubSpeakerVoices, [id]: v });
+    };
+    return (
+      <div key={id}>
+        <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
+          {label}
+        </label>
+        <div className="flex items-center gap-1">
           <select
-            value={dubSettings.targetLanguage}
-            onChange={(e) => changeLanguage(e.target.value)}
-            className={selectCls}
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            className={cn(selectCls, "flex-1")}
             style={{ borderColor: "#332e28" }}
-            aria-label="Target dub language"
+            aria-label={label}
           >
-            {languages.length === 0 && (
-              <option value={dubSettings.targetLanguage}>
-                {langNames[dubSettings.targetLanguage] ?? dubSettings.targetLanguage}
-              </option>
-            )}
-            {languages.map((l) => (
-              <option key={l.code} value={l.code}>
-                {l.name}
+            {options.length === 0 && <option value={value}>{value || "auto"}</option>}
+            {options.map((v) => (
+              <option key={v.shortName} value={v.shortName}>
+                {v.displayName}
               </option>
             ))}
           </select>
+          <button
+            type="button"
+            onClick={() => void playPreview(value)}
+            disabled={!value}
+            title="Listen to this voice"
+            className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded border text-orange-600 transition-colors hover:bg-orange-500/10 disabled:cursor-not-allowed disabled:opacity-40"
+            style={{ borderColor: "#332e28" }}
+            aria-label={`Preview ${label}`}
+          >
+            <Play size={11} />
+          </button>
         </div>
-        <div>
-          <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
-            AI model provider
-          </label>
-          <div className="grid grid-cols-2 gap-1" role="group" aria-label="Dub AI model provider">
+      </div>
+    );
+  };
+
+  const stageChipState = (id: DubStage) => {
+    if (id === "transcript") return dubTranscript ? "done" : stage === id ? "active" : "todo";
+    if (id === "script") return dubScript ? "done" : stage === id ? "active" : "todo";
+    return dubResult ? "done" : stage === id ? "active" : "todo";
+  };
+
+  return (
+    <Section icon={<Languages size={13} />} title="Dub Studio — transcribe · script · dub" defaultOpen>
+      {/* ── Stepper: three reviewable stages over one pipeline ── */}
+      <div className="mb-2 flex items-center gap-1" role="group" aria-label="Dub Studio stages">
+        {DUB_STAGES.map((s, idx) => {
+          const state = stageChipState(s.id);
+          const Icon = s.icon;
+          return (
+            <button
+              key={s.id}
+              type="button"
+              onClick={() => setStage(s.id)}
+              aria-current={stage === s.id ? "step" : undefined}
+              className={cn(
+                "flex flex-1 items-center justify-center gap-1 rounded border px-1.5 py-1.5 text-[10px] font-medium transition-colors",
+                state === "active"
+                  ? "border-orange-500/50 bg-orange-500/15 text-orange-300"
+                  : state === "done"
+                    ? "border-teal-500/40 bg-teal-500/10 text-teal-300"
+                    : "border-[#2b2723] bg-[#26221e] text-stone-500 hover:bg-white/[0.04] hover:text-stone-300",
+              )}
+              title={
+                s.id === "transcript"
+                  ? "Stage 1 — word-level transcript (Groq Whisper)"
+                  : s.id === "script"
+                    ? "Stage 2 — create the dubbing script in the selected language"
+                    : "Stage 3 — one voice or per-speaker voices, then synthesize"
+              }
+            >
+              {state === "done" ? <Check size={11} /> : <Icon size={11} />}
+              <span className="hidden sm:inline">{s.label}</span>
+              {idx === 0 && <sup className="ml-px text-[8px] opacity-70">1</sup>}
+              {idx === 1 && <sup className="ml-px text-[8px] opacity-70">2</sup>}
+              {idx === 2 && <sup className="ml-px text-[8px] opacity-70">3</sup>}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* ═══════════════════════════════════════════════════════════════════
+          STAGE 1 — WORD-LEVEL TRANSCRIPT
+          ═══════════════════════════════════════════════════════════════ */}
+      {stage === "transcript" && (
+        <div className="mb-2 rounded border p-2" style={{ borderColor: "#332e28", backgroundColor: "#26221e" }}>
+          <p className="mb-1.5 text-[10px] leading-relaxed text-stone-400">
+            <span className="font-semibold text-stone-300">1 · Audio → transcript (word level).</span>{" "}
+            Extracts the timeline&apos;s audio and transcribes it with Groq Whisper — every line
+            keeps its per-word timings.
+          </p>
+
+          {transcribeBusy ? (
+            <DubProgressRow
+              status={dubProgress?.status ?? "Transcribing…"}
+              progress={dubProgress?.progress ?? 0}
+              onCancel={onCancelDub}
+            />
+          ) : (
             <button
               type="button"
-              onClick={() =>
-                dubSettings.textProvider !== "groq" &&
-                onDubSettingsChange({ ...dubSettings, textProvider: "groq" })
+              onClick={onStartDubTranscribe}
+              disabled={dubSourceCount === 0 || groqHasKey === false}
+              title={
+                dubSourceCount === 0
+                  ? "Import a local video clip first — the transcript uses the timeline's audio"
+                  : groqHasKey === false
+                    ? "Add your free Groq API key in the Captions tab first"
+                    : "Extract + transcribe the timeline audio at word level"
               }
-              className={cn(
-                "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
-                (dubSettings.textProvider ?? "groq") === "groq"
-                  ? "border-orange-500/50 bg-orange-500/15 text-orange-300"
-                  : "border-[#2b2723] bg-[#26221e] text-stone-500 hover:bg-white/[0.04] hover:text-stone-300",
-              )}
-              aria-pressed={(dubSettings.textProvider ?? "groq") === "groq"}
-              title="Groq chat models run the dub's speaker detection + translation (free tier)"
+              className="mb-2 flex w-full items-center justify-center gap-1.5 rounded bg-orange-500 px-2.5 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              <Sparkles size={12} /> Groq
+              <ScanText size={11} />
+              {dubTranscript ? "Re-transcribe audio" : "Transcribe audio · word level"}
             </button>
-            <button
-              type="button"
-              onClick={() =>
-                (dubSettings.textProvider ?? "groq") !== "gemini" &&
-                onDubSettingsChange({ ...dubSettings, textProvider: "gemini" })
-              }
-              className={cn(
-                "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
-                dubSettings.textProvider === "gemini"
-                  ? "border-orange-500/50 bg-orange-500/15 text-orange-300"
-                  : "border-[#2b2723] bg-[#26221e] text-stone-500 hover:bg-white/[0.04] hover:text-stone-300",
+          )}
+
+          {dubTranscript && !transcribeBusy && (
+            <div>
+              <div className="mb-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-stone-400">
+                <span className="font-semibold text-stone-300">
+                  {langNames[dubTranscript.language] ?? dubTranscript.language}
+                </span>
+                <span>· {dubTranscript.wordCount} words</span>
+                <span>· {dubTranscript.utterances.length} lines</span>
+                <span className="flex items-center gap-0.5">
+                  <Clock size={9} /> {(dubTranscript.totalMs / 1000).toFixed(1)}s
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setShowWords((w) => !w)}
+                  aria-pressed={showWords}
+                  className={cn(
+                    "ml-auto rounded border px-1.5 py-0.5 text-[9px] font-medium transition-colors",
+                    showWords
+                      ? "border-orange-500/50 bg-orange-500/15 text-orange-300"
+                      : "border-[#332e28] text-stone-400 hover:bg-white/[0.06]",
+                  )}
+                >
+                  {showWords ? "Hide word timings" : "Show word timings"}
+                </button>
+              </div>
+
+              {transcriptStale && (
+                <p className="mb-1.5 flex items-center gap-1 rounded border px-1.5 py-1 text-[10px] text-amber-300" style={{ borderColor: "rgba(251, 191, 36, 0.3)", backgroundColor: "rgba(251, 191, 36, 0.07)" }}>
+                  <AlertTriangle size={10} className="shrink-0" />
+                  The timeline changed since this transcript — re-transcribe to stay in sync.
+                </p>
               )}
-              aria-pressed={dubSettings.textProvider === "gemini"}
-              title="Gemini models run the dub's speaker detection + translation — needs your Gemini key (Settings → Script Writer)"
-            >
-              <PenLine size={12} /> Gemini
-            </button>
-          </div>
-          {dubSettings.textProvider === "gemini" && geminiHasKey === false && (
-            <p className="mt-1 text-[10px] text-orange-400/90">
-              No Gemini key saved — add one in Settings → Script Writer (aistudio.google.com/apikey),
-              or switch back to Groq.
-            </p>
+
+              <div
+                className="ff-scroll-thin mb-1.5 max-h-72 overflow-y-auto rounded border p-1"
+                style={{ borderColor: "#332e28", backgroundColor: "#211e1a" }}
+                role="log"
+                aria-label="Word-level transcript"
+              >
+                {dubTranscript.utterances.map((u, i) => (
+                  <div key={i} className="mb-1 rounded px-1.5 py-1 text-[10px] leading-relaxed" style={{ backgroundColor: "#26221e" }}>
+                    <div className="flex items-baseline gap-1.5">
+                      <span className="shrink-0 font-mono text-[9px] text-teal-400">
+                        {dubTimecode(u.startMs)}–{dubTimecode(u.endMs)}
+                      </span>
+                      <span className="text-stone-300">{u.text}</span>
+                    </div>
+                    {showWords && u.words && u.words.length > 0 && (
+                      <div className="mt-1 flex flex-wrap gap-x-2 gap-y-0.5">
+                        {u.words.map((w, j) => (
+                          <span key={j} className="text-stone-500">
+                            {w.text}
+                            <span className="ml-0.5 font-mono text-[8px] text-stone-600">
+                              {(w.startMs / 1000).toFixed(2)}–{(w.endMs / 1000).toFixed(2)}
+                            </span>
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => void copyTranscript()}
+                  className="flex items-center gap-1 rounded border px-1.5 py-1 text-[10px] text-stone-400 transition-colors hover:bg-white/[0.06]"
+                  style={{ borderColor: "#332e28" }}
+                >
+                  {copied ? <Check size={10} /> : <Copy size={10} />}
+                  {copied ? "Copied" : "Copy"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    dubDownloadText(
+                      `transcript-${dubTranscript.language || "audio"}.json`,
+                      JSON.stringify(dubTranscript, null, 2),
+                      "application/json",
+                    )
+                  }
+                  className="flex items-center gap-1 rounded border px-1.5 py-1 text-[10px] text-stone-400 transition-colors hover:bg-white/[0.06]"
+                  style={{ borderColor: "#332e28" }}
+                >
+                  <Download size={10} /> JSON
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    dubDownloadText(
+                      `transcript-${dubTranscript.language || "audio"}.txt`,
+                      dubTranscript.utterances
+                        .map((u) => `${dubTimecode(u.startMs)} → ${dubTimecode(u.endMs)}  ${u.text}`)
+                        .join("\n"),
+                      "text/plain",
+                    )
+                  }
+                  className="flex items-center gap-1 rounded border px-1.5 py-1 text-[10px] text-stone-400 transition-colors hover:bg-white/[0.06]"
+                  style={{ borderColor: "#332e28" }}
+                >
+                  <Download size={10} /> TXT
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    dubDownloadText(
+                      `transcript-${dubTranscript.language || "audio"}.srt`,
+                      dubTranscript.utterances
+                        .map((u, i) => `${i + 1}\n${dubSrtTime(u.startMs)} --> ${dubSrtTime(u.endMs)}\n${u.text}\n`)
+                        .join("\n"),
+                      "text/plain",
+                    )
+                  }
+                  className="flex items-center gap-1 rounded border px-1.5 py-1 text-[10px] text-stone-400 transition-colors hover:bg-white/[0.06]"
+                  style={{ borderColor: "#332e28" }}
+                >
+                  <Download size={10} /> SRT
+                </button>
+                <button
+                  type="button"
+                  onClick={onDiscardTranscript}
+                  className="flex items-center gap-1 rounded border px-1.5 py-1 text-[10px] text-stone-400 transition-colors hover:bg-white/[0.06]"
+                  style={{ borderColor: "#332e28" }}
+                >
+                  <Trash2 size={10} /> Clear
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setStage("script")}
+                  className="ml-auto flex items-center gap-1 rounded bg-orange-500 px-2 py-1 text-[10px] font-semibold text-white transition-colors hover:bg-orange-400"
+                >
+                  Create the dubbing script <ChevronRight size={10} />
+                </button>
+              </div>
+            </div>
           )}
         </div>
-      </div>
-      <div className="mb-2 grid grid-cols-1 gap-1.5">
-        {(dubSettings.textProvider ?? "groq") === "gemini" ? (
-          <div>
-            <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
-              Gemini model
-            </label>
-            <select
-              value={dubSettings.geminiModel}
-              onChange={(e) =>
-                onDubSettingsChange({ ...dubSettings, geminiModel: e.target.value })
-              }
-              className={selectCls}
-              style={{ borderColor: "#332e28" }}
-              aria-label="Gemini dub model"
-            >
-              {geminiModels.length === 0 && (
-                <option value={dubSettings.geminiModel}>{dubSettings.geminiModel}</option>
+      )}
+
+      {/* ═══════════════════════════════════════════════════════════════════
+          STAGE 2 — THE EDITABLE DUBBING SCRIPT
+          ═══════════════════════════════════════════════════════════════ */}
+      {stage === "script" && (
+        <div className="mb-2 rounded border p-2" style={{ borderColor: "#332e28", backgroundColor: "#26221e" }}>
+          <p className="mb-1.5 text-[10px] leading-relaxed text-stone-400">
+            <span className="font-semibold text-stone-300">2 · Dubbing script.</span>{" "}
+            Detects the speakers, translates every line into the target language and shows the
+            full script for review — edit any line before dubbing.
+          </p>
+
+          {/* language + provider */}
+          <div className="mb-2 grid grid-cols-2 gap-1.5">
+            <div>
+              <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
+                Dub into
+              </label>
+              <select
+                value={dubSettings.targetLanguage}
+                onChange={(e) => changeLanguage(e.target.value)}
+                className={selectCls}
+                style={{ borderColor: "#332e28" }}
+                aria-label="Target dub language"
+              >
+                {languages.length === 0 && (
+                  <option value={dubSettings.targetLanguage}>
+                    {langNames[dubSettings.targetLanguage] ?? dubSettings.targetLanguage}
+                  </option>
+                )}
+                {languages.map((l) => (
+                  <option key={l.code} value={l.code}>
+                    {l.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
+                AI model provider
+              </label>
+              <div className="grid grid-cols-2 gap-1" role="group" aria-label="Dub AI model provider">
+                <button
+                  type="button"
+                  onClick={() =>
+                    dubSettings.textProvider !== "groq" &&
+                    onDubSettingsChange({ ...dubSettings, textProvider: "groq" })
+                  }
+                  className={cn(
+                    "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
+                    (dubSettings.textProvider ?? "groq") === "groq"
+                      ? "border-orange-500/50 bg-orange-500/15 text-orange-300"
+                      : "border-[#2b2723] bg-[#26221e] text-stone-500 hover:bg-white/[0.04] hover:text-stone-300",
+                  )}
+                  aria-pressed={(dubSettings.textProvider ?? "groq") === "groq"}
+                  title="Groq chat models run the dub's speaker detection + translation (free tier)"
+                >
+                  <Sparkles size={12} /> Groq
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    (dubSettings.textProvider ?? "groq") !== "gemini" &&
+                    onDubSettingsChange({ ...dubSettings, textProvider: "gemini" })
+                  }
+                  className={cn(
+                    "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
+                    dubSettings.textProvider === "gemini"
+                      ? "border-orange-500/50 bg-orange-500/15 text-orange-300"
+                      : "border-[#2b2723] bg-[#26221e] text-stone-500 hover:bg-white/[0.04] hover:text-stone-300",
+                  )}
+                  aria-pressed={dubSettings.textProvider === "gemini"}
+                  title="Gemini models run the dub's speaker detection + translation — needs your Gemini key (Settings → Script Writer)"
+                >
+                  <PenLine size={12} /> Gemini
+                </button>
+              </div>
+              {dubSettings.textProvider === "gemini" && geminiHasKey === false && (
+                <p className="mt-1 text-[10px] text-orange-400/90">
+                  No Gemini key saved — add one in Settings → Script Writer (aistudio.google.com/apikey),
+                  or switch back to Groq.
+                </p>
               )}
-              {geminiModels.map((m) => (
-                <option key={m.id} value={m.id} title={m.hint}>
-                  {m.label}
-                </option>
-              ))}
-            </select>
+            </div>
           </div>
-        ) : (
-          <div>
-            <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
-              Groq model (free tier)
-            </label>
-            <select
-              value={dubSettings.groqModel}
-              onChange={(e) =>
-                onDubSettingsChange({ ...dubSettings, groqModel: e.target.value })
-              }
-              className={selectCls}
-              style={{ borderColor: "#332e28" }}
-              aria-label="Groq text model"
-            >
-              {models.length === 0 && (
-                <option value={dubSettings.groqModel}>{dubSettings.groqModel}</option>
-              )}
-              {models.map((m) => (
-                <option key={m.id} value={m.id} title={m.hint}>
-                  {m.label}
-                </option>
-              ))}
-            </select>
+
+          <div className="mb-2 grid grid-cols-2 gap-1.5">
+            {(dubSettings.textProvider ?? "groq") === "gemini" ? (
+              <div>
+                <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
+                  Gemini model
+                </label>
+                <select
+                  value={dubSettings.geminiModel}
+                  onChange={(e) =>
+                    onDubSettingsChange({ ...dubSettings, geminiModel: e.target.value })
+                  }
+                  className={selectCls}
+                  style={{ borderColor: "#332e28" }}
+                  aria-label="Gemini dub model"
+                >
+                  {geminiModels.length === 0 && (
+                    <option value={dubSettings.geminiModel}>{dubSettings.geminiModel}</option>
+                  )}
+                  {geminiModels.map((m) => (
+                    <option key={m.id} value={m.id} title={m.hint}>
+                      {m.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            ) : (
+              <div>
+                <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
+                  Groq model (free tier)
+                </label>
+                <select
+                  value={dubSettings.groqModel}
+                  onChange={(e) =>
+                    onDubSettingsChange({ ...dubSettings, groqModel: e.target.value })
+                  }
+                  className={selectCls}
+                  style={{ borderColor: "#332e28" }}
+                  aria-label="Groq text model"
+                >
+                  {models.length === 0 && (
+                    <option value={dubSettings.groqModel}>{dubSettings.groqModel}</option>
+                  )}
+                  {models.map((m) => (
+                    <option key={m.id} value={m.id} title={m.hint}>
+                      {m.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            <div>
+              <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
+                Voice mode
+              </label>
+              <div className="grid grid-cols-2 gap-1" role="group" aria-label="Voice mode">
+                <button
+                  type="button"
+                  onClick={() => setVoiceMode("single")}
+                  className={cn(
+                    "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
+                    singleMode
+                      ? "border-orange-500/50 bg-orange-500/15 text-orange-300"
+                      : "border-[#2b2723] bg-[#26221e] text-stone-500 hover:bg-white/[0.04] hover:text-stone-300",
+                  )}
+                  aria-pressed={singleMode}
+                  title="One voice reads every line — speaker detection is skipped"
+                >
+                  <User size={12} /> One voice
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setVoiceMode("multi")}
+                  className={cn(
+                    "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
+                    !singleMode
+                      ? "border-orange-500/50 bg-orange-500/15 text-orange-300"
+                      : "border-[#2b2723] bg-[#26221e] text-stone-500 hover:bg-white/[0.04] hover:text-stone-300",
+                  )}
+                  aria-pressed={!singleMode}
+                  title="Detect speakers and assign a voice to each"
+                >
+                  <Users size={12} /> Multi-speaker
+                </button>
+              </div>
+            </div>
           </div>
-        )}
-      </div>
-      {/* v1.20: voice mode — one narrator for the whole dub vs per-speaker
-          voices. Pill styling mirrors the STT engine toggle. */}
-      <div className="mb-2">
-        <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
-          Voice mode
-        </label>
-        <div className="grid grid-cols-2 gap-1" role="group" aria-label="Voice mode">
-          <button
-            type="button"
-            onClick={() => setVoiceMode("single")}
-            className={cn(
-              "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
-              singleMode
-                ? "border-orange-500/50 bg-orange-500/15 text-orange-300"
-                : "border-[#2b2723] bg-[#26221e] text-stone-500 hover:bg-white/[0.04] hover:text-stone-300",
-            )}
-            aria-pressed={singleMode}
-            title="One voice reads every line — speaker detection is skipped"
-          >
-            <User size={12} /> One voice
-          </button>
-          <button
-            type="button"
-            onClick={() => setVoiceMode("multi")}
-            className={cn(
-              "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
-              !singleMode
-                ? "border-orange-500/50 bg-orange-500/15 text-orange-300"
-                : "border-[#2b2723] bg-[#26221e] text-stone-500 hover:bg-white/[0.04] hover:text-stone-300",
-            )}
-            aria-pressed={!singleMode}
-            title="Detect speakers and alternate female/male voices"
-          >
-            <Users size={12} /> Multi-speaker
-          </button>
-        </div>
-      </div>
-      {singleMode ? (
-        <div className="mb-2">
-          <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
-            Dubbing voice
-          </label>
-          <div className="flex items-center gap-1">
-            <select
-              value={singleVoiceValue}
-              onChange={(e) =>
-                onDubSettingsChange({ ...dubSettings, singleVoice: e.target.value })
-              }
-              className={cn(selectCls, "flex-1")}
-              style={{ borderColor: "#332e28" }}
-              aria-label="Dubbing voice"
-            >
-              {localeVoices.length === 0 && (
-                <option value={singleVoiceValue}>
-                  {singleVoiceValue || "auto"}
-                </option>
-              )}
-              {localeVoices.map((v) => (
-                <option key={v.shortName} value={v.shortName}>
-                  {v.displayName}
-                </option>
-              ))}
-            </select>
+
+          {scriptBusy ? (
+            <DubProgressRow
+              status={dubProgress?.status ?? "Writing the script…"}
+              progress={dubProgress?.progress ?? 0}
+              onCancel={onCancelDub}
+            />
+          ) : (
             <button
               type="button"
-              onClick={() => void playPreview(singleVoiceValue)}
-              disabled={!singleVoiceValue}
-              title="Listen to this voice"
-              className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded border text-orange-600 transition-colors hover:bg-orange-500/10 disabled:cursor-not-allowed disabled:opacity-40"
-              style={{ borderColor: "#332e28" }}
-              aria-label="Preview dubbing voice"
+              onClick={onStartDubScript}
+              disabled={!dubTranscript || groqHasKey === false}
+              title={
+                !dubTranscript
+                  ? "Run stage 1 first — the script is built from the word-level transcript"
+                  : groqHasKey === false
+                    ? "Add your free Groq API key in the Captions tab first"
+                    : "Detect speakers + translate the transcript into the selected language"
+              }
+              className="mb-2 flex w-full items-center justify-center gap-1.5 rounded bg-orange-500 px-2.5 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              <Play size={11} />
+              <FileText size={11} />
+              {dubScript
+                ? `Regenerate script (${dubSettings.targetLanguage})`
+                : `Create dubbing script (${langNames[dubSettings.targetLanguage] ?? dubSettings.targetLanguage})`}
             </button>
-          </div>
-        </div>
-      ) : (
-      <div className="mb-2 grid grid-cols-2 gap-1.5">
-        {(
-          [
-            ["Speaker 1 · female", "femaleVoice"],
-            ["Speaker 2 · male", "maleVoice"],
-          ] as const
-        ).map(([label, key]) => (
-          <div key={key}>
-            <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
-              {label}
-            </label>
-            <div className="flex items-center gap-1">
-              <select
-                value={dubSettings[key]}
-                onChange={(e) =>
-                  onDubSettingsChange({ ...dubSettings, [key]: e.target.value })
-                }
-                className={cn(selectCls, "flex-1")}
-                style={{ borderColor: "#332e28" }}
-                aria-label={label}
+          )}
+
+          {dubScript && !scriptBusy && (
+            <div>
+              <div className="mb-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-stone-400">
+                <span className="font-semibold text-stone-300">
+                  {singleMode ? "One voice" : `${dubScript.speakerCount} speakers`}
+                </span>
+                <span>· {scriptLines.length} lines · editable</span>
+                <span className="text-stone-500">
+                  (dub: {dubScript.targetLanguageName ?? dubScript.targetLanguage})
+                </span>
+                <button
+                  type="button"
+                  onClick={onDiscardScript}
+                  className="ml-auto flex items-center gap-1 rounded border px-1.5 py-0.5 text-[9px] text-stone-400 transition-colors hover:bg-white/[0.06]"
+                  style={{ borderColor: "#332e28" }}
+                >
+                  <Trash2 size={9} /> Clear script
+                </button>
+              </div>
+
+              {dubScript.warnings.length > 0 && (
+                <p className="mb-1.5 flex items-start gap-1 rounded border px-1.5 py-1 text-[10px] leading-relaxed text-amber-300" style={{ borderColor: "rgba(251, 191, 36, 0.3)", backgroundColor: "rgba(251, 191, 36, 0.07)" }}>
+                  <AlertTriangle size={10} className="mt-px shrink-0" />
+                  {dubScript.warnings[0]}
+                  {dubScript.warnings.length > 1 && ` (+${dubScript.warnings.length - 1} more)`}
+                </p>
+              )}
+
+              <div
+                className="ff-scroll-thin mb-1.5 max-h-80 overflow-y-auto rounded border p-1"
+                style={{ borderColor: "#332e28", backgroundColor: "#211e1a" }}
+                role="list"
+                aria-label="Dubbing script lines"
               >
-                {localeVoices.length === 0 && (
-                  <option value={dubSettings[key]}>{dubSettings[key] || "auto"}</option>
-                )}
-                {localeVoices
-                  .filter(
-                    (v) =>
-                      (key === "femaleVoice"
-                        ? v.gender === "Female"
-                        : v.gender === "Male") || localeVoices.length <= 2,
-                  )
-                  .map((v) => (
+                {scriptLines.map((l) => (
+                  <div
+                    key={l.i}
+                    className="mb-1 rounded p-1.5"
+                    style={{ backgroundColor: "#26221e" }}
+                    role="listitem"
+                  >
+                    <div className="mb-1 flex items-center gap-1.5">
+                      {!singleMode && (
+                        <select
+                          value={l.speaker}
+                          onChange={(e) =>
+                            onDubScriptChange(
+                              scriptLines.map((x) =>
+                                x.i === l.i ? { ...x, speaker: Number(e.target.value) } : x,
+                              ),
+                            )
+                          }
+                          className="shrink-0 rounded border bg-[#211e1a] px-1 py-px text-[9px] text-stone-300 focus:border-orange-500"
+                          style={{ borderColor: "#332e28" }}
+                          aria-label={`Speaker for line ${l.i + 1}`}
+                        >
+                          {Array.from({ length: multiSpeakerCount }, (_, id) => (
+                            <option key={id} value={id}>
+                              Speaker {id + 1}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+                      {singleMode && <SpeakerChip id={0} />}
+                      <span className="font-mono text-[9px] text-teal-400">
+                        {dubTimecode(l.startMs)}–{dubTimecode(l.endMs)}
+                      </span>
+                      <span className="min-w-0 flex-1 truncate text-[10px] text-stone-500">
+                        {l.sourceText}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => onDubScriptChange(scriptLines.filter((x) => x.i !== l.i))}
+                        title="Remove this line from the dub"
+                        className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-stone-500 transition-colors hover:bg-white/[0.06] hover:text-stone-300"
+                        aria-label={`Remove line ${l.i + 1}`}
+                      >
+                        <Trash2 size={10} />
+                      </button>
+                    </div>
+                    <textarea
+                      value={l.translatedText}
+                      onChange={(e) =>
+                        onDubScriptChange(
+                          scriptLines.map((x) =>
+                            x.i === l.i ? { ...x, translatedText: e.target.value } : x,
+                          ),
+                        )
+                      }
+                      rows={2}
+                      className="ff-scroll-thin w-full resize-y rounded border bg-[#211e1a] px-1.5 py-1 text-[10px] leading-relaxed text-stone-200 focus:border-orange-500 focus:outline-none"
+                      style={{ borderColor: "#332e28" }}
+                      aria-label={`Dubbed text for line ${l.i + 1}`}
+                    />
+                  </div>
+                ))}
+              </div>
+
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => setStage("dub")}
+                  className="flex items-center gap-1 rounded bg-orange-500 px-2 py-1 text-[10px] font-semibold text-white transition-colors hover:bg-orange-400"
+                >
+                  Choose voices &amp; dub <ChevronRight size={10} />
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ═══════════════════════════════════════════════════════════════════
+          STAGE 3 — VOICES + SYNTHESIZE
+          ═══════════════════════════════════════════════════════════════ */}
+      {stage === "dub" && (
+        <div className="mb-2 rounded border p-2" style={{ borderColor: "#332e28", backgroundColor: "#26221e" }}>
+          <p className="mb-1.5 text-[10px] leading-relaxed text-stone-400">
+            <span className="font-semibold text-stone-300">3 · Voices &amp; dub.</span>{" "}
+            {dubScript
+              ? "Synthesize the edited script with the voices below — original audio is ducked."
+              : "No script yet — the button below runs the whole pipeline in one click."}
+          </p>
+
+          {singleMode ? (
+            <div className="mb-2">
+              <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
+                Dubbing voice
+              </label>
+              <div className="flex items-center gap-1">
+                <select
+                  value={singleVoiceValue}
+                  onChange={(e) =>
+                    onDubSettingsChange({ ...dubSettings, singleVoice: e.target.value })
+                  }
+                  className={cn(selectCls, "flex-1")}
+                  style={{ borderColor: "#332e28" }}
+                  aria-label="Dubbing voice"
+                >
+                  {localeVoices.length === 0 && (
+                    <option value={singleVoiceValue}>
+                      {singleVoiceValue || "auto"}
+                    </option>
+                  )}
+                  {localeVoices.map((v) => (
                     <option key={v.shortName} value={v.shortName}>
                       {v.displayName}
                     </option>
                   ))}
-              </select>
-              <button
-                type="button"
-                onClick={() => void playPreview(dubSettings[key])}
-                disabled={!dubSettings[key]}
-                title="Listen to this voice"
-                className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded border text-orange-600 transition-colors hover:bg-orange-500/10 disabled:cursor-not-allowed disabled:opacity-40"
-                style={{ borderColor: "#332e28" }}
-                aria-label={`Preview ${label}`}
-              >
-                <Play size={11} />
-              </button>
+                </select>
+                <button
+                  type="button"
+                  onClick={() => void playPreview(singleVoiceValue)}
+                  disabled={!singleVoiceValue}
+                  title="Listen to this voice"
+                  className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded border text-orange-600 transition-colors hover:bg-orange-500/10 disabled:cursor-not-allowed disabled:opacity-40"
+                  style={{ borderColor: "#332e28" }}
+                  aria-label="Preview dubbing voice"
+                >
+                  <Play size={11} />
+                </button>
+              </div>
             </div>
-          </div>
-        ))}
-      </div>
-      )}
-      <Field
-        label="Original audio"
-        hint={`${Math.round(dubSettings.originalVolume * 100)}%`}
-      >
-        <input
-          type="range"
-          min={0}
-          max={100}
-          step={5}
-          value={Math.round(dubSettings.originalVolume * 100)}
-          onChange={(e) =>
-            onDubSettingsChange({
-              ...dubSettings,
-              originalVolume: Number(e.target.value) / 100,
-            })
-          }
-          className="w-full accent-orange-600"
-          aria-label="Original audio level under the dub"
-        />
-      </Field>
+          ) : (
+            <div className="mb-2 grid grid-cols-2 gap-1.5">
+              {Array.from({ length: multiSpeakerCount }, (_, id) => speakerVoiceRow(id))}
+            </div>
+          )}
 
-      {dubBusy && dubProgress ? (
-        <div className="mb-2">
-          <div className="mb-1 flex items-center justify-between gap-2">
-            <span className="flex items-center gap-1 text-[10px] text-stone-400">
-              <Loader2 size={10} className="animate-spin" /> {dubProgress.status}
-            </span>
+          <Field
+            label="Original audio"
+            hint={`${Math.round(dubSettings.originalVolume * 100)}%`}
+          >
+            <input
+              type="range"
+              min={0}
+              max={100}
+              step={5}
+              value={Math.round(dubSettings.originalVolume * 100)}
+              onChange={(e) =>
+                onDubSettingsChange({
+                  ...dubSettings,
+                  originalVolume: Number(e.target.value) / 100,
+                })
+              }
+              className="w-full accent-orange-600"
+              aria-label="Original audio level under the dub"
+            />
+          </Field>
+
+          {dubRunBusy ? (
+            <div className="mt-2">
+              <DubProgressRow
+                status={dubProgress?.status ?? "Dubbing…"}
+                progress={dubProgress?.progress ?? 0}
+                onCancel={onCancelDub}
+              />
+            </div>
+          ) : (
             <button
               type="button"
-              onClick={onCancelDub}
-              className="flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] text-stone-400 transition-colors hover:bg-white/[0.06]"
-              style={{ borderColor: "#332e28" }}
+              onClick={dubScript ? onStartDubFromScript : onStartDub}
+              disabled={
+                (dubScript ? scriptLines.length === 0 : dubSourceCount === 0) ||
+                (dubScript ? false : groqHasKey === false)
+              }
+              title={
+                dubScript
+                  ? "Synthesize the edited script (no re-transcription, no re-translation)"
+                  : dubSourceCount === 0
+                    ? "Import a local video clip first — the dub uses the timeline's audio"
+                    : groqHasKey === false
+                      ? "Add your free Groq API key in the Captions tab first"
+                      : "Transcribe → translate → synthesize a full dub track in one click"
+              }
+              className="mt-2 flex w-full items-center justify-center gap-1.5 rounded bg-orange-500 px-2.5 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              <Square size={9} /> Cancel
+              <Languages size={11} />
+              {dubScript
+                ? `Start dubbing — this script (${scriptLines.length} lines)`
+                : "Auto: transcribe → script → dub"}
             </button>
-          </div>
-          <div
-            className="h-1 w-full overflow-hidden rounded-full"
-            style={{ backgroundColor: "#332e28" }}
-            role="progressbar"
-            aria-valuenow={Math.round(dubProgress.progress)}
-            aria-valuemin={0}
-            aria-valuemax={100}
-          >
-            <div
-              className="h-full rounded-full bg-gradient-to-r from-orange-400 to-orange-600 transition-all"
-              style={{ width: `${Math.max(3, Math.min(100, dubProgress.progress))}%` }}
-            />
-          </div>
-        </div>
-      ) : (
-        <button
-          type="button"
-          onClick={onStartDub}
-          disabled={startDisabled}
-          title={
-            dubSourceCount === 0
-              ? "Import a local video clip first — the dub uses the timeline's audio"
-              : groqHasKey === false
-                ? "Add your free Groq API key in the Captions tab first"
-                : "Transcribe → translate → synthesize a full dub track"
-          }
-          className="flex w-full items-center justify-center gap-1.5 rounded bg-orange-500 px-2.5 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-40"
-        >
-          <Languages size={11} />
-          {dubBusy ? "Dubbing…" : "Start dubbing"}
-        </button>
-      )}
+          )}
 
-      {dubResult && (
-        <div className="mt-2 rounded border" style={{ borderColor: "#332e28" }}>
-          <div className="flex items-center justify-between px-2 py-1.5">
-            <span className="text-[10px] font-semibold text-stone-400">
-              {dubResult.speakers.length} speaker
-              {dubResult.speakers.length === 1 ? "" : "s"} ·{" "}
-              {dubResult.segments.length} segments
-            </span>
-            <div className="flex items-center gap-1">
-              <button
-                type="button"
-                onClick={onApplyDubTrack}
-                className="flex items-center gap-1 rounded bg-orange-500 px-2 py-1 text-[10px] font-semibold text-white transition-colors hover:bg-orange-400"
-              >
-                <Check size={10} /> Add to timeline
-              </button>
-              <button
-                type="button"
-                onClick={onDiscardDub}
-                className="flex items-center gap-1 rounded border px-1.5 py-1 text-[10px] text-stone-400 transition-colors hover:bg-white/[0.06]"
-                style={{ borderColor: "#332e28" }}
-              >
-                <Trash2 size={10} /> Discard
-              </button>
-            </div>
-          </div>
-          <div
-            className="ff-scroll-thin max-h-64 overflow-y-auto px-2 pb-2"
-            role="log"
-            aria-label="Dub segments"
-          >
-            {dubResult.segments.map((s, i) => (
-              <div
-                key={i}
-                className="mb-1 rounded px-1.5 py-1 text-[10px] leading-relaxed"
-                style={{ backgroundColor: "#26221e" }}
-              >
-                <span
-                  className="mr-1 rounded px-1 py-px font-mono text-[9px] font-semibold"
-                  style={{
-                    backgroundColor: s.speaker === 0 ? "rgba(13, 148, 136, 0.35)" : "#2b1c10",
-                    color: s.speaker === 0 ? "#2dd4bf" : "#fdba74",
-                  }}
-                >
-                  S{(s.speaker ?? 0) + 1}
+          {dubResult && (
+            <div className="mt-2 rounded border" style={{ borderColor: "#332e28" }}>
+              <div className="flex items-center justify-between px-2 py-1.5">
+                <span className="text-[10px] font-semibold text-stone-400">
+                  {dubResult.speakers.length} speaker
+                  {dubResult.speakers.length === 1 ? "" : "s"} ·{" "}
+                  {dubResult.segments.length} segments
                 </span>
-                <span className="text-stone-500">
-                  {(s.startMs / 1000).toFixed(1)}s
-                </span>
-                <span className="mx-1 text-stone-400">·</span>
-                {s.translatedText}
-                <div className="mt-0.5 truncate text-stone-400">{s.sourceText}</div>
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={onApplyDubTrack}
+                    className="flex items-center gap-1 rounded bg-orange-500 px-2 py-1 text-[10px] font-semibold text-white transition-colors hover:bg-orange-400"
+                  >
+                    <Check size={10} /> Add to timeline
+                  </button>
+                  <button
+                    type="button"
+                    onClick={onDiscardDub}
+                    className="flex items-center gap-1 rounded border px-1.5 py-1 text-[10px] text-stone-400 transition-colors hover:bg-white/[0.06]"
+                    style={{ borderColor: "#332e28" }}
+                  >
+                    <Trash2 size={10} /> Discard
+                  </button>
+                </div>
               </div>
-            ))}
-          </div>
+              <div
+                className="ff-scroll-thin max-h-64 overflow-y-auto px-2 pb-2"
+                role="log"
+                aria-label="Dub segments"
+              >
+                {dubResult.segments.map((s, i) => (
+                  <div
+                    key={i}
+                    className="mb-1 rounded px-1.5 py-1 text-[10px] leading-relaxed"
+                    style={{ backgroundColor: "#26221e" }}
+                  >
+                    <SpeakerChip id={s.speaker ?? 0} />
+                    <span className="text-stone-500">
+                      {(s.startMs / 1000).toFixed(1)}s
+                    </span>
+                    <span className="mx-1 text-stone-400">·</span>
+                    {s.translatedText}
+                    <div className="mt-0.5 truncate text-stone-400">{s.sourceText}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 

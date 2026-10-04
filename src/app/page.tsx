@@ -94,7 +94,10 @@ import {
   type CaptionSettings,
   type DisclaimerClip,
   type DubSettings,
+  type DubScriptLine,
+  type DubScriptResult,
   type DubTrackResult,
+  type DubTranscriptResult,
   type ExportProgress,
   type HeadlineItem,
   type ItemEdit,
@@ -174,7 +177,7 @@ const DISCLAIMER_DEFAULT_MS = 2000;
 /** v1.14.2: renderer build stamp — the desktop-only landing carries it so a
  * browser visitor sees which build is live (in Electron, Header separately
  * cross-checks it against the exe's app.getVersion()). */
-const BUILD_VERSION = "1.25.0";
+const BUILD_VERSION = "1.26.0";
 
 // ---------------------------------------------------------------------------
 // v1.23 FLOW — the left navigation rail. One dock, six phases: the media
@@ -1560,13 +1563,22 @@ export default function Page() {
   );
 
   // ---- v1.17 TRANSLATE & DUB (Groq Whisper → LLM → Edge TTS) — HMR probe ---
-  const [dubBusy, setDubBusy] = useState(false);
+  // v1.26 DUB STUDIO: dubOp replaces the flat boolean (which stage is in
+  // flight); transcript/script/speaker-voices live HERE because the Dub
+  // Studio Section unmounts on accordion collapse.
+  const [dubOp, setDubOp] = useState<"transcribe" | "script" | "dub" | null>(null);
+  const dubBusy = dubOp !== null;
   const [dubProgress, setDubProgress] = useState<{
     phase: string;
     progress: number;
     status: string;
   } | null>(null);
   const [dubResult, setDubResult] = useState<DubTrackResult | null>(null);
+  const [dubTranscript, setDubTranscript] = useState<
+    (DubTranscriptResult & { sourceCount?: number }) | null
+  >(null);
+  const [dubScript, setDubScript] = useState<DubScriptResult | null>(null);
+  const [dubSpeakerVoices, setDubSpeakerVoices] = useState<Record<number, string>>({});
 
   // Progress events from the main process (same channel pattern as whisper).
   useEffect(() => {
@@ -1609,7 +1621,7 @@ export default function Page() {
       });
       return;
     }
-    setDubBusy(true);
+    setDubOp("dub");
     setDubProgress({ phase: "prepare", progress: 0, status: "Starting…" });
     setDubResult(null);
     try {
@@ -1639,7 +1651,7 @@ export default function Page() {
         description: err instanceof Error ? err.message : String(err),
       });
     } finally {
-      setDubBusy(false);
+      setDubOp(null);
       setDubProgress(null);
     }
   }, [dubBusy, dubSources, dubSettings]);
@@ -1652,6 +1664,155 @@ export default function Page() {
     } catch {
       /* no active run */
     }
+  }, []);
+
+  // ---- v1.26 DUB STUDIO stages (same dub:progress channel + cancel) ----
+
+  /** Stage 1 — extract + transcribe the timeline audio at WORD level. */
+  const startDubTranscribe = useCallback(async () => {
+    if (dubBusy) return;
+    const api = window.electronAPI;
+    if (!api || typeof api.dubTranscribe !== "function") {
+      toast.error("Dubbing runs in the FrameFuse desktop app");
+      return;
+    }
+    if (dubSources.length === 0) {
+      toast.error("No local video clips on the timeline to transcribe", {
+        description: "Import a video from disk (not a restored project) first.",
+      });
+      return;
+    }
+    setDubOp("transcribe");
+    setDubProgress({ phase: "prepare", progress: 0, status: "Starting…" });
+    try {
+      const r = await api.dubTranscribe({
+        segments: dubSources,
+        sourceLanguage: "auto",
+      });
+      setDubTranscript({ ...r, sourceCount: dubSources.length });
+      toast.success("Word-level transcript ready", {
+        description: `${r.wordCount} words · ${r.utterances.length} lines · detected ${
+          r.language || "speech"
+        } — next: create the dubbing script.`,
+      });
+    } catch (err) {
+      toast.error("Transcription failed", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setDubOp(null);
+      setDubProgress(null);
+    }
+  }, [dubBusy, dubSources]);
+
+  /** Stage 2 — transcript → speakers + translation → the editable script. */
+  const startDubScript = useCallback(async () => {
+    if (dubBusy || !dubTranscript) return;
+    const api = window.electronAPI;
+    if (!api || typeof api.dubScript !== "function") {
+      toast.error("Dubbing runs in the FrameFuse desktop app");
+      return;
+    }
+    setDubOp("script");
+    setDubProgress({ phase: "speakers", progress: 0, status: "Detecting speakers…" });
+    try {
+      const r = await api.dubScript({
+        utterances: dubTranscript.utterances,
+        sourceLanguage:
+          dubTranscript.language && dubTranscript.language !== "unknown"
+            ? dubTranscript.language
+            : "auto",
+        targetLanguage: dubSettings.targetLanguage,
+        targetLocale: dubSettings.targetLocale,
+        groqModel: dubSettings.groqModel,
+        textProvider: dubSettings.textProvider ?? "groq",
+        geminiModel: dubSettings.geminiModel,
+        voiceMode: dubSettings.voiceMode ?? "multi",
+      });
+      setDubScript(r);
+      toast.success("Dubbing script ready", {
+        description: `${r.lines.length} lines · ${
+          r.speakerCount === 1 ? "one voice" : `${r.speakerCount} speakers`
+        } — edit any line, then dub it.`,
+      });
+    } catch (err) {
+      toast.error("Script generation failed", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setDubOp(null);
+      setDubProgress(null);
+    }
+  }, [dubBusy, dubTranscript, dubSettings]);
+
+  /** Stage 4 — dub from the EDITED script (no re-transcription/translation,
+   *  no Groq key needed on this leg — Edge TTS + ffmpeg only). */
+  const startDubFromScript = useCallback(async () => {
+    if (dubBusy || !dubScript) return;
+    const api = window.electronAPI;
+    if (!api || typeof api.dubStart !== "function") {
+      toast.error("Dubbing runs in the FrameFuse desktop app");
+      return;
+    }
+    setDubOp("dub");
+    setDubProgress({ phase: "synthesize", progress: 0, status: "Starting…" });
+    setDubResult(null);
+    try {
+      const result = await api.dubStart({
+        scriptLines: dubScript.lines.map((l) => ({
+          speaker: l.speaker,
+          sourceText: l.sourceText,
+          translatedText: l.translatedText,
+          startMs: l.startMs,
+          endMs: l.endMs,
+        })),
+        scriptVoices: {
+          ...(dubSettings.femaleVoice ? { 0: dubSettings.femaleVoice } : {}),
+          ...(dubSettings.maleVoice ? { 1: dubSettings.maleVoice } : {}),
+          ...dubSpeakerVoices,
+        },
+        scriptLanguage: dubScript.targetLanguage,
+        scriptSpeakerCount: dubScript.speakerCount,
+        targetLanguage: dubSettings.targetLanguage,
+        targetLocale: dubSettings.targetLocale,
+        voiceMode: dubSettings.voiceMode ?? "multi",
+        singleVoice: dubSettings.singleVoice ?? null,
+        femaleVoice: dubSettings.femaleVoice || undefined,
+        maleVoice: dubSettings.maleVoice || undefined,
+      });
+      setDubResult(result);
+      toast.success("Dub track ready", {
+        description: `${result.segments.length} segments · ${result.speakers.length} speaker${
+          result.speakers.length === 1 ? "" : "s"
+        } — review it, then add it to the timeline.`,
+      });
+    } catch (err) {
+      toast.error("Dubbing failed", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setDubOp(null);
+      setDubProgress(null);
+    }
+  }, [dubBusy, dubScript, dubSettings, dubSpeakerVoices]);
+
+  /** Stage-2 line edits (the script lives page-side; edits are textareas). */
+  const handleDubScriptLinesChange = useCallback((lines: DubScriptLine[]) => {
+    setDubScript((prev) => (prev ? { ...prev, lines } : prev));
+  }, []);
+
+  const handleDubSpeakerVoicesChange = useCallback((voices: Record<number, string>) => {
+    setDubSpeakerVoices(voices);
+  }, []);
+
+  /** Transcript clear — the script is built FROM it, so both go. */
+  const discardDubTranscript = useCallback(() => {
+    setDubTranscript(null);
+    setDubScript(null);
+  }, []);
+
+  const discardDubScript = useCallback(() => {
+    setDubScript(null);
   }, []);
 
   /** Dub result → VO placements (kind "dub"). Applying a new track
@@ -5795,12 +5956,23 @@ const handleConvertSubtitlesToNative = useCallback(() => {
                   onCreateWordCaptions={handleCreateWordCaptions}
                   dubSourceCount={dubSources.length}
                   dubBusy={dubBusy}
+                  dubOp={dubOp}
                   dubProgress={dubProgress}
                   dubResult={dubResult}
+                  dubTranscript={dubTranscript}
+                  dubScript={dubScript}
+                  dubSpeakerVoices={dubSpeakerVoices}
                   onStartDub={() => void startDub()}
                   onCancelDub={() => void cancelDub()}
                   onApplyDubTrack={applyDubTrack}
                   onDiscardDub={() => setDubResult(null)}
+                  onStartDubTranscribe={() => void startDubTranscribe()}
+                  onDiscardTranscript={discardDubTranscript}
+                  onStartDubScript={() => void startDubScript()}
+                  onDiscardScript={discardDubScript}
+                  onStartDubFromScript={() => void startDubFromScript()}
+                  onDubScriptChange={handleDubScriptLinesChange}
+                  onDubSpeakerVoicesChange={handleDubSpeakerVoicesChange}
                   voCount={displayVoItems.length}
                 />
               )}

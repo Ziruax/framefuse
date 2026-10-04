@@ -1,0 +1,75 @@
+/**
+ * The window.electronAPI stub injected before hydration (Task 3-b v1.25 UI
+ * verification — QWERTY Hinglish/Roman Urdu script writer). The 6-d dub
+ * surface is kept so the whole Dubbing tab (Voiceover + Script Writer +
+ * Translate & Dub) mounts exactly like the desktop app; the scriptwriter
+ * surface (scriptModels / geminiGet / geminiSet / scriptGenerate) is added,
+ * and scriptGenerate RECORDS its payload on window.__scriptGenPayload so the
+ * E2E can assert the EXACT language string the renderer routes for the QWERTY
+ * variants. Every other `typeof api?.x === "function"` gate stays closed
+ * exactly like a browser session, so the studio mounts through the same
+ * paths.
+ */
+(function () {
+  var unsub = function () { return function () {}; };
+  var HINGLISH_SCRIPT =
+    "kya haal hai dosto, aaj hum ek aisi app dekhenge jo bina editing " +
+    "ke reels bana deti hai. [pause] BAS teen photos daalo, gaana chuno, " +
+    "aur EXPORT dabao. Seriously — itna SIMPLE kabhi nahi dekha hoga.";
+  var URDU_SCRIPT =
+    "kya haal hai dost, aaj hum ek aisi app dekhenge jo bina editing ke " +
+    "reels bana deti hai. [pause] BAS teen photos daalo, gaana chuno, aur " +
+    "EXPORT dabao.";
+  window.electronAPI = {
+    // menu + progress subscriptions (mount path of page.tsx)
+    onMenu: unsub,
+    onDubProgress: unsub,
+    onExportProgress: onTtsProgressStub,
+    // engine diagnostics gate (EngineDiagnosticsCard probe — returns a
+    // loaded native engine so the export tab renders its ok state)
+    engineStatus: function () {
+      return Promise.resolve({
+        loaded: true, binaryPath: "/opt/framefuse/engine", version: "0.4.1",
+      });
+    },
+    ffmpegStatus: function () {
+      return Promise.resolve({ ok: true, path: "/usr/bin/ffmpeg" });
+    },
+    whisperGroqGet: function () {
+      return Promise.resolve({ hasKey: true, maskedKey: "gsk_TEST…1234" });
+    },
+    // the dub card's voice catalog (main process tts:voices shape)
+    ttsVoices: function () {
+      return Promise.resolve({
+        voices: [
+          { shortName: "hi-IN-SwaraNeural", gender: "Female", locale: "hi-IN", friendlyName: "Swara", displayName: "Swara · Hindi (India)" },
+          { shortName: "hi-IN-MadhurNeural", gender: "Male", locale: "hi-IN", friendlyName: "Madhur", displayName: "Madhur · Hindi (India)" },
+          { shortName: "ur-PK-UzmaNeural", gender: "Female", locale: "ur-PK", friendlyName: "Uzma", displayName: "Uzma · Urdu (Pakistan)" },
+          { shortName: "ur-PK-AsadNeural", gender: "Male", locale: "ur-PK", friendlyName: "Asad", displayName: "Asad · Urdu (Pakistan)" },
+        ],
+        pairs: {
+          "hi-IN": { female: "hi-IN-SwaraNeural", male: "hi-IN-MadhurNeural" },
+          "ur-PK": { female: "ur-PK-UzmaNeural", male: "ur-PK-AsadNeural" },
+        },
+      });
+    },
+    ttsPreview: function () {
+      return Promise.resolve({ bytes: new ArrayBuffer(8), bytesLen: 8 });
+    },
+    ttsSynthesize: function () {
+      return Promise.reject(new Error("stub — TTS disabled in this harness"));
+    },
+    dubModels: function () {
+      return Promise.resolve({
+        models: [
+          { id: "llama-3.3-70b-versatile", label: "Llama 3.3 70B", hint: "default" },
+          { id: "llama-3.1-8b-instant", label: "Llama 3.1 8B", hint: "fastest" },
+        ],
+        default: "llama-3.3-70b-versatile",
+        langNames: { hi: "Hindi", en: "English", es: "Spanish", ur: "Urdu" },
+      });
+    },
+    dubStart: function () {
+      return Promise.reject(new Error("stub — dubbing disabled in this harness"));
+    },
+    dubCancel: function () {

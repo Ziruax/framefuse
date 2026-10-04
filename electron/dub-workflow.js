@@ -336,6 +336,14 @@ function groupWordsToUtterances(words, opts) {
     startMs: Math.round(g.start * 1000),
     endMs: Math.round(g.end * 1000),
     text: g.words.map((x) => x.text).join(" "),
+    // v1.26 Dub Studio: keep the word-level timings (ms) on each line so the
+    // transcript stage can show per-word boundaries. Downstream dub phases
+    // ignore the field; extra key is backward-compatible.
+    words: g.words.map((x) => ({
+      text: x.text,
+      startMs: Math.round(x.start * 1000),
+      endMs: Math.round(x.end * 1000),
+    })),
   });
   const splitRec = (g) => {
     if ((g.end - g.start) * 1000 <= maxDurMs || g.words.length < 2) {
@@ -617,29 +625,95 @@ function translateUserPrompt(utts, idxs, langName) {
  *   startMs is the FITTED start; endMs is the source utterance end; the
  *   actual dub end is startMs + ttsDurMs (probed from the final WAV).
  */
-async function runDub(opts) {
+/** v1.26 script-dub speaker resolution: the renderer's per-speaker picks
+ *  (ctx.speakerVoices, id → ShortName) override the locale pair's auto
+ *  defaults; single mode collapses everything onto speaker 0. */
+function scriptSpeakers(ctx) {
+  const pairPick = (() => {
+    let pairs;
+    try {
+      pairs = ttsDeps().voicePairsByLocale();
+    } catch (err) {
+      throw new Error(`Could not load Edge TTS voices: ${err.message}`);
+    }
+    return pickVoicePair(pairs, ctx.targetLocale, ctx.targetLanguage);
+  })();
+  if (!pairPick.ok) {
+    throw new Error(`No Edge TTS voices available for ${ctx.targetLocale} — cannot dub into this language`);
+  }
+
+  if (ctx.singleMode) {
+    const { voice, gender } = pickVoiceForSpeaker(0, pairPick, ctx.speakerVoices);
+    return {
+      speakerCount: 1,
+      voiceList: [{ id: 0, voice, gender }],
+      ids: ctx.scriptLines.map(() => 0),
+      warnings: [...pairPick.warnings],
+    };
+  }
+
+  let speakerCount = 1;
+  for (const l of ctx.scriptLines) {
+    if (Number.isInteger(l.speaker) && l.speaker + 1 > speakerCount) speakerCount = l.speaker + 1;
+  }
+  if (Number.isInteger(ctx.scriptSpeakerCount) && ctx.scriptSpeakerCount > speakerCount) {
+    speakerCount = ctx.scriptSpeakerCount;
+  }
+  speakerCount = Math.min(8, speakerCount);
+  const voiceList = [];
+  for (let id = 0; id < speakerCount; id++) {
+    const { voice, gender } = pickVoiceForSpeaker(id, pairPick, ctx.speakerVoices);
+    voiceList.push({ id, voice, gender });
+  }
+  const ids = ctx.scriptLines.map((l) =>
+    Math.min(Math.max(Number.isInteger(l.speaker) ? l.speaker : 0, 0), speakerCount - 1));
+  return { speakerCount, voiceList, ids, warnings: [...pairPick.warnings] };
+}
+
+/** Shared validation + ctx + abort wiring for the file-touching dub entry
+ *  points (runDub, runDubTranscript). v1.26: when scriptLines are supplied
+ *  the whole LLM/Whisper leg is skipped — segments and the Groq key are NOT
+ *  required (only tempDir for the TTS wavs). */
+function createDubRun(opts) {
   const o = opts || {};
 
-  // ---- validation (fail fast, before touching the disk) ----
-  if (!Array.isArray(o.segments) || o.segments.length === 0) {
-    throw new Error("runDub: no source segments — pass the timeline's base-lane segments");
-  }
-  const segs = o.segments
-    .map((s, i) => ({
-      videoPath: String((s && s.videoPath) || ""),
-      startMs: Math.max(0, Math.round(Number(s && s.startMs) || 0)),
-    }))
-    .sort((a, b) => a.startMs - b.startMs);
-  for (let i = 0; i < segs.length; i++) {
-    if (!segs[i].videoPath) {
-      throw new Error(`runDub: segment ${i + 1} has no videoPath`);
+  // ---- v1.26 script-dub validation (synthesize + fit only) ----
+  const scriptLines = Array.isArray(o.scriptLines) && o.scriptLines.length > 0
+    ? o.scriptLines
+        .map((l) => ({
+          speaker: Number.isInteger(l && l.speaker) ? l.speaker : 0,
+          sourceText: String((l && l.sourceText) || "").trim(),
+          translatedText: String((l && l.translatedText) || "").trim(),
+          startMs: Math.max(0, Math.round(Number(l && l.startMs) || 0)),
+          endMs: Math.max(0, Math.round(Number(l && l.endMs) || 0)),
+        }))
+        .filter((l) => l.translatedText || l.sourceText)
+    : null;
+
+  let segs = null;
+  if (!scriptLines) {
+    // ---- classic-path validation (fail fast, before touching the disk) ----
+    if (!Array.isArray(o.segments) || o.segments.length === 0) {
+      throw new Error("runDub: no source segments — pass the timeline's base-lane segments");
     }
-    if (!fs.existsSync(segs[i].videoPath)) {
-      throw new Error(`runDub: source file not found for segment ${i + 1}: ${segs[i].videoPath}`);
+    segs = o.segments
+      .map((s) => ({
+        videoPath: String((s && s.videoPath) || ""),
+        startMs: Math.max(0, Math.round(Number(s && s.startMs) || 0)),
+      }))
+      .sort((a, b) => a.startMs - b.startMs);
+    for (let i = 0; i < segs.length; i++) {
+      if (!segs[i].videoPath) {
+        throw new Error(`runDub: segment ${i + 1} has no videoPath`);
+      }
+      if (!fs.existsSync(segs[i].videoPath)) {
+        throw new Error(`runDub: source file not found for segment ${i + 1}: ${segs[i].videoPath}`);
+      }
     }
   }
+
   const apiKey = typeof o.apiKey === "string" ? o.apiKey.trim() : "";
-  if (!apiKey) {
+  if (!scriptLines && !apiKey) {
     throw new Error("runDub: no Groq API key — dubbing needs a key with Whisper + chat model access");
   }
   // v1.22 text provider: "groq" (default, unchanged behavior) or "gemini"
@@ -648,7 +722,7 @@ async function runDub(opts) {
   const textProvider = o.textProvider === "gemini" ? "gemini" : "groq";
   const geminiApiKey =
     typeof o.geminiApiKey === "string" ? o.geminiApiKey.trim() : "";
-  if (textProvider === "gemini" && !geminiApiKey) {
+  if (!scriptLines && textProvider === "gemini" && !geminiApiKey) {
     throw new Error(
       "runDub: no Gemini API key — open Settings → Script Writer, paste your Gemini key (aistudio.google.com/apikey), or switch dubbing back to the Groq model",
     );
@@ -674,8 +748,18 @@ async function runDub(opts) {
   const singleVoice = typeof o.singleVoice === "string" ? o.singleVoice.trim() : "";
   const singleMode = o.voiceMode === "single" || singleVoice.length > 0;
 
+  const speakerVoices = { ...(o.speakerVoices && typeof o.speakerVoices === "object" ? o.speakerVoices : {}) };
+  if (o.scriptVoices && typeof o.scriptVoices === "object") {
+    for (const [k, v] of Object.entries(o.scriptVoices)) {
+      if (typeof v === "string" && v.trim()) speakerVoices[k] = v.trim();
+    }
+  }
+
   const ctx = {
     segments: segs,
+    scriptLines,
+    scriptLanguage: typeof o.scriptLanguage === "string" ? o.scriptLanguage : "",
+    scriptSpeakerCount: Number.isInteger(o.scriptSpeakerCount) ? o.scriptSpeakerCount : null,
     apiKey,
     dubDir,
     ffmpegPath: o.ffmpegPath || "ffmpeg",
@@ -690,7 +774,7 @@ async function runDub(opts) {
     geminiApiKey,
     speakerVoices: singleMode && singleVoice
       ? { 0: singleVoice, 1: singleVoice, 2: singleVoice, 3: singleVoice }
-      : (o.speakerVoices && typeof o.speakerVoices === "object" ? o.speakerVoices : null),
+      : speakerVoices,
     singleMode,
     ttsRatePct: Number.isFinite(Number(o.ttsRatePct)) ? Number(o.ttsRatePct) : 0,
     ttsPitchHz: Number.isFinite(Number(o.ttsPitchHz)) ? Number(o.ttsPitchHz) : 0,
@@ -725,6 +809,12 @@ async function runDub(opts) {
     ctx.rejectCancelled(new Error(CANCEL_DUB_MSG));
   };
 
+  return { ctx, cancelled };
+}
+
+async function runDub(opts) {
+  const { ctx, cancelled } = createDubRun(opts);
+
   const work = runPipeline(ctx);
   try {
     const result = await Promise.race([work, cancelled]);
@@ -732,7 +822,163 @@ async function runDub(opts) {
     return result;
   } catch (err) {
     ctx.completed = true;
-    removeDubDir(dubDir); // auto-clean on abort/error (caller keeps nothing)
+    removeDubDir(ctx.dubDir); // auto-clean on abort/error (caller keeps nothing)
+    const msg = err && err.message ? err.message : String(err);
+    throw new Error(isCancelMessage(msg) ? CANCEL_DUB_MSG : msg);
+  }
+}
+
+/** v1.26 Dub Studio STAGE 1 — word-level transcript. Runs the pipeline's
+ *  prepare + transcribe phases and returns pure data (utterance lines, each
+ *  with word-level timings mapped onto timeline time). The temp dir is
+ *  removed on completion — no files survive this call. */
+async function runDubTranscript(opts) {
+  const { ctx, cancelled } = createDubRun({ ...opts, scriptLines: null });
+
+  const work = (async () => {
+    const prep = await phase(ctx, "prepare", () => prepareSource(ctx));
+    const trans = await phase(ctx, "transcribe", () => transcribeSource(ctx, prep));
+    return { prep, trans };
+  })();
+  try {
+    const { prep, trans } = await Promise.race([work, cancelled]);
+    ctx.completed = true;
+    // Everything on disk was an intermediate — drop it all.
+    for (const f of ctx.tempFiles) {
+      try { fs.unlinkSync(f); } catch (_) { /* best effort */ }
+    }
+    removeDubDir(ctx.dubDir);
+    const wordCount = trans.utts.reduce(
+      (m, u) => m + (Array.isArray(u.words) ? u.words.length : 0),
+      0,
+    );
+    const language = trans.language ||
+      (ctx.sourceLanguage !== "auto" ? ctx.sourceLanguage : "unknown");
+    report(ctx, "done", 100, "Transcript ready", { language, lines: trans.utts.length, words: wordCount });
+    return {
+      language,
+      totalMs: prep.totalMs,
+      utterances: trans.utts,
+      wordCount,
+    };
+  } catch (err) {
+    ctx.completed = true;
+    removeDubDir(ctx.dubDir);
+    const msg = err && err.message ? err.message : String(err);
+    throw new Error(isCancelMessage(msg) ? CANCEL_DUB_MSG : msg);
+  }
+}
+
+/** v1.26 Dub Studio STAGE 2 — the editable dubbing script. Takes the stage-1
+ *  transcript (utterance lines, no files) and runs the speakers + translate
+ *  phases with the chosen provider (Groq default / Gemini). No temp files,
+ *  no ffmpeg — pure LLM work, abortable via the same abortRef contract. */
+async function runDubScript(opts) {
+  const o = opts || {};
+  if (!Array.isArray(o.utterances) || o.utterances.length === 0) {
+    throw new Error("runDubScript: no transcript lines — run the transcription stage first");
+  }
+  const utts = o.utterances
+    .map((u) => ({
+      startMs: Math.max(0, Math.round(Number(u && u.startMs) || 0)),
+      endMs: Math.max(0, Math.round(Number(u && u.endMs) || 0)),
+      text: String((u && u.text) || "").replace(/\s+/g, " ").trim(),
+    }))
+    .filter((u) => u.text && u.endMs > u.startMs)
+    .sort((a, b) => a.startMs - b.startMs);
+  if (utts.length === 0) {
+    throw new Error("The transcript has no usable lines — re-run the transcription stage");
+  }
+  const textProvider = o.textProvider === "gemini" ? "gemini" : "groq";
+  const apiKey = typeof o.apiKey === "string" ? o.apiKey.trim() : "";
+  const geminiApiKey =
+    typeof o.geminiApiKey === "string" ? o.geminiApiKey.trim() : "";
+  if (textProvider === "groq" && !apiKey) {
+    throw new Error("runDubScript: no Groq API key — script generation needs a Groq chat model");
+  }
+  if (textProvider === "gemini" && !geminiApiKey) {
+    throw new Error(
+      "runDubScript: no Gemini API key — open Settings → Script Writer, paste your Gemini key (aistudio.google.com/apikey), or switch to a Groq model",
+    );
+  }
+
+  const singleVoice = typeof o.singleVoice === "string" ? o.singleVoice.trim() : "";
+  const singleMode = o.voiceMode === "single" || singleVoice.length > 0;
+
+  const ctx = {
+    segments: null,
+    scriptLines: null,
+    apiKey,
+    dubDir: null,
+    ffmpegPath: o.ffmpegPath || "ffmpeg",
+    ffprobePath: o.ffprobePath || "ffprobe",
+    sourceLanguage: typeof o.sourceLanguage === "string" && o.sourceLanguage ? o.sourceLanguage : "auto",
+    targetLanguage: String(o.targetLanguage || "en").toLowerCase().trim(),
+    targetLocale: String(o.targetLocale || o.targetLanguage || "en").trim(),
+    groqModel: GC.normalizeTextModel(o.groqModel),
+    whisperModel: GW.normalizeGroqModel(o.whisperModel),
+    textProvider,
+    geminiModel: GM.normalizeTextModel(o.geminiModel),
+    geminiApiKey,
+    speakerVoices: singleMode && singleVoice
+      ? { 0: singleVoice, 1: singleVoice, 2: singleVoice, 3: singleVoice }
+      : (o.speakerVoices && typeof o.speakerVoices === "object" ? o.speakerVoices : null),
+    singleMode,
+    onProgress: typeof o.onProgress === "function" ? o.onProgress : null,
+    tempFiles: [],
+    childAborts: [],
+    aborted: false,
+    completed: false,
+    rejectCancelled: null,
+  };
+  const cancelled = new Promise((_, rej) => { ctx.rejectCancelled = rej; });
+  ctx.childAbortRef = () => {
+    const ref = { abort: null };
+    ctx.childAborts.push(ref);
+    return ref;
+  };
+  ctx.checkAbort = () => {
+    if (ctx.aborted) throw new Error(CANCEL_DUB_MSG);
+  };
+  const abortRef = o.abortRef && typeof o.abortRef === "object" ? o.abortRef : { abort: null };
+  abortRef.abort = () => {
+    if (ctx.completed || ctx.aborted) return;
+    ctx.aborted = true;
+    for (const ref of ctx.childAborts) {
+      try { if (typeof ref.abort === "function") ref.abort(); } catch (_) { /* best effort */ }
+    }
+    ctx.rejectCancelled(new Error(CANCEL_DUB_MSG));
+  };
+
+  const work = (async () => {
+    const trans = { utts, language: ctx.sourceLanguage !== "auto" ? ctx.sourceLanguage : null };
+    const speakerInfo = await phase(ctx, "speakers", () =>
+      ctx.singleMode ? singleVoiceSpeakers(ctx, trans) : detectSpeakers(ctx, trans));
+    const warnings = [...speakerInfo.warnings];
+    const translations = await phase(ctx, "translate", () => translateSegments(ctx, trans, warnings));
+    return { speakerInfo, translations, warnings };
+  })();
+  try {
+    const { speakerInfo, translations, warnings } = await Promise.race([work, cancelled]);
+    ctx.completed = true;
+    report(ctx, "done", 100, "Script ready", { lines: utts.length, speakers: speakerInfo.speakerCount });
+    return {
+      targetLanguage: ctx.targetLanguage,
+      targetLanguageName: languageName(ctx.targetLanguage),
+      speakerCount: speakerInfo.speakerCount,
+      voices: speakerInfo.voiceList,
+      lines: utts.map((u, i) => ({
+        i,
+        startMs: u.startMs,
+        endMs: u.endMs,
+        speaker: Number.isInteger(speakerInfo.ids[i]) ? speakerInfo.ids[i] : 0,
+        sourceText: u.text,
+        translatedText: translations[i],
+      })),
+      warnings,
+    };
+  } catch (err) {
+    ctx.completed = true;
     const msg = err && err.message ? err.message : String(err);
     throw new Error(isCancelMessage(msg) ? CANCEL_DUB_MSG : msg);
   }
@@ -761,12 +1007,35 @@ function report(ctx, phaseName, progress, status, detail) {
 }
 
 async function runPipeline(ctx) {
-  const prep = await phase(ctx, "prepare", () => prepareSource(ctx));
-  const trans = await phase(ctx, "transcribe", () => transcribeSource(ctx, prep));
-  const speakerInfo = await phase(ctx, "speakers", () =>
-    ctx.singleMode ? singleVoiceSpeakers(ctx, trans) : detectSpeakers(ctx, trans));
-  const warnings = [...speakerInfo.warnings];
-  const translations = await phase(ctx, "translate", () => translateSegments(ctx, trans, warnings));
+  let prep = null;
+  let trans = null;
+  let translations = null;
+  let speakerInfo;
+  const warnings = [];
+
+  if (ctx.scriptLines) {
+    // v1.26 Dub Studio stage-4 path: the script came from the (edited)
+    // renderer — transcription, speaker detection and translation are ALL
+    // skipped; only synthesize + fit run (no LLM, no Groq key needed).
+    trans = {
+      utts: ctx.scriptLines.map((l) => ({
+        startMs: l.startMs,
+        endMs: Math.max(l.endMs, l.startMs + 1),
+        text: l.sourceText || l.translatedText,
+      })),
+      language: ctx.scriptLanguage || null,
+    };
+    translations = ctx.scriptLines.map((l) => l.translatedText || l.sourceText);
+    speakerInfo = await phase(ctx, "speakers", () => scriptSpeakers(ctx));
+    warnings.push(...speakerInfo.warnings);
+  } else {
+    prep = await phase(ctx, "prepare", () => prepareSource(ctx));
+    trans = await phase(ctx, "transcribe", () => transcribeSource(ctx, prep));
+    speakerInfo = await phase(ctx, "speakers", () =>
+      ctx.singleMode ? singleVoiceSpeakers(ctx, trans) : detectSpeakers(ctx, trans));
+    warnings.push(...speakerInfo.warnings);
+    translations = await phase(ctx, "translate", () => translateSegments(ctx, trans, warnings));
+  }
   const synth = await phase(ctx, "synthesize", () => synthesizeVoices(ctx, trans, translations, speakerInfo));
   const fitted = await phase(ctx, "fit", () => fitSegments(ctx, trans, translations, synth, speakerInfo, warnings));
 
@@ -942,12 +1211,19 @@ async function transcribeSource(ctx, prep) {
   if (words.length > 0) {
     rawUtts = groupWordsToUtterances(words);
   } else if (segChunks.length > 0) {
-    // Segment-level fallback: chunk per utterance, pad unknown ends.
-    rawUtts = segChunks.map((c) => ({
-      startMs: Math.round(((c.timestamp && c.timestamp[0]) || 0) * 1000),
-      endMs: Math.round((((c.timestamp && c.timestamp[1]) != null ? c.timestamp[1] : (c.timestamp && c.timestamp[0]) || 0) + 0.4) * 1000),
-      text: c.text,
-    }));
+    // Segment-level fallback: chunk per utterance, pad unknown ends. Each
+    // line carries ONE pseudo-word spanning its window (v1.26: the transcript
+    // viewer always has word rows, honestly labeled as segment-level).
+    rawUtts = segChunks.map((c) => {
+      const startMs = Math.round(((c.timestamp && c.timestamp[0]) || 0) * 1000);
+      const endMs = Math.round((((c.timestamp && c.timestamp[1]) != null ? c.timestamp[1] : (c.timestamp && c.timestamp[0]) || 0) + 0.4) * 1000);
+      return {
+        startMs,
+        endMs,
+        text: c.text,
+        words: [{ text: c.text, startMs, endMs }],
+      };
+    });
   } else {
     throw new Error("No speech was detected in the source audio — dubbing needs a track with spoken dialogue");
   }
@@ -957,6 +1233,16 @@ async function transcribeSource(ctx, prep) {
       startMs: concatMsToTimelineMs(timelineMap, u.startMs),
       endMs: concatMsToTimelineMs(timelineMap, u.endMs),
       text: String(u.text || "").replace(/\s+/g, " ").trim(),
+      // v1.26: word rows ride along, mapped onto timeline time.
+      words: Array.isArray(u.words)
+        ? u.words
+            .filter((w) => w && typeof w.text === "string" && w.text.trim())
+            .map((w) => ({
+              text: w.text,
+              startMs: concatMsToTimelineMs(timelineMap, w.startMs),
+              endMs: concatMsToTimelineMs(timelineMap, w.endMs),
+            }))
+        : undefined,
     }))
     .filter((u) => u.text && u.endMs > u.startMs)
     .sort((a, b) => a.startMs - b.startMs);
@@ -1351,6 +1637,9 @@ function removeDubDir(dir) {
 module.exports = {
   // The orchestrator
   runDub,
+  // v1.26 Dub Studio stages
+  runDubTranscript,
+  runDubScript,
   cleanupDubTemp,
   // Language helpers
   LANG_NAMES,

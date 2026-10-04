@@ -911,6 +911,50 @@ export interface DubTrackResult {
   dubDir: string;
 }
 
+/** ── v1.26 Dub Studio staged workflow ──
+ *  Stage 1 — word-level transcript (Groq Whisper): the timeline's audio
+ *  becomes utterance lines, each carrying its word-level timings. */
+export interface DubTranscriptWord {
+  text: string;
+  startMs: number;
+  endMs: number;
+}
+
+export interface DubTranscriptUtterance {
+  startMs: number;
+  endMs: number;
+  text: string;
+  /** Word-level timings for this line (absent when Whisper only returned
+ *  segment-level cues — then a single pseudo-word carries the line). */
+  words?: DubTranscriptWord[];
+}
+
+export interface DubTranscriptResult {
+  language: string;
+  totalMs: number;
+  utterances: DubTranscriptUtterance[];
+  wordCount: number;
+}
+
+/** Stage 2 — the editable dubbing script: one line per utterance with the
+ *  detected speaker, the original text and the translated (dub) text. */
+export interface DubScriptLine {
+  i: number;
+  startMs: number;
+  endMs: number;
+  speaker: number;
+  sourceText: string;
+  translatedText: string;
+}
+
+export interface DubScriptResult {
+  targetLanguage: string;
+  targetLanguageName: string;
+  speakerCount: number;
+  lines: DubScriptLine[];
+  warnings: string[];
+}
+
 /** Monotonic sequence for instance ids (unique within the same ms). */
 let voSeq = 0;
 
@@ -1513,7 +1557,9 @@ declare global {
       }) => void) => () => void;
       /** ── v1.17 Groq dubbing (transcribe → speakers → translate → TTS) ── */
       dubStart?: (p: {
-        segments: Array<{ videoPath: string; startMs: number; endMs?: number }>;
+        /** v1.26: omitted on the script-dub leg (scriptLines present) —
+         *  no audio extraction, no Whisper, no LLM needed. */
+        segments?: Array<{ videoPath: string; startMs: number; endMs?: number }>;
         sourceLanguage?: string;
         targetLanguage: string;
         targetLocale: string;
@@ -1532,8 +1578,44 @@ declare global {
          *  (empty/null = the locale pair's default female). */
         singleVoice?: string | null;
         ttsRatePct?: number;
+        /** v1.26 Dub Studio stage 4: dub from the EDITED script — skips
+         *  transcription/translation and synthesizes these lines as-is. */
+        scriptLines?: Array<{
+          speaker: number;
+          sourceText: string;
+          translatedText: string;
+          startMs: number;
+          endMs: number;
+        }>;
+        /** v1.26: per-speaker Edge-TTS voices for the script dub (id →
+         *  ShortName; absent ids fall back to the locale pair's default). */
+        scriptVoices?: Record<string, string>;
+        /** v1.26: the script's language (labels the result + the VO items). */
+        scriptLanguage?: string;
+        /** v1.26: the script's speaker count (voice list size hint). */
+        scriptSpeakerCount?: number;
       }) => Promise<DubTrackResult>;
       dubCancel?: () => Promise<{ ok: boolean; running: boolean }>;
+      /** ── v1.26 Dub Studio stages (same dub:progress channel + dub:cancel
+ *  abort as dubStart; ONE dub-family op at a time in the main process) ── */
+      /** Stage 1: extract + transcribe the timeline audio at WORD level
+ *  (Groq Whisper) → utterance lines with per-word timings. */
+      dubTranscribe?: (p: {
+        segments: Array<{ videoPath: string; startMs: number; endMs?: number }>;
+        sourceLanguage?: string;
+      }) => Promise<DubTranscriptResult>;
+      /** Stage 2: transcript → speaker detection + translation → the
+ *  editable dubbing script in the target language (default Hindi). */
+      dubScript?: (p: {
+        utterances: DubTranscriptUtterance[];
+        sourceLanguage?: string;
+        targetLanguage: string;
+        targetLocale: string;
+        groqModel?: string;
+        textProvider?: "groq" | "gemini";
+        geminiModel?: string;
+        voiceMode?: "single" | "multi";
+      }) => Promise<DubScriptResult>;
       /** Free-tier chat model list + defaults (no key needed). v1.22 adds
        *  the Gemini list + key presence for the provider picker. */
       dubModels?: () => Promise<{

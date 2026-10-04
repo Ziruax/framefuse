@@ -141,6 +141,14 @@ contextBridge.exposeInMainWorld("electronAPI", {
   //   transcription is always Groq. Progress arrives via onDubProgress.
   //   Reuses the Captions-tab Groq key — there is no second key UI.
   dubStart: (p) => ipcRenderer.invoke("dub:start", p),
+  // v1.26 Dub Studio stages (same dub:progress channel + dubCancel abort):
+  // dubTranscribe: ({ segments, sourceLanguage }) → word-level transcript
+  //   { language, totalMs, wordCount, utterances:[{…, words:[…]}] }.
+  dubTranscribe: (p) => ipcRenderer.invoke("dub:transcribe", p),
+  // dubScript: ({ utterances, targetLanguage, targetLocale, groqModel,
+  //   textProvider, geminiModel, voiceMode, singleVoice }) → the editable
+  //   dubbing script { lines, speakerCount, warnings }.
+  dubScript: (p) => ipcRenderer.invoke("dub:script", p),
   // dubCancel: () → { ok, running } — aborts the active dub run.
   dubCancel: (p) => ipcRenderer.invoke("dub:cancel", p),
   // dubModels: () → { models, default, langNames, gemini: { models, default,
