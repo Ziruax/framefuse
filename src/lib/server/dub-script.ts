@@ -1,13 +1,15 @@
 /**
  * SERVER-ONLY dubbing script generation (speaker detection + translation).
  *
- * One z-ai LLM call turns timed source utterances into a JSON dubbing script
- * (speakerCount + per-line speaker + translation). Parsing is defensive
- * (fences / extra prose), with ONE stricter retry, then a simpler
- * translation-only fallback, then keeping the source text with a warning.
+ * One LLM call (v1.27: through the SELECTED provider — built-in cloud /
+ * Groq / Gemini, configured in the Settings tab) turns timed source
+ * utterances into a JSON dubbing script (speakerCount + per-line speaker +
+ * translation). Parsing is defensive (fences / extra prose), with ONE stricter
+ * retry, then a simpler translation-only fallback, then keeping the source
+ * text with a warning.
  */
 
-import { zaiChatText } from "./zai";
+import { providerChatText, type TextProviderRequest } from "./ai-models";
 import { dubLangName, dubScriptHint } from "./dub-langs";
 
 // ---------------------------------------------------------------------------
@@ -44,6 +46,8 @@ export interface BuildScriptInput {
   /** ISO code, default "hi". */
   targetLanguage: string;
   style?: string;
+  /** v1.27: provider + model + keys from the Settings tab. */
+  provider?: TextProviderRequest;
 }
 
 // ---------------------------------------------------------------------------
@@ -125,13 +129,15 @@ const SYSTEM_PROMPT =
 async function batchTranslate(
   utterances: ScriptUtterance[],
   lang: string,
+  provider: TextProviderRequest,
 ): Promise<Map<number, string> | null> {
   const name = dubLangName(lang);
   const hint = dubScriptHint(lang);
   const numbered = utterances.map((u, i) => `${i}: ${u.text}`).join("\n");
-  const raw = await zaiChatText(
+  const raw = await providerChatText(
     "You are a translator. You always reply with strict JSON, no prose.",
     `Translate each numbered line to ${name} (${hint}). Keep meaning and register natural for dubbing.\n${numbered}\n\nReturn ONLY a JSON array: [{"i":0,"translatedText":"..."}] with one object per input line.`,
+    provider,
     { maxTokens: 8000 },
   );
   let s = raw.trim();
@@ -167,15 +173,17 @@ export async function buildDubScript(input: BuildScriptInput): Promise<DubScript
   const lang = (input.targetLanguage || "hi").toLowerCase();
   const warnings: string[] = [];
   const utterances = input.utterances;
+  const provider: TextProviderRequest = input.provider ?? { provider: "builtin", model: "glm-4.6" };
 
   let llm: LlmScript | null = null;
   // Two attempts: normal prompt, then a stricter retry.
   for (let attempt = 0; attempt < 2 && !llm; attempt++) {
     let raw = "";
     try {
-      raw = await zaiChatText(
+      raw = await providerChatText(
         SYSTEM_PROMPT,
         buildUserPrompt(input, attempt > 0),
+        provider,
         { maxTokens: 16000 },
       );
     } catch (err) {
@@ -213,7 +221,7 @@ export async function buildDubScript(input: BuildScriptInput): Promise<DubScript
     speakerCount = 1;
     warnings.push("script JSON parse failed twice; using single-speaker fallback");
     try {
-      translations = await batchTranslate(utterances, lang);
+      translations = await batchTranslate(utterances, lang, provider);
     } catch {
       translations = null;
     }

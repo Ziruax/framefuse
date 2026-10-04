@@ -1,14 +1,30 @@
 /**
- * SERVER-ONLY dubbing synthesis — per-speaker Edge-TTS voices + duration fit.
+ * SERVER-ONLY dubbing synthesis — per-speaker Edge-TTS voices + duration fit
+ * + v1.27 WORD-TO-WORD TIMING.
  *
- * Each script line is synthesized with its speaker's resolved voice. When the
- * natural TTS duration overruns the line's timeline slot by > 12%, the line is
- * re-synthesized ONCE with a speed-up rate (≤ +60%); if it still overruns it
- * is accepted with a warning. Short audio is never stretched (natural pacing).
+ * Each script line is synthesized with its speaker's resolved voice. Then:
+ *
+ *   • When the line carries the ORIGINAL utterance's word timings (from the
+ *     stage-1 transcript) and word timing is on, the synthesized PCM is warped
+ *     (WSOLA, pitch-preserving) so every dubbed word lands when the original
+ *     word was spoken — clamped to naturalness guardrails so the flow never
+ *     sounds rushed or dragged.
+ *   • Without word timings (or when the timing is too far off to fix by
+ *     warping), the classic duration fit applies: one Edge-TTS speed-up
+ *     re-synthesis (≤ +60%) when the natural duration overruns the line's
+ *     slot by > 12%; short audio is never stretched.
+ *
+ * Warped segments come back as WAV (24 kHz mono PCM); unwarped keep the MP3.
  */
 
 import { getVoiceCatalog, synthesize } from "./edge-tts";
 import type { TtsVoice, TtsVoicePair, TtsWord } from "./edge-tts";
+import {
+  decodeToPcm,
+  encodeWav,
+  warpWordsToTimeline,
+  type WarpWord,
+} from "./word-warp";
 
 // ---------------------------------------------------------------------------
 // Public shapes (web DubTrackResult contract)
@@ -20,12 +36,27 @@ export interface DubSynthLine {
   translatedText: string;
   startMs: number;
   endMs: number;
+  /** v1.27: the ORIGINAL utterance's word timings (absolute timeline ms) —
+   *  present when the client still holds the stage-1 transcript. Drives the
+   *  word-to-word timing match. */
+  sourceWords?: WarpWord[];
 }
 
 export interface DubSynthSpeaker {
   id: number;
   voice: string;
   gender: string;
+}
+
+export interface DubSynthAlign {
+  /** Word timing match ran (WSOLA warp applied). */
+  applied: boolean;
+  /** Why it was skipped (short lines, drift already tiny, too far…). */
+  reason?: string;
+  maxDriftMs?: number;
+  globalFactor?: number;
+  synthWords?: number;
+  targetWords?: number;
 }
 
 export interface DubSynthSegment {
@@ -37,7 +68,10 @@ export interface DubSynthSegment {
   wavPath: string;
   ttsDurMs: number;
   speedApplied: number;
-  bytes: string; // base64 MP3
+  /** "wav" when word-warped, else the raw Edge-TTS "mp3". */
+  format: "wav" | "mp3";
+  align?: DubSynthAlign;
+  bytes: string; // base64
 }
 
 export interface DubSynthResult {
@@ -61,6 +95,8 @@ export interface DubSynthInput {
   voices?: Record<string, string> | null;
   /** Overrides every speaker when non-null. */
   singleVoice?: string | null;
+  /** v1.27: word-to-word timing (default true when sourceWords are present). */
+  wordTiming?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -138,12 +174,163 @@ const OVERFLOW_TOLERANCE = 1.12; // ttsDur ≤ slot × 1.12 is fine
 const MAX_SPEEDUP_PCT = 60;
 
 // ---------------------------------------------------------------------------
+// Word-to-word timing synthesis for ONE line
+// ---------------------------------------------------------------------------
+
+interface LineSynthesis {
+  bytes: Buffer;
+  format: "wav" | "mp3";
+  ttsDurMs: number;
+  speedApplied: number;
+  align: DubSynthAlign;
+}
+
+/**
+ * Synthesize one line with the word-to-word timing pipeline:
+ *   1. natural synthesis;
+ *   2. Edge-TTS rate re-synthesis when the GLOBAL duration is far off (a real
+ *      speaking-rate change is always more natural than a big warp);
+ *   3. WSOLA word warp to land each word on its original timing (guardrailed);
+ *   4. fall back to the classic duration fit when timing data is missing.
+ */
+async function synthesizeLineWithTiming(
+  text: string,
+  voice: string,
+  line: DubSynthLine,
+  wordTiming: boolean,
+): Promise<LineSynthesis> {
+  const sourceWords = line.sourceWords ?? [];
+  const usable = wordTiming && sourceWords.length >= 2;
+
+  // Target word times relative to the line start (clamp inside the slot).
+  const slotMs = Math.max(MIN_SLOT_MS, line.endMs - line.startMs);
+  const targetWords: WarpWord[] = sourceWords.map((w) => {
+    const startMs = Math.max(0, w.startMs - line.startMs);
+    const endMs = Math.max(startMs + 1, Math.min(slotMs, w.endMs - line.startMs));
+    return { startMs, endMs };
+  });
+  const targetDurMs =
+    targetWords.length > 0 ? Math.min(slotMs, Math.max(...targetWords.map((w) => w.endMs))) : slotMs;
+
+  // ---- 1. natural synthesis ----
+  let result = await synthesize({ text, voice, ratePct: 0, pitchHz: 0, volumePct: 0 });
+  let synthWords: TtsWord[] = result.words;
+  let synthDurMs = naturalDurationMs(synthWords, result.bytesLen);
+  let speedApplied = 1.0;
+
+  // ---- 2. global rate re-synthesis (natural speech-rate change) ----
+  const globalFactor = synthDurMs > 0 ? targetDurMs / synthDurMs : 1;
+  if (usable && globalFactor < 0.72) {
+    // Way too long → speed the TTS voice up (Edge rate is pitch-preserving).
+    const ratePct = Math.min(
+      MAX_SPEEDUP_PCT,
+      Math.max(5, Math.round((synthDurMs / targetDurMs - 1) * 100)),
+    );
+    const retry = await synthesize({ text, voice, ratePct, pitchHz: 0, volumePct: 0 });
+    const retryDurMs = naturalDurationMs(retry.words, retry.bytesLen);
+    if (retryDurMs > 0 && retryDurMs < synthDurMs) {
+      result = retry;
+      synthWords = retry.words;
+      synthDurMs = retryDurMs;
+      speedApplied = 1 + ratePct / 100;
+    }
+  } else if (usable && globalFactor > 1.45) {
+    // Way too short — the dub can't stretch that far naturally; keep natural
+    // pacing (the segment simply ends early inside its slot).
+    return {
+      bytes: result.bytes,
+      format: "mp3",
+      ttsDurMs: synthDurMs,
+      speedApplied,
+      align: {
+        applied: false,
+        reason: "translation much shorter than the original — natural pacing kept",
+        synthWords: synthWords.length,
+        targetWords: targetWords.length,
+        globalFactor: Math.round(globalFactor * 1000) / 1000,
+      },
+    };
+  }
+
+  // ---- 3. WSOLA word warp ----
+  if (usable && synthWords.length >= 2) {
+    try {
+      const pcm = await decodeToPcm(result.bytes);
+      const warpSynthWords: WarpWord[] = synthWords.map((w) => ({
+        startMs: w.offsetMs,
+        endMs: w.offsetMs + w.durationMs,
+      }));
+      const warp = warpWordsToTimeline(pcm, warpSynthWords, targetWords);
+      if (warp.applied) {
+        return {
+          bytes: encodeWav(warp.pcm),
+          format: "wav",
+          ttsDurMs: Math.round(warp.durationMs),
+          speedApplied,
+          align: {
+            applied: true,
+            maxDriftMs: warp.report.maxDriftMs,
+            globalFactor: warp.report.globalFactor,
+            synthWords: warp.report.synthWords,
+            targetWords: warp.report.targetWords,
+          },
+        };
+      }
+      // Skipped (already aligned / guardrail) — keep the audio, note why.
+      return {
+        bytes: result.bytes,
+        format: "mp3",
+        ttsDurMs: synthDurMs,
+        speedApplied,
+        align: {
+          applied: false,
+          reason: warp.report.skippedReason,
+          maxDriftMs: warp.report.maxDriftMs,
+          synthWords: warp.report.synthWords,
+          targetWords: warp.report.targetWords,
+          globalFactor: warp.report.globalFactor,
+        },
+      };
+    } catch {
+      // Decode/warp failure → classic fit below (never fail the line for it).
+    }
+  }
+
+  // ---- 4. classic duration fit (no timing data / warp unavailable) ----
+  if (synthDurMs > slotMs * OVERFLOW_TOLERANCE) {
+    const ratePct = Math.min(
+      MAX_SPEEDUP_PCT,
+      Math.max(1, Math.round((synthDurMs / slotMs - 1) * 100)),
+    );
+    const retry = await synthesize({ text, voice, ratePct, pitchHz: 0, volumePct: 0 });
+    const retryDurMs = naturalDurationMs(retry.words, retry.bytesLen);
+    if (retryDurMs > 0 && retryDurMs < synthDurMs) {
+      result = retry;
+      synthDurMs = retryDurMs;
+      speedApplied = 1 + ratePct / 100;
+    }
+  }
+  // Short audio (< 50% of the slot) is kept — natural pacing, gaps are fine.
+  return {
+    bytes: result.bytes,
+    format: "mp3",
+    ttsDurMs: synthDurMs,
+    speedApplied,
+    align: {
+      applied: false,
+      reason: usable ? "word warp unavailable" : "no source word timings",
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
 export async function synthesizeDubTrack(input: DubSynthInput): Promise<DubSynthResult> {
   const warnings: string[] = [];
   const { voices, pairs } = await getVoiceCatalog();
+  const wordTiming = input.wordTiming !== false; // default ON
 
   // Speaker ids appearing in the lines (sorted, clamped to 0..5).
   const speakerIds = Array.from(
@@ -159,6 +346,7 @@ export async function synthesizeDubTrack(input: DubSynthInput): Promise<DubSynth
   }
 
   const segments: DubSynthSegment[] = [];
+  let alignedCount = 0;
   for (let i = 0; i < input.lines.length; i++) {
     const line = input.lines[i];
     const speaker = Math.max(0, Math.min(5, Math.round(line.speaker)));
@@ -170,33 +358,9 @@ export async function synthesizeDubTrack(input: DubSynthInput): Promise<DubSynth
       continue;
     }
 
-    const slotMs = Math.max(MIN_SLOT_MS, line.endMs - line.startMs);
-
     try {
-      // First synthesis at natural speed.
-      let result = await synthesize({ text, voice, ratePct: 0, pitchHz: 0, volumePct: 0 });
-      let ttsDurMs = naturalDurationMs(result.words, result.bytesLen);
-      let speedApplied = 1.0;
-
-      // Duration fit: one speed-up re-synthesis when clearly too long.
-      if (ttsDurMs > slotMs * OVERFLOW_TOLERANCE) {
-        const ratePct = Math.min(
-          MAX_SPEEDUP_PCT,
-          Math.max(1, Math.round((ttsDurMs / slotMs - 1) * 100)),
-        );
-        const retry = await synthesize({ text, voice, ratePct, pitchHz: 0, volumePct: 0 });
-        const retryDurMs = naturalDurationMs(retry.words, retry.bytesLen);
-        if (retryDurMs > 0 && retryDurMs < ttsDurMs) {
-          result = retry;
-          ttsDurMs = retryDurMs;
-        }
-        speedApplied = 1 + ratePct / 100;
-        if (ttsDurMs > slotMs * OVERFLOW_TOLERANCE) {
-          warnings.push(`line ${i} exceeds its slot`);
-        }
-      }
-      // Short audio (< 50% of the slot) is kept — natural pacing, gaps are fine.
-
+      const r = await synthesizeLineWithTiming(text, voice, line, wordTiming);
+      if (r.align.applied) alignedCount++;
       segments.push({
         startMs: line.startMs,
         endMs: line.endMs,
@@ -204,10 +368,15 @@ export async function synthesizeDubTrack(input: DubSynthInput): Promise<DubSynth
         sourceText: line.sourceText,
         translatedText: line.translatedText,
         wavPath: "",
-        ttsDurMs,
-        speedApplied,
-        bytes: result.bytes.toString("base64"),
+        ttsDurMs: r.ttsDurMs,
+        speedApplied: r.speedApplied,
+        format: r.format,
+        align: r.align,
+        bytes: r.bytes.toString("base64"),
       });
+      if (r.ttsDurMs > Math.max(MIN_SLOT_MS, line.endMs - line.startMs) * OVERFLOW_TOLERANCE) {
+        warnings.push(`line ${i} exceeds its slot`);
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : "synthesis failed";
       warnings.push(`line ${i} failed: ${msg}`);
@@ -219,6 +388,11 @@ export async function synthesizeDubTrack(input: DubSynthInput): Promise<DubSynth
   if (segments.length === 0 && input.lines.length > 0) {
     throw new Error(
       warnings[0] || "Every dubbing line failed to synthesize",
+    );
+  }
+  if (alignedCount > 0) {
+    warnings.unshift(
+      `word-to-word timing applied to ${alignedCount}/${segments.length} segments`,
     );
   }
 

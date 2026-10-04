@@ -2558,3 +2558,32 @@ Stage Summary:
 - Six leaf API routes + five server libs shipped; web preview now has full speech capability parity: voice catalog, single/long TTS with word timings, multi-file timeline transcription with estimated word-level cues + language ID, LLM dubbing script with speaker attribution, and per-speaker dub synthesis with duration fit — all returning the exact Task-12 contract shapes (bytes as base64 MP3, wavPaths []/dubDir "" for the web transport).
 - Contract deviations (documented for 12-b): volume 0..2 maps to (v−1)·100 volumePct; out-of-range prosody clamps instead of 400; maxDuration 300 exported on four routes (spec only required transcribe); dub/synthesize totalDurationMs = max(startMs+ttsDurMs); transcribe meta semantics = "send FULL media files + their timeline trim windows" (−ss startMs −t endMs−startMs are input options, utterances map to timeline startMs).
 - Reliability notes: z-ai endpoints throttle under rapid-fire calls (both helpers retry once); ASR needs WAV/WebM (pipeline always feeds 16kHz WAV); z-ai-web-dev-sdk lives in node_modules as a manual copy from the bun global install — re-copy if node_modules is regenerated.
+
+---
+Task ID: 12
+Agent: lead (main session)
+Task: v1.27 — Central Settings tab for AI provider/model defaults, Groq Whisper transcription provider, word-to-word dub timing, remove duplicate VOICEOVER section
+
+Work Log:
+- Created `src/lib/merger/ai-settings.ts` — client AI-settings store (localStorage `framefuse.ai.v1`, pub/sub + useSyncExternalStore): sttProvider (builtin|groq) + sttGroqModel, dubTextProvider (builtin|groq|gemini) + per-provider model, groqKey/geminiKey. Model catalogs mirrored client+server.
+- Created `src/lib/server/ai-models.ts` — provider dispatch: providerChatText (groq via api.groq.com chat completions, gemini via generativelanguage v1beta generateContent, builtin via z-ai SDK with model passthrough — zai.ts gained `opts.model`), key validation (testProviderKey → POST /api/ai/test), model-catalog exports.
+- `dub-script.ts` routes through the selected provider; `/api/dub/script` accepts provider/model/keys + returns providerUsed/modelUsed; `/api/dub/models` now serves the full catalogs (builtin/groq/gemini/whisper).
+- `dub-transcribe.ts` v1.27 engine select: "groq" → Groq Whisper verbose_json + timestamp_granularities word+segment → REAL per-word timestamps (utterances = Groq segments, words attached by time window; >10min auto-chunked under the 25MB cap); "builtin" keeps z-ai ASR + silencedetect. `/api/dub/transcribe` accepts provider/groqKey/groqModel/sourceLanguage form fields.
+- Created `src/lib/server/word-warp.ts` — the word-to-word timing engine: MP3→PCM (ffmpeg spawn, 24kHz mono), anchor building (word-START-exact: speech intervals rate-clamped 0.78–1.28×, gap intervals 0.25–20× with silence pad/truncate), WSOLA time-stretch (1024-frame, ±320 search, normalized cross-correlation) for speech, in-memory WAV encode. Guardrails: global factor 0.72–1.45 (else Edge-TTS rate re-synthesis first), skip when drift < 45ms.
+- `dub-synthesize.ts` v1.27 pipeline per line: natural synth → rate re-synthesis when global factor < 0.72 → WSOLA word warp (needs sourceWords ≥ 2) → WAV out + align report {applied, reason, maxDriftMs, globalFactor}; classic slot fit as fallback. `/api/dub/synthesize` accepts per-line sourceWords + wordTiming (default true).
+- Frontend: new "settings" dock tab (page.tsx DOCK_SECTIONS + SettingsPanel SETTINGS_TABS) with `AiModelsSection` (Groq/Gemini key rows with masked display + save/test/remove, caption-transcription provider + whisper model, dubbing-script provider + model, per-provider key fallback warnings).
+- Dub Studio stage 2: removed the web-gated "Cloud AI (built-in)" + Groq/Gemini provider buttons + model selects → read-only provider/model summaries + gear buttons (onOpenSettings → jumps to the Settings tab). Stage 3: new Word-to-word timing toggle (Match words / Natural pacing, DubSettings.wordTiming default ON, persisted). Stage 1/2/3 Groq-key gating removed (AI settings own the keys).
+- Captions tab: the Groq Cloud engine card + key UI + model picker REMOVED → live engine summary + Settings jump; `generateCaptionsFromAudio` gained a WEB fallback through `/api/dub/transcribe` (utterances+words → cues) — captions no longer desktop-gated.
+- TTS tab: the legacy standalone VOICEOVER (TTS) card REMOVED (336 lines) — the AI TTS Studio covers it; no duplicate surface.
+- `speech-api.ts`: dubTranscribe (provider/groqKey/groqModel + realWordTimings), dubScript (provider/model/keys + providerUsed), dubSynthesize (sourceWords + wordTiming + align/format passthrough), fetchDubModels catalogs; postJson gained signal.
+- page.tsx: scriptProviderNow/sttProviderNow (read loadAiSettings() fresh at call time), sourceWordsForLine (script line i ↔ transcript utterance i, ±400ms window sanity), all 4 dub flows wired (auto pipeline, transcribe, script, fromScript — sourceWords + wordTiming ride every synthesize), dock Settings section.
+- types.ts: DubTranscriptResult.realWordTimings, DubScriptResult.providerUsed/modelUsed, DubSegmentResult.format/align, DubSettings.wordTiming.
+- Version → 1.27.0 (package.json, Header, layout title).
+
+Stage Summary:
+- ONE place for AI provider/model defaults: the new Settings dock tab (keys + caption transcription + dubbing script writing). Dub Studio + Captions show read-only summaries with gear jumps — all scattered pickers removed.
+- Script writing provider REAL in the web preview: Built-in Cloud AI (GLM 4.6/4.5 Air/…), Groq (Llama 3.3 70B/…) with the user's key, Gemini (3.5 Flash Lite/…) with the user's key; no-key selections degrade to builtin with a visible fallback note.
+- Word-to-word dub timing (user's #1 priority): WSOLA warps each dubbed word onto the original speaker's word timing — speech-rate clamped ±28% per word, pauses inserted/trimmed as silence, global-factor guardrails, Edge-TTS rate re-synthesis when too far. E2E-verified in-browser: "word-sync" badge + WAV segments (24kHz PCM, ffprobe-valid).
+- Groq Whisper path gives REAL word timestamps (best timing input); the builtin cloud ASR stays keyless with estimated timings.
+- Web caption generation unlocked (no more "desktop app only" wall).
+- Verified: lint clean, tsc clean (my files), agent-browser E2E (Settings render/persist, gear jumps, TTS dedupe, captions generate → test-speech.whisper.srt, full dub pipeline → VO lane "VO DUB S1 3.7s"), mobile 390px no overflow, no console errors.

@@ -22,6 +22,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Rocket as RocketIcon,
+  Settings as SettingsIcon,
   Sparkles as SparklesIcon,
   X,
   type LucideIcon,
@@ -66,6 +67,13 @@ import {
   dubTranscribe as runDubTranscribe,
   hasElectronBridge,
 } from "@/lib/speech-api";
+// v1.27 CENTRAL AI SETTINGS — provider/model/keys for transcription + script
+// writing live in the Settings tab (localStorage store, pub/sub synced).
+import {
+  loadAiSettings,
+  useAiSettings,
+  type AiSettings,
+} from "@/lib/merger/ai-settings";
 import {
   groupWordLevelCues,
   looksLikeWordLevelCues,
@@ -214,6 +222,9 @@ const DOCK_SECTIONS: {
   // v1.24: dedicated DUBBING phase — the Dub Studio (transcribe → script
   // → voices & dub), script writer and text removal.
   { id: "dubbing", label: "Dubbing", title: "Dubbing & voice", icon: LanguagesIcon },
+  // v1.27: dedicated SETTINGS dock tab — the central home for AI provider/
+  // model defaults + keys (captions transcription, dubbing script writing).
+  { id: "settings", label: "Settings", title: "Settings & AI models", icon: SettingsIcon },
   { id: "export", label: "Export", title: "Export", icon: RocketIcon },
 ];
 
@@ -295,6 +306,8 @@ const DEFAULT_DUB_SETTINGS: DubSettings = {
   voiceMode: "multi",
   singleVoice: null,
   originalVolume: 0.15,
+  // v1.27: word-to-word timing ON by default (naturalness-guardrailed).
+  wordTiming: true,
 };
 
 function loadDubSettings(): DubSettings {
@@ -337,6 +350,8 @@ function loadDubSettings(): DubSettings {
         typeof j.originalVolume === "number" && Number.isFinite(j.originalVolume)
           ? Math.max(0, Math.min(1, j.originalVolume))
           : DEFAULT_DUB_SETTINGS.originalVolume,
+      // v1.27: absent → ON.
+      wordTiming: j.wordTiming === false ? false : true,
     };
   } catch {
     return { ...DEFAULT_DUB_SETTINGS };
@@ -532,6 +547,9 @@ export default function Page() {
   const [voItems, setVoItems] = useState<VoiceoverItem[]>([]);
   /** v1.17: dub run configuration (machine-level localStorage pref). */
   const [dubSettings, setDubSettings] = useState<DubSettings>(() => loadDubSettings());
+  /** v1.27: the central AI settings (Settings tab) — provider/model/keys for
+   *  transcription + script writing. Live via the store's pub/sub. */
+  const aiSettings = useAiSettings();
   /** v5.4: timeline multi-select — ids of clips the USER selected (click /
    *  Ctrl-click / Shift-click / marquee / Ctrl+A). Deliberately NOT
    *  persisted and NOT playhead-derived (activeSegment covers that): the
@@ -1643,6 +1661,42 @@ export default function Page() {
 
   const dubSourceCount = hasElectronBridge() ? dubSources.length : webDubSources.length;
 
+  // ---- v1.27 AI-provider plumbing (Settings tab defaults) ----------------
+  /** Script-writing provider request, read FRESH at call time (keys may have
+   *  changed in the Settings tab since the last render). */
+  const scriptProviderNow = useCallback(() => {
+    const ai = loadAiSettings();
+    if (ai.dubTextProvider === "groq")
+      return { provider: "groq" as const, model: ai.dubGroqModel, groqKey: ai.groqKey };
+    if (ai.dubTextProvider === "gemini")
+      return { provider: "gemini" as const, model: ai.dubGeminiModel, geminiKey: ai.geminiKey };
+    return { provider: "builtin" as const, model: ai.dubBuiltinModel };
+  }, []);
+
+  /** Transcription provider request (Groq Whisper needs its key — otherwise
+   *  the server falls back to the builtin cloud ASR). */
+  const sttProviderNow = useCallback(() => {
+    const ai = loadAiSettings();
+    if (ai.sttProvider === "groq" && ai.groqKey.trim())
+      return { provider: "groq" as const, groqKey: ai.groqKey, groqModel: ai.sttGroqModel };
+    return { provider: "builtin" as const };
+  }, []);
+
+  /** v1.27: the transcript's word timings for one script line (the
+   *  word-to-word timing input). Script line `i` ↔ transcript utterance `i`
+   *  — the index is stable through line edits; a window sanity check guards
+   *  against a stale transcript. */
+  const sourceWordsForLine = useCallback(
+    (line: { i: number; startMs: number; endMs: number }) => {
+      if (!dubTranscript) return undefined;
+      const u = dubTranscript.utterances[line.i];
+      if (!u || !u.words || u.words.length < 2) return undefined;
+      if (Math.abs(u.startMs - line.startMs) > 400) return undefined; // stale
+      return u.words.map((w) => ({ startMs: w.startMs, endMs: w.endMs }));
+    },
+    [dubTranscript],
+  );
+
   const startDub = useCallback(async () => {
     if (dubBusy) return;
     const api = window.electronAPI;
@@ -1691,6 +1745,7 @@ export default function Page() {
         const transcript = await runDubTranscribe({
           webSources: webDubSources,
           sourceLanguage: "auto",
+          ...sttProviderNow(),
           signal: abort.signal,
         });
         setDubTranscript({ ...transcript, sourceCount: webDubSources.length });
@@ -1704,6 +1759,7 @@ export default function Page() {
           targetLanguage: dubSettings.targetLanguage,
           targetLocale: dubSettings.targetLocale,
           voiceMode: dubSettings.voiceMode ?? "multi",
+          ...scriptProviderNow(),
           signal: abort.signal,
         });
         setDubScript(script);
@@ -1715,6 +1771,12 @@ export default function Page() {
             translatedText: l.translatedText,
             startMs: l.startMs,
             endMs: l.endMs,
+            // v1.27: word-to-word timing input — the transcript (in state)
+            // matches this freshly-built script 1:1 by index.
+            sourceWords: transcript.utterances[l.i]?.words?.map((w) => ({
+              startMs: w.startMs,
+              endMs: w.endMs,
+            })),
           })),
           scriptVoices: {
             ...(dubSettings.femaleVoice ? { 0: dubSettings.femaleVoice } : {}),
@@ -1728,6 +1790,7 @@ export default function Page() {
           singleVoice: dubSettings.singleVoice ?? null,
           femaleVoice: dubSettings.femaleVoice || undefined,
           maleVoice: dubSettings.maleVoice || undefined,
+          wordTiming: dubSettings.wordTiming !== false,
           signal: abort.signal,
         });
       }
@@ -1749,7 +1812,7 @@ export default function Page() {
       setDubOp(null);
       setDubProgress(null);
     }
-  }, [dubBusy, dubSources, webDubSources, dubSettings]);
+  }, [dubBusy, dubSources, webDubSources, dubSettings, sttProviderNow, scriptProviderNow]);
 
   const cancelDub = useCallback(async () => {
     dubAbortRef.current?.abort();
@@ -1786,6 +1849,7 @@ export default function Page() {
         segments: useWeb ? undefined : dubSources,
         webSources: useWeb ? webDubSources : undefined,
         sourceLanguage: "auto",
+        ...sttProviderNow(),
         signal: abort.signal,
       });
       setDubTranscript({
@@ -1795,7 +1859,7 @@ export default function Page() {
       toast.success("Word-level transcript ready", {
         description: `${r.wordCount} words · ${r.utterances.length} lines · detected ${
           r.language || "speech"
-        } — next: create the dubbing script.`,
+        }${r.realWordTimings ? " · REAL word timestamps" : ""} — next: create the dubbing script.`,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1809,7 +1873,7 @@ export default function Page() {
       setDubOp(null);
       setDubProgress(null);
     }
-  }, [dubBusy, dubSources, webDubSources]);
+  }, [dubBusy, dubSources, webDubSources, sttProviderNow]);
 
   /** Stage 2 — transcript → speakers + translation → the editable script.
  *  v1.26: IPC-first, /api/dub/script (cloud LLM) in the web preview. */
@@ -1829,13 +1893,14 @@ export default function Page() {
         targetLanguage: dubSettings.targetLanguage,
         targetLocale: dubSettings.targetLocale,
         voiceMode: dubSettings.voiceMode ?? "multi",
+        ...scriptProviderNow(),
         signal: abort.signal,
       });
       setDubScript(r);
       toast.success("Dubbing script ready", {
         description: `${r.lines.length} lines · ${
           r.speakerCount === 1 ? "one voice" : `${r.speakerCount} speakers`
-        } — edit any line, then dub it.`,
+        }${r.providerUsed && r.providerUsed !== "builtin" ? ` · ${r.providerUsed}` : ""} — edit any line, then dub it.`,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1849,7 +1914,7 @@ export default function Page() {
       setDubOp(null);
       setDubProgress(null);
     }
-  }, [dubBusy, dubTranscript, dubSettings]);
+  }, [dubBusy, dubTranscript, dubSettings, scriptProviderNow]);
 
   /** Stage 4 — dub from the EDITED script (no re-transcription/translation;
  *  Edge TTS + ffmpeg only in the desktop app, /api/dub/synthesize in the
@@ -1869,6 +1934,9 @@ export default function Page() {
           translatedText: l.translatedText,
           startMs: l.startMs,
           endMs: l.endMs,
+          // v1.27: word-to-word timing — the original utterance's word
+          // timings ride each line (index-stable through line edits).
+          sourceWords: sourceWordsForLine(l),
         })),
         scriptVoices: {
           ...(dubSettings.femaleVoice ? { 0: dubSettings.femaleVoice } : {}),
@@ -1883,13 +1951,15 @@ export default function Page() {
         singleVoice: dubSettings.singleVoice ?? null,
         femaleVoice: dubSettings.femaleVoice || undefined,
         maleVoice: dubSettings.maleVoice || undefined,
+        wordTiming: dubSettings.wordTiming !== false,
         signal: abort.signal,
       });
       setDubResult(result);
+      const aligned = result.segments.filter((s) => s.align?.applied).length;
       toast.success("Dub track ready", {
         description: `${result.segments.length} segments · ${result.speakers.length} speaker${
           result.speakers.length === 1 ? "" : "s"
-        } — review it, then add it to the timeline.`,
+        }${aligned > 0 ? ` · word-timing matched on ${aligned}` : ""} — review it, then add it to the timeline.`,
       });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1903,7 +1973,7 @@ export default function Page() {
       setDubOp(null);
       setDubProgress(null);
     }
-  }, [dubBusy, dubScript, dubSettings, dubSpeakerVoices]);
+  }, [dubBusy, dubScript, dubSettings, dubSpeakerVoices, sourceWordsForLine]);
 
   /** Stage-2 line edits (the script lives page-side; edits are textareas). */
   const handleDubScriptLinesChange = useCallback((lines: DubScriptLine[]) => {
@@ -3403,10 +3473,11 @@ export default function Page() {
       });
       return;
     }
-    if (!isWhisperAvailable()) {
-      toast.error("Transcription runs in the FrameFuse desktop app", {
-        description:
-          "Open the project in the FrameFuse desktop app and add your free Groq API key (Settings → Captions).",
+    if (!isWhisperAvailable() && !sourceFile.size) {
+      // A restored-project music clip with no bytes AND no Electron bridge —
+      // nothing to send to the web route either.
+      toast.error("Transcription source is empty", {
+        description: "Re-import the audio/video clip, then generate captions.",
       });
       return;
     }
@@ -3417,13 +3488,55 @@ export default function Page() {
 
     const ac = new AbortController();
     try {
-      const result = await transcribeWithWhisper({
-        audioFile: sourceFile,
-        sourcePath,
-        signal: ac.signal,
-        language: whisperLanguage,
-        onProgress: (p) => setWhisperProgress(p),
-      });
+      let result: { cues: SubtitleCue[]; wordLevel: boolean; language: string | null };
+      if (isWhisperAvailable()) {
+        // Desktop — the main-process Groq Whisper pipeline.
+        const r = await transcribeWithWhisper({
+          audioFile: sourceFile,
+          sourcePath,
+          signal: ac.signal,
+          language: whisperLanguage,
+          onProgress: (p) => setWhisperProgress(p),
+        });
+        result = { cues: r.cues, wordLevel: r.wordLevel, language: r.language };
+      } else {
+        // v1.27 WEB PREVIEW — the speech transport (/api/dub/transcribe):
+        // Groq Whisper (REAL word timestamps) or the builtin cloud ASR,
+        // whichever the Settings tab configured. Utterances + words → cues.
+        setWhisperProgress({
+          progress: 10,
+          status: "Uploading audio — transcribing…",
+        });
+        const r = await runDubTranscribe({
+          webSources: [{ file: sourceFile, startMs: 0 }],
+          sourceLanguage: whisperLanguage === "auto" ? "auto" : whisperLanguage,
+          ...sttProviderNow(),
+          signal: ac.signal,
+        });
+        setWhisperProgress({ progress: 90, status: "Building cues…" });
+        const cues: SubtitleCue[] = r.utterances
+          .filter((u) => u.text.trim())
+          .map((u, idx) => ({
+            id: idx + 1,
+            startMs: u.startMs,
+            endMs: u.endMs,
+            text: u.text.trim(),
+            ...(u.words && u.words.length > 0
+              ? {
+                  words: u.words.map((w) => ({
+                    text: w.text,
+                    startMs: w.startMs,
+                    endMs: w.endMs,
+                  })),
+                }
+              : {}),
+          }));
+        result = {
+          cues,
+          wordLevel: r.realWordTimings === true,
+          language: r.language && r.language !== "auto" ? r.language : null,
+        };
+      }
 
       if (result.cues.length === 0) {
         toast.error("No speech detected", {
@@ -3485,7 +3598,7 @@ export default function Page() {
       setWhisperBusy(false);
       setWhisperProgress(null);
     }
-  }, [primaryMusicClip, timeline.segments, whisperBusy, whisperLanguage, whisperModel, requestHistoryPush]);
+  }, [primaryMusicClip, timeline.segments, whisperBusy, whisperLanguage, whisperModel, requestHistoryPush, sttProviderNow]);
 
   const loadSamples = useCallback(async () => {
     try {

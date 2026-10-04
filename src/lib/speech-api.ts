@@ -60,11 +60,12 @@ async function apiJson<T>(url: string, init?: RequestInit): Promise<T> {
   return body;
 }
 
-function postJson<T>(url: string, payload: unknown): Promise<T> {
+function postJson<T>(url: string, payload: unknown, signal?: AbortSignal): Promise<T> {
   return apiJson<T>(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+    signal,
   });
 }
 
@@ -502,6 +503,10 @@ export interface DubModelsWeb {
     default: string;
     hasKey: boolean;
   };
+  /** v1.27: the full Settings-tab catalogs (web route). */
+  builtin?: { models: Array<{ id: string; label: string; hint: string }>; default: string };
+  groq?: { models: Array<{ id: string; label: string; hint: string }>; default: string };
+  whisper?: { models: Array<{ id: string; label: string; hint: string }>; default: string };
 }
 
 interface ModelsResponse extends ApiEnvelope {
@@ -510,6 +515,10 @@ interface ModelsResponse extends ApiEnvelope {
   langNames: Record<string, string>;
   provider?: string;
   web?: boolean;
+  builtin?: { models: Array<{ id: string; label: string; hint: string }>; default: string };
+  groq?: { models: Array<{ id: string; label: string; hint: string }>; default: string };
+  gemini?: { models: Array<{ id: string; label: string; hint: string }>; default: string };
+  whisper?: { models: Array<{ id: string; label: string; hint: string }>; default: string };
 }
 
 /** Model/language catalog for the Dub Studio (langNames feeds the language
@@ -537,6 +546,12 @@ export async function fetchDubModels(): Promise<DubModelsWeb | null> {
       default: r.default ?? "",
       langNames: r.langNames ?? {},
       provider: "web",
+      builtin: r.builtin,
+      groq: r.groq,
+      gemini: r.gemini
+        ? { models: r.gemini.models ?? [], default: r.gemini.default ?? "", hasKey: true }
+        : undefined,
+      whisper: r.whisper,
     };
   } catch {
     return null;
@@ -560,16 +575,25 @@ interface TranscribeResponse extends ApiEnvelope {
     text: string;
     words?: Array<{ text: string; startMs: number; endMs: number }>;
   }>;
+  /** v1.27: true when the word timings are REAL (Groq Whisper). */
+  realWordTimings?: boolean;
+  providerUsed?: string;
 }
 
 /** Stage 1 — audio → word-level transcript. Electron keeps the Groq Whisper
- *  IPC path; the web route runs ffmpeg extraction + ASR server-side. */
+ *  IPC path; the web route runs ffmpeg extraction + ASR server-side
+ *  (v1.27: "groq" → Groq Whisper with REAL word timestamps, "builtin" →
+ *  cloud ASR — the provider/model/key come from the Settings tab). */
 export async function dubTranscribe(p: {
   /** Electron sources (absolute paths). */
   segments?: Array<{ videoPath: string; startMs: number; endMs?: number }>;
   /** Web sources (browser File objects). */
   webSources?: WebDubSource[];
   sourceLanguage?: string;
+  /** v1.27: transcription engine + credentials. */
+  provider?: "builtin" | "groq";
+  groqKey?: string;
+  groqModel?: string;
   signal?: AbortSignal;
 }): Promise<DubTranscriptResult> {
   const api = hasElectronBridge() ? window.electronAPI : undefined;
@@ -595,6 +619,12 @@ export async function dubTranscribe(p: {
       })),
     ),
   );
+  if (p.provider === "groq") {
+    form.append("provider", "groq");
+    form.append("groqKey", p.groqKey ?? "");
+    form.append("groqModel", p.groqModel ?? "");
+    if (p.sourceLanguage) form.append("sourceLanguage", p.sourceLanguage);
+  }
   const r = await postForm<TranscribeResponse>(
     "/api/dub/transcribe",
     form,
@@ -605,6 +635,8 @@ export async function dubTranscribe(p: {
     totalMs: r.totalMs,
     wordCount: r.wordCount,
     utterances: r.utterances ?? [],
+    /** v1.27: real per-word timestamps (Groq Whisper) vs estimates. */
+    realWordTimings: r.realWordTimings === true,
   };
 }
 
@@ -621,16 +653,24 @@ interface ScriptResponse extends ApiEnvelope {
     translatedText: string;
   }>;
   warnings: string[];
+  providerUsed?: string;
+  modelUsed?: string;
 }
 
 /** Stage 2 — transcript → speaker detection + translation → script.
- *  Electron: Groq/Gemini via IPC. Web: the z-ai LLM route. */
+ *  Electron: Groq/Gemini via IPC. Web: the SELECTED provider (v1.27 —
+ *  built-in cloud / Groq / Gemini, from the Settings tab) via /api/dub/script. */
 export async function dubScript(p: {
   utterances: DubTranscriptResult["utterances"];
   sourceLanguage?: string;
   targetLanguage: string;
   targetLocale?: string;
   voiceMode?: "single" | "multi";
+  /** v1.27: script-writing provider + model + keys (Settings tab). */
+  provider?: "builtin" | "groq" | "gemini";
+  model?: string;
+  groqKey?: string;
+  geminiKey?: string;
   signal?: AbortSignal;
 }): Promise<DubScriptResult> {
   const api = hasElectronBridge() ? window.electronAPI : undefined;
@@ -653,7 +693,12 @@ export async function dubScript(p: {
       })),
       sourceLanguage: p.sourceLanguage,
       targetLanguage: p.targetLanguage,
+      provider: p.provider ?? "builtin",
+      ...(p.model ? { model: p.model } : {}),
+      ...(p.groqKey ? { groqKey: p.groqKey } : {}),
+      ...(p.geminiKey ? { geminiKey: p.geminiKey } : {}),
     },
+    p.signal,
   );
   return {
     targetLanguage: r.targetLanguage,
@@ -661,6 +706,10 @@ export async function dubScript(p: {
     speakerCount: r.speakerCount,
     lines: r.lines ?? [],
     warnings: r.warnings ?? [],
+    /** v1.27: which provider actually ran (groq/gemini degrade to builtin
+     *  without their key — the UI can show the truth). */
+    providerUsed: r.providerUsed,
+    modelUsed: r.modelUsed,
   };
 }
 
@@ -676,6 +725,8 @@ interface DubSynthResponse extends ApiEnvelope {
     wavPath: string;
     ttsDurMs: number;
     speedApplied: number;
+    format?: "wav" | "mp3";
+    align?: { applied: boolean; reason?: string; maxDriftMs?: number; globalFactor?: number };
     bytes: string;
   }>;
   wavPaths: string[];
@@ -685,7 +736,9 @@ interface DubSynthResponse extends ApiEnvelope {
 }
 
 /** Stage 3/4 — synthesize the dub. Electron: dubStart IPC (bytes as
- *  ArrayBuffer on segments). Web: the Edge-TTS route (base64 → decoded). */
+ *  ArrayBuffer on segments). Web: the Edge-TTS route (base64 → decoded).
+ *  v1.27: `sourceWords` (the stage-1 transcript's word timings per line) +
+ *  `wordTiming` enable the word-to-word timing match (WSOLA warp). */
 export async function dubSynthesize(p: {
   scriptLines: Array<{
     speaker: number;
@@ -693,6 +746,9 @@ export async function dubSynthesize(p: {
     translatedText: string;
     startMs: number;
     endMs: number;
+    /** The ORIGINAL utterance's word timings (absolute timeline ms) —
+     *  matched line-by-line via the transcript index. */
+    sourceWords?: Array<{ startMs: number; endMs: number }>;
   }>;
   scriptVoices?: Record<string, string>;
   scriptLanguage?: string;
@@ -703,6 +759,8 @@ export async function dubSynthesize(p: {
   singleVoice?: string | null;
   femaleVoice?: string;
   maleVoice?: string;
+  /** v1.27: word-to-word timing (default true). */
+  wordTiming?: boolean;
   signal?: AbortSignal;
 }): Promise<DubTrackResult> {
   const api = hasElectronBridge() ? window.electronAPI : undefined;
@@ -723,16 +781,28 @@ export async function dubSynthesize(p: {
   const r = await postJson<DubSynthResponse>("/api/dub/synthesize", {
     language: p.scriptLanguage ?? p.targetLanguage,
     targetLocale: p.targetLocale ?? "",
-    lines: p.scriptLines,
+    lines: p.scriptLines.map((l) => ({
+      speaker: l.speaker,
+      sourceText: l.sourceText,
+      translatedText: l.translatedText,
+      startMs: l.startMs,
+      endMs: l.endMs,
+      ...(l.sourceWords && l.sourceWords.length >= 2
+        ? { sourceWords: l.sourceWords.map((w) => ({ startMs: w.startMs, endMs: w.endMs })) }
+        : {}),
+    })),
     voices: p.scriptVoices ?? {},
     singleVoice: p.singleVoice ?? null,
     femaleVoice: p.femaleVoice || undefined,
     maleVoice: p.maleVoice || undefined,
+    wordTiming: p.wordTiming !== false,
   });
   const segments = (r.segments ?? []).map((s) => {
     const u8 = base64ToUint8(s.bytes);
     return {
       ...s,
+      format: s.format ?? "mp3",
+      align: s.align,
       bytes: u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength) as ArrayBuffer,
     };
   });

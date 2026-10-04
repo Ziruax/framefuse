@@ -8,6 +8,7 @@ import {
   Captions,
   Music,
   Rocket,
+  Settings2,
   ArrowLeftRight,
   BadgeCheck,
   Wand2,
@@ -45,6 +46,8 @@ import {
   PenLine,
   Activity,
   AlertTriangle,
+  Timer,
+  Wind,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import type {
@@ -59,7 +62,6 @@ import type {
   VideoSettings,
   WatermarkPosition,
   WatermarkSettings,
-  GroqConfigPayload,
   TextRemovalSettings,
   TextRemovalMode,
   TextRemovalRegion,
@@ -135,6 +137,10 @@ import {
 // v1.20: AI Script Writer (Gemini default + Groq chat models) — mounted in
 // the Audio tab, right after Voiceover.
 import ScriptWriterSection from "./ScriptWriterSection";
+// v1.27: the central AI-models home — provider/model defaults + keys.
+import AiModelsSection from "./AiModelsSection";
+// v1.27: the AI settings store the Dub Studio summaries read.
+import { dubTextConfig, sttConfig, useAiSettings } from "@/lib/merger/ai-settings";
 // v1.25: shared Edge-TTS catalog hook (was in-file above VoiceoverSection).
 import { useTtsVoices } from "./use-tts-voices";
 // v1.25: AI Text-to-Speech Studio (Dubbing tab) + the shared voice-filter
@@ -148,13 +154,6 @@ import TtsStudioSection, {
 } from "./TtsStudioSection";
 // v1.15: burn-in text detection (tesseract.js) + STT engine routing.
 import { detectTextRegions } from "@/lib/merger/textDetect";
-// v1.15: STT engine routing (Groq cloud vs local) — an app-level device
-// preference, never stored in project files.
-import {
-  GROQ_MODEL_OPTIONS,
-  loadSttSettings,
-  saveSttSettings,
-} from "@/lib/merger/sttSettings";
 
 // ---------------------------------------------------------------------------
 // Whisper languages
@@ -869,7 +868,7 @@ function Toggle({
 }
 
 // ---------------------------------------------------------------------------
-// v5.0 tabs — Media | Captions | Effects | Audio | TTS | Dubbing | Export
+// v5.0 tabs — Media | Captions | Effects | Audio | TTS | Dubbing | Export | Settings
 // (v1.11: Chroma tab REMOVED — its keyer + track switch already live in the
 // media panel's per-clip settings, one place, no duplicate surface.)
 // (v1.24: DUBBING tab ADDED — voiceover, script writer, translate & dub and
@@ -878,6 +877,9 @@ function Toggle({
 // (v1.26: TTS tab SPLIT OUT — simple text-to-speech (the AI TTS Studio +
 // Voiceover) gets its own home; Dubbing keeps the Dub Studio + Script
 // Writer + Text Removal.)
+// (v1.27: SETTINGS tab ADDED — the central AI-models home. Provider/model
+// pickers scattered across the Dub Studio and the Captions engine card were
+// REMOVED — those surfaces now show read-only summaries that jump here.)
 // ---------------------------------------------------------------------------
 const SETTINGS_TAB_IDS = [
   "media",
@@ -887,6 +889,7 @@ const SETTINGS_TAB_IDS = [
   "tts",
   "dubbing",
   "export",
+  "settings",
 ] as const;
 
 type SettingsTabId = (typeof SETTINGS_TAB_IDS)[number];
@@ -961,6 +964,13 @@ const SETTINGS_TABS: {
     icon: Rocket,
     accent: "#fbbf24",
     glow: "rgba(217, 119, 6, 0.35)",
+  },
+  {
+    id: "settings",
+    label: "Settings",
+    icon: Settings2,
+    accent: "#d6d3d1",
+    glow: "rgba(120, 113, 108, 0.35)",
   },
 ];
 
@@ -1158,6 +1168,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
     tts: null,
     dubbing: null,
     export: null,
+    settings: null,
   });
   // Whisper auto-switch guard: flip to Captions once per busy→true edge so
   // the transcription progress is visible. The user can navigate away
@@ -1237,7 +1248,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
           role="tablist"
           aria-label="Settings sections"
           onKeyDown={handleTablistKeyDown}
-          className="ff-settings-tabs sticky top-0 z-30 grid grid-cols-5 border-b"
+          className="ff-settings-tabs sticky top-0 z-30 grid grid-cols-8 border-b"
           style={{ borderColor: "#2b2723", backgroundColor: "#1a1815" }}
         >
           {SETTINGS_TABS.map((t) => {
@@ -2015,9 +2026,11 @@ export function SettingsPanel(props: SettingsPanelProps) {
 
         {/* ─── v1.26 TTS tab — SIMPLE text-to-speech gets its own home: the
             AI TTS Studio (long-form Edge-TTS, language picker, voice
-            presets, word timings) + the classic one-clip Voiceover. Both
-            run IPC-first and fall back to the /api/tts routes in the web
-            preview, so everything below is live in a browser. ──────── */}
+            presets, word timings, one-clip voiceover handoffs).
+            (v1.27: the legacy standalone VOICEOVER (TTS) card was REMOVED —
+            the Studio's "Add as voiceover" covers it; no duplicate surface.)
+            Everything below runs IPC-first and falls back to the /api/tts
+            routes in the web preview, so it's live in a browser. ──────── */}
         <div
           id="ff-settings-tabpanel-tts"
           role="tabpanel"
@@ -2031,9 +2044,6 @@ export function SettingsPanel(props: SettingsPanelProps) {
             onAddMusicAudio={onAddMusicAudio}
             onCreateWordCaptions={onCreateWordCaptions}
           />
-
-          {/* ── v1.17: Voiceover (Edge TTS narration — web + desktop) ─── */}
-          <VoiceoverSection onAddVoiceover={onAddVoiceover} voCount={voCount} />
         </div>
 
         {/* ─── Dubbing tab (v1.24) — the full dub pipeline: Dub Studio
@@ -2075,6 +2085,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
             onStartDubFromScript={onStartDubFromScript}
             onDubScriptChange={onDubScriptChange}
             onDubSpeakerVoicesChange={onDubSpeakerVoicesChange}
+            onOpenSettings={() => setTab("settings")}
           />
 
           {/* ── v1.24: Text removal moved here from the Effects tab —
@@ -2120,7 +2131,25 @@ export function SettingsPanel(props: SettingsPanelProps) {
             whisperModel={whisperModel}
             onWhisperModelChange={onWhisperModelChange}
             hasSpeechSource={hasAudio || hasVideoClip}
+            onOpenSettings={() => setTab("settings")}
           />
+        </div>
+
+        {/* ─── v1.27 Settings tab — the ONE place AI provider/model defaults
+            live (keys, caption transcription, dubbing script writing). The
+            Dub Studio + Captions cards show read-only summaries that jump
+            here via onOpenSettings. ─────────────────────────────────── */}
+        <div
+          id="ff-settings-tabpanel-settings"
+          role="tabpanel"
+          aria-labelledby="ff-settings-tab-settings"
+          tabIndex={tab === "settings" ? 0 : -1}
+          className={cn(
+            "pb-2 pt-2",
+            tab === "settings" ? "ff-tab-panel-in" : "hidden",
+          )}
+        >
+          <AiModelsSection />
         </div>
       </div>
     </div>
@@ -3243,6 +3272,8 @@ interface CaptionsSectionProps {
   onWhisperModelChange: (model: string) => void;
   /** v1.3: transcription source available (audio track OR a video clip). */
   hasSpeechSource: boolean;
+  /** v1.27: opens the Settings tab (transcription provider/model home). */
+  onOpenSettings: () => void;
 }
 
 function CaptionsSection(props: CaptionsSectionProps) {
@@ -3266,7 +3297,12 @@ function CaptionsSection(props: CaptionsSectionProps) {
     onWhisperLanguageChange,
     onConvertSubtitlesToNative,
     hasSpeechSource,
+    onOpenSettings,
   } = props;
+
+  // v1.27: the transcription engine summary comes from the central AI
+  // settings (the Settings tab owns provider + model + keys).
+  const sttSummary = sttConfig(useAiSettings());
 
   const set = (patch: Partial<CaptionSettings>) =>
     onCaptionSettingsChange({ ...captionSettings, ...patch });
@@ -3324,145 +3360,6 @@ function CaptionsSection(props: CaptionsSectionProps) {
   // per-word animation pickers, so those two fields hide.
   const kineticOn = hasWords && !!captionSettings.kinetic?.enabled;
 
-  // ── v1.15 STT engine routing (Groq Cloud — the only engine) ──────────────
-  // App-level preference (localStorage, never in project files). The Groq
-  // API key itself lives in the MAIN process (userData/groq.json, 0600) and
-  // only a MASKED form ever crosses the bridge.
-  const groqApi =
-    typeof window !== "undefined" && window.electronAPI
-      ? (window.electronAPI as unknown as {
-          whisperGroqGet?: () => Promise<GroqConfigPayload>;
-          whisperGroqSet?: (p: {
-            apiKey?: string;
-            model?: string;
-          }) => Promise<GroqConfigPayload>;
-          whisperGroqTest?: (p: {
-            apiKey?: string;
-          }) => Promise<{ ok: boolean; message: string; whisperModels: string[] }>;
-        })
-      : undefined;
-  const [groqCfg, setGroqCfg] = useState<GroqConfigPayload | null>(null);
-  const [groqKeyInput, setGroqKeyInput] = useState("");
-  const [groqKeyEditing, setGroqKeyEditing] = useState(false);
-  const [groqBusy, setGroqBusy] = useState<"" | "save" | "test" | "clear">("");
-
-  // Load the on-device Groq config once (masked key presence + model).
-  useEffect(() => {
-    const get = groqApi?.whisperGroqGet;
-    if (!get) return;
-    let cancelled = false;
-    get()
-      .then((cfg) => {
-        if (!cancelled && cfg) {
-          setGroqCfg(cfg);
-          // Mirror any main-side model drift into the app preference.
-          const cur = loadSttSettings();
-          if (cur.groqModel !== cfg.model) {
-            saveSttSettings({ ...cur, groqModel: cfg.model });
-          }
-        }
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const saveGroqKey = useCallback(async () => {
-    const set = groqApi?.whisperGroqSet;
-    const key = groqKeyInput.trim();
-    if (!set) return;
-    if (!key) {
-      toast.error("Paste an API key first", {
-        description: "Create a free key at console.groq.com → API Keys.",
-      });
-      return;
-    }
-    setGroqBusy("save");
-    try {
-      const cfg = await set({ apiKey: key });
-      setGroqCfg(cfg);
-      setGroqKeyInput("");
-      setGroqKeyEditing(false);
-      toast.success("Groq API key saved on this device", {
-        description: "whisper-large-v3-turbo is now the default captions engine.",
-      });
-    } catch (err) {
-      toast.error("Could not save the key", {
-        description: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      setGroqBusy("");
-    }
-  }, [groqApi, groqKeyInput]);
-
-  const clearGroqKey = useCallback(async () => {
-    const set = groqApi?.whisperGroqSet;
-    if (!set) return;
-    setGroqBusy("clear");
-    try {
-      const cfg = await set({ apiKey: "" });
-      setGroqCfg(cfg);
-      // v1.20: Groq is the ONLY engine — clearing the key does NOT switch
-      // any preference; the card simply returns to the "add key" state.
-      toast.success("API key removed", {
-        description: "Paste a Groq API key to transcribe again.",
-      });
-    } catch (err) {
-      toast.error("Could not remove the key", {
-        description: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      setGroqBusy("");
-    }
-  }, [groqApi]);
-
-  const testGroqKey = useCallback(async () => {
-    const test = groqApi?.whisperGroqTest;
-    if (!test) return;
-    setGroqBusy("test");
-    try {
-      const r = await test(
-        groqKeyEditing && groqKeyInput.trim()
-          ? { apiKey: groqKeyInput.trim() }
-          : {},
-      );
-      if (r.ok) {
-        toast.success("Groq key works", {
-          description:
-            r.whisperModels.length > 0
-              ? `Available: ${r.whisperModels.slice(0, 3).join(", ")}`
-              : r.message,
-        });
-      } else {
-        toast.error("Groq key check failed", { description: r.message });
-      }
-    } catch (err) {
-      toast.error("Could not reach Groq", {
-        description: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      setGroqBusy("");
-    }
-  }, [groqApi, groqKeyEditing, groqKeyInput]);
-
-  const pickGroqModel = useCallback(
-    async (model: string) => {
-      const cur = loadSttSettings();
-      saveSttSettings({ ...cur, groqModel: model });
-      const set = groqApi?.whisperGroqSet;
-      if (set) {
-        try {
-          const cfg = await set({ model });
-          setGroqCfg(cfg);
-        } catch {
-          /* main-side persistence is best-effort; the preference is set */
-        }
-      }
-    },
-    [groqApi],
-  );
-
   return (
     <Section icon={<Captions size={13} />} title="Captions" defaultOpen>
       {/* ── Whisper generation ── */}
@@ -3477,7 +3374,9 @@ function CaptionsSection(props: CaptionsSectionProps) {
           </span>
         </div>
 
-        {/* ── v1.15/v1.20: Speech-to-text ENGINE — Groq Cloud (only) ── */}
+        {/* ── v1.27: Speech-to-text ENGINE — configured in the Settings tab.
+            The old Groq key UI + model picker moved there; this card shows
+            the live defaults (read-only) + a jump button. ── */}
         <div
           className="mb-2.5 rounded-lg border p-2.5"
           style={{ borderColor: "#2b2723", backgroundColor: "#211e1a" }}
@@ -3486,192 +3385,35 @@ function CaptionsSection(props: CaptionsSectionProps) {
             <span className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">
               Engine
             </span>
-            {groqCfg?.hasKey && (
-              <span
-                className="flex items-center gap-1 text-[10px] font-medium text-emerald-300"
-                title="Groq key saved on this device"
-              >
-                <Check size={10} /> Key saved
+            <button
+              type="button"
+              onClick={onOpenSettings}
+              title="Change the transcription provider + model (Settings → Default AI models)"
+              className="flex items-center gap-1 rounded border px-1.5 py-0.5 text-[9px] font-medium text-stone-400 transition-colors hover:bg-white/[0.06] hover:text-stone-200"
+              style={{ borderColor: "#332e28" }}
+              aria-label="Open AI model settings"
+            >
+              <Settings2 size={10} /> Settings
+            </button>
+          </div>
+          <div
+            className="flex items-center justify-center gap-1.5 rounded border border-orange-500/50 bg-orange-500/15 px-2 py-1.5 text-[11px] font-medium text-orange-300"
+            aria-label={`${sttSummary.provider} transcription engine`}
+            title={`${sttSummary.provider}${sttSummary.modelId ? ` · ${sttSummary.modelLabel}` : ""} — configured in Settings → Default AI models`}
+          >
+            {sttSummary.provider === "Groq" ? <Mic size={12} /> : <Cloud size={12} />}
+            {sttSummary.provider}
+            {sttSummary.modelId && (
+              <span className="text-[10px] font-normal text-orange-300/70">
+                · {sttSummary.modelLabel}
               </span>
             )}
           </div>
-          {/* v1.20: Groq Cloud is the ONLY engine — a fixed badge, no toggle. */}
-          <div
-            className="flex items-center justify-center gap-1.5 rounded border border-orange-500/50 bg-orange-500/15 px-2 py-1.5 text-[11px] font-medium text-orange-300"
-            aria-label="Groq Cloud — the only transcription engine"
-            title="Groq Cloud — the only transcription engine (cloud transcription with your own free API key)"
-          >
-            <Cloud size={12} />
-            Groq Cloud
-            <span className="rounded-full bg-orange-500/20 px-1.5 py-px text-[8px] font-semibold uppercase">
-              Only engine
-            </span>
-          </div>
           <p className="mt-1.5 text-[9px] leading-relaxed text-stone-400">
-            Groq Cloud is the only transcription engine — a free API key is
-            all it needs.
+            {sttSummary.provider === "Groq"
+              ? "Groq Whisper with REAL per-word timestamps — the free key lives in Settings → Default AI models."
+              : "The keyless built-in cloud ASR — word timings are estimated inside each speech window."}
           </p>
-
-          <div className="mt-2">
-              {!inElectron || !groqApi?.whisperGroqGet ? (
-                <p className="text-[10px] leading-relaxed text-stone-500">
-                  Transcription runs in the FrameFuse desktop app — add your
-                  free Groq API key there (Settings → Captions).
-                </p>
-              ) : groqCfg?.hasKey && !groqKeyEditing ? (
-                <div className="space-y-2">
-                  <div className="flex items-center gap-2">
-                    <KeyRound size={11} className="shrink-0 text-orange-600" />
-                    <span
-                      className="flex-1 truncate rounded border bg-[#26221e] px-2 py-1 font-mono text-[10px] text-stone-400"
-                      style={{ borderColor: "#2b2723" }}
-                      title={groqCfg.maskedKey}
-                    >
-                      {groqCfg.maskedKey}
-                    </span>
-                  </div>
-                  <div className="flex gap-1">
-                    <button
-                      type="button"
-                      onClick={testGroqKey}
-                      disabled={groqBusy !== ""}
-                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-stone-400 transition-colors hover:bg-white/[0.06] disabled:cursor-not-allowed disabled:opacity-50"
-                      style={{ borderColor: "#332e28" }}
-                    >
-                      {groqBusy === "test" ? (
-                        <Loader2 size={10} className="animate-spin" />
-                      ) : (
-                        <BadgeCheck size={10} />
-                      )}
-                      Test key
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setGroqKeyEditing(true);
-                        setGroqKeyInput("");
-                      }}
-                      disabled={groqBusy !== ""}
-                      className="rounded border px-2 py-1 text-[10px] font-medium text-stone-400 transition-colors hover:bg-white/[0.06] disabled:cursor-not-allowed disabled:opacity-50"
-                      style={{ borderColor: "#332e28" }}
-                    >
-                      Replace
-                    </button>
-                    <button
-                      type="button"
-                      onClick={clearGroqKey}
-                      disabled={groqBusy !== ""}
-                      className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-rose-400/90 transition-colors hover:bg-rose-500/10 hover:border-rose-500/50 disabled:cursor-not-allowed disabled:opacity-50"
-                      style={{ borderColor: "#332e28" }}
-                    >
-                      {groqBusy === "clear" ? (
-                        <Loader2 size={10} className="animate-spin" />
-                      ) : (
-                        <Trash2 size={10} />
-                      )}
-                      Remove
-                    </button>
-                  </div>
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  <input
-                    type="password"
-                    value={groqKeyInput}
-                    onChange={(e) => setGroqKeyInput(e.target.value)}
-                    placeholder="gsk_… paste your Groq API key"
-                    spellCheck={false}
-                    autoComplete="off"
-                    className="w-full rounded border bg-[#211e1a] px-2 py-1.5 font-mono text-[10px] text-stone-300 placeholder:text-stone-500 focus:border-orange-500/60 focus:outline-none"
-                    style={{ borderColor: "#332e28" }}
-                    aria-label="Groq API key"
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        void saveGroqKey();
-                      }
-                    }}
-                  />
-                  <div className="flex items-center gap-1">
-                    <button
-                      type="button"
-                      onClick={saveGroqKey}
-                      disabled={groqBusy !== "" || !groqKeyInput.trim()}
-                      className="flex items-center gap-1 rounded bg-orange-500 px-2.5 py-1 text-[10px] font-semibold text-white transition-colors hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-40"
-                    >
-                      {groqBusy === "save" ? (
-                        <Loader2 size={10} className="animate-spin" />
-                      ) : (
-                        <KeyRound size={10} />
-                      )}
-                      Save key
-                    </button>
-                    {groqKeyEditing && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setGroqKeyEditing(false);
-                          setGroqKeyInput("");
-                        }}
-                        className="rounded border px-2 py-1 text-[10px] font-medium text-stone-500 transition-colors hover:bg-white/[0.06]"
-                        style={{ borderColor: "#332e28" }}
-                      >
-                        Cancel
-                      </button>
-                    )}
-                    <a
-                      href="https://console.groq.com/keys"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="ml-auto flex items-center gap-1 text-[10px] font-medium text-orange-400 underline-offset-2 hover:underline"
-                    >
-                      Get a free key
-                      <ExternalLink size={9} />
-                    </a>
-                  </div>
-                </div>
-              )}
-
-              {/* Cloud model — turbo is the default (faster). */}
-              <div className="mt-2">
-                <div className="mb-1 flex items-center justify-between">
-                  <span className="text-[10px] font-semibold uppercase tracking-wide text-stone-500">
-                    Cloud model
-                  </span>
-                  <span className="text-[9px] text-stone-400">Whisper large</span>
-                </div>
-                <div className="grid grid-cols-2 gap-1">
-                  {GROQ_MODEL_OPTIONS.map((m) => {
-                    const active =
-                      (groqCfg?.model ?? loadSttSettings().groqModel) === m.id;
-                    return (
-                      <button
-                        key={m.id}
-                        type="button"
-                        onClick={() => {
-                          void pickGroqModel(m.id);
-                        }}
-                        title={m.hint}
-                        className={cn(
-                          "rounded border px-2 py-1.5 text-[10px] font-medium transition-colors",
-                          active
-                            ? "border-orange-500/50 bg-orange-500/15 text-orange-300"
-                            : "border-[#2b2723] bg-[#26221e] text-stone-500 hover:bg-white/[0.04] hover:text-stone-300",
-                        )}
-                        aria-pressed={active}
-                      >
-                        {m.label}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <p className="mt-2 text-[9px] leading-relaxed text-stone-400">
-                Your key stays on this device; audio is sent to api.groq.com
-                for transcription only.
-              </p>
-            </div>
         </div>
         <div className="mb-2 flex gap-2">
           <select
@@ -5198,342 +4940,6 @@ function voicePreviewSample(locale: string, userText: string): string {
 
 // v1.25: useTtsVoices (this file's shared voice-catalog hook) moved to
 // ./use-tts-voices.ts — the TTS Studio imports it too.
-function VoiceoverSection({
-  onAddVoiceover,
-  voCount,
-}: {
-  onAddVoiceover: (r: {
-    text: string;
-    voice: string;
-    ratePct?: number;
-    pitchHz?: number;
-    volume?: number;
-    durationMs: number;
-    bytes: ArrayBuffer | Blob;
-  }) => void;
-  voCount: number;
-}) {
-  const { voices, pairs } = useTtsVoices();
-  const [text, setText] = useState("");
-  // v1.25: QWERTY romanized → native script (hi/ur), shared with the Studio.
-  const [qwerty, setQwerty] = useState(true);
-  const [locale, setLocale] = useState("en-US");
-  const [voice, setVoice] = useState("en-US-AriaNeural");
-  const [voiceSearch, setVoiceSearch] = useState("");
-  const [voiceGender, setVoiceGender] = useState<VoiceGenderFilter>("all");
-  const [ratePct, setRatePct] = useState(0);
-  const [pitchHz, setPitchHz] = useState(0);
-  const [volume, setVolume] = useState(1);
-  const [busy, setBusy] = useState(false);
-  const [previewBusy, setPreviewBusy] = useState(false);
-  const previewAudioRef = useRef<HTMLAudioElement | null>(null);
-
-  const locales = useMemo(() => {
-    const set = new Set<string>();
-    for (const v of voices ?? []) set.add(v.locale);
-    return Array.from(set).sort();
-  }, [voices]);
-  const localeVoices = useMemo(
-    () =>
-      filterTtsVoices(voices ?? [], {
-        search: voiceSearch,
-        locale,
-        gender: voiceGender,
-      }),
-    [voices, voiceSearch, locale, voiceGender],
-  );
-
-  // QWERTY resolution (hi/ur): romanized → native, native passes through.
-  const showQwerty = localeWantsTranslit(locale) !== null;
-  const qw = useMemo(
-    () => resolveQwertyText(text, locale, qwerty),
-    [text, locale, qwerty],
-  );
-
-  // Locale switch → default to that locale's female pair voice.
-  const changeLocale = useCallback(
-    (next: string) => {
-      setLocale(next);
-      setVoiceSearch("");
-      const pair = pairs[next];
-      if (pair?.female) setVoice(pair.female);
-      else {
-        const first = (voices ?? []).find((v) => v.locale === next);
-        if (first) setVoice(first.shortName);
-      }
-    },
-    [pairs, voices],
-  );
-
-  // Gender filter switch → keep the current voice when it still matches,
-  // else the first voice of the new filter (shared Studio behavior).
-  const changeVoiceGender = useCallback(
-    (g: VoiceGenderFilter) => {
-      setVoiceGender(g);
-      const list = filterTtsVoices(voices ?? [], {
-        search: voiceSearch,
-        locale,
-        gender: g,
-      });
-      if (list.length > 0 && !list.some((v) => v.shortName === voice)) {
-        setVoice(list[0].shortName);
-      }
-    },
-    [voices, voiceSearch, locale, voice],
-  );
-
-  const stopPreview = useCallback(() => {
-    const a = previewAudioRef.current;
-    if (a) {
-      a.pause();
-      previewAudioRef.current = null;
-    }
-  }, []);
-
-  useEffect(() => stopPreview, [stopPreview]);
-
-  const playPreview = useCallback(async () => {
-    if (!voice) return;
-    stopPreview();
-    setPreviewBusy(true);
-    try {
-      // v1.26 transport — previews work in the web preview too.
-      const r = await ttsPreviewVoice({
-        voice,
-        // v1.25: previews read the CONVERTED text (native script for hi/ur).
-        text: voicePreviewSample(locale, qw.converted),
-      });
-      const blob = new Blob([r.bytes], { type: "audio/mpeg" });
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-      previewAudioRef.current = audio;
-      audio.onended = () => URL.revokeObjectURL(url);
-      await audio.play();
-    } catch (err) {
-      toast.error("Voice preview failed", {
-        description: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      setPreviewBusy(false);
-    }
-  }, [voice, locale, qw, stopPreview]);
-
-  const addVoiceover = useCallback(async () => {
-    // v1.25: synthesize (and store) the CONVERTED text — hi/ur QWERTY input
-    // reaches Edge TTS as native script, and export regeneration matches.
-    const trimmed = qw.converted.trim();
-    if (!trimmed) {
-      toast.error("Write the narration text first");
-      return;
-    }
-    if (!voice) {
-      toast.error("Select a voice first");
-      return;
-    }
-    setBusy(true);
-    try {
-      // v1.26 transport — IPC in the desktop app, /api/tts/synthesize in
-      // the web preview (the volume slider maps to the engine convention).
-      const r = await ttsSynthesizeShort({
-        text: trimmed,
-        voice,
-        ratePct,
-        pitchHz,
-        volumePct: Math.round(volume * 100),
-      });
-      onAddVoiceover({
-        text: trimmed,
-        voice,
-        ratePct,
-        pitchHz,
-        volume,
-        durationMs: r.durationMs,
-        bytes: r.bytes,
-      });
-      setText("");
-    } catch (err) {
-      toast.error("Voiceover synthesis failed", {
-        description: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      setBusy(false);
-    }
-  }, [qw, voice, ratePct, pitchHz, volume, onAddVoiceover]);
-
-  const selectCls =
-    "w-full rounded border bg-[#211e1a] px-2 py-1.5 text-[11px] text-stone-300 focus:border-orange-500";
-
-  return (
-    <Section icon={<Mic size={13} />} title="Voiceover (TTS)" defaultOpen={false}>
-      <textarea
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        rows={3}
-        placeholder="Narration text — one clip is placed at the playhead."
-        className="mb-2 w-full resize-y rounded border bg-[#211e1a] px-2 py-1.5 text-[11px] text-stone-300 placeholder:text-stone-500 focus:border-orange-500 focus:outline-none"
-        style={{ borderColor: "#332e28" }}
-        aria-label="Narration text"
-      />
-      {showQwerty && (
-        <div className="mb-2">
-          <StudioToggle
-            checked={qwerty}
-            onChange={setQwerty}
-            label="QWERTY input — auto-converts to native script"
-          />
-          {qwerty && qw.nativeDetected && (
-            <p className="mt-1 text-[10px] leading-relaxed text-amber-400/90">
-              Native script detected — converting is skipped
-            </p>
-          )}
-          {qwerty && qw.willConvert && (
-            <p
-              className="mt-1 truncate rounded px-1.5 py-1 text-[10px] text-stone-300"
-              style={{ backgroundColor: "#10201d" }}
-              title={qw.converted}
-            >
-              {qw.converted.slice(0, 120)}
-              {qw.converted.length > 120 ? " …" : ""}
-            </p>
-          )}
-        </div>
-      )}
-      <div className="mb-1.5 flex items-center gap-1.5">
-        <div className="relative min-w-0 flex-1">
-          <Search
-            size={11}
-            className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-stone-500"
-          />
-          <input
-            value={voiceSearch}
-            onChange={(e) => setVoiceSearch(e.target.value)}
-            placeholder="Search voices…"
-            className="w-full rounded border bg-[#211e1a] py-1.5 pl-7 pr-2 text-[11px] text-stone-300 placeholder:text-stone-500 focus:border-orange-500 focus:outline-none"
-            style={{ borderColor: "#332e28" }}
-            aria-label="Search voices"
-          />
-        </div>
-        <VoiceGenderChips value={voiceGender} onChange={changeVoiceGender} />
-      </div>
-      <div className="mb-2 grid grid-cols-2 gap-1.5">
-        <div>
-          <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
-            Language
-          </label>
-          <select
-            value={locale}
-            onChange={(e) => changeLocale(e.target.value)}
-            className={selectCls}
-            style={{ borderColor: "#332e28" }}
-            aria-label="Voiceover language"
-          >
-            {locales.length === 0 && <option value={locale}>{locale}</option>}
-            {locales.map((l) => (
-              <option key={l} value={l}>
-                {l}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div>
-          <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
-            Voice
-          </label>
-          <div className="flex items-center gap-1">
-            <select
-              value={voice}
-              onChange={(e) => setVoice(e.target.value)}
-              className={cn(selectCls, "flex-1")}
-              style={{ borderColor: "#332e28" }}
-              aria-label="Voiceover voice"
-            >
-              {localeVoices.length === 0 && <option value={voice}>{voice}</option>}
-              {localeVoices.map((v) => (
-                <option key={v.shortName} value={v.shortName}>
-                  {v.displayName} ({v.shortName})
-                </option>
-              ))}
-            </select>
-            <button
-              type="button"
-              onClick={() => void playPreview()}
-              disabled={previewBusy || !voice}
-              title="Listen to this voice before using it"
-              className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded border text-orange-600 transition-colors hover:bg-orange-500/10 disabled:cursor-not-allowed disabled:opacity-40"
-              style={{ borderColor: "#332e28" }}
-              aria-label="Preview voice"
-            >
-              {previewBusy ? (
-                <Loader2 size={11} className="animate-spin" />
-              ) : (
-                <Play size={11} />
-              )}
-            </button>
-          </div>
-        </div>
-      </div>
-      <div className="mb-2 grid grid-cols-3 gap-1.5">
-        <Field label="Rate" hint={`${ratePct > 0 ? "+" : ""}${ratePct}%`}>
-          <input
-            type="range"
-            min={-50}
-            max={50}
-            step={5}
-            value={ratePct}
-            onChange={(e) => setRatePct(Number(e.target.value))}
-            className="w-full accent-orange-600"
-            aria-label="Speech rate"
-          />
-        </Field>
-        <Field label="Pitch" hint={`${pitchHz > 0 ? "+" : ""}${pitchHz}Hz`}>
-          <input
-            type="range"
-            min={-20}
-            max={20}
-            step={2}
-            value={pitchHz}
-            onChange={(e) => setPitchHz(Number(e.target.value))}
-            className="w-full accent-orange-600"
-            aria-label="Pitch"
-          />
-        </Field>
-        <Field label="Volume" hint={`${Math.round(volume * 100)}%`}>
-          <input
-            type="range"
-            min={0}
-            max={100}
-            step={5}
-            value={Math.round(volume * 100)}
-            onChange={(e) => setVolume(Number(e.target.value) / 100)}
-            className="w-full accent-orange-600"
-            aria-label="Voiceover volume"
-          />
-        </Field>
-      </div>
-      <button
-        type="button"
-        onClick={() => void addVoiceover()}
-        disabled={busy || !text.trim()}
-        className="flex w-full items-center justify-center gap-1.5 rounded bg-orange-500 px-2.5 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-40"
-      >
-        {busy ? (
-          <>
-            <Loader2 size={11} className="animate-spin" /> Synthesizing…
-          </>
-        ) : (
-          <>
-            <Mic size={11} /> Add at playhead
-          </>
-        )}
-      </button>
-      <p className="mb-1 mt-1 text-[10px] leading-relaxed text-stone-500">
-        {voCount > 0
-          ? `${voCount} clip${voCount === 1 ? "" : "s"} on the VO lane — drag to move, Alt+click to remove.`
-          : "Voiceovers regenerate automatically at export after a project is reopened."}
-      </p>
-    </Section>
-  );
-}
 
 // ---------------------------------------------------------------------------
 // v1.17 — TRANSLATE & DUB (Groq Whisper → free LLM → Edge TTS).
@@ -5570,6 +4976,8 @@ interface DubSectionProps {
   onStartDubFromScript: () => void;
   onDubScriptChange: (lines: DubScriptLine[]) => void;
   onDubSpeakerVoicesChange: (voices: Record<number, string>) => void;
+  /** v1.27: opens the Settings tab (provider/model defaults live there). */
+  onOpenSettings: () => void;
 }
 
 const DUB_LOCALE_PREFERENCE = ["-IN", "-US", "-GB", "-CA", "-AU"];
@@ -5709,20 +5117,17 @@ function DubSection(props: DubSectionProps) {
     onStartDubFromScript,
     onDubScriptChange,
     onDubSpeakerVoicesChange,
+    /** v1.27: jump to the Settings tab (the provider/model home). */
+    onOpenSettings,
   } = props;
 
   const { voices, pairs } = useTtsVoices();
-  const [models, setModels] = useState<Array<{ id: string; label: string; hint: string }>>([]);
+  // v1.27: the central AI settings (Settings tab) drive every provider/model
+  // summary this card shows — no more local pickers.
+  const aiSettings = useAiSettings();
+  const scriptProvider = dubTextConfig(aiSettings);
+  const sttProvider = sttConfig(aiSettings);
   const [langNames, setLangNames] = useState<Record<string, string>>({});
-  const [groqHasKey, setGroqHasKey] = useState<boolean | null>(null);
-  // v1.22: the Gemini dub-provider picker data (models + key presence).
-  const [geminiModels, setGeminiModels] = useState<
-    Array<{ id: string; label: string; hint: string }>
-  >([]);
-  const [geminiHasKey, setGeminiHasKey] = useState<boolean | null>(null);
-  /** v1.26: the web speech provider is active (no electronAPI bridge) —
- *  the API routes run the transcription/translation, no keys needed. */
-  const [webProvider, setWebProvider] = useState(false);
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
 
   // Stage navigation + the word-timing toggle (ephemeral UI state — fine to
@@ -5732,27 +5137,15 @@ function DubSection(props: DubSectionProps) {
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
-    // v1.26 transport: dubModels resolves IPC-first and falls back to
+    // v1.27 transport: dubModels resolves IPC-first and falls back to
     // /api/dub/models — the language dropdown (langNames) populates in the
-    // web preview too. provider === "web" marks the keyless cloud engine.
+    // web preview too. Provider/model pickers no longer live here.
     fetchDubModels()
       .then((r) => {
         if (!r) return;
-        setModels(r.models ?? []);
         setLangNames(r.langNames ?? {});
-        setGeminiModels(r.gemini?.models ?? []);
-        setGeminiHasKey(r.gemini ? !!r.gemini.hasKey : null);
-        setWebProvider(r.provider === "web");
-        if (r.provider === "web") setGroqHasKey(true);
       })
       .catch(() => {});
-    const api = window.electronAPI;
-    if (typeof api?.whisperGroqGet === "function") {
-      api
-        .whisperGroqGet()
-        .then((cfg) => setGroqHasKey(!!cfg?.hasKey))
-        .catch(() => setGroqHasKey(false));
-    }
   }, []);
 
   // Keep the effective locale + default voices in sync with the language.
@@ -5795,6 +5188,9 @@ function DubSection(props: DubSectionProps) {
   // process skips speaker detection entirely); "multi" = the classic
   // per-speaker female/male pair. Old persisted prefs read as "multi".
   const singleMode = (dubSettings.voiceMode ?? "multi") === "single";
+
+  // v1.27: word-to-word timing (absent prefs read as ON).
+  const wordTimingOn = dubSettings.wordTiming !== false;
 
   /** The voice the single-mode select shows as selected: the explicit pick
    *  when the locale offers it, else the locale's default. */
@@ -6031,9 +5427,9 @@ function DubSection(props: DubSectionProps) {
         <div className="mb-2 rounded border p-2" style={{ borderColor: "#332e28", backgroundColor: "#26221e" }}>
           <p className="mb-1.5 text-[10px] leading-relaxed text-stone-400">
             <span className="font-semibold text-stone-300">1 · Audio → transcript (word level).</span>{" "}
-            {webProvider
-              ? "Extracts the timeline's audio and transcribes it with the built-in cloud ASR — every line keeps its per-word timings."
-              : "Extracts the timeline's audio and transcribes it with Groq Whisper — every line keeps its per-word timings."}
+            {sttProvider.provider === "Groq"
+              ? `Extracts the timeline's audio and transcribes it with Groq Whisper (${sttProvider.modelLabel}) — REAL per-word timestamps, the best input for word-to-word dub timing.`
+              : "Extracts the timeline's audio and transcribes it with the built-in cloud ASR — every line keeps its per-word timings."}
           </p>
 
           {transcribeBusy ? (
@@ -6046,13 +5442,11 @@ function DubSection(props: DubSectionProps) {
             <button
               type="button"
               onClick={onStartDubTranscribe}
-              disabled={dubSourceCount === 0 || groqHasKey === false}
+              disabled={dubSourceCount === 0}
               title={
                 dubSourceCount === 0
                   ? "Import a local video clip first — the transcript uses the timeline's audio"
-                  : groqHasKey === false
-                    ? "Add your free Groq API key in the Captions tab first"
-                    : "Extract + transcribe the timeline audio at word level"
+                  : "Extract + transcribe the timeline audio at word level"
               }
               className="mb-2 flex w-full items-center justify-center gap-1.5 rounded bg-orange-500 px-2.5 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-40"
             >
@@ -6212,7 +5606,8 @@ function DubSection(props: DubSectionProps) {
             full script for review — edit any line before dubbing.
           </p>
 
-          {/* language + provider */}
+          {/* language + the script-writing provider (v1.27: read-only —
+              the Settings tab owns provider/model defaults). */}
           <div className="mb-2 grid grid-cols-2 gap-1.5">
             <div>
               <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
@@ -6239,125 +5634,34 @@ function DubSection(props: DubSectionProps) {
             </div>
             <div>
               <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
-                AI model provider
+                Script writer
               </label>
-              {webProvider ? (
+              <div className="flex items-stretch gap-1">
                 <div
-                  className="flex items-center justify-center gap-1.5 rounded border border-orange-500/50 bg-orange-500/15 px-2 py-1.5 text-[11px] font-medium text-orange-300"
-                  title="The web preview's built-in cloud AI runs the dub's speaker detection + translation — no key needed. The desktop app uses your Groq/Gemini key."
+                  className="flex min-w-0 flex-1 items-center gap-1.5 rounded border border-orange-500/50 bg-orange-500/15 px-2 py-1.5 text-[11px] font-medium text-orange-300"
+                  title={`${scriptProvider.provider} · ${scriptProvider.modelLabel} writes the script (speaker detection + translation)`}
                 >
-                  <Sparkles size={12} /> Cloud AI (built-in)
+                  <Sparkles size={12} className="shrink-0" />
+                  <span className="truncate">{scriptProvider.provider}</span>
+                  <span className="truncate text-[10px] font-normal text-orange-300/70">
+                    · {scriptProvider.modelLabel}
+                  </span>
                 </div>
-              ) : (
-                <>
-                  <div className="grid grid-cols-2 gap-1" role="group" aria-label="Dub AI model provider">
-                    <button
-                      type="button"
-                      onClick={() =>
-                        dubSettings.textProvider !== "groq" &&
-                        onDubSettingsChange({ ...dubSettings, textProvider: "groq" })
-                      }
-                      className={cn(
-                        "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
-                        (dubSettings.textProvider ?? "groq") === "groq"
-                          ? "border-orange-500/50 bg-orange-500/15 text-orange-300"
-                          : "border-[#2b2723] bg-[#26221e] text-stone-500 hover:bg-white/[0.04] hover:text-stone-300",
-                      )}
-                      aria-pressed={(dubSettings.textProvider ?? "groq") === "groq"}
-                      title="Groq chat models run the dub's speaker detection + translation (free tier)"
-                    >
-                      <Sparkles size={12} /> Groq
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        (dubSettings.textProvider ?? "groq") !== "gemini" &&
-                        onDubSettingsChange({ ...dubSettings, textProvider: "gemini" })
-                      }
-                      className={cn(
-                        "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
-                        dubSettings.textProvider === "gemini"
-                          ? "border-orange-500/50 bg-orange-500/15 text-orange-300"
-                          : "border-[#2b2723] bg-[#26221e] text-stone-500 hover:bg-white/[0.04] hover:text-stone-300",
-                      )}
-                      aria-pressed={dubSettings.textProvider === "gemini"}
-                      title="Gemini models run the dub's speaker detection + translation — needs your Gemini key (Settings → Script Writer)"
-                    >
-                      <PenLine size={12} /> Gemini
-                    </button>
-                  </div>
-                  {dubSettings.textProvider === "gemini" && geminiHasKey === false && (
-                    <p className="mt-1 text-[10px] text-orange-400/90">
-                      No Gemini key saved — add one in Settings → Script Writer (aistudio.google.com/apikey),
-                      or switch back to Groq.
-                    </p>
-                  )}
-                </>
-              )}
+                <button
+                  type="button"
+                  onClick={onOpenSettings}
+                  title="Change the script-writing provider + model (Settings → Default AI models)"
+                  className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded border text-stone-400 transition-colors hover:bg-white/[0.06] hover:text-stone-200"
+                  style={{ borderColor: "#332e28" }}
+                  aria-label="Open AI model settings"
+                >
+                  <Settings2 size={11} />
+                </button>
+              </div>
             </div>
           </div>
 
           <div className="mb-2 grid grid-cols-2 gap-1.5">
-            {webProvider ? (
-              <div>
-                <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
-                  AI model
-                </label>
-                <p className="rounded border border-[#2b2723] bg-[#26221e] px-2 py-1.5 text-[10px] leading-relaxed text-stone-400">
-                  Speaker detection + translation run on the built-in cloud
-                  model — nothing to configure (no key needed in the web
-                  preview).
-                </p>
-              </div>
-            ) : (dubSettings.textProvider ?? "groq") === "gemini" ? (
-              <div>
-                <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
-                  Gemini model
-                </label>
-                <select
-                  value={dubSettings.geminiModel}
-                  onChange={(e) =>
-                    onDubSettingsChange({ ...dubSettings, geminiModel: e.target.value })
-                  }
-                  className={selectCls}
-                  style={{ borderColor: "#332e28" }}
-                  aria-label="Gemini dub model"
-                >
-                  {geminiModels.length === 0 && (
-                    <option value={dubSettings.geminiModel}>{dubSettings.geminiModel}</option>
-                  )}
-                  {geminiModels.map((m) => (
-                    <option key={m.id} value={m.id} title={m.hint}>
-                      {m.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            ) : (
-              <div>
-                <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
-                  Groq model (free tier)
-                </label>
-                <select
-                  value={dubSettings.groqModel}
-                  onChange={(e) =>
-                    onDubSettingsChange({ ...dubSettings, groqModel: e.target.value })
-                  }
-                  className={selectCls}
-                  style={{ borderColor: "#332e28" }}
-                  aria-label="Groq text model"
-                >
-                  {models.length === 0 && (
-                    <option value={dubSettings.groqModel}>{dubSettings.groqModel}</option>
-                  )}
-                  {models.map((m) => (
-                    <option key={m.id} value={m.id} title={m.hint}>
-                      {m.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            )}
             <div>
               <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
                 Voice mode
@@ -6393,6 +5697,35 @@ function DubSection(props: DubSectionProps) {
                 </button>
               </div>
             </div>
+            <div>
+              <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
+                Transcription
+              </label>
+              <div className="flex items-stretch gap-1">
+                <div
+                  className="flex min-w-0 flex-1 items-center gap-1.5 rounded border border-[#2b2723] bg-[#26221e] px-2 py-1.5 text-[11px] font-medium text-stone-300"
+                  title={`${sttProvider.provider}${sttProvider.modelId ? ` · ${sttProvider.modelLabel}` : ""} — stage 1 transcribes with this engine`}
+                >
+                  <ScanText size={12} className="shrink-0 text-teal-400" />
+                  <span className="truncate">{sttProvider.provider}</span>
+                  {sttProvider.modelId && (
+                    <span className="truncate text-[10px] font-normal text-stone-500">
+                      · {sttProvider.modelLabel}
+                    </span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={onOpenSettings}
+                  title="Change the transcription provider + model (Settings → Default AI models)"
+                  className="flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded border text-stone-400 transition-colors hover:bg-white/[0.06] hover:text-stone-200"
+                  style={{ borderColor: "#332e28" }}
+                  aria-label="Open AI model settings"
+                >
+                  <Settings2 size={11} />
+                </button>
+              </div>
+            </div>
           </div>
 
           {scriptBusy ? (
@@ -6405,13 +5738,11 @@ function DubSection(props: DubSectionProps) {
             <button
               type="button"
               onClick={onStartDubScript}
-              disabled={!dubTranscript || groqHasKey === false}
+              disabled={!dubTranscript}
               title={
                 !dubTranscript
                   ? "Run stage 1 first — the script is built from the word-level transcript"
-                  : groqHasKey === false
-                    ? "Add your free Groq API key in the Captions tab first"
-                    : "Detect speakers + translate the transcript into the selected language"
+                  : `${scriptProvider.provider} · ${scriptProvider.modelLabel} detects speakers + translates the transcript`
               }
               className="mb-2 flex w-full items-center justify-center gap-1.5 rounded bg-orange-500 px-2.5 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-40"
             >
@@ -6591,6 +5922,56 @@ function DubSection(props: DubSectionProps) {
             </div>
           )}
 
+          {/* v1.27: word-to-word timing — warp the dub so its words land on
+              the ORIGINAL speaker's word timings (naturalness-guardrailed).
+              Needs the stage-1 transcript's word timings; default ON. */}
+          <div className="mb-2">
+            <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
+              Word-to-word timing
+            </label>
+            <div className="grid grid-cols-2 gap-1" role="group" aria-label="Word-to-word timing mode">
+              <button
+                type="button"
+                onClick={() =>
+                  !wordTimingOn &&
+                  onDubSettingsChange({ ...dubSettings, wordTiming: true })
+                }
+                className={cn(
+                  "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
+                  wordTimingOn
+                    ? "border-orange-500/50 bg-orange-500/15 text-orange-300"
+                    : "border-[#2b2723] bg-[#26221e] text-stone-500 hover:bg-white/[0.04] hover:text-stone-300",
+                )}
+                aria-pressed={wordTimingOn}
+                title="Warp each dubbed word onto the original speaker's word timing — pauses stretch for free, speech-rate changes stay inside natural bounds"
+              >
+                <Timer size={12} /> Match words
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  wordTimingOn &&
+                  onDubSettingsChange({ ...dubSettings, wordTiming: false })
+                }
+                className={cn(
+                  "flex items-center justify-center gap-1.5 rounded border px-2 py-1.5 text-[11px] font-medium transition-colors",
+                  !wordTimingOn
+                    ? "border-teal-500/40 bg-teal-500/10 text-teal-300"
+                    : "border-[#2b2723] bg-[#26221e] text-stone-500 hover:bg-white/[0.04] hover:text-stone-300",
+                )}
+                aria-pressed={!wordTimingOn}
+                title="Keep the natural TTS pacing — segments still fit their utterance slots"
+              >
+                <Wind size={12} /> Natural pacing
+              </button>
+            </div>
+            <p className="mt-1 text-[9px] leading-relaxed text-stone-500">
+              {wordTimingOn
+                ? "Dubbed words land when the original words were spoken (WSOLA warp, pitch-preserving, ±28% speech-rate guardrails). Best with Groq Whisper transcription — real word timestamps."
+                : "No per-word alignment — only the classic slot fit (one speed-up re-synthesis when a line overruns)."}
+            </p>
+          </div>
+
           <Field
             label="Original audio"
             hint={`${Math.round(dubSettings.originalVolume * 100)}%`}
@@ -6624,18 +6005,13 @@ function DubSection(props: DubSectionProps) {
             <button
               type="button"
               onClick={dubScript ? onStartDubFromScript : onStartDub}
-              disabled={
-                (dubScript ? scriptLines.length === 0 : dubSourceCount === 0) ||
-                (dubScript ? false : groqHasKey === false)
-              }
+              disabled={dubScript ? scriptLines.length === 0 : dubSourceCount === 0}
               title={
                 dubScript
                   ? "Synthesize the edited script (no re-transcription, no re-translation)"
                   : dubSourceCount === 0
                     ? "Import a local video clip first — the dub uses the timeline's audio"
-                    : groqHasKey === false
-                      ? "Add your free Groq API key in the Captions tab first"
-                      : "Transcribe → translate → synthesize a full dub track in one click"
+                    : "Transcribe → translate → synthesize a full dub track in one click"
               }
               className="mt-2 flex w-full items-center justify-center gap-1.5 rounded bg-orange-500 px-2.5 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-40"
             >
@@ -6687,6 +6063,15 @@ function DubSection(props: DubSectionProps) {
                     <span className="text-stone-500">
                       {(s.startMs / 1000).toFixed(1)}s
                     </span>
+                    {s.align?.applied && (
+                      <span
+                        className="ml-1 rounded border border-orange-500/40 bg-orange-500/10 px-1 py-px align-middle text-[8px] font-semibold text-orange-300"
+                        title={`Word-to-word timing applied — max word-start drift ${s.align.maxDriftMs ?? "?"} ms`}
+                      >
+                        <Timer size={8} className="mr-0.5 inline" />
+                        word-sync
+                      </span>
+                    )}
                     <span className="mx-1 text-stone-400">·</span>
                     {s.translatedText}
                     <div className="mt-0.5 truncate text-stone-400">{s.sourceText}</div>
@@ -6700,9 +6085,7 @@ function DubSection(props: DubSectionProps) {
 
       <p className="mb-1 mt-1 text-[10px] leading-relaxed text-stone-500">
         {dubSourceCount > 0
-          ? webProvider
-            ? `Source: ${dubSourceCount} timeline clip${dubSourceCount === 1 ? "" : "s"} — cloud transcription, no key needed in the web preview.`
-            : `Source: ${dubSourceCount} timeline clip${dubSourceCount === 1 ? "" : "s"} — free Groq key required (Captions tab).`
+          ? `Source: ${dubSourceCount} timeline clip${dubSourceCount === 1 ? "" : "s"} — transcription + script providers are configured in Settings.`
           : "Import a local video clip on the timeline to dub it."}
       </p>
     </Section>

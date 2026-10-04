@@ -104,6 +104,21 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // v1.27: transcription engine (Settings tab) — "groq" (Whisper) or
+    // "builtin" (cloud ASR). The Groq key rides the request; it is never
+    // persisted server-side.
+    const formProvider = String(form.get("provider") ?? "builtin");
+    const provider = formProvider === "groq" ? "groq" : "builtin";
+    const groqKey = String(form.get("groqKey") ?? "").trim();
+    const groqModelRaw = String(form.get("groqModel") ?? "").trim();
+    const groqModel = ["whisper-large-v3", "whisper-large-v3-turbo"].includes(groqModelRaw)
+      ? groqModelRaw
+      : "whisper-large-v3-turbo";
+    const sourceLanguage = String(form.get("sourceLanguage") ?? "auto").trim().slice(0, 8) || "auto";
+    if (provider === "groq" && !groqKey) {
+      return bad("A Groq API key is required for Groq Whisper transcription", 400);
+    }
+
     // ---- save uploads into a fresh temp dir ----
     workDir = fs.mkdtempSync(path.join(os.tmpdir(), "ff-dub-"));
     const uploads: TranscribeUpload[] = [];
@@ -119,8 +134,17 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    const result = await transcribeDubUploads(workDir, uploads);
-    return NextResponse.json(result);
+    const result = await transcribeDubUploads(workDir, uploads, {
+      provider,
+      groqKey,
+      groqModel,
+      sourceLanguage,
+    });
+    return NextResponse.json({
+      ...result,
+      providerUsed: provider === "groq" && groqKey ? "groq" : "builtin",
+      realWordTimings: provider === "groq" && !!groqKey,
+    });
   } catch (err) {
     if (err instanceof TranscribeFailure) {
       return bad(err.message, err.status);

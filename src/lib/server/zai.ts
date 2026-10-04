@@ -61,12 +61,14 @@ export async function getZai(): Promise<ZaiInstance> {
 /**
  * One chat completion (thinking disabled) → assistant text.
  * `system` is delivered with the sandbox-verified role layout.
+ * v1.27: `opts.model` passes a GLM model id through (the service accepts
+ * model ids like "glm-4.6" / "glm-4.5-air").
  * Retries once on transient 429 rate limits.
  */
 export async function zaiChatText(
   system: string,
   user: string,
-  opts?: { maxTokens?: number },
+  opts?: { maxTokens?: number; model?: string },
 ): Promise<string> {
   const zai = await getZai();
   const body = {
@@ -76,6 +78,7 @@ export async function zaiChatText(
     ],
     thinking: { type: "disabled" as const },
     ...(opts?.maxTokens ? { max_tokens: opts.maxTokens } : {}),
+    ...(opts?.model ? { model: opts.model } : {}),
   };
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {

@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 import { buildDubScript } from "@/lib/server/dub-script";
 import type { ScriptUtterance } from "@/lib/server/dub-script";
+import { normalizeTextProvider } from "@/lib/server/ai-models";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -65,9 +66,18 @@ export async function POST(req: NextRequest) {
   const style =
     typeof body.style === "string" && body.style.trim() ? body.style.trim().slice(0, 120) : undefined;
 
+  // v1.27: provider + model + keys (Settings tab defaults ride every call).
+  const provider = normalizeTextProvider(body.provider);
+
   try {
-    const result = await buildDubScript({ utterances, sourceLanguage, targetLanguage, style });
-    return NextResponse.json(result);
+    const result = await buildDubScript({ utterances, sourceLanguage, targetLanguage, style, provider });
+    return NextResponse.json({
+      ...result,
+      // Surface which provider actually ran (groq/gemini degrade to builtin
+      // when their key is missing — the UI shows the truth).
+      providerUsed: provider.provider,
+      modelUsed: provider.model ?? "",
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Script generation failed";
     return bad(message, 500);

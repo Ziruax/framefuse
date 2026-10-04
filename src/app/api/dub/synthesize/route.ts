@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 import { synthesizeDubTrack } from "@/lib/server/dub-synthesize";
 import type { DubSynthLine } from "@/lib/server/dub-synthesize";
+import type { WarpWord } from "@/lib/server/word-warp";
 import { pairsCached } from "@/lib/server/edge-tts";
 import { dubLocaleForLang } from "@/lib/server/dub-langs";
 
@@ -26,12 +27,34 @@ function parseLines(raw: unknown): DubSynthLine[] | null {
     if (typeof e.endMs !== "number" || !Number.isFinite(e.endMs)) return null;
     const speaker =
       typeof e.speaker === "number" && Number.isFinite(e.speaker) ? Math.round(e.speaker) : 0;
+    // v1.27: optional original-utterance word timings (absolute timeline ms)
+    // — the word-to-word timing match uses these.
+    let sourceWords: DubSynthLine["sourceWords"];
+    if (Array.isArray(e.sourceWords)) {
+      const words: WarpWord[] = [];
+      for (const w of e.sourceWords) {
+        if (
+          w &&
+          typeof w === "object" &&
+          typeof (w as Record<string, unknown>).startMs === "number" &&
+          typeof (w as Record<string, unknown>).endMs === "number"
+        ) {
+          const ww = w as { startMs: number; endMs: number };
+          words.push({
+            startMs: Math.max(0, Math.round(ww.startMs)),
+            endMs: Math.max(0, Math.round(ww.endMs)),
+          });
+        }
+      }
+      if (words.length >= 2) sourceWords = words;
+    }
     out.push({
       speaker,
       sourceText: e.sourceText,
       translatedText: e.translatedText,
       startMs: Math.round(e.startMs),
       endMs: Math.round(e.endMs),
+      ...(sourceWords ? { sourceWords } : {}),
     });
   }
   return out;
@@ -94,6 +117,9 @@ export async function POST(req: NextRequest) {
     typeof singleVoiceRaw === "string" && singleVoiceRaw.trim() ? singleVoiceRaw.trim() : null;
 
   const voices = parseVoiceMap(body.voices);
+  // v1.27: word-to-word timing (default true) — warp the dub so its words
+  // land on the original speaker's word timings when available.
+  const wordTiming = body.wordTiming === undefined ? true : body.wordTiming !== false;
 
   try {
     const result = await synthesizeDubTrack({
@@ -102,6 +128,7 @@ export async function POST(req: NextRequest) {
       lines,
       voices,
       singleVoice,
+      wordTiming,
     });
     return NextResponse.json(result);
   } catch (err) {

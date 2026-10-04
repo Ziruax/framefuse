@@ -875,6 +875,10 @@ export interface DubSettings {
   singleVoice: string | null;
   /** Original-audio level under the dub (0..1) — the duck. */
   originalVolume: number;
+  /** v1.27: word-to-word timing match — warp the dub so its words land on
+   *  the ORIGINAL speaker's word timings (naturalness-guardrailed). Absent
+   *  (old persisted prefs) reads as ON at the call sites. */
+  wordTiming?: boolean;
 }
 
 /** Renderer-side view of DUB.runDub's result (the main process returns it
@@ -891,6 +895,15 @@ export interface DubSegmentResult {
   /** Final (probed) audio duration, ms — post atempo fit. */
   ttsDurMs: number;
   speedApplied: number;
+  /** v1.27: "wav" when word-warped (WSOLA), else the raw Edge-TTS "mp3". */
+  format?: "wav" | "mp3";
+  /** v1.27: word-to-word timing diagnostics. */
+  align?: {
+    applied: boolean;
+    reason?: string;
+    maxDriftMs?: number;
+    globalFactor?: number;
+  };
   /** The wav bytes (present on the dub:start result). */
   bytes?: ArrayBuffer;
 }
@@ -934,6 +947,9 @@ export interface DubTranscriptResult {
   totalMs: number;
   utterances: DubTranscriptUtterance[];
   wordCount: number;
+  /** v1.27: true when the word timings are REAL (Groq Whisper timestamps) —
+   *  the builtin cloud ASR estimates them by distribution. */
+  realWordTimings?: boolean;
 }
 
 /** Stage 2 — the editable dubbing script: one line per utterance with the
@@ -953,6 +969,9 @@ export interface DubScriptResult {
   speakerCount: number;
   lines: DubScriptLine[];
   warnings: string[];
+  /** v1.27: which provider wrote the script (Settings tab defaults). */
+  providerUsed?: string;
+  modelUsed?: string;
 }
 
 /** Monotonic sequence for instance ids (unique within the same ms). */
