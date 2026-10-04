@@ -38,10 +38,12 @@ export function videoSourceUrl(
 /**
  * Build the AudioMixer track list from the timeline model — EVERY audio
  * lane:
- *  (a) the music track — pinned at musicStartMs, looping when the user
- *      enabled musicLoop OR the track is shorter than the timeline; volume
- *      = master × music; music-local fade-in/fade-out automation (the
- *      fade-out always ENDS at the video end);
+ *  (a) the music clips (v1.25: N placements, each pinned at its startMs,
+ *      looping when the user enabled clip.loop OR the clip is shorter than
+ *      its remaining window; volume = master × clip; music-local fades —
+ *      the fade-out always ENDS at the video end) — or the LEGACY single
+ *      music track (audioTrack + audio.music* scalars) for unmigrated
+ *      callers;
  *  (b) every BASE-lane video segment's audio at its timeline position with
  *      its trim offset and per-clip volume (scaled by master); speed≠1
  *      clips time-compress via playbackRate (sync-correct twin of atempo);
@@ -59,7 +61,7 @@ export function videoSourceUrl(
 export function buildAudioTracks(
   opts: Pick<
     ExportNativeOptions,
-    "segments" | "imageUrls" | "audioTrack" | "audio" | "totalMs"
+    "segments" | "imageUrls" | "audioTrack" | "musicClips" | "audio" | "totalMs"
   >,
   sfxTracks: AudioTrackData[],
 ): AudioTrackData[] {
@@ -67,7 +69,31 @@ export function buildAudioTracks(
   const totalSec = opts.totalMs / 1000;
   const masterVolume = clampNum(opts.audio?.masterVolume, 0, 2, 1);
 
-  if (opts.audioTrack) {
+  // v1.25 MULTI-MUSIC: N clips → N music branches (each with its own start /
+  // volume / loop; a loop clip spans the remainder of the video). The legacy
+  // single-audioTrack branch below stays for callers that never migrated.
+  if (opts.musicClips && opts.musicClips.length > 0) {
+    const fadeInMs = Math.max(0, clampNum(opts.audio?.fadeInMs, 0, Infinity, 0));
+    const fadeOutMs = Math.max(0, clampNum(opts.audio?.fadeOutMs, 0, Infinity, 0));
+    for (const clip of opts.musicClips) {
+      if (!clip || !clip.url) continue;
+      const startSec = Math.max(0, clampNum(clip.startMs, 0, Infinity, 0) / 1000);
+      const clipDurSec = Math.max(0.01, clampNum(clip.durationMs, 0, Infinity, 0) / 1000);
+      const loop = clip.loop === true || clipDurSec < totalSec - startSec;
+      tracks.push({
+        url: clip.url,
+        startSec,
+        offsetSec: 0,
+        durationSec: loop ? Math.max(0.01, totalSec - startSec) : clipDurSec,
+        volume: masterVolume * clampNum(clip.volume, 0, 2, 1),
+        loop,
+        ...(fadeInMs > 0 ? { fadeInSec: fadeInMs / 1000 } : {}),
+        ...(fadeOutMs > 0
+          ? { fadeOut: { startSec: Math.max(0, totalSec - fadeOutMs / 1000), endSec: totalSec } }
+          : {}),
+      });
+    }
+  } else if (opts.audioTrack) {
     const startSec = Math.max(0, clampNum(opts.audio?.musicStartMs, 0, Infinity, 0) / 1000);
     const trackShorter =
       opts.audioTrack.durationMs != null && opts.audioTrack.durationMs < opts.totalMs;

@@ -1,6 +1,8 @@
 "use client";
 
 // src/components/ScriptWriterSection.tsx — v1.20 AI Script Writer.
+// (v1.25: QWERTY Hindi/Urdu — Hinglish + Roman Urdu language options with a
+// live native-script preview and one-click conversion, via @/lib/translit.)
 //
 // Generates narration scripts with a cloud text model. DEFAULT provider is
 // Google Gemini (Gemini 3.5 Flash Lite — fastest + generous free tier); the
@@ -28,12 +30,14 @@ import {
   Copy,
   ExternalLink,
   KeyRound,
+  Languages,
   Loader2,
   Sparkles,
   Trash2,
 } from "lucide-react";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
+import { transliterate, type TranslitScript } from "@/lib/translit";
 import type { GeminiConfigPayload, ScriptModelCatalog } from "@/lib/merger/types";
 
 // ---------------------------------------------------------------------------
@@ -66,15 +70,56 @@ const WORDS_PER_SECOND = 2.5;
 
 const TONES = ["energetic", "professional", "cinematic", "friendly", "educational"];
 const DURATIONS_SEC = [15, 30, 60, 90, 120];
-const LANGUAGES = [
-  "English",
-  "Urdu",
-  "Hindi",
-  "Arabic",
-  "Spanish",
-  "French",
-  "German",
+
+/** v1.25 language options. `value` is the persisted pref + <select> value;
+ *  `roman` marks the romanized QWERTY variants (turns on the native-script
+ *  preview + convert card); `promptValue` is the EXACT string sent to the
+ *  script:generate IPC — main.js interpolates it into
+ *  "Write the entire script in ${lang}.", so the QWERTY values embed the
+ *  full romanized-script instruction themselves (no main.js change needed);
+ *  `nativeValue` is the select value "Convert script to native" switches to
+ *  so later edits/regenerations stay in native script. */
+interface LanguageOption {
+  value: string;
+  label: string;
+  roman?: TranslitScript;
+  promptValue: string;
+  nativeValue?: string;
+}
+const LANGUAGES: LanguageOption[] = [
+  { value: "English", label: "English", promptValue: "English" },
+  {
+    value: "Hinglish (Hindi · QWERTY)",
+    label: "Hinglish (Hindi · QWERTY)",
+    roman: "hi",
+    promptValue:
+      'Hindi written in ROMANIZED Latin script (Hinglish, as typed on an English QWERTY keyboard — e.g. "kya haal hai dosto, aaj hum...") — NOT Devanagari',
+    nativeValue: "Hindi (Devanagari)",
+  },
+  {
+    value: "Roman Urdu (Urdu · QWERTY)",
+    label: "Roman Urdu (Urdu · QWERTY)",
+    roman: "ur",
+    promptValue:
+      'Urdu written in ROMANIZED Latin script (Roman Urdu, as typed on an English QWERTY keyboard — e.g. "kya haal hai dost, aaj hum...") — NOT Nastaliq script',
+    nativeValue: "Urdu (Nastaliq)",
+  },
+  { value: "Hindi (Devanagari)", label: "Hindi (Devanagari)", promptValue: "Hindi" },
+  { value: "Urdu (Nastaliq)", label: "Urdu (Nastaliq)", promptValue: "Urdu" },
+  { value: "Arabic", label: "Arabic", promptValue: "Arabic" },
+  { value: "Spanish", label: "Spanish", promptValue: "Spanish" },
+  { value: "French", label: "French", promptValue: "French" },
+  { value: "German", label: "German", promptValue: "German" },
 ];
+
+/** v1.25 migration: prefs saved by older builds map onto the romanized
+ *  QWERTY variants (the friendlier default for Hindi/Urdu writers on an
+ *  English keyboard); anything unknown falls back to English. */
+function normalizeLanguage(saved: string): string {
+  if (saved === "Hindi") return "Hinglish (Hindi · QWERTY)";
+  if (saved === "Urdu") return "Roman Urdu (Urdu · QWERTY)";
+  return LANGUAGES.some((l) => l.value === saved) ? saved : "English";
+}
 
 // ---------------------------------------------------------------------------
 // localStorage persistence (app-level preference, never in project files).
@@ -114,9 +159,7 @@ function loadPrefs(): ScriptWriterPrefs {
           ? Number(j.durationSec)
           : 60,
       language:
-        typeof j.language === "string" && LANGUAGES.includes(j.language)
-          ? j.language
-          : "English",
+        typeof j.language === "string" ? normalizeLanguage(j.language) : "English",
       lastScript: typeof j.lastScript === "string" ? j.lastScript : "",
     };
   } catch {
@@ -148,6 +191,7 @@ export default function ScriptWriterSection() {
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
+  const [nativeCopied, setNativeCopied] = useState(false);
 
   const api = typeof window !== "undefined" ? window.electronAPI : undefined;
 
@@ -301,6 +345,15 @@ export default function ScriptWriterSection() {
   );
   const estSec = Math.round(scriptWords / WORDS_PER_SECOND);
 
+  // ── v1.25: romanized (QWERTY) language support ──────────────────────────
+  const activeLanguage =
+    LANGUAGES.find((l) => l.value === prefs.language) ?? LANGUAGES[0];
+  const romanScript = activeLanguage.roman ?? null;
+  const nativePreview = useMemo(
+    () => (romanScript && script.trim() ? transliterate(script, romanScript) : ""),
+    [romanScript, script],
+  );
+
   const generate = useCallback(async () => {
     const gen = api?.scriptGenerate;
     const topic = prefs.prompt.trim();
@@ -318,7 +371,7 @@ export default function ScriptWriterSection() {
         prompt: topic,
         tone: prefs.tone,
         durationSec: prefs.durationSec,
-        language: prefs.language,
+        language: activeLanguage.promptValue,
       });
       if (r.ok) {
         updatePrefs({ lastScript: r.text });
@@ -338,7 +391,7 @@ export default function ScriptWriterSection() {
     } finally {
       setGenerating(false);
     }
-  }, [api, model, prefs, provider, updatePrefs]);
+  }, [activeLanguage, api, model, prefs, provider, updatePrefs]);
 
   const copyScript = useCallback(async () => {
     const t = script.trim();
@@ -356,6 +409,40 @@ export default function ScriptWriterSection() {
       });
     }
   }, [script]);
+
+  /** Copy the transliterated native script (for TTS voices + captions). */
+  const copyNativeScript = useCallback(async () => {
+    const t = nativePreview.trim();
+    if (!t) return;
+    try {
+      await navigator.clipboard.writeText(t);
+      setNativeCopied(true);
+      toast.success("Native script copied", {
+        description: `Paste it into the Voiceover narration field — ${
+          romanScript === "hi" ? "hi-IN" : "ur-PK"
+        } voices read it natively.`,
+      });
+      setTimeout(() => setNativeCopied(false), 1500);
+    } catch (err) {
+      toast.error("Copy failed", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }, [nativePreview, romanScript]);
+
+  /** Replace the romanized script with its native-script transliteration and
+   *  flip the language to the native variant, so edits + regenerations stay
+   *  native (persisted through the normal prefs mechanism). */
+  const convertToNative = useCallback(() => {
+    if (!romanScript || !script.trim() || !activeLanguage.nativeValue) return;
+    updatePrefs({
+      lastScript: transliterate(script, romanScript),
+      language: activeLanguage.nativeValue,
+    });
+    toast.success("Script converted to native script", {
+      description: `Language switched to ${activeLanguage.nativeValue} — edits and regenerations stay native.`,
+    });
+  }, [activeLanguage, romanScript, script, updatePrefs]);
 
   // ── Render ───────────────────────────────────────────────────────────────
 
@@ -614,64 +701,72 @@ export default function ScriptWriterSection() {
             aria-label="Script topic prompt"
           />
 
-          {/* ── Tone / duration / language ── */}
-          <div className="mb-2.5 grid grid-cols-3 gap-1.5">
-            <div>
-              <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
-                Tone
-              </label>
-              <select
-                value={prefs.tone}
-                onChange={(e) => updatePrefs({ tone: e.target.value })}
-                className={selectCls}
-                style={{ borderColor: "#332e28" }}
-                aria-label="Script tone"
-              >
-                {TONES.map((t) => (
-                  <option key={t} value={t}>
-                    {t[0].toUpperCase() + t.slice(1)}
-                  </option>
-                ))}
-              </select>
+          {/* ── Tone / duration / language (+ QWERTY hint) ── */}
+          <div className="mb-2.5">
+            <div className="grid grid-cols-3 gap-1.5">
+              <div>
+                <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
+                  Tone
+                </label>
+                <select
+                  value={prefs.tone}
+                  onChange={(e) => updatePrefs({ tone: e.target.value })}
+                  className={selectCls}
+                  style={{ borderColor: "#332e28" }}
+                  aria-label="Script tone"
+                >
+                  {TONES.map((t) => (
+                    <option key={t} value={t}>
+                      {t[0].toUpperCase() + t.slice(1)}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
+                  Duration
+                </label>
+                <select
+                  value={prefs.durationSec}
+                  onChange={(e) =>
+                    updatePrefs({ durationSec: Number(e.target.value) })
+                  }
+                  className={selectCls}
+                  style={{ borderColor: "#332e28" }}
+                  aria-label="Target script duration"
+                >
+                  {DURATIONS_SEC.map((d) => (
+                    <option key={d} value={d}>
+                      {d}s
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
+                  Language
+                </label>
+                <select
+                  value={prefs.language}
+                  onChange={(e) => updatePrefs({ language: e.target.value })}
+                  className={selectCls}
+                  style={{ borderColor: "#332e28" }}
+                  aria-label="Script language"
+                >
+                  {LANGUAGES.map((l) => (
+                    <option key={l.value} value={l.value}>
+                      {l.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
             </div>
-            <div>
-              <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
-                Duration
-              </label>
-              <select
-                value={prefs.durationSec}
-                onChange={(e) =>
-                  updatePrefs({ durationSec: Number(e.target.value) })
-                }
-                className={selectCls}
-                style={{ borderColor: "#332e28" }}
-                aria-label="Target script duration"
-              >
-                {DURATIONS_SEC.map((d) => (
-                  <option key={d} value={d}>
-                    {d}s
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
-                Language
-              </label>
-              <select
-                value={prefs.language}
-                onChange={(e) => updatePrefs({ language: e.target.value })}
-                className={selectCls}
-                style={{ borderColor: "#332e28" }}
-                aria-label="Script language"
-              >
-                {LANGUAGES.map((l) => (
-                  <option key={l} value={l}>
-                    {l}
-                  </option>
-                ))}
-              </select>
-            </div>
+            {romanScript && (
+              <p className="mt-1 text-[10px] leading-relaxed text-stone-500">
+                Type however you like — the generator writes romanized; convert
+                to native script for perfect TTS voices.
+              </p>
+            )}
           </div>
 
           {/* ── Generate ── */}
@@ -728,6 +823,64 @@ export default function ScriptWriterSection() {
                     <Copy size={10} />
                   )}
                   {copied ? "Copied" : "Copy"}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* ── v1.25: native-script preview (QWERTY languages only) — the
+              transliterated text Edge-TTS voices + burned-in captions need ── */}
+          {romanScript && script && nativePreview && (
+            <div
+              className="mt-2 rounded-lg border p-2.5"
+              style={{
+                borderColor: "rgba(13, 148, 136, 0.35)",
+                backgroundColor: "#10201d",
+              }}
+            >
+              <div className="mb-1.5 flex items-center gap-1.5">
+                <Languages size={12} className="shrink-0" style={{ color: "#2dd4bf" }} />
+                <span
+                  id="ff-scriptwriter-native-preview-label"
+                  className="text-[10px] font-semibold uppercase tracking-wide text-stone-500"
+                >
+                  Native script preview (for TTS &amp; captions)
+                </span>
+              </div>
+              <pre
+                aria-labelledby="ff-scriptwriter-native-preview-label"
+                className="mb-2 max-h-40 overflow-y-auto whitespace-pre-wrap rounded border bg-[#211e1a] px-2 py-1.5 text-[11px] leading-relaxed text-stone-200"
+                style={{ borderColor: "rgba(13, 148, 136, 0.25)" }}
+              >
+                {nativePreview}
+              </pre>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => void copyNativeScript()}
+                  className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-orange-400 transition-colors hover:border-orange-500/40 hover:bg-orange-500/10 disabled:cursor-not-allowed disabled:opacity-50"
+                  style={{ borderColor: "#332e28" }}
+                  title="Copy the transliterated native script to the clipboard"
+                >
+                  {nativeCopied ? (
+                    <Check size={10} className="text-emerald-400" />
+                  ) : (
+                    <Copy size={10} />
+                  )}
+                  {nativeCopied ? "Copied ✓" : "Copy native script"}
+                </button>
+                <button
+                  type="button"
+                  onClick={convertToNative}
+                  className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-semibold text-white transition-colors hover:bg-teal-600"
+                  style={{
+                    borderColor: "rgba(13, 148, 136, 0.5)",
+                    backgroundColor: "#14b8a6",
+                  }}
+                  title="Replace the romanized script with native script and switch the language to the native variant"
+                >
+                  <Languages size={10} />
+                  Convert script to native
                 </button>
               </div>
             </div>

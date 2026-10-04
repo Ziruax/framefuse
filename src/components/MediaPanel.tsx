@@ -62,7 +62,7 @@ import type {
   DisclaimerClip,
   MediaSegment,
   TimelineMode,
-  AudioTrack,
+  MusicClip,
   OverlapWarning,
   SubtitleFile,
   TransitionSettings,
@@ -97,13 +97,15 @@ import { ShieldAlert } from "lucide-react";
 interface MediaPanelProps {
   segments: MediaSegment[];
   mode: TimelineMode | null;
-  audioTrack: AudioTrack | null;
+  /** v1.25 MULTI-MUSIC: the music-clip stack (the timeline Audio lane's
+   *  citizens — the chip list shows one entry per clip). */
+  musicClips: MusicClip[];
   subtitles: SubtitleFile | null;
   skipped: string[];
   warnings: OverlapWarning[];
   onAddFiles: (files: File[]) => void;
-  /** Drag-drop support: audio + .srt + .framefuse.json files are routed too. */
-  onAddAudioFile: (file: File) => void;
+  /** Drag-drop support: ALL dropped audio files become music clips (v1.25). */
+  onAddAudioFiles: (files: File[]) => void;
   onAddSubtitleFile: (file: File) => void;
   /** Open a dropped .framefuse.json project (v4.2). */
   onLoadProjectFile: (file: File) => void;
@@ -114,7 +116,8 @@ interface MediaPanelProps {
   openVideoPicker: () => void;
   openAudioPicker: () => void;
   openSubtitlePicker: () => void;
-  onRemoveAudio: () => void;
+  /** Removes ONE music clip by id (v1.25). */
+  onRemoveMusicClip: (id: string) => void;
   onRemoveSubtitles: () => void;
   onRemove: (id: string) => void;
   onOverride: (id: string, durationMs: number) => void;
@@ -213,12 +216,12 @@ const isProjectFile = (f: File) =>
 export function MediaPanelBase({
   segments,
   mode,
-  audioTrack,
+  musicClips,
   subtitles,
   skipped,
   warnings,
   onAddFiles,
-  onAddAudioFile,
+  onAddAudioFiles,
   onAddSubtitleFile,
   onLoadProjectFile,
   onLoadSamples,
@@ -226,7 +229,7 @@ export function MediaPanelBase({
   openVideoPicker,
   openAudioPicker,
   openSubtitlePicker,
-  onRemoveAudio,
+  onRemoveMusicClip,
   onRemoveSubtitles,
   onRemove,
   onOverride,
@@ -385,7 +388,8 @@ export function MediaPanelBase({
     );
     if (projects.length) onLoadProjectFile(projects[projects.length - 1]);
     if (images.length || videos.length) onAddFiles([...images, ...videos]);
-    if (audio.length) onAddAudioFile(audio[audio.length - 1]);
+    // v1.25: every dropped audio file becomes its own music-clip stack entry.
+    if (audio.length) onAddAudioFiles(audio);
     if (srts.length) onAddSubtitleFile(srts[srts.length - 1]);
   };
 
@@ -783,7 +787,7 @@ export function MediaPanelBase({
             ["all", "All", segments.length, Layers],
             ["videos", "Videos", videoSegCount, Video],
             ["images", "Images", imageSegCount, ImageIcon],
-            ["audio", "Audio", (audioTrack ? 1 : 0) + (sfxItems?.length ?? 0), Music],
+            ["audio", "Audio", musicClips.length + (sfxItems?.length ?? 0), Music],
             ["subs", "Subs", subtitles ? subtitles.cues.length : 0, CaptionsIcon],
           ] as const
         ).map(([tab, label, count, Icon]) => {
@@ -959,7 +963,7 @@ export function MediaPanelBase({
             the track card, beat sync and the SFX palette). */}
         {mediaTab === "audio" && (
           <div className="space-y-1.5 p-3">
-            {!audioTrack && (
+            {musicClips.length === 0 && (
               <button
                 type="button"
                 onClick={openAudioPicker}
@@ -967,10 +971,10 @@ export function MediaPanelBase({
               >
                 <Music className="mb-2 size-5" style={{ color: "#8f887f" }} />
                 <span className="text-[12px] font-medium" style={{ color: "#e7e5e4" }}>
-                  Attach an audio track
+                  Attach background music
                 </span>
                 <span className="mt-1 text-[10px]" style={{ color: "#78716c" }}>
-                  MP3 · WAV · M4A · OGG — music or voiceover, mixed into the export
+                  MP3 · WAV · M4A · OGG — add as many tracks as you like; they stack on the Audio lane
                 </span>
               </button>
             )}
@@ -1946,9 +1950,11 @@ export function MediaPanelBase({
                 media) and the populated library (list + grid views). */}
             {disclaimerSection}
 
-            {/* Audio track chip — v1.3: lives on All + Audio tabs. */}
-            {audioTrack && (mediaTab === "all" || mediaTab === "audio") && (
+            {/* Music track chips (v1.25: ONE PER CLIP) — All + Audio tabs. */}
+            {musicClips.map((clip) =>
+              (mediaTab === "all" || mediaTab === "audio") && (
               <div
+                key={clip.id}
                 className="flex items-center gap-2.5 rounded-lg border p-2 transition-colors"
                 style={{
                   borderColor: "rgba(13, 148, 136, 0.45)",
@@ -1968,31 +1974,35 @@ export function MediaPanelBase({
                   <div
                     className="truncate text-[11px] font-medium"
                     style={{ color: "#b5aea3" }}
-                    title={audioTrack.fileName}
+                    title={clip.fileName}
                   >
-                    {audioTrack.fileName}
+                    {clip.fileName}
                   </div>
                   <div className="text-[9px]" style={{ color: "#8f887f" }}>
-                    audio track
-                    {audioTrack.durationMs
-                      ? ` · ${fmtTimecode(audioTrack.durationMs)}`
+                    music track · {fmtTimecode(Math.max(0, clip.startMs))}
+                    {clip.loop ? " · loop" : ""}
+                    {clip.durationMs
+                      ? ` · ${fmtTimecode(clip.durationMs)}`
                       : ""}
                   </div>
                 </div>
                 <button
                   type="button"
-                  onClick={onRemoveAudio}
+                  onClick={() => onRemoveMusicClip(clip.id)}
                   className="shrink-0 rounded p-1 transition-colors hover:bg-rose-500/15"
                   style={{ color: "#78716c" }}
-                  title="Remove audio"
+                  title="Remove this music track"
+                  aria-label={`Remove ${clip.fileName}`}
                 >
                   <Trash2 className="size-3.5" />
                 </button>
               </div>
+              ),
             )}
 
-            {/* Beat-sync card (v4.6) — cut on the pulse. v1.3: All + Audio tabs. */}
-            {audioTrack && (mediaTab === "all" || mediaTab === "audio") && (
+            {/* Beat-sync card (v4.6) — cut on the pulse. v1.3: All + Audio tabs.
+                v1.25: driven by the PRIMARY music clip (stack index 0). */}
+            {musicClips.length > 0 && (mediaTab === "all" || mediaTab === "audio") && (
               <div
                 className="rounded-lg border p-2.5"
                 style={{
@@ -2125,10 +2135,10 @@ export function MediaPanelBase({
                     <button
                       type="button"
                       onClick={onFitToAudio}
-                      disabled={beatBusy || !audioTrack.durationMs}
+                      disabled={beatBusy || !(musicClips[0]?.durationMs > 0)}
                       className={cn(
                         "flex items-center justify-center gap-1 rounded-md border px-1.5 py-1.5 text-[9px] font-semibold transition-all",
-                        beatBusy || !audioTrack.durationMs
+                        beatBusy || !(musicClips[0]?.durationMs > 0)
                           ? "cursor-not-allowed opacity-40"
                           : "hover:-translate-y-px hover:brightness-125",
                       )}

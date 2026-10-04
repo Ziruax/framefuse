@@ -1407,7 +1407,8 @@ function planSmartSegments(o) {
  *                    //   dw, dh, chroma, a, b, fps }] (built by main.js via
  *                    //   buildOverlaySpecsForWindow(0, totalMs))
  *   audio,           // AudioSettings
- *   audioPath,       // music absolute path | null
+ *   audioPath,       // music absolute path | null (LEGACY single)
+ *   musicTracks,     // v1.25: [{ path, startMs, volume, loop }] music clips
  *   sfx,             // [{ wavPath, startMs, volume }]
  *   voiceovers,      // v1.17: same shape — narration MP3s + dub WAVs
  *   clipAudio,       // [{ inputIdx (= base segment index), startMs, volume,
@@ -1482,7 +1483,9 @@ function buildSinglePassPlan(o) {
     const clipAudioList = Array.isArray(clipAudio) ? clipAudio : [];
     const sfxList = Array.isArray(sfx) ? sfx : [];
     const voList = Array.isArray(o.voiceovers) ? o.voiceovers : [];
-    if (!(clipAudioList.length > 0 || audioPath || sfxList.length > 0 || voList.length > 0)) {
+    if (!(clipAudioList.length > 0 || audioPath ||
+          (Array.isArray(o.musicTracks) && o.musicTracks.some((t) => t && t.path)) ||
+          sfxList.length > 0 || voList.length > 0)) {
       return {
         inputs: [], script: "", hasAudioOut: false, videoOutLabel: null,
         warnings, scriptBytes: 0,
@@ -1510,14 +1513,28 @@ function buildSinglePassPlan(o) {
       idx += 1;
     }
     inputs.push(...branchInputs);
-    const loopMusic = !!(audioPath && audio && audio.musicLoop);
-    if (audioPath) {
+    // v1.25 MULTI-MUSIC: N music inputs (each with its own -stream_loop when
+    // the clip loops) — else the legacy single music input. Input layout:
+    // clips, music, sfx, voiceovers (same order the two-step graph uses).
+    const musicTracks = Array.isArray(o.musicTracks)
+      ? o.musicTracks.filter((t) => t && typeof t.path === "string" && t.path)
+      : [];
+    const hasMusicClips = musicTracks.length > 0;
+    const loopMusic = !hasMusicClips && !!(audioPath && audio && audio.musicLoop);
+    if (hasMusicClips) {
+      musicTracks.forEach((t) => {
+        inputs.push("-thread_queue_size", "512");
+        if (t.loop) inputs.push("-stream_loop", "-1");
+        inputs.push("-i", t.path);
+      });
+      idx += musicTracks.length;
+    } else if (audioPath) {
       inputs.push("-thread_queue_size", "512");
       if (loopMusic) inputs.push("-stream_loop", "-1");
       inputs.push("-i", audioPath);
     }
     const musicInputIdx = idx;
-    if (audioPath) idx += 1;
+    if (audioPath && !hasMusicClips) idx += 1;
     const sfxRefs = [];
     sfxList.forEach((s) => {
       inputs.push("-thread_queue_size", "512", "-i", s.wavPath);
@@ -1536,7 +1553,14 @@ function buildSinglePassPlan(o) {
       totalSec: totalMs / 1000,
       audio,
       clipAudio: branchRefs,
-      hasMusic: !!audioPath,
+      musicTracks: hasMusicClips
+        ? musicTracks.map((t, k) => ({
+            inputIdx: branchRefs.length + k,
+            startMs: t.startMs,
+            volume: t.volume,
+          }))
+        : undefined,
+      hasMusic: !!audioPath && !hasMusicClips,
       musicInputIdx,
       loudnorm,
       masterLoudnorm,
@@ -1806,16 +1830,31 @@ function buildSinglePassPlan(o) {
   const clipAudioList = Array.isArray(clipAudio) ? clipAudio : [];
   const voList = Array.isArray(o.voiceovers) ? o.voiceovers : [];
   const hasAudioOut = !videoOnly &&
-    (clipAudioList.length > 0 || !!audioPath || sfxList.length > 0 || voList.length > 0);
+    (clipAudioList.length > 0 || !!audioPath ||
+      (Array.isArray(o.musicTracks) && o.musicTracks.some((t) => t && t.path)) ||
+      sfxList.length > 0 || voList.length > 0);
   if (hasAudioOut) {
-    const loopMusic = !!(audioPath && audio && audio.musicLoop);
-    if (audioPath) {
+    // v1.25 MULTI-MUSIC: N music inputs after the video inputs (each with
+    // its own -stream_loop), else the legacy single music input.
+    const musicTracks = Array.isArray(o.musicTracks)
+      ? o.musicTracks.filter((t) => t && typeof t.path === "string" && t.path)
+      : [];
+    const hasMusicClips = musicTracks.length > 0;
+    const loopMusic = !hasMusicClips && !!(audioPath && audio && audio.musicLoop);
+    if (hasMusicClips) {
+      musicTracks.forEach((t) => {
+        inputs.push("-thread_queue_size", "512");
+        if (t.loop) inputs.push("-stream_loop", "-1");
+        inputs.push("-i", t.path);
+      });
+      idx += musicTracks.length;
+    } else if (audioPath) {
       inputs.push("-thread_queue_size", "512");
       if (loopMusic) inputs.push("-stream_loop", "-1");
       inputs.push("-i", audioPath);
     }
     const musicInputIdx = idx;
-    if (audioPath) idx += 1;
+    if (audioPath && !hasMusicClips) idx += 1;
     sfxList.forEach((s) => {
       inputs.push("-thread_queue_size", "512", "-i", s.wavPath);
       s.inputIdx = idx;
@@ -1838,7 +1877,14 @@ function buildSinglePassPlan(o) {
         volume: c.volume,
         atempo: c.atempo,
       })),
-      hasMusic: !!audioPath,
+      musicTracks: hasMusicClips
+        ? musicTracks.map((t, k) => ({
+            inputIdx: musicInputIdx - musicTracks.length + k,
+            startMs: t.startMs,
+            volume: t.volume,
+          }))
+        : undefined,
+      hasMusic: !!audioPath && !hasMusicClips,
       musicInputIdx,
       loudnorm,
       masterLoudnorm,

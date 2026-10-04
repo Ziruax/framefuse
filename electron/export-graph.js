@@ -1139,6 +1139,14 @@ const AFORMAT = "aformat=sample_rates=48000:channel_layouts=stereo";
  * Music keeps the v4.9 post-processing settings (loudnorm / fades) on its
  * own branch; apad pads the mix to the full video length so -shortest can
  * never truncate the video. With a single branch the amix stage is skipped.
+ * v1.25 MULTI-MUSIC: when `o.musicTracks` is present (N clips, refs built
+ * by the caller with their input indexes) the music side becomes N branches
+ * in the SFX/VO template — `[iK:a] volume, afade?, afade?, adelay, aformat
+ * [mK]` — one per clip (each with its own start / volume; the input itself
+ * carries `-stream_loop -1` when clip.loop). The LEGACY single-music branch
+ * (hasMusic + musicInputIdx + the audio.music* scalars) stays byte-identical
+ * for old payloads; loudnorm never touches the N-clip branches (same
+ * contract as the SFX WAVs — user-volume music, master bus guards the sum).
  */
 function buildAudioMixGraph(o) {
   const totalSec = Number(o && o.totalSec) || 0;
@@ -1190,7 +1198,31 @@ function buildAudioMixGraph(o) {
     branches.push({ label, chain: `[${c.inputIdx}:a]${parts.join(",")}${label}` });
   });
 
-  if (o && o.hasMusic) {
+  const multiMusic = Array.isArray(o && o.musicTracks) ? o.musicTracks.filter(Boolean) : [];
+  if (multiMusic.length > 0) {
+    // v1.25 MULTI-MUSIC — one SFX-style branch per clip (volume + optional
+    // music-local fades + adelay + aformat). No loudnorm here: the branches
+    // are user-volume music placements; the master bus (volume + estimated
+    // loudnorm + limiter below) guards the summed level.
+    multiMusic.forEach((t, k) => {
+      const vol = clampNum(t.volume, 0, 2, 1);
+      const d = Math.max(0, Math.round(Number(t.startMs) || 0));
+      const m = [];
+      if (vol !== 1) m.push(`volume=${String(vol)}`);
+      if (audio.fadeInMs > 0) {
+        m.push(`afade=t=in:st=0:d=${(audio.fadeInMs / 1000).toFixed(3)}`);
+      }
+      if (audio.fadeOutMs > 0) {
+        // Stream-local (clip) time — the fade ENDs at the video end (same
+        // alignment rule as the legacy single-music branch below).
+        const start = Math.max(0, totalSec - d / 1000 - audio.fadeOutMs / 1000);
+        m.push(`afade=t=out:st=${start.toFixed(3)}:d=${(audio.fadeOutMs / 1000).toFixed(3)}`);
+      }
+      if (d > 0) m.push(`adelay=${d}|${d}`);
+      m.push(AFORMAT);
+      branches.push({ label: `[m${k}]`, chain: `[${t.inputIdx}:a]${m.join(",")}[m${k}]` });
+    });
+  } else if (o && o.hasMusic) {
     // v5.2 music placement: [volume] → [loudnorm] → [fades (music-local)]
     // → [adelay=startMs] → aformat. adelay comes LAST so loudnorm/fades
     // measure the music itself, not the leading silence; the fade-out end
@@ -1380,8 +1412,9 @@ function estimateMixLoudnessDb(o) {
  * normalize + volumes + adelay + amix + master volume) to a temp WAV — the
  * first half of the master-bus loudnorm path. main.js then MEASURES this
  * WAV and muxes it with the measured master gain (see buildConcatArgs'
- * masterMix mode). Inputs: music (with loop flags) + clip WAVs + SFX WAVs,
- * in that order — indexes are assigned here, 0-based.
+ * masterMix mode). Inputs: music (N v1.25 clips with loop flags, or the
+ * legacy single) + clip WAVs + SFX WAVs, in that order — indexes are
+ * assigned here, 0-based.
  * totalSec (the ACTUAL concat length) is passed through to the graph for the
  * music fade-out alignment AND used as the output -t cap — the looped music
  * input is infinite (amix duration=longest + no video stream here), so the
@@ -1395,16 +1428,28 @@ function buildAudioMixRenderArgs(o) {
     : [];
   const sfxList = Array.isArray(o && o.sfx) ? o.sfx.filter((s) => s && typeof s.wavPath === "string" && s.wavPath) : [];
   const voList = Array.isArray(o && o.voiceovers) ? o.voiceovers.filter((v) => v && typeof v.wavPath === "string" && v.wavPath) : [];
+  // v1.25 MULTI-MUSIC: N clip inputs first (each with its own -stream_loop),
+  // else the legacy single music input.
+  const musicTracks = Array.isArray(o && o.musicTracks)
+    ? o.musicTracks.filter((t) => t && typeof t.path === "string" && t.path)
+    : [];
+  const hasMusicClips = musicTracks.length > 0;
   const hasMusic = !!o.audioPath;
   const loopMusic = hasMusic && !!(audio.musicLoop);
   const args = [];
   let idx = 0;
-  if (hasMusic) {
+  if (hasMusicClips) {
+    musicTracks.forEach((t) => {
+      if (t.loop) args.push("-stream_loop", "-1");
+      args.push("-i", t.path);
+      idx += 1;
+    });
+  } else if (hasMusic) {
     if (loopMusic) args.push("-stream_loop", "-1");
     args.push("-i", o.audioPath);
     idx = 1;
   }
-  const musicIdx = hasMusic ? 0 : -1;
+  const musicIdx = hasMusic && !hasMusicClips ? 0 : -1;
   const clipBase = idx;
   clipAudio.forEach((c) => { args.push("-i", c.wavPath); idx += 1; });
   const sfxBase = idx;
@@ -1422,7 +1467,14 @@ function buildAudioMixRenderArgs(o) {
       startMs: c.startMs,
       volume: c.volume,
     })),
-    hasMusic,
+    hasMusic: hasMusic && !hasMusicClips,
+    musicTracks: hasMusicClips
+      ? musicTracks.map((t, k) => ({
+          inputIdx: k,
+          startMs: t.startMs,
+          volume: t.volume,
+        }))
+      : undefined,
     musicInputIdx: musicIdx,
     loudnorm: o.loudnorm,
     rawMix: true,
@@ -1979,24 +2031,40 @@ function buildConcatArgs(o) {
       "-movflags", "+faststart", "-y", o.outputPath,
     ];
   }
+  // v1.25 MULTI-MUSIC: the clip stack arrives as o.musicTracks
+  // ([{ path, startMs, volume, loop }…]) — N inputs, each with its own
+  // -stream_loop when the clip loops. The legacy single path (o.audioPath +
+  // audio.music*) keeps its exact v5.2 argv below.
+  const musicTracks = Array.isArray(o.musicTracks)
+    ? o.musicTracks.filter((t) => t && typeof t.path === "string" && t.path)
+    : [];
+  const hasMusicClips = musicTracks.length > 0;
+  const hasMusic = !!o.audioPath || hasMusicClips;
   // v5.2: loop-to-fill — -stream_loop -1 makes the music input infinite;
   // -shortest (video stream) + apad=whole_dur cap the output at the video
   // length, so the track repeats until the video ends.
-  const loopMusic = hasMusic && !!(o.audio && o.audio.musicLoop);
+  const loopMusic = !hasMusicClips && hasMusic && !!(o.audio && o.audio.musicLoop);
   const args = ["-f", "concat", "-safe", "0", "-i", o.concatListPath];
-  // Input layout: 0 = concat video (audio-less clips), 1 = music (when
-  // present), then the pre-extracted clip-audio WAVs, then the SFX WAVs.
-  if (hasMusic) {
+  // Input layout: 0 = concat video (audio-less clips), 1..N = music (clips
+  // or the legacy single), then the pre-extracted clip-audio WAVs, then the
+  // SFX WAVs, then the VO inputs.
+  if (hasMusicClips) {
+    musicTracks.forEach((t) => {
+      if (t.loop) args.push("-stream_loop", "-1");
+      args.push("-i", t.path);
+    });
+  } else if (hasMusic) {
     if (loopMusic) args.push("-stream_loop", "-1");
     args.push("-i", o.audioPath);
   }
   const musicIdx = 1;
-  const clipBase = hasMusic ? 2 : 1;
+  const musicCount = hasMusicClips ? musicTracks.length : hasMusic ? 1 : 0;
+  const clipBase = 1 + musicCount;
   clipAudio.forEach((c) => args.push("-i", c.wavPath));
   const sfxBase = clipBase + clipAudio.length;
   sfxList.forEach((s) => args.push("-i", s.wavPath));
   // v1.17: VO inputs after the SFX inputs (input layout: 0 = concat video,
-  // 1 = music, then clip WAVs, SFX WAVs, VO MP3/WAVs).
+  // 1..N = music, then clip WAVs, SFX WAVs, VO MP3/WAVs).
   const voBase = sfxBase + sfxList.length;
   voList.forEach((v) => args.push("-i", v.wavPath));
   // ALWAYS -c copy for video (captions already burned in step 1)
@@ -2012,7 +2080,16 @@ function buildConcatArgs(o) {
           startMs: c.startMs,
           volume: c.volume,
         })),
-        hasMusic,
+        // v1.25: N-clip music refs own the graph's music side when present;
+        // otherwise the legacy single branch (loudnorm + music scalars).
+        musicTracks: hasMusicClips
+          ? musicTracks.map((t, k) => ({
+              inputIdx: 1 + k,
+              startMs: t.startMs,
+              volume: t.volume,
+            }))
+          : undefined,
+        hasMusic: !hasMusicClips && hasMusic,
         musicInputIdx: musicIdx,
         loudnorm: o.loudnorm,
         // v1.14.5: simple-audio fast path — static per-branch + master gains
@@ -2036,7 +2113,7 @@ function buildConcatArgs(o) {
         "-shortest",
       );
     }
-  } else if (hasMusic) {
+  } else if (hasMusic && !hasMusicClips) {
     // Audio chain (v5.2): [volume] → [normalize] → [fade in] → [fade out]
     // → [adelay=startMs] → [pad to video length]. Fades run in MUSIC-local
     // time (before adelay) so loudnorm/fades never measure leading silence;

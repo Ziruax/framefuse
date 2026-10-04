@@ -47,6 +47,7 @@ import type { LucideIcon } from "lucide-react";
 import type {
   AudioSettings,
   CaptionSettings,
+  MusicClip,
   HeadlineItem,
   KenBurnsConfig,
   SubtitleFile,
@@ -115,9 +116,22 @@ import { ANIMATION_LABELS } from "@/lib/merger/captionAnimations";
 import type { WhisperProgress } from "@/lib/merger/whisper";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
+// v1.25: QWERTY (romanized) Hindi/Urdu detection for the voice pickers.
+import { localeWantsTranslit } from "@/lib/translit";
 // v1.20: AI Script Writer (Gemini default + Groq chat models) — mounted in
 // the Audio tab, right after Voiceover.
 import ScriptWriterSection from "./ScriptWriterSection";
+// v1.25: shared Edge-TTS catalog hook (was in-file above VoiceoverSection).
+import { useTtsVoices } from "./use-tts-voices";
+// v1.25: AI Text-to-Speech Studio (Dubbing tab) + the shared voice-filter
+// helpers the Voiceover picker reuses.
+import TtsStudioSection, {
+  filterTtsVoices,
+  resolveQwertyText,
+  StudioToggle,
+  VoiceGenderChips,
+  type VoiceGenderFilter,
+} from "./TtsStudioSection";
 // v1.15: burn-in text detection (tesseract.js) + STT engine routing.
 import { detectTextRegions } from "@/lib/merger/textDetect";
 // v1.15: STT engine routing (Groq cloud vs local) — an app-level device
@@ -146,6 +160,7 @@ const WHISPER_LANGUAGES: { value: string; label: string }[] = [
   { value: "zh", label: "Chinese" },
   { value: "ar", label: "Arabic" },
   { value: "hi", label: "Hindi" },
+  { value: "ur", label: "Urdu" },
   { value: "tr", label: "Turkish" },
   { value: "pl", label: "Polish" },
   { value: "vi", label: "Vietnamese" },
@@ -202,19 +217,24 @@ interface SettingsPanelProps {
   inElectron: boolean;
   subtitles: SubtitleFile | null;
   hasAudio: boolean;
-  /** ── v1.24: Background music ──
-   * The pinned music track (page's audioTrack) for the dedicated picker
-   * card: a direct "choose file" flow that skips the media library. */
-  musicTrack: { fileName: string; durationMs: number | null } | null;
-  /** Opens the OS audio file picker (page's hidden <input accept="audio/*">). */
-  openMusicPicker: () => void;
-  /** Drops the pinned music track (one undo step). */
-  onRemoveMusic: () => void;
+  /** ── v1.25: Background music — the MULTI-CLIP stack ──
+   * The Audio tab card and the timeline Audio lane share this stack: N
+   * independently draggable/volume/loop-controllable music clips. */
+  musicClips: MusicClip[];
+  /** Opens the OS audio file picker (multi-select; page's hidden input). */
+  onAddMusic: () => void;
+  /** Removes ONE music clip by id (one undo step). */
+  onRemoveMusicClip: (id: string) => void;
+  /** Patches ONE music clip (volume / loop / durationMs). */
+  onMusicClipEdit: (id: string, patch: Partial<MusicClip>) => void;
   onGenerateCaptions: () => void;
   whisperBusy: boolean;
   whisperProgress: WhisperProgress | null;
   whisperLanguage: string;
   onWhisperLanguageChange: (lang: string) => void;
+  /** v1.25: convert ROMANIZED (QWERTY) subtitles to native Devanagari /
+   *  Nastaliq script — page owns the cue mutation + undo step. */
+  onConvertSubtitlesToNative?: () => void;
   /** v1.20: transcription model (Groq whisper model id — kept wired for the
    *  app-level STT preference; the local size picker is gone with the engines). */
   whisperModel: string;
@@ -247,9 +267,25 @@ interface SettingsPanelProps {
     voice: string;
     ratePct?: number;
     pitchHz?: number;
-    volume: number;
+    /** v1.25: optional so the TTS Studio's contract (volume?: number)
+     *  composes; the Voiceover section always sends its slider fraction. */
+    volume?: number;
     durationMs: number;
-    bytes: ArrayBuffer;
+    /** v1.25: the TTS Studio hands a Blob (long-run read-back); the
+     *  Voiceover section still passes the raw ArrayBuffer. */
+    bytes: ArrayBuffer | Blob;
+  }) => void;
+  /** ── v1.25 TTS STUDIO HANDOFFS ── */
+  /** Synthesized audio as a TIMELINE MUSIC clip (any length). */
+  onAddMusicAudio: (a: {
+    fileName: string;
+    blob: Blob;
+    durationMs: number;
+  }) => void;
+  /** Word-level captions from the TTS word timings. */
+  onCreateWordCaptions: (r: {
+    title: string;
+    words: Array<{ text: string; startMs: number; endMs: number }>;
   }) => void;
   /** Machine-level dub preferences (localStorage). */
   dubSettings: DubSettings;
@@ -945,9 +981,11 @@ export function SettingsPanel(props: SettingsPanelProps) {
     inElectron,
     subtitles,
     hasAudio,
-    musicTrack,
-    openMusicPicker,
-    onRemoveMusic,
+    musicClips,
+    onAddMusic,
+    onRemoveMusicClip,
+    onMusicClipEdit,
+    onConvertSubtitlesToNative,
     onGenerateCaptions,
     whisperBusy,
     whisperProgress,
@@ -967,6 +1005,8 @@ export function SettingsPanel(props: SettingsPanelProps) {
     onRandomMix,
     boundaryCount,
     onAddVoiceover,
+    onAddMusicAudio,
+    onCreateWordCaptions,
     dubSettings,
     onDubSettingsChange,
     dubSourceCount,
@@ -1813,102 +1853,106 @@ export function SettingsPanel(props: SettingsPanelProps) {
             </Field>
           </Section>
 
-          {/* ── v1.24: Background music — dedicated card (pick a file
-              directly, no media-library detour) + volume/loop controls. ── */}
+          {/* ── v1.25: Background music — the MULTI-TRACK stack. Every clip
+              has its own row (name, duration, start) with per-clip volume,
+              loop and remove; "Add another track" stacks more files (they
+              appear as new rows on the timeline's Audio lane). ── */}
           <Section icon={<Music size={13} />} title="Background music" defaultOpen>
-            {musicTrack ? (
-              <>
-                {/* Current track — name, duration, one-click remove. */}
-                <div className="mb-2.5 flex items-center gap-2 rounded-md border px-2 py-1.5"
+            {musicClips.length === 0 && (
+              <p className="mb-2 text-[10px] leading-relaxed text-stone-500">
+                Add background music that plays under the whole video —
+                mixed with clip audio at its own volume. Add as many tracks
+                as you like; they stack on the timeline's Audio lane.
+              </p>
+            )}
+            {musicClips.map((clip) => {
+              const volPct = Math.round(Math.max(0, Math.min(2, clip.volume)) * 100);
+              const loopsToFill =
+                clip.loop && clip.durationMs > 0 && totalMs > 0
+                  ? clip.startMs + clip.durationMs < totalMs
+                  : false;
+              return (
+                <div key={clip.id} className="mb-2.5 rounded-md border"
                   style={{ borderColor: "rgba(13, 148, 136, 0.35)", backgroundColor: "#10201d" }}
                 >
-                  <Music size={13} className="shrink-0" style={{ color: "#2dd4bf" }} />
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-[11px] font-medium text-stone-400" title={musicTrack.fileName}>
-                      {musicTrack.fileName}
-                    </p>
-                    <p className="text-[9px] tabular-nums text-stone-500">
-                      {musicTrack.durationMs
-                        ? `${(musicTrack.durationMs / 1000).toFixed(1)}s${musicTrack.durationMs < totalMs ? " — loops to fill the video" : ""}`
-                        : "reading duration…"}
-                    </p>
+                  {/* Clip row — name, duration, one-click remove. */}
+                  <div className="flex items-center gap-2 px-2 py-1.5">
+                    <Music size={13} className="shrink-0" style={{ color: "#2dd4bf" }} />
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-[11px] font-medium text-stone-400" title={clip.fileName}>
+                        {clip.fileName}
+                      </p>
+                      <p className="text-[9px] tabular-nums text-stone-500">
+                        {clip.durationMs > 0
+                          ? `${(clip.durationMs / 1000).toFixed(1)}s @ ${(clip.startMs / 1000).toFixed(1)}s${loopsToFill ? " — loops to fill the video" : ""}`
+                          : "reading duration…"}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => onRemoveMusicClip(clip.id)}
+                      className="flex size-6 shrink-0 items-center justify-center rounded-md text-stone-500 transition-colors hover:bg-rose-500/10 hover:text-rose-400"
+                      title="Remove this music track"
+                      aria-label={`Remove ${clip.fileName}`}
+                    >
+                      <Trash2 size={12} />
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    onClick={onRemoveMusic}
-                    className="flex size-6 shrink-0 items-center justify-center rounded-md text-stone-500 transition-colors hover:bg-rose-500/10 hover:text-rose-400"
-                    title="Remove background music"
-                    aria-label="Remove background music"
-                  >
-                    <Trash2 size={12} />
-                  </button>
-                </div>
-                <Row label="Music volume">
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="range"
-                      min={0}
-                      max={200}
-                      step={5}
-                      value={Math.round(
-                        Math.max(0, Math.min(2, audioSettings.musicVolume)) * 100,
-                      )}
-                      onChange={(e) =>
-                        onAudioSettingsChange({
-                          ...audioSettings,
-                          musicVolume: Math.max(
-                            0,
-                            Math.min(2, Number(e.target.value) / 100),
-                          ),
-                        })
-                      }
-                      className="w-28 accent-teal-600"
-                      aria-label="Background music volume"
+                  {/* Per-clip volume + loop controls. */}
+                  <Row label="Volume">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="range"
+                        min={0}
+                        max={200}
+                        step={5}
+                        value={volPct}
+                        onChange={(e) =>
+                          onMusicClipEdit(clip.id, {
+                            volume: Math.max(
+                              0,
+                              Math.min(2, Number(e.target.value) / 100),
+                            ),
+                          })
+                        }
+                        className="w-28 accent-teal-600"
+                        aria-label={`Volume for ${clip.fileName}`}
+                      />
+                      <span className="w-9 text-right text-[10px] tabular-nums text-stone-500">
+                        {volPct}%
+                      </span>
+                    </div>
+                  </Row>
+                  <Row label="Loop to fill video">
+                    <Toggle
+                      checked={clip.loop}
+                      onChange={(v) => onMusicClipEdit(clip.id, { loop: v })}
+                      label=""
                     />
-                    <span className="w-9 text-right text-[10px] tabular-nums text-stone-500">
-                      {Math.round(
-                        Math.max(0, Math.min(2, audioSettings.musicVolume)) * 100,
-                      )}
-                      %
-                    </span>
-                  </div>
-                </Row>
-                <Row label="Loop to fill video">
-                  <Toggle
-                    checked={audioSettings.musicLoop}
-                    onChange={(v) =>
-                      onAudioSettingsChange({ ...audioSettings, musicLoop: v })
-                    }
-                    label=""
-                  />
-                </Row>
-                <p className="mb-1 mt-[-8px] text-[10px] leading-relaxed text-stone-500">
-                  The music plays under the whole video
-                  {audioSettings.musicStartMs > 0
-                    ? ` (starting at ${(audioSettings.musicStartMs / 1000).toFixed(1)}s — drag the music clip on the timeline's Audio lane to reposition)`
-                    : " — drag the music clip on the timeline's Audio lane to reposition it"}
-                  . Loop repeats it until the video ends.
-                </p>
-              </>
-            ) : (
-              <p className="mb-2 text-[10px] leading-relaxed text-stone-500">
-                Add a music track that plays under the whole video — mixed
-                with clip audio at its own volume.
+                  </Row>
+                </div>
+              );
+            })}
+            {musicClips.length > 0 && (
+              <p className="mb-1 text-[10px] leading-relaxed text-stone-500">
+                {musicClips.length === 1
+                  ? "Drag the music clip on the timeline's Audio lane to reposition it; drag its right edge to trim (when not looping)."
+                  : `${musicClips.length} tracks stack as rows on the timeline's Audio lane — drag each clip to reposition it.`}
               </p>
             )}
             <button
               type="button"
-              onClick={openMusicPicker}
+              onClick={onAddMusic}
               className="flex w-full items-center justify-center gap-1.5 rounded-md border px-2 py-1.5 text-[10px] font-semibold transition-colors"
               style={{
                 borderColor: "rgba(13, 148, 136, 0.5)",
-                backgroundColor: musicTrack ? "#10201d" : "#14b8a6",
-                color: musicTrack ? "#2dd4bf" : "#ffffff",
+                backgroundColor: musicClips.length > 0 ? "#10201d" : "#14b8a6",
+                color: musicClips.length > 0 ? "#2dd4bf" : "#ffffff",
               }}
-              title="Choose an audio file (mp3, wav, m4a…)"
+              title="Choose one or more audio files (mp3, wav, m4a…)"
             >
               <Upload size={11} />
-              {musicTrack ? "Replace music file" : "Add background music"}
+              {musicClips.length > 0 ? "Add another track" : "Add background music"}
             </button>
           </Section>
         </div>
@@ -1923,6 +1967,17 @@ export function SettingsPanel(props: SettingsPanelProps) {
           tabIndex={tab === "dubbing" ? 0 : -1}
           className={cn("pb-2 pt-2", tab === "dubbing" ? "ff-tab-panel-in" : "hidden")}
         >
+          {/* ── v1.25: AI TEXT-TO-SPEECH STUDIO — long-form Edge-TTS with
+              word timings + timeline handoffs. The card renders in the web
+              preview too (inert — every IPC sits behind
+              window.electronAPI?.), so the surface is browser-verifiable. ── */}
+          <TtsStudioSection
+            onAddVoiceover={onAddVoiceover}
+            voCount={voCount}
+            onAddMusicAudio={onAddMusicAudio}
+            onCreateWordCaptions={onCreateWordCaptions}
+          />
+
           {/* ── v1.17: Voiceover (Edge TTS narration, Electron only) ────── */}
           {inElectron && (
             <VoiceoverSection onAddVoiceover={onAddVoiceover} voCount={voCount} />
@@ -1986,6 +2041,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
             whisperProgress={whisperProgress}
             whisperLanguage={whisperLanguage}
             onWhisperLanguageChange={onWhisperLanguageChange}
+            onConvertSubtitlesToNative={onConvertSubtitlesToNative}
             whisperModel={whisperModel}
             onWhisperModelChange={onWhisperModelChange}
             hasSpeechSource={hasAudio || hasVideoClip}
@@ -3103,6 +3159,9 @@ interface CaptionsSectionProps {
   whisperProgress: WhisperProgress | null;
   whisperLanguage: string;
   onWhisperLanguageChange: (lang: string) => void;
+  /** v1.25: convert ROMANIZED (QWERTY) subtitles to native Devanagari /
+   *  Nastaliq script — page owns the cue mutation + undo step. */
+  onConvertSubtitlesToNative?: () => void;
   /** v1.20: transcription model (Groq whisper model id — kept wired for the
    *  app-level STT preference; the local size picker is gone with the engines). */
   whisperModel: string;
@@ -3130,6 +3189,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
     whisperProgress,
     whisperLanguage,
     onWhisperLanguageChange,
+    onConvertSubtitlesToNative,
     hasSpeechSource,
   } = props;
 
@@ -3588,6 +3648,46 @@ function CaptionsSection(props: CaptionsSectionProps) {
           Speech is taken from your audio track, or the first video clip when no
           track is loaded.
         </p>
+
+        {/* v1.25 QWERTY captions: romanized (Hinglish / Roman Urdu) subtitle
+            text converts to native Devanagari / Nastaliq so burn-in + kinetic
+            typography render properly (and hi-IN / ur-PK voices read it
+            naturally). Shown for Hindi/Urdu transcriptions with cues loaded. */}
+        {subtitles != null &&
+          (whisperLanguage === "hi" || whisperLanguage === "ur") &&
+          onConvertSubtitlesToNative != null && (
+            <div
+              className="mt-2 rounded-md border px-2.5 py-2"
+              style={{
+                borderColor: "rgba(13, 148, 136, 0.35)",
+                backgroundColor: "#10201d",
+              }}
+            >
+              <p className="text-[10px] leading-relaxed text-stone-400">
+                Typed the captions on a QWERTY keyboard (Hinglish / Roman
+                Urdu)? Convert them to native script for clean burn-in and
+                word-perfect karaoke timing.
+              </p>
+              <button
+                type="button"
+                onClick={onConvertSubtitlesToNative}
+                className="mt-1.5 flex w-full items-center justify-center gap-1.5 rounded-md border px-2 py-1.5 text-[10px] font-semibold transition-colors hover:brightness-110"
+                style={{
+                  borderColor: "rgba(13, 148, 136, 0.5)",
+                  backgroundColor: "#14b8a6",
+                  color: "#ffffff",
+                }}
+                title={
+                  whisperLanguage === "hi"
+                    ? "Romanized → Devanagari (editable, one undo step)"
+                    : "Romanized → Nastaliq Urdu (editable, one undo step)"
+                }
+              >
+                <Languages size={11} />
+                Convert to {whisperLanguage === "hi" ? "Devanagari" : "Urdu script"}
+              </button>
+            </div>
+          )}
 
       </div>
 
@@ -5021,37 +5121,8 @@ function voicePreviewSample(locale: string, userText: string): string {
   return VOICE_PREVIEW_SAMPLES[lang] ?? "This is a voice preview.";
 }
 
-interface TtsVoice {
-  shortName: string;
-  gender: string;
-  locale: string;
-  friendlyName: string;
-  displayName: string;
-}
-
-/** Shared lazy voice-catalog loader (one fetch per mounted section; the
- *  main process caches too — repeated calls are cheap). */
-function useTtsVoices() {
-  const [voices, setVoices] = useState<TtsVoice[] | null>(null);
-  const [pairs, setPairs] = useState<Record<string, { female: string; male: string }>>({});
-  useEffect(() => {
-    const get = window.electronAPI?.ttsVoices;
-    if (typeof get !== "function") return;
-    let cancelled = false;
-    get()
-      .then((r) => {
-        if (cancelled || !r) return;
-        setVoices(r.voices ?? []);
-        setPairs(r.pairs ?? {});
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-  return { voices, pairs };
-}
-
+// v1.25: useTtsVoices (this file's shared voice-catalog hook) moved to
+// ./use-tts-voices.ts — the TTS Studio imports it too.
 function VoiceoverSection({
   onAddVoiceover,
   voCount,
@@ -5061,16 +5132,20 @@ function VoiceoverSection({
     voice: string;
     ratePct?: number;
     pitchHz?: number;
-    volume: number;
+    volume?: number;
     durationMs: number;
-    bytes: ArrayBuffer;
+    bytes: ArrayBuffer | Blob;
   }) => void;
   voCount: number;
 }) {
   const { voices, pairs } = useTtsVoices();
   const [text, setText] = useState("");
+  // v1.25: QWERTY romanized → native script (hi/ur), shared with the Studio.
+  const [qwerty, setQwerty] = useState(true);
   const [locale, setLocale] = useState("en-US");
   const [voice, setVoice] = useState("en-US-AriaNeural");
+  const [voiceSearch, setVoiceSearch] = useState("");
+  const [voiceGender, setVoiceGender] = useState<VoiceGenderFilter>("all");
   const [ratePct, setRatePct] = useState(0);
   const [pitchHz, setPitchHz] = useState(0);
   const [volume, setVolume] = useState(1);
@@ -5084,14 +5159,27 @@ function VoiceoverSection({
     return Array.from(set).sort();
   }, [voices]);
   const localeVoices = useMemo(
-    () => (voices ?? []).filter((v) => v.locale === locale),
-    [voices, locale],
+    () =>
+      filterTtsVoices(voices ?? [], {
+        search: voiceSearch,
+        locale,
+        gender: voiceGender,
+      }),
+    [voices, voiceSearch, locale, voiceGender],
+  );
+
+  // QWERTY resolution (hi/ur): romanized → native, native passes through.
+  const showQwerty = localeWantsTranslit(locale) !== null;
+  const qw = useMemo(
+    () => resolveQwertyText(text, locale, qwerty),
+    [text, locale, qwerty],
   );
 
   // Locale switch → default to that locale's female pair voice.
   const changeLocale = useCallback(
     (next: string) => {
       setLocale(next);
+      setVoiceSearch("");
       const pair = pairs[next];
       if (pair?.female) setVoice(pair.female);
       else {
@@ -5100,6 +5188,23 @@ function VoiceoverSection({
       }
     },
     [pairs, voices],
+  );
+
+  // Gender filter switch → keep the current voice when it still matches,
+  // else the first voice of the new filter (shared Studio behavior).
+  const changeVoiceGender = useCallback(
+    (g: VoiceGenderFilter) => {
+      setVoiceGender(g);
+      const list = filterTtsVoices(voices ?? [], {
+        search: voiceSearch,
+        locale,
+        gender: g,
+      });
+      if (list.length > 0 && !list.some((v) => v.shortName === voice)) {
+        setVoice(list[0].shortName);
+      }
+    },
+    [voices, voiceSearch, locale, voice],
   );
 
   const stopPreview = useCallback(() => {
@@ -5120,7 +5225,8 @@ function VoiceoverSection({
     try {
       const r = await preview({
         voice,
-        text: voicePreviewSample(locale, text),
+        // v1.25: previews read the CONVERTED text (native script for hi/ur).
+        text: voicePreviewSample(locale, qw.converted),
       });
       const blob = new Blob([r.bytes], { type: "audio/mpeg" });
       const url = URL.createObjectURL(blob);
@@ -5135,12 +5241,14 @@ function VoiceoverSection({
     } finally {
       setPreviewBusy(false);
     }
-  }, [voice, locale, text, stopPreview]);
+  }, [voice, locale, qw, stopPreview]);
 
   const addVoiceover = useCallback(async () => {
     const synth = window.electronAPI?.ttsSynthesize;
     if (typeof synth !== "function") return;
-    const trimmed = text.trim();
+    // v1.25: synthesize (and store) the CONVERTED text — hi/ur QWERTY input
+    // reaches Edge TTS as native script, and export regeneration matches.
+    const trimmed = qw.converted.trim();
     if (!trimmed) {
       toast.error("Write the narration text first");
       return;
@@ -5152,7 +5260,9 @@ function VoiceoverSection({
         voice,
         ratePct,
         pitchHz,
-        volumePct: 0,
+        // v1.25: the real slider value (UI 0..100 → engine -100..0; the
+        // old hardcoded 0 ignored the volume control entirely).
+        volumePct: Math.round(volume * 100) - 100,
       });
       onAddVoiceover({
         text: trimmed,
@@ -5171,7 +5281,7 @@ function VoiceoverSection({
     } finally {
       setBusy(false);
     }
-  }, [text, voice, ratePct, pitchHz, volume, onAddVoiceover]);
+  }, [qw, voice, ratePct, pitchHz, volume, onAddVoiceover]);
 
   const selectCls =
     "w-full rounded border bg-[#211e1a] px-2 py-1.5 text-[11px] text-stone-300 focus:border-orange-500";
@@ -5187,6 +5297,47 @@ function VoiceoverSection({
         style={{ borderColor: "#332e28" }}
         aria-label="Narration text"
       />
+      {showQwerty && (
+        <div className="mb-2">
+          <StudioToggle
+            checked={qwerty}
+            onChange={setQwerty}
+            label="QWERTY input — auto-converts to native script"
+          />
+          {qwerty && qw.nativeDetected && (
+            <p className="mt-1 text-[10px] leading-relaxed text-amber-400/90">
+              Native script detected — converting is skipped
+            </p>
+          )}
+          {qwerty && qw.willConvert && (
+            <p
+              className="mt-1 truncate rounded px-1.5 py-1 text-[10px] text-stone-300"
+              style={{ backgroundColor: "#10201d" }}
+              title={qw.converted}
+            >
+              {qw.converted.slice(0, 120)}
+              {qw.converted.length > 120 ? " …" : ""}
+            </p>
+          )}
+        </div>
+      )}
+      <div className="mb-1.5 flex items-center gap-1.5">
+        <div className="relative min-w-0 flex-1">
+          <Search
+            size={11}
+            className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-stone-500"
+          />
+          <input
+            value={voiceSearch}
+            onChange={(e) => setVoiceSearch(e.target.value)}
+            placeholder="Search voices…"
+            className="w-full rounded border bg-[#211e1a] py-1.5 pl-7 pr-2 text-[11px] text-stone-300 placeholder:text-stone-500 focus:border-orange-500 focus:outline-none"
+            style={{ borderColor: "#332e28" }}
+            aria-label="Search voices"
+          />
+        </div>
+        <VoiceGenderChips value={voiceGender} onChange={changeVoiceGender} />
+      </div>
       <div className="mb-2 grid grid-cols-2 gap-1.5">
         <div>
           <label className="mb-0.5 block text-[10px] font-medium text-stone-500">
@@ -5222,7 +5373,7 @@ function VoiceoverSection({
               {localeVoices.length === 0 && <option value={voice}>{voice}</option>}
               {localeVoices.map((v) => (
                 <option key={v.shortName} value={v.shortName}>
-                  {v.displayName}
+                  {v.displayName} ({v.shortName})
                 </option>
               ))}
             </select>

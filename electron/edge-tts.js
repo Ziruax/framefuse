@@ -39,17 +39,23 @@
 //   5. The server answers with binary frames of the shape
 //        [uint16 BE header length][ASCII header\r\n][payload]
 //      where Path:audio frames carry raw MP3 (audio-24khz-48kbitrate-
-//      mono-mp3) and Path:audio.metadata carries word-boundary JSON
-//      (ignored here — dub-workflow uses ffmpeg for timing). TEXT frames
+//      mono-mp3). Path:audio.metadata carries word-boundary JSON — it
+//      arrives as TEXT frames on the live service (same header\r\n\r\nbody
+//      layout as turn.end; binary metadata frames are also accepted) and
+//      is parsed into per-word {text, offsetMs, durationMs} timings — the
+//      Offset/Duration fields are 100-ns FILETIME ticks, /10,000 → ms.
+//      TEXT frames
 //      drive the session: Path:turn.end = done; Path:response may carry a
 //      403-style service error; Path:notification / turn.start are noise.
 //      The MP3 chunks are concatenated and returned (or written to
 //      o.outFile).
 //
 // Robustness rules (see the task contract with dub-workflow.js):
-//   • 25 s overall timeout per attempt (socket destroyed, promise rejected);
-//     ONE full retry with a freshly generated Sec-MS-GEC + ConnectionId on
-//     403-ish failures or handshake stalls.
+//   • Overall timeout per attempt: 25 s + 20 ms per character of text (a
+//     2800-char long-form chunk legitimately streams for tens of seconds;
+//     short dub lines still die at the 25 s baseline); socket destroyed,
+//     promise rejected. ONE full retry with a freshly generated Sec-MS-GEC
+//     + ConnectionId on 403-ish failures or handshake stalls.
 //   • 403 at the upgrade also teaches the module the server clock (from the
 //     response Date header) — the token window is validated server-side, so
 //     a wrong LOCAL clock otherwise means permanent 403s.
@@ -58,6 +64,11 @@
 //     historical 131 after the live service started 403-ing it).
 //   • Max 3000 characters of text per call (callers must chunk longer
 //     scripts); max 3 concurrent syntheses — extra callers queue FIFO.
+//   • synthesizeLong() splits scripts up to 1.5 M characters (~200 k
+//     words) into ≤2800-char sentence chunks, synthesizes them through the
+//     same 3-slot queue, and merges ONE MP3 + GLOBAL word timings (per-
+//     chunk duration comes from the byte count — 48 kbps CBR ⇒ 6000 B/s);
+//     a single abortRef cancels every chunk, in flight and queued.
 //   • o.abortRef = { abort: null } is populated with a cancel function
 //     (same pattern as groq-whisper.js) and works while queued, too.
 //
@@ -99,6 +110,11 @@ const OUTPUT_FORMAT = "audio-24khz-48kbitrate-mono-mp3";
 /** The service caps one synthesis request; longer scripts must be chunked
  *  by the caller (dub-workflow.js splits on sentence boundaries). */
 const MAX_TEXT_LEN = 3000;
+/** synthesizeLong() input cap — ~200,000 words ≈ 1.5 M characters. */
+const MAX_LONG_TEXT_LEN = 1500000;
+/** Chunk size for synthesizeLong() — under the per-request 3000 cap with
+ *  headroom for the SSML/prosody wrapper. */
+const LONG_CHUNK_LEN = 2800;
 const VOICES_TIMEOUT_MS = 15000;
 const SYNTH_TIMEOUT_MS = 25000;
 const HANDSHAKE_TIMEOUT_MS = 10000;
@@ -161,7 +177,8 @@ function generateSecMsgEC() {
 /** Normalize one raw voice descriptor from the service (or the fallback
  *  table) into FrameFuse's shape.
  *  @returns {{shortName:string, gender:"Female"|"Male", locale:string,
- *             friendlyName:string, displayName:string}|null} */
+ *             friendlyName:string, displayName:string,
+ *             localName?:string, styleList?:string[]}|null} */
 function normalizeVoice(v) {
   if (!v || typeof v !== "object") return null;
   const shortName = typeof v.ShortName === "string" ? v.ShortName.trim() : "";
@@ -187,6 +204,21 @@ function normalizeVoice(v) {
     locale,
     friendlyName,
     displayName: `${friendlyName} (${locale}, ${gender})`,
+    // Optional catalog extras — present ONLY when the source provides them
+    // (the built-in fallback table has neither). The live list ships
+    // LocalName directly and StyleList as a comma-separated string
+    // ("cheerful, sad") — styleList is the split array. Existing field
+    // names are untouched.
+    ...(typeof v.LocalName === "string" && v.LocalName.trim()
+      ? { localName: v.LocalName.trim() }
+      : {}),
+    ...(typeof v.StyleList === "string" && v.StyleList.trim()
+      ? {
+          styleList: v.StyleList.split(",")
+            .map((s) => s.trim())
+            .filter(Boolean),
+        }
+      : {}),
   };
 }
 
@@ -455,21 +487,54 @@ function formatSigned(value, unit) {
   return `${v >= 0 ? "+" : ""}${v}${unit}`;
 }
 
+/** Validate an optional mstts:express-as voice style. The voice catalog
+ *  advertises per-voice styles ("cheerful", "newscast"…) in StyleList; the
+ *  token must stay short and alphanumeric (plus -/_) so it can never
+ *  smuggle markup into the SSML.
+ *  @returns {string|null} trimmed style, or null when absent/empty. */
+function normalizeStyleOption(style) {
+  if (style === undefined || style === null) return null;
+  if (typeof style !== "string") {
+    throw new Error('synthesize: style must be a string (e.g. "cheerful")');
+  }
+  const s = style.trim();
+  if (!s) return null;
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(s)) {
+    throw new Error(
+      `synthesize: invalid style "${s}" — expected a short alphanumeric ` +
+        `token (e.g. "cheerful"; see the voice's styleList)`,
+    );
+  }
+  return s;
+}
+
 /** Build the SSML utterance exactly as the service expects it.
  *  @param {{text:string, voice:string, locale?:string,
- *           ratePct?:number, pitchHz?:number, volumePct?:number}} o */
+ *           ratePct?:number, pitchHz?:number, volumePct?:number,
+ *           style?:string|null}} o — style wraps the prosody in
+ *           <mstts:express-as> (voice styles; only voices that advertise
+ *           them in StyleList actually render differently). */
 function buildSsml(o) {
   const locale = o.locale || localeFromVoice(o.voice);
   const pitch = formatSigned(o.pitchHz, "Hz");
   const rate = formatSigned(o.ratePct, "%");
   const volume = formatSigned(o.volumePct, "%");
+  const prosody =
+    `<prosody pitch='${pitch}' rate='${rate}' volume='${volume}'>` +
+    `${escapeXml(o.text)}</prosody>`;
+  const styled = o.style
+    ? `<mstts:express-as style='${escapeXml(o.style)}'>${prosody}</mstts:express-as>`
+    : prosody;
+  // The mstts namespace is declared on <speak> ONLY when a style is used,
+  // so the styleless document stays byte-identical to the pre-style SSML
+  // (existing callers — dub-workflow — see no change at all).
   return (
-    `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' ` +
+    `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis'` +
+    `${o.style ? ` xmlns:mstts='https://www.w3.org/2001/mstts'` : ""} ` +
     `xml:lang='${escapeXml(locale)}'>` +
     `<voice name='${escapeXml(o.voice)}'>` +
-    `<prosody pitch='${pitch}' rate='${rate}' volume='${volume}'>` +
-    `${escapeXml(o.text)}` +
-    `</prosody></voice></speak>`
+    `${styled}` +
+    `</voice></speak>`
   );
 }
 
@@ -632,6 +697,18 @@ function createWsFrameParser(onFrame, onError) {
   };
 }
 
+/** Decode one Edge binary message — [uint16 BE header length][ASCII header
+ *  \r\n lines][payload] — into { headerText, payload, msgPath }, or null
+ *  when malformed. Shared by the live session and the unit tests. */
+function decodeBinaryMessage(data) {
+  if (!Buffer.isBuffer(data) || data.length < 2) return null;
+  const headerLength = data.readUInt16BE(0);
+  if (headerLength > data.length - 2) return null;
+  const headerText = data.slice(2, 2 + headerLength).toString("utf8");
+  const payload = data.slice(2 + headerLength);
+  return { headerText, payload, msgPath: headerValue(headerText, "Path") };
+}
+
 /** Read a value from a "\r\n"-separated header block (case-insensitive). */
 function headerValue(headerText, name) {
   for (const line of headerText.split("\r\n")) {
@@ -685,12 +762,53 @@ function responseFrameError(bodyText) {
   return err;
 }
 
+/** Parse a Path:audio.metadata JSON payload into per-word timing entries.
+ *  Frame shape (one entry per spoken word, in arrival order):
+ *    {"Metadata":[{"Type":"WordBoundary","Data":{"Offset":1250000,
+ *     "Duration":500000,"text":{"Text":"Hello","Length":5,
+ *     "BoundaryType":"WordBoundary"}}}]
+ *  Offset/Duration are 100-NANOSECOND units (Windows FILETIME ticks) —
+ *  1 ms = 10,000 units. Malformed frames are skipped, never fatal: the
+ *  audio frames themselves remain the source of truth for the MP3.
+ *  @param {Buffer} payload the bytes after the binary header
+ *  @param {Array<{text:string, offsetMs:number, durationMs:number}>} out */
+function collectWordMetadata(payload, out) {
+  let parsed = null;
+  try {
+    parsed = JSON.parse(payload.toString("utf8"));
+  } catch (_) {
+    return; // non-JSON metadata — ignore
+  }
+  const items = parsed && Array.isArray(parsed.Metadata) ? parsed.Metadata : null;
+  if (!items) return;
+  for (const item of items) {
+    if (!item || item.Type !== "WordBoundary" || !item.Data) continue;
+    const d = item.Data;
+    // Some service revisions flatten the text object ("Text" directly on
+    // Data) — accept both shapes.
+    const text =
+      d.text && typeof d.text.Text === "string"
+        ? d.text.Text
+        : typeof d.Text === "string"
+          ? d.Text
+          : null;
+    const offsetMs = Math.round(Number(d.Offset) / 10000);
+    const durationMs = Math.round(Number(d.Duration) / 10000);
+    if (text === null || !Number.isFinite(offsetMs) || !Number.isFinite(durationMs)) {
+      continue;
+    }
+    out.push({ text, offsetMs, durationMs });
+  }
+}
+
 /** One full synthesis connection: TLS connect → WSS upgrade → speech.config
  *  + SSML → drain frames until Path:turn.end. Sec-MS-GEC and ConnectionId
  *  are regenerated on every call, so a retry is a genuinely fresh session.
  *
  *  @param {{ssml:string, abortRef?:object}} opts
- *  @returns {Promise<Buffer>} the raw MP3 bytes
+ *  @returns {Promise<{mp3:Buffer, words:Array<{text:string,
+ *    offsetMs:number, durationMs:number}>}>} the raw MP3 bytes plus this
+ *    attempt's WordBoundary timings (empty when the service sends none).
  */
 function attemptSynthesis(opts) {
   return new Promise((resolve, reject) => {
@@ -739,6 +857,10 @@ function attemptSynthesis(opts) {
 
     const audioChunks = [];
     let audioBytes = 0;
+    // WordBoundary timings for THIS attempt (arrival order). A retry runs a
+    // fresh attempt → a fresh array, so words from a failed attempt can
+    // never leak into a successful result.
+    const words = [];
     let settled = false;
     let handshakeDone = false;
     let closeSent = false;
@@ -772,7 +894,7 @@ function attemptSynthesis(opts) {
         }
       }
       if (err) reject(err);
-      else resolve(mp3Bytes);
+      else resolve({ mp3: mp3Bytes, words });
     };
 
     // Cancellation hook — the same { abort: fn } pattern as groq-whisper.
@@ -784,15 +906,22 @@ function attemptSynthesis(opts) {
       opts.abortRef.abort = hardAbort;
     }
 
-    // 25 s overall watchdog for THIS attempt.
+    // Overall watchdog for THIS attempt. The base 25 s covers short
+    // utterances (dub lines); longer texts stream proportionally more audio
+    // (a 2800-char synthesizeLong chunk is ~235 s of MP3 and takes ~17 s
+    // solo, ~3× that when three chunks share the service), so the window
+    // scales with the text length — 20 ms per character, measured as ~6 ms
+    // per character of wall time for a healthy stream.
+    const overallTimeoutMs =
+      SYNTH_TIMEOUT_MS + Math.round(opts.text.length * 20);
     overallTimer = setTimeout(() => {
       finish(
         new Error(
-          `Edge TTS timed out after ${Math.round(SYNTH_TIMEOUT_MS / 1000)}s ` +
+          `Edge TTS timed out after ${Math.round(overallTimeoutMs / 1000)}s ` +
             "without finishing the audio stream",
         ),
       );
-    }, SYNTH_TIMEOUT_MS);
+    }, overallTimeoutMs);
 
     // Faster watchdog for a stalled upgrade (retryable → one fresh retry).
     handshakeTimer = setTimeout(() => {
@@ -855,20 +984,32 @@ function attemptSynthesis(opts) {
         const err = responseFrameError(bodyText);
         if (err) finish(err);
         // Benign response acks fall through — ignored.
+        return;
       }
-      // turn.start / audio.metadata / notification / … — not needed here.
+      if (msgPath === "audio.metadata") {
+        // OBSERVED ON THE LIVE SERVICE: word-boundary metadata arrives as
+        // TEXT frames (header\r\n\r\nJSON body), the same layout as
+        // turn.start/response — not as binary frames as the old comment
+        // assumed. The binary-frame interception in handleServerBinary
+        // stays as a belt-and-braces path.
+        collectWordMetadata(Buffer.from(bodyText, "utf8"), words);
+        return;
+      }
+      // turn.start / notification / … — not needed here.
     }
 
     function handleServerBinary(data) {
-      if (data.length < 2) return; // malformed — ignore
-      const headerLength = data.readUInt16BE(0);
-      if (headerLength > data.length - 2) return; // malformed — ignore
-      const headerText = data.slice(2, 2 + headerLength).toString("utf8");
-      const payload = data.slice(2 + headerLength);
-      if (headerValue(headerText, "Path") === "audio") {
-        if (payload.length > 0) {
-          audioChunks.push(payload);
-          audioBytes += payload.length;
+      const msg = decodeBinaryMessage(data);
+      if (!msg) return; // malformed — ignore
+      if (msg.msgPath === "audio.metadata") {
+        // WordBoundary timing frames — collected, never fatal.
+        collectWordMetadata(msg.payload, words);
+        return;
+      }
+      if (msg.msgPath === "audio") {
+        if (msg.payload.length > 0) {
+          audioChunks.push(msg.payload);
+          audioBytes += msg.payload.length;
           if (audioBytes > MAX_AUDIO_BYTES) {
             finish(
               new Error(
@@ -880,11 +1021,11 @@ function attemptSynthesis(opts) {
         }
         return;
       }
-      // Other binary messages (audio.metadata word boundaries, and on some
-      // server revisions turn.end) share the text-frame layout — reuse it.
+      // Other binary messages (on some server revisions turn.end arrives
+      // as a binary frame) share the text-frame layout — reuse it.
       handleServerText(
-        headerText +
-          (payload.length ? "\r\n\r\n" + payload.toString("utf8") : ""),
+        msg.headerText +
+          (msg.payload.length ? "\r\n\r\n" + msg.payload.toString("utf8") : ""),
       );
     }
 
@@ -1088,6 +1229,7 @@ function normalizeSynthOptions(o) {
     VOLUME_RANGE[0],
     VOLUME_RANGE[1],
   );
+  const style = normalizeStyleOption(o.style); // throws on malformed tokens
   const locale = localeFromVoice(voice);
   return {
     text: cleanText,
@@ -1096,7 +1238,8 @@ function normalizeSynthOptions(o) {
     ratePct,
     pitchHz,
     volumePct,
-    ssml: buildSsml({ text: cleanText, voice, locale, ratePct, pitchHz, volumePct }),
+    style,
+    ssml: buildSsml({ text: cleanText, voice, locale, ratePct, pitchHz, volumePct, style }),
     outFile:
       typeof o.outFile === "string" && o.outFile.trim() ? o.outFile.trim() : null,
     abortRef:
@@ -1114,6 +1257,9 @@ function normalizeSynthOptions(o) {
  * @param {number} [o.ratePct=0]   Rate delta — +10 = 10% faster (SSML rate).
  * @param {number} [o.pitchHz=0]   Pitch delta in Hz (SSML pitch, "+2Hz").
  * @param {number} [o.volumePct=0] Volume delta in % (SSML volume).
+ * @param {string} [o.style]       Optional mstts:express-as voice style
+ *                                 token (e.g. "cheerful" — must appear in
+ *                                 the voice's styleList to have an effect).
  * @param {string} [o.outFile]     Absolute path — the MP3 is written there
  *                                 (parent dirs created) and returned as
  *                                 filePath.
@@ -1121,9 +1267,11 @@ function normalizeSynthOptions(o) {
  *                                 Populated with a cancel function (same
  *                                 pattern as groq-whisper.js groqTranscribe).
  *                                 Callable immediately, even while queued.
- * @returns {Promise<{filePath:string|null, bytes:Buffer, bytesLen:number}>}
+ * @returns {Promise<{filePath:string|null, bytes:Buffer, bytesLen:number,
+ *          words:Array<{text:string, offsetMs:number, durationMs:number}>}>}
  *          bytes = the raw MP3 (audio-24khz-48kbitrate-mono-mp3);
- *          filePath = outFile when given, else null.
+ *          filePath = outFile when given, else null;
+ *          words = per-word timings from the WordBoundary metadata stream.
  */
 async function synthesize(o) {
   const opts = normalizeSynthOptions(o); // throws → rejected promise
@@ -1138,9 +1286,12 @@ async function synthesize(o) {
   try {
     if (opts.abortRef && opts.abortRef._cancelled) throw cancelledError();
     let mp3Bytes = null;
+    let words = null;
     for (let attempt = 1; attempt <= 2; attempt++) {
       try {
-        mp3Bytes = await attemptSynthesis(opts);
+        const attemptResult = await attemptSynthesis(opts);
+        mp3Bytes = attemptResult.mp3;
+        words = attemptResult.words;
         break;
       } catch (err) {
         const cancelled =
@@ -1152,7 +1303,12 @@ async function synthesize(o) {
         // regenerates Sec-MS-GEC + ConnectionId inside attemptSynthesis.
       }
     }
-    const result = { filePath: null, bytes: mp3Bytes, bytesLen: mp3Bytes.length };
+    const result = {
+      filePath: null,
+      bytes: mp3Bytes,
+      bytesLen: mp3Bytes.length,
+      words: words || [],
+    };
     if (opts.outFile) {
       try {
         fs.mkdirSync(path.dirname(opts.outFile), { recursive: true });
@@ -1170,11 +1326,244 @@ async function synthesize(o) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Long-form synthesis — sentence chunking, 3-way parallel, single MP3
+// ---------------------------------------------------------------------------
+
+/** Sentence terminators for long-text chunking — Latin .!?… + newline +
+ *  Devanagari danda (।) + Urdu/Arabic question mark (؟): the dubbing flow
+ *  feeds Hindi/Marathi/Urdu scripts, so the Latin set alone is not enough. */
+const SENTENCE_END_RE = /[.!\u2026\u0964\u061F!?\n]/;
+const WHITESPACE_RE = /\s/;
+
+/** Split a long script into synthesis-sized chunks (each ≤ maxLen chars).
+ *  Cut preference inside each window: (1) the LAST sentence terminator
+ *  (Latin .!?…, newline, ।, ؟); (2) the LAST whitespace (a single sentence
+ *  longer than the window); (3) a hard cut (a single unbroken token longer
+ *  than the window). Only the CHUNK EDGES are trimmed — the text itself is
+ *  never re-normalized, so joining the chunks reproduces the input minus
+ *  the whitespace at the cut points.
+ *  @param {string} text
+ *  @param {number} maxLen
+ *  @returns {string[]} non-empty chunks whose lengths are ≤ maxLen */
+function splitTextIntoChunks(text, maxLen) {
+  const trimmed = String(text).trim();
+  if (!trimmed) return [];
+  if (trimmed.length <= maxLen) return [trimmed];
+  const chunks = [];
+  let start = 0;
+  while (start < trimmed.length) {
+    const remaining = trimmed.length - start;
+    if (remaining <= maxLen) {
+      const last = trimmed.slice(start).trim();
+      if (last) chunks.push(last);
+      break;
+    }
+    const window = trimmed.slice(start, start + maxLen);
+    let cut = -1;
+    for (let i = window.length - 1; i > 0; i--) {
+      if (SENTENCE_END_RE.test(window[i])) {
+        cut = i + 1;
+        break;
+      }
+    }
+    if (cut === -1) {
+      for (let i = window.length - 1; i > 0; i--) {
+        if (WHITESPACE_RE.test(window[i])) {
+          cut = i + 1;
+          break;
+        }
+      }
+    }
+    if (cut === -1) cut = window.length; // one unbroken token — hard cut
+    const piece = window.slice(0, cut).trim();
+    if (piece) chunks.push(piece);
+    start += cut;
+    while (start < trimmed.length && WHITESPACE_RE.test(trimmed[start])) {
+      start += 1; // the next chunk starts at its first non-space character
+    }
+  }
+  return chunks;
+}
+
+/** Bytes-per-second of the negotiated output format — 48 kbps CBR MP3 ⇒
+ *  exactly 6000 bytes/s, so byteCount / 6000 = seconds with frame-level
+ *  accuracy (the format has no VBR drift; main.js uses the same math as
+ *  its ffprobe fallback). */
+const CBR_BYTES_PER_SECOND = 6000;
+
+/**
+ * Synthesize a LONG script (up to MAX_LONG_TEXT_LEN ≈ 200 k words) as ONE
+ * logical utterance: the text is split into ≤ LONG_CHUNK_LEN sentence
+ * chunks, every chunk goes through the normal synthesize() pipeline (the
+ * engine-slot queue keeps MAX_CONCURRENT_SYNTH in flight and queues the
+ * rest FIFO), and the per-chunk MP3s are concatenated — MP3 frame streams
+ * concatenate losslessly, exactly like the intra-call audio frames do.
+ *
+ * Word timings are rebased to GLOBAL offsets: chunk i starts at the sum of
+ * the durations of chunks 0…i-1, where each chunk's duration comes from its
+ * byte count (48 kbps CBR ⇒ bytesLen/6000 seconds — see
+ * CBR_BYTES_PER_SECOND).
+ *
+ * @param {object} o
+ * @param {string} o.text          1…1.5 M characters.
+ * @param {string} o.voice         Short name, e.g. "en-US-AriaNeural".
+ * @param {number} [o.ratePct=0]   Rate delta — +10 = 10% faster (SSML rate).
+ * @param {number} [o.pitchHz=0]   Pitch delta in Hz (SSML pitch, "+2Hz").
+ * @param {number} [o.volumePct=0] Volume delta in % (SSML volume).
+ * @param {string} [o.style]       Optional mstts:express-as style token.
+ * @param {(p:{phase:"synth", chunkIndex:number, chunkCount:number,
+ *             charsDone:number, totalChars:number})=>void} [o.onProgress]
+ *                                 Fired after each chunk completes.
+ * @param {{abort:Function}} [o.abortRef]
+ *                                 Populated with ONE cancel function that
+ *                                 aborts EVERY chunk (in flight and queued
+ *                                 — dub-workflow's childAbortRef pattern);
+ *                                 on abort the promise rejects with an
+ *                                 Error whose .cancelled is true.
+ * @returns {Promise<{bytes:Buffer, bytesLen:number,
+ *          words:Array<{text:string, offsetMs:number, durationMs:number}>,
+ *          chunkCount:number}>} the merged MP3 (chunk order, NOT completion
+ *          order) + word timings with global offsets, sorted by offset.
+ */
+async function synthesizeLong(o) {
+  if (!o || typeof o !== "object") {
+    throw new Error(
+      "synthesizeLong: an options object is required ({ text, voice, … })",
+    );
+  }
+  const text = typeof o.text === "string" ? o.text : "";
+  if (!text.trim()) {
+    throw new Error(
+      "synthesizeLong: text is required and must be a non-empty string",
+    );
+  }
+  if (text.length > MAX_LONG_TEXT_LEN) {
+    throw new Error(
+      `synthesizeLong: text is ${text.length} characters — the cap is ` +
+        `${MAX_LONG_TEXT_LEN} (~200,000 words); split the project into passes`,
+    );
+  }
+  const voice = typeof o.voice === "string" ? o.voice.trim() : "";
+  if (!voice) {
+    throw new Error(
+      'synthesizeLong: voice is required (e.g. "en-US-AriaNeural" — see listVoices())',
+    );
+  }
+  const style = normalizeStyleOption(o.style); // throws on malformed tokens
+  const numberOrZero = (v) =>
+    typeof v === "number" && Number.isFinite(v) ? v : 0;
+  // Prosody clamps happen per chunk inside normalizeSynthOptions — the
+  // values here only need to be finite numbers.
+  const ratePct = numberOrZero(o.ratePct);
+  const pitchHz = numberOrZero(o.pitchHz);
+  const volumePct = numberOrZero(o.volumePct);
+  const onProgress =
+    typeof o.onProgress === "function" ? o.onProgress : null;
+  const chunks = splitTextIntoChunks(text, LONG_CHUNK_LEN);
+
+  // Cancellation: ONE caller-facing { abort } fans out to a per-chunk
+  // abortRef (each is re-pointed by synthesize()/acquireSlot()/
+  // attemptSynthesis() as that chunk moves queued → active, so abort()
+  // always reaches the live stage).
+  const chunkRefs = chunks.map(() => ({ abort: null }));
+  const cancelAll = () => {
+    for (const ref of chunkRefs) {
+      try {
+        if (typeof ref.abort === "function") ref.abort();
+      } catch (_) {
+        /* best effort */
+      }
+    }
+  };
+  if (o.abortRef && typeof o.abortRef === "object") {
+    o.abortRef.abort = cancelAll;
+  }
+
+  // Fire ALL chunk syntheses up front — the engine-slot queue serializes
+  // at MAX_CONCURRENT_SYNTH live sockets and hands out the rest FIFO.
+  // Results land at their INDEX, so parallel completion can never reorder
+  // the merged audio; charsDone is only ever mutated from the JS thread
+  // (single-threaded), so plain accumulation is race-free.
+  const results = new Array(chunks.length).fill(null);
+  const failures = [];
+  let charsDone = 0;
+  await Promise.all(
+    chunks.map((chunkText, i) =>
+      (async () => {
+        try {
+          results[i] = await synthesize({
+            text: chunkText,
+            voice,
+            ratePct,
+            pitchHz,
+            volumePct,
+            style: style || undefined,
+            abortRef: chunkRefs[i],
+          });
+        } catch (err) {
+          failures.push(err);
+          // One chunk dying kills the whole run — cancel the siblings (in
+          // flight AND still queued) instead of burning their sockets.
+          cancelAll();
+          return;
+        }
+        charsDone += chunkText.length;
+        if (onProgress) {
+          try {
+            onProgress({
+              phase: "synth",
+              chunkIndex: i,
+              chunkCount: chunks.length,
+              charsDone,
+              totalChars: text.length,
+            });
+          } catch (_) {
+            /* listener errors must not kill the run */
+          }
+        }
+      })(),
+    ),
+  );
+  if (failures.length > 0) {
+    // A genuine chunk error wins over the sibling cancellations it caused;
+    // pure caller-cancels surface as the module's standard cancelled error.
+    const real = failures.find((err) => !(err && err.cancelled));
+    throw real || cancelledError();
+  }
+
+  // ---- merge: chunk ORDER (not completion order) defines the timeline ----
+  const bytesParts = [];
+  let bytesLen = 0;
+  const words = [];
+  let chunkStartMs = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    const r = results[i];
+    bytesParts.push(r.bytes);
+    bytesLen += r.bytesLen;
+    // 48 kbps CBR MP3 ⇒ 6000 B/s: byte count IS the chunk duration.
+    const chunkDurMs = (r.bytesLen / CBR_BYTES_PER_SECOND) * 1000;
+    for (const w of r.words || []) {
+      words.push({
+        text: w.text,
+        offsetMs: Math.round(chunkStartMs + w.offsetMs),
+        durationMs: w.durationMs,
+      });
+    }
+    chunkStartMs += chunkDurMs;
+  }
+  words.sort((a, b) => a.offsetMs - b.offsetMs);
+  const bytes = Buffer.concat(bytesParts, bytesLen);
+  return { bytes, bytesLen, words, chunkCount: chunks.length };
+}
+
 module.exports = {
   // Public API — consumed by dub-workflow.js and the voiceover UI.
   listVoices, // () => Promise<Array<{shortName, gender, locale, friendlyName, displayName}>>
   voicePairsByLocale, // () => Object<string, {female, male}> (SYNC plain map)
-  synthesize, // (o) => Promise<{filePath, bytes, bytesLen}>
+  synthesize, // (o) => Promise<{filePath, bytes, bytesLen, words}>
+  synthesizeLong, // (o) => Promise<{bytes, bytesLen, words, chunkCount}>
+  splitTextIntoChunks, // (text, maxLen) => string[] (long-text chunking)
   FALLBACK_VOICES, // built-in catalog (used automatically when offline)
   // Constants surfaced for callers / tests.
   SPEECH_HOST,
@@ -1191,4 +1580,6 @@ module.exports = {
   buildSsml,
   buildWsFrame,
   createWsFrameParser,
+  decodeBinaryMessage, // (Buffer) => {headerText, payload, msgPath}|null
+  collectWordMetadata, // (payload, out[]) => void (WordBoundary parsing)
 };

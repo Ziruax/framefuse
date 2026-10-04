@@ -44,6 +44,7 @@ import {
   Maximize,
   Mic,
   Music2,
+  Plus,
   Play,
   Repeat,
   Scissors,
@@ -64,6 +65,7 @@ import type {
   HeadlineItem,
   ItemEdit,
   MediaSegment,
+  MusicClip,
   OverlayTransform,
   SfxItem,
   TimelineMode,
@@ -127,17 +129,25 @@ interface TimelineRulerProps {
   onRemove?: (id: string) => void;
   /** v5.1: the active BASE segment (toolbar enable states + duration chip). */
   activeSegment?: MediaSegment | null;
-  /** v5.2: background music placement — the audio lane renders a DRAGGABLE
-   *  music clip (move to reposition, hover popover for volume + loop). */
-  musicStartMs?: number;
-  musicLoop?: boolean;
-  musicVolume?: number;
-  /** Music track duration (audioTrack.durationMs) — drives the clip width. */
-  musicDurationMs?: number | null;
-  musicName?: string | null;
-  onMusicMove?: (startMs: number) => void;
-  onMusicLoopChange?: (loop: boolean) => void;
-  onMusicVolumeChange?: (volume: number) => void;
+  /** v1.25 MULTI-MUSIC: the background-music clip stack — the Audio lane
+   *  renders it as a GROWABLE multi-row lane (greedy packing by startMs;
+   *  loop clips occupy their row until the timeline end). Each clip is
+   *  independently draggable, trimmable (non-loop), volume/loop-controllable
+   *  (hover popover) and removable. Starts are DISPLAY-time (the page owns
+   *  the base↔display shift). */
+  musicClips?: MusicClip[];
+  /** Fallback duration for the primary clip while its probe is in flight
+   *  (the decoded waveform's duration — same fallback the single-track lane
+   *  used). Null when no waveform either. */
+  waveformDurationMs?: number | null;
+  /** Move ONE music clip to a new display-time start (ms). */
+  onMusicMove?: (id: string, startMs: number) => void;
+  /** Patch ONE music clip (volume / loop / trimmable durationMs). */
+  onMusicClipEdit?: (id: string, patch: Partial<MusicClip>) => void;
+  /** Remove ONE music clip. */
+  onRemoveMusicClip?: (id: string) => void;
+  /** Open the multi-file music picker (the lane-gutter "+" button). */
+  onAddMusic?: () => void;
   /** v5.4: multi-select — ids of the currently SELECTED clips (base +
    *  overlay lanes). Selection is a user-intent concept (click /
    *  Ctrl-click / Shift-click / marquee drag / Ctrl+A), distinct from the
@@ -148,14 +158,16 @@ interface TimelineRulerProps {
   onSelectionChange?: (ids: string[]) => void;
   /** v5.4: remove MANY clips in ONE undo step (toolbar trash + Delete key
    *  act on the selection when present). v5.5: ids may MIX segments, SFX
-   *  pills and MUSIC_SEL_ID — the page routes each kind. */
+   *  pills and MUSIC CLIP ids (v1.25: real `mus_*` ids — the page routes
+   *  each kind). */
   onRemoveMany?: (ids: string[]) => void;
   /** v5.5: commit a coordinated GROUP MOVE (dragging any selected item
    *  moves the whole selection with one clamped delta; one undo step). */
   onGroupMove?: (move: {
     clips: { id: string; startMs: number }[];
     sfx: { id: string; startMs: number }[];
-    musicStartMs?: number;
+    /** v1.25: the selected music clips (per-clip starts). */
+    music?: { id: string; startMs: number }[];
   }) => void;
   /** v5.5: copy the selection (segments + SFX pills) to the clipboard. */
   onCopySelection?: () => void;
@@ -180,9 +192,8 @@ interface TimelineRulerProps {
   } | null;
 }
 
-/** v5.5: sentinel id of the singleton background-music clip inside the
- *  selection array (page.tsx routes it to the audio-track removal). */
-export const MUSIC_SEL_ID = "__ff_music__";
+// (v1.25: the v5.5 MUSIC_SEL_ID sentinel is GONE — music clips carry real
+// `mus_*` ids exactly like SFX pills, and the page routes them the same way.)
 
 // v4.9: bar tints — the segment bar is now a FILMSTRIP (thumbnail shows
 // through), so these gradients are translucent kind-tints layered over the
@@ -347,6 +358,22 @@ type DragInfo =
       origDur: number;
     }
   | {
+      /** v1.25: music clip gesture — move + right-edge trim (NON-loop clips
+       *  only; loop clips span to the timeline end and are never trimmed). */
+      kind: "music";
+      id: string;
+      gesture: "move" | "trim-r";
+      pointerId: number;
+      startX: number;
+      msPerPx: number;
+      didDrag: boolean;
+      origStart: number;
+      /** Effective (visible) duration at gesture start. */
+      origDur: number;
+      /** Probed SOURCE length — the trim ceiling (0 = unknown → no trim). */
+      sourceDur: number;
+    }
+  | {
       /** v5.5: coordinated GROUP drag — pressing an item that belongs to a
        *  multi-selection (≥ 2 entries) and dragging moves the WHOLE group
        *  with one delta. The driver (whichever item was pressed) routes the
@@ -369,8 +396,8 @@ type DragInfo =
       clips: { id: string; origStart: number; origDur: number }[];
       /** SFX members (driver included when it is an SFX pill). */
       sfx: { id: string; origStart: number; origDur: number }[];
-      /** Music member start (null when the singleton isn't selected). */
-      musicOrigStart: number | null;
+      /** v1.25: MUSIC members (driver included when it is a music clip). */
+      music: { id: string; origStart: number }[];
     };
 
 /** Live drag feedback mirrored into render (local state; parent state only
@@ -397,13 +424,24 @@ type DragPreview =
       durMs: number;
       /** v5.5: group-drag member previews (OTHER clips + sfx + music). */
       group?: GroupPreview;
+    }
+  | {
+      /** v1.25: live music-clip gesture feedback (move / trim-r). */
+      kind: "music";
+      id: string;
+      gesture: "move" | "trim-r";
+      startMs: number;
+      durMs: number;
+      /** v5.5: group-drag member previews (OTHER clips + sfx + music). */
+      group?: GroupPreview;
     };
 
 /** v5.5: previews for the non-driver members of a group drag. */
 type GroupPreview = {
   clips: { id: string; startMs: number; durMs: number }[];
   sfx: { id: string; startMs: number; durMs: number }[];
-  musicStart?: number;
+  /** v1.25: music member previews (per-clip). */
+  music: { id: string; startMs: number }[];
 };
 
 /** Max trimmable TIMELINE duration for a clip (video: the remaining SOURCE
@@ -587,6 +625,80 @@ function computeGroupDelta(
   const clamped = Math.max(d.loDelta, Math.min(d.hiDelta, raw));
   const snapped = snapMs(clamped);
   return Math.max(d.loDelta, Math.min(d.hiDelta, snapped));
+}
+
+/** v1.25: the MINIMUM visible music-clip span (matches the clip pill's
+ *  min width so a 0-duration probe never collapses the clip). */
+const MIN_MUSIC_DUR_MS = 200;
+
+/** v1.25: pure math for ONE music-clip gesture (the computeSfxDrag twin).
+ *  move   : start = orig + dx, snapped, clamped [0, totalMs − 200].
+ *  trim-r : dur = orig + dx, snapped, clamped [200, sourceDur]. */
+function computeMusicDrag(
+  d: Extract<DragInfo, { kind: "music" }>,
+  clientX: number,
+  totalMs: number,
+): { startMs: number; durationMs: number } {
+  const dx = clientX - d.startX;
+  if (d.gesture === "trim-r") {
+    const hi = d.sourceDur > 0 ? d.sourceDur : d.origDur;
+    const nd = snapMs(d.origDur + dx * d.msPerPx);
+    return {
+      startMs: d.origStart,
+      durationMs: Math.max(
+        MIN_MUSIC_DUR_MS,
+        Math.min(Math.max(MIN_MUSIC_DUR_MS, hi), nd),
+      ),
+    };
+  }
+  // move
+  const maxStart = Math.max(0, totalMs - 200);
+  return {
+    startMs: Math.max(0, Math.min(maxStart, snapMs(d.origStart + dx * d.msPerPx))),
+    durationMs: d.origDur,
+  };
+}
+
+/** v1.25: a music clip's EFFECTIVE timeline duration (the trimmable
+ *  durationMs; falls back to the probed source length, then the waveform
+ *  duration for the PRIMARY clip, then the 200ms minimum). */
+function musicEffectiveDurMs(
+  clip: MusicClip,
+  waveformDurMs?: number | null,
+): number {
+  if (clip.durationMs > 0) return clip.durationMs;
+  if (clip.sourceDurationMs > 0) return clip.sourceDurationMs;
+  if (waveformDurMs != null && waveformDurMs > 0) return waveformDurMs;
+  return MIN_MUSIC_DUR_MS;
+}
+
+/** v1.25: greedy row packing for the multi-row Audio lane — sorted by
+ *  startMs, a clip joins the first row whose last clip's end ≤ its start
+ *  (loop clips end at the TIMELINE end, so nothing ever joins after them);
+ *  otherwise the clip opens a new row. Lane height = rows × AUDIO_H. */
+interface MusicLayoutEntry {
+  clip: MusicClip;
+  row: number;
+}
+function packMusicRows(
+  clips: MusicClip[],
+  endOf: (clip: MusicClip) => number,
+): { entries: MusicLayoutEntry[]; rows: number } {
+  const sorted = [...clips].sort((a, b) => a.startMs - b.startMs);
+  const rowEnds: number[] = [];
+  const entries: MusicLayoutEntry[] = [];
+  for (const clip of sorted) {
+    const end = endOf(clip);
+    let row = rowEnds.findIndex((e) => clip.startMs >= e);
+    if (row === -1) {
+      rowEnds.push(end);
+      row = rowEnds.length - 1;
+    } else {
+      rowEnds[row] = Math.max(rowEnds[row], end);
+    }
+    entries.push({ clip, row });
+  }
+  return { entries, rows: Math.max(1, rowEnds.length) };
 }
 
 interface OverlayLayoutEntry {
@@ -1560,14 +1672,12 @@ export function TimelineRuler({
   onDuplicate,
   onRemove,
   activeSegment,
-  musicStartMs = 0,
-  musicLoop = false,
-  musicVolume = 1,
-  musicDurationMs = null,
-  musicName = null,
+  musicClips: musicClipsProp,
+  waveformDurationMs = null,
   onMusicMove,
-  onMusicLoopChange,
-  onMusicVolumeChange,
+  onMusicClipEdit,
+  onRemoveMusicClip,
+  onAddMusic,
   selectedIds: selectedIdsProp,
   onSelectionChange,
   onRemoveMany,
@@ -1630,7 +1740,7 @@ export function TimelineRuler({
   type CtxTarget =
     | { kind: "clip"; id: string; x: number; y: number }
     | { kind: "sfx"; id: string; x: number; y: number }
-    | { kind: "music"; id: ""; x: number; y: number }
+    | { kind: "music"; id: string; x: number; y: number }
     | { kind: "empty"; id: ""; x: number; y: number };
   const [ctxMenu, setCtxMenu] = useState<CtxTarget | null>(null);
   const [ctxIdx, setCtxIdx] = useState(0);
@@ -1666,14 +1776,17 @@ export function TimelineRuler({
     setCtxMenu({ kind: "sfx", id, x: e.clientX, y: e.clientY });
   };
 
-  const openMusicMenu = (e: ReactMouseEvent) => {
+  const openMusicMenu = (e: ReactMouseEvent, id: string) => {
     e.preventDefault();
     e.stopPropagation();
-    if (onSelectionChange && !(selectedIdsProp ?? []).includes(MUSIC_SEL_ID)) {
-      onSelectionChange([MUSIC_SEL_ID]);
+    // v1.25: clip-menu parity — a right-click OUTSIDE a containing selection
+    // selects the clip solo first (menu actions act on the selection).
+    if (onSelectionChange && !(selectedIdsProp ?? []).includes(id)) {
+      onSelectionChange([id]);
+      anchorIdRef.current = id;
     }
     setCtxIdx(0);
-    setCtxMenu({ kind: "music", id: "", x: e.clientX, y: e.clientY });
+    setCtxMenu({ kind: "music", id, x: e.clientX, y: e.clientY });
   };
 
   const openLaneMenu = (e: ReactMouseEvent) => {
@@ -1693,6 +1806,8 @@ export function TimelineRuler({
     videoDurations != null;
   const sfxList = sfxItems ?? [];
   const voList = voItems ?? [];
+  // v1.25: the music clip stack (display-time starts).
+  const musicList = musicClipsProp ?? [];
 
   // ------------------------------------------------------------------
   // v5.1 PIXEL ZOOM state (4..400 px per timeline second).
@@ -1914,91 +2029,129 @@ export function TimelineRuler({
     return null;
   };
 
-  // ---- v5.2: MUSIC clip drag (self-contained gesture — no lane switching,
-  // no shared DragInfo: the music track is a singleton on the audio lane).
-  // Press seeks to the music start (SFX pill parity); drag previews locally
-  // and commits once on pointerup. Snapped to the same 10ms grid.
-  const [musicDrag, setMusicDrag] = useState<{
-    pointerId: number;
-    startX: number;
-    origStart: number;
-    startMs: number;
-    didDrag: boolean;
-  } | null>(null);
-  /** Effective (preview-aware) music start. */
-  const musicStart = Math.max(
-    0,
-    Math.min(totalMs, musicDrag?.startMs ?? musicStartMs),
-  );
-
-  const beginMusicDrag = (e: ReactPointerEvent<HTMLDivElement>) => {
-    if (e.button !== 0 || !onMusicMove) return;
+  // ---- v1.25: MUSIC clip drag (per-clip, the SFX gesture template — one
+  // shared DragInfo kind "music"; move + right-edge trim for NON-loop
+  // clips). Press seeks to the clip's start (SFX pill parity); drag previews
+  // locally via DragPreview and commits once on pointerup; Alt+press is
+  // reserved for remove. Snapped to the same 10ms grid.
+  const beginMusicDrag = (
+    e: ReactPointerEvent<HTMLDivElement>,
+    clip: MusicClip,
+    gesture: "move" | "trim-r" = "move",
+  ) => {
+    if (e.button !== 0) return;
     e.stopPropagation();
-    onSeek(Math.max(0, musicStartMs));
-    // v5.5: a press on a multi-selected music clip hijacks into a GROUP
-    // gesture (the whole selection moves together).
-    if (tryBeginGroupDrag(e, "music", MUSIC_SEL_ID, Math.max(0, musicStartMs))) {
+    if (e.altKey && onRemoveMusicClip) return;
+    // v5.5: a MOVE press on a multi-selected music clip hijacks into a GROUP
+    // gesture (the whole selection moves; trims stay single-clip).
+    if (
+      gesture === "move" &&
+      tryBeginGroupDrag(e, "music", clip.id, Math.max(0, clip.startMs))
+    ) {
       return;
     }
+    // Press-seek only for the clip body (edge presses carry trim intent).
+    if (gesture === "move") onSeek(Math.max(0, clip.startMs));
+    if (!onMusicMove && gesture === "move") return;
+    if (!onMusicClipEdit && gesture === "trim-r") return;
     try {
       e.currentTarget.setPointerCapture(e.pointerId);
     } catch {
       // best-effort
     }
-    setMusicDrag({
+    dragRef.current = {
+      kind: "music",
+      id: clip.id,
+      gesture,
       pointerId: e.pointerId,
       startX: e.clientX,
-      origStart: Math.max(0, musicStartMs),
-      startMs: Math.max(0, musicStartMs),
+      msPerPx: msPerPxNow(),
       didDrag: false,
-    });
+      origStart: Math.max(0, clip.startMs),
+      origDur: musicEffectiveDurMs(clip),
+      sourceDur:
+        clip.sourceDurationMs > 0
+          ? clip.sourceDurationMs
+          : clip.durationMs > 0
+            ? clip.durationMs
+            : 0,
+    };
   };
 
   const handleMusicPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const d = dragRef.current;
+    if (!d || d.pointerId !== e.pointerId) return;
     // v5.5: group gestures route through the shared group handler.
-    const gd = dragRef.current;
-    if (gd && gd.kind === "group" && gd.pointerId === e.pointerId) {
-      handleGroupPointerMove(e, gd);
+    if (d.kind === "group") {
+      handleGroupPointerMove(e, d);
       return;
     }
-    const d = musicDrag;
-    if (!d || d.pointerId !== e.pointerId) return;
-    const dx = e.clientX - d.startX;
+    if (d.kind !== "music") return;
     if (!d.didDrag) {
-      if (Math.abs(dx) <= DRAG_DEADZONE_PX) return;
+      if (Math.abs(e.clientX - d.startX) <= DRAG_DEADZONE_PX) return;
+      d.didDrag = true;
     }
-    const msPerPx = msPerPxNow();
-    const maxStart = Math.max(0, totalMs - 200);
-    const ns = Math.max(
-      0,
-      Math.min(maxStart, snapMs(d.origStart + dx * msPerPx)),
-    );
-    setMusicDrag((prev) =>
-      prev && prev.pointerId === e.pointerId
-        ? { ...prev, didDrag: true, startMs: ns }
-        : prev,
-    );
+    const r = computeMusicDrag(d, e.clientX, totalMs);
+    setDragPreview({
+      kind: "music",
+      id: d.id,
+      gesture: d.gesture,
+      startMs: r.startMs,
+      durMs: r.durationMs,
+    });
   };
 
   const handleMusicPointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const d = dragRef.current;
+    if (!d || d.pointerId !== e.pointerId) return;
     // v5.5: group release (commit or click-select) — before the solo path.
-    const gd = dragRef.current;
-    if (gd && gd.kind === "group" && gd.pointerId === e.pointerId) {
-      handleGroupPointerUp(e, gd);
+    if (d.kind === "group") {
+      handleGroupPointerUp(e, d);
       return;
     }
-    const d = musicDrag;
-    if (!d || d.pointerId !== e.pointerId) return;
-    setMusicDrag(null);
-    if (d.didDrag) {
-      if (onMusicMove) onMusicMove(d.startMs);
-    } else if (onSelectionChange) {
+    if (d.kind !== "music") return;
+    dragRef.current = null;
+    setDragPreview(null);
+    if (!d.didDrag) {
       // v5.5: a plain music-clip click SELECTS it (clip parity).
-      onSelectionChange([MUSIC_SEL_ID]);
+      if (onSelectionChange && !e.altKey) {
+        onSelectionChange(clickSelectionFor(d.id, e));
+        anchorIdRef.current = d.id;
+      }
+      return;
+    }
+    const r = computeMusicDrag(d, e.clientX, totalMs);
+    if (d.gesture === "move") {
+      onMusicMove?.(d.id, r.startMs);
+    } else {
+      // trim-r — commit the new visible duration as a patch (page clamps
+      // to [200ms, probed source length]).
+      onMusicClipEdit?.(d.id, { durationMs: Math.round(r.durationMs) });
     }
   };
 
-  const handleMusicDragAbort = () => setMusicDrag(null);
+  const handleMusicDragAbort = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const d = dragRef.current;
+    if (d && d.pointerId === e.pointerId) {
+      dragRef.current = null;
+      setDragPreview(null);
+    }
+  };
+
+  /** Live music-clip preview (solo gesture or group member). */
+  const musicPreviewFor = (id: string): {
+    startMs: number;
+    durMs: number;
+    dragging: boolean;
+  } | null => {
+    if (!dragPreview) return null;
+    if (dragPreview.kind === "music" && dragPreview.id === id) {
+      return { startMs: dragPreview.startMs, durMs: dragPreview.durMs, dragging: true };
+    }
+    const g = dragPreview.group?.music.find((m) => m.id === id);
+    if (g) return { startMs: g.startMs, durMs: 0, dragging: true };
+    return null;
+  };
 
   // ---- v1.17 VOICEOVER chip drag (self-contained, music-drag parity: no
   // lane switching, no shared DragInfo, no marquee/selection integration).
@@ -2074,12 +2227,8 @@ export function TimelineRuler({
     e: { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean },
   ) => {
     if (!onSelectionChange) return;
-    if (driver.type === "music") {
-      onSelectionChange([MUSIC_SEL_ID]);
-    } else {
-      onSelectionChange(clickSelectionFor(driver.id, e));
-      anchorIdRef.current = driver.id;
-    }
+    onSelectionChange(clickSelectionFor(driver.id, e));
+    anchorIdRef.current = driver.id;
   };
 
   /**
@@ -2087,8 +2236,8 @@ export function TimelineRuler({
    * group owns the pointer (caller must NOT begin a solo gesture). The
    * coordinated bounds: every member stays inside [0, totalMs]; a BASE-lane
    * member may not cross its previous neighbor's end UNLESS that neighbor
-   * is also in the group (it moves away); the music clip keeps its
-   * [0, totalMs − 200] window (music-drag parity).
+   * is also in the group (it moves away); every MUSIC clip keeps its
+   * [0, totalMs − 200] window (music-drag parity, per clip).
    */
   const tryBeginGroupDrag = (
     e: ReactPointerEvent<HTMLDivElement>,
@@ -2104,16 +2253,15 @@ export function TimelineRuler({
     // resolve to nothing — stale ids are inert, never crash the gesture).
     const clipMembers = segments.filter((s) => selSet.has(s.id));
     const sfxMembers = sfxList.filter((s) => selSet.has(s.id));
-    const musicSelected =
-      selSet.has(MUSIC_SEL_ID) && onMusicMove != null && musicStartMs != null;
-    const musicStart = Math.max(0, musicStartMs ?? 0);
+    const musicMembers =
+      onMusicMove != null ? musicList.filter((c) => selSet.has(c.id)) : [];
     const memberCount =
-      clipMembers.length + sfxMembers.length + (musicSelected ? 1 : 0);
+      clipMembers.length + sfxMembers.length + musicMembers.length;
     if (memberCount < 2) return false;
     const driverIn =
       (driverType === "clip" && clipMembers.some((m) => m.id === driverId)) ||
       (driverType === "sfx" && sfxMembers.some((m) => m.id === driverId)) ||
-      (driverType === "music" && musicSelected);
+      (driverType === "music" && musicMembers.some((m) => m.id === driverId));
     if (!driverIn) return false;
 
     // Coordinated bounds (ms deltas).
@@ -2140,8 +2288,9 @@ export function TimelineRuler({
       lo = Math.max(lo, -start);
       hi = Math.min(hi, totalMs - start);
     }
-    if (musicSelected) {
-      const start = driverType === "music" ? driverStartMs : musicStart;
+    for (const m of musicMembers) {
+      const start =
+        driverType === "music" && m.id === driverId ? driverStartMs : m.startMs;
       lo = Math.max(lo, -start);
       hi = Math.min(hi, Math.max(0, totalMs - 200) - start);
     }
@@ -2175,11 +2324,11 @@ export function TimelineRuler({
           driverType === "sfx" && s.id === driverId ? driverStartMs : s.startMs,
         origDur: sfxDurationMs(s),
       })),
-      musicOrigStart: musicSelected
-        ? driverType === "music"
-          ? driverStartMs
-          : musicStart
-        : null,
+      music: musicMembers.map((m) => ({
+        id: m.id,
+        origStart:
+          driverType === "music" && m.id === driverId ? driverStartMs : m.startMs,
+      })),
     };
     return true;
   };
@@ -2201,6 +2350,7 @@ export function TimelineRuler({
     const delta = computeGroupDelta(d, e.clientX);
     const driverClip = d.clips.find((c) => c.id === d.driver.id);
     const driverSfx = d.sfx.find((c) => c.id === d.driver.id);
+    const driverMusic = d.music.find((c) => c.id === d.driver.id);
     const group: GroupPreview = {
       clips: d.clips
         .filter((c) => c.id !== d.driver.id)
@@ -2216,8 +2366,12 @@ export function TimelineRuler({
           startMs: c.origStart + delta,
           durMs: c.origDur,
         })),
-      musicStart:
-        d.musicOrigStart != null ? d.musicOrigStart + delta : undefined,
+      music: d.music
+        .filter((c) => c.id !== d.driver.id)
+        .map((c) => ({
+          id: c.id,
+          startMs: c.origStart + delta,
+        })),
     };
     if (driverClip) {
       setDragPreview({
@@ -2239,26 +2393,15 @@ export function TimelineRuler({
         durMs: driverSfx.origDur,
         group,
       });
-    } else {
-      // Music-driven: no dragPreview driver entry, only the group.
+    } else if (driverMusic) {
+      // v1.25: a music clip can DRIVE the group (per-clip preview entry).
       setDragPreview({
-        kind: "sfx",
-        id: "__music_driver__",
+        kind: "music",
+        id: driverMusic.id,
         gesture: "move",
-        startMs: 0,
+        startMs: driverMusic.origStart + delta,
         durMs: 0,
         group,
-      });
-    }
-    // The music clip previews through the musicDrag channel (musicStart
-    // reads it in render).
-    if (d.musicOrigStart != null) {
-      setMusicDrag({
-        pointerId: d.pointerId,
-        startX: d.startX,
-        origStart: d.musicOrigStart,
-        startMs: d.musicOrigStart + delta,
-        didDrag: true,
       });
     }
   };
@@ -2272,7 +2415,6 @@ export function TimelineRuler({
   ) => {
     dragRef.current = null;
     setDragPreview(null);
-    setMusicDrag(null);
     if (!d.didDrag) {
       commitClickSelection(d.driver, e);
       return;
@@ -2283,18 +2425,21 @@ export function TimelineRuler({
     onGroupMove?.({
       clips: d.clips.map((c) => ({ id: c.id, startMs: c.origStart + delta })),
       sfx: d.sfx.map((c) => ({ id: c.id, startMs: c.origStart + delta })),
-      musicStartMs:
-        d.musicOrigStart != null ? d.musicOrigStart + delta : undefined,
+      music: d.music.map((c) => ({
+        id: c.id,
+        startMs: c.origStart + delta,
+      })),
     });
   };
 
-  // v5.2: music-clip hover state drives the volume/loop popover. React state
-  // (not CSS group-hover): Tailwind's `pointer-events-none` and the
-  // `group-hover:pointer-events-auto` variant share specificity, so cascade
-  // order decides — inline styles are deterministic. The popover is a DOM
-  // descendant of the clip, so moving the pointer from the clip into the
-  // (flush, top-0) popover never fires pointerleave — the chain is unbroken.
-  const [musicHover, setMusicHover] = useState(false);
+  // v5.2→v1.25: music-clip hover state (the HOVERED CLIP's id) drives the
+  // volume/loop/trim popover. React state (not CSS group-hover): Tailwind's
+  // `pointer-events-none` and the `group-hover:pointer-events-auto` variant
+  // share specificity, so cascade order decides — inline styles are
+  // deterministic. The popover is a DOM descendant of the clip, so moving
+  // the pointer from the clip into the (flush, top-0) popover never fires
+  // pointerleave — the chain is unbroken.
+  const [musicHoverId, setMusicHoverId] = useState<string | null>(null);
 
   /**
    * Begin a clip gesture (body = move, edges = trim). Guards: only when the
@@ -2583,9 +2728,6 @@ export function TimelineRuler({
     if (d && d.pointerId === e.pointerId) {
       dragRef.current = null;
       setDragPreview(null);
-      // v5.5: a group drag may be previewing the music clip via musicDrag
-      // — clear it too (a stale preview would freeze the clip mid-air).
-      if (d.kind === "group") setMusicDrag(null);
     }
   };
 
@@ -2754,21 +2896,25 @@ export function TimelineRuler({
         return { id: s.id, startMs: s.startMs, endMs: s.startMs + dur };
       }),
     );
-    // Music geometry: loop → the whole timeline; else start + duration
-    // (musicDurationMs falls back to the WAVEFORM duration — durationMs
-    // can be null right after an undo restore). Presence = musicName
-    // (audioTrack.fileName) — the one prop that tracks the track itself.
-    if (musicName != null && musicStartMs != null) {
-      const mDur =
-        musicDurationMs && musicDurationMs > 0
-          ? musicDurationMs
-          : waveform?.durationMs ?? totalMs;
-      const musicEnd = musicLoop
-        ? totalMs
-        : Math.min(totalMs, musicStartMs + mDur);
-      scanRange(audioAxisRef.current, [
-        { id: MUSIC_SEL_ID, startMs: musicStartMs, endMs: musicEnd },
-      ]);
+    // Music geometry: every clip scans in (loop → the whole timeline; else
+    // start + effective duration — the primary falls back to the waveform
+    // duration while its probe is in flight). v1.25: real mus_* ids.
+    if (musicList.length > 0) {
+      const primary = musicList[0];
+      scanRange(
+        audioAxisRef.current,
+        musicList.map((c) => {
+          const dur = musicEffectiveDurMs(
+            c,
+            c.id === primary?.id ? (waveformDurationMs ?? null) : null,
+          );
+          return {
+            id: c.id,
+            startMs: c.startMs,
+            endMs: c.loop ? totalMs : Math.min(totalMs, c.startMs + dur),
+          };
+        }),
+      );
     }
     return ids;
   };
@@ -3180,41 +3326,49 @@ export function TimelineRuler({
       ];
     }
     if (ctxMenu.kind === "music") {
+      // v1.25: per-clip menu — the target is a real mus_* id clip.
+      const mc = musicList.find((c) => c.id === ctxMenu.id);
       const sel = selectedIdsProp ?? [];
-      const multi = sel.length > 1 && sel.includes(MUSIC_SEL_ID);
+      const multi = sel.length > 1 && sel.includes(ctxMenu.id);
       return [
         {
           icon: Play,
           label: "Jump to music start",
-          onClick: () => onSeek(Math.max(0, musicStart)),
+          onClick: () => onSeek(Math.max(0, mc?.startMs ?? 0)),
         },
         {
           icon: Maximize,
           label: "Move to 00:00",
-          onClick: onMusicMove ? () => onMusicMove(0) : undefined,
-          disabled: onMusicMove == null || musicStart <= 0,
+          onClick:
+            mc && onMusicMove ? () => onMusicMove(mc.id, 0) : undefined,
+          disabled: mc == null || onMusicMove == null || mc.startMs <= 0,
         },
         {
           icon: Repeat,
-          label: musicLoop ? "Stop looping" : "Loop full video",
-          onClick: onMusicLoopChange
-            ? () => onMusicLoopChange(!musicLoop)
-            : undefined,
-          disabled: onMusicLoopChange == null,
+          label: mc?.loop ? "Stop looping" : "Loop to fill video",
+          onClick:
+            mc && onMusicClipEdit
+              ? () => onMusicClipEdit(mc.id, { loop: !mc.loop })
+              : undefined,
+          disabled: mc == null || onMusicClipEdit == null,
         },
-        ...(multi
-          ? [
-              { sep: true, label: "" } as CtxItem,
-              {
-                icon: Trash2,
-                label: `Delete ${sel.length} selected`,
-                kbd: "Del",
-                danger: true,
-                onClick: onRemoveMany ? () => onRemoveMany(sel) : undefined,
-                disabled: onRemoveMany == null,
-              } as CtxItem,
-            ]
-          : []),
+        { sep: true, label: "" },
+        {
+          icon: Trash2,
+          label: multi ? `Delete ${sel.length} selected` : "Remove music clip",
+          kbd: multi ? "Del" : "Alt+click",
+          danger: true,
+          onClick: multi
+            ? onRemoveMany
+              ? () => onRemoveMany(sel)
+              : undefined
+            : mc && onRemoveMusicClip
+              ? () => onRemoveMusicClip(mc.id)
+              : undefined,
+          disabled: multi
+            ? onRemoveMany == null
+            : mc == null || onRemoveMusicClip == null,
+        },
       ];
     }
     // Empty lane space
@@ -3226,13 +3380,13 @@ export function TimelineRuler({
         disabled:
           segments.length === 0 &&
           sfxList.length === 0 &&
-          musicName == null,
+          musicList.length === 0,
         onClick: onSelectionChange
           ? () =>
               onSelectionChange([
                 ...segments.map((s) => s.id),
                 ...sfxList.map((s) => s.id),
-                ...(musicName != null ? [MUSIC_SEL_ID] : []),
+                ...musicList.map((c) => c.id),
               ])
           : undefined,
       },
@@ -3980,49 +4134,111 @@ export function TimelineRuler({
             </div>
           </div>
 
-          {/* LANE 3 — AUDIO (v5.2: DRAGGABLE background-music clip with volume
-              + loop controls — a first-class timeline citizen instead of a
-              read-only strip). Cyan-900/20-tinted while a waveform is loaded. */}
-          <div
-            role="group"
-            aria-label="Audio lane"
-            className="flex shrink-0 border-b"
-            style={{
-              height: AUDIO_H,
-              borderColor: ROW_BORDER,
-              backgroundColor: hasWave ? LANE_BG_WAVE : LANE_BG_A,
-            }}
-          >
-            <LaneLabel icon={AudioLines} text="Audio" accent="#0d9488" sticky />
-            <div
-              ref={audioAxisRef}
-              className="relative min-w-0 shrink-0 transition-colors hover:bg-white/[0.04]"
-              style={{ width: axisW }}
-              {...laneMarqueeHandlers}
-            >
-              {hasWave && waveform ? (
-                <>
-                  {/* Waveform anchored at the music start; repeats when the
-                      loop-to-fill mode is on (progress stays audio-relative). */}
-                  <WaveformStrip
-                    data={waveform}
-                    totalMs={totalMs}
-                    currentMs={currentMs}
-                    startMs={musicStart}
-                    loop={musicLoop}
-                    className="pointer-events-none absolute inset-x-1 inset-y-0"
-                  />
-                  {/* The music CLIP — drag to reposition; hover reveals the
-                      volume slider + loop toggle popover. */}
-                  {(() => {
+          {/* LANE 3 — AUDIO (v1.25 MULTI-MUSIC: a GROWABLE multi-row stack of
+              background-music clips — greedy row packing by startMs; every
+              clip is an independent citizen: draggable, trimmable (non-loop),
+              per-clip volume/loop popover, removable, multi-select + group
+              drag. The PRIMARY clip (index 0) still owns the waveform strip.
+              Cyan-900/20-tinted while a waveform is loaded. */}
+          {(() => {
+            const primary = musicList[0] ?? null;
+            // v1.25: greedy row packing — loop clips end at the timeline end,
+            // so nothing ever joins a row after one; lane height = rows × 34.
+            const endOf = (c: MusicClip) =>
+              c.loop
+                ? totalMs
+                : Math.min(
+                    totalMs,
+                    c.startMs +
+                      musicEffectiveDurMs(
+                        c,
+                        c.id === primary?.id ? (waveformDurationMs ?? null) : null,
+                      ),
+                  );
+            const { entries, rows } = packMusicRows(musicList, endOf);
+            const laneH = Math.max(AUDIO_H, rows * AUDIO_H);
+            const primaryEntry = primary
+              ? entries.find((e) => e.clip.id === primary.id) ?? null
+              : null;
+            return (
+              <div
+                role="group"
+                aria-label="Audio lane"
+                className="flex shrink-0 border-b"
+                style={{
+                  height: laneH,
+                  borderColor: ROW_BORDER,
+                  backgroundColor: hasWave ? LANE_BG_WAVE : LANE_BG_A,
+                }}
+              >
+                {/* Lane gutter (LaneLabel + the v1.25 "+ add music" button). */}
+                <div
+                  className="sticky left-0 z-[7] flex h-full w-16 shrink-0 select-none items-center justify-center gap-1 border-r"
+                  style={{ borderColor: GUTTER_BORDER, backgroundColor: "#211e1a" }}
+                >
+                  <AudioLines className="size-3 shrink-0" style={{ color: "#0d9488" }} aria-hidden />
+                  <span className="truncate text-[9px] font-bold uppercase tracking-wider text-stone-400">
+                    {musicList.length > 1 ? `Audio · ${musicList.length}` : "Audio"}
+                  </span>
+                  {onAddMusic && (
+                    <button
+                      type="button"
+                      onClick={onAddMusic}
+                      title="Add background music track — pick one or more audio files (they stack as new rows)"
+                      aria-label="Add background music track"
+                      className="ml-0.5 flex size-4 shrink-0 cursor-pointer items-center justify-center rounded border transition-colors hover:border-teal-400/80 hover:bg-teal-500/15"
+                      style={{ borderColor: "rgba(13,148,136,0.55)", color: "#2dd4bf" }}
+                    >
+                      <Plus className="size-3" aria-hidden />
+                    </button>
+                  )}
+                </div>
+                <div
+                  ref={audioAxisRef}
+                  className="relative min-w-0 shrink-0 transition-colors hover:bg-white/[0.04]"
+                  style={{ width: axisW }}
+                  {...laneMarqueeHandlers}
+                >
+                  {musicList.length === 0 && (
+                    <EmptyHint>
+                      No music track — add one with the + button or the Audio tab
+                    </EmptyHint>
+                  )}
+                  {/* Waveform of the PRIMARY clip, anchored at its start (the
+                      strip lives in the primary's ROW so row growth never
+                      stretches it); repeats when it loops to fill. */}
+                  {hasWave && waveform && primaryEntry && (
+                    <div
+                      className="pointer-events-none absolute inset-x-0"
+                      style={{ top: primaryEntry.row * AUDIO_H, height: AUDIO_H }}
+                      aria-hidden
+                    >
+                      <WaveformStrip
+                        data={waveform}
+                        totalMs={totalMs}
+                        currentMs={currentMs}
+                        startMs={primaryEntry.clip.startMs}
+                        loop={primaryEntry.clip.loop}
+                        className="pointer-events-none absolute inset-x-1 inset-y-0"
+                      />
+                    </div>
+                  )}
+                  {/* The music CLIPS — one pill per clip per packed row. */}
+                  {entries.map(({ clip, row }) => {
+                    const isPrimary = clip.id === primary?.id;
+                    const pv = musicPreviewFor(clip.id);
+                    const clipSelected = isSel(clip.id);
+                    const effectiveDur = musicEffectiveDurMs(
+                      clip,
+                      isPrimary ? (waveformDurationMs ?? null) : null,
+                    );
+                    const startMs = Math.max(0, pv?.startMs ?? clip.startMs);
                     const durMs =
-                      musicDurationMs && musicDurationMs > 0
-                        ? musicDurationMs
-                        : waveform.durationMs;
-                    const endMs = musicLoop
-                      ? Math.max(totalMs, musicStart + 200)
-                      : Math.min(totalMs, musicStart + durMs);
-                    const left = layout ? layout.pxOf(musicStart) : 0;
+                      pv && pv.durMs > 0 ? pv.durMs : effectiveDur;
+                    const endMs = clip.loop
+                      ? Math.max(totalMs, startMs + 200)
+                      : Math.min(totalMs, startMs + durMs);
+                    const left = layout ? layout.pxOf(startMs) : 0;
                     const width = Math.max(
                       24,
                       layout
@@ -4030,81 +4246,93 @@ export function TimelineRuler({
                         : axisW * (endMs / Math.max(1, totalMs)),
                     );
                     const volPct = Math.round(
-                      Math.max(0, Math.min(2, musicVolume)) * 100,
+                      Math.max(0, Math.min(2, clip.volume)) * 100,
                     );
-                    // v5.5: a selected music clip carries the amber accent.
-                    const musicSelected = isSel(MUSIC_SEL_ID);
+                    const dragging = pv != null;
+                    const hovered = musicHoverId === clip.id;
+                    const trimmable =
+                      onMusicClipEdit != null && !clip.loop && clip.sourceDurationMs > 0;
                     return (
                       <div
+                        key={clip.id}
                         role="button"
                         tabIndex={0}
-                        aria-label={`Background music clip starting at ${fmtTimecode(musicStart)}${musicLoop ? ", looping to fill the video" : ""}${musicSelected ? ", selected" : ""}`}
+                        aria-label={`Background music clip ${middleEllipsis(clip.fileName, 24)} starting at ${fmtTimecode(startMs)}${clip.loop ? ", looping to fill the video" : ""}${clipSelected ? ", selected" : ""}`}
                         className={cn(
-                          // NOTE: no overflow-hidden AND no z-index — the
-                          // hover popover (volume + loop) floats ABOVE the
-                          // 34px lane and its z-[60] must escape this clip's
-                          // subtree (a z here would create a stacking context
-                          // that traps the popover under the video lane's
-                          // z-[3] filmstrip bars). The clip still paints over
-                          // the waveform strip (later absolute sibling).
-                          "group absolute top-1 bottom-1 flex select-none items-center gap-1 rounded-md border pl-1.5 text-[8px] font-semibold",
+                          // NOTE: no overflow-hidden AND no z-index — the hover
+                          // popover (volume + loop) floats ABOVE the 34px row
+                          // and its z-[60] must escape this clip's subtree.
+                          "group absolute flex select-none items-center gap-1 rounded-md border pl-1.5 pr-2 text-[8px] font-semibold",
                           onMusicMove
                             ? "cursor-grab touch-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-teal-500/70"
                             : "cursor-pointer",
-                          musicDrag && "cursor-grabbing",
-                          // v5.5: amber selection ring (clip parity).
-                          musicSelected && "ff-clip-selected",
+                          dragging && "cursor-grabbing",
+                          clipSelected && "ff-clip-selected",
                         )}
                         style={{
+                          top: row * AUDIO_H + 3,
+                          height: AUDIO_H - 6,
                           left,
                           width,
-                          backgroundColor: musicSelected
+                          backgroundColor: clipSelected
                             ? "rgba(234, 88, 12, 0.16)"
-                            : musicDrag
+                            : dragging
                               ? "rgba(13, 148, 136, 0.30)"
                               : "rgba(13, 148, 136, 0.16)",
-                          borderColor: musicSelected
+                          borderColor: clipSelected
                             ? "rgba(234, 88, 12, 0.9)"
-                            : musicLoop
+                            : clip.loop
                               ? "rgba(13, 148, 136, 0.75)"
                               : "rgba(13, 148, 136, 0.45)",
-                          color: musicSelected ? "#fb923c" : "#2dd4bf",
-                          boxShadow: musicDrag
+                          color: clipSelected ? "#fb923c" : "#2dd4bf",
+                          boxShadow: dragging
                             ? "0 0 0 1.5px rgba(13,148,136,0.7), 0 4px 12px rgba(0,0,0,0.45)"
-                            : musicSelected
+                            : clipSelected
                               ? "0 0 0 2px rgba(234, 88, 12, 0.4), 0 0 12px rgba(234, 88, 12, 0.2)"
                               : "0 1px 2px rgba(0,0,0,0.35)",
                         }}
-                        title={`Background music · starts ${fmtTimecode(musicStart)}${musicLoop ? " · loops to fill the video" : ` · ${fmtTimecode(durMs)} long`}${onMusicMove ? " · drag to reposition" : ""}\nright-click for actions`}
-                        onContextMenu={openMusicMenu}
-                        onPointerDown={beginMusicDrag}
+                        title={`Background music · ${clip.fileName} · starts ${fmtTimecode(startMs)}${clip.loop ? " · loops to fill the video" : ` · ${fmtTimecode(durMs)} long`}${onMusicMove ? " · drag to reposition" : ""}${trimmable ? " · drag the right edge to trim" : ""}${onRemoveMusicClip ? " · Alt+click to remove" : ""}\nright-click for actions`}
+                        onContextMenu={(e) => openMusicMenu(e, clip.id)}
+                        onPointerDown={(e) => beginMusicDrag(e, clip)}
                         onPointerMove={handleMusicPointerMove}
                         onPointerUp={handleMusicPointerUp}
                         onPointerCancel={handleMusicDragAbort}
                         onLostPointerCapture={handleMusicDragAbort}
-                        onPointerEnter={() => setMusicHover(true)}
-                        onPointerLeave={() => setMusicHover(false)}
+                        onPointerEnter={() => setMusicHoverId(clip.id)}
+                        onPointerLeave={() =>
+                          setMusicHoverId((h) => (h === clip.id ? null : h))
+                        }
+                        onClick={(e) => {
+                          if (e.altKey && onRemoveMusicClip) {
+                            e.stopPropagation();
+                            onRemoveMusicClip(clip.id);
+                          }
+                        }}
                         onKeyDown={(e) => {
                           if (e.key === "Enter" || e.key === " ") {
                             e.preventDefault();
-                            onSeek(Math.max(0, musicStart));
+                            onSeek(Math.max(0, startMs));
+                          } else if (
+                            (e.key === "Delete" || e.key === "Backspace") &&
+                            onRemoveMusicClip
+                          ) {
+                            e.preventDefault();
+                            onRemoveMusicClip(clip.id);
                           }
                         }}
                       >
                         <Music2 className="size-2.5 shrink-0" aria-hidden />
                         <span className="min-w-0 flex-1 truncate">
-                          {musicName
-                            ? middleEllipsis(musicName, 28)
-                            : "Background music"}
+                          {middleEllipsis(clip.fileName, 28)}
                         </span>
-                        {musicLoop && (
+                        {clip.loop && (
                           <span
                             className="flex shrink-0 items-center gap-0.5 rounded px-1 py-px"
                             style={{
                               backgroundColor: "rgba(45, 212, 191, 0.18)",
                               border: "1px solid rgba(45, 212, 191, 0.45)",
                             }}
-                            title="Looping — the track repeats to cover the ENTIRE video"
+                            title="Looping — this track repeats to cover the remainder of the video"
                           >
                             <Repeat className="size-2.5" aria-hidden />
                             loop
@@ -4112,7 +4340,7 @@ export function TimelineRuler({
                         )}
                         <span
                           className="flex shrink-0 items-center gap-0.5 tabular-nums opacity-80"
-                          title={`Music volume — ${volPct}% (adjust in the hover controls or Settings → Audio)`}
+                          title={`Music volume — ${volPct}% (hover controls or the Audio tab)`}
                         >
                           {volPct === 0 ? (
                             <VolumeX className="size-2.5" aria-hidden />
@@ -4121,19 +4349,28 @@ export function TimelineRuler({
                           )}
                           {volPct}%
                         </span>
-                        {/* Hover popover: volume slider + loop toggle (floats
-                            ABOVE the 34px lane so nothing is crammed).
-                            top-0 + -translate-y-full keeps the popover's
-                            bottom edge FLUSH with the clip's top edge — a
-                            gap would break the pointer chain (the pointer
-                            would fall through to the lane above and the
-                            popover would close before the click lands). */}
-                        {(onMusicVolumeChange || onMusicLoopChange) && (
+                        {/* v1.25: right-edge trim handle (NON-loop clips with a
+                            probed source length — the trim ceiling). Teal 5px
+                            zone fading in on hover, SFX-handle parity. */}
+                        {trimmable && (
+                          <div
+                            className="absolute inset-y-0 right-0 z-[2] w-[5px] cursor-ew-resize touch-none bg-teal-500/25 opacity-0 shadow-[inset_-1px_0_0_rgba(13,148,136,0.7)] transition-opacity duration-100 group-hover:opacity-100"
+                            title="Drag to lengthen/shorten the clip (min 0.2s, max the source length)"
+                            aria-hidden
+                            onPointerDown={(e) =>
+                              beginMusicDrag(e, clip, "trim-r")
+                            }
+                            onLostPointerCapture={handleMusicDragAbort}
+                          />
+                        )}
+                        {/* Hover popover: per-clip volume slider + loop toggle
+                            + remove (floats ABOVE the row). */}
+                        {onMusicClipEdit && (
                           <div
                             className="absolute top-0 left-1/2 z-[60] -translate-x-1/2 -translate-y-full transition-opacity duration-100"
                             style={{
-                              opacity: musicHover || musicDrag ? 1 : 0,
-                              pointerEvents: musicHover || musicDrag ? "auto" : "none",
+                              opacity: hovered || dragging ? 1 : 0,
+                              pointerEvents: hovered || dragging ? "auto" : "none",
                             }}
                           >
                             <div
@@ -4144,50 +4381,59 @@ export function TimelineRuler({
                               }}
                               onPointerDown={(e) => e.stopPropagation()}
                             >
-                              {onMusicVolumeChange && (
-                                <label className="flex items-center gap-1.5 text-[9px] font-medium text-stone-300">
-                                  <Volume2 className="size-3 text-teal-400" aria-hidden />
-                                  <input
-                                    type="range"
-                                    min={0}
-                                    max={200}
-                                    step={5}
-                                    value={volPct}
-                                    aria-label="Background music volume"
-                                    className="w-24 accent-teal-400"
-                                    onChange={(e) =>
-                                      onMusicVolumeChange(
-                                        Math.max(
-                                          0,
-                                          Math.min(2, Number(e.target.value) / 100),
-                                        ),
-                                      )
-                                    }
-                                  />
-                                  <span className="w-8 tabular-nums text-stone-400">
-                                    {volPct}%
-                                  </span>
-                                </label>
-                              )}
-                              {onMusicLoopChange && (
+                              <label className="flex items-center gap-1.5 text-[9px] font-medium text-stone-300">
+                                <Volume2 className="size-3 text-teal-400" aria-hidden />
+                                <input
+                                  type="range"
+                                  min={0}
+                                  max={200}
+                                  step={5}
+                                  value={volPct}
+                                  aria-label={`Volume for ${clip.fileName}`}
+                                  className="w-24 accent-teal-400"
+                                  onChange={(e) =>
+                                    onMusicClipEdit(clip.id, {
+                                      volume: Math.max(
+                                        0,
+                                        Math.min(2, Number(e.target.value) / 100),
+                                      ),
+                                    })
+                                  }
+                                />
+                                <span className="w-8 tabular-nums text-stone-400">
+                                  {volPct}%
+                                </span>
+                              </label>
+                              <button
+                                type="button"
+                                aria-pressed={clip.loop}
+                                className={cn(
+                                  "flex cursor-pointer items-center gap-1 rounded-md border px-1.5 py-1 text-[9px] font-semibold transition-colors",
+                                  clip.loop
+                                    ? "border-teal-500/70 bg-teal-500/15 text-teal-300"
+                                    : "border-[#3a352d] bg-[#26221e] text-stone-400 hover:border-teal-500/60 hover:text-teal-300",
+                                )}
+                                title={
+                                  clip.loop
+                                    ? "Looping ON — this track repeats to cover the rest of the video"
+                                    : "Loop to fill the rest of the video — background tracks are usually longer than the edit"
+                                }
+                                onClick={() =>
+                                  onMusicClipEdit(clip.id, { loop: !clip.loop })
+                                }
+                              >
+                                <Repeat className="size-3" aria-hidden />
+                                {clip.loop ? "Looping" : "Loop to fill"}
+                              </button>
+                              {onRemoveMusicClip && (
                                 <button
                                   type="button"
-                                  aria-pressed={musicLoop}
-                                  className={cn(
-                                    "flex cursor-pointer items-center gap-1 rounded-md border px-1.5 py-1 text-[9px] font-semibold transition-colors",
-                                    musicLoop
-                                      ? "border-teal-500/70 bg-teal-500/15 text-teal-300"
-                                      : "border-[#3a352d] bg-[#26221e] text-stone-400 hover:border-teal-500/60 hover:text-teal-300",
-                                  )}
-                                  title={
-                                    musicLoop
-                                      ? "Looping ON — the music repeats to cover the entire video length"
-                                      : "Loop to fill the ENTIRE video — background tracks are usually longer than the edit"
-                                  }
-                                  onClick={() => onMusicLoopChange(!musicLoop)}
+                                  aria-label={`Remove ${clip.fileName}`}
+                                  className="flex size-5 cursor-pointer items-center justify-center rounded-md border border-[#3a352d] bg-[#26221e] text-stone-400 transition-colors hover:border-rose-400/60 hover:bg-rose-500/15 hover:text-rose-300"
+                                  title="Remove this music clip"
+                                  onClick={() => onRemoveMusicClip(clip.id)}
                                 >
-                                  <Repeat className="size-3" aria-hidden />
-                                  {musicLoop ? "Looping" : "Loop full video"}
+                                  <Trash2 className="size-3" aria-hidden />
                                 </button>
                               )}
                             </div>
@@ -4195,15 +4441,11 @@ export function TimelineRuler({
                         )}
                       </div>
                     );
-                  })()}
-                </>
-              ) : (
-                <EmptyHint>
-                  No music track — load audio from the Media tab
-                </EmptyHint>
-              )}
-            </div>
-          </div>
+                  })}
+                </div>
+              </div>
+            );
+          })()}
 
           {/* LANE 4 — SFX (draggable pills) */}
           <div

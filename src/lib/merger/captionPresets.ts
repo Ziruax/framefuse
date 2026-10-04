@@ -855,6 +855,18 @@ export interface FontOption {
 
 export const FONT_OPTIONS: FontOption[] = [
   {
+    id: "noto-devanagari",
+    name: "Noto Sans Devanagari",
+    stack: '"Noto Sans Devanagari", "Mangal", sans-serif',
+    ffmpegName: "Noto Sans Devanagari",
+  },
+  {
+    id: "noto-nastaliq",
+    name: "Noto Nastaliq Urdu",
+    stack: '"Noto Nastaliq Urdu", "Urdu Typesetting", serif',
+    ffmpegName: "Noto Nastaliq Urdu",
+  },
+  {
     id: "inter",
     name: "Inter",
     stack: 'Inter, "Segoe UI", Arial, sans-serif',

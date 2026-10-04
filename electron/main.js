@@ -1317,22 +1317,24 @@ ipcMain.handle("tts:voices", async () => {
   return { voices: await ttsVoicesOnce(), pairs: TTS.voicePairsByLocale() };
 });
 
-/** { voice, text? } → { bytes: ArrayBuffer, bytesLen } — a SHORT sample,
- *  never written to disk. Text is trimmed to ≤120 chars; the caller passes
- *  a locale-appropriate sample for non-Latin voices. */
+/** { voice, text?, style? } → { bytes: ArrayBuffer, bytesLen } — a SHORT
+ *  sample, never written to disk. Text is trimmed to ≤300 chars; the
+ *  caller passes a locale-appropriate sample for non-Latin voices. */
 ipcMain.handle("tts:preview", async (_event, payload) => {
   const p = payload || {};
   const voice = typeof p.voice === "string" ? p.voice.trim() : "";
   if (!voice) throw new Error("No voice selected");
-  let text = typeof p.text === "string" ? p.text.trim().slice(0, 120) : "";
+  let text = typeof p.text === "string" ? p.text.trim().slice(0, 300) : "";
   if (!text) text = "This is a preview of the selected voice.";
+  const style =
+    typeof p.style === "string" && p.style.trim() ? p.style.trim() : undefined;
   if (ttsPreviewAbortRef && typeof ttsPreviewAbortRef.abort === "function") {
     try { ttsPreviewAbortRef.abort(); } catch (_) { /* already dead */ }
   }
   const abortRef = { abort: null };
   ttsPreviewAbortRef = abortRef;
   try {
-    const r = await TTS.synthesize({ text, voice, abortRef });
+    const r = await TTS.synthesize({ text, voice, style, abortRef });
     const b = r.bytes || Buffer.alloc(0);
     return {
       bytes: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength),
@@ -1343,12 +1345,14 @@ ipcMain.handle("tts:preview", async (_event, payload) => {
   }
 });
 
-/** { text, voice, ratePct, pitchHz, volumePct } → { filePath, bytes:
- *  ArrayBuffer, durationMs } — full narration synthesis. The MP3 lands in
- *  the shared temp dir (vo_<ts>_<rand>.mp3 — same lifecycle as saveTempAudio
- *  files, wiped by cleanup-temp) and probeMediaAsync measures its REAL
- *  duration (the 48 kbps mono MP3 ≈ 6000 B/s fallback only fires when
- *  ffprobe is unavailable). */
+/** { text, voice, ratePct, pitchHz, volumePct, style? } → { filePath,
+ *  bytes: ArrayBuffer, durationMs, words } — full narration synthesis. The
+ *  MP3 lands in the shared temp dir (vo_<ts>_<rand>.mp3 — same lifecycle as
+ *  saveTempAudio files, wiped by cleanup-temp) and probeMediaAsync measures
+ *  its REAL duration (the 48 kbps mono MP3 ≈ 6000 B/s fallback only fires
+ *  when ffprobe is unavailable). words = per-word timings ({ text,
+ *  offsetMs, durationMs }) from the WordBoundary metadata stream. Scripts
+ *  longer than 3000 chars belong to tts:synthesize-long. */
 ipcMain.handle("tts:synthesize", async (_event, payload) => {
   const p = payload || {};
   const text = typeof p.text === "string" ? p.text.trim() : "";
@@ -1358,15 +1362,17 @@ ipcMain.handle("tts:synthesize", async (_event, payload) => {
   if (text.length > 3000) {
     throw new Error(`Narration is ${text.length} characters — Edge TTS accepts up to 3000`);
   }
-  const ratePct = Math.max(-50, Math.min(50, Number(p.ratePct) || 0));
-  const pitchHz = Math.max(-20, Math.min(20, Number(p.pitchHz) || 0));
+  const ratePct = Math.max(-95, Math.min(95, Number(p.ratePct) || 0));
+  const pitchHz = Math.max(-100, Math.min(100, Number(p.pitchHz) || 0));
   const volumePct = Math.max(-100, Math.min(100, Number(p.volumePct) || 0));
+  const style =
+    typeof p.style === "string" && p.style.trim() ? p.style.trim() : undefined;
   ensureTempDir();
   const outPath = path.join(
     tempDir,
     `vo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp3`,
   );
-  const r = await TTS.synthesize({ text, voice, ratePct, pitchHz, volumePct, outFile: outPath });
+  const r = await TTS.synthesize({ text, voice, ratePct, pitchHz, volumePct, style, outFile: outPath });
   let durationMs = 0;
   try {
     const info = await probeMediaAsync(outPath);
@@ -1378,7 +1384,155 @@ ipcMain.handle("tts:synthesize", async (_event, payload) => {
     filePath: outPath,
     bytes: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength),
     durationMs,
+    words: Array.isArray(r.words) ? r.words : [],
   };
+});
+
+// ── v1.24 LONG-FORM TTS (≤ ~200 k words) ──────────────────────────────
+// One long run at a time (mutex, same shape as the dub workflow's): the
+// renderer sends the WHOLE script — synthesizeLong chunks on sentence
+// boundaries main-side, keeps 3 chunks in flight, streams progress on
+// "tts:progress", and merges ONE MP3. The merged bytes stay in the main
+// process (a 200k-word script is ~50 MB of MP3 — far too big for one IPC
+// reply); the renderer fetches them for playback via tts:read-audio.
+
+/** Active long-TTS run state — ONE synthesizeLong at a time. */
+const ttsLongState = {
+  running: false,
+  runId: null,        // the renderer's run id (progress + cancel matching)
+  activeAbort: null,  // { abort } handed to TTS.synthesizeLong
+};
+/** Hard input cap for tts:synthesize-long (~200,000 words). */
+const TTS_LONG_MAX_CHARS = 1500000;
+
+ipcMain.handle("tts:synthesize-long", async (event, payload) => {
+  if (ttsLongState.running) {
+    throw new Error("A long text-to-speech job is already running");
+  }
+  const p = payload || {};
+  const text = typeof p.text === "string" ? p.text : "";
+  if (!text.trim()) throw new Error("No narration text entered");
+  if (text.length > TTS_LONG_MAX_CHARS) {
+    throw new Error("Text too long — 200k word limit reached");
+  }
+  const voice = typeof p.voice === "string" ? p.voice.trim() : "";
+  if (!voice) throw new Error("No voice selected");
+  const runId = typeof p.runId === "string" ? p.runId : "";
+  const ratePct = Math.max(-95, Math.min(100, Number(p.ratePct) || 0));
+  const pitchHz = Math.max(-100, Math.min(100, Number(p.pitchHz) || 0));
+  const volumePct = Math.max(-100, Math.min(100, Number(p.volumePct) || 0));
+  const style =
+    typeof p.style === "string" && p.style.trim() ? p.style.trim() : undefined;
+  const abortRef = { abort: null };
+  ttsLongState.running = true;
+  ttsLongState.runId = runId || null;
+  ttsLongState.activeAbort = abortRef;
+  const sendProgress = (info) => {
+    if (event.sender && !event.sender.isDestroyed()) {
+      event.sender.send("tts:progress", Object.assign({ runId: ttsLongState.runId }, info));
+    }
+  };
+  try {
+    const totalChars = text.length;
+    const r = await TTS.synthesizeLong({
+      text,
+      voice,
+      ratePct,
+      pitchHz,
+      volumePct,
+      style,
+      abortRef,
+      onProgress: (prog) => {
+        // Chunk-level heartbeat → the renderer's progress bar.
+        sendProgress({
+          phase: "synth",
+          status: "synthesizing",
+          chunkIndex: prog.chunkIndex,
+          chunkCount: prog.chunkCount,
+          charsDone: prog.charsDone,
+          totalChars,
+        });
+      },
+    });
+    ensureTempDir();
+    const outPath = path.join(tempDir, `ttslong_${Date.now()}.mp3`);
+    try {
+      fs.writeFileSync(outPath, r.bytes);
+    } catch (err) {
+      throw new Error(`Could not write the long narration file: ${err.message}`);
+    }
+    // Real duration via ffprobe; the 48 kbps CBR bytes/6000-s estimate only
+    // fires when ffprobe is unavailable (same fallback as tts:synthesize).
+    sendProgress({ phase: "probe", status: "probing" });
+    let durationMs = 0;
+    try {
+      const info = await probeMediaAsync(outPath);
+      if (info && Number(info.durationMs) > 0) durationMs = info.durationMs;
+    } catch (_) { /* probe failure → the byte-rate estimate below */ }
+    if (!(durationMs > 0)) durationMs = Math.round((r.bytesLen / 6000) * 1000);
+    sendProgress({
+      phase: "done",
+      status: "complete",
+      durationMs,
+      chunkCount: r.chunkCount,
+    });
+    return {
+      filePath: outPath,
+      fileName: path.basename(outPath),
+      bytesLen: r.bytesLen,
+      durationMs,
+      words: Array.isArray(r.words) ? r.words : [],
+      chunkCount: r.chunkCount,
+    };
+  } finally {
+    ttsLongState.running = false;
+    ttsLongState.runId = null;
+    ttsLongState.activeAbort = null;
+  }
+});
+
+/** { runId } → { ok, running } — abort the active long run. Guarded by
+ *  runId equality: a stale cancel from an older run is a no-op, as is a
+ *  cancel when nothing is running. */
+ipcMain.handle("tts:cancel-long", async (_event, payload) => {
+  const p = payload || {};
+  const runId = typeof p.runId === "string" ? p.runId : "";
+  if (!ttsLongState.running || !ttsLongState.activeAbort) {
+    return { ok: false, running: ttsLongState.running };
+  }
+  if (runId && ttsLongState.runId && runId !== ttsLongState.runId) {
+    return { ok: false, running: true }; // not this run's cancel
+  }
+  try { ttsLongState.activeAbort.abort(); } catch (_) { /* best effort */ }
+  return { ok: true, running: true };
+});
+
+/** { filePath } → { bytes: ArrayBuffer } — read an MP3 the main process
+ *  wrote into its temp dir (ttslong_*.mp3 / vo_*.mp3) so the renderer can
+ *  build a playback Blob. SECURITY: the path is resolved and must sit
+ *  INSIDE the FrameFuse temp dir — anything else (absolute escapes, ../
+ *  traversal, symlinks resolved elsewhere) is refused. Capped at 200 MB. */
+ipcMain.handle("tts:read-audio", async (_event, payload) => {
+  const p = payload || {};
+  const requested = typeof p.filePath === "string" ? p.filePath.trim() : "";
+  if (!requested) throw new Error("No audio file path given");
+  const dir = path.resolve(ensureTempDir()) + path.sep;
+  const resolved = path.resolve(requested);
+  if (!resolved.startsWith(dir)) {
+    throw new Error("Audio can only be read from the app temp directory");
+  }
+  let st = null;
+  try {
+    st = fs.statSync(resolved);
+  } catch (_) {
+    throw new Error("Audio file not found");
+  }
+  if (!st.isFile()) throw new Error("Not an audio file");
+  if (st.size > 200 * 1024 * 1024) {
+    throw new Error("Audio file exceeds the 200 MB read cap");
+  }
+  const b = fs.readFileSync(resolved);
+  return { bytes: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) };
 });
 
 /** Active dub run state (mirrors whisperState's role). ONE dub at a time. */
@@ -3766,6 +3920,29 @@ function optimizeAssForConstrainedCpu(doc) {
 
 ipcMain.handle("export-native", async (event, opts) => {
   const { outputPath, fps: reqFps, width: reqWidth, height: reqHeight, bitrateMbps, quality, crf, audioKbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark, overlays, sfx, fastMode: fastModeWanted, slideshowFps24, textRemoval: textRemovalRaw, headlineGeometry, kineticCompositions, kineticGeometry, voiceovers, dubOriginalVolume } = opts;
+  // ── v1.25 MULTI-MUSIC payload normalization ───────────────────────────
+  // The renderer now ships `musicClips` (N placements, each with its resolved
+  // real path). OLD payloads (and any other call sites) still send the legacy
+  // `audioPath` + `audio.music*` scalars — normalize BOTH into one internal
+  // descriptor list; the graph builders take `musicTracks` (N clips) or the
+  // legacy single path, never both.
+  const musicClipList = Array.isArray(opts.musicClips)
+    ? opts.musicClips
+        .map((c) => c && typeof c.path === "string" && c.path
+          ? {
+              path: c.path,
+              startMs: Math.max(0, Math.round(Number(c.startMs) || 0)),
+              volume: Math.max(0, Math.min(2, Number(c.volume) || 1)),
+              loop: !!(c && c.loop),
+            }
+          : null)
+        .filter(Boolean)
+    : [];
+  const hasMusicClips = musicClipList.length > 0;
+  const musicCount = hasMusicClips ? musicClipList.length : (typeof audioPath === "string" && audioPath ? 1 : 0);
+  if (hasMusicClips) {
+    console.log(`[Export] music: ${musicClipList.length} clip track(s) (multi-music v1.25 path)`);
+  }
   // ── v1.15 BURN-IN TEXT REMOVAL (default OFF) ──────────────────────────
   // sanitizeTextRemoval → null keeps every graph byte-identical when the
   // feature is off (the only default). Region rects are SOURCE-normalized
@@ -5248,7 +5425,7 @@ ipcMain.handle("export-native", async (event, opts) => {
         // the per-branch ebur128 analysis from the render itself.
         let spAudioFastGain = false;
         let spMasterGainDb = null;
-        if (audio && audio.normalize && (clipAudioBranches.length > 0 || audioPath)) {
+        if (audio && audio.normalize && (clipAudioBranches.length > 0 || musicCount > 0)) {
           prof.beginStage("loudness");
           const measures = { clip: new Array(clipAudioBranches.length).fill(null), music: null };
           const tasks = clipAudioBranches.map((c, k) => ({
@@ -5259,7 +5436,10 @@ ipcMain.handle("export-native", async (event, opts) => {
               durMs: (Number(segments[c.inputIdx].durationMs) || 0) * (segInfo[c.inputIdx].speed !== 1 ? segInfo[c.inputIdx].speed : 1),
             },
           }));
-          if (audioPath) tasks.push({ kind: "music", p: audioPath, win: null });
+          // v1.25: only the LEGACY single-music input is measured (the N-clip
+          // branches carry no loudnorm — SFX-style user-volume placements).
+          const legacyMusicPath = hasMusicClips ? null : audioPath;
+          if (legacyMusicPath) tasks.push({ kind: "music", p: legacyMusicPath, win: null });
           for (let t = 0; t < tasks.length; t += 8) {
             const chunkT = tasks.slice(t, t + 8);
             const res = await Promise.all(chunkT.map((task) => measureLoudnessAsync(task.p, task.win)));
@@ -5270,9 +5450,9 @@ ipcMain.handle("export-native", async (event, opts) => {
           }
           prof.endStage("loudness");
           spLoudnorm = measures;
-          const branchCount = clipAudioBranches.length + (audioPath ? 1 : 0);
+          const branchCount = clipAudioBranches.length + musicCount;
           const clipsUsable = measures.clip.every((m) => G.loudnessGainDb(m) != null);
-          const musicUsable = !audioPath || G.loudnessGainDb(measures.music) != null;
+          const musicUsable = !legacyMusicPath || G.loudnessGainDb(measures.music) != null;
           spAudioFastGain = branchCount > 0 && branchCount <= 3 && clipsUsable && musicUsable;
           if (spAudioFastGain) {
             // The estimated mix loudness as the master static gain (same
@@ -5308,7 +5488,7 @@ ipcMain.handle("export-native", async (event, opts) => {
               music: measures.music,
             });
           }
-        } else if (audioPath || clipAudioBranches.length > 0) {
+        } else if (musicCount > 0 || clipAudioBranches.length > 0) {
           // v1.14.6 (user directive): normalize OFF → loudnorm is FULLY out
           // of this export — no measurement spawns, no loudnorm filters, no
           // master-mix render/remeasure. One explicit log line so the argv
@@ -5545,8 +5725,8 @@ ipcMain.handle("export-native", async (event, opts) => {
         let spAudioPath = null;
         let spAudioErr = null;
         const hasAudioBus =
-          clipAudioBranches.length > 0 || !!audioPath || sfxList.length > 0 ||
-          voiceoverList.length > 0;
+          clipAudioBranches.length > 0 || !!audioPath || hasMusicClips ||
+          sfxList.length > 0 || voiceoverList.length > 0;
         const spAudioPromise = hasAudioBus
           ? (async () => {
               const aPlan = SP.buildSinglePassPlan({
@@ -5557,7 +5737,10 @@ ipcMain.handle("export-native", async (event, opts) => {
                 height,
                 totalMs,
                 audio,
-                audioPath,
+                audioPath: hasMusicClips ? null : audioPath,
+                // v1.25 MULTI-MUSIC: the N-clip music inputs (SFX-style
+                // branches; each loop clip's input gets -stream_loop -1).
+                musicTracks: hasMusicClips ? musicClipList : undefined,
                 sfx: sfxList,
                 voiceovers: voiceoverList,
                 clipAudio: clipAudioBranches,
@@ -5892,13 +6075,14 @@ ipcMain.handle("export-native", async (event, opts) => {
     let loudnormCtx = null;
     let audioFastGain = false;
     let masterGainDb = null;
-    if (audio && audio.normalize && (clipAudioJobs.length > 0 || audioPath)) {
+    const legacyMusicPath2 = hasMusicClips ? null : audioPath;
+    if (audio && audio.normalize && (clipAudioJobs.length > 0 || musicCount > 0)) {
       prof.beginStage("loudness");
-      loudnormCtx = await measureLoudnormContext(clipAudioJobs, audioPath);
+      loudnormCtx = await measureLoudnormContext(clipAudioJobs, legacyMusicPath2);
       prof.endStage("loudness");
-      const branchCount = clipAudioJobs.length + (audioPath ? 1 : 0);
+      const branchCount = clipAudioJobs.length + musicCount;
       const clipsUsable = (loudnormCtx.clip || []).every((m) => G.loudnessGainDb(m) != null);
-      const musicUsable = !audioPath || G.loudnessGainDb(loudnormCtx.music) != null;
+      const musicUsable = !legacyMusicPath2 || G.loudnessGainDb(loudnormCtx.music) != null;
       audioFastGain = branchCount > 0 && branchCount <= 3 && clipsUsable && musicUsable;
       if (audioFastGain) {
         const est = G.estimateMixLoudnessDb({
@@ -5920,7 +6104,7 @@ ipcMain.handle("export-native", async (event, opts) => {
             `(volume=dB, master ${masterGainDb != null ? `${masterGainDb}dB` : "—"}) — loudnorm filters + master-mix render skipped`,
         );
       }
-    } else if (audioPath || clipAudioJobs.length > 0) {
+    } else if (musicCount > 0 || clipAudioJobs.length > 0) {
       // v1.14.6 (user directive): normalize OFF → loudnorm fully bypassed
       // (mirrors the smart path's guarantee line).
       console.log(
@@ -5946,7 +6130,7 @@ ipcMain.handle("export-native", async (event, opts) => {
     // falls back to the v1.2 direct graph — never to a failed export.
     let masterMix = null;
     const audioBranchCount =
-      (audioPath ? 1 : 0) + clipAudioJobs.length + sfxList.length +
+      musicCount + clipAudioJobs.length + sfxList.length +
       voiceoverList.length;
     if (
       audio && audio.normalize && audioBranchCount >= 2 && actualTotalSec > 0 &&
@@ -5959,7 +6143,9 @@ ipcMain.handle("export-native", async (event, opts) => {
         const mixWavPath = path.join(tempDir, `mixmaster_${Date.now()}.wav`);
         tempFiles.push(mixWavPath);
         const renderArgs = G.buildAudioMixRenderArgs({
-          audioPath,
+          audioPath: legacyMusicPath2,
+          // v1.25 MULTI-MUSIC: N-clip music inputs own the music side.
+          musicTracks: hasMusicClips ? musicClipList : undefined,
           audio,
           totalSec: actualTotalSec,
           sfx: sfxList,
@@ -5994,7 +6180,10 @@ ipcMain.handle("export-native", async (event, opts) => {
     // v1.1: totalSec = the ACTUAL concatenated video length (see above).
     const concatArgs = G.buildConcatArgs({
       concatListPath,
-      audioPath,
+      audioPath: legacyMusicPath2,
+      // v1.25 MULTI-MUSIC: N-clip music inputs (SFX-style graph branches; N
+      // inputs with per-clip -stream_loop, indexes 1..N before the WAVs).
+      musicTracks: hasMusicClips ? musicClipList : undefined,
       audio,
       outputPath,
       totalSec: actualTotalSec,
@@ -6011,7 +6200,9 @@ ipcMain.handle("export-native", async (event, opts) => {
         startMs: j.startMs,
         volume: j.volume,
       })),
-      newAudioGraph: anyVideoAudio || sfxList.length > 0 || voiceoverList.length > 0,
+      // v1.25: any multi-music stack forces the amix graph path (the legacy
+      // single -af chain can only filter ONE input).
+      newAudioGraph: anyVideoAudio || sfxList.length > 0 || voiceoverList.length > 0 || hasMusicClips,
     });
 
     exportPhase = "mux";

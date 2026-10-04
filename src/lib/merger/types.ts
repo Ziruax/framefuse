@@ -242,6 +242,42 @@ export interface AudioTrack {
   sourcePath?: string | null;
 }
 
+/** v1.25 MULTI-MUSIC: one background-music placement on the (growable,
+ *  multi-row) Audio lane. Replaces the v5.2 single `audioTrack` + the
+ *  AudioSettings music scalars — N clips each individually draggable,
+ *  volume-controlled, loopable and removable; files can be added at any time.
+ *  LEGACY MIGRATION: a pre-1.25 session's `audioTrack` +
+ *  `audio.{musicStartMs,musicVolume,musicLoop}` converts to musicClips[0]. */
+export interface MusicClip {
+  /** Placement id — `mus_<ts36>_<seq36>` (unique per import). */
+  id: string;
+  fileName: string;
+  /** Object URL for the preview pool (never revoked mid-session). */
+  url: string;
+  /** v1.3 ZERO-COPY: absolute on-disk path when picked inside Electron
+   *  (export + Whisper address the original file). Null for restored clips. */
+  sourcePath?: string | null;
+  /** EFFECTIVE clip duration on the timeline (ms) — the probed source length
+   *  on import; non-loop clips are trimmable down from it (min 200ms). */
+  durationMs: number;
+  /** Probed SOURCE length (ms) — the trim ceiling for `durationMs`. Equals
+   *  durationMs until the right edge is dragged. 0 while probing. */
+  sourceDurationMs: number;
+  /** Timeline start (base time — the display layer shifts by the disclaimer). */
+  startMs: number;
+  /** 0..2 (1 = unity) — the old musicVolume semantics, per clip. */
+  volume: number;
+  /** Loop the source to fill the remainder of the video (loop-to-fill). */
+  loop: boolean;
+}
+
+/** Factory: fresh placement id (monotonic seq keeps burst imports unique). */
+let _musicClipSeq = 0;
+export function makeMusicClipId(): string {
+  _musicClipSeq += 1;
+  return `mus_${Date.now().toString(36)}_${_musicClipSeq.toString(36)}`;
+}
+
 export interface OverlapWarning {
   message: string;
   segments: [string, string];
@@ -926,6 +962,12 @@ export interface ExportNativeOptions {
   /** segId -> object URL (or data URL) for the image. */
   imageUrls: Record<string, string>;
   audioTrack?: AudioTrack | null;
+  /** v1.25 MULTI-MUSIC: N background-music placements (the audioTrack
+   *  successor — preferred when present). startMs here is DISPLAY time (the
+   *  caller shifts by the disclaimer lead-in exactly like the legacy
+   *  musicStartMs shift); each clip resolves to a real file in native.ts
+   *  (sourcePath direct or a saveTempAudio upload). */
+  musicClips?: MusicClip[] | null;
   settings: VideoSettings;
   kenBurns: KenBurnsConfig;
   totalMs: number;
@@ -1005,7 +1047,11 @@ export function defaultTextRemovalSettings(): TextRemovalSettings {
 
 /** Audio post-processing options for export (v4.1). v5.2 adds background
  *  music placement controls — the music track is now a first-class timeline
- *  citizen (draggable on the audio lane, volume, loop-to-fill). */
+ *  citizen (draggable on the audio lane, volume, loop-to-fill).
+ *  v1.25 MULTI-MUSIC: the three music* scalars below are LEGACY — new code
+ *  reads per-clip state from MusicClip[] (musicClips) instead; they stay for
+ *  old project files + the single-music FFmpeg back-compat branch and are
+ *  still written (from clip 0) on save for older builds. */
 export interface AudioSettings {
   /** Normalize loudness to -16 LUFS (social-media standard) via ffmpeg loudnorm. */
   normalize: boolean;
@@ -1399,6 +1445,8 @@ declare global {
           locale: string;
           friendlyName: string;
           displayName: string;
+          /** v1.25: advertised express-as styles (rare on the free endpoint). */
+          styleList?: string[];
         }>;
         pairs: Record<string, { female: string; male: string }>;
       }>;
@@ -1407,15 +1455,62 @@ declare global {
       ttsPreview?: (p: {
         voice: string;
         text?: string;
+        style?: string;
       }) => Promise<{ bytes: ArrayBuffer; bytesLen: number }>;
-      /** Full narration synthesis → MP3 bytes + measured duration. */
+      /** Full narration synthesis → MP3 bytes + measured duration.
+       *  v1.25: returns WORD-LEVEL timings too. */
       ttsSynthesize?: (p: {
         text: string;
         voice: string;
         ratePct?: number;
         pitchHz?: number;
         volumePct?: number;
-      }) => Promise<{ filePath: string; bytes: ArrayBuffer; durationMs: number }>;
+        style?: string;
+      }) => Promise<{
+        filePath: string;
+        bytes: ArrayBuffer;
+        durationMs: number;
+        words?: Array<{ text: string; offsetMs: number; durationMs: number }>;
+      }>;
+      /** v1.25 LONG-FORM TTS: up to ~200,000 words are chunked main-side
+       *  (sentence-aware, 3 in flight) and merged into ONE MP3; `words`
+       *  carry GLOBAL timings. The merged bytes stay main-side — fetch them
+       *  for playback with ttsReadAudio. ONE long run at a time; progress
+       *  arrives via onTtsProgress; cancel with ttsCancelLong(runId). */
+      ttsSynthesizeLong?: (p: {
+        runId: string;
+        text: string;
+        voice: string;
+        ratePct?: number;
+        pitchHz?: number;
+        volumePct?: number;
+        style?: string;
+      }) => Promise<{
+        filePath: string;
+        fileName: string;
+        bytesLen: number;
+        durationMs: number;
+        chunkCount: number;
+        words: Array<{ text: string; offsetMs: number; durationMs: number }>;
+      }>;
+      /** Aborts the active long run (no-op when none / id mismatch). */
+      ttsCancelLong?: (runId: string) => Promise<{ ok: boolean; running: boolean }>;
+      /** Reads an MP3 the main process wrote into its temp dir (path
+       *  guarded, ≤200 MB) so the renderer can build a playback Blob. */
+      ttsReadAudio?: (p: {
+        filePath: string;
+      }) => Promise<{ bytes: ArrayBuffer; bytesLen: number }>;
+      /** Long-run progress events (filter by runId). */
+      onTtsProgress?: (cb: (d: {
+        runId: string;
+        phase: "synth" | "probe" | "done";
+        chunkIndex?: number;
+        chunkCount?: number;
+        charsDone?: number;
+        totalChars?: number;
+        status: string;
+        durationMs?: number;
+      }) => void) => () => void;
       /** ── v1.17 Groq dubbing (transcribe → speakers → translate → TTS) ── */
       dubStart?: (p: {
         segments: Array<{ videoPath: string; startMs: number; endMs?: number }>;

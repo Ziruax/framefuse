@@ -99,14 +99,38 @@ contextBridge.exposeInMainWorld("electronAPI", {
   //   is cached main-side (one network fetch per session, fallback catalog
   //   offline).
   ttsVoices: () => ipcRenderer.invoke("tts:voices"),
-  // ttsPreview: ({ voice, text }) → { bytes: ArrayBuffer, bytesLen } — a
-  //   SHORT sample, never written to disk. Single-flight main-side: starting
-  //   a new preview cancels the previous one (voice browsing is rapid-fire).
+  // ttsPreview: ({ voice, text, style? }) → { bytes: ArrayBuffer, bytesLen }
+  //   — a SHORT sample (≤300 chars), never written to disk. Single-flight
+  //   main-side: starting a new preview cancels the previous one (voice
+  //   browsing is rapid-fire).
   ttsPreview: (p) => ipcRenderer.invoke("tts:preview", p),
-  // ttsSynthesize: ({ text, voice, ratePct, pitchHz, volumePct }) →
-  //   { filePath, bytes: ArrayBuffer(MP3), durationMs } — narration for the
-  //   timeline voiceover lane.
+  // ttsSynthesize: ({ text, voice, ratePct, pitchHz, volumePct, style? }) →
+  //   { filePath, bytes: ArrayBuffer(MP3), durationMs, words: [{ text,
+  //   offsetMs, durationMs }] } — narration for the timeline voiceover
+  //   lane (≤3000 chars; longer scripts → ttsSynthesizeLong).
   ttsSynthesize: (p) => ipcRenderer.invoke("tts:synthesize", p),
+  // LONG-FORM TTS: ttsSynthesizeLong: ({ runId, text, voice, ratePct,
+  //   pitchHz, volumePct, style }) → { filePath, fileName, bytesLen,
+  //   durationMs, words, chunkCount } — scripts up to ~200 k words are
+  //   chunked main-side (sentence boundaries, 3 in flight) and merged into
+  //   ONE MP3; words carry GLOBAL timings. The merged bytes stay in the
+  //   main process — fetch them for playback with ttsReadAudio(filePath).
+  //   ONE long run at a time; progress arrives via onTtsProgress ({ runId,
+  //   phase: "synth"|"probe"|"done", chunkIndex, chunkCount, charsDone,
+  //   totalChars, status, durationMs }); cancel with ttsCancelLong(runId).
+  ttsSynthesizeLong: (p) => ipcRenderer.invoke("tts:synthesize-long", p),
+  // ttsCancelLong: (runId) → { ok, running } — aborts the active long run
+  //   (no-op when none is running or the runId doesn't match the run).
+  ttsCancelLong: (runId) => ipcRenderer.invoke("tts:cancel-long", { runId }),
+  // ttsReadAudio: (filePath) → { bytes: ArrayBuffer } — reads an MP3 the
+  //   main process wrote into its temp dir (path guarded against escapes,
+  //   ≤200 MB) so the renderer can build a playback Blob.
+  ttsReadAudio: (filePath) => ipcRenderer.invoke("tts:read-audio", { filePath }),
+  onTtsProgress: (callback) => {
+    const handler = (_event, data) => callback(data);
+    ipcRenderer.on("tts:progress", handler);
+    return () => ipcRenderer.removeListener("tts:progress", handler);
+  },
   // dubStart: ({ segments, sourceLanguage, targetLanguage, targetLocale,
   //   groqModel, textProvider, geminiModel, femaleVoice, maleVoice,
   //   voiceMode, singleVoice }) → dub result (segments carry wav BYTES).

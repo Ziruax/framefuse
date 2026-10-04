@@ -343,6 +343,7 @@ async function exportViaFFmpeg(
     segments,
     imageUrls,
     audioTrack,
+    musicClips,
     settings,
     kenBurns,
     audio,
@@ -495,6 +496,16 @@ async function exportViaFFmpeg(
   // Render failures (no OfflineAudioContext, unknown id, synthesis error)
   // skip that placement with a console warn instead of failing the export.
   const ipcSfx: NativeSfxPayload[] = [];
+  // v1.25: the resolved multi-music IPC payload (path per clip; set when the
+  // caller passed musicClips — the legacy audioPath path stays null then).
+  let ipcMusic: {
+    path: string;
+    startMs: number;
+    volume: number;
+    loop: boolean;
+    durationMs: number;
+    fileName: string;
+  }[] | null = null;
   if (opts.sfx && opts.sfx.length > 0) {
     const wavCache = new Map<string, { wavPath: string; durationMs: number } | null>();
     for (const item of opts.sfx) {
@@ -536,11 +547,44 @@ async function exportViaFFmpeg(
     }
   }
 
-  // 2. Resolve the music track. v1.3 zero-copy: a locally-picked track
-  // ships its absolute path (audioTrack.sourcePath, resolved at import);
-  // restored-from-project tracks keep the byte-upload fallback.
+  // 2. Resolve the music clips (v1.25 MULTI-MUSIC). v1.3 zero-copy per
+  // clip: a locally-picked track ships its absolute path
+  // (musicClips[].sourcePath, resolved at import); restored-from-project
+  // clips keep the byte-upload fallback. The legacy single audioTrack path
+  // (below) stays for callers that never migrated — main.js accepts BOTH.
   let audioPath: string | null = null;
-  if (audioTrack) {
+  if (musicClips && musicClips.length > 0) {
+    const ipcMusicClips: {
+      path: string;
+      startMs: number;
+      volume: number;
+      loop: boolean;
+      durationMs: number;
+      fileName: string;
+    }[] = [];
+    for (const clip of musicClips) {
+      if (!clip || !clip.url) continue;
+      const directAudio =
+        typeof clip.sourcePath === "string" && clip.sourcePath
+          ? clip.sourcePath
+          : null;
+      const path = directAudio
+        ? directAudio
+        : await api.saveTempAudio({
+            name: clip.fileName || `music_${clip.id}`,
+            bytes: await fetchBytes(clip.url),
+          });
+      ipcMusicClips.push({
+        path,
+        startMs: Math.max(0, Math.round(clip.startMs) || 0),
+        volume: Math.max(0, Math.min(2, clip.volume)),
+        loop: clip.loop === true,
+        durationMs: Math.max(0, Math.round(clip.durationMs) || 0),
+        fileName: clip.fileName,
+      });
+    }
+    if (ipcMusicClips.length > 0) ipcMusic = ipcMusicClips;
+  } else if (audioTrack) {
     const directAudio =
       typeof audioTrack.sourcePath === "string" && audioTrack.sourcePath
         ? audioTrack.sourcePath
@@ -767,6 +811,10 @@ async function exportViaFFmpeg(
       kenBurns,
       segments: segPayload,
       audioPath,
+      // v1.25 MULTI-MUSIC: the resolved per-clip music inputs (preferred by
+      // the main process; audioPath above is the legacy single-track path
+      // and stays null whenever musicClips were resolved).
+      musicClips: ipcMusic ?? undefined,
       audio,
       captionSettings: ipcCaptionSettings,
       subtitleCues: ipcSubtitleCues,

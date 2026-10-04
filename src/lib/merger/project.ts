@@ -16,6 +16,9 @@
 //   "savedAt": 1730000000000,
 //   "images":   [{ "id": "f...", "name": "001__Beat_1_0s_x.jpg", "type": "image/jpeg", "dataUrl": "...", "mediaType": "image" | "video"? }],
 //   "audio":    { "name": "voiceover.mp3", "type": "audio/mpeg", "dataUrl": "..." } | null,
+//   "musicClips":[ { "name": "...", "type": "audio/mpeg", "dataUrl": "...",          // v1.25
+//                   "startMs": 0, "volume": 1, "loop": true, "durationMs": 120000,
+//                   "sourceDurationMs": 120000 } ],
 //   "subtitles":{ "fileName": "...", "cues": [...] } | null,
 //   "headlines":[ ... ],
 //   "overrides":{ "f...": 4200 },
@@ -75,6 +78,23 @@ export interface ProjectAudioEntry {
   dataUrl: string;
 }
 
+/** v1.25 MULTI-MUSIC: one persisted music-clip placement — the bytes inline
+ *  as a data URL (same MAX_AUDIO_MB cap as the legacy audio entry) plus the
+ *  placement facts (start / volume / loop / trim). The legacy top-level
+ *  `audio` entry keeps being written from clip 0 so older builds can still
+ *  open the file. */
+export interface ProjectMusicClipEntry {
+  name: string;
+  type: string;
+  dataUrl: string;
+  startMs: number;
+  volume: number;
+  loop: boolean;
+  /** Effective (trimmable) duration + the probed source length. */
+  durationMs: number;
+  sourceDurationMs: number;
+}
+
 export interface ProjectDisclaimerEntry {
   name: string;
   type: string;
@@ -91,6 +111,10 @@ export interface ProjectFile {
   savedAt: number;
   images: ProjectImageEntry[];
   audio: ProjectAudioEntry | null;
+  /** v1.25: the full background-music stack (N clips). Absent on ≤1.24
+   *  files → the loader migrates the legacy `audio` + settings.audio music
+   *  scalars into a single clip. */
+  musicClips?: ProjectMusicClipEntry[];
   subtitles: {
     fileName: string;
     cues: SubtitleCue[];
@@ -136,6 +160,15 @@ export interface SaveProjectInput {
    *  `images: [{ id, file }]` keeps compiling (defaults to "image"). */
   images: { id: string; file: File; mediaType?: MediaKind }[];
   audio: File | null;
+  /** v1.25: the background-music placements (files + placement facts). */
+  musicClips?: {
+    file: File;
+    startMs: number;
+    volume: number;
+    loop: boolean;
+    durationMs: number;
+    sourceDurationMs: number;
+  }[];
   subtitles: { fileName: string; cues: SubtitleCue[] } | null;
   headlines: HeadlineItem[];
   overrides: Record<string, number>;
@@ -210,6 +243,31 @@ export async function buildProjectFile(
     };
   }
 
+  // v1.25 MULTI-MUSIC: the full clip stack inlines (per-clip 25MB cap —
+  // oversized entries are dropped from `musicClips` but their placement
+  // facts would be useless without bytes, so the whole clip is skipped and
+  // the loader flags it via musicSkipped). The legacy `audio` entry above
+  // (clip 0) keeps older builds opening the same file.
+  let musicClips: ProjectMusicClipEntry[] = [];
+  let musicSkipped = false;
+  for (const mc of input.musicClips ?? []) {
+    if (!mc || !mc.file) continue;
+    if (mc.file.size > MAX_AUDIO_MB * 1024 * 1024) {
+      musicSkipped = true;
+      continue;
+    }
+    musicClips.push({
+      name: mc.file.name,
+      type: mc.file.type || "audio/mpeg",
+      dataUrl: await fileToDataUrl(mc.file),
+      startMs: Math.max(0, Math.round(mc.startMs) || 0),
+      volume: Math.min(2, Math.max(0, mc.volume)),
+      loop: mc.loop === true,
+      durationMs: Math.max(200, Math.round(mc.durationMs) || 200),
+      sourceDurationMs: Math.max(0, Math.round(mc.sourceDurationMs) || 0),
+    });
+  }
+
   let watermark: ProjectFile["watermark"] = null;
   if (input.watermark) {
     const wmImg = input.watermark.image;
@@ -251,6 +309,7 @@ export async function buildProjectFile(
     savedAt: Date.now(),
     images,
     audio,
+    ...(musicClips.length > 0 ? { musicClips } : {}),
     subtitles: input.subtitles
       ? {
           fileName: input.subtitles.fileName,
@@ -486,6 +545,19 @@ export interface LoadedProject {
    *  v5.0: entries carry the saved mediaType when it was "video". */
   imageFiles: { id: string; file: File; mediaType?: MediaKind }[];
   audioFile: File | null;
+  /** v1.25: rehydrated music-clip FILES + placement facts (present when the
+   *  doc carried `musicClips`; the legacy single-audio path migrates in the
+   *  page so ≤1.24 files keep loading). */
+  musicClipFiles: {
+    file: File;
+    startMs: number;
+    volume: number;
+    loop: boolean;
+    durationMs: number;
+    sourceDurationMs: number;
+  }[];
+  /** A music clip existed but its bytes could not be inlined/rehydrated. */
+  musicSkipped: boolean;
   /** Watermark image File (v4.4) or null. */
   watermarkFile: { id: string; file: File } | null;
   /** v1.14: disclaimer / intro card (File + saved duration facts) or null. */
@@ -585,6 +657,29 @@ export async function parseProjectDoc(doc: unknown): Promise<LoadedProject> {
     }
   }
 
+  // v1.25 MULTI-MUSIC: rehydrate the clip stack when the doc carries it.
+  // Bytes that fail to reconstruct drop the whole clip (a placement without
+  // audio is a ghost) and flag musicSkipped so the UI can warn.
+  const musicClipFiles: LoadedProject["musicClipFiles"] = [];
+  let musicSkipped = false;
+  if (Array.isArray(project.musicClips)) {
+    for (const mc of project.musicClips) {
+      if (!mc || !mc.dataUrl || !mc.name) continue;
+      try {
+        musicClipFiles.push({
+          file: await dataUrlToFile(mc.dataUrl, mc.name, mc.type),
+          startMs: Math.max(0, Math.round(Number(mc.startMs)) || 0),
+          volume: Math.min(2, Math.max(0, Number(mc.volume) || 1)),
+          loop: mc.loop === true,
+          durationMs: Math.max(200, Math.round(Number(mc.durationMs)) || 200),
+          sourceDurationMs: Math.max(0, Math.round(Number(mc.sourceDurationMs)) || 0),
+        });
+      } catch {
+        musicSkipped = true;
+      }
+    }
+  }
+
   // Watermark image (v4.4).
   let watermarkFile: { id: string; file: File } | null = null;
   if (project.watermark?.image?.dataUrl) {
@@ -633,6 +728,8 @@ export async function parseProjectDoc(doc: unknown): Promise<LoadedProject> {
     project,
     imageFiles,
     audioFile,
+    musicClipFiles,
+    musicSkipped,
     watermarkFile,
     disclaimerFile,
     srtText: validCues ? serializeSrt(cues) : null,

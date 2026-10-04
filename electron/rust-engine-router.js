@@ -833,20 +833,51 @@ function buildRustTimeline(opts) {
     }));
 
   // ── music + master fades ──
+  // v1.25 MULTI-MUSIC: prefer the `musicClips` stack (N placements). The
+  // native engine's music channel takes clip 0 (full support incl. loop);
+  // the remaining clips ride the extraAudio bus (volume + start, no loop —
+  // a documented native-engine limitation; the FFmpeg graph is the full
+  // N-branch path). Legacy payloads (audioPath + audio.music*) unchanged.
   const audio = opts.audio || {};
-  const music = opts.audioPath
-    ? {
-        path: String(opts.audioPath),
-        volume: Math.max(0, Math.min(2, Number(audio.musicVolume) || 1)),
-        startMs: Math.max(0, Number(audio.musicStartMs) || 0),
-        loopTrack: !!audio.musicLoop,
-      }
-    : null;
+  const musicClipList = Array.isArray(opts.musicClips)
+    ? opts.musicClips.filter((c) => c && typeof c.path === "string" && c.path)
+    : [];
+  let music = null;
+  if (musicClipList.length > 0) {
+    const first = musicClipList[0];
+    music = {
+      path: String(first.path),
+      volume: Math.max(0, Math.min(2, Number(first.volume) || 1)),
+      startMs: Math.max(0, Number(first.startMs) || 0),
+      loopTrack: !!first.loop,
+    };
+    if (musicClipList.length > 1) {
+      console.log(
+        `[RustEngine] ${musicClipList.length} music clips: clip 1 rides the music channel (loop support), ${musicClipList.length - 1} join the extra-audio bus (no loop in the native engine)`,
+      );
+    }
+  } else if (opts.audioPath) {
+    music = {
+      path: String(opts.audioPath),
+      volume: Math.max(0, Math.min(2, Number(audio.musicVolume) || 1)),
+      startMs: Math.max(0, Number(audio.musicStartMs) || 0),
+      loopTrack: !!audio.musicLoop,
+    };
+  }
 
   // ── v2 EXTRA AUDIO: voiceovers (narration MP3 / dub WAVs) + SFX
   // placements → the native audio bus. MP3s arrive 24 kHz mono — the
   // engine's swresample stage upmixes to the 48 kHz stereo bus.
   const extraAudio = [];
+  // v1.25: music clips 2..N ride the extra-audio bus (see the note above).
+  for (let mi = 1; mi < musicClipList.length; mi += 1) {
+    const mc = musicClipList[mi];
+    extraAudio.push({
+      path: String(mc.path),
+      startMs: Math.max(0, Number(mc.startMs) || 0),
+      volume: Math.max(0, Math.min(2, Number(mc.volume) || 1)),
+    });
+  }
   for (const v of voList) {
     extraAudio.push({
       path: String(v.wavPath),

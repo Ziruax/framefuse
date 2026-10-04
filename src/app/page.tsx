@@ -9,6 +9,9 @@ import {
   type ChangeEvent,
 } from "react";
 import { toast } from "@/lib/toast";
+// v1.25: QWERTY (romanized) Hindi/Urdu transliteration — Hinglish → Devanagari,
+// Roman Urdu → Nastaliq — for script writing, captions and TTS input.
+import { transliterate, isLikelyRomanized } from "@/lib/translit";
 import {
   Captions as CaptionsIcon,
   FolderOpen,
@@ -28,7 +31,7 @@ import { ShortcutsOverlay } from "@/components/ShortcutsOverlay";
 import { DesktopOnlyLanding } from "@/components/DesktopOnlyLanding";
 import { MediaPanel } from "@/components/MediaPanel";
 import { PreviewPanel } from "@/components/PreviewPanel";
-import { MUSIC_SEL_ID, TimelineRuler } from "@/components/TimelineRuler";
+import { TimelineRuler } from "@/components/TimelineRuler";
 import { SettingsPanel, type SettingsTabId } from "@/components/SettingsPanel";
 import { Splitter, useResizableLayout } from "@/components/ResizableSplitters";
 import {
@@ -62,6 +65,7 @@ import {
   serializeVtt,
   serializeVttWords,
   shiftCues,
+  type SubtitleCue,
 } from "@/lib/merger/subtitles";
 import {
   detectBeats as detectBeatsInAudio,
@@ -82,6 +86,7 @@ import {
   defaultTransitionSettings,
   defaultWatermarkSettings,
   makeHeadlineItem,
+  makeMusicClipId,
   makeVoiceoverItem,
   DISCLAIMER_ID,
   type AudioSettings,
@@ -96,6 +101,7 @@ import {
   type KenBurnsConfig,
   type KenBurnsDirection,
   type MediaSegment,
+  type MusicClip,
   type OverlayTransform,
   type SubtitleFile,
   type TextRemovalSettings,
@@ -168,7 +174,7 @@ const DISCLAIMER_DEFAULT_MS = 2000;
 /** v1.14.2: renderer build stamp — the desktop-only landing carries it so a
  * browser visitor sees which build is live (in Electron, Header separately
  * cross-checks it against the exe's app.getVersion()). */
-const BUILD_VERSION = "1.24.0";
+const BUILD_VERSION = "1.25.0";
 
 // ---------------------------------------------------------------------------
 // v1.23 FLOW — the left navigation rail. One dock, six phases: the media
@@ -393,14 +399,19 @@ function loadPersisted(): Partial<PersistedSettings> {
 export default function Page() {
   // ---- Source data --------------------------------------------------------
   const [items, setItems] = useState<MediaItem[]>([]);
-  const [audioTrack, setAudioTrack] = useState<AudioTrack | null>(null);
+  // v1.25 MULTI-MUSIC: N background-music clips (the v5.2 single audioTrack
+  // successor). The waveform/beat grid still derive from clip 0 (the
+  // "primary"); every clip is an independent timeline citizen.
+  const [musicClips, setMusicClips] = useState<MusicClip[]>([]);
   const [subtitles, setSubtitles] = useState<SubtitleFile | null>(null);
   const [overrides, setOverrides] = useState<Record<string, number>>({});
   // v1.14: disclaimer / intro lead-in clip (image or video, ANY filename).
   const [disclaimer, setDisclaimer] = useState<DisclaimerClip | null>(null);
 
   // ---- Audio playback (synced with preview) -------------------------------
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  // v1.25: a POOL of <audio> elements, one per music clip (ref-registered
+  // from the hidden elements rendered below; ids never collide).
+  const musicElsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
 
   // ---- Settings -----------------------------------------------------------
   // v4.2 hydration fix: persisted (localStorage) values are applied in a
@@ -832,8 +843,18 @@ export default function Page() {
       cues: shiftCues(subtitles.cues, disclaimerOffsetMs),
     };
   }, [subtitles, disclaimerOffsetMs]);
-  /** Music start in display space (strip clip + waveform origin). */
-  const displayMusicStartMs = audioSettings.musicStartMs + disclaimerOffsetMs;
+  /** v1.25: the music clips in DISPLAY space (strip coords — the timeline
+   *  renders these; every edit write translates back to base before storing,
+   *  exactly like the old single-music musicStartMs shift). */
+  const displayMusicClips = useMemo(
+    () =>
+      disclaimerOffsetMs > 0
+        ? musicClips.map((c) => ({ ...c, startMs: c.startMs + disclaimerOffsetMs }))
+        : musicClips,
+    [musicClips, disclaimerOffsetMs],
+  );
+  /** The "primary" music clip (index 0) — the waveform/beat/captions source. */
+  const primaryMusicClip = musicClips.length > 0 ? musicClips[0] : null;
 
   const activeSegment = useMemo(
     () =>
@@ -920,7 +941,8 @@ export default function Page() {
     kenBurns: KenBurnsConfig;
     settings: VideoSettings;
     audioSettings: AudioSettings;
-    audioTrack: AudioTrack | null;
+    /** v1.25: the background-music clip stack (audioTrack's successor). */
+    musicClips: MusicClip[];
     whisperLanguage: string;
     /** v1.20: transcription model (Groq whisper model id; legacy local sizes are ignored). */
     whisperModel?: string;
@@ -969,7 +991,7 @@ export default function Page() {
       kenBurns,
       settings,
       audioSettings,
-      audioTrack,
+      musicClips,
       whisperLanguage,
       whisperModel,
       transition: transitionSettings,
@@ -1054,7 +1076,8 @@ export default function Page() {
     setKenBurns(snap.kenBurns);
     setSettings(snap.settings);
     setAudioSettings(snap.audioSettings);
-    setAudioTrack(snap.audioTrack);
+    // v1.25: restore the multi-music stack (the single audioTrack is gone).
+    setMusicClips(snap.musicClips ?? []);
     setWhisperLanguage(snap.whisperLanguage);
     setTransitionSettings(snap.transition);
     setWatermarkImage(snap.watermarkImage);
@@ -1475,9 +1498,14 @@ export default function Page() {
       voice: string;
       ratePct?: number;
       pitchHz?: number;
-      volume: number;
+      /** v1.25: optional (the TTS Studio's contract) — makeVoiceoverItem
+       *  defaults it to 1. */
+      volume?: number;
       durationMs: number;
-      bytes: ArrayBuffer;
+      // v1.25: the TTS Studio hands a Blob (main-process read-back); the
+      // Voiceover section still passes the raw ArrayBuffer. storeVoBytes
+      // normalizes both.
+      bytes: ArrayBuffer | Blob;
     }) => {
       const baseMs = Math.max(0, currentMsRef.current - disclaimerOffsetRef.current);
       const item = makeVoiceoverItem({
@@ -1497,6 +1525,38 @@ export default function Page() {
       });
     },
     [storeVoBytes],
+  );
+
+  // ---- v1.25 TTS STUDIO HANDOFF #1 — synthesized audio → Audio lane -----
+  /** Long-run TTS output (any length) lands as an independent MUSIC clip at
+   *  the playhead: drag, trim, loop and mix it like any imported track. The
+   *  blob backs preview playback (object URL, tracked for revoke) and the
+   *  export's saveTempAudio fallback (no sourcePath — bytes ship over IPC). */
+  const handleAddTtsMusicAudio = useCallback(
+    (a: { fileName: string; blob: Blob; durationMs: number }) => {
+      if (!(a.durationMs > 0)) return;
+      requestHistoryPush();
+      const clip: MusicClip = {
+        id: makeMusicClipId(),
+        fileName: a.fileName,
+        url: trackUrl(URL.createObjectURL(a.blob)),
+        sourcePath: null,
+        durationMs: a.durationMs,
+        sourceDurationMs: a.durationMs,
+        // Same "at the playhead, base time" source as the VO handler above.
+        startMs: Math.max(
+          0,
+          Math.round(currentMsRef.current - disclaimerOffsetRef.current),
+        ),
+        volume: 1,
+        loop: false,
+      };
+      setMusicClips((prev) => [...prev, clip]);
+      toast.success("TTS audio added to the Audio lane", {
+        description: `${fmtTimecode(a.durationMs)} at ${fmtTimecode(clip.startMs)} — drag to reposition, trim or layer it.`,
+      });
+    },
+    [requestHistoryPush, trackUrl],
   );
 
   // ---- v1.17 TRANSLATE & DUB (Groq Whisper → LLM → Edge TTS) — HMR probe ---
@@ -1629,41 +1689,38 @@ export default function Page() {
 
   // ---- Playback rAF loop --------------------------------------------------
   /**
-   * v5.2: background music is now a first-class timeline citizen — map the
-   * master playhead onto the <audio> element's position honoring the user's
-   * placement: musicStartMs offset (null = silence before it starts),
-   * musicLoop wrap (the track repeats to fill the whole video), and natural
-   * end (null when the playhead is past a non-looping track). durationMs
-   * unknown → fall back to raw seconds (pre-v5.2 behavior).
+   * v1.25 MULTI-MUSIC: map the master playhead onto EACH clip's <audio>
+   * element honoring its placement — startMs offset (null = silence before
+   * it starts), loop wrap (the source repeats to fill the whole video), and
+   * natural end at the clip's (trimmable) durationMs (null when the playhead
+   * is past a non-looping clip). Same math as the v5.2 single-track
+   * musicPosFor, per clip.
    */
-  const musicPosFor = useCallback(
-    (timelineMs: number): number | null => {
-      if (!audioTrack) return null;
-      const durMs = audioTrack.durationMs ?? 0;
+  const musicPosForClip = useCallback(
+    (clip: MusicClip, timelineMs: number): number | null => {
       // v1.14: display→base — the music stays silent through the disclaimer
       // lead-in (it has no link to the audio track) and starts exactly N ms
       // later, in lockstep with the shifted clips.
-      const rel =
-        timelineMs - disclaimerOffsetRef.current - audioSettings.musicStartMs;
+      const rel = timelineMs - disclaimerOffsetRef.current - clip.startMs;
       if (rel < 0) return null;
+      const durMs = clip.durationMs > 0 ? clip.durationMs : clip.sourceDurationMs;
       if (durMs > 0) {
-        if (audioSettings.musicLoop) return (rel % durMs) / 1000;
+        if (clip.loop) return (rel % durMs) / 1000;
         if (rel >= durMs) return null;
       }
       return rel / 1000;
     },
-    [audioTrack, audioSettings.musicStartMs, audioSettings.musicLoop],
+    [],
   );
 
-  /** v5.2: push the computed music position onto the element (pause when the
-   *  playhead sits outside the music window; re-sync on >0.25s drift while
-   *  playing so loop wraps + late starts stay locked to the timeline).
-   *  v1.3: the master volume scales the music element too (capped at 1 —
-   *  the >1 boost ranges are export-only). */
-  const syncMusicElement = useCallback(
+  /** v1.25: push the computed position onto every element in the pool (pause
+   *  the ones whose window the playhead sits outside; re-sync on >0.25s drift
+   *  while playing so loop wraps + late starts stay locked to the timeline).
+   *  The master volume scales every element too (capped at 1 — the >1 boost
+   *  ranges are export-only). */
+  const syncMusicElements = useCallback(
     (timelineMs: number, playing: boolean) => {
-      const el = audioRef.current;
-      if (!el || !audioTrack) return;
+      if (musicClips.length === 0) return;
       // HTMLMediaElement.volume is 0..1 (values >1 throw) — the >1 boost
       // range is an EXPORT-only gain (FFmpeg volume filter).
       const master =
@@ -1671,50 +1728,49 @@ export default function Page() {
         Number.isFinite(audioSettings.masterVolume)
           ? Math.max(0, Math.min(2, audioSettings.masterVolume))
           : 1;
-      el.volume = Math.max(
-        0,
-        Math.min(1, audioSettings.musicVolume * master),
-      );
-      const pos = musicPosFor(timelineMs);
-      if (pos == null) {
-        if (!el.paused) el.pause();
-        return;
-      }
-      // v1.4: shuttle — the music element plays at the preview rate (set via
-      // ref so mid-playback rate changes apply on the next tick without
-      // rebuilding this callback).
-      const shuttle = previewRateRef.current || 1;
-      if (Number.isFinite(el.playbackRate) && el.playbackRate !== shuttle) {
-        try {
-          el.playbackRate = shuttle;
-        } catch {
-          /* rate out of range — keep the native rate */
+      for (const clip of musicClips) {
+        const el = musicElsRef.current.get(clip.id);
+        if (!el) continue;
+        el.volume = Math.max(0, Math.min(1, clip.volume * master));
+        const pos = musicPosForClip(clip, timelineMs);
+        if (pos == null) {
+          if (!el.paused) el.pause();
+          continue;
         }
-      }
-      if (Math.abs(el.currentTime - pos) > 0.25 || el.paused) {
-        try {
-          el.currentTime = pos;
-        } catch {
-          /* seeking before metadata — ignored */
+        // v1.4: shuttle — the music elements play at the preview rate (set
+        // via ref so mid-playback rate changes apply on the next tick without
+        // rebuilding this callback).
+        const shuttle = previewRateRef.current || 1;
+        if (Number.isFinite(el.playbackRate) && el.playbackRate !== shuttle) {
+          try {
+            el.playbackRate = shuttle;
+          } catch {
+            /* rate out of range — keep the native rate */
+          }
         }
+        if (Math.abs(el.currentTime - pos) > 0.25 || el.paused) {
+          try {
+            el.currentTime = pos;
+          } catch {
+            /* seeking before metadata — ignored */
+          }
+        }
+        if (playing && el.paused) el.play().catch(() => {});
+        if (!playing && !el.paused) el.pause();
       }
-      if (playing && el.paused) el.play().catch(() => {});
-      if (!playing && !el.paused) el.pause();
     },
-    [audioTrack, audioSettings.musicVolume, audioSettings.masterVolume, musicPosFor],
+    [musicClips, audioSettings.masterVolume, musicPosForClip],
   );
 
   useEffect(() => {
     if (!isPlaying) {
-      // Pause audio when not playing
-      if (audioRef.current) {
-        audioRef.current.pause();
-      }
+      // Pause every music element when not playing.
+      for (const el of musicElsRef.current.values()) el.pause();
       return;
     }
 
-    // Start audio playback synced with timeline (v5.2 placement-aware).
-    syncMusicElement(currentMsRef.current, true);
+    // Start audio playback synced with timeline (placement-aware, per clip).
+    syncMusicElements(currentMsRef.current, true);
 
     let raf = 0;
     let last = performance.now();
@@ -1728,12 +1784,27 @@ export default function Page() {
       if (m >= total) {
         // v1.24: LOOP ENTIRE VIDEO — when the transport loop toggle is ON,
         // reaching the end wraps the master clock (music + preview follow
-        // the existing sync paths) and playback continues seamlessly.
+        // the existing sync paths) and playback continues seamlessly. The
+        // hard re-seek below re-locks every music element to the wrapped
+        // playhead (v1.25: per-clip, not just the single element).
         if (videoLoopRef.current && total > 0) {
           m = m - total;
           currentMsRef.current = m;
           setCurrentMs(m);
-          syncMusicElement(m, true);
+          syncMusicElements(m, true);
+          // v1.25: a full wrap must HARD-resync all music elements (drift
+          // check alone can miss the wrap for long tracks).
+          for (const clip of musicClips) {
+            const el = musicElsRef.current.get(clip.id);
+            if (!el) continue;
+            const pos = musicPosForClip(clip, m);
+            if (pos == null) continue;
+            try {
+              el.currentTime = pos;
+            } catch {
+              /* seeking before metadata — ignored */
+            }
+          }
           raf = requestAnimationFrame(tick);
           return;
         }
@@ -1741,34 +1812,34 @@ export default function Page() {
         currentMsRef.current = m;
         setCurrentMs(m);
         setIsPlaying(false);
-        if (audioRef.current) audioRef.current.pause();
+        for (const el of musicElsRef.current.values()) el.pause();
         return;
       }
       currentMsRef.current = m;
       setCurrentMs(m);
-      // Keep the music element locked to the timeline (loop wraps, start
+      // Keep the music elements locked to the timeline (loop wraps, start
       // offsets, natural end) — cheap: only re-seeks on real drift.
-      syncMusicElement(m, true);
+      syncMusicElements(m, true);
       raf = requestAnimationFrame(tick);
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, [isPlaying, audioTrack, syncMusicElement]);
+  }, [isPlaying, musicClips, syncMusicElements, musicPosForClip]);
 
-  // v5.2: live volume changes apply to the element even while paused.
+  // v1.25: live volume/master changes apply to the pool even while paused.
   useEffect(() => {
-    if (audioRef.current) {
-      const master =
-        audioSettings.masterVolume != null &&
-        Number.isFinite(audioSettings.masterVolume)
-          ? Math.max(0, Math.min(2, audioSettings.masterVolume))
-          : 1;
-      audioRef.current.volume = Math.max(
-        0,
-        Math.min(1, audioSettings.musicVolume * master),
-      );
+    const master =
+      audioSettings.masterVolume != null &&
+      Number.isFinite(audioSettings.masterVolume)
+        ? Math.max(0, Math.min(2, audioSettings.masterVolume))
+        : 1;
+    for (const clip of musicClips) {
+      const el = musicElsRef.current.get(clip.id);
+      if (el) {
+        el.volume = Math.max(0, Math.min(1, clip.volume * master));
+      }
     }
-  }, [audioSettings.musicVolume, audioSettings.masterVolume, audioTrack]);
+  }, [audioSettings.masterVolume, musicClips]);
 
   // ---- Detect Electron + wire app-menu accelerators -----------------------
   const exportRef = useRef<() => void>(() => {});
@@ -1882,14 +1953,29 @@ export default function Page() {
       const res = await exportNative({
         segments: exportSegments,
         imageUrls,
-        audioTrack,
         settings,
         kenBurns,
+        // v1.25 MULTI-MUSIC: N placements — startMs shifted by the disclaimer
+        // lead-in exactly like the old single musicStartMs shift; native.ts
+        // resolves each clip to a real file (sourcePath or saveTempAudio).
+        // The audio.music* scalars ride along legacy-only (written from clip
+        // 0 for back-compat with old builds; the main process prefers
+        // musicClips whenever present).
+        musicClips:
+          musicClips.length > 0
+            ? musicClips.map((c) => ({ ...c, startMs: c.startMs + leadInMs }))
+            : null,
         audio:
           leadInMs > 0
             ? {
                 ...audioSettings,
-                musicStartMs: audioSettings.musicStartMs + leadInMs,
+                ...(musicClips.length > 0
+                  ? {
+                      musicStartMs: musicClips[0].startMs + leadInMs,
+                      musicVolume: musicClips[0].volume,
+                      musicLoop: musicClips[0].loop,
+                    }
+                  : { musicStartMs: audioSettings.musicStartMs + leadInMs }),
               }
             : audioSettings,
         totalMs: displayTotalMs,
@@ -2130,7 +2216,7 @@ export default function Page() {
     displayHeadlines,
     displaySfxItems,
     items,
-    audioTrack,
+    musicClips,
     settings,
     kenBurns,
     audioSettings,
@@ -2417,41 +2503,86 @@ export default function Page() {
   }, []);
   const clearWaveform = useCallback(() => setWaveform(null), []);
 
-  const addAudio = useCallback((file: File) => {
-    requestHistoryPush();
-    clearBeatInfo();
-    clearWaveform();
-    setAudioTrack(() => {
-      // The previous track's URL stays alive (undo-safe); unmount revokes.
-      const url = trackUrl(URL.createObjectURL(file));
-      const a = document.createElement("audio");
-      a.preload = "metadata";
-      a.onloadedmetadata = () => {
-        const dur =
-          a.duration && Number.isFinite(a.duration)
-            ? a.duration * 1000
+  /** v1.25 MULTI-MUSIC: import N music files as N independent clips (the
+   *  picker input is `multiple`; the panel dropzone routes the same way).
+   *  New clips APPEND — the stack never replaces. startMs defaults to 0 (the
+   *  old single-music default), volume 1, loop true (loop-to-fill, the
+   *  previous default behavior). Each file's duration probes via its own
+   *  <audio> metadata element (the addAudio pattern, per clip). The beat
+   *  grid + waveform derive from clip 0 — they reset when the FIRST clip
+   *  lands (previously: every track swap). */
+  const addMusicFiles = useCallback(
+    (files: File[]) => {
+      const audioFiles = files.filter(
+        (f) =>
+          (f.type && f.type.startsWith("audio/")) ||
+          /\.(mp3|wav|m4a|ogg|flac|aac|opus)$/i.test(f.name),
+      );
+      if (audioFiles.length === 0) return;
+      requestHistoryPush();
+      const firstClip = musicClips.length === 0;
+      if (firstClip) {
+        clearBeatInfo();
+        clearWaveform();
+      }
+      const added: MusicClip[] = audioFiles.map((file) => {
+        // The previous tracks' URLs stay alive (undo-safe); unmount revokes.
+        const url = trackUrl(URL.createObjectURL(file));
+        const id = makeMusicClipId();
+        const a = document.createElement("audio");
+        a.preload = "metadata";
+        a.onloadedmetadata = () => {
+          const dur =
+            a.duration && Number.isFinite(a.duration)
+              ? Math.round(a.duration * 1000)
+              : 0;
+          if (dur > 0) {
+            setMusicClips((prev) =>
+              prev.map((c) =>
+                c.id === id
+                  ? { ...c, durationMs: dur, sourceDurationMs: dur }
+                  : c,
+              ),
+            );
+          }
+        };
+        a.src = url;
+        // v1.3 zero-copy: remember the on-disk path (Electron only) so export
+        // and Whisper address the ORIGINAL file instead of re-uploading bytes.
+        const nativePath =
+          typeof window !== "undefined" &&
+          window.electronAPI?.getFilePath
+            ? window.electronAPI.getFilePath(file)
             : null;
-        setAudioTrack((p) =>
-          p && p.url === url ? { ...p, durationMs: dur } : p,
-        );
-      };
-      a.src = url;
-      // v1.3 zero-copy: remember the on-disk path (Electron only) so export
-      // and Whisper address the ORIGINAL file instead of re-uploading bytes.
-      const nativePath =
-        typeof window !== "undefined" &&
-        window.electronAPI?.getFilePath
-          ? window.electronAPI.getFilePath(file)
-          : null;
-      return {
-        fileName: file.name,
-        url,
-        durationMs: null,
-        sourcePath: typeof nativePath === "string" && nativePath ? nativePath : null,
-      };
-    });
-    toast.success(`Audio: ${file.name}`);
-  }, [requestHistoryPush, trackUrl, clearBeatInfo, clearWaveform]);
+        return {
+          id,
+          fileName: file.name,
+          url,
+          // 0 while the probe runs (rendering falls back to a min pill).
+          durationMs: 0,
+          sourceDurationMs: 0,
+          startMs: 0,
+          volume: 1,
+          loop: true,
+          sourcePath:
+            typeof nativePath === "string" && nativePath ? nativePath : null,
+        };
+      });
+      setMusicClips((prev) => [...prev, ...added]);
+      toast.success(
+        added.length === 1
+          ? `Music: ${added[0].fileName}`
+          : `Added ${added.length} music tracks`,
+        {
+          description:
+            added.length > 1
+              ? "Each track is an independent clip on the Audio lane — drag, loop, mix or remove them individually."
+              : "Drag the clip on the Audio lane to reposition it; add more tracks any time.",
+        },
+      );
+    },
+    [requestHistoryPush, trackUrl, clearBeatInfo, clearWaveform, musicClips],
+  );
 
   // ---- v1.14: Disclaimer / intro lead-in ----------------------------------
   /**
@@ -2599,7 +2730,9 @@ export default function Page() {
   // state is set in the promise continuation, not synchronously in the
   // effect body). Undecodable audio simply keeps the strip hidden; the
   // in-flight decode is cancelled when the track changes again.
-  const audioUrl = audioTrack?.url ?? null;
+  // v1.25: the strip derives from clip 0 (the "primary") — appending more
+  // clips never re-decodes; removing clip 0 switches the source.
+  const audioUrl = primaryMusicClip?.url ?? null;
   useEffect(() => {
     if (!audioUrl) return;
     let cancelled = false;
@@ -2869,6 +3002,60 @@ export default function Page() {
     }
   }, [subtitles, captionSettings, settings.aspect, settings.resolution]);
 
+  // ---- v1.25 TTS STUDIO HANDOFF #2 — word timings → captions -----------
+  /** The Studio's word-level timings (one entry per synthesized word, global
+   *  offsets) become phrase-grouped karaoke captions — the exact same
+   *  grouping + word-mode arming the Whisper flow performs, so the same
+   *  caption styles (karaoke highlight, word-only, kinetic) work on TTS. */
+  const handleCreateWordCaptions = useCallback(
+    (r: {
+      title: string;
+      words: Array<{ text: string; startMs: number; endMs: number }>;
+    }) => {
+      if (r.words.length === 0) {
+        toast.error("No word timings in this result");
+        return;
+      }
+      const wordCues: SubtitleCue[] = r.words.map((w, i) => ({
+        id: i + 1,
+        startMs: w.startMs,
+        endMs: w.endMs,
+        text: w.text,
+        words: [w],
+      }));
+      const cues = groupWordLevelCues(wordCues);
+      requestHistoryPush(250);
+      setSubtitles({
+        fileName: `${r.title.replace(/\.[^.]+$/, "")}.tts.srt`,
+        cues,
+        rawText: serializeSrt(cues),
+      });
+      // Auto-enable captions + word mode + a word-aware preset (mirrors the
+      // whisper flow) so the karaoke effect is immediately visible.
+      setCaptionSettings((prev) => {
+        const next = { ...prev, enabled: true };
+        if (!prev.wordMode || prev.wordMode === "off") {
+          next.wordMode = "word";
+        }
+        const isWordPreset =
+          prev.presetId.startsWith("word-") ||
+          prev.presetId.startsWith("kinetic-");
+        if (!isWordPreset) {
+          next.presetId = "word-karaoke";
+        }
+        if (!prev.animation || prev.animation === "none") {
+          const preset = CAPTION_PRESETS.find((p) => p.id === next.presetId);
+          if (preset?.animation) next.animation = preset.animation;
+        }
+        return next;
+      });
+      toast.success(`Word-level captions ready — ${r.words.length} words`, {
+        description: `${cues.length} caption${cues.length === 1 ? "" : "s"} · word-by-word mode armed — play from the clip's start to see the karaoke highlight.`,
+      });
+    },
+    [requestHistoryPush],
+  );
+
   // ---- Whisper caption generation (word-level timestamps) ----------------
   const [whisperBusy, setWhisperBusy] = useState(false);
   const [whisperProgress, setWhisperProgress] = useState<WhisperProgress | null>(null);
@@ -2909,15 +3096,17 @@ export default function Page() {
     // captioned — requiring a separate audio upload was backwards).
     let sourceFile: File | null = null;
     let sourcePath: string | null = null;
-    if (audioTrack) {
-      sourcePath = audioTrack.sourcePath ?? null;
+    if (primaryMusicClip) {
+      sourcePath = primaryMusicClip.sourcePath ?? null;
       if (sourcePath) {
-        sourceFile = new File([], audioTrack.fileName, { type: "audio/mpeg" });
+        sourceFile = new File([], primaryMusicClip.fileName, {
+          type: "audio/mpeg",
+        });
       } else {
         try {
-          const resp = await fetch(audioTrack.url);
+          const resp = await fetch(primaryMusicClip.url);
           const blob = await resp.blob();
-          sourceFile = new File([blob], audioTrack.fileName, {
+          sourceFile = new File([blob], primaryMusicClip.fileName, {
             type: blob.type || "audio/mpeg",
           });
         } catch {
@@ -3026,7 +3215,7 @@ export default function Page() {
       setWhisperBusy(false);
       setWhisperProgress(null);
     }
-  }, [audioTrack, timeline.segments, whisperBusy, whisperLanguage, whisperModel, requestHistoryPush]);
+  }, [primaryMusicClip, timeline.segments, whisperBusy, whisperLanguage, whisperModel, requestHistoryPush]);
 
   const loadSamples = useCallback(async () => {
     try {
@@ -3056,12 +3245,86 @@ export default function Page() {
     }
   }, [addFiles]);
 
-  const removeAudio = useCallback(() => {
+  // ---- v1.25 MULTI-MUSIC: per-clip edit channels ---------------------------
+  /** Drop ONE music clip (object URL stays alive — undo-safe). Beat grid +
+   *  waveform reset only when the PRIMARY (clip 0) goes away. */
+  const removeMusicClip = useCallback(
+    (id: string) => {
+      requestHistoryPush();
+      const wasPrimary = musicClips[0]?.id === id;
+      setMusicClips((prev) => prev.filter((c) => c.id !== id));
+      setSelectedIds((prev) => prev.filter((x) => x !== id));
+      if (wasPrimary) {
+        clearBeatInfo();
+        clearWaveform();
+      }
+    },
+    [requestHistoryPush, clearBeatInfo, clearWaveform, musicClips],
+  );
+
+  /** Drop the whole stack in one undo step. */
+  const removeAllMusic = useCallback(() => {
+    if (musicClips.length === 0) return;
     requestHistoryPush();
+    setMusicClips([]);
+    setSelectedIds((prev) =>
+      prev.filter((id) => !musicClips.some((c) => c.id === id)),
+    );
     clearBeatInfo();
     clearWaveform();
-    setAudioTrack(null);
-  }, [requestHistoryPush, clearBeatInfo, clearWaveform]);
+  }, [requestHistoryPush, clearBeatInfo, clearWaveform, musicClips]);
+
+  /** Move ONE music clip (display-time start → base storage, 10ms-rounded). */
+  const moveMusicClip = useCallback(
+    (id: string, startMs: number) => {
+      requestHistoryPush();
+      const ms = Math.max(0, Math.round(startMs - disclaimerOffsetRef.current));
+      setMusicClips((prev) =>
+        prev.map((c) => (c.id === id ? { ...c, startMs: ms } : c)),
+      );
+    },
+    [requestHistoryPush],
+  );
+
+  /** Patch ONE music clip (volume / loop / trimmable durationMs — the
+   *  timeline popovers + the Audio-tab card both commit through here). */
+  const editMusicClip = useCallback(
+    (id: string, patch: Partial<MusicClip>) => {
+      if (Object.keys(patch).length === 0) return;
+      requestHistoryPush(600);
+      setMusicClips((prev) =>
+        prev.map((c) => {
+          if (c.id !== id) return c;
+          const next: MusicClip = { ...c };
+          if (typeof patch.volume === "number" && Number.isFinite(patch.volume)) {
+            next.volume = Math.max(0, Math.min(2, patch.volume));
+          }
+          if (typeof patch.loop === "boolean") {
+            next.loop = patch.loop;
+          }
+          if (
+            typeof patch.durationMs === "number" &&
+            Number.isFinite(patch.durationMs)
+          ) {
+            // Trim: clamp [200ms, probed source length] (source unknown →
+            // the current duration stands).
+            const max = c.sourceDurationMs > 0 ? c.sourceDurationMs : c.durationMs;
+            next.durationMs = Math.round(
+              Math.max(200, Math.min(Math.max(200, max), patch.durationMs)),
+            );
+          }
+          if (
+            typeof patch.startMs === "number" &&
+            Number.isFinite(patch.startMs)
+          ) {
+            next.startMs = Math.max(0, Math.round(patch.startMs));
+          }
+          return next;
+        }),
+      );
+    },
+    [requestHistoryPush],
+  );
 
   const removeItem = useCallback((id: string) => {
     requestHistoryPush();
@@ -3123,17 +3386,23 @@ export default function Page() {
     (ids: string[]) => {
       if (ids.length === 0) return;
       // v5.5: the selection may MIX kinds — segment ids, SFX pill ids and
-      // the MUSIC sentinel. Route each kind through its own channel; the
-      // debounced history push coalesces the whole burst into ONE undo
-      // step (requestHistoryPush restarts a single 80ms flush timer).
-      const segIds = ids.filter((id) => id !== MUSIC_SEL_ID);
-      const hasMusic = ids.includes(MUSIC_SEL_ID);
+      // MUSIC CLIP ids (v1.25: real per-clip ids, no more sentinel). Route
+      // each kind through its own channel; the debounced history push
+      // coalesces the whole burst into ONE undo step (requestHistoryPush
+      // restarts a single 80ms flush timer).
       // Resolve SFX ids against the live placements (exact — never guesses
       // from id prefixes; a clip id can never collide with a placement id).
       const liveSfx = stateRef.current?.sfxItems ?? [];
       const sfxIdSet = new Set(liveSfx.map((s) => s.id));
-      const sfxIds = new Set(segIds.filter((id) => sfxIdSet.has(id)));
-      const itemIds = segIds.filter((id) => !sfxIds.has(id));
+      const sfxIds = new Set(ids.filter((id) => sfxIdSet.has(id)));
+      // v1.25: resolve music ids against the live clip stack the same way.
+      const liveMusic = stateRef.current?.musicClips ?? [];
+      const musicIdSet = new Set(liveMusic.map((c) => c.id));
+      const musicIds = new Set(ids.filter((id) => musicIdSet.has(id)));
+      const itemIds = ids.filter(
+        (id) => !sfxIds.has(id) && !musicIds.has(id),
+      );
+      const hasMusic = musicIds.size > 0;
 
       // SFX removal channel (one setSfxItems for any count).
       if (sfxIds.size > 0 && itemIds.length === 0 && !hasMusic) {
@@ -3147,13 +3416,25 @@ export default function Page() {
         );
         return;
       }
-      // Music removal channel (removeAudio clears beat/waveform too).
+      // Music removal channel (removing the primary clip clears the beat
+      // grid + waveform too).
       if (hasMusic && itemIds.length === 0 && sfxIds.size === 0) {
-        removeAudio();
+        const wasPrimary = musicIds.has(liveMusic[0]?.id ?? "");
+        requestHistoryPush();
+        setMusicClips((prev) => prev.filter((c) => !musicIds.has(c.id)));
+        if (wasPrimary || liveMusic.length === musicIds.size) {
+          clearBeatInfo();
+          clearWaveform();
+        }
         setSelectedIds([]);
-        toast.success("Removed background music", {
-          description: "Ctrl+Z restores the track (beat grid + waveform).",
-        });
+        toast.success(
+          musicIds.size === 1
+            ? "Removed background music"
+            : `Removed ${musicIds.size} music tracks`,
+          {
+            description: "Ctrl+Z restores them (beat grid + waveform follow clip 1).",
+          },
+        );
         return;
       }
       // Mixed / clips-only: clips go through the (history-coalesced) clip
@@ -3163,10 +3444,21 @@ export default function Page() {
         setSfxItems((prev) => prev.filter((s) => !sfxIds.has(s.id)));
       }
       if (hasMusic) {
-        removeAudio();
-        toast.success("Removed background music", {
-          description: "Ctrl+Z restores the track (beat grid + waveform).",
-        });
+        const wasPrimary = musicIds.has(liveMusic[0]?.id ?? "");
+        requestHistoryPush();
+        setMusicClips((prev) => prev.filter((c) => !musicIds.has(c.id)));
+        if (wasPrimary || liveMusic.length === musicIds.size) {
+          clearBeatInfo();
+          clearWaveform();
+        }
+        toast.success(
+          musicIds.size === 1
+            ? "Removed background music"
+            : `Removed ${musicIds.size} music tracks`,
+          {
+            description: "Ctrl+Z restores them (beat grid + waveform follow clip 1).",
+          },
+        );
       }
       if (itemIds.length === 0) {
         setSelectedIds([]);
@@ -3227,7 +3519,7 @@ export default function Page() {
       });
       setSelectedIds([]);
     },
-    [requestHistoryPush, removeItem, removeAudio],
+    [requestHistoryPush, removeItem, clearBeatInfo, clearWaveform],
   );
 
   const overrideDuration = useCallback((id: string, durationMs: number) => {
@@ -3248,12 +3540,13 @@ export default function Page() {
   // ---- Beat-sync actions (v4.6) ------------------------------------------
 
   const handleDetectBeats = useCallback(async () => {
-    if (!audioTrack || beatBusy) return;
+    // v1.25: beat detection runs on the PRIMARY music clip (clip 0).
+    if (!primaryMusicClip || beatBusy) return;
     setBeatBusy(true);
     try {
-      const resp = await fetch(audioTrack.url);
+      const resp = await fetch(primaryMusicClip.url);
       const blob = await resp.blob();
-      const file = new File([blob], audioTrack.fileName, {
+      const file = new File([blob], primaryMusicClip.fileName, {
         type: blob.type || "audio/mpeg",
       });
       const info = await detectBeatsInAudio(file);
@@ -3276,7 +3569,7 @@ export default function Page() {
     } finally {
       setBeatBusy(false);
     }
-  }, [audioTrack, beatBusy]);
+  }, [primaryMusicClip, beatBusy]);
 
   const handleSnapToBeats = useCallback(() => {
     if (!beatInfo || !timeline.segments.length) return;
@@ -3320,7 +3613,11 @@ export default function Page() {
   }, []);
 
   const handleFitToAudio = useCallback(() => {
-    if (!audioTrack || !audioTrack.durationMs || !timeline.segments.length) return;
+    // v1.25: fits against the PRIMARY clip's source length (clip 0).
+    const fitMs = primaryMusicClip
+      ? primaryMusicClip.sourceDurationMs || primaryMusicClip.durationMs
+      : 0;
+    if (!fitMs || fitMs <= 0 || !timeline.segments.length) return;
     if (timeline.mode !== "sequential") {
       toast.error("Fit-to-audio needs the sequence timeline", {
         description: "Timestamped filenames drive absolute timelines.",
@@ -3329,15 +3626,15 @@ export default function Page() {
     }
     const plan = planFitToAudio(
       timeline.segments.map((s) => ({ id: s.id, durationMs: s.durationMs })),
-      audioTrack.durationMs,
+      fitMs,
     );
     if (!Object.keys(plan).length) return;
     requestHistoryPush();
     setOverrides((prev) => ({ ...prev, ...plan }));
     toast.success("Video fitted to audio", {
-      description: `Timeline now ends with the audio at ${fmtTimecode(audioTrack.durationMs)}.`,
+      description: `Timeline now ends with the audio at ${fmtTimecode(fitMs)}.`,
     });
-  }, [audioTrack, timeline.segments, timeline.mode, requestHistoryPush]);
+  }, [primaryMusicClip, timeline.segments, timeline.mode, requestHistoryPush]);
 
   const reorderItem = useCallback((id: string, dir: -1 | 1) => {
     requestHistoryPush();
@@ -3820,16 +4117,22 @@ const handleRandomTransitionMix = useCallback(() => {
    * — one delta for every member, ONE undo step. Clip patches go through
    * translateItemEdit (overlay default geometry + base duration mirroring,
    * same contract as handleTimelineEdit) but are applied in a SINGLE
-   * setItemEdits pass; SFX placements + the music start ride the same
-   * debounced history push.
+   * setItemEdits pass; SFX placements + the music clips (v1.25: the whole
+   * selected sub-stack, per-clip) ride the same debounced history push.
    */
   const handleGroupMove = useCallback(
     (move: {
       clips: { id: string; startMs: number }[];
       sfx: { id: string; startMs: number }[];
-      musicStartMs?: number;
+      music?: { id: string; startMs: number }[];
     }) => {
-      if (move.clips.length === 0 && move.sfx.length === 0) return;
+      if (
+        move.clips.length === 0 &&
+        move.sfx.length === 0 &&
+        (move.music?.length ?? 0) === 0
+      ) {
+        return;
+      }
       requestHistoryPush();
       // v1.14: display→base — the ruler commits display-time starts.
       const off = disclaimerOffsetRef.current;
@@ -3872,16 +4175,22 @@ const handleRandomTransitionMix = useCallback(() => {
           ),
         );
       }
-      if (move.musicStartMs != null) {
-        const ms = Math.max(0, Math.round(move.musicStartMs - off));
-        setAudioSettings((prev) =>
-          prev.musicStartMs === ms ? prev : { ...prev, musicStartMs: ms },
+      if (move.music && move.music.length > 0) {
+        const musicById = new Map(
+          move.music.map((m) => [m.id, Math.max(0, Math.round(m.startMs - off))]),
+        );
+        setMusicClips((prev) =>
+          prev.map((c) =>
+            musicById.has(c.id)
+              ? { ...c, startMs: musicById.get(c.id) ?? c.startMs }
+              : c,
+          ),
         );
       }
       const n =
         move.clips.length +
         move.sfx.length +
-        (move.musicStartMs != null ? 1 : 0);
+        (move.music?.length ?? 0);
       toast.info(`Moved ${n} item${n === 1 ? "" : "s"} together`, {
         description: "One undo step — Ctrl+Z restores every position.",
       });
@@ -4178,18 +4487,43 @@ const handleRandomTransitionMix = useCallback(() => {
    * saveProject/saveProjectAs bridges (main.js persists this doc verbatim).
    */
   const buildProjectDoc = useCallback(async (): Promise<ProjectFile | null> => {
-    let audioFile: File | null = null;
-    if (audioTrack) {
+    // v1.25 MULTI-MUSIC: serialize EVERY clip (bytes + placement facts).
+    // The legacy `audio` entry keeps being written from clip 0 so older
+    // builds can still open the file, and the legacy audio.music* settings
+    // scalars mirror clip 0 for the same reason.
+    const musicFileFor = async (clip: MusicClip): Promise<File | null> => {
       try {
-        const resp = await fetch(audioTrack.url);
+        const resp = await fetch(clip.url);
         const blob = await resp.blob();
-        audioFile = new File([blob], audioTrack.fileName, {
+        return new File([blob], clip.fileName, {
           type: blob.type || "audio/mpeg",
         });
       } catch {
-        audioFile = null;
+        return null;
+      }
+    };
+    const musicClipInputs: {
+      file: File;
+      startMs: number;
+      volume: number;
+      loop: boolean;
+      durationMs: number;
+      sourceDurationMs: number;
+    }[] = [];
+    for (const clip of musicClips) {
+      const file = await musicFileFor(clip);
+      if (file) {
+        musicClipInputs.push({
+          file,
+          startMs: clip.startMs,
+          volume: clip.volume,
+          loop: clip.loop,
+          durationMs: clip.durationMs,
+          sourceDurationMs: clip.sourceDurationMs,
+        });
       }
     }
+    const audioFile = musicClipInputs.length > 0 ? musicClipInputs[0].file : null;
     return await buildProjectFile({
       // v5.0: entries carry their mediaType so videos round-trip as videos.
       images: items.map((it) => ({
@@ -4198,6 +4532,8 @@ const handleRandomTransitionMix = useCallback(() => {
         mediaType: it.mediaType,
       })),
       audio: audioFile,
+      // v1.25: the full music-clip stack (musicClips[].
+      musicClips: musicClipInputs.length > 0 ? musicClipInputs : undefined,
       subtitles: subtitles
         ? { fileName: subtitles.fileName, cues: subtitles.cues }
         : null,
@@ -4229,14 +4565,23 @@ const handleRandomTransitionMix = useCallback(() => {
         kenBurns,
         video: settings,
         caption: captionSettings,
-        audio: audioSettings,
+        // v1.25: legacy music scalars mirror clip 0 (older builds read them).
+        audio:
+          musicClips.length > 0
+            ? {
+                ...audioSettings,
+                musicStartMs: musicClips[0].startMs,
+                musicVolume: musicClips[0].volume,
+                musicLoop: musicClips[0].loop,
+              }
+            : audioSettings,
         whisperLanguage,
         transition: transitionSettings,
       },
     });
   }, [
     items,
-    audioTrack,
+    musicClips,
     subtitles,
     headlineItems,
     overrides,
@@ -4400,27 +4745,103 @@ const handleRandomTransitionMix = useCallback(() => {
           if (it.mediaType === "video") probeVideoItem(it);
         }
 
-        // Audio.
-        if (loaded.audioFile) {
-          const url = trackUrl(URL.createObjectURL(loaded.audioFile));
+        // v1.25 MULTI-MUSIC. Two paths:
+        //  (a) the doc carried `musicClips` → restore the stack verbatim;
+        //  (b) legacy docs (≤1.24: single `audio` + settings.audio.music*
+        //      scalars) → MIGRATE into musicClips[0], preserving the saved
+        //      start / volume / loop exactly.
+        if (loaded.musicClipFiles.length > 0) {
+          const restoredClips: MusicClip[] = loaded.musicClipFiles.map(
+            (mc, idx) => {
+              const url = trackUrl(URL.createObjectURL(mc.file));
+              const id = `mus_${Date.now().toString(36)}_${idx.toString(36)}`;
+              const a = document.createElement("audio");
+              a.preload = "metadata";
+              a.onloadedmetadata = () => {
+                const dur =
+                  a.duration && Number.isFinite(a.duration)
+                    ? Math.round(a.duration * 1000)
+                    : 0;
+                if (dur > 0) {
+                  setMusicClips((prev) =>
+                    prev.map((c) =>
+                      c.id === id
+                        ? {
+                            ...c,
+                            durationMs: Math.min(c.durationMs > 0 ? c.durationMs : dur, dur),
+                            sourceDurationMs: dur,
+                          }
+                        : c,
+                    ),
+                  );
+                }
+              };
+              a.src = url;
+              return {
+                id,
+                fileName: mc.file.name,
+                url,
+                durationMs: mc.durationMs,
+                sourceDurationMs: mc.sourceDurationMs,
+                startMs: mc.startMs,
+                volume: mc.volume,
+                loop: mc.loop,
+                sourcePath: null,
+              };
+            },
+          );
+          setMusicClips(restoredClips);
+          clearBeatInfo();
           clearWaveform();
+        } else if (loaded.audioFile) {
+          // Legacy single-track migration → musicClips[0].
+          const url = trackUrl(URL.createObjectURL(loaded.audioFile));
+          const legacyId = `mus_${Date.now().toString(36)}_0`;
+          const legacyStart = Math.max(
+            0,
+            Math.round(Number(project.settings.audio?.musicStartMs) || 0),
+          );
+          const legacyVol =
+            typeof project.settings.audio?.musicVolume === "number"
+              ? Math.max(0, Math.min(2, project.settings.audio.musicVolume))
+              : 1;
+          const legacyLoop = project.settings.audio?.musicLoop === true;
           const a = document.createElement("audio");
           a.preload = "metadata";
           a.onloadedmetadata = () => {
             const dur =
-              a.duration && Number.isFinite(a.duration) ? a.duration * 1000 : null;
-            setAudioTrack((p) =>
-              p && p.url === url ? { ...p, durationMs: dur } : p,
-            );
+              a.duration && Number.isFinite(a.duration)
+                ? Math.round(a.duration * 1000)
+                : 0;
+            if (dur > 0) {
+              setMusicClips((prev) =>
+                prev.map((c) =>
+                  c.id === legacyId
+                    ? { ...c, durationMs: dur, sourceDurationMs: dur }
+                    : c,
+                ),
+              );
+            }
           };
           a.src = url;
-          setAudioTrack({
-            fileName: loaded.audioFile.name,
-            url,
-            durationMs: null,
-          });
+          setMusicClips([
+            {
+              id: legacyId,
+              fileName: loaded.audioFile.name,
+              url,
+              durationMs: 0,
+              sourceDurationMs: 0,
+              startMs: legacyStart,
+              volume: legacyVol,
+              loop: legacyLoop,
+              sourcePath: null,
+            },
+          ]);
+          clearBeatInfo();
+          clearWaveform();
         } else {
-          setAudioTrack(null);
+          setMusicClips([]);
+          clearBeatInfo();
           clearWaveform();
         }
 
@@ -4509,6 +4930,12 @@ const handleRandomTransitionMix = useCallback(() => {
             description: `${shownName}${
               loaded.audioSkipped ? " · audio skipped (>25MB)" : ""
             }${
+              loaded.musicSkipped ? " · a music clip was skipped (>25MB)" : ""
+            }${
+              loaded.musicClipFiles.length || loaded.audioFile
+                ? ` · ${loaded.musicClipFiles.length || 1} music track${(loaded.musicClipFiles.length || 1) === 1 ? "" : "s"} restored`
+                : ""
+            }${
               loaded.videoSkipped
                 ? " · video skipped (too large to inline at save time)"
                 : ""
@@ -4525,7 +4952,7 @@ const handleRandomTransitionMix = useCallback(() => {
         toast.error(e instanceof Error ? e.message : "Project load failed");
       }
     },
-    [requestHistoryPush, trackUrl, clearWaveform, probeVideoItem, probeDisclaimerClip],
+    [requestHistoryPush, trackUrl, clearWaveform, clearBeatInfo, probeVideoItem, probeDisclaimerClip],
   );
 
   /**
@@ -4559,7 +4986,7 @@ const handleRandomTransitionMix = useCallback(() => {
   const newProject = useCallback(() => {
     const hasSession =
       items.length > 0 ||
-      audioTrack != null ||
+      musicClips.length > 0 ||
       subtitles != null ||
       headlineItems.length > 0 ||
       sfxItems.length > 0 ||
@@ -4579,7 +5006,7 @@ const handleRandomTransitionMix = useCallback(() => {
     setMotionOverrides({});
     setSubtitles(null);
     setHeadlineItems([]);
-    setAudioTrack(null);
+    setMusicClips([]);
     setItemEdits({});
     setSfxItems([]);
     setVoItems([]);
@@ -4610,7 +5037,7 @@ const handleRandomTransitionMix = useCallback(() => {
     });
   }, [
     items.length,
-    audioTrack,
+    musicClips.length,
     subtitles,
     headlineItems.length,
     sfxItems.length,
@@ -4634,14 +5061,15 @@ const handleRandomTransitionMix = useCallback(() => {
       const clamped = Math.max(0, Math.min(ms, totalMsRef.current));
       currentMsRef.current = clamped;
       setCurrentMs(clamped);
-      // Sync audio position (v5.2: placement-aware — start offset / loop).
-      syncMusicElement(clamped, isPlayingRef.current);
+      // Sync audio position (v1.25: per-clip placement-aware — start /
+      // loop / trim).
+      syncMusicElements(clamped, isPlayingRef.current);
       // v5.0: SFX sources stop + reschedule at the new playhead (the async
       // schedule self-aborts when superseded, so scrub bursts are cheap).
       if (isPlayingRef.current) void scheduleSfxFrom(clamped);
       else stopSfxSources();
     },
-    [scheduleSfxFrom, stopSfxSources, syncMusicElement],
+    [scheduleSfxFrom, stopSfxSources, syncMusicElements],
   );
 
   const togglePlay = useCallback(() => {
@@ -4740,20 +5168,17 @@ const handleRandomTransitionMix = useCallback(() => {
       } else if (mod && (e.key === "a" || e.key === "A")) {
         // v5.4: select every clip (base + overlay). Inputs are guarded
         // above, so this only fires on app-chrome focus. v5.5: SFX pills
-        // and the music clip join Ctrl+A (the full selection story). The
-        // music gate is PRESENCE (audioTrack != null) — durationMs can be
-        // null right after an undo restore (the async probe never
-        // re-pushes history), and the clip still exists.
+        // and the music clips join Ctrl+A (the full selection story).
+        // v1.25: music entries are REAL clip ids (one per music track).
         const segs = timelineSegmentsRef.current;
         const sfx = stateRef.current?.sfxItems ?? [];
-        const musicTrack = stateRef.current?.audioTrack;
-        const music = musicTrack != null ? [MUSIC_SEL_ID] : [];
+        const music = stateRef.current?.musicClips ?? [];
         if (segs.length + sfx.length + music.length > 0) {
           e.preventDefault();
           setSelectedIds([
             ...segs.map((s) => s.id),
             ...sfx.map((s) => s.id),
-            ...music,
+            ...music.map((c) => c.id),
           ]);
         }
       } else if (mod && (e.key === "c" || e.key === "C")) {
@@ -4908,6 +5333,36 @@ const handleRandomTransitionMix = useCallback(() => {
     },
     [requestHistoryPush],
   );
+  /** v1.25 QWERTY captions: convert ROMANIZED (Hinglish / Roman Urdu) subtitle
+ *  cues — and their per-word timestamps — to native script (Devanagari or
+ *  Nastaliq). No-ops with a toast when the cues are already native. */
+const handleConvertSubtitlesToNative = useCallback(() => {
+  setSubtitles((prev) => {
+    if (!prev) return prev;
+    const target = whisperLanguage === "ur" ? "ur" : "hi";
+    const sample = prev.cues
+      .slice(0, 8)
+      .map((c) => c.text)
+      .join(" ");
+    if (!isLikelyRomanized(sample)) {
+      toast.info(
+        `Captions already use ${target === "hi" ? "Devanagari" : "Urdu"} script — nothing to convert.`,
+      );
+      return prev;
+    }
+    const cues = prev.cues.map((c) => ({
+      ...c,
+      text: transliterate(c.text, target),
+      words: c.words?.map((w) => ({ ...w, text: transliterate(w.text, target) })),
+    }));
+    requestHistoryPush(300);
+    toast.success(
+      `Converted ${cues.length} caption${cues.length === 1 ? "" : "s"} to ${target === "hi" ? "Devanagari" : "Urdu script"}.`,
+    );
+    return { ...prev, cues, rawText: serializeSrt(cues) };
+  });
+}, [whisperLanguage, requestHistoryPush]);
+
   const handleWhisperLanguageChange = useCallback(
     (lang: string) => {
       requestHistoryPush();
@@ -5214,20 +5669,20 @@ const handleRandomTransitionMix = useCallback(() => {
                 <MediaPanel
                   segments={displaySegments}
                   mode={timeline.mode}
-                  audioTrack={audioTrack}
+                  musicClips={musicClips}
                   subtitles={subtitles}
                   skipped={allSkipped}
                   warnings={timeline.warnings}
                   transition={transitionSettings}
                   onAddFiles={addFiles}
-                  onAddAudioFile={addAudio}
+                  onAddAudioFiles={addMusicFiles}
                   onAddSubtitleFile={addSubtitles}
                   onLoadSamples={loadSamples}
                   openImagePicker={openImagePicker}
                   openVideoPicker={openVideoPicker}
                   openAudioPicker={openAudioPicker}
                   openSubtitlePicker={openSubtitlePicker}
-                  onRemoveAudio={removeAudio}
+                  onRemoveMusicClip={removeMusicClip}
                   onRemoveSubtitles={removeSubtitles}
                   onRemove={removeItem}
                   onOverride={overrideDuration}
@@ -5305,24 +5760,19 @@ const handleRandomTransitionMix = useCallback(() => {
                   onExportVttWords={exportVttWordsSidecar}
                   inElectron={inElectron}
                   subtitles={subtitles}
-                  hasAudio={!!audioTrack}
-                  // v1.24: dedicated background-music card (picker + info +
-                  // remove) — reuses the page's pinned audioTrack + picker.
-                  musicTrack={
-                    audioTrack
-                      ? {
-                          fileName: audioTrack.fileName,
-                          durationMs: audioTrack.durationMs,
-                        }
-                      : null
-                  }
-                  openMusicPicker={openAudioPicker}
-                  onRemoveMusic={removeAudio}
+                  hasAudio={musicClips.length > 0}
+                  // v1.25 MULTI-MUSIC: the Audio-tab card renders the whole
+                  // clip stack (per-clip volume/loop/remove + add-another).
+                  musicClips={musicClips}
+                  onAddMusic={openAudioPicker}
+                  onRemoveMusicClip={removeMusicClip}
+                  onMusicClipEdit={editMusicClip}
                   onGenerateCaptions={generateCaptionsFromAudio}
                   whisperBusy={whisperBusy}
                   whisperProgress={whisperProgress}
                   whisperLanguage={whisperLanguage}
                   onWhisperLanguageChange={handleWhisperLanguageChange}
+                  onConvertSubtitlesToNative={handleConvertSubtitlesToNative}
                   whisperModel={whisperModel}
                   onWhisperModelChange={setWhisperModel}
                   hasVideoClip={timeline.segments.some(
@@ -5341,6 +5791,8 @@ const handleRandomTransitionMix = useCallback(() => {
                   dubSettings={dubSettings}
                   onDubSettingsChange={handleDubSettingsChange}
                   onAddVoiceover={handleAddVoiceover}
+                  onAddMusicAudio={handleAddTtsMusicAudio}
+                  onCreateWordCaptions={handleCreateWordCaptions}
                   dubSourceCount={dubSources.length}
                   dubBusy={dubBusy}
                   dubProgress={dubProgress}
@@ -5497,48 +5949,15 @@ const handleRandomTransitionMix = useCallback(() => {
                   ? clipboard.clips.length + clipboard.sfx.length
                   : 0
               }
-              // ---- v5.2: music placement (draggable clip on the audio lane) ----
-              // v1.14: display-space start (strip coords); the commit
-              // translates back to base before storing.
-              musicStartMs={displayMusicStartMs}
-              musicLoop={audioSettings.musicLoop}
-              musicVolume={audioSettings.musicVolume}
-              musicDurationMs={audioTrack?.durationMs ?? null}
-              musicName={audioTrack?.fileName ?? null}
-              onMusicMove={(startMs) => {
-                // v5.5: music drags are now undoable (one push per gesture —
-                // the debounced flush coalesces pointerup bursts).
-                requestHistoryPush();
-                const ms = Math.max(
-                  0,
-                  Math.round(startMs - disclaimerOffsetRef.current),
-                );
-                setAudioSettings((prev) =>
-                  prev.musicStartMs === ms ? prev : { ...prev, musicStartMs: ms },
-                );
-              }}
-              onMusicLoopChange={(loop) => {
-                setAudioSettings((prev) =>
-                  prev.musicLoop === loop ? prev : { ...prev, musicLoop: loop },
-                );
-                toast.success(
-                  loop
-                    ? "Music loops to fill the entire video"
-                    : "Music plays once from its start point",
-                  {
-                    description: loop
-                      ? "The track repeats until the video ends — perfect for short edits over long background music."
-                      : "Turn it back on any time from the clip's hover controls.",
-                  },
-                );
-              }}
-              onMusicVolumeChange={(volume) => {
-                setAudioSettings((prev) =>
-                  prev.musicVolume === volume
-                    ? prev
-                    : { ...prev, musicVolume: Math.max(0, Math.min(2, volume)) },
-                );
-              }}
+              // ---- v1.25 MULTI-MUSIC: the clip stack on the (growable,
+              // multi-row) Audio lane. Display-space starts (strip coords);
+              // every commit translates back to base before storing. ----
+              musicClips={displayMusicClips}
+              waveformDurationMs={waveform?.durationMs ?? null}
+              onMusicMove={moveMusicClip}
+              onMusicClipEdit={editMusicClip}
+              onRemoveMusicClip={removeMusicClip}
+              onAddMusic={openAudioPicker}
               // ---- v1: BIG-TIMELINE mode (one-click 65% height toggle) ----
               timelineBig={timelineBig}
               onToggleTimelineBig={toggleTimelineBig}
@@ -5619,6 +6038,7 @@ const handleRandomTransitionMix = useCallback(() => {
         ref={audioInputRef}
         type="file"
         accept="audio/*"
+        multiple
         style={{
           position: "absolute",
           opacity: 0,
@@ -5627,8 +6047,8 @@ const handleRandomTransitionMix = useCallback(() => {
           pointerEvents: "none",
         }}
         onChange={(e: ChangeEvent<HTMLInputElement>) => {
-          const f = e.target.files?.[0];
-          if (f) addAudio(f);
+          // v1.25: MULTI-music — every picked file becomes its own clip.
+          if (e.target.files) addMusicFiles(Array.from(e.target.files));
           e.target.value = "";
         }}
       />
@@ -5703,15 +6123,21 @@ const handleRandomTransitionMix = useCallback(() => {
         }}
       />
 
-      {/* Hidden audio element for preview playback (synced with timeline) */}
-      {audioTrack && (
+      {/* v1.25: hidden <audio> POOL — one element per music clip, keyed by
+          id (refs register into musicElsRef; removals deregister). The rAF
+          loop syncs every element to the master playhead. */}
+      {musicClips.map((clip) => (
         <audio
-          ref={audioRef}
-          src={audioTrack.url}
+          key={clip.id}
+          ref={(el) => {
+            if (el) musicElsRef.current.set(clip.id, el);
+            else musicElsRef.current.delete(clip.id);
+          }}
+          src={clip.url}
           preload="auto"
           style={{ display: "none" }}
         />
-      )}
+      ))}
 
       {/* v1.2: keyboard shortcuts reference overlay (`?`) */}
       {shortcutsOpen && <ShortcutsOverlay onClose={closeShortcuts} />}
