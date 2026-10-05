@@ -125,7 +125,22 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // ttsReadAudio: (filePath) → { bytes: ArrayBuffer } — reads an MP3 the
   //   main process wrote into its temp dir (path guarded against escapes,
   //   ≤200 MB) so the renderer can build a playback Blob.
-  ttsReadAudio: (filePath) => ipcRenderer.invoke("tts:read-audio", { filePath }),
+  // v1.33.1 SHAPE FIX: callers pass BOTH forms — the renderer's typed
+  // contract is ttsReadAudio({ filePath }) (src/lib/merger/types.ts +
+  // speech-api.ts) while this wrapper historically took a bare string.
+  // The double-wrap ({ filePath: { filePath } }) made the main process's
+  // strict string check see "" and every desktop TTS-Studio Generate died
+  // with "No audio file path given". Normalize BOTH shapes here so the
+  // payload that crosses the IPC boundary is always { filePath: string }.
+  ttsReadAudio: (p) => {
+    const filePath =
+      typeof p === "string"
+        ? p
+        : p && typeof p === "object" && typeof p.filePath === "string"
+          ? p.filePath
+          : "";
+    return ipcRenderer.invoke("tts:read-audio", { filePath });
+  },
   onTtsProgress: (callback) => {
     const handler = (_event, data) => callback(data);
     ipcRenderer.on("tts:progress", handler);

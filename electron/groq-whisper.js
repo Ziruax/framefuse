@@ -405,7 +405,8 @@ function transportFailoverWorthy(status, bodyText) {
 // ---------------------------------------------------------------------------
 
 /** Derive the v1.33 structured job code (AudioJobError shape) from a
- *  classified Groq failure. */
+ *  classified Groq failure. v1.33.1: a client-side TIMEOUT is its own
+ *  retryable code — it is NOT a connectivity verdict. */
 function groqJobCode(status, bodyText, genuine) {
   if (!status) return "GROQ_CONNECTION";
   if (status === 404) return genuine ? "GROQ_MODEL_NOT_FOUND" : "GROQ_INTERCEPTED_404";
@@ -421,6 +422,20 @@ function groqJobCode(status, bodyText, genuine) {
   return "GROQ_REQUEST_FAILED";
 }
 
+/** v1.33.1: is this groq-sdk error the SDK's own request timeout
+ *  (APIConnectionTimeoutError / "Request timed out.")? Distinguishing it
+ *  from a genuine network failure is the difference between "your audio
+ *  is too long for one request" and "your VPN is broken" — v1.33 blurred
+ *  them into one misleading "could not reach api.groq.com" message. */
+function isSdkTimeoutError(e) {
+  if (!e) return false;
+  const name = e.constructor && e.constructor.name;
+  if (name === "APIConnectionTimeoutError") return true;
+  if (name === "APIUserAbortError") return false;
+  return /timed? ?out/i.test(String(e.message || "")) ||
+    (e.cause ? /timed? ?out|ETIMEDOUT/i.test(String(e.cause.message || e.cause)) : false);
+}
+
 /** Map a groq-sdk error (APIError family / APIConnectionError) to the app's
  *  classified Error with status, apiMessage, the v1.32 transport-failover
  *  marker and the v1.33 structured job shape attached. */
@@ -434,8 +449,21 @@ function mapSdkError(e, apiKey, transportMode) {
       (j && typeof j.message === "string" ? j.message : "") || "";
   } catch (_) { /* non-JSON body */ }
   const genuine = isGenuineGroqErrorBody(bodyText);
+  // v1.33.1: a client-side timeout gets its own honest verdict. The old
+  // text blamed the network ("VPN/proxy/firewall or the provider is
+  // down") while the app's own request cap had killed the request —
+  // with a green key test right next to it, users concluded the app was
+  // broken. Now it names the cap, states the key is fine, and says what
+  // to do.
+  const timedOut = isSdkTimeoutError(e);
   let message;
-  if (!status) {
+  if (!status && timedOut) {
+    message =
+      "The Groq transcription request timed out (the app's 15-minute cap) — " +
+      "the key and network are fine (the test probe passes); this audio is " +
+      "too long or the upload too slow for one request. Retry, use a shorter " +
+      "audio file, or check the connection speed";
+  } else if (!status) {
     message = `Could not reach api.groq.com: ${e && e.message ? e.message : e}` +
       " — a network-level failure (VPN/proxy/firewall or the provider is down)";
   } else {
@@ -445,6 +473,7 @@ function mapSdkError(e, apiKey, transportMode) {
   err.status = status;
   err.apiMessage = apiMessage;
   err.cause = e;
+  err.timedOut = timedOut;
   // v1.32 TRANSPORT FAILOVER at the SDK layer: an interceptor-shaped
   // response (401/403/404 with NO genuine Groq envelope) on the
   // OS-proxy-honoring transport retries once through direct Node https.
@@ -458,9 +487,9 @@ function mapSdkError(e, apiKey, transportMode) {
   }
   err.job = {
     service: "groq",
-    code: groqJobCode(status, bodyText, genuine),
+    code: !status && timedOut ? "GROQ_TIMEOUT" : groqJobCode(status, bodyText, genuine),
     message,
-    retryable: status === 429 || status >= 500 || !status,
+    retryable: timedOut || status === 429 || status >= 500 || !status,
   };
   return err;
 }
@@ -602,8 +631,19 @@ async function groqTranscribeOnceRaw(o, modelId, wantWordTimestamps, language, t
   }
 
   const fileBytes = fs.statSync(filePath).size;
+  // v1.33.1 THE TRANSCRIPTION-TIMEOUT FIX: this client is TRANSIENT (never
+  // cached — the upload-progress sink closes over THIS run) and carries a
+  // 15-minute request cap. The v1.33 cache handed back groqTestKey's
+  // 15-second probe client here, so every real transcription after a
+  // successful key test aborted mid-request (APIConnectionTimeoutError has
+  // NO status → "Could not reach api.groq.com") while the key test stayed
+  // green. 900 s covers the ladder-compressed whole-file upload (hours of
+  // 16 kbps mono audio ≈ tens of MB) plus whisper-large-v3-turbo's
+  // processing time on top; the run stays user-cancellable the whole way.
+  const GROQ_TRANSCRIBE_TIMEOUT_MS = 900000;
   const { client } = sdkClient(apiKey, transportMode, {
-    timeoutMs: 120000,
+    timeoutMs: GROQ_TRANSCRIBE_TIMEOUT_MS,
+    transient: true,
     onUploadProgress: ({ uploaded, total }) => {
       if (!onProgress) return;
       const t = Math.max(total || fileBytes, 1);
@@ -628,7 +668,9 @@ async function groqTranscribeOnceRaw(o, modelId, wantWordTimestamps, language, t
         ...(language ? { language } : {}),
         temperature: 0,
       },
-      { signal: abortCtl.signal },
+      // v1.33.1: the per-request timeout is explicit so the 15-minute cap
+      // survives even if a future refactor swaps in a cached client.
+      { timeout: GROQ_TRANSCRIBE_TIMEOUT_MS, signal: abortCtl.signal },
     );
     onProgress?.({ progress: 65, status: `Groq ${modelId} is transcribing…` });
 
@@ -862,6 +904,7 @@ module.exports = {
   groqTranscribeProbe,
   groqJobCode,
   mapSdkError,
+  isSdkTimeoutError,
   validateAudioFile,
   safeJsonStringify,
 };

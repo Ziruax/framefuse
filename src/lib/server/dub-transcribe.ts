@@ -15,7 +15,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import { zaiAsrFile, zaiChatText } from "./zai";
-import { groqClient, sdkErrorFacts, validateAudioFileServer } from "./groq-sdk-client";
+import { groqClient, isSdkTimeoutError, sdkErrorFacts, validateAudioFileServer } from "./groq-sdk-client";
 
 const execFileAsync = promisify(execFile);
 
@@ -280,6 +280,13 @@ interface GroqVerboseJson {
   words?: GroqWord[];
 }
 
+/** v1.33.1: per-request timeout for real transcriptions. The route chunks
+ *  audio into ≤10-minute WAVs (~19 MB); the SDK's fetchWithTimeout covers
+ *  upload + inference, so a slow uplink needs headroom far beyond the
+ *  client default. groq-sdk merges this as `options.timeout ?? this.timeout`
+ *  — per-request beats any cached client timeout. */
+const GROQ_REQUEST_TIMEOUT_MS = 600_000;
+
 /** One Groq Whisper call → verbose JSON (segments + word timestamps).
  *  v1.31: THREE 401/403 families (research-verified — see the notes in
  *  electron/groq-whisper.js classifyGroqError): non-JSON = intercepted
@@ -306,16 +313,25 @@ async function groqWhisper(
   }
   const client = groqClient(groqKey);
   let res: { ok: boolean; status: number; body: string };
+  let rawErr: unknown = null;
+  let timedOut = false;
   try {
-    const json = await client.audio.transcriptions.create({
-      file: fs.createReadStream(wavPath),
-      model,
-      response_format: "verbose_json",
-      timestamp_granularities: ["word", "segment"],
-      ...(language && language !== "auto" ? { language } : {}),
-    });
+    const json = await client.audio.transcriptions.create(
+      {
+        file: fs.createReadStream(wavPath),
+        model,
+        response_format: "verbose_json",
+        timestamp_granularities: ["word", "segment"],
+        ...(language && language !== "auto" ? { language } : {}),
+      },
+      // v1.33.1: an explicit per-request timeout — a cached short-timeout
+      // client (the key-test's) can never cap this transcription again.
+      { timeout: GROQ_REQUEST_TIMEOUT_MS },
+    );
     return json as GroqVerboseJson;
   } catch (e) {
+    rawErr = e;
+    timedOut = isSdkTimeoutError(e);
     const f = sdkErrorFacts(e);
     res = { ok: false, status: f.status, body: f.bodyText };
   }
@@ -331,10 +347,27 @@ async function groqWhisper(
       isJson = true;
     } catch { /* non-JSON body */ }
     if (!res.status) {
-      throw new TranscribeFailure(
-        `Could not reach api.groq.com — a network-level failure (VPN/proxy/firewall or the provider is down)`,
-        502,
-      );
+      // v1.33.1: an SDK request timeout is NOT a connectivity verdict —
+      // say so honestly (the key test passing while this fails was the
+      // exact "what the hell is going on" report), and always carry the
+      // underlying error message for diagnosis.
+      const raw = rawErr instanceof Error ? rawErr.message : rawErr ? String(rawErr) : "unknown error";
+      const t = timedOut
+        ? new TranscribeFailure(
+            `The Groq transcription request timed out (the 10-minute per-request cap) — the key and network are fine (the test probe passes); this chunk's upload or transcription was too slow. Retry, or use a shorter audio file [SDK: ${raw}]`,
+            504,
+          )
+        : new TranscribeFailure(
+            `Could not reach api.groq.com: ${raw} — a network-level failure (VPN/proxy/firewall or the provider is down)`,
+            502,
+          );
+      t.job = {
+        service: "groq",
+        code: timedOut ? "GROQ_TIMEOUT" : "GROQ_CONNECTION",
+        message: t.message,
+        retryable: true,
+      };
+      throw t;
     }
     const raw = api ? ` [${api}]` : "";
     const masked =

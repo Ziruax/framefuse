@@ -35,20 +35,42 @@ export interface SdkErrorFacts {
   isJson: boolean;
 }
 
-/** One shared client per key (dev-server routes are single-process). */
+/** One shared client per (key, timeout) (dev-server routes are
+ *  single-process). v1.33.1: the timeout is part of the cache key — the
+ *  v1.33 (key)-only cache handed the key-test's 120 s client to callers
+ *  that asked for a LONGER transcription budget, and the groq-sdk merges
+ *  per-request timeouts as `options.timeout ?? this.timeout`, so a cached
+ *  short client silently capped every real transcription. */
 const clientCache = new Map<string, Groq>();
 
 export function groqClient(apiKey: string, timeoutMs = 120_000): Groq {
   const key = apiKey.trim();
-  const cached = clientCache.get(key);
+  const cacheKey = `${key}|${timeoutMs}`;
+  const cached = clientCache.get(cacheKey);
   if (cached) return cached;
   const client = new Groq({
     apiKey: key,
     timeout: timeoutMs,
     maxRetries: 0, // route handlers own retry/classification policy
   });
-  clientCache.set(key, client);
+  clientCache.set(cacheKey, client);
   return client;
+}
+
+/** v1.33.1: true when the groq-sdk error is the SDK's own request timeout
+ *  (APIConnectionTimeoutError / "Request timed out.") — NOT a connectivity
+ *  verdict. Blaming the network for the app's own request cap is exactly
+ *  the "test green, captions fail" confusion this release fixes. */
+export function isSdkTimeoutError(e: unknown): boolean {
+  if (!e || typeof e !== "object") return false;
+  const err = e as { constructor?: { name?: string }; message?: string; cause?: { message?: string } | Error };
+  const name = err.constructor?.name;
+  if (name === "APIConnectionTimeoutError") return true;
+  if (name === "APIUserAbortError") return false;
+  if (err.message && /timed? ?out/i.test(err.message)) return true;
+  const causeMsg =
+    err.cause instanceof Error ? err.cause.message : typeof err.cause?.message === "string" ? err.cause.message : "";
+  return !!causeMsg && /timed? ?out|ETIMEDOUT/i.test(causeMsg);
 }
 
 /** Request key → saved key → GROQ_API_KEY env (never NEXT_PUBLIC_). */

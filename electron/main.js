@@ -1563,7 +1563,14 @@ ipcMain.handle("tts:cancel-long", async (_event, payload) => {
  *  traversal, symlinks resolved elsewhere) is refused. Capped at 200 MB. */
 ipcMain.handle("tts:read-audio", async (_event, payload) => {
   const p = payload || {};
-  const requested = typeof p.filePath === "string" ? p.filePath.trim() : "";
+  // v1.33.1: tolerate a double-wrapped { filePath: { filePath } } payload
+  // (a stale caller shape) — normalize BEFORE the strict string check so
+  // a shape mismatch can never surface as "No audio file path given".
+  let requested = typeof p.filePath === "string" ? p.filePath.trim() : "";
+  if (!requested && p.filePath && typeof p.filePath === "object" &&
+      typeof p.filePath.filePath === "string") {
+    requested = p.filePath.filePath.trim();
+  }
   if (!requested) throw new Error("No audio file path given");
   const dir = path.resolve(ensureTempDir()) + path.sep;
   const resolved = path.resolve(requested);

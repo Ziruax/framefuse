@@ -183,10 +183,25 @@ function makeGroqFetch(transportMode, opts) {
 }
 
 /**
- * Per-API-key SDK client cache — one client per (key, transport) pair.
- * The SDK client is stateless besides its options; caching avoids
+ * Per-API-key SDK client cache — one client per (key, transport, timeout)
+ * triple. The SDK client is stateless besides its options; caching avoids
  * rebuilding the adapter per call. mode "auto" → electron-net fetch,
  * "node" → direct Node https fetch (failover path).
+ *
+ * v1.33.1 CACHE-POISONING FIX (the "test passes, transcription fails"
+ * root cause): the key used to be (key, mode) ONLY, so the FIRST client
+ * created for a key — groqTestKey's 15-second probe client — was handed
+ * back to every later call that asked for a LONGER timeout or its own
+ * upload-progress sink. Real transcriptions then ran with the probe's
+ * 15s cap and no progress: any audio longer than a few seconds aborted
+ * (APIConnectionTimeoutError, no status) and surfaced as "Could not reach
+ * api.groq.com — a network-level failure", while the key test stayed
+ * green. Two hard rules now:
+ *   1. timeoutMs is part of the cache key — a caller asking for a
+ *      different timeout can never be handed a client with a shorter one.
+ *   2. opts.transient bypasses the cache entirely — per-call state (the
+ *      upload-progress sink closes over THIS run) must never leak into
+ *      another run, so transcription clients are always built fresh.
  */
 const clientCache = new Map();
 
@@ -208,18 +223,24 @@ function loadGroqSdk() {
 /** @returns {import("groq-sdk").default} */
 function sdkClient(apiKey, transportMode, opts) {
   const mode = transportMode === "node" ? "node" : "auto";
-  const cacheKey = `${apiKey}|${mode}`;
-  let entry = clientCache.get(cacheKey);
-  if (entry) return entry;
+  const timeoutMs = (opts && opts.timeoutMs) || 120000;
+  const transient = !!(opts && opts.transient);
+  if (!transient) {
+    const cacheKey = `${apiKey}|${mode}|${timeoutMs}`;
+    const cached = clientCache.get(cacheKey);
+    if (cached) return cached;
+  }
   const Groq = loadGroqSdk();
   const client = new Groq({
     apiKey,
     maxRetries: 0, // the app owns retry policy (classification-aware)
-    timeout: (opts && opts.timeoutMs) || 120000,
+    timeout: timeoutMs,
     fetch: makeGroqFetch(mode, opts),
   });
-  entry = { client };
-  clientCache.set(cacheKey, entry);
+  const entry = { client, timeoutMs };
+  if (!transient) {
+    clientCache.set(`${apiKey}|${mode}|${timeoutMs}`, entry);
+  }
   return entry;
 }
 
