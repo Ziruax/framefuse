@@ -1,44 +1,52 @@
 "use client";
 
 // ---------------------------------------------------------------------------
-// v1.27 CENTRAL AI SETTINGS — one store, every AI surface.
+// v1.27/v1.28 CENTRAL AI SETTINGS — one store, every AI surface.
 //
 // The Dub Studio's script writing, the Captions transcription and the voice
-// model catalogs all read their PROVIDER + MODEL from here. Before v1.27 the
-// provider/model pickers were scattered (Dub Studio stage 2, the Captions
-// engine card, the Script Writer); they now live ONLY in the Settings tab —
-// the other surfaces show a read-only summary + a jump link.
+// model catalogs all read their PROVIDER + MODEL from here. The pickers live
+// ONLY in the Settings tab — the other surfaces show a read-only summary +
+// a jump link.
 //
-// Keys: in the WEB PREVIEW the Groq/Gemini keys live in localStorage
-// (framefuse.aikeys.v1) and ride EACH request to the API routes (the server
-// never persists them). In the desktop app the main-process key files remain
-// authoritative — this store's key fields are then best-effort mirrors.
+// v1.28: the "builtin" (sandbox z-ai) provider is GONE — it only worked on
+// the dev box, never on user devices. Real providers: Groq + Gemini. Keys:
+// in the WEB PREVIEW they live in localStorage (framefuse.ai.v1) and ride
+// each request to the API routes; in the DESKTOP app they are stored by the
+// MAIN process (userData/groq.json + gemini.json, 0600) via the
+// whisperGroqSet/geminiSet IPC — the store's key fields are then
+// best-effort mirrors, and the *OnDevice flags track the main-process truth.
 //
-// Model catalogs: the GLM ids the built-in cloud accepts, the Groq chat ids,
-// the Gemini text ids and the Groq Whisper ids. The server routes accept the
-// same ids (src/lib/server/ai-models.ts keeps a mirrored copy — keep in sync).
+// Model catalogs: the Groq chat ids, the Gemini text ids and the Groq
+// Whisper ids. The server routes accept the same ids
+// (src/lib/server/ai-models.ts keeps a mirrored copy — keep in sync).
 // ---------------------------------------------------------------------------
 
 /** Text-LLM providers for script writing. */
-export type AiTextProvider = "builtin" | "groq" | "gemini";
-/** Transcription providers (captions + Dub Studio stage 1). */
-export type AiSttProvider = "builtin" | "groq";
+export type AiTextProvider = "groq" | "gemini";
+/** Transcription providers (captions + Dub Studio stage 1) — Groq Whisper. */
+export type AiSttProvider = "groq";
 
 export interface AiSettings {
-  /** v1.27: transcription provider — "builtin" (cloud ASR, no key) or
-   *  "groq" (Groq Whisper, real word timestamps, needs the Groq key). */
+  /** Transcription provider — "groq" (Whisper, real word timestamps,
+   *  needs the Groq key). v1.28: the only provider (builtin removed). */
   sttProvider: AiSttProvider;
   /** Groq Whisper model id. */
   sttGroqModel: string;
-  /** v1.27: the dub's SCRIPT WRITING provider (speaker detection +
-   *  translation). "builtin" = the keyless cloud model. */
+  /** The dub's SCRIPT WRITING provider (speaker detection + translation). */
   dubTextProvider: AiTextProvider;
   dubGroqModel: string;
   dubGeminiModel: string;
-  dubBuiltinModel: string;
-  /** API keys (web preview — localStorage only, sent per-request). */
+  /** API keys (web preview — localStorage only, sent per-request). In the
+   *  desktop app the raw key lives ONLY in the main-process key files; the
+   *  *OnDevice flags below mirror their presence for the read-only
+   *  summaries. */
   groqKey: string;
   geminiKey: string;
+  /** v1.28 desktop mirrors: the main process has a key saved on this device
+   *  (userData/groq.json / gemini.json). Set by the Settings tab from the
+   *  whisperGroqGet/geminiGet IPC payloads; always false in the web preview. */
+  groqKeyOnDevice?: boolean;
+  geminiKeyOnDevice?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -50,15 +58,6 @@ export interface AiModelOption {
   label: string;
   hint: string;
 }
-
-/** Built-in cloud text models (the z-ai backend). */
-export const BUILTIN_TEXT_MODELS: AiModelOption[] = [
-  { id: "glm-4.6", label: "GLM 4.6", hint: "Most capable — best translation quality" },
-  { id: "glm-4.5-air", label: "GLM 4.5 Air", hint: "Lighter + fast, solid translations" },
-  { id: "glm-4.5", label: "GLM 4.5", hint: "Balanced flagship" },
-  { id: "glm-4-plus", label: "GLM 4 Plus", hint: "Steady all-rounder" },
-  { id: "glm-4-flash", label: "GLM 4 Flash", hint: "Fastest, short scripts" },
-];
 
 /** Groq chat models (script writing — free tier friendly). */
 export const GROQ_TEXT_MODELS: AiModelOption[] = [
@@ -85,7 +84,6 @@ export const GROQ_WHISPER_MODELS: AiModelOption[] = [
   { id: "whisper-large-v3", label: "Whisper Large v3", hint: "Maximum accuracy" },
 ];
 
-export const DUB_BUILTIN_DEFAULT = "glm-4.6";
 export const DUB_GROQ_DEFAULT = "llama-3.3-70b-versatile";
 export const DUB_GEMINI_DEFAULT = "gemini-3.5-flash-lite";
 export const STT_GROQ_DEFAULT = "whisper-large-v3-turbo";
@@ -95,33 +93,30 @@ export const STT_GROQ_DEFAULT = "whisper-large-v3-turbo";
 // ---------------------------------------------------------------------------
 
 export const DEFAULT_AI_SETTINGS: AiSettings = {
-  sttProvider: "builtin",
+  sttProvider: "groq",
   sttGroqModel: STT_GROQ_DEFAULT,
-  dubTextProvider: "builtin",
+  dubTextProvider: "groq",
   dubGroqModel: DUB_GROQ_DEFAULT,
   dubGeminiModel: DUB_GEMINI_DEFAULT,
-  dubBuiltinModel: DUB_BUILTIN_DEFAULT,
   groqKey: "",
   geminiKey: "",
+  groqKeyOnDevice: false,
+  geminiKeyOnDevice: false,
 };
 
 const STORAGE_KEY = "framefuse.ai.v1";
 
 function isTextProvider(v: unknown): v is AiTextProvider {
-  return v === "builtin" || v === "groq" || v === "gemini";
-}
-function isSttProvider(v: unknown): v is AiSttProvider {
-  return v === "builtin" || v === "groq";
-}
-function str(v: unknown, fallback: string): string {
-  return typeof v === "string" && v.trim() ? v.trim() : fallback;
+  return v === "groq" || v === "gemini";
 }
 function pickModel(v: unknown, catalog: AiModelOption[], fallback: string): string {
   if (typeof v === "string" && catalog.some((m) => m.id === v)) return v;
   return fallback;
 }
 
-/** Load + sanitize (unknown/garbage fields fall back to defaults). */
+/** Load + sanitize (unknown/garbage fields fall back to defaults).
+ * v1.28 migration: a stored "builtin" provider (the removed sandbox-only
+ * engine) reads as "groq" — old installs keep working with one provider. */
 export function loadAiSettings(): AiSettings {
   if (typeof window === "undefined") return { ...DEFAULT_AI_SETTINGS };
   try {
@@ -129,14 +124,15 @@ export function loadAiSettings(): AiSettings {
     if (!raw) return { ...DEFAULT_AI_SETTINGS };
     const j = JSON.parse(raw) as Record<string, unknown>;
     return {
-      sttProvider: isSttProvider(j.sttProvider) ? j.sttProvider : "builtin",
+      sttProvider: "groq",
       sttGroqModel: pickModel(j.sttGroqModel, GROQ_WHISPER_MODELS, STT_GROQ_DEFAULT),
-      dubTextProvider: isTextProvider(j.dubTextProvider) ? j.dubTextProvider : "builtin",
+      dubTextProvider: isTextProvider(j.dubTextProvider) ? j.dubTextProvider : "groq",
       dubGroqModel: pickModel(j.dubGroqModel, GROQ_TEXT_MODELS, DUB_GROQ_DEFAULT),
       dubGeminiModel: pickModel(j.dubGeminiModel, GEMINI_TEXT_MODELS, DUB_GEMINI_DEFAULT),
-      dubBuiltinModel: pickModel(j.dubBuiltinModel, BUILTIN_TEXT_MODELS, DUB_BUILTIN_DEFAULT),
       groqKey: typeof j.groqKey === "string" ? j.groqKey : "",
       geminiKey: typeof j.geminiKey === "string" ? j.geminiKey : "",
+      groqKeyOnDevice: j.groqKeyOnDevice === true,
+      geminiKeyOnDevice: j.geminiKeyOnDevice === true,
     };
   } catch {
     return { ...DEFAULT_AI_SETTINGS };
@@ -210,8 +206,8 @@ export function providerLabel(p: AiTextProvider | AiSttProvider): string {
       return "Groq";
     case "gemini":
       return "Gemini";
-    case "builtin":
-      return "Built-in Cloud AI";
+    default:
+      return "Groq";
   }
 }
 
@@ -221,26 +217,24 @@ export function modelLabel(catalog: AiModelOption[], id: string): string {
 
 /** The provider+model the DUB script writing currently uses. */
 export function dubTextConfig(s: AiSettings): { provider: string; modelId: string; modelLabel: string } {
-  const provider = providerLabel(s.dubTextProvider);
-  if (s.dubTextProvider === "groq")
-    return { provider, modelId: s.dubGroqModel, modelLabel: modelLabel(GROQ_TEXT_MODELS, s.dubGroqModel) };
   if (s.dubTextProvider === "gemini")
-    return { provider, modelId: s.dubGeminiModel, modelLabel: modelLabel(GEMINI_TEXT_MODELS, s.dubGeminiModel) };
-  return { provider, modelId: s.dubBuiltinModel, modelLabel: modelLabel(BUILTIN_TEXT_MODELS, s.dubBuiltinModel) };
+    return { provider: "Gemini", modelId: s.dubGeminiModel, modelLabel: modelLabel(GEMINI_TEXT_MODELS, s.dubGeminiModel) };
+  return { provider: "Groq", modelId: s.dubGroqModel, modelLabel: modelLabel(GROQ_TEXT_MODELS, s.dubGroqModel) };
 }
 
 /** The provider+model CAPTION transcription currently uses. */
 export function sttConfig(s: AiSettings): { provider: string; modelId: string; modelLabel: string } {
-  const provider = providerLabel(s.sttProvider);
-  if (s.sttProvider === "groq")
-    return { provider, modelId: s.sttGroqModel, modelLabel: modelLabel(GROQ_WHISPER_MODELS, s.sttGroqModel) };
-  return { provider, modelId: "", modelLabel: "Cloud ASR" };
+  return {
+    provider: "Groq Whisper",
+    modelId: s.sttGroqModel,
+    modelLabel: modelLabel(GROQ_WHISPER_MODELS, s.sttGroqModel),
+  };
 }
 
-/** A Groq key is configured (web localStorage or Electron main-process). */
+/** A Groq key is configured (web localStorage or the Electron main process). */
 export function hasGroqKey(s: AiSettings): boolean {
-  return s.groqKey.trim().length > 0;
+  return s.groqKey.trim().length > 0 || s.groqKeyOnDevice === true;
 }
 export function hasGeminiKey(s: AiSettings): boolean {
-  return s.geminiKey.trim().length > 0;
+  return s.geminiKey.trim().length > 0 || s.geminiKeyOnDevice === true;
 }

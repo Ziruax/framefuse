@@ -581,16 +581,17 @@ interface TranscribeResponse extends ApiEnvelope {
 }
 
 /** Stage 1 — audio → word-level transcript. Electron keeps the Groq Whisper
- *  IPC path; the web route runs ffmpeg extraction + ASR server-side
- *  (v1.27: "groq" → Groq Whisper with REAL word timestamps, "builtin" →
- *  cloud ASR — the provider/model/key come from the Settings tab). */
+ *  IPC path (key + model live in the main-process config); the web route
+ *  runs ffmpeg extraction + ASR server-side ("groq" → Groq Whisper with
+ *  REAL word timestamps when a key is set — otherwise the sandbox cloud
+ *  fallback). */
 export async function dubTranscribe(p: {
   /** Electron sources (absolute paths). */
   segments?: Array<{ videoPath: string; startMs: number; endMs?: number }>;
   /** Web sources (browser File objects). */
   webSources?: WebDubSource[];
   sourceLanguage?: string;
-  /** v1.27: transcription engine + credentials. */
+  /** Transcription engine + credentials (web transport). */
   provider?: "builtin" | "groq";
   groqKey?: string;
   groqModel?: string;
@@ -658,16 +659,17 @@ interface ScriptResponse extends ApiEnvelope {
 }
 
 /** Stage 2 — transcript → speaker detection + translation → script.
- *  Electron: Groq/Gemini via IPC. Web: the SELECTED provider (v1.27 —
- *  built-in cloud / Groq / Gemini, from the Settings tab) via /api/dub/script. */
+ *  Electron: Groq/Gemini via IPC (the provider+model from the Settings
+ *  tab ride the payload; keys live in the main-process key files). Web:
+ *  the selected provider via /api/dub/script (keys ride the request). */
 export async function dubScript(p: {
   utterances: DubTranscriptResult["utterances"];
   sourceLanguage?: string;
   targetLanguage: string;
   targetLocale?: string;
   voiceMode?: "single" | "multi";
-  /** v1.27: script-writing provider + model + keys (Settings tab). */
-  provider?: "builtin" | "groq" | "gemini";
+  /** Script-writing provider + model (Settings tab). */
+  provider?: "groq" | "gemini";
   model?: string;
   groqKey?: string;
   geminiKey?: string;
@@ -681,6 +683,12 @@ export async function dubScript(p: {
       targetLanguage: p.targetLanguage,
       targetLocale: p.targetLocale ?? "",
       voiceMode: p.voiceMode,
+      // v1.28: the Settings tab's provider + model ride the IPC payload —
+      // before this they were dropped and the desktop always used its own
+      // defaults. Keys are read from the main-process key files.
+      textProvider: p.provider === "gemini" ? "gemini" : "groq",
+      ...(p.provider !== "gemini" && p.model ? { groqModel: p.model } : {}),
+      ...(p.provider === "gemini" && p.model ? { geminiModel: p.model } : {}),
     });
   }
   const r = await postJson<ScriptResponse>(
@@ -693,7 +701,7 @@ export async function dubScript(p: {
       })),
       sourceLanguage: p.sourceLanguage,
       targetLanguage: p.targetLanguage,
-      provider: p.provider ?? "builtin",
+      provider: p.provider ?? "groq",
       ...(p.model ? { model: p.model } : {}),
       ...(p.groqKey ? { groqKey: p.groqKey } : {}),
       ...(p.geminiKey ? { geminiKey: p.geminiKey } : {}),

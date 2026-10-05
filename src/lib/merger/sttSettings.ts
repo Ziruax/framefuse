@@ -10,7 +10,14 @@
  * v1.20: Groq Cloud is the ONLY transcription engine — the "local" engine
  * option no longer exists (stored "local" preferences migrate to "groq"
  * on read).
+ *
+ * v1.28: the model preference moved to the central AI settings
+ * (src/lib/merger/ai-settings.ts — the Settings tab); sttRouting() reads
+ * it from there. This module remains for the saved-key diagnostics and
+ * legacy migration only.
  */
+
+import { loadAiSettings } from "./ai-settings";
 
 export type SttEngine = "groq";
 
@@ -89,8 +96,10 @@ export function saveSttSettings(s: SttSettings): void {
  * The routing object whisper.ts forwards to the main process on every
  * transcription call. v1.20: the engine is always "groq" — a missing key
  * produces a clear actionable error main-side (no local fallback exists).
+ * v1.28: the model comes from the CENTRAL AI settings (the Settings tab's
+ * "Caption transcription" picker) — this legacy store is no longer a second
+ * source of truth.
  */
 export function sttRouting(): { engine: "groq"; groqModel: string } {
-  const s = loadSttSettings();
-  return { engine: s.engine, groqModel: s.groqModel };
+  return { engine: "groq", groqModel: loadAiSettings().sttGroqModel || DEFAULT_STT_SETTINGS.groqModel };
 }

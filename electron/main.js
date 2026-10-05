@@ -955,7 +955,7 @@ ipcMain.handle("whisper:transcribe", async (event, payload) => {
     const groqCfg = GQ.loadGroqConfig(app.getPath("userData"));
     if (!groqCfg.apiKey) {
       throw new Error(
-        "No Groq API key saved. Open Settings → Captions → Transcription and paste your free Groq API key (console.groq.com).",
+        "No Groq API key saved. Open Settings → Default AI models and paste your free Groq API key (console.groq.com).",
       );
     }
     const groqModel = GQ.normalizeGroqModel(
@@ -1225,7 +1225,7 @@ ipcMain.handle("script:generate", async (_event, payload) => {
         return {
           ok: false,
           error:
-            "No Groq API key saved — open Settings → Captions, paste your key from console.groq.com (free), then pick the Groq model here again.",
+            "No Groq API key saved — open Settings → Default AI models, paste your free key from console.groq.com, then retry.",
         };
       }
       const res = await GC.groqChat({
@@ -1561,7 +1561,7 @@ ipcMain.handle("dub:start", async (event, payload) => {
   const groqCfg = GQ.loadGroqConfig(app.getPath("userData"));
   if (!scriptLines && !groqCfg.apiKey) {
     throw new Error(
-      "No Groq API key saved — open Settings → Captions, paste your key from console.groq.com (free), or add it before dubbing.",
+      "No Groq API key saved — open Settings → Default AI models and paste your free key from console.groq.com.",
     );
   }
   // v1.22: the Gemini text provider (speaker detection + translation).
@@ -1572,7 +1572,7 @@ ipcMain.handle("dub:start", async (event, payload) => {
     textProvider === "gemini" ? GM.loadGeminiConfig(app.getPath("userData")).apiKey : "";
   if (!scriptLines && textProvider === "gemini" && !geminiApiKey) {
     throw new Error(
-      "No Gemini API key saved — open Settings → Script Writer and paste your Gemini key (aistudio.google.com/apikey), or switch the dubbing AI model back to Groq.",
+      "No Gemini API key saved — open Settings → Default AI models and paste your key from aistudio.google.com/apikey, or switch the script provider to Groq.",
     );
   }
   const segs = (Array.isArray(p.segments) ? p.segments : [])
@@ -1690,7 +1690,7 @@ ipcMain.handle("dub:transcribe", async (event, payload) => {
   const groqCfg = GQ.loadGroqConfig(app.getPath("userData"));
   if (!groqCfg.apiKey) {
     throw new Error(
-      "No Groq API key saved — open Settings → Captions, paste your key from console.groq.com (free), or add it before dubbing.",
+      "No Groq API key saved — open Settings → Default AI models and paste your free key from console.groq.com.",
     );
   }
   const segs = (Array.isArray(p.segments) ? p.segments : [])
@@ -1745,14 +1745,14 @@ ipcMain.handle("dub:script", async (event, payload) => {
     const geminiApiKey = GM.loadGeminiConfig(app.getPath("userData")).apiKey;
     if (!geminiApiKey) {
       throw new Error(
-        "No Gemini API key saved — open Settings → Script Writer and paste your Gemini key (aistudio.google.com/apikey), or switch to a Groq model.",
+        "No Gemini API key saved — open Settings → Default AI models and paste your key from aistudio.google.com/apikey, or switch the script provider to Groq.",
       );
     }
   } else {
     apiKey = GQ.loadGroqConfig(app.getPath("userData")).apiKey;
     if (!apiKey) {
       throw new Error(
-        "No Groq API key saved — open Settings → Captions, paste your key from console.groq.com (free), or add it before dubbing.",
+        "No Groq API key saved — open Settings → Default AI models and paste your free key from console.groq.com.",
       );
     }
   }

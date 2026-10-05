@@ -31,7 +31,6 @@ import {
   ChevronRight,
   Copy,
   Download,
-  Cloud,
   KeyRound,
   ExternalLink,
   Eraser,
@@ -3401,7 +3400,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
             aria-label={`${sttSummary.provider} transcription engine`}
             title={`${sttSummary.provider}${sttSummary.modelId ? ` · ${sttSummary.modelLabel}` : ""} — configured in Settings → Default AI models`}
           >
-            {sttSummary.provider === "Groq" ? <Mic size={12} /> : <Cloud size={12} />}
+            <Mic size={12} />
             {sttSummary.provider}
             {sttSummary.modelId && (
               <span className="text-[10px] font-normal text-orange-300/70">
@@ -3410,9 +3409,7 @@ function CaptionsSection(props: CaptionsSectionProps) {
             )}
           </div>
           <p className="mt-1.5 text-[9px] leading-relaxed text-stone-400">
-            {sttSummary.provider === "Groq"
-              ? "Groq Whisper with REAL per-word timestamps — the free key lives in Settings → Default AI models."
-              : "The keyless built-in cloud ASR — word timings are estimated inside each speech window."}
+            {"Groq Whisper with REAL per-word timestamps — the free key lives in Settings → Default AI models."}
           </p>
         </div>
         <div className="mb-2 flex gap-2">
@@ -5427,9 +5424,7 @@ function DubSection(props: DubSectionProps) {
         <div className="mb-2 rounded border p-2" style={{ borderColor: "#332e28", backgroundColor: "#26221e" }}>
           <p className="mb-1.5 text-[10px] leading-relaxed text-stone-400">
             <span className="font-semibold text-stone-300">1 · Audio → transcript (word level).</span>{" "}
-            {sttProvider.provider === "Groq"
-              ? `Extracts the timeline's audio and transcribes it with Groq Whisper (${sttProvider.modelLabel}) — REAL per-word timestamps, the best input for word-to-word dub timing.`
-              : "Extracts the timeline's audio and transcribes it with the built-in cloud ASR — every line keeps its per-word timings."}
+            {`Extracts the timeline's audio and transcribes it with Groq Whisper (${sttProvider.modelLabel}) — REAL per-word timestamps, the best input for word-to-word dub timing. The free key lives in Settings → Default AI models.`}
           </p>
 
           {transcribeBusy ? (

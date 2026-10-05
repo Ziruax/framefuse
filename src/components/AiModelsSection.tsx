@@ -1,18 +1,24 @@
 "use client";
 
-// src/components/AiModelsSection.tsx — v1.27 SETTINGS TAB.
+// src/components/AiModelsSection.tsx — v1.28 SETTINGS TAB.
 //
 // The ONE place provider/model defaults are configured:
-//   • API keys (Groq + Gemini — localStorage, ride each API request)
+//   • API keys (Groq + Gemini)
 //   • Caption transcription (Captions → AI Captions + Dub Studio stage 1)
 //   • Dubbing script writing (Dub Studio stage 2)
 //
-// The Dub Studio / Captions cards used to embed their own model pickers —
-// they now show read-only summaries that link here (onOpenSettings).
+// v1.28: the sandbox-only "Built-in Cloud" provider is REMOVED — Groq and
+// Gemini are the real providers. Key handling is DUAL-TRANSPORT:
+//   • DESKTOP (electronAPI): keys are stored by the MAIN process
+//     (userData/groq.json + gemini.json, 0600) via whisperGroqSet/geminiSet
+//     IPC; the bridge never returns the raw key (masked payloads only);
+//     Test runs the main-process key check (no CORS, real network).
+//   • WEB PREVIEW: keys stay in localStorage and ride each API request;
+//     Test goes through POST /api/ai/test (server-side fetch).
 // Visual tokens mirror the SettingsPanel cards (#332e28 borders, #26221e /
 // #211e1a fills, stone text) so the tab looks native.
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   BadgeCheck,
   Check,
@@ -22,13 +28,11 @@ import {
   Loader2,
   Mic,
   Settings2,
-  Sparkles,
   Trash2,
 } from "lucide-react";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import {
-  BUILTIN_TEXT_MODELS,
   GEMINI_TEXT_MODELS,
   GROQ_TEXT_MODELS,
   GROQ_WHISPER_MODELS,
@@ -36,8 +40,6 @@ import {
   useAiSettings,
   type AiModelOption,
   type AiSettings,
-  type AiSttProvider,
-  type AiTextProvider,
 } from "@/lib/merger/ai-settings";
 
 // ---------------------------------------------------------------------------
@@ -124,16 +126,38 @@ function ModelSelect({
 }
 
 // ---------------------------------------------------------------------------
-// Key row (masked display + save/test/remove)
+// Key row (masked display + save/test/remove) — dual transport
 // ---------------------------------------------------------------------------
+
+/** The desktop bridge (typed minimal — the full shape lives in types.ts). */
+type KeyBridge = {
+  whisperGroqGet?: () => Promise<{ hasKey: boolean; maskedKey: string; model?: string }>;
+  whisperGroqSet?: (p: { apiKey?: string; model?: string }) => Promise<{ hasKey: boolean; maskedKey: string }>;
+  whisperGroqTest?: (p: { apiKey?: string }) => Promise<{ ok: boolean; message: string }>;
+  geminiGet?: () => Promise<{ hasKey: boolean; maskedKey: string }>;
+  geminiSet?: (p: { apiKey: string }) => Promise<{ hasKey: boolean; maskedKey: string }>;
+  geminiTest?: (p: { apiKey?: string }) => Promise<{ ok: boolean; message: string }>;
+  geminiClear?: () => Promise<{ ok: boolean }>;
+};
+
+function keyBridge(): KeyBridge | null {
+  if (typeof window === "undefined") return null;
+  const api = (window as { electronAPI?: KeyBridge }).electronAPI;
+  return api ?? null;
+}
 
 function KeyRow({ provider }: { provider: "groq" | "gemini" }) {
   const ai = useAiSettings();
   const isGroq = provider === "groq";
   const savedKey = isGroq ? ai.groqKey : ai.geminiKey;
-  const [editing, setEditing] = useState(!savedKey);
+  const onDevice = isGroq ? ai.groqKeyOnDevice === true : ai.geminiKeyOnDevice === true;
+  const bridge = keyBridge();
+  const [editing, setEditing] = useState(!savedKey && !onDevice);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState<"" | "save" | "test">("");
+  /** Desktop masked key from the main process (the raw key never crosses
+   *  the bridge — this is the display form when a key file exists). */
+  const [deviceMasked, setDeviceMasked] = useState("");
 
   const persist = useCallback(
     (next: Partial<AiSettings>) => {
@@ -142,32 +166,96 @@ function KeyRow({ provider }: { provider: "groq" | "gemini" }) {
     [ai],
   );
 
-  const save = useCallback(() => {
+  // Hydrate the desktop key status (masked form + on-device flag) once.
+  useEffect(() => {
+    if (!bridge) return;
+    let alive = true;
+    (async () => {
+      try {
+        if (isGroq) {
+          const st = await bridge.whisperGroqGet?.();
+          if (!alive || !st) return;
+          setDeviceMasked(st.maskedKey || "");
+          if (st.hasKey) persist({ groqKeyOnDevice: true });
+        } else {
+          const st = await bridge.geminiGet?.();
+          if (!alive || !st) return;
+          setDeviceMasked(st.maskedKey || "");
+          if (st.hasKey) persist({ geminiKeyOnDevice: true });
+        }
+      } catch {
+        /* bridge hiccup — the row just starts in its editing state */
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [isGroq]);
+
+  const save = useCallback(async () => {
     const key = input.trim();
     if (!key) return;
-    persist(isGroq ? { groqKey: key } : { geminiKey: key });
-    setEditing(false);
-    setInput("");
-    toast.success(`${isGroq ? "Groq" : "Gemini"} key saved`, {
-      description: "It stays in this browser and rides each AI request.",
-    });
-  }, [input, isGroq, persist]);
+    setBusy("save");
+    try {
+      if (bridge) {
+        // Desktop — the MAIN process owns the key file (userData, 0600).
+        if (isGroq) {
+          await bridge.whisperGroqSet?.({ apiKey: key, model: ai.sttGroqModel });
+        } else {
+          await bridge.geminiSet?.({ apiKey: key });
+        }
+        persist(isGroq ? { groqKeyOnDevice: true } : { geminiKeyOnDevice: true });
+        setEditing(false);
+        setInput("");
+        toast.success(`${isGroq ? "Groq" : "Gemini"} key saved`, {
+          description: "Stored on this device (the app data folder) — used by transcription, script writing and dubbing.",
+        });
+      } else {
+        // Web preview — localStorage, rides each request.
+        persist(isGroq ? { groqKey: key, groqKeyOnDevice: false } : { geminiKey: key, geminiKeyOnDevice: false });
+        setEditing(false);
+        setInput("");
+        toast.success(`${isGroq ? "Groq" : "Gemini"} key saved`, {
+          description: "It stays in this browser and rides each AI request.",
+        });
+      }
+    } catch (err) {
+      toast.error("Could not save the key", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setBusy("");
+    }
+  }, [input, isGroq, persist, bridge, ai.sttGroqModel]);
 
   const test = useCallback(async () => {
-    const key = editing && input.trim() ? input.trim() : savedKey;
-    if (!key) return;
+    const candidate = editing && input.trim() ? input.trim() : savedKey;
+    if (!candidate && !bridge) return; // desktop can test the SAVED on-device key
     setBusy("test");
     try {
-      const res = await fetch("/api/ai/test", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider, key }),
-      });
-      const j = (await res.json()) as { ok?: boolean; message?: string; error?: string };
-      if (res.ok && j.ok) {
-        toast.success(`${isGroq ? "Groq" : "Gemini"} key works`, { description: j.message });
+      let ok = false;
+      let message = "";
+      if (bridge) {
+        // Desktop — the main-process check (real https, no CORS).
+        const r = isGroq
+          ? await bridge.whisperGroqTest?.(candidate ? { apiKey: candidate } : {})
+          : await bridge.geminiTest?.(candidate ? { apiKey: candidate } : {});
+        ok = !!r?.ok;
+        message = r?.message ?? "";
       } else {
-        toast.error("Key check failed", { description: j.message ?? j.error ?? `HTTP ${res.status}` });
+        const res = await fetch("/api/ai/test", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ provider, key: candidate }),
+        });
+        const j = (await res.json()) as { ok?: boolean; message?: string; error?: string };
+        ok = res.ok && !!j.ok;
+        message = j.message ?? j.error ?? `HTTP ${res.status}`;
+      }
+      if (ok) {
+        toast.success(`${isGroq ? "Groq" : "Gemini"} key works`, { description: message });
+      } else {
+        toast.error("Key check failed", { description: message });
       }
     } catch (err) {
       toast.error("Could not reach the key test", {
@@ -176,11 +264,34 @@ function KeyRow({ provider }: { provider: "groq" | "gemini" }) {
     } finally {
       setBusy("");
     }
-  }, [editing, input, isGroq, savedKey, provider]);
+  }, [editing, input, isGroq, savedKey, provider, bridge]);
 
-  const masked = savedKey
-    ? `${savedKey.slice(0, 6)}${"•".repeat(Math.max(4, Math.min(24, savedKey.length - 8)))}${savedKey.slice(-3)}`
-    : "";
+  const remove = useCallback(async () => {
+    setBusy("save");
+    try {
+      if (bridge) {
+        if (isGroq) await bridge.whisperGroqSet?.({ apiKey: "" });
+        else await bridge.geminiClear?.();
+        setDeviceMasked("");
+        persist(isGroq ? { groqKeyOnDevice: false } : { geminiKeyOnDevice: false });
+      } else {
+        persist(isGroq ? { groqKey: "" } : { geminiKey: "" });
+      }
+      toast.info(`${isGroq ? "Groq" : "Gemini"} key removed`);
+    } catch (err) {
+      toast.error("Could not remove the key", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setBusy("");
+    }
+  }, [bridge, isGroq, persist]);
+
+  const hasSomeKey = !!savedKey || onDevice;
+  const masked =
+    savedKey
+      ? `${savedKey.slice(0, 6)}${"•".repeat(Math.max(4, Math.min(24, savedKey.length - 8)))}${savedKey.slice(-3)}`
+      : deviceMasked;
 
   return (
     <div className="rounded-lg border p-2.5" style={INNER}>
@@ -189,14 +300,14 @@ function KeyRow({ provider }: { provider: "groq" | "gemini" }) {
           <KeyRound size={10} className="text-orange-600" />
           {isGroq ? "Groq API key" : "Gemini API key"}
         </span>
-        {savedKey && !editing && (
+        {hasSomeKey && !editing && (
           <span className="flex items-center gap-1 text-[10px] font-medium text-emerald-300">
             <Check size={10} /> Key saved
           </span>
         )}
       </div>
 
-      {!editing && savedKey ? (
+      {!editing && hasSomeKey ? (
         <div className="space-y-2">
           <div className="flex items-center gap-2">
             <span
@@ -232,7 +343,7 @@ function KeyRow({ provider }: { provider: "groq" | "gemini" }) {
             </button>
             <button
               type="button"
-              onClick={() => persist(isGroq ? { groqKey: "" } : { geminiKey: "" })}
+              onClick={remove}
               disabled={busy !== ""}
               className="flex items-center gap-1 rounded border px-2 py-1 text-[10px] font-medium text-rose-400/90 transition-colors hover:border-rose-500/50 hover:bg-rose-500/10 disabled:cursor-not-allowed disabled:opacity-50"
               style={ROW_BORDER}
@@ -308,8 +419,12 @@ function KeyRow({ provider }: { provider: "groq" | "gemini" }) {
 
       <p className="mt-1.5 text-[9px] leading-relaxed text-stone-400">
         {isGroq
-          ? "Used for Whisper transcription + Groq script models. It stays in this browser and rides each request — the server never stores it."
-          : "Used for Gemini script models. It stays in this browser and rides each request — the server never stores it."}
+          ? bridge
+            ? "Stored on this device (app data, private) — used for Whisper transcription + Groq script models."
+            : "Used for Whisper transcription + Groq script models. It stays in this browser and rides each request — the server never stores it."
+          : bridge
+            ? "Stored on this device (app data, private) — used for Gemini script models."
+            : "Used for Gemini script models. It stays in this browser and rides each request — the server never stores it."}
       </p>
     </div>
   );
@@ -326,15 +441,15 @@ export default function AiModelsSection() {
     [ai],
   );
 
-  const groqReady = ai.groqKey.trim().length > 0;
-  const geminiReady = ai.geminiKey.trim().length > 0;
+  const groqReady = ai.groqKey.trim().length > 0 || ai.groqKeyOnDevice === true;
+  const geminiReady = ai.geminiKey.trim().length > 0 || ai.geminiKeyOnDevice === true;
 
   return (
     <section aria-label="Default AI models" className="mb-4 rounded-lg border p-3" style={CARD}>
       <div className="mb-2 flex items-center gap-1.5">
         <Settings2 size={13} className="text-orange-600" />
         <span className="text-[11px] font-semibold text-stone-200">Default AI models</span>
-        <span className="ml-auto text-[9px] text-stone-500">v1.27 · one place</span>
+        <span className="ml-auto text-[9px] text-stone-500">v1.28 · one place</span>
       </div>
       <p className="mb-3 text-[10px] leading-relaxed text-stone-400">
         Every AI surface (Captions, Dub Studio) reads its provider and model from here. The cards
@@ -354,48 +469,37 @@ export default function AiModelsSection() {
           title="Caption transcription"
           sub="Captions + Dub stage 1"
         />
-        <div className="mb-2 grid grid-cols-2 gap-1" role="group" aria-label="Transcription provider">
+        <div className="mb-2 flex flex-wrap items-center gap-1" role="group" aria-label="Transcription provider">
           <ProviderButton
-            active={ai.sttProvider === "builtin"}
-            onClick={() => update({ sttProvider: "builtin" })}
-            icon={<Sparkles size={12} />}
-            label="Built-in Cloud ASR"
-            title="Keyless cloud transcription (word timings estimated)"
-          />
-          <ProviderButton
-            active={ai.sttProvider === "groq"}
+            active={true}
             onClick={() => update({ sttProvider: "groq" })}
             icon={<Mic size={12} />}
             label="Groq Whisper"
             title="Whisper with REAL per-word timestamps — needs the Groq key (best for word-to-word dub timing)"
           />
         </div>
-        {ai.sttProvider === "groq" && (
-          <div className="flex flex-wrap items-end gap-2">
-            <ModelSelect
-              label="Whisper model"
-              value={ai.sttGroqModel}
-              catalog={GROQ_WHISPER_MODELS}
-              onChange={(id) => update({ sttGroqModel: id })}
-              ariaLabel="Groq Whisper model"
-            />
-            {groqReady ? (
-              <span className="flex items-center gap-1 pb-1.5 text-[10px] font-medium text-emerald-300">
-                <Check size={10} /> Groq key ready
-              </span>
-            ) : (
-              <span className="pb-1.5 text-[10px] text-orange-400/90">
-                No Groq key saved — transcription falls back to the built-in cloud ASR.
-              </span>
-            )}
-          </div>
-        )}
-        {ai.sttProvider === "builtin" && (
-          <p className="text-[10px] leading-relaxed text-stone-500">
-            Keyless cloud ASR with silence-based utterance windows — word timings are estimated
-            inside each line.
-          </p>
-        )}
+        <div className="flex flex-wrap items-end gap-2">
+          <ModelSelect
+            label="Whisper model"
+            value={ai.sttGroqModel}
+            catalog={GROQ_WHISPER_MODELS}
+            onChange={(id) => update({ sttGroqModel: id })}
+            ariaLabel="Groq Whisper model"
+          />
+          {groqReady ? (
+            <span className="flex items-center gap-1 pb-1.5 text-[10px] font-medium text-emerald-300">
+              <Check size={10} /> Groq key ready
+            </span>
+          ) : (
+            <span className="pb-1.5 text-[10px] text-orange-400/90">
+              Save your Groq key above to transcribe (free at console.groq.com).
+            </span>
+          )}
+        </div>
+        <p className="mt-1.5 text-[10px] leading-relaxed text-stone-500">
+          Groq Whisper gives real per-word timestamps — the input for word-to-word dub timing and
+          karaoke captions.
+        </p>
       </div>
 
       {/* ── Dubbing script writing ───────────────────────────────────── */}
@@ -405,14 +509,7 @@ export default function AiModelsSection() {
           title="Dubbing script writing"
           sub="Dub stage 2"
         />
-        <div className="mb-2 grid grid-cols-3 gap-1" role="group" aria-label="Script writing provider">
-          <ProviderButton
-            active={ai.dubTextProvider === "builtin"}
-            onClick={() => update({ dubTextProvider: "builtin" })}
-            icon={<Sparkles size={12} />}
-            label="Built-in Cloud AI"
-            title="Keyless cloud model (GLM) — speaker detection + translation"
-          />
+        <div className="mb-2 grid grid-cols-2 gap-1" role="group" aria-label="Script writing provider">
           <ProviderButton
             active={ai.dubTextProvider === "groq"}
             onClick={() => update({ dubTextProvider: "groq" })}
@@ -429,15 +526,6 @@ export default function AiModelsSection() {
           />
         </div>
         <div className="flex flex-wrap items-end gap-2">
-          {ai.dubTextProvider === "builtin" && (
-            <ModelSelect
-              label="Cloud model"
-              value={ai.dubBuiltinModel}
-              catalog={BUILTIN_TEXT_MODELS}
-              onChange={(id) => update({ dubBuiltinModel: id })}
-              ariaLabel="Built-in script model"
-            />
-          )}
           {ai.dubTextProvider === "groq" && (
             <ModelSelect
               label="Groq model"
@@ -463,7 +551,7 @@ export default function AiModelsSection() {
               </span>
             ) : (
               <span className="pb-1.5 text-[10px] text-orange-400/90">
-                No Groq key — the script falls back to the built-in cloud model.
+                Save your Groq key above to write scripts with Groq.
               </span>
             ))}
           {ai.dubTextProvider === "gemini" &&
@@ -473,7 +561,7 @@ export default function AiModelsSection() {
               </span>
             ) : (
               <span className="pb-1.5 text-[10px] text-orange-400/90">
-                No Gemini key — the script falls back to the built-in cloud model.
+                Save your Gemini key above to write scripts with Gemini.
               </span>
             ))}
         </div>

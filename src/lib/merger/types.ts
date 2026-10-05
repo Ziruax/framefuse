@@ -1703,6 +1703,11 @@ declare global {
         height: number;
         /** Optional headline overlay items to include in the sidecar. v4.2 */
         headlines?: unknown[];
+        /** v1.28 kinetic parity: the SAME choreography the burn-in exports
+         *  carry (kinetic events replace the legacy cue lines — without
+         *  these a kinetic project exported a plain-caption sidecar). */
+        kineticCompositions?: unknown[];
+        kineticGeometry?: unknown[];
       }) => Promise<{ path: string; size: number } | null>;
     };
   }

@@ -194,7 +194,7 @@ const DISCLAIMER_DEFAULT_MS = 2000;
 /** v1.14.2: renderer build stamp — the desktop-only landing carries it so a
  * browser visitor sees which build is live (in Electron, Header separately
  * cross-checks it against the exe's app.getVersion()). */
-const BUILD_VERSION = "1.26.0";
+const BUILD_VERSION = "1.28.0";
 
 // ---------------------------------------------------------------------------
 // v1.23 FLOW — the left navigation rail. One dock, six phases: the media
@@ -1661,23 +1661,24 @@ export default function Page() {
 
   const dubSourceCount = hasElectronBridge() ? dubSources.length : webDubSources.length;
 
-  // ---- v1.27 AI-provider plumbing (Settings tab defaults) ----------------
+  // ---- v1.27/v1.28 AI-provider plumbing (Settings tab defaults) ----------------
   /** Script-writing provider request, read FRESH at call time (keys may have
-   *  changed in the Settings tab since the last render). */
+   *  changed in the Settings tab since the last render). v1.28: builtin is
+   *  gone — Groq (default) or Gemini, with their key from the same store
+   *  (web transport only; the desktop reads its own key files). */
   const scriptProviderNow = useCallback(() => {
     const ai = loadAiSettings();
-    if (ai.dubTextProvider === "groq")
-      return { provider: "groq" as const, model: ai.dubGroqModel, groqKey: ai.groqKey };
     if (ai.dubTextProvider === "gemini")
       return { provider: "gemini" as const, model: ai.dubGeminiModel, geminiKey: ai.geminiKey };
-    return { provider: "builtin" as const, model: ai.dubBuiltinModel };
+    return { provider: "groq" as const, model: ai.dubGroqModel, groqKey: ai.groqKey };
   }, []);
 
-  /** Transcription provider request (Groq Whisper needs its key — otherwise
-   *  the server falls back to the builtin cloud ASR). */
+  /** Transcription provider request (Groq Whisper — needs its key for the
+   *  web transport; without one the WEB route falls back to the sandbox
+   *  cloud ASR. The DESKTOP IPC path reads its own on-device key file). */
   const sttProviderNow = useCallback(() => {
     const ai = loadAiSettings();
-    if (ai.sttProvider === "groq" && ai.groqKey.trim())
+    if (ai.groqKey.trim() || ai.groqKeyOnDevice)
       return { provider: "groq" as const, groqKey: ai.groqKey, groqModel: ai.sttGroqModel };
     return { provider: "builtin" as const };
   }, []);
@@ -1719,18 +1720,19 @@ export default function Page() {
     try {
       let result: DubTrackResult;
       if (ipcDub) {
-        // Electron — the one-shot main-process pipeline (byte-identical to
-        // ≤ v1.25).
+        // Electron — the one-shot main-process pipeline. v1.28: the AI
+        // provider + model come from the Settings tab (scriptProviderNow),
+        // not the legacy dubSettings prefs; the keys live in the
+        // main-process key files.
+        const scriptCfg = scriptProviderNow();
         result = await ipcDub({
           segments: dubSources,
           sourceLanguage: "auto",
           targetLanguage: dubSettings.targetLanguage,
           targetLocale: dubSettings.targetLocale,
-          groqModel: dubSettings.groqModel,
-          // v1.22: the dub's AI model provider — Groq (default) or Gemini
-          // (the Script Writer's key + the Gemini model list).
-          textProvider: dubSettings.textProvider ?? "groq",
-          geminiModel: dubSettings.geminiModel,
+          groqModel: scriptCfg.provider === "groq" ? scriptCfg.model : dubSettings.groqModel,
+          textProvider: scriptCfg.provider,
+          geminiModel: scriptCfg.provider === "gemini" ? scriptCfg.model : dubSettings.geminiModel,
           femaleVoice: dubSettings.femaleVoice || undefined,
           maleVoice: dubSettings.maleVoice || undefined,
           voiceMode: dubSettings.voiceMode ?? "multi",
@@ -3300,6 +3302,66 @@ export default function Page() {
       const dims = resolveDimensions(settings.aspect, settings.resolution);
       const preset = getCaptionPreset(captionSettings.presetId);
       const font = getFontOption(captionSettings.fontId);
+      // v1.28 kinetic parity: the sidecar carries the SAME kinetic
+      // choreography the burn-in exports carry (plan + measured geometry at
+      // the export resolution) — before this, kinetic projects exported a
+      // plain-caption .ass.
+      let kineticCompositions: unknown[] | undefined;
+      let kineticGeometry: unknown[] | undefined;
+      if (captionSettings.kinetic?.enabled && subtitles.cues.some((c) => c.words?.length)) {
+        const { buildKineticPlan } = await import("@/lib/merger/kinetic/engine");
+        const { measureKineticPlanDom, ensureKineticFontsLoaded } = await import(
+          "@/lib/merger/kinetic/render"
+        );
+        type KineticCueInput = Parameters<typeof buildKineticPlan>[0][number];
+        await ensureKineticFontsLoaded();
+        const kineticCues: KineticCueInput[] = subtitles.cues.map((c) => ({
+          startMs: c.startMs,
+          endMs: c.endMs,
+          text: c.text,
+          words: c.words?.map((w) => ({
+            text: w.text,
+            startMs: w.startMs,
+            endMs: w.endMs,
+          })),
+        }));
+        const plan = buildKineticPlan(kineticCues, captionSettings.kinetic);
+        kineticCompositions = plan.compositions.map((comp) => ({
+          presetId: comp.presetId,
+          classification: comp.classification,
+          intensity: comp.intensity,
+          startMs: comp.startMs,
+          endMs: comp.endMs,
+          words: comp.words.map((w) => ({
+            text: w.text,
+            startMs: w.startMs,
+            endMs: w.endMs,
+            role: w.role,
+            emphasis: w.emphasis,
+            phraseIndex: w.phraseIndex,
+          })),
+          phrases: comp.phrases.map((p) => ({
+            role: p.role,
+            scale: p.scale,
+            weight: p.weight,
+            align: p.align,
+            indentFrac: p.indentFrac,
+          })),
+        }));
+        kineticGeometry =
+          measureKineticPlanDom(
+            plan,
+            captionSettings.kinetic,
+            {
+              fontSizeScale: captionSettings.fontSizeScale || 1,
+              customColor: captionSettings.customColor,
+              fontOverride: captionSettings.kinetic.fontOverride,
+              accentOverride: captionSettings.kinetic.accentOverride,
+            },
+            dims.w,
+            dims.h,
+          ) ?? undefined;
+      }
       const res = await api.exportAssFile({
         cues: subtitles.cues.map((c) => ({
           startMs: c.startMs,
@@ -3330,9 +3392,12 @@ export default function Page() {
           customPosition: captionSettings.customPosition,
           wordMode: captionSettings.wordMode,
           animation: captionSettings.animation || preset.animation || "none",
+          ...(captionSettings.kinetic ? { kinetic: { ...captionSettings.kinetic } } : {}),
         },
         width: dims.w,
         height: dims.h,
+        ...(kineticCompositions ? { kineticCompositions } : {}),
+        ...(kineticGeometry ? { kineticGeometry } : {}),
       });
       if (res) {
         toast.success("Exported .ass subtitle file", { description: res.path });
