@@ -365,6 +365,12 @@ export function PreviewPanel({
   const chromeRef = useRef<HTMLCanvasElement | null>(null);
   const scratchRef = useRef<HTMLCanvasElement | null>(null);
   const dims = previewDimensions(aspect);
+  // v1.29 AUDIO-ONLY PROJECTS: the transport (play / scrub / loop / full
+  // screen) works whenever there is ANY timeline content — a voiceover clip
+  // extending the total counts, even with zero visual segments (the stage
+  // shows black while the audio plays). Segment-specific buttons (step,
+  // fit, match-aspect) stay segment-gated below.
+  const canControl = segments.length > 0 || totalMs > 0;
   // v4.8: hover point for the motion-aiming overlay (normalized coords).
   const [aim, setAim] = useState<{ nx: number; ny: number } | null>(null);
   // v5.0: hidden video paint sources, one per video media id (created/
@@ -1115,6 +1121,11 @@ export function PreviewPanel({
     // -stream_loop -1) so a short green-screen clip spans its whole
     // (longer) timeline window; the element itself gets loop=true so native
     // playback wraps identically.
+    // v5.8: BASE-LANE LOOP parity — a track-0 video with seg.loop (loop-to-
+    // fill, the v1.29 voiceover case) gets the SAME modular-time treatment:
+    // localMs wraps modulo the source duration (incl. the el.duration
+    // fallback) and el.loop=true keeps audio-free native looping. The
+    // overlay path uses overlayLoop only; the base path uses loop only.
     const syncVideoTo = (
       el: HTMLVideoElement,
       vSeg: MediaSegment | null,
@@ -1147,7 +1158,11 @@ export function PreviewPanel({
           ? vSeg.speed
           : 1;
       let localMs = vSeg.trimInMs + (currentMs - vSeg.startMs) * speed;
-      if (vSeg.overlayLoop) {
+      // v5.8: the loop condition — overlay clips loop via overlayLoop, the
+      // ACTIVE BASE clip loops via seg.loop (never both on one segment).
+      const wantLoop =
+        vSeg.overlayLoop === true || (isBase && vSeg.loop === true);
+      if (wantLoop) {
         const srcDurMs = Number.isFinite(vSeg.sourceDurationMs)
           ? (vSeg.sourceDurationMs ?? 0)
           : 0;
@@ -1159,7 +1174,6 @@ export function PreviewPanel({
               : 0;
         if (durMs > 0) localMs = ((localMs % durMs) + durMs) % durMs;
       }
-      const wantLoop = vSeg.overlayLoop === true;
       if (el.loop !== wantLoop) el.loop = wantLoop;
       const targetSec = Math.max(0, localMs) / 1000;
       const dur = Number.isFinite(el.duration) && el.duration > 0 ? el.duration : null;
@@ -2280,7 +2294,7 @@ export function PreviewPanel({
           <button
             type="button"
             onClick={onTogglePlay}
-            disabled={segments.length === 0}
+            disabled={!canControl}
             className="flex size-9 items-center justify-center rounded-full text-white shadow-lg transition-all duration-150 hover:scale-105 hover:brightness-110 hover:shadow-[0_6px_24px_rgba(6,182,212,0.6)] active:scale-95 disabled:opacity-30 disabled:hover:scale-100 disabled:hover:brightness-100"
             style={{
               background: "linear-gradient(135deg, #fcd34d 0%, #f59e0b 60%, #d97706 100%)",
@@ -2314,7 +2328,7 @@ export function PreviewPanel({
             <button
               type="button"
               onClick={onVideoLoopChange}
-              disabled={segments.length === 0}
+              disabled={!canControl}
               className={cn(
                 "flex size-7 items-center justify-center rounded-lg transition-all active:scale-90 disabled:opacity-30 disabled:hover:bg-transparent",
                 videoLoop
@@ -2438,7 +2452,7 @@ export function PreviewPanel({
               onClick={() => {
                 void toggleFullscreen();
               }}
-              disabled={segments.length === 0}
+              disabled={!canControl}
               className="flex size-7 items-center justify-center rounded-lg transition-all hover:bg-white/10 active:scale-90 disabled:opacity-30 disabled:hover:bg-transparent disabled:hover:shadow-none"
               style={{ color: isFullscreen ? "#fcd34d" : "#d6d3d1" }}
               title={
@@ -2469,7 +2483,7 @@ export function PreviewPanel({
             step={10}
             value={Math.min(currentMs, totalMs)}
             onChange={(e) => onSeek(Number(e.target.value))}
-            disabled={segments.length === 0}
+            disabled={!canControl}
             className="w-full"
             style={{
               background: `linear-gradient(to right, #fcd34d ${pct}%, #f59e0b ${Math.min(

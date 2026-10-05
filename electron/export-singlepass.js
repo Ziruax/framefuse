@@ -1501,12 +1501,19 @@ function buildSinglePassPlan(o) {
       const speed = G.resolveSegSpeed(seg);
       const durMs = Math.max(0, Number(seg.durationMs) || 0);
       const sourceWinMs = speed !== 1 ? durMs * speed : durMs;
+      // v1.29 LOOP-TO-FILL: a looping base video's own audio loops with it
+      // (-stream_loop -1, no input -t); the process-level OUTPUT -t (bounded
+      // by the audio bus total) caps the render. Non-loop segments keep the
+      // exact legacy argv.
+      const segLoop = seg.loop === true;
       branchInputs.push(
         "-thread_queue_size", "512",
         ...G.buildVideoInputArgs({
           trimInMs: Number(seg.trimInMs) || 0,
           path: seg.videoPath,
-          durMs: sourceWinMs,
+          durMs: !segLoop ? sourceWinMs : undefined,
+          loop: segLoop,
+          srcDurMs: segLoop ? Number(seg.sourceDurationMs) || 0 : undefined,
         }),
       );
       branchRefs.push({ inputIdx: idx, startMs: c.startMs, volume: c.volume, atempo: c.atempo });
@@ -1630,6 +1637,11 @@ function buildSinglePassPlan(o) {
     if (isVideo) {
       const speed = G.resolveSegSpeed(seg);
       const sourceWinMs = speed !== 1 ? durMs * speed : durMs;
+      // v1.29 LOOP-TO-FILL: looped base video — infinite input, no input -t;
+      // the per-window frame caps / process -t bound the render at the fill
+      // window (main.js disables timeline windowing for loop projects —
+      // this passthrough keeps the shared argv builder loop-correct).
+      const segLoop = seg.loop === true;
       inputs.push("-thread_queue_size", "512");
       inputs.push(...G.buildVideoInputArgs({
         trimInMs: Number(seg.trimInMs) || 0,
@@ -1645,7 +1657,9 @@ function buildSinglePassPlan(o) {
         // v6: the shared graph has no per-stream output -t, so the input is
         // bounded here (same seek/window semantics as the two-step's
         // buildVideoInputArgs + output -t pair, verified by the harness).
-        durMs: sourceWinMs,
+        durMs: !segLoop ? sourceWinMs : undefined,
+        loop: segLoop,
+        srcDurMs: segLoop ? Number(seg.sourceDurationMs) || 0 : undefined,
       }));
       // v6.5 PHASE NORMALIZER: `setpts=PTS-STARTPTS` pins the chain's output
       // to pts 0. Without it, an input seek whose phase lands in the first

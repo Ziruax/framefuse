@@ -1497,6 +1497,26 @@ function FilmstripBar({
           {idx + 1}
         </span>
       ) : null}
+      {/* v5.8: LOOP-TO-FILL badge — a base-lane video whose edit sets loop
+          repeats until the timeline end (10s clip + 1h voiceover). Teal
+          scrim pill, top-right, visible on any strip wide enough for it. */}
+      {seg.loop === true &&
+        (layout != null
+          ? (widthPxish as number) > 26
+          : (widthPxish as number) > 10) && (
+          <span
+            className="absolute right-0.5 top-0 flex h-[13px] items-center gap-0.5 rounded-bl-[4px] px-1 text-[8px] font-bold"
+            style={{
+              backgroundColor: "rgba(13, 148, 136, 0.78)",
+              color: "#ccfbf1",
+              textShadow: "0 1px 1px rgba(0,0,0,0.7)",
+            }}
+            title="Looping — this clip repeats to fill the timeline end"
+          >
+            <Repeat className="size-2" aria-hidden />
+            loop
+          </span>
+        )}
       {/* Duration tag on wide strips. */}
       {(layout != null ? (widthPxish as number) > 34 : (widthPxish as number) > 14) ? (
         <span
@@ -3258,6 +3278,26 @@ export function TimelineRuler({
             : undefined,
           disabled: onEditItem == null,
         });
+        // v5.8: BASE-lane VIDEO loop-to-fill — the clip repeats until the
+        // timeline end (the 10s-video + 1h-voiceover case: the visuals
+        // repeat to match the audio). Overlay clips keep their own
+        // overlayLoop twin above; images never loop.
+        if (seg.mediaType === "video") {
+          items.push({
+            icon: Repeat,
+            label:
+              seg.loop === true
+                ? "Stop looping clip"
+                : "Loop to fill timeline",
+            onClick: onEditItem
+              ? () =>
+                  onEditItem(seg.id, {
+                    loop: seg.loop === true ? undefined : true,
+                  })
+              : undefined,
+            disabled: onEditItem == null,
+          });
+        }
       }
       items.push(
         { sep: true, label: "" },
@@ -3344,13 +3384,32 @@ export function TimelineRuler({
           disabled: mc == null || onMusicMove == null || mc.startMs <= 0,
         },
         {
+          // v1.29: role switch — the context-menu twin of the hover popover's
+          // Voiceover/Music toggle (voice = fixed length + transcription
+          // source; music = loop-to-fill background).
+          icon: Mic,
+          label:
+            mc?.role === "voice"
+              ? "Use as background music"
+              : "Use as voiceover",
+          onClick:
+            mc && onMusicClipEdit
+              ? () =>
+                  onMusicClipEdit(mc.id, {
+                    role: mc.role === "voice" ? "music" : "voice",
+                    loop: mc.role === "voice",
+                  })
+              : undefined,
+          disabled: mc == null || onMusicClipEdit == null,
+        },
+        {
           icon: Repeat,
           label: mc?.loop ? "Stop looping" : "Loop to fill video",
           onClick:
             mc && onMusicClipEdit
               ? () => onMusicClipEdit(mc.id, { loop: !mc.loop })
               : undefined,
-          disabled: mc == null || onMusicClipEdit == null,
+          disabled: mc == null || onMusicClipEdit == null || mc.role === "voice",
         },
         { sep: true, label: "" },
         {
@@ -4144,16 +4203,17 @@ export function TimelineRuler({
             const primary = musicList[0] ?? null;
             // v1.25: greedy row packing — loop clips end at the timeline end,
             // so nothing ever joins a row after one; lane height = rows × 34.
+            // v1.29: NON-loop clips (voiceovers) are FIXED-LENGTH content that
+            // may extend PAST the visual timeline end — no totalMs clamp (the
+            // timeline already extends to the non-loop audio end page-side,
+            // but a probe-in-flight or hand-set duration still renders true).
             const endOf = (c: MusicClip) =>
               c.loop
                 ? totalMs
-                : Math.min(
-                    totalMs,
-                    c.startMs +
-                      musicEffectiveDurMs(
-                        c,
-                        c.id === primary?.id ? (waveformDurationMs ?? null) : null,
-                      ),
+                : c.startMs +
+                  musicEffectiveDurMs(
+                    c,
+                    c.id === primary?.id ? (waveformDurationMs ?? null) : null,
                   );
             const { entries, rows } = packMusicRows(musicList, endOf);
             const laneH = Math.max(AUDIO_H, rows * AUDIO_H);
@@ -4235,9 +4295,11 @@ export function TimelineRuler({
                     const startMs = Math.max(0, pv?.startMs ?? clip.startMs);
                     const durMs =
                       pv && pv.durMs > 0 ? pv.durMs : effectiveDur;
+                    // v1.29: non-loop clips render their TRUE length (voice
+                    // clips can outlive the visual timeline — see endOf).
                     const endMs = clip.loop
                       ? Math.max(totalMs, startMs + 200)
-                      : Math.min(totalMs, startMs + durMs);
+                      : startMs + durMs;
                     const left = layout ? layout.pxOf(startMs) : 0;
                     const width = Math.max(
                       24,
@@ -4252,12 +4314,16 @@ export function TimelineRuler({
                     const hovered = musicHoverId === clip.id;
                     const trimmable =
                       onMusicClipEdit != null && !clip.loop && clip.sourceDurationMs > 0;
+                    // v1.29: role — "voice" reads as a VOICEOVER (fixed
+                    // length, Mic pill, transcription source), "music" (or
+                    // absent) is the legacy loop-to-fill background track.
+                    const isVoice = clip.role === "voice";
                     return (
                       <div
                         key={clip.id}
                         role="button"
                         tabIndex={0}
-                        aria-label={`Background music clip ${middleEllipsis(clip.fileName, 24)} starting at ${fmtTimecode(startMs)}${clip.loop ? ", looping to fill the video" : ""}${clipSelected ? ", selected" : ""}`}
+                        aria-label={`${isVoice ? "Voiceover clip" : "Background music clip"} ${middleEllipsis(clip.fileName, 24)} starting at ${fmtTimecode(startMs)}${clip.loop ? ", looping to fill the video" : ""}${isVoice ? ", fixed length — the timeline runs to its end" : ""}${clipSelected ? ", selected" : ""}`}
                         className={cn(
                           // NOTE: no overflow-hidden AND no z-index — the hover
                           // popover (volume + loop) floats ABOVE the 34px row
@@ -4291,7 +4357,7 @@ export function TimelineRuler({
                               ? "0 0 0 2px rgba(234, 88, 12, 0.4), 0 0 12px rgba(234, 88, 12, 0.2)"
                               : "0 1px 2px rgba(0,0,0,0.35)",
                         }}
-                        title={`Background music · ${clip.fileName} · starts ${fmtTimecode(startMs)}${clip.loop ? " · loops to fill the video" : ` · ${fmtTimecode(durMs)} long`}${onMusicMove ? " · drag to reposition" : ""}${trimmable ? " · drag the right edge to trim" : ""}${onRemoveMusicClip ? " · Alt+click to remove" : ""}\nright-click for actions`}
+                        title={`${isVoice ? "Voiceover" : "Background music"} · ${clip.fileName} · starts ${fmtTimecode(startMs)}${clip.loop ? " · loops to fill the video" : ` · ${fmtTimecode(durMs)} long`}${isVoice ? " · the timeline runs to this clip's end" : ""}${onMusicMove ? " · drag to reposition" : ""}${trimmable ? " · drag the right edge to trim" : ""}${onRemoveMusicClip ? " · Alt+click to remove" : ""}\nright-click for actions`}
                         onContextMenu={(e) => openMusicMenu(e, clip.id)}
                         onPointerDown={(e) => beginMusicDrag(e, clip)}
                         onPointerMove={handleMusicPointerMove}
@@ -4321,10 +4387,29 @@ export function TimelineRuler({
                           }
                         }}
                       >
-                        <Music2 className="size-2.5 shrink-0" aria-hidden />
+                        {isVoice ? (
+                          <Mic className="size-2.5 shrink-0" aria-hidden />
+                        ) : (
+                          <Music2 className="size-2.5 shrink-0" aria-hidden />
+                        )}
                         <span className="min-w-0 flex-1 truncate">
                           {middleEllipsis(clip.fileName, 28)}
                         </span>
+                        {/* v1.29: voice clips carry a Mic pill (teal accent) —
+                            fixed-length narration, never trimmed to the video. */}
+                        {isVoice && (
+                          <span
+                            className="flex shrink-0 items-center gap-0.5 rounded px-1 py-px"
+                            style={{
+                              backgroundColor: "rgba(45, 212, 191, 0.18)",
+                              border: "1px solid rgba(45, 212, 191, 0.6)",
+                            }}
+                            title="Voiceover — fixed length: the timeline runs to this clip's end (it is never trimmed to the video)"
+                          >
+                            <Mic className="size-2.5" aria-hidden />
+                            VO
+                          </span>
+                        )}
                         {clip.loop && (
                           <span
                             className="flex shrink-0 items-center gap-0.5 rounded px-1 py-px"
@@ -4340,7 +4425,7 @@ export function TimelineRuler({
                         )}
                         <span
                           className="flex shrink-0 items-center gap-0.5 tabular-nums opacity-80"
-                          title={`Music volume — ${volPct}% (hover controls or the Audio tab)`}
+                          title={`${isVoice ? "Voiceover" : "Music"} volume — ${volPct}% (hover controls or the Audio tab)`}
                         >
                           {volPct === 0 ? (
                             <VolumeX className="size-2.5" aria-hidden />
@@ -4363,8 +4448,8 @@ export function TimelineRuler({
                             onLostPointerCapture={handleMusicDragAbort}
                           />
                         )}
-                        {/* Hover popover: per-clip volume slider + loop toggle
-                            + remove (floats ABOVE the row). */}
+                        {/* Hover popover: per-clip volume slider + role toggle
+                            + loop toggle + remove (floats ABOVE the row). */}
                         {onMusicClipEdit && (
                           <div
                             className="absolute top-0 left-1/2 z-[60] -translate-x-1/2 -translate-y-full transition-opacity duration-100"
@@ -4381,6 +4466,61 @@ export function TimelineRuler({
                               }}
                               onPointerDown={(e) => e.stopPropagation()}
                             >
+                              {/* v1.29 ROLE toggle — Voiceover vs Music.
+                                  Switching to voice turns loop OFF (fixed
+                                  length, the timeline runs to its end);
+                                  switching to music turns loop ON (the
+                                  legacy default). */}
+                              <div
+                                role="group"
+                                aria-label={`Role for ${clip.fileName}`}
+                                className="flex items-center rounded-md border p-0.5"
+                                style={{
+                                  borderColor: "#3a352d",
+                                  backgroundColor: "#26221e",
+                                }}
+                              >
+                                <button
+                                  type="button"
+                                  aria-pressed={isVoice}
+                                  onClick={() =>
+                                    onMusicClipEdit(clip.id, {
+                                      role: "voice",
+                                      loop: false,
+                                    })
+                                  }
+                                  title="Voiceover — narration: fixed length, the timeline runs to its end, captions transcribe it"
+                                  className={cn(
+                                    "flex cursor-pointer items-center gap-1 rounded px-1.5 py-1 text-[9px] font-semibold transition-colors",
+                                    isVoice
+                                      ? "bg-teal-500/20 text-teal-300"
+                                      : "text-stone-400 hover:text-teal-300",
+                                  )}
+                                >
+                                  <Mic className="size-3" aria-hidden />
+                                  Voiceover
+                                </button>
+                                <button
+                                  type="button"
+                                  aria-pressed={!isVoice}
+                                  onClick={() =>
+                                    onMusicClipEdit(clip.id, {
+                                      role: "music",
+                                      loop: true,
+                                    })
+                                  }
+                                  title="Background music — loops to fill the video length"
+                                  className={cn(
+                                    "flex cursor-pointer items-center gap-1 rounded px-1.5 py-1 text-[9px] font-semibold transition-colors",
+                                    !isVoice
+                                      ? "bg-teal-500/20 text-teal-300"
+                                      : "text-stone-400 hover:text-teal-300",
+                                  )}
+                                >
+                                  <Music2 className="size-3" aria-hidden />
+                                  Music
+                                </button>
+                              </div>
                               <label className="flex items-center gap-1.5 text-[9px] font-medium text-stone-300">
                                 <Volume2 className="size-3 text-teal-400" aria-hidden />
                                 <input
@@ -4404,27 +4544,29 @@ export function TimelineRuler({
                                   {volPct}%
                                 </span>
                               </label>
-                              <button
-                                type="button"
-                                aria-pressed={clip.loop}
-                                className={cn(
-                                  "flex cursor-pointer items-center gap-1 rounded-md border px-1.5 py-1 text-[9px] font-semibold transition-colors",
-                                  clip.loop
-                                    ? "border-teal-500/70 bg-teal-500/15 text-teal-300"
-                                    : "border-[#3a352d] bg-[#26221e] text-stone-400 hover:border-teal-500/60 hover:text-teal-300",
-                                )}
-                                title={
-                                  clip.loop
-                                    ? "Looping ON — this track repeats to cover the rest of the video"
-                                    : "Loop to fill the rest of the video — background tracks are usually longer than the edit"
-                                }
-                                onClick={() =>
-                                  onMusicClipEdit(clip.id, { loop: !clip.loop })
-                                }
-                              >
-                                <Repeat className="size-3" aria-hidden />
-                                {clip.loop ? "Looping" : "Loop to fill"}
-                              </button>
+                              {!isVoice && (
+                                <button
+                                  type="button"
+                                  aria-pressed={clip.loop}
+                                  className={cn(
+                                    "flex cursor-pointer items-center gap-1 rounded-md border px-1.5 py-1 text-[9px] font-semibold transition-colors",
+                                    clip.loop
+                                      ? "border-teal-500/70 bg-teal-500/15 text-teal-300"
+                                      : "border-[#3a352d] bg-[#26221e] text-stone-400 hover:border-teal-500/60 hover:text-teal-300",
+                                  )}
+                                  title={
+                                    clip.loop
+                                      ? "Looping ON — this track repeats to cover the rest of the video"
+                                      : "Loop to fill the rest of the video — background tracks are usually longer than the edit"
+                                  }
+                                  onClick={() =>
+                                    onMusicClipEdit(clip.id, { loop: !clip.loop })
+                                  }
+                                >
+                                  <Repeat className="size-3" aria-hidden />
+                                  {clip.loop ? "Looping" : "Loop to fill"}
+                                </button>
+                              )}
                               {onRemoveMusicClip && (
                                 <button
                                   type="button"

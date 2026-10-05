@@ -1036,7 +1036,7 @@ async function runPipeline(ctx) {
     warnings.push(...speakerInfo.warnings);
     translations = await phase(ctx, "translate", () => translateSegments(ctx, trans, warnings));
   }
-  const synth = await phase(ctx, "synthesize", () => synthesizeVoices(ctx, trans, translations, speakerInfo));
+  const synth = await phase(ctx, "synthesize", () => synthesizeVoices(ctx, trans, translations, speakerInfo, warnings));
   const fitted = await phase(ctx, "fit", () => fitSegments(ctx, trans, translations, synth, speakerInfo, warnings));
 
   // ---- done: drop every intermediate, keep only the final WAVs ----
@@ -1463,7 +1463,7 @@ async function translateSegments(ctx, trans, warnings) {
 
 // ---- phase 5: synthesize ---------------------------------------------------
 
-async function synthesizeVoices(ctx, trans, translations, speakerInfo) {
+async function synthesizeVoices(ctx, trans, translations, speakerInfo, warnings) {
   const utts = trans.utts;
   const n = utts.length;
   const synth = ttsDeps().ttsSynthesize;
@@ -1475,12 +1475,31 @@ async function synthesizeVoices(ctx, trans, translations, speakerInfo) {
   const results = new Array(n);
   let nextIdx = 0;
   let done = 0;
+  let skippedUnspeakable = 0;
 
   const worker = async () => {
     for (;;) {
       const i = nextIdx++;
       if (i >= n) return;
       ctx.checkAbort();
+      // v1.29: a line with NO speakable characters (punctuation-only,
+      // symbols, emoji — garbage transcript tokens like "#") makes Edge TTS
+      // return zero audio, which used to fail the WHOLE dub with a
+      // misleading voice-name error. Skip the line with a warning instead —
+      // one bad line must never kill the dub.
+      const lineText = String(translations[i] || "").trim();
+      if (!lineText || !/[\p{L}\p{N}]/u.test(lineText)) {
+        if (warnings) {
+          warnings.push(
+            `Segment ${i + 1}: no speakable text ("${lineText.slice(0, 12)}") — skipped`,
+          );
+        }
+        results[i] = { mp3Path: null, durMs: 0, skipped: true };
+        skippedUnspeakable++;
+        done++;
+        report(ctx, "synthesize", (done / n) * 100, `Synthesized voice ${done}/${n}…`);
+        continue;
+      }
       const outFile = path.join(ctx.dubDir, `dub_${pad(i)}.mp3`);
       let lastErr = null;
       for (let attempt = 0; attempt < 2; attempt++) { // one retry for transient TTS hiccups
@@ -1527,6 +1546,11 @@ async function synthesizeVoices(ctx, trans, translations, speakerInfo) {
 
   const workerCount = Math.min(TTS_CONCURRENCY, Math.max(1, n));
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  if (results.every((r) => !r || r.skipped) && n > 0) {
+    throw new Error(
+      "No speakable lines in the script — every line is punctuation/symbols only. Re-run transcription on real speech, or edit the script lines.",
+    );
+  }
   return results;
 }
 
@@ -1541,6 +1565,9 @@ async function fitSegments(ctx, trans, translations, synth, speakerInfo, warning
   for (let i = 0; i < n; i++) {
     ctx.checkAbort();
     const u = utts[i];
+    // v1.29: synthesizeVoices skips un-speakable lines (punctuation-only
+    // transcript tokens) — their slots simply drop out of the dub track.
+    if (!synth[i] || synth[i].skipped) continue;
     const windowMs = Math.max(MIN_WINDOW_MS, u.endMs - u.startMs);
     const ttsDurMs = synth[i].durMs;
     const leadInMs = Math.max(0, u.startMs - prevSpeechEndMs); // gap before, never crossing the previous dub's end

@@ -136,6 +136,33 @@ function rustEligible(opts) {
 
   // v2: voiceovers + SFX ride the NATIVE audio bus (extraAudio) — no gate.
 
+  // v1.29 LOOP-TO-FILL (user complaints 3/4): a base-lane (track 0) video
+  // marked `loop` renders via the FFmpeg CLI's -stream_loop pipeline — the
+  // native engine has no base-lane loop support (its per-segment windows
+  // are bounded by the source). Looping projects ride the CLI path.
+  const segList = Array.isArray(opts.segments) ? opts.segments : [];
+  if (segList.some((s) => s && (Number(s.track) || 0) === 0 && s.mediaType === "video" && s.loop === true)) {
+    reasons.push("base-loop");
+  }
+
+  // v1.29 AUDIO-EXTENDED TIMELINE: when the renderer's authoritative
+  // totalMs EXCEEDS the last visual segment end (a voice/full-length audio
+  // track extends the timeline), the export must honor the audio-driven
+  // length — the native engine's segment-bounded compositor would trim the
+  // audio back to the visuals (the exact reported bug). Extended projects
+  // ride the FFmpeg CLI pipeline (its clocks already honor the payload).
+  if (Array.isArray(opts.segments) && opts.segments.length > 0) {
+    const segTotalMs = opts.segments.reduce(
+      (sum, s) => Math.max(sum, (s && (s.endMs ?? (s.startMs ?? 0) + (s.durationMs ?? 0))) || 0),
+      0,
+    );
+    const payloadTotalMs = Number.isFinite(Number(opts.totalMs)) ? Math.max(0, Number(opts.totalMs)) : 0;
+    // 250 ms tolerance — packet-granularity rounding must not trip the gate.
+    if (payloadTotalMs > segTotalMs + 250) {
+      reasons.push("audio-extends-video");
+    }
+  }
+
   const tr = opts.textRemoval;
   if (tr && tr.mode && tr.mode !== "none" && Array.isArray(tr.regions) && tr.regions.length > 0) {
     reasons.push("text-removal");
@@ -693,11 +720,17 @@ function buildRustTimeline(opts) {
   // image timeline renders at the film rate; never silent: result carries it)
   const allImages = segments.every((s) => s && s.mediaType !== "video") && segments.length > 0;
   let slideshowFpsApplied = null;
-  const totalMs = segments.reduce(
+  // v1.29 AUDIO-EXTENDED TIMELINE: max(segments end, payload totalMs) — the
+  // renderer's authoritative total (audio-driven timelines) wins when it
+  // exceeds the visuals. (rustEligible already routes extended projects to
+  // the CLI pipeline; this keeps the timeline honest as defense-in-depth.)
+  const segTotalMs = segments.reduce(
     (sum, s) =>
       Math.max(sum, s.endMs ?? (s.startMs ?? 0) + (s.durationMs ?? 0)),
     0,
   );
+  const payloadTotalMs = Number.isFinite(Number(opts.totalMs)) ? Math.max(0, Number(opts.totalMs)) : 0;
+  const totalMs = Math.max(segTotalMs, payloadTotalMs);
   if (
     allImages &&
     opts.slideshowFps24 !== false &&

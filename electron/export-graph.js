@@ -256,6 +256,12 @@ function clipNeedsReEncode(ctx) {
   } = ctx;
   const isVideo = !!(seg && seg.mediaType === "video" && seg.videoPath);
   if (!isVideo) return true;
+  // v1.29 LOOP-TO-FILL: a looping base video's window can be far LONGER
+  // than its source — the copy fast paths (legacy single-copy, sandwich,
+  // keyframe-aligned trims) would slice the finite SOURCE once and produce
+  // a clip shorter than the fill window (the v1.29 complaint-3 regression
+  // guard). A loop clip always renders through the graph (-stream_loop).
+  if (seg.loop === true) return true;
   if (resolveSegSpeed(seg) !== 1) return true;
   if ((Number(seg.trimInMs) || 0) > 0 && trimKeyAligned !== true) return true;
   if (Number(overlayCount) > 0) return true;
@@ -777,16 +783,36 @@ const HWACCEL_TOKEN = process.platform === "win32" ? "d3d11va" : "auto";
  * v5.1: `o.durMs` (SOURCE window, ms) adds the input `-t` so a sped-up clip
  * demuxes exactly the window setpts will retime. Absent (speed 1) → no `-t`,
  * byte-identical to the pre-v5.1 argv.
+ * v1.29 LOOP-TO-FILL (base-lane videos): `o.loop === true` prepends
+ * `-stream_loop -1` BEFORE -ss (same order as buildOverlayVideoInputArgs,
+ * v5.2) so a source SHORTER than the timeline window repeats to fill it;
+ * the seek is taken modulo the source duration when known (o.srcDurMs > 0 →
+ * a window running past the first iteration still lands inside it), and the
+ * input `-t` is OMITTED (the source is infinite — the OUTPUT `-t` that
+ * buildClipArgs appends bounds the encode at the fill window). `o.loop`
+ * falsy → argv byte-identical to the pre-v1.29 output.
  */
 function buildVideoInputArgs(o) {
   // v1.4.2: `ssSec` (µs-precision preformatted seconds) lets the chunked
   // encode path pass EXACT frame-aligned seek points — fmt3()'s ms
   // truncation can straddle a frame edge at 60 fps (16.7 ms/frame).
   // Legacy callers (no ssSec) keep the byte-identical fmt3 output.
-  const ss =
+  const loop = !!(o && o.loop);
+  let ss =
     o && o.ssSec != null
       ? o.ssSec
       : fmt3(Math.max(0, Number(o && o.trimInMs) || 0));
+  // v1.29: a looped input is infinite — the -ss would eventually address
+  // iteration 0 only; modulo keeps the seek inside the first pass (mirrors
+  // buildOverlayVideoInputArgs: ms % srcDurMs, then fmt3 seconds). ssSec
+  // (chunk path) never rides a loop — chunking is disabled for loop
+  // segments in main.js — but the modulo is applied to the numeric value
+  // anyway when both arrive (defensive).
+  if (loop && Number(o && o.srcDurMs) > 0) {
+    const ssMs = Number(ss) * 1000; // fmt3/ssSec are SECONDS; srcDurMs is ms
+    const modMs = Number(o.srcDurMs);
+    if (Number.isFinite(ssMs)) ss = fmt3(Math.max(0, ssMs % modMs));
+  }
   const hwTok =
     o && o.hwaccel === true
       ? HWACCEL_TOKEN
@@ -795,11 +821,14 @@ function buildVideoInputArgs(o) {
         : null;
   const hw = hwTok ? ["-hwaccel", hwTok] : [];
   const durMs = Number(o && o.durMs);
+  // v1.29: loop ⇒ NO input -t (the source is infinite; the output -t
+  // bounds the render at the fill window). Speed retiming still applies to
+  // the looped stream via setpts/atempo downstream.
   const t =
-    o && Number.isFinite(durMs) && durMs > 0
+    !loop && o && Number.isFinite(durMs) && durMs > 0
       ? ["-t", fmt3(durMs)]
       : [];
-  return [...hw, "-ss", ss, ...t, "-i", o && o.path];
+  return [...(loop ? ["-stream_loop", "-1"] : []), ...hw, "-ss", ss, ...t, "-i", o && o.path];
 }
 
 /** v5.1: format a speed factor for ffmpeg expressions (≤6 decimals). */
@@ -1752,13 +1781,22 @@ function buildClipArgs(ctx) {
     const effDurMs = ch ? ch.durMs : Math.max(0, Number(seg.durationMs) || 0);
     const sourceWinMs = speed !== 1 ? effDurMs * speed : 0;
     const ssMs = (Number(seg.trimInMs) || 0) + (ch ? ch.offsetMs * speed : 0);
+    // v1.29 LOOP-TO-FILL: a looping base video repeats its SOURCE to fill
+    // the timeline window — `-stream_loop -1` on the input, no input -t,
+    // and the OUTPUT -t (effDurSec) bounds the encode at the FILL window
+    // (endMs may sit far past sourceDurationMs). Chunking is disabled for
+    // loop segments upstream (a chunk seek past the source length would
+    // address the wrong window), so `ch` is always null here in practice.
+    const segLoop = seg.loop === true;
     const inputs = [
       ...buildVideoInputArgs({
         trimInMs: ssMs,
         ssSec: ch ? (ssMs / 1000).toFixed(6) : undefined,
         path: seg.videoPath,
         hwaccel,
-        durMs: speed !== 1 ? sourceWinMs : undefined,
+        durMs: !segLoop && speed !== 1 ? sourceWinMs : undefined,
+        loop: segLoop,
+        srcDurMs: segLoop ? Number(seg.sourceDurationMs) || 0 : undefined,
       }),
     ];
     let inputIdx = 1;

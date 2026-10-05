@@ -213,6 +213,24 @@ export async function testProviderKey(
 ): Promise<{ ok: boolean; message: string; models: string[] }> {
   const trimmed = key.trim();
   if (!trimmed) return { ok: false, message: "No key provided", models: [] };
+  // v1.29: mask the key in rejection messages so users can tell WHICH key
+  // was tested (mirrors the desktop classifier in groq-whisper.js — the
+  // auth-rejected request never shows up in the provider's usage console).
+  const maskKey = (k: string, head: number) =>
+    k.length <= head + 4 ? `${k.slice(0, 3)}…` : `${k.slice(0, head)}…${k.slice(-4)}`;
+  const classifyGroq = (status: number, body: string) => {
+    let api = "";
+    try {
+      api = (JSON.parse(body) as { error?: { message?: string } }).error?.message ?? "";
+    } catch { /* non-JSON */ }
+    const raw = api ? ` [${api}]` : "";
+    if (status === 401 || status === 403) {
+      return `Groq rejected the API key (${maskKey(trimmed, 7)}) — re-save a valid key from console.groq.com → API Keys${raw}`;
+    }
+    if (status === 429) return `Groq rate limit reached — wait a moment and test again${raw}`;
+    if (status >= 500) return `Groq server error (${status}) — usually transient, try again${raw}`;
+    return `Groq request failed (HTTP ${status})${raw}`;
+  };
   try {
     if (provider === "groq") {
       const res = await fetchWithTimeout("https://api.groq.com/openai/v1/models", {
@@ -220,7 +238,7 @@ export async function testProviderKey(
       });
       if (!res.ok) {
         const body = await res.text().catch(() => "");
-        return { ok: false, message: `Groq ${res.status}: ${body.slice(0, 200)}`, models: [] };
+        return { ok: false, message: classifyGroq(res.status, body), models: [] };
       }
       const j = (await res.json()) as { data?: { id?: string }[] };
       const whisper = (j.data ?? [])
@@ -237,6 +255,24 @@ export async function testProviderKey(
     });
     if (!res.ok) {
       const body = await res.text().catch(() => "");
+      // Google returns 400 with "API key not valid" for bad keys (and
+      // 401/403 for restricted ones) — route all key-shaped failures to
+      // the same actionable text.
+      let api = "";
+      try {
+        api = (JSON.parse(body) as { error?: { message?: string } }).error?.message ?? "";
+      } catch { /* non-JSON */ }
+      const keyish =
+        res.status === 401 ||
+        res.status === 403 ||
+        (res.status === 400 && /api key|api_key/i.test(api));
+      if (keyish) {
+        return {
+          ok: false,
+          message: `Gemini rejected the API key (${maskKey(trimmed, 4)}) — re-save a valid key from aistudio.google.com/apikey${api ? ` [${api}]` : ""}`,
+          models: [],
+        };
+      }
       return { ok: false, message: `Gemini ${res.status}: ${body.slice(0, 200)}`, models: [] };
     }
     const j = (await res.json()) as { models?: { name?: string }[] };

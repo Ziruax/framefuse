@@ -15,6 +15,7 @@ import {
   Plus,
   Upload,
   Music,
+  Mic,
   Trash2,
   Pencil,
   Check,
@@ -104,8 +105,10 @@ interface MediaPanelProps {
   skipped: string[];
   warnings: OverlapWarning[];
   onAddFiles: (files: File[]) => void;
-  /** Drag-drop support: ALL dropped audio files become music clips (v1.25). */
-  onAddAudioFiles: (files: File[]) => void;
+  /** Drag-drop support: ALL dropped audio files become music clips (v1.25).
+   *  v1.29: an optional role marks the import as VOICEOVER audio —
+   *  loop off, the timeline extends to its end, transcription prefers it. */
+  onAddAudioFiles: (files: File[], role?: "music" | "voice") => void;
   onAddSubtitleFile: (file: File) => void;
   /** Open a dropped .framefuse.json project (v4.2). */
   onLoadProjectFile: (file: File) => void;
@@ -115,6 +118,8 @@ interface MediaPanelProps {
    *  (per user request); videos stay button-reachable through this one. */
   openVideoPicker: () => void;
   openAudioPicker: () => void;
+  /** v1.29: open the VOICEOVER audio picker (imports role "voice"). */
+  openVoiceAudioPicker?: () => void;
   openSubtitlePicker: () => void;
   /** Removes ONE music clip by id (v1.25). */
   onRemoveMusicClip: (id: string) => void;
@@ -228,6 +233,7 @@ export function MediaPanelBase({
   openImagePicker,
   openVideoPicker,
   openAudioPicker,
+  openVoiceAudioPicker,
   openSubtitlePicker,
   onRemoveMusicClip,
   onRemoveSubtitles,
@@ -960,23 +966,63 @@ export function MediaPanelBase({
         )}
 
         {/* v1.3: AUDIO tab empty state (segments or not — the audio tab owns
-            the track card, beat sync and the SFX palette). */}
+            the track card, beat sync and the SFX palette).
+            v1.29: TWO explicit import paths — "Background music" (loop to
+            fill, the legacy default) and "Voiceover audio" (role "voice":
+            loop off, the timeline runs to its end, transcription prefers
+            it). Drag&drop still imports as background music. */}
         {mediaTab === "audio" && (
           <div className="space-y-1.5 p-3">
-            {musicClips.length === 0 && (
-              <button
-                type="button"
-                onClick={openAudioPicker}
-                className="ff-dropzone ff-grid-bg flex w-full cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-[#332e28] px-6 py-10 text-center transition-all duration-200 hover:border-teal-400 hover:bg-teal-500/10"
-              >
-                <Music className="mb-2 size-5" style={{ color: "#8f887f" }} />
-                <span className="text-[12px] font-medium" style={{ color: "#e7e5e4" }}>
-                  Attach background music
-                </span>
-                <span className="mt-1 text-[10px]" style={{ color: "#78716c" }}>
-                  MP3 · WAV · M4A · OGG — add as many tracks as you like; they stack on the Audio lane
-                </span>
-              </button>
+            {musicClips.length === 0 ? (
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={openAudioPicker}
+                  className="ff-dropzone ff-grid-bg flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-[#332e28] px-3 py-8 text-center transition-all duration-200 hover:border-teal-400 hover:bg-teal-500/10"
+                >
+                  <Music className="mb-2 size-5" style={{ color: "#8f887f" }} aria-hidden />
+                  <span className="text-[11px] font-medium" style={{ color: "#e7e5e4" }}>
+                    Background music
+                  </span>
+                  <span className="mt-1 text-[9px]" style={{ color: "#78716c" }}>
+                    loops to fill the video length
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={openVoiceAudioPicker ?? openAudioPicker}
+                  className="ff-dropzone ff-grid-bg flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed border-[#332e28] px-3 py-8 text-center transition-all duration-200 hover:border-teal-400 hover:bg-teal-500/10"
+                >
+                  <Mic className="mb-2 size-5" style={{ color: "#8f887f" }} aria-hidden />
+                  <span className="text-[11px] font-medium" style={{ color: "#e7e5e4" }}>
+                    Voiceover audio
+                  </span>
+                  <span className="mt-1 text-[9px]" style={{ color: "#78716c" }}>
+                    fixed length — the video runs to its end
+                  </span>
+                </button>
+              </div>
+            ) : (
+              openVoiceAudioPicker && (
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={openAudioPicker}
+                    className="flex cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-dashed border-[#332e28] py-2 text-[10px] font-semibold text-stone-500 transition-all duration-200 hover:border-teal-400 hover:bg-teal-500/10 hover:text-teal-300 active:scale-[0.98]"
+                  >
+                    <Music className="size-3" aria-hidden />
+                    Add music
+                  </button>
+                  <button
+                    type="button"
+                    onClick={openVoiceAudioPicker}
+                    className="flex cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-dashed border-[#332e28] py-2 text-[10px] font-semibold text-stone-500 transition-all duration-200 hover:border-teal-400 hover:bg-teal-500/10 hover:text-teal-300 active:scale-[0.98]"
+                  >
+                    <Mic className="size-3" aria-hidden />
+                    Add voiceover
+                  </button>
+                </div>
+              )
             )}
             {onAddSfx != null && (
               <SfxPalette
@@ -1968,7 +2014,11 @@ export function MediaPanelBase({
                     boxShadow: "0 2px 10px rgba(13, 148, 136, 0.12)",
                   }}
                 >
-                  <Music className="size-4" style={{ color: "#2dd4bf" }} />
+                  {clip.role === "voice" ? (
+                    <Mic className="size-4" style={{ color: "#2dd4bf" }} />
+                  ) : (
+                    <Music className="size-4" style={{ color: "#2dd4bf" }} />
+                  )}
                 </div>
                 <div className="min-w-0 flex-1">
                   <div
@@ -1979,7 +2029,10 @@ export function MediaPanelBase({
                     {clip.fileName}
                   </div>
                   <div className="text-[9px]" style={{ color: "#8f887f" }}>
-                    music track · {fmtTimecode(Math.max(0, clip.startMs))}
+                    {clip.role === "voice"
+                      ? "voiceover · fixed length"
+                      : "music track"}{" "}
+                    · {fmtTimecode(Math.max(0, clip.startMs))}
                     {clip.loop ? " · loop" : ""}
                     {clip.durationMs
                       ? ` · ${fmtTimecode(clip.durationMs)}`
@@ -2774,6 +2827,65 @@ function ClipSettings({
               : "Video only — images use the full frame."}
           </p>
         </div>
+
+        {/* v5.8: LOOP-TO-FILL (base-lane VIDEO) — the clip repeats until the
+            timeline end. THE fix for "10s video + 1h audio": turn this on
+            and the visuals repeat to match the audio's length. The overlay
+            lane keeps its own overlayLoop twin (see Overlay window below);
+            images never loop. */}
+        {!onOverlay && isVideo && (
+          <div
+            className="rounded-md border p-2"
+            style={{ borderColor: "#2b2723", backgroundColor: "#211e1a" }}
+          >
+            <div className="mb-1.5 flex items-center justify-between">
+              <span
+                className="flex items-center gap-1 text-[8px] font-semibold uppercase tracking-[0.12em]"
+                style={{ color: "#78716c" }}
+              >
+                <Repeat className="size-2.5" /> Loop to fill
+              </span>
+              <span
+                className="text-[9px] font-semibold"
+                style={{ color: edit?.loop === true ? "#2dd4bf" : "#8f887f" }}
+              >
+                {edit?.loop === true ? "looping" : "plays once"}
+              </span>
+            </div>
+            <button
+              type="button"
+              aria-pressed={edit?.loop === true}
+              onClick={() =>
+                onSetItemEdit(
+                  seg.id,
+                  edit?.loop === true ? { loop: undefined } : { loop: true },
+                )
+              }
+              className={cn(
+                "flex w-full cursor-pointer items-center justify-center gap-1 rounded border px-2 py-1 text-[9px] font-semibold transition-colors",
+              )}
+              style={
+                edit?.loop === true
+                  ? {
+                      borderColor: "rgba(13, 148, 136, 0.6)",
+                      backgroundColor: "rgba(13, 148, 136, 0.2)",
+                      color: "#2dd4bf",
+                    }
+                  : {
+                      borderColor: "#2b2723",
+                      backgroundColor: "#26221e",
+                      color: "#8f887f",
+                    }
+              }
+              title="Repeat this clip until the timeline end — a short video fills a long voiceover; the trim start is where each repeat begins"
+            >
+              <Repeat className="size-2.5" />
+              {edit?.loop === true
+                ? "Looping to the timeline end"
+                : "Loop to the timeline end"}
+            </button>
+          </div>
+        )}
 
         <ChromaSection
           seg={seg}

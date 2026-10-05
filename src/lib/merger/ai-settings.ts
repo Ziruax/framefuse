@@ -16,6 +16,12 @@
 // whisperGroqSet/geminiSet IPC — the store's key fields are then
 // best-effort mirrors, and the *OnDevice flags track the main-process truth.
 //
+// v1.29 KEY TRUTH: on desktop the DEVICE key file is the ONLY key any AI
+// feature sends. The Settings tab migrates any localStorage mirror onto the
+// device on first hydrate and then keeps the mirror EMPTY (groqKey/geminiKey
+// stay ""), so the *OnDevice flags alone describe desktop key presence and
+// the masked display can never show a stale second key.
+//
 // Model catalogs: the Groq chat ids, the Gemini text ids and the Groq
 // Whisper ids. The server routes accept the same ids
 // (src/lib/server/ai-models.ts keeps a mirrored copy — keep in sync).

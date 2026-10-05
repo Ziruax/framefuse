@@ -18,7 +18,7 @@
 //   "audio":    { "name": "voiceover.mp3", "type": "audio/mpeg", "dataUrl": "..." } | null,
 //   "musicClips":[ { "name": "...", "type": "audio/mpeg", "dataUrl": "...",          // v1.25
 //                   "startMs": 0, "volume": 1, "loop": true, "durationMs": 120000,
-//                   "sourceDurationMs": 120000 } ],
+//                   "sourceDurationMs": 120000, "role": "voice"? } ],               // v1.29 role
 //   "subtitles":{ "fileName": "...", "cues": [...] } | null,
 //   "headlines":[ ... ],
 //   "overrides":{ "f...": 4200 },
@@ -90,6 +90,9 @@ export interface ProjectMusicClipEntry {
   startMs: number;
   volume: number;
   loop: boolean;
+  /** v1.29: "voice" = voiceover/narration (loop forced false, extends the
+   *  timeline); "music"/absent = legacy background music. */
+  role?: "music" | "voice";
   /** Effective (trimmable) duration + the probed source length. */
   durationMs: number;
   sourceDurationMs: number;
@@ -166,6 +169,8 @@ export interface SaveProjectInput {
     startMs: number;
     volume: number;
     loop: boolean;
+    /** v1.29: voiceover vs background music (absent = music). */
+    role?: "music" | "voice";
     durationMs: number;
     sourceDurationMs: number;
   }[];
@@ -263,6 +268,10 @@ export async function buildProjectFile(
       startMs: Math.max(0, Math.round(mc.startMs) || 0),
       volume: Math.min(2, Math.max(0, mc.volume)),
       loop: mc.loop === true,
+      // v1.29: the clip's role survives the round-trip (absent = music).
+      ...(mc.role === "voice" || mc.role === "music"
+        ? { role: mc.role }
+        : {}),
       durationMs: Math.max(200, Math.round(mc.durationMs) || 200),
       sourceDurationMs: Math.max(0, Math.round(mc.sourceDurationMs) || 0),
     });
@@ -392,6 +401,10 @@ export function sanitizeItemEdits(
     // v5.2: loop the overlay source to span its full timeline window.
     if (edit.overlayLoop === true) {
       clean.overlayLoop = true;
+    }
+    // v5.8: loop the BASE-lane video source to fill the timeline end.
+    if (edit.loop === true) {
+      clean.loop = true;
     }
     if (
       edit.overlay &&
@@ -553,6 +566,8 @@ export interface LoadedProject {
     startMs: number;
     volume: number;
     loop: boolean;
+    /** v1.29: voiceover vs background music (undefined = music). */
+    role?: "music" | "voice";
     durationMs: number;
     sourceDurationMs: number;
   }[];
@@ -671,6 +686,11 @@ export async function parseProjectDoc(doc: unknown): Promise<LoadedProject> {
           startMs: Math.max(0, Math.round(Number(mc.startMs)) || 0),
           volume: Math.min(2, Math.max(0, Number(mc.volume) || 1)),
           loop: mc.loop === true,
+          // v1.29: role round-trip — only the two known values survive
+          // (anything else loads as the legacy music default).
+          ...(mc.role === "voice" || mc.role === "music"
+            ? { role: mc.role }
+            : {}),
           durationMs: Math.max(200, Math.round(Number(mc.durationMs)) || 200),
           sourceDurationMs: Math.max(0, Math.round(Number(mc.sourceDurationMs)) || 0),
         });

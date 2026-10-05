@@ -171,6 +171,13 @@ export interface ItemEdit {
    *  source window at 2× becomes a 5s timeline clip. Images and overlay-lane
    * clips resolve speed 1 (the export overlay graph is speed-1 by design). */
   speed?: number;
+  /** v5.8: loop the BASE-lane video source so the clip FILLS the timeline
+   *  end (loop-to-fill) — the base-lane twin of overlayLoop. A 10s video +
+   *  a 1h voiceover: turn this on and the video repeats until the audio's
+   *  end. The item edit (`ItemEdit.loop`) is the user toggle; the RESOLVED
+   *  flag here (true only on track-0 video segments) is what the preview
+   *  (modular currentTime) and the export (-stream_loop -1) consume. */
+  loop?: boolean;
   /** v5.2: loop the overlay source so it spans the full clip window even
    *  when the source is shorter than the timeline duration (green-screen
    *  clips stretched to the whole video). Export uses -stream_loop -1;
@@ -224,6 +231,11 @@ export interface MediaSegment {
   /** v5.2: true when the overlay source should LOOP to fill its whole
    *  timeline window (short green-screen clip spanning the full video). */
   overlayLoop: boolean;
+  /** v5.8: true when this BASE-lane VIDEO segment loops to FILL the timeline
+   *  end (loop-to-fill — `itemEdits[id].loop === true`). Absent/false = the
+   *  clip plays once and stops at its natural end. Present ONLY on base-lane
+   *  video segments (overlays keep using overlayLoop; images never loop). */
+  loop?: boolean;
   /** Resolved chroma key settings or null. NOT sanitized in the timeline —
    *  chroma.ts owns sanitization at the UI boundary. */
   chroma: ChromaKeySettings | null;
@@ -269,6 +281,17 @@ export interface MusicClip {
   volume: number;
   /** Loop the source to fill the remainder of the video (loop-to-fill). */
   loop: boolean;
+  /** v1.29: WHAT this clip is, not just how it behaves.
+   *  - "voice" — a VOICEOVER / narration clip: loop is forced false, the
+   *    clip EXTENDS the timeline (its full length becomes the video's end —
+   *    never trimmed to match the visuals), and transcription prefers it
+   *    (generateCaptionsFromAudio picks the first voice clip).
+   *  - "music" — legacy background music: loops to fill (default true) and
+   *    never extends the timeline.
+   *  ABSENT = "music" (back-compat: every pre-1.29 project/clip loads as
+   *  background music, exactly the old behavior). The lane + popovers offer
+   *  a role switch that keeps the invariant role voice ⇒ loop false. */
+  role?: "music" | "voice";
 }
 
 /** Factory: fresh placement id (monotonic seq keeps burst imports unique). */

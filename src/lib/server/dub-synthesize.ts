@@ -357,6 +357,15 @@ export async function synthesizeDubTrack(input: DubSynthInput): Promise<DubSynth
       warnings.push(`line ${i} has empty text — skipped`);
       continue;
     }
+    // v1.29: a line with NO speakable characters (punctuation-only, symbols,
+    // emoji, whitespace — real cases: garbage transcript tokens like "#" or
+    // "…") makes Edge TTS return zero audio, which used to fail the WHOLE
+    // dub run with a misleading "voice name is probably invalid" error.
+    // Skip it with a warning instead — one bad line must never kill the dub.
+    if (!/[\p{L}\p{N}]/u.test(text)) {
+      warnings.push(`line ${i} has no speakable text ("${text.slice(0, 12)}") — skipped`);
+      continue;
+    }
 
     try {
       const r = await synthesizeLineWithTiming(text, voice, line, wordTiming);
@@ -386,8 +395,13 @@ export async function synthesizeDubTrack(input: DubSynthInput): Promise<DubSynth
   segments.sort((a, b) => a.startMs - b.startMs);
 
   if (segments.length === 0 && input.lines.length > 0) {
+    const onlyUnspeakable =
+      warnings.length > 0 &&
+      warnings.every((w) => /no speakable text|empty text/.test(w));
     throw new Error(
-      warnings[0] || "Every dubbing line failed to synthesize",
+      onlyUnspeakable
+        ? "No speakable lines in the script — every line is punctuation/symbols only. Re-run transcription on real speech, or edit the script lines."
+        : warnings[0] || "Every dubbing line failed to synthesize",
     );
   }
   if (alignedCount > 0) {

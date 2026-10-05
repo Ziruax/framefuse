@@ -1,6 +1,6 @@
 "use client";
 
-// src/components/AiModelsSection.tsx — v1.28 SETTINGS TAB.
+// src/components/AiModelsSection.tsx — v1.28/v1.29 SETTINGS TAB.
 //
 // The ONE place provider/model defaults are configured:
 //   • API keys (Groq + Gemini)
@@ -15,6 +15,15 @@
 //     Test runs the main-process key check (no CORS, real network).
 //   • WEB PREVIEW: keys stay in localStorage and ride each API request;
 //     Test goes through POST /api/ai/test (server-side fetch).
+//
+// v1.29 KEY TRUTH (the "groq rejected the api key but the console shows no
+// call" fix): on DESKTOP the DEVICE key file is the ONLY key any AI feature
+// ever sends — so it is also the only key the Test button tests. A stale
+// localStorage mirror (web-preview or v1.27 era) is MIGRATED to the device
+// on first hydrate and then cleared, and keys are FORMAT-CHECKED before any
+// network call (gsk_… / AIza…, no quotes, no spaces). Rejection messages now
+// echo the MASKED key that was refused, because auth-rejected requests do
+// NOT appear in the provider consoles' usage.
 // Visual tokens mirror the SettingsPanel cards (#332e28 borders, #26221e /
 // #211e1a fills, stone text) so the tab looks native.
 
@@ -146,6 +155,72 @@ function keyBridge(): KeyBridge | null {
   return api ?? null;
 }
 
+// ---------------------------------------------------------------------------
+// v1.29 key pre-flight — catch the classic paste artifacts BEFORE any
+// network call (a quoted/spaced/prefixed-wrong key can only ever produce
+// a 403 "rejected the API key" with no trace in console usage).
+// ---------------------------------------------------------------------------
+
+/** Strip ONE pair of wrapping quotes (the classic copy-paste artifact) —
+ *  mirrors main.js's GQ.normalizeGroqApiKey backstop. */
+function stripWrappingQuotes(s: string): string {
+  const t = s.trim();
+  if (
+    t.length >= 2 &&
+    ((t.startsWith('"') && t.endsWith('"')) ||
+      (t.startsWith("'") && t.endsWith("'")))
+  ) {
+    return t.slice(1, -1).trim();
+  }
+  return t;
+}
+
+interface KeyProblem {
+  title: string;
+  description: string;
+}
+
+/** Groq keys start with "gsk_" and carry no whitespace/quotes/newlines. */
+function groqKeyProblem(key: string): KeyProblem | null {
+  if (!key) {
+    return {
+      title: "Paste your Groq API key first",
+      description: "Get a free key at console.groq.com/keys.",
+    };
+  }
+  if (!key.startsWith("gsk_")) {
+    return {
+      title: "That doesn't look like a Groq API key",
+      description: "Copy the full gsk_… key from console.groq.com/keys (no quotes, no spaces).",
+    };
+  }
+  if (/\s/.test(key) || /["']/.test(key)) {
+    return {
+      title: "The Groq API key contains spaces or quotes",
+      description: "Copy the full gsk_… key from console.groq.com/keys — exactly as shown, no quotes, no spaces.",
+    };
+  }
+  return null;
+}
+
+/** Gemini keys are AIza…-style; sanity only (no hard length rule — Google
+ *  has shipped more than one length). */
+function geminiKeyProblem(key: string): KeyProblem | null {
+  if (!key) {
+    return {
+      title: "Paste your Gemini API key first",
+      description: "Get a free key at aistudio.google.com/apikey.",
+    };
+  }
+  if (/\s/.test(key) || /["']/.test(key)) {
+    return {
+      title: "That doesn't look like a Gemini API key",
+      description: "Copy the full AIza… key from aistudio.google.com/apikey (no quotes, no spaces).",
+    };
+  }
+  return null;
+}
+
 function KeyRow({ provider }: { provider: "groq" | "gemini" }) {
   const ai = useAiSettings();
   const isGroq = provider === "groq";
@@ -167,6 +242,18 @@ function KeyRow({ provider }: { provider: "groq" | "gemini" }) {
   );
 
   // Hydrate the desktop key status (masked form + on-device flag) once.
+  // v1.29 KEY TRUTH: on desktop the DEVICE key file (userData/groq.json /
+  // gemini.json) is the ONLY key transcription and script writing ever
+  // send, so this effect also reconciles any localStorage mirror:
+  //   • device has NO key + localStorage has one (web-preview or v1.27
+  //     era) → MIGRATE it onto the device, then clear the localStorage copy;
+  //   • device HAS a key + localStorage also has one (stale — possibly a
+  //     DIFFERENT key) → keep the device key, clear the localStorage copy
+  //     so the masked display and the Test button can never point at the
+  //     wrong key. This is the exact v1.28 bug: Test passed on the
+  //     localStorage key while transcription sent the device one.
+  // Runs once per mount (deps [isGroq]) — a second run would find an empty
+  // localStorage mirror and do nothing.
   useEffect(() => {
     if (!bridge) return;
     let alive = true;
@@ -175,13 +262,60 @@ function KeyRow({ provider }: { provider: "groq" | "gemini" }) {
         if (isGroq) {
           const st = await bridge.whisperGroqGet?.();
           if (!alive || !st) return;
-          setDeviceMasked(st.maskedKey || "");
-          if (st.hasKey) persist({ groqKeyOnDevice: true });
+          if (st.hasKey) {
+            setDeviceMasked(st.maskedKey || "");
+            persist(
+              savedKey
+                ? { groqKey: "", groqKeyOnDevice: true }
+                : { groqKeyOnDevice: true },
+            );
+            // A device key exists — never leave the row in its editing
+            // state (v1.28 quirk: first desktop mount with a pre-existing
+            // groq.json showed an EMPTY input instead of the masked key).
+            setEditing(false);
+            return;
+          }
+          if (savedKey) {
+            const cleaned = stripWrappingQuotes(savedKey);
+            if (groqKeyProblem(cleaned)) {
+              // A malformed mirror can never work — drop it so the row
+              // starts clean in its editing state.
+              persist({ groqKey: "", groqKeyOnDevice: false });
+              return;
+            }
+            await bridge.whisperGroqSet?.({ apiKey: cleaned, model: ai.sttGroqModel });
+            const st2 = await bridge.whisperGroqGet?.();
+            if (!alive) return;
+            setDeviceMasked(st2?.maskedKey || "");
+            persist({ groqKey: "", groqKeyOnDevice: true });
+            setEditing(false);
+          }
         } else {
           const st = await bridge.geminiGet?.();
           if (!alive || !st) return;
-          setDeviceMasked(st.maskedKey || "");
-          if (st.hasKey) persist({ geminiKeyOnDevice: true });
+          if (st.hasKey) {
+            setDeviceMasked(st.maskedKey || "");
+            persist(
+              savedKey
+                ? { geminiKey: "", geminiKeyOnDevice: true }
+                : { geminiKeyOnDevice: true },
+            );
+            setEditing(false);
+            return;
+          }
+          if (savedKey) {
+            const cleaned = stripWrappingQuotes(savedKey);
+            if (geminiKeyProblem(cleaned)) {
+              persist({ geminiKey: "", geminiKeyOnDevice: false });
+              return;
+            }
+            await bridge.geminiSet?.({ apiKey: cleaned });
+            const st2 = await bridge.geminiGet?.();
+            if (!alive) return;
+            setDeviceMasked(st2?.maskedKey || "");
+            persist({ geminiKey: "", geminiKeyOnDevice: true });
+            setEditing(false);
+          }
         }
       } catch {
         /* bridge hiccup — the row just starts in its editing state */
@@ -193,18 +327,25 @@ function KeyRow({ provider }: { provider: "groq" | "gemini" }) {
   }, [isGroq]);
 
   const save = useCallback(async () => {
-    const key = input.trim();
+    const key = stripWrappingQuotes(input);
     if (!key) return;
+    // v1.29 pre-flight: never store or send an obviously malformed key.
+    const problem = isGroq ? groqKeyProblem(key) : geminiKeyProblem(key);
+    if (problem) {
+      toast.error(problem.title, { description: problem.description });
+      return;
+    }
     setBusy("save");
     try {
       if (bridge) {
         // Desktop — the MAIN process owns the key file (userData, 0600).
+        // The localStorage mirror stays EMPTY (device key is the truth).
         if (isGroq) {
           await bridge.whisperGroqSet?.({ apiKey: key, model: ai.sttGroqModel });
         } else {
           await bridge.geminiSet?.({ apiKey: key });
         }
-        persist(isGroq ? { groqKeyOnDevice: true } : { geminiKeyOnDevice: true });
+        persist(isGroq ? { groqKey: "", groqKeyOnDevice: true } : { geminiKey: "", geminiKeyOnDevice: true });
         setEditing(false);
         setInput("");
         toast.success(`${isGroq ? "Groq" : "Gemini"} key saved`, {
@@ -229,20 +370,39 @@ function KeyRow({ provider }: { provider: "groq" | "gemini" }) {
   }, [input, isGroq, persist, bridge, ai.sttGroqModel]);
 
   const test = useCallback(async () => {
-    const candidate = editing && input.trim() ? input.trim() : savedKey;
-    if (!candidate && !bridge) return; // desktop can test the SAVED on-device key
+    // v1.29 KEY TRUTH: on DESKTOP the device key file is the only key the
+    // app ever sends — so it is the only "saved" key Test checks:
+    //   • editing with input → validate + test the INPUT (pre-flight first);
+    //   • otherwise → send NO apiKey: the main process tests the key saved
+    //     on this device (userData/groq.json / gemini.json). The
+    //     localStorage mirror is NEVER sent from desktop — it may be a
+    //     different key, which is exactly the v1.28 "test passed but
+    //     transcription said the key was rejected" bug.
+    const typed = editing ? stripWrappingQuotes(input) : "";
+    if (typed) {
+      const problem = isGroq ? groqKeyProblem(typed) : geminiKeyProblem(typed);
+      if (problem) {
+        toast.error(problem.title, { description: problem.description });
+        return;
+      }
+    }
+    if (!bridge && !typed && !savedKey) return; // web with nothing to test
     setBusy("test");
     try {
       let ok = false;
       let message = "";
       if (bridge) {
-        // Desktop — the main-process check (real https, no CORS).
+        // Desktop — the main-process check (real https, no CORS). An empty
+        // payload means "test the key saved on this device".
         const r = isGroq
-          ? await bridge.whisperGroqTest?.(candidate ? { apiKey: candidate } : {})
-          : await bridge.geminiTest?.(candidate ? { apiKey: candidate } : {});
+          ? await bridge.whisperGroqTest?.(typed ? { apiKey: typed } : {})
+          : await bridge.geminiTest?.(typed ? { apiKey: typed } : {});
         ok = !!r?.ok;
         message = r?.message ?? "";
       } else {
+        // Web preview — the localStorage key rides the request.
+        const candidate = typed || savedKey;
+        if (!candidate) return;
         const res = await fetch("/api/ai/test", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -273,7 +433,9 @@ function KeyRow({ provider }: { provider: "groq" | "gemini" }) {
         if (isGroq) await bridge.whisperGroqSet?.({ apiKey: "" });
         else await bridge.geminiClear?.();
         setDeviceMasked("");
-        persist(isGroq ? { groqKeyOnDevice: false } : { geminiKeyOnDevice: false });
+        // v1.29: clear the localStorage mirror too — after removal NO key
+        // may linger anywhere (the row must start clean in editing mode).
+        persist(isGroq ? { groqKey: "", groqKeyOnDevice: false } : { geminiKey: "", geminiKeyOnDevice: false });
       } else {
         persist(isGroq ? { groqKey: "" } : { geminiKey: "" });
       }
@@ -288,10 +450,15 @@ function KeyRow({ provider }: { provider: "groq" | "gemini" }) {
   }, [bridge, isGroq, persist]);
 
   const hasSomeKey = !!savedKey || onDevice;
-  const masked =
-    savedKey
-      ? `${savedKey.slice(0, 6)}${"•".repeat(Math.max(4, Math.min(24, savedKey.length - 8)))}${savedKey.slice(-3)}`
-      : deviceMasked;
+  const localMask = savedKey
+    ? `${savedKey.slice(0, 6)}${"•".repeat(Math.max(4, Math.min(24, savedKey.length - 8)))}${savedKey.slice(-3)}`
+    : "";
+  // v1.29: on DESKTOP the DEVICE key is the truth — its masked form wins
+  // whenever we're not mid-edit (a stale localStorage copy must never be
+  // the thing the user reads back). The local mask only shows as a
+  // pre-hydrate fallback — and on the web preview, where localStorage IS
+  // the truth.
+  const masked = bridge && !editing ? deviceMasked || localMask : localMask || deviceMasked;
 
   return (
     <div className="rounded-lg border p-2.5" style={INNER}>

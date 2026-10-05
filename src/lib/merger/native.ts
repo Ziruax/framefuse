@@ -110,9 +110,29 @@ interface NativeSegPayload {
    *  the FFmpeg graph as setpts (video) + atempo (audio) — mirrors how
    *  volume travels: resolved by timeline.ts, consumed by export-graph.js. */
   speed?: number;
+  /** v1.29 LOOP-TO-FILL (base-lane videos): true when this segment's
+   *  [startMs, endMs) window is a FILL window that repeats the source
+   *  (short video looped to match a long audio track). Only ever set on
+   *  track-0 video segments; endMs/durationMs = the fill window (may be
+   *  much longer than sourceDurationMs). The export chain renders it with
+   *  `-stream_loop -1` and bounds the output at the fill window. */
+  loop?: true;
   chroma?: ChromaKeySettings | null;
   overlay?: OverlayTransform | null;
 }
+
+/**
+ * v1.29 (task 16-b2): the renderer-contract fields read defensively. The
+ * 16-b1 agent lands `MediaSegment.loop` / `MusicClip.role` in types.ts in
+ * parallel; casting through these minimal shapes keeps THIS module
+ * type-clean both before and after those fields exist (structural typing —
+ * no excess-property checks apply to variable references).
+ */
+const loopFillOf = (seg: { loop?: boolean }): boolean => seg.loop === true;
+const roleOf = (
+  clip: { role?: "music" | "voice" },
+): "music" | "voice" | undefined =>
+  clip.role === "voice" || clip.role === "music" ? clip.role : undefined;
 
 /** Overlay-lane segment (track ≥ 1) → composited per clip, never a clip. */
 interface NativeOverlayPayload {
@@ -430,6 +450,10 @@ async function exportViaFFmpeg(
           ...(seg.speed != null && seg.speed !== 1
             ? { speed: seg.speed }
             : {}),
+          // v1.29 LOOP-TO-FILL: only when the timeline resolved this base
+          // video as a loop-to-fill window (absent for every legacy project
+          // — payload stays byte-identical).
+          ...(loopFillOf(seg) ? { loop: true } : {}),
           chroma: seg.chroma ? sanitizeChromaKeySettings(seg.chroma) : null,
           overlay: seg.overlay,
         });
@@ -505,6 +529,10 @@ async function exportViaFFmpeg(
     loop: boolean;
     durationMs: number;
     fileName: string;
+    /** v1.29: "music" | "voice" (voice = full-length narration-style
+     *  placement; loop is always false there). Informational for the
+     *  export chain — the renderer already resolved loop per role. */
+    role?: "music" | "voice";
   }[] | null = null;
   if (opts.sfx && opts.sfx.length > 0) {
     const wavCache = new Map<string, { wavPath: string; durationMs: number } | null>();
@@ -561,6 +589,7 @@ async function exportViaFFmpeg(
       loop: boolean;
       durationMs: number;
       fileName: string;
+      role?: "music" | "voice";
     }[] = [];
     for (const clip of musicClips) {
       if (!clip || !clip.url) continue;
@@ -574,6 +603,7 @@ async function exportViaFFmpeg(
             name: clip.fileName || `music_${clip.id}`,
             bytes: await fetchBytes(clip.url),
           });
+      const clipRole = roleOf(clip);
       ipcMusicClips.push({
         path,
         startMs: Math.max(0, Math.round(clip.startMs) || 0),
@@ -581,6 +611,7 @@ async function exportViaFFmpeg(
         loop: clip.loop === true,
         durationMs: Math.max(0, Math.round(clip.durationMs) || 0),
         fileName: clip.fileName,
+        ...(clipRole ? { role: clipRole } : {}),
       });
     }
     if (ipcMusicClips.length > 0) ipcMusic = ipcMusicClips;
@@ -813,6 +844,14 @@ async function exportViaFFmpeg(
       slideshowFps24: settings.slideshowFps24 !== false,
       // v1.2: export audio bitrate (192 default = v1.1 behavior).
       audioKbps: settings.audioKbps ?? 192,
+      // v1.29 AUDIO-EXTENDED TIMELINE: the renderer's authoritative timeline
+      // total (fillEndMs = max(last visual segment end, non-loop audio ends)).
+      // The main process takes max(payload totalMs, segments end) so a long
+      // audio track no longer trims to the visual length (user complaints
+      // 3/4). Omitted when absent/invalid → legacy payloads byte-identical.
+      ...(Number.isFinite(opts.totalMs) && opts.totalMs > 0
+        ? { totalMs: Math.max(0, Math.round(opts.totalMs)) }
+        : {}),
       kenBurns,
       segments: segPayload,
       audioPath,

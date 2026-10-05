@@ -1085,11 +1085,16 @@ function groqConfigPayload() {
 
 ipcMain.handle("whisper:groq-get", async () => groqConfigPayload());
 
-/** { apiKey?: string ("" clears), model?: "whisper-large-v3-turbo" | "whisper-large-v3" } */
+/** { apiKey?: string ("" clears), model?: "whisper-large-v3-turbo" | "whisper-large-v3" }
+ *  v1.29: the pasted key is NORMALIZED here (main-process backstop) — one
+ *  pair of wrapping quotes is stripped, and a key that still contains
+ *  internal whitespace/quotes THROWS (the renderer surfaces the message).
+ *  Malformed keys must never reach groq.json: they only produce a
+ *  "Groq rejected the API key" 403 later — with no trace in console usage. */
 ipcMain.handle("whisper:groq-set", async (_event, payload) => {
   const patch = {};
   if (payload && typeof payload.apiKey === "string") {
-    patch.apiKey = payload.apiKey.trim();
+    patch.apiKey = GQ.normalizeGroqApiKey(payload.apiKey);
   }
   if (payload && typeof payload.model === "string" && payload.model) {
     patch.model = payload.model;
@@ -4068,7 +4073,7 @@ function optimizeAssForConstrainedCpu(doc) {
 }
 
 ipcMain.handle("export-native", async (event, opts) => {
-  const { outputPath, fps: reqFps, width: reqWidth, height: reqHeight, bitrateMbps, quality, crf, audioKbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark, overlays, sfx, fastMode: fastModeWanted, slideshowFps24, textRemoval: textRemovalRaw, headlineGeometry, kineticCompositions, kineticGeometry, voiceovers, dubOriginalVolume } = opts;
+  const { outputPath, fps: reqFps, width: reqWidth, height: reqHeight, bitrateMbps, quality, crf, audioKbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark, overlays, sfx, fastMode: fastModeWanted, slideshowFps24, textRemoval: textRemovalRaw, headlineGeometry, kineticCompositions, kineticGeometry, voiceovers, dubOriginalVolume, totalMs: payloadTotalMs } = opts;
   // ── v1.25 MULTI-MUSIC payload normalization ───────────────────────────
   // The renderer now ships `musicClips` (N placements, each with its resolved
   // real path). OLD payloads (and any other call sites) still send the legacy
@@ -4083,6 +4088,11 @@ ipcMain.handle("export-native", async (event, opts) => {
               startMs: Math.max(0, Math.round(Number(c.startMs) || 0)),
               volume: Math.max(0, Math.min(2, Number(c.volume) || 1)),
               loop: !!(c && c.loop),
+              // v1.29: "music" | "voice" — voice = full-length narration-style
+              // placement (loop is false there by contract). Informational for
+              // the graph builders (branches are volume/fades/adelay either
+              // way); sanitized to the two legal values, default "music".
+              role: c.role === "voice" ? "voice" : "music",
             }
           : null)
         .filter(Boolean)
@@ -4195,7 +4205,30 @@ ipcMain.handle("export-native", async (event, opts) => {
   // coordinate space. The pre-fast-mode call sites (two-step + chunk jobs,
   // built at the ORIGINAL dims) also read it before any reassignment.
   let kineticGeoList = Array.isArray(kineticGeometry) ? kineticGeometry : undefined;
-  const totalMs = segments.reduce((sum, s) => Math.max(sum, s.endMs ?? (s.startMs ?? 0) + s.durationMs), 0) || segments.reduce((sum, s) => sum + s.durationMs, 0);
+  // v1.29 AUDIO-EXTENDED TIMELINE (user complaints 3/4 — the CRITICAL fix):
+  // totalMs used to be recomputed from the SEGMENTS alone, so a 1h9m audio
+  // over a 10s video trimmed every downstream -t/apad/fade clock to 10s.
+  // The renderer now ships the authoritative total (fillEndMs = max(last
+  // visual end, non-loop audio ends)); take max(segments, payload) so a
+  // stale/absent payload keeps the legacy value and an audio-driven timeline
+  // extends the export clocks (mix -t, apad whole_dur, fade-out alignment).
+  const segmentsTotalMs = segments.reduce((sum, s) => Math.max(sum, s.endMs ?? (s.startMs ?? 0) + s.durationMs), 0) || segments.reduce((sum, s) => sum + s.durationMs, 0);
+  const payloadTotal = Number.isFinite(Number(payloadTotalMs)) ? Math.max(0, Number(payloadTotalMs)) : 0;
+  const totalMs = Math.max(segmentsTotalMs, payloadTotal);
+  if (payloadTotal > segmentsTotalMs) {
+    console.log(
+      `[Export] audio-extended timeline: segments end at ${(segmentsTotalMs / 1000).toFixed(1)}s — payload totalMs ${(payloadTotal / 1000).toFixed(1)}s extends the export clocks (audio no longer trims to the visuals)`,
+    );
+  }
+  // v1.29 LOOP-TO-FILL: any base-lane video marked loop renders through the
+  // -stream_loop graph as ONE process (chunking/sub-windowing is disabled
+  // for it — see the chunk plan below and the smart-pipeline gate).
+  const hasBaseLoopSeg = segments.some((s) => s && s.mediaType === "video" && s.loop === true);
+  if (hasBaseLoopSeg) {
+    console.log(
+      `[Export] base-lane loop-to-fill: ${segments.filter((s) => s && s.mediaType === "video" && s.loop === true).length} looping video segment(s) — chunked encode + smart windowing disabled for them (single -stream_loop render per loop clip)`,
+    );
+  }
   const totalSec = totalMs / 1000;
 
   // ── v1.14.5 SLIDESHOW 24 FPS MODE (export-speed plan §2 — Phase 1) ──────
@@ -4546,7 +4579,11 @@ ipcMain.handle("export-native", async (event, opts) => {
     // keeping the legacy budget byte-for-byte.
     const estVideoJobs = segments.reduce((n, s) => {
       if (s && s.mediaType === "video" && s.videoPath) {
-        const plan = G.planChunkFrames(Number(s.durationMs) || 0, fps, CHUNK_TARGET_SEC, maxChunks);
+        // v1.29: looping base videos NEVER chunk (the chunk offsets would
+        // seek past the finite SOURCE — the loop renders as one process).
+        const plan = s.loop === true
+          ? null
+          : G.planChunkFrames(Number(s.durationMs) || 0, fps, CHUNK_TARGET_SEC, maxChunks);
         return n + (plan ? plan.length : 1);
       }
       return n + 1;
@@ -5034,7 +5071,13 @@ ipcMain.handle("export-native", async (event, opts) => {
       // Images are deliberately NOT chunked (zoompan frame indexing +
       // slideshows are inherently many-clip).
       const segIsVideo = seg.mediaType === "video" && seg.videoPath;
-      const chunkPlan = segIsVideo
+      // v1.29 LOOP-TO-FILL: chunking is DISABLED for looping segments — the
+      // chunk plan's per-chunk seeks are offsets into the SOURCE window,
+      // which for a loop is only the first sourceDurationMs of a fill window
+      // that can be far longer (a 1h9m fill over a 10s source would emit
+      // chunks seeking to 30min of a 10s file). The loop renders as ONE
+      // -stream_loop process bounded by the output -t (= the fill window).
+      const chunkPlan = segIsVideo && seg.loop !== true
         ? G.planChunkFrames(Number(seg.durationMs) || 0, fps, CHUNK_TARGET_SEC, maxChunks)
         : null;
       // v1.4.2→v1.12: hw decode is per-source, probe-gated tri-state
@@ -5163,22 +5206,44 @@ ipcMain.handle("export-native", async (event, opts) => {
       // applied here via atempo; volume stays in the step-2 mix graph).
       // v6 FIX: -ss trimInMs — the extraction window now matches the video
       // arm (the v5.2 argv read the audio from the file START).
+      // v1.29 LOOP-TO-FILL: a looping base video's OWN audio must loop with
+      // it — -stream_loop -1 on the input (BEFORE -ss, the overlay-input
+      // order), -ss taken modulo the source duration, NO input -t (the
+      // source is infinite), and the OUTPUT -t bounds the extraction at the
+      // segment's timeline window (the fill window). Speed retiming (atempo)
+      // applies to the looped stream exactly as it does to the video arm.
+      // (The copy/sandwich branches above can never see a loop segment —
+      // clipNeedsReEncode returns true for loop, so the re-encode path is
+      // the only reachable one for them.)
       if (segHasAudio) {
         const wavPath = path.join(tempDir, `audio_${String(i).padStart(4, "0")}_${Date.now()}.wav`);
         tempFiles.push(wavPath);
         const speed = Number(seg.speed) > 0 ? Number(seg.speed) : 1;
         const sourceWinMs = speed !== 1 ? Math.max(0, Number(seg.durationMs) || 0) * speed : 0;
         const tempo = speed !== 1 ? G.atempoFilters(speed) : [];
+        const segLoop = seg.loop === true;
+        const loopSrcDurMs = segLoop ? Number(seg.sourceDurationMs) || 0 : 0;
+        const loopSsMs = loopSrcDurMs > 0
+          ? Math.max(0, trimInMs % loopSrcDurMs)
+          : trimInMs;
         clipAudioJobs.push({
           idx: jobs.length + clipAudioJobs.length,
           args: [
-            ...(trimInMs > 0 ? ["-ss", G.fmt3(trimInMs)] : []),
-            ...(sourceWinMs > 0 ? ["-t", (sourceWinMs / 1000).toFixed(3)] : []),
+            ...(segLoop ? ["-stream_loop", "-1"] : []),
+            ...((!segLoop && trimInMs > 0) || (segLoop && loopSsMs > 0)
+              ? ["-ss", G.fmt3(segLoop ? loopSsMs : trimInMs)]
+              : []),
+            ...(!segLoop && sourceWinMs > 0 ? ["-t", (sourceWinMs / 1000).toFixed(3)] : []),
             "-i", seg.videoPath,
             "-vn",
             ...(tempo.length > 0 ? ["-af", tempo.join(",")] : []),
             "-ar", "48000", "-ac", "2",
             "-c:a", "pcm_s16le",
+            // v1.29: loop ⇒ OUTPUT -t = the timeline window (bounds the
+            // otherwise-infinite looped extraction at the fill window).
+            ...(segLoop
+              ? ["-t", (Math.max(0, Number(seg.durationMs) || 0) / 1000).toFixed(3)]
+              : []),
             "-y", wavPath,
           ],
           wavPath,
@@ -5955,7 +6020,13 @@ ipcMain.handle("export-native", async (event, opts) => {
                 plan: aPlan,
                 scriptPath: aScriptPath,
                 abr: `${abr}k`,
-                totalSec: plan.totalFrames / fps,
+                // v1.29 AUDIO-EXTENDED TIMELINE: the audio bus is bounded by
+                // the FULL export total (max(video frames, payload totalMs))
+                // — the video frame model alone would trim a voice/music
+                // track back to the visual length (the complaint-3/4 bug).
+                // The final mux's -shortest still ends the FILE at the video
+                // end when the visuals are shorter (verified behavior).
+                totalSec: Math.max(plan.totalFrames / fps, totalSec),
                 outputPath: spAudioPath,
               });
               const audioStart = Date.now();
@@ -6153,11 +6224,20 @@ ipcMain.handle("export-native", async (event, opts) => {
       }
     };
 
-    if (anyEncodeJob) {
+    if (anyEncodeJob && !hasBaseLoopSeg) {
       const smartResult = await planSmartRenderingPipeline();
       if (smartResult) return smartResult;
       // (the pipeline logged why it fell back — the two-step pool below
       // takes over with its per-clip jobs + concat + amix)
+    } else if (anyEncodeJob && hasBaseLoopSeg) {
+      // v1.29: the smart pipeline's clean/dirty windowing + per-window
+      // sub-seeks (windowSegmentsForChunk ssSec, keyframe-snapped copies)
+      // assume the source window covers the timeline window — a loop
+      // segment's fill window can be far PAST its source length, so looping
+      // projects ride the two-step pool (per-clip -stream_loop renders).
+      console.log(
+        "[framefuse] smart render skipped: base-lane loop-to-fill segment(s) → two-step pool (per-clip -stream_loop renders)",
+      );
     }
 
     // ─── STEP 1 (run): PARALLEL encode + audio-extraction pool ────
@@ -6373,6 +6453,17 @@ ipcMain.handle("export-native", async (event, opts) => {
     // audio mix (clip WAVs + music + SFX → amix → AAC once). Music-only /
     // no-audio projects keep the exact v4.9 -af / copy paths.
     // v1.1: totalSec = the ACTUAL concatenated video length (see above).
+    // v1.29 MUX DECISION (video SHORTER than audio, real-ffmpeg verified —
+    // /tmp smoke, ffmpeg 7.1.5): every audio-bearing mux branch already
+    // carries -shortest, so when the audio-extended totalSec (40s) exceeds
+    // the concat video length (10s) the file simply ENDS at the video end
+    // with the audio truncated at the file end — measured: 10.023s output,
+    // 0.3s wall (no stall on the longer amix/apad stream), both streams
+    // present, full decode clean. NO extra -t/-shortest added: the whole
+    // point of the audio-extended total is the audio rides the full clock
+    // (mix -t, apad whole_dur, fade alignment); the FILE end follows the
+    // visuals. Loop-to-fill projects never hit this case (the loop clip
+    // extends the video to the audio's end).
     const concatArgs = G.buildConcatArgs({
       concatListPath,
       audioPath: legacyMusicPath2,

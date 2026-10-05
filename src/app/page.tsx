@@ -717,6 +717,9 @@ export default function Page() {
   const imageInputRef = useRef<HTMLInputElement>(null);
   const videoInputRef = useRef<HTMLInputElement>(null);
   const audioInputRef = useRef<HTMLInputElement>(null);
+  // v1.29: VOICEOVER picker — same multi-file audio input, but imports with
+  // role "voice" (loop off, extends the timeline, transcription prefers it).
+  const voiceAudioInputRef = useRef<HTMLInputElement>(null);
   // v1.11: all-media picker (the welcome hero's "Import media" card — one
   // dialog, images AND videos; the per-kind buttons stay in the media panel).
   const mediaInputRef = useRef<HTMLInputElement>(null);
@@ -729,6 +732,11 @@ export default function Page() {
   // v1.11: welcome hero — images + videos in one picker.
   const openMediaPicker = useCallback(() => mediaInputRef.current?.click(), []);
   const openAudioPicker = useCallback(() => audioInputRef.current?.click(), []);
+  // v1.29: the Media panel's "Voiceover audio" button imports role "voice".
+  const openVoiceAudioPicker = useCallback(
+    () => voiceAudioInputRef.current?.click(),
+    [],
+  );
   const openSubtitlePicker = useCallback(
     () => subtitleInputRef.current?.click(),
     [],
@@ -789,7 +797,14 @@ export default function Page() {
     return { entries: ents, skippedUnparseable: skipped };
   }, [items, videoThumbnails]);
 
-  const timeline = useMemo(
+  // v5.8 TWO-PASS timeline. Pass 1 (raw): the classic build with NO fill —
+  // its totalMs is the pure VISUAL extent. The AUDIO extension (v1.29: a
+  // NON-loop music clip — a voiceover, or any track the user un-looped —
+  // runs to its full source end) then raises the fill target, and pass 2
+  // re-resolves the timeline with that target so base-lane looping videos
+  // stretch to the end. fillEndMs is computed from the RAW pass only —
+  // never from the loop-extended result (no recursion, no feedback loop).
+  const rawTimeline = useMemo(
     () =>
       buildTimeline(
         entries,
@@ -800,6 +815,47 @@ export default function Page() {
         videoDurations,
       ),
     [entries, overrides, kenBurns, motionOverrides, itemEdits, videoDurations],
+  );
+  /** v1.29: the furthest end of any NON-loop audio clip (role "voice"
+   *  implies non-loop; a legacy music clip with loop turned off also
+   *  extends — that's exactly the 1h9m-audio-vs-10s-video complaint).
+   *  Loop/music clips never extend the timeline (music loops to fill). */
+  const audioExtEndMs = useMemo(
+    () =>
+      musicClips.reduce(
+        (m, c) =>
+          c.loop || c.role === "music"
+            ? m
+            : Math.max(
+                m,
+                c.startMs + Math.max(200, c.sourceDurationMs || c.durationMs),
+              ),
+        0,
+      ),
+    [musicClips],
+  );
+  /** v5.8: the loop-to-fill target = max(raw visual end, audio extension). */
+  const timelineFillEndMs = Math.max(rawTimeline.totalMs, audioExtEndMs);
+  const timeline = useMemo(
+    () =>
+      buildTimeline(
+        entries,
+        overrides,
+        kenBurns,
+        motionOverrides,
+        itemEdits,
+        videoDurations,
+        timelineFillEndMs,
+      ),
+    [
+      entries,
+      overrides,
+      kenBurns,
+      motionOverrides,
+      itemEdits,
+      videoDurations,
+      timelineFillEndMs,
+    ],
   );
 
   // ---- v1.14: DISPLAY timeline (base + disclaimer lead-in offset) ----------
@@ -820,7 +876,28 @@ export default function Page() {
     () => shiftSegments(timeline.segments, disclaimerOffsetMs),
     [timeline.segments, disclaimerOffsetMs],
   );
-  const displayTotalMs = timeline.totalMs + disclaimerOffsetMs;
+  // v1.29: the display total is the FILL end (visuals + audio extension) —
+  // a looping base video fills to this; the transport + export total run to
+  // the audio's end, never the old visuals-only length.
+  const displayTotalMs = timelineFillEndMs + disclaimerOffsetMs;
+
+  // v1.29 UX GUARD (one-shot): the first time a NON-loop audio clip's end
+  // pushes the timeline past the last VISUAL segment while no base-lane
+  // video is looping, tell the user once — the fix for "my 1h audio
+  // outlives the 10s video" is turning on Loop on a video clip. Ref-guarded:
+  // never blocks, never repeats for the rest of the session.
+  const audioExtHintShownRef = useRef(false);
+  useEffect(() => {
+    if (audioExtHintShownRef.current) return;
+    // Extension must actually be active AND there are visuals to outlive.
+    if (audioExtEndMs <= rawTimeline.totalMs || rawTimeline.totalMs <= 0) return;
+    if (timeline.segments.some((s) => s.loop === true)) return;
+    audioExtHintShownRef.current = true;
+    toast.info("Timeline now runs to the audio's end", {
+      description:
+        "Turn on Loop on a video clip to fill the visuals — right-click a video clip or use its clip settings.",
+    });
+  }, [audioExtEndMs, rawTimeline.totalMs, timeline.segments]);
   /** Display segments + the virtual disclaimer clip at [0, N) — the preview
    *  (canvas draw, hidden video sync, stepSegment) and the export payload. */
   const previewSegments = useMemo(
@@ -2853,9 +2930,13 @@ export default function Page() {
    *  previous default behavior). Each file's duration probes via its own
    *  <audio> metadata element (the addAudio pattern, per clip). The beat
    *  grid + waveform derive from clip 0 — they reset when the FIRST clip
-   *  lands (previously: every track swap). */
+   *  lands (previously: every track swap).
+   *  v1.29: `role` picks WHAT the import is — "voice" (voiceover/narration:
+   *  loop forced OFF, the clip extends the timeline, transcription prefers
+   *  it) or "music" (the legacy default: loop-to-fill background music).
+   *  Drag&drop and the legacy single picker stay "music" (back-compat). */
   const addMusicFiles = useCallback(
-    (files: File[]) => {
+    (files: File[], role?: "music" | "voice") => {
       const audioFiles = files.filter(
         (f) =>
           (f.type && f.type.startsWith("audio/")) ||
@@ -2868,6 +2949,7 @@ export default function Page() {
         clearBeatInfo();
         clearWaveform();
       }
+      const isVoice = role === "voice";
       const added: MusicClip[] = audioFiles.map((file) => {
         // The previous tracks' URLs stay alive (undo-safe); unmount revokes.
         const url = trackUrl(URL.createObjectURL(file));
@@ -2906,23 +2988,38 @@ export default function Page() {
           sourceDurationMs: 0,
           startMs: 0,
           volume: 1,
-          loop: true,
+          // v1.29: voice = fixed-length narration (never loops); music =
+          // loop-to-fill (the legacy default).
+          loop: !isVoice,
+          ...(isVoice ? { role: "voice" as const } : {}),
           sourcePath:
             typeof nativePath === "string" && nativePath ? nativePath : null,
         };
       });
       setMusicClips((prev) => [...prev, ...added]);
-      toast.success(
-        added.length === 1
-          ? `Music: ${added[0].fileName}`
-          : `Added ${added.length} music tracks`,
-        {
-          description:
-            added.length > 1
-              ? "Each track is an independent clip on the Audio lane — drag, loop, mix or remove them individually."
-              : "Drag the clip on the Audio lane to reposition it; add more tracks any time.",
-        },
-      );
+      if (isVoice) {
+        toast.success(
+          added.length === 1
+            ? `Voiceover: ${added[0].fileName}`
+            : `Added ${added.length} voiceover clips`,
+          {
+            description:
+              "Voiceover audio keeps its full length — the timeline now runs to its end. Transcribe it for captions from the Captions tab.",
+          },
+        );
+      } else {
+        toast.success(
+          added.length === 1
+            ? `Music: ${added[0].fileName}`
+            : `Added ${added.length} music tracks`,
+          {
+            description:
+              added.length > 1
+                ? "Each track is an independent clip on the Audio lane — drag, loop, mix or remove them individually."
+                : "Drag the clip on the Audio lane to reposition it; add more tracks any time.",
+          },
+        );
+      }
     },
     [requestHistoryPush, trackUrl, clearBeatInfo, clearWaveform, musicClips],
   );
@@ -3449,29 +3546,35 @@ export default function Page() {
   }, [kenBurns, settings, captionSettings, audioSettings, whisperLanguage, whisperModel, headlineItems, transitionSettings, watermarkSettings, beatStride, favoritePresets, mediaView, textRemoval]);
 
   const generateCaptionsFromAudio = useCallback(async () => {
-    // v1.3: the transcription source is the MUSIC track when present, else
-    // the first base-lane VIDEO clip (its speech is usually what users want
-    // captioned — requiring a separate audio upload was backwards).
+    // v1.29: transcription source preference — (a) the first VOICEOVER
+    // clip (role "voice": a 1h9m narration is what the user wants captioned,
+    // never the background music under it), then (b) the first base-lane
+    // VIDEO clip (its speech is usually what users want captioned), then
+    // (c) any music clip (the legacy music-first behavior, last resort).
     let sourceFile: File | null = null;
     let sourcePath: string | null = null;
-    if (primaryMusicClip) {
-      sourcePath = primaryMusicClip.sourcePath ?? null;
-      if (sourcePath) {
-        sourceFile = new File([], primaryMusicClip.fileName, {
-          type: "audio/mpeg",
-        });
-      } else {
-        try {
-          const resp = await fetch(primaryMusicClip.url);
-          const blob = await resp.blob();
-          sourceFile = new File([blob], primaryMusicClip.fileName, {
-            type: blob.type || "audio/mpeg",
-          });
-        } catch {
-          sourceFile = null;
-        }
+    const musicClipToFile = async (clip: MusicClip): Promise<File | null> => {
+      const path = clip.sourcePath ?? null;
+      if (path) {
+        return new File([], clip.fileName, { type: "audio/mpeg" });
       }
+      try {
+        const resp = await fetch(clip.url);
+        const blob = await resp.blob();
+        return new File([blob], clip.fileName, {
+          type: blob.type || "audio/mpeg",
+        });
+      } catch {
+        return null;
+      }
+    };
+    // (a) the first voiceover clip.
+    const voiceClip = musicClips.find((c) => c.role === "voice") ?? null;
+    if (voiceClip) {
+      sourcePath = voiceClip.sourcePath ?? null;
+      sourceFile = await musicClipToFile(voiceClip);
     }
+    // (b) the first base-lane VIDEO clip.
     if (!sourceFile) {
       const seg = timeline.segments.find(
         (s) => s.mediaType === "video" && (s.track ?? 0) === 0 && s.file,
@@ -3484,6 +3587,11 @@ export default function Page() {
             : null;
         if (!sourcePath) sourcePath = null;
       }
+    }
+    // (c) any music clip (legacy music-first behavior).
+    if (!sourceFile && primaryMusicClip) {
+      sourcePath = primaryMusicClip.sourcePath ?? null;
+      sourceFile = await musicClipToFile(primaryMusicClip);
     }
     if (!sourceFile) {
       toast.error("Add an audio track or a video clip first", {
@@ -3616,7 +3724,7 @@ export default function Page() {
       setWhisperBusy(false);
       setWhisperProgress(null);
     }
-  }, [primaryMusicClip, timeline.segments, whisperBusy, whisperLanguage, whisperModel, requestHistoryPush, sttProviderNow]);
+  }, [primaryMusicClip, musicClips, timeline.segments, whisperBusy, whisperLanguage, whisperModel, requestHistoryPush, sttProviderNow]);
 
   const loadSamples = useCallback(async () => {
     try {
@@ -3687,8 +3795,12 @@ export default function Page() {
     [requestHistoryPush],
   );
 
-  /** Patch ONE music clip (volume / loop / trimmable durationMs — the
-   *  timeline popovers + the Audio-tab card both commit through here). */
+  /** Patch ONE music clip (volume / loop / trimmable durationMs / role —
+   *  the timeline popovers + the Audio-tab card both commit through here).
+   *  v1.29 ROLE INVARIANT: role "voice" ⇒ loop false, role "music" ⇒ loop
+   *  true (the legacy default) — a role patch applies the matching loop
+   *  first, then an explicit loop field in the same patch still wins (the
+   *  popover sends both, so the pairing is deliberate either way). */
   const editMusicClip = useCallback(
     (id: string, patch: Partial<MusicClip>) => {
       if (Object.keys(patch).length === 0) return;
@@ -3697,11 +3809,19 @@ export default function Page() {
         prev.map((c) => {
           if (c.id !== id) return c;
           const next: MusicClip = { ...c };
+          if (patch.role === "voice" || patch.role === "music") {
+            next.role = patch.role;
+            // Role sets the loop default (voice never loops; music does).
+            next.loop = patch.role === "voice" ? false : true;
+          }
           if (typeof patch.volume === "number" && Number.isFinite(patch.volume)) {
             next.volume = Math.max(0, Math.min(2, patch.volume));
           }
           if (typeof patch.loop === "boolean") {
-            next.loop = patch.loop;
+            // Explicit loop wins over the role default — EXCEPT a voice
+            // clip can never loop (the invariant holds even under a
+            // contradictory patch, e.g. the plain Loop button on a voiceover).
+            next.loop = next.role === "voice" ? false : patch.loop;
           }
           if (
             typeof patch.durationMs === "number" &&
@@ -4908,6 +5028,7 @@ const handleRandomTransitionMix = useCallback(() => {
       startMs: number;
       volume: number;
       loop: boolean;
+      role?: "music" | "voice";
       durationMs: number;
       sourceDurationMs: number;
     }[] = [];
@@ -4919,6 +5040,8 @@ const handleRandomTransitionMix = useCallback(() => {
           startMs: clip.startMs,
           volume: clip.volume,
           loop: clip.loop,
+          // v1.29: the role round-trips (voice clips keep voice semantics).
+          ...(clip.role ? { role: clip.role } : {}),
           durationMs: clip.durationMs,
           sourceDurationMs: clip.sourceDurationMs,
         });
@@ -5187,6 +5310,9 @@ const handleRandomTransitionMix = useCallback(() => {
                 startMs: mc.startMs,
                 volume: mc.volume,
                 loop: mc.loop,
+                // v1.29: voice/music role restores verbatim (undefined =
+                // the legacy music default).
+                ...(mc.role ? { role: mc.role } : {}),
                 sourcePath: null,
               };
             },
@@ -5474,7 +5600,9 @@ const handleRandomTransitionMix = useCallback(() => {
   );
 
   const togglePlay = useCallback(() => {
-    if (segmentsRef.current.length === 0) return;
+    // v1.29: audio-only projects (a voiceover clip, no visual segments) can
+    // play — the gate is "is there ANY timeline content", not segments.
+    if (totalMsRef.current <= 0) return;
     setIsPlaying((p) => {
       if (!p && currentMsRef.current >= totalMsRef.current) {
         currentMsRef.current = 0;
@@ -6082,6 +6210,7 @@ const handleConvertSubtitlesToNative = useCallback(() => {
                   openImagePicker={openImagePicker}
                   openVideoPicker={openVideoPicker}
                   openAudioPicker={openAudioPicker}
+                  openVoiceAudioPicker={openVoiceAudioPicker}
                   openSubtitlePicker={openSubtitlePicker}
                   onRemoveMusicClip={removeMusicClip}
                   onRemoveSubtitles={removeSubtitles}
@@ -6166,6 +6295,7 @@ const handleConvertSubtitlesToNative = useCallback(() => {
                   // clip stack (per-clip volume/loop/remove + add-another).
                   musicClips={musicClips}
                   onAddMusic={openAudioPicker}
+                  onAddVoiceAudio={openVoiceAudioPicker}
                   onRemoveMusicClip={removeMusicClip}
                   onMusicClipEdit={editMusicClip}
                   onGenerateCaptions={generateCaptionsFromAudio}
@@ -6461,6 +6591,26 @@ const handleConvertSubtitlesToNative = useCallback(() => {
         onChange={(e: ChangeEvent<HTMLInputElement>) => {
           // v1.25: MULTI-music — every picked file becomes its own clip.
           if (e.target.files) addMusicFiles(Array.from(e.target.files));
+          e.target.value = "";
+        }}
+      />
+      <input
+        ref={voiceAudioInputRef}
+        type="file"
+        accept="audio/*"
+        multiple
+        style={{
+          position: "absolute",
+          opacity: 0,
+          width: 1,
+          height: 1,
+          pointerEvents: "none",
+        }}
+        onChange={(e: ChangeEvent<HTMLInputElement>) => {
+          // v1.29: VOICEOVER import — role "voice" (loop off, timeline
+          // extends to the audio's end, transcription prefers it).
+          if (e.target.files)
+            addMusicFiles(Array.from(e.target.files), "voice");
           e.target.value = "";
         }}
       />

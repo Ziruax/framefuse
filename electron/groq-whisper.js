@@ -142,6 +142,35 @@ function maskApiKey(key) {
   return `${key.slice(0, 7)}…${key.slice(-4)}`;
 }
 
+/** Normalize a user-pasted Groq API key BEFORE it is stored or sent (v1.29):
+ *  trim, strip ONE pair of wrapping quotes (the classic copy artifact), and
+ *  REJECT anything that still contains internal whitespace or quote
+ *  characters — those can never authenticate and only produce a confusing
+ *  403 "Groq rejected the API key" later. Returns "" for empty input.
+ *  Throws an actionable Error the caller surfaces to the user. */
+function normalizeGroqApiKey(raw) {
+  let key = String(raw == null ? "" : raw).trim();
+  if (!key) return "";
+  if (
+    (key.startsWith('"') && key.endsWith('"')) ||
+    (key.startsWith("'") && key.endsWith("'"))
+  ) {
+    key = key.slice(1, -1).trim();
+  }
+  if (!key) return "";
+  if (/\s/.test(key)) {
+    throw new Error(
+      "Groq API key contains spaces or line breaks — copy the full gsk_… key from console.groq.com/keys (no quotes, no spaces)",
+    );
+  }
+  if (/["']/.test(key)) {
+    throw new Error(
+      "Groq API key contains quote characters — copy the raw gsk_… key from console.groq.com/keys",
+    );
+  }
+  return key;
+}
+
 // ---------------------------------------------------------------------------
 // Audio compression for upload (ffmpeg, bitrate ladder).
 // ---------------------------------------------------------------------------
@@ -228,19 +257,29 @@ async function extractAudioForGroq(ffmpegPath, inputPath, outDir, onStage) {
 // HTTPS plumbing (raw https.request — upload progress + no deps).
 // ---------------------------------------------------------------------------
 
-/** Classify a Groq API failure into an actionable message. */
-function classifyGroqError(status, bodyText) {
+/** Classify a Groq API failure into an actionable message.
+ *  v1.29: `maskedKey` ("gsk_AbC…9xY2") is appended to the 401/403 text so
+ *  the user can SEE which stored key was rejected. Auth-rejected requests
+ *  do NOT appear in console.groq.com usage, so without the fingerprint the
+ *  "my key is accurate and no API call was made" confusion is unresolvable
+ *  (the v1.28 Test button could pass on a localStorage key while
+ *  transcription sent a DIFFERENT device key). */
+function classifyGroqError(status, bodyText, maskedKey) {
   let apiMessage = "";
   try {
     const j = JSON.parse(bodyText);
     apiMessage = j?.error?.message || j?.message || "";
   } catch (_) { /* non-JSON body */ }
   const raw = apiMessage ? ` [${apiMessage}]` : "";
+  const keyPart = maskedKey ? ` (${maskedKey})` : "";
   switch (status) {
     case 401:
     case 403:
-      // Groq returns 403 (not 401) for invalid/revoked keys.
-      return `Groq rejected the API key — check that it's valid (console.groq.com → API Keys) and has audio model access${raw}`;
+      // Groq returns 403 (not 401) for invalid/revoked keys — live-verified
+      // v1.29 against api.groq.com: a bogus Bearer gets
+      // 403 {"error":{"message":"Forbidden"}}. The docs' 401 is the
+      // "missing credentials" twin; both mean the key was refused.
+      return `Groq rejected the API key${keyPart} — re-save the key in Settings → Default AI models (console.groq.com → API Keys)${raw}`;
     case 404:
       return `Groq model not found — whisper-large-v3 access may not be enabled for this key${raw}`;
     case 413:
@@ -406,12 +445,16 @@ function groqTranscribeOnce(o, modelId, wantWordTimestamps, language) {
           if (res.statusCode !== 200) {
             // v1.22: attach the machine-readable facts so groqTranscribe's
             // retry layer can classify (400 timestamps / 404 model).
+            // v1.29: thread the MASKED form of the key we actually sent so
+            // the rejection message names the culprit key.
             let apiMessage = "";
             try {
               const j = JSON.parse(body);
               apiMessage = j?.error?.message || j?.message || "";
             } catch (_) { /* non-JSON body */ }
-            const err = new Error(classifyGroqError(res.statusCode, body));
+            const err = new Error(
+              classifyGroqError(res.statusCode, body, maskApiKey(apiKey)),
+            );
             err.status = res.statusCode;
             err.apiMessage = apiMessage;
             reject(err);
@@ -545,7 +588,12 @@ function groqTestKey(apiKey) {
         res.on("end", () => {
           const body = Buffer.concat(chunks).toString("utf8");
           if (res.statusCode !== 200) {
-            resolve({ ok: false, message: classifyGroqError(res.statusCode, body), whisperModels: [] });
+            // v1.29: masked fingerprint of the key we just probed.
+            resolve({
+              ok: false,
+              message: classifyGroqError(res.statusCode, body, maskApiKey(apiKey)),
+              whisperModels: [],
+            });
             return;
           }
           let whisperModels = [];
@@ -585,6 +633,7 @@ module.exports = {
   loadGroqConfig,
   saveGroqConfig,
   maskApiKey,
+  normalizeGroqApiKey,
   encodeCompactAudio,
   extractAudioForGroq,
   classifyGroqError,

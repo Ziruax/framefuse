@@ -136,11 +136,14 @@ function removeGeminiConfig(userDataDir) {
   }
 }
 
-/** "AIzaSyB…9xY2" → "AIzaSyB…9xY2" (first 7 + last 4) for safe display. */
+/** "AIzaSyB…k9xY2" → "AIza…k9xY2" (first 4 + last 4) for safe display.
+ *  v1.29: tightened from first-7 to first-4 — the first 4 chars of a
+ *  Gemini key are the constant "AIza" anyway, so nothing identifying is
+ *  lost, and the masked form is what rejection messages echo back. */
 function maskGeminiKey(key) {
   if (!key) return "";
-  if (key.length <= 12) return `${key.slice(0, 3)}…`;
-  return `${key.slice(0, 7)}…${key.slice(-4)}`;
+  if (key.length <= 10) return `${key.slice(0, 4)}…`;
+  return `${key.slice(0, 4)}…${key.slice(-4)}`;
 }
 
 /** Masked payload for the renderer — the raw key NEVER crosses the bridge. */
@@ -154,20 +157,30 @@ function geminiConfigPayload(userDataDir) {
 // with generateContent wording).
 // ---------------------------------------------------------------------------
 
-/** Classify a Gemini API failure into an actionable message. */
-function classifyGeminiError(status, bodyText) {
+/** Classify a Gemini API failure into an actionable message.
+ *  v1.29: `maskedKey` ("AIza…k9xY2") is appended to the 401/403 text so
+ *  the user can see WHICH stored key was rejected (auth-rejected requests
+ *  never show up in usage metrics). */
+function classifyGeminiError(status, bodyText, maskedKey) {
   let apiMessage = "";
   try {
     const j = JSON.parse(bodyText);
     apiMessage = j?.error?.message || j?.message || "";
   } catch (_) { /* non-JSON body */ }
   const raw = apiMessage ? ` [${apiMessage}]` : "";
+  const keyPart = maskedKey ? ` (${maskedKey})` : "";
   switch (status) {
     case 400:
+      // Google answers a bad API key with 400 "API key not valid. Please
+      // pass a valid API key." (live-verified v1.29 — NOT 401/403), so the
+      // key wording + masked fingerprint must catch that shape too.
+      if (/api[ _-]?key/i.test(apiMessage) && /(not valid|invalid)/i.test(apiMessage)) {
+        return `Gemini rejected the API key${keyPart} — re-save the key in Settings → Default AI models (aistudio.google.com/apikey)${raw}`;
+      }
       return `Gemini rejected the request (invalid request — check the prompt and parameters)${raw}`;
     case 401:
     case 403:
-      return `Gemini API key invalid or missing access — get a key at aistudio.google.com/apikey and check it's enabled${raw}`;
+      return `Gemini rejected the API key${keyPart} — re-save the key in Settings → Default AI models (aistudio.google.com/apikey)${raw}`;
     case 404:
       return `Gemini model not found — pick another model in the dropdown${raw}`;
     case 429:
@@ -240,10 +253,14 @@ function geminiRequestOnce(o) {
           clearTimeout(timer);
           const bodyText = Buffer.concat(chunks).toString("utf8");
           if (res.statusCode !== 200) {
-            reject(makeChatError(classifyGeminiError(res.statusCode, bodyText), {
-              status: res.statusCode,
-              retryable: res.statusCode === 429 || res.statusCode >= 500,
-            }));
+            // v1.29: masked fingerprint of the key this request carried.
+            reject(makeChatError(
+              classifyGeminiError(res.statusCode, bodyText, maskGeminiKey(apiKey)),
+              {
+                status: res.statusCode,
+                retryable: res.statusCode === 429 || res.statusCode >= 500,
+              },
+            ));
             return;
           }
           let j;
@@ -489,7 +506,13 @@ function geminiTestKey(input) {
         res.on("end", () => {
           const body = Buffer.concat(chunks).toString("utf8");
           if (res.statusCode !== 200) {
-            resolve({ ok: false, message: classifyGeminiError(res.statusCode, body), modelCount: 0, models: [] });
+            // v1.29: masked fingerprint of the key we just probed.
+            resolve({
+              ok: false,
+              message: classifyGeminiError(res.statusCode, body, maskGeminiKey(apiKey)),
+              modelCount: 0,
+              models: [],
+            });
             return;
           }
           // v1.22: ids this key can call generateContent on.

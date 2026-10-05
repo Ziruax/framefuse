@@ -36,7 +36,7 @@
 "use strict";
 
 const https = require("https");
-const { GROQ_API_HOST } = require("./groq-whisper");
+const { GROQ_API_HOST, maskApiKey } = require("./groq-whisper");
 
 const CHAT_PATH = "/openai/v1/chat/completions";
 const MODELS_PATH = "/openai/v1/models";
@@ -93,18 +93,22 @@ function normalizeTextModel(id) {
 // with chat-completion wording).
 // ---------------------------------------------------------------------------
 
-/** Classify a Groq chat-completion failure into an actionable message. */
-function classifyChatError(status, bodyText) {
+/** Classify a Groq chat-completion failure into an actionable message.
+ *  v1.29: `maskedKey` ("gsk_AbC…9xY2") is appended to the 401/403 text so
+ *  the user can see WHICH stored key was rejected (auth-rejected requests
+ *  never show up in console.groq.com usage). */
+function classifyChatError(status, bodyText, maskedKey) {
   let apiMessage = "";
   try {
     const j = JSON.parse(bodyText);
     apiMessage = j?.error?.message || j?.message || "";
   } catch (_) { /* non-JSON body */ }
   const raw = apiMessage ? ` [${apiMessage}]` : "";
+  const keyPart = maskedKey ? ` (${maskedKey})` : "";
   switch (status) {
     case 401:
     case 403:
-      return `Groq rejected the API key — check that it's valid (console.groq.com → API Keys) and has chat model access${raw}`;
+      return `Groq rejected the API key${keyPart} — re-save the key in Settings → Default AI models (console.groq.com → API Keys)${raw}`;
     case 404:
       return `Groq model not found — this chat model may not be enabled for your key${raw}`;
     case 400:
@@ -266,10 +270,14 @@ function chatRequestOnce(o) {
           clearTimeout(timer);
           const bodyText = Buffer.concat(chunks).toString("utf8");
           if (res.statusCode !== 200) {
-            reject(makeChatError(classifyChatError(res.statusCode, bodyText), {
-              status: res.statusCode,
-              retryable: res.statusCode === 429 || res.statusCode >= 500,
-            }));
+            // v1.29: masked fingerprint of the key this request carried.
+            reject(makeChatError(
+              classifyChatError(res.statusCode, bodyText, maskApiKey(apiKey)),
+              {
+                status: res.statusCode,
+                retryable: res.statusCode === 429 || res.statusCode >= 500,
+              },
+            ));
             return;
           }
           let j;
@@ -425,7 +433,7 @@ function groqListTextModels(apiKey) {
         res.on("end", () => {
           const body = Buffer.concat(chunks).toString("utf8");
           if (res.statusCode !== 200) {
-            console.warn(`[groq-chat] Could not list models (HTTP ${res.statusCode}): ${classifyChatError(res.statusCode, body)}`);
+            console.warn(`[groq-chat] Could not list models (HTTP ${res.statusCode}): ${classifyChatError(res.statusCode, body, maskApiKey(apiKey))}`);
             resolve([]);
             return;
           }

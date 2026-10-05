@@ -175,6 +175,13 @@ interface ResolvedEntry {
   speed: number;
   /** v5.2: loop the overlay source so it spans its full timeline window. */
   overlayLoop: boolean;
+  /** v5.8: loop the BASE-lane video source so the clip fills the timeline
+   *  END (loop-to-fill). True only for track-0 video items whose edit sets
+   *  `loop: true` — the resolved flag lands on the segment (MediaSegment.
+   *  loop) and the timeline builder stretches the segment's end to
+   *  fillEndMs (the 7th buildTimeline argument, computed page-side as
+   *  max(raw segment end, non-loop audio end)). */
+  baseLoop: boolean;
   chroma: ChromaKeySettings | null;
   overlay: OverlayTransform | null;
 }
@@ -205,6 +212,10 @@ function resolveEntry(
   // v5.2: loop the overlay source so short green-screen clips can span the
   // whole video (export -stream_loop -1, preview wraps currentTime).
   const overlayLoop = edit?.overlayLoop === true && track >= 1;
+  // v5.8: loop-to-fill for BASE-lane VIDEOS (the overlayLoop twin). The
+  // timeline builder extends a looping clip's end to fillEndMs; preview +
+  // export repeat the source. Images and overlay-lane items never loop.
+  const baseLoop = edit?.loop === true && mediaType === "video" && track === 0;
   return {
     entry: e,
     mediaType,
@@ -214,6 +225,7 @@ function resolveEntry(
     sourceDurationMs,
     speed,
     overlayLoop,
+    baseLoop,
     // Raw passthrough — chroma.ts owns sanitization at the UI boundary.
     chroma: edit?.chroma ?? null,
     overlay: edit?.overlay ?? null,
@@ -250,6 +262,9 @@ function makeSegment(
     sourceDurationMs: r.sourceDurationMs,
     speed: r.speed,
     overlayLoop: r.overlayLoop,
+    // v5.8: resolved loop-to-fill (base-lane videos only — see ResolvedEntry.
+    // baseLoop). Undefined everywhere else so payloads/JSON stay minimal.
+    ...(r.baseLoop ? { loop: true as const } : {}),
     chroma: r.chroma,
     overlay: r.overlay,
   };
@@ -301,6 +316,14 @@ export function buildTimeline(
   itemEdits?: Record<string, ItemEdit>,
   /** v5.0: known video source durations (id → ms) driving video defaults. */
   videoDurations?: Record<string, number>,
+  /** v5.8: LOOP-TO-FILL target (ms). Default/0 = no extension. Base-lane
+   *  video segments with `itemEdits[id].loop === true` are stretched so
+   *  their endMs reaches this value (the timeline end — a FINAL duration
+   *  override, NOT divided by speed; trimInMs is unchanged and the source
+   *  repeats from the trim window). The caller computes it as
+   *  max(raw totalMs, non-loop audio end) via a FIRST pass with fillEndMs
+   *  omitted — never feed this builder's own totalMs back in (recursion). */
+  fillEndMs?: number,
 ): BuildTimelineResult {
   const warnings: OverlapWarning[] = [];
   const skipped: string[] = [];
@@ -424,45 +447,42 @@ export function buildTimeline(
       );
     }
 
-    // Duration-only files can't be placed in absolute mode → skipped.
-    // v5.0 exception: VIDEOS don't need filename timing — they are appended
-    // after the last base segment (in original order) at their source
-    // duration, matching the "add clip to the end of the edit" semantics of
-    // a real video editor. Images keep the v4.9 skip behavior.
-    const videoTail = durationOnly.filter((r) => r.mediaType === "video");
-    const imageTail = durationOnly.filter((r) => r.mediaType !== "video");
-    if (videoTail.length > 0) {
-      let cursor = segments.reduce((m, s) => Math.max(m, s.endMs), 0);
-      for (const r of videoTail) {
-        const e = r.entry;
-        const ov = overrides[e.id];
-        const dur =
-          ov && ov > 0
-            ? ov
-            : e.parsed.durationMs != null
-              ? e.parsed.durationMs
-              : r.sourceDurationMs ?? DEFAULT_DURATION_MS;
-        // v5.3: honor an edited start (trim/move); never overlap the clips
-        // already placed — a start before the cursor packs at the cursor.
-        const startMs = Math.max(cursor, editStartOf(e.id, cursor));
-        // v5.1: an override is the final timeline duration (unscaled); the
-        // implicit source window is what speed divides.
-        const endMs =
-          startMs +
-          Math.max(200, ov && ov > 0 ? ov : scaleDur(r, dur));
-        const dir =
-          motionOverrides?.[e.id] ??
-          resolveDirection(e.id, kenBurns.direction, kenBurns.directionPool);
-        segments.push(
-          makeSegment(r, e.parsed.kind as SegmentKind, startMs, endMs, dir),
-        );
-        cursor = endMs;
-      }
-    }
-    for (const r of imageTail) {
-      skipped.push(
-        `${r.entry.fileName} (duration pattern not used in absolute mode)`,
+    // Duration-only files have no filename timing to place absolutely.
+    // v5.0 exception: VIDEOS don't need it — they append after the last base
+    // segment (in original order) at their source duration, matching the
+    // "add clip to the end of the edit" semantics of a real video editor.
+    // v5.8: IMAGES append the SAME way (DEFAULT_DURATION_MS or their parsed
+    // durationMs) — previously they were skipped, which left plain-named
+    // imports unplaceable whenever a start-bearing clip forced absolute
+    // mode (the "nothing shows until I rename files" trap). The skip list
+    // stays only for genuinely unplaceable entries (none in practice).
+    let cursor = segments.reduce((m, s) => Math.max(m, s.endMs), 0);
+    for (const r of durationOnly) {
+      const e = r.entry;
+      const ov = overrides[e.id];
+      const dur =
+        ov && ov > 0
+          ? ov
+          : e.parsed.durationMs != null
+            ? e.parsed.durationMs
+            : r.mediaType === "video"
+              ? r.sourceDurationMs ?? DEFAULT_DURATION_MS
+              : DEFAULT_DURATION_MS;
+      // v5.3: honor an edited start (trim/move); never overlap the clips
+      // already placed — a start before the cursor packs at the cursor.
+      const startMs = Math.max(cursor, editStartOf(e.id, cursor));
+      // v5.1: an override is the final timeline duration (unscaled); the
+      // implicit source window is what speed divides.
+      const endMs =
+        startMs +
+        Math.max(200, ov && ov > 0 ? ov : scaleDur(r, dur));
+      const dir =
+        motionOverrides?.[e.id] ??
+        resolveDirection(e.id, kenBurns.direction, kenBurns.directionPool);
+      segments.push(
+        makeSegment(r, e.parsed.kind as SegmentKind, startMs, endMs, dir),
       );
+      cursor = endMs;
     }
   } else {
     // Sequential: stack durations in original order. A video without an
@@ -535,7 +555,30 @@ export function buildTimeline(
     segments.push(...overlaySegs);
   }
 
+  // v5.8: LOOP-TO-FILL — base-lane VIDEO segments whose edit sets
+  // `loop: true` are stretched so their end reaches `fillEndMs` (the final
+  // timeline duration the caller computed from the raw segment end + the
+  // non-loop audio end). The fill window is a FINAL duration — like an
+  // explicit override it is NOT divided by speed; trimInMs is unchanged and
+  // the source simply repeats from the trim window (preview wraps
+  // currentTime, export uses -stream_loop -1). makeSegment already flagged
+  // these `seg.loop = true`; the extension here also re-derives durationMs.
+  if (fillEndMs && fillEndMs > 0) {
+    for (const seg of segments) {
+      if ((seg.track ?? 0) !== 0) continue; // base lane only
+      if (seg.mediaType !== "video") continue; // videos only
+      if (seg.loop !== true) continue; // the edit's loop flag
+      const endMs = Math.max(seg.startMs + 200, fillEndMs);
+      if (endMs > seg.endMs) {
+        seg.endMs = endMs;
+        seg.durationMs = endMs - seg.startMs;
+      }
+    }
+  }
+
   // v5.0: total spans ALL lanes (overlays can extend past the base end).
+  // v5.8: looping segments' ends count — they fill to fillEndMs and thus cap
+  // the total at fillEndMs naturally (something longer still wins).
   const totalMs = segments.reduce((m, s) => Math.max(m, s.endMs), 0);
 
   return { segments, mode, totalMs, warnings, skipped };

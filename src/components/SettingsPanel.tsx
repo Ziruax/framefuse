@@ -235,6 +235,9 @@ interface SettingsPanelProps {
   musicClips: MusicClip[];
   /** Opens the OS audio file picker (multi-select; page's hidden input). */
   onAddMusic: () => void;
+  /** v1.29: opens the VOICEOVER audio picker (role "voice" — fixed length,
+   *  no loop, the timeline runs to its end). Same files, different role. */
+  onAddVoiceAudio?: () => void;
   /** Removes ONE music clip by id (one undo step). */
   onRemoveMusicClip: (id: string) => void;
   /** Patches ONE music clip (volume / loop / durationMs). */
@@ -1036,6 +1039,7 @@ export function SettingsPanel(props: SettingsPanelProps) {
     hasAudio,
     musicClips,
     onAddMusic,
+    onAddVoiceAudio,
     onRemoveMusicClip,
     onMusicClipEdit,
     onConvertSubtitlesToNative,
@@ -1922,43 +1926,76 @@ export function SettingsPanel(props: SettingsPanelProps) {
           {/* ── v1.25: Background music — the MULTI-TRACK stack. Every clip
               has its own row (name, duration, start) with per-clip volume,
               loop and remove; "Add another track" stacks more files (they
-              appear as new rows on the timeline's Audio lane). ── */}
-          <Section icon={<Music size={13} />} title="Background music" defaultOpen>
+              appear as new rows on the timeline's Audio lane).
+              v1.29: VOICEOVER import lives here too — a voice clip is fixed
+              length (never looped, never trimmed): the timeline runs to its
+              end and transcription prefers it. ── */}
+          <Section icon={<Music size={13} />} title="Music & voiceover" defaultOpen>
             {musicClips.length === 0 && (
               <p className="mb-2 text-[10px] leading-relaxed text-stone-500">
-                Add background music that plays under the whole video —
-                mixed with clip audio at its own volume. Add as many tracks
-                as you like; they stack on the timeline's Audio lane.
+                Background music loops under the whole video; a voiceover is
+                fixed-length narration the timeline runs to (and Whisper
+                transcribes first). Both stack on the timeline's Audio lane.
               </p>
             )}
             {musicClips.map((clip) => {
               const volPct = Math.round(Math.max(0, Math.min(2, clip.volume)) * 100);
+              const isVoice = clip.role === "voice";
               const loopsToFill =
                 clip.loop && clip.durationMs > 0 && totalMs > 0
                   ? clip.startMs + clip.durationMs < totalMs
                   : false;
               return (
                 <div key={clip.id} className="mb-2.5 rounded-md border"
-                  style={{ borderColor: "rgba(13, 148, 136, 0.35)", backgroundColor: "#10201d" }}
+                  style={{ borderColor: isVoice ? "rgba(245, 158, 11, 0.4)" : "rgba(13, 148, 136, 0.35)", backgroundColor: isVoice ? "#231a0e" : "#10201d" }}
                 >
-                  {/* Clip row — name, duration, one-click remove. */}
+                  {/* Clip row — name, duration, role chip, one-click remove. */}
                   <div className="flex items-center gap-2 px-2 py-1.5">
-                    <Music size={13} className="shrink-0" style={{ color: "#2dd4bf" }} />
+                    {isVoice ? (
+                      <Mic size={13} className="shrink-0" style={{ color: "#fbbf24" }} />
+                    ) : (
+                      <Music size={13} className="shrink-0" style={{ color: "#2dd4bf" }} />
+                    )}
                     <div className="min-w-0 flex-1">
                       <p className="truncate text-[11px] font-medium text-stone-400" title={clip.fileName}>
                         {clip.fileName}
                       </p>
                       <p className="text-[9px] tabular-nums text-stone-500">
                         {clip.durationMs > 0
-                          ? `${(clip.durationMs / 1000).toFixed(1)}s @ ${(clip.startMs / 1000).toFixed(1)}s${loopsToFill ? " — loops to fill the video" : ""}`
+                          ? `${(clip.durationMs / 1000).toFixed(1)}s @ ${(clip.startMs / 1000).toFixed(1)}s${isVoice ? " — voiceover, fixed length" : loopsToFill ? " — loops to fill the video" : ""}`
                           : "reading duration…"}
                       </p>
                     </div>
+                    {/* v1.29 role switch — voice ↔ music (loop follows the role). */}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onMusicClipEdit(clip.id, {
+                          role: isVoice ? "music" : "voice",
+                          loop: isVoice,
+                        })
+                      }
+                      className="flex shrink-0 items-center gap-1 rounded-md border px-1.5 py-0.5 text-[9px] font-semibold transition-colors"
+                      style={{
+                        borderColor: isVoice ? "rgba(245, 158, 11, 0.55)" : "rgba(13, 148, 136, 0.5)",
+                        color: isVoice ? "#fbbf24" : "#2dd4bf",
+                        backgroundColor: "rgba(0,0,0,0.25)",
+                      }}
+                      title={
+                        isVoice
+                          ? "Voiceover — fixed length, timeline runs to its end, transcription prefers it. Click to make this looping background music."
+                          : "Background music — loops to fill the video. Click to make this a fixed-length voiceover."
+                      }
+                      aria-pressed={isVoice}
+                    >
+                      {isVoice ? <Mic size={10} /> : <Music size={10} />}
+                      {isVoice ? "Voice" : "Music"}
+                    </button>
                     <button
                       type="button"
                       onClick={() => onRemoveMusicClip(clip.id)}
                       className="flex size-6 shrink-0 items-center justify-center rounded-md text-stone-500 transition-colors hover:bg-rose-500/10 hover:text-rose-400"
-                      title="Remove this music track"
+                      title="Remove this audio track"
                       aria-label={`Remove ${clip.fileName}`}
                     >
                       <Trash2 size={12} />
@@ -2002,24 +2039,42 @@ export function SettingsPanel(props: SettingsPanelProps) {
             {musicClips.length > 0 && (
               <p className="mb-1 text-[10px] leading-relaxed text-stone-500">
                 {musicClips.length === 1
-                  ? "Drag the music clip on the timeline's Audio lane to reposition it; drag its right edge to trim (when not looping)."
+                  ? "Drag the clip on the timeline's Audio lane to reposition it; drag its right edge to trim (when not looping)."
                   : `${musicClips.length} tracks stack as rows on the timeline's Audio lane — drag each clip to reposition it.`}
               </p>
             )}
-            <button
-              type="button"
-              onClick={onAddMusic}
-              className="flex w-full items-center justify-center gap-1.5 rounded-md border px-2 py-1.5 text-[10px] font-semibold transition-colors"
-              style={{
-                borderColor: "rgba(13, 148, 136, 0.5)",
-                backgroundColor: musicClips.length > 0 ? "#10201d" : "#14b8a6",
-                color: musicClips.length > 0 ? "#2dd4bf" : "#ffffff",
-              }}
-              title="Choose one or more audio files (mp3, wav, m4a…)"
-            >
-              <Upload size={11} />
-              {musicClips.length > 0 ? "Add another track" : "Add background music"}
-            </button>
+            <div className="grid grid-cols-2 gap-1.5">
+              <button
+                type="button"
+                onClick={onAddMusic}
+                className="flex items-center justify-center gap-1.5 rounded-md border px-2 py-1.5 text-[10px] font-semibold transition-colors"
+                style={{
+                  borderColor: "rgba(13, 148, 136, 0.5)",
+                  backgroundColor: musicClips.length > 0 ? "#10201d" : "#14b8a6",
+                  color: musicClips.length > 0 ? "#2dd4bf" : "#ffffff",
+                }}
+                title="Choose one or more audio files (mp3, wav, m4a…) — loops to fill the video"
+              >
+                <Upload size={11} />
+                {musicClips.length > 0 ? "Add music" : "Add background music"}
+              </button>
+              {onAddVoiceAudio && (
+                <button
+                  type="button"
+                  onClick={onAddVoiceAudio}
+                  className="flex items-center justify-center gap-1.5 rounded-md border px-2 py-1.5 text-[10px] font-semibold transition-colors"
+                  style={{
+                    borderColor: "rgba(245, 158, 11, 0.5)",
+                    backgroundColor: musicClips.length > 0 ? "#231a0e" : "#f59e0b",
+                    color: musicClips.length > 0 ? "#fbbf24" : "#ffffff",
+                  }}
+                  title="Import narration/speech audio — fixed length, the timeline runs to its end (Whisper transcribes it first)"
+                >
+                  <Mic size={11} />
+                  Add voiceover
+                </button>
+              )}
+            </div>
           </Section>
         </div>
 
