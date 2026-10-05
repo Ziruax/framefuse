@@ -89,7 +89,7 @@ const KINETIC_PRESET_SPECS = [
   { id: "cinematic-stack", fontId: "bebas", casing: "upper", baseWeight: 400, emphasisWeight: 400,
     trackingFrac: 0.04, lineHeightFrac: 1.14, entrance: "blur-focus", entranceMs: 420, staggerMs: 110,
     overshoot: 0.12, emphasisMotion: "hold", hold: "drift", exit: "fade", exitMs: 300,
-    accentColor: "#E5E7EB", shadow: true, supportAlpha: 0.78, blockRotateDeg: 0 },
+    accentColor: "#FCD34D", shadow: true, supportAlpha: 0.78, blockRotateDeg: 0 },
   { id: "perspective-stack", fontId: "montserrat", casing: "none", baseWeight: 600, emphasisWeight: 800,
     trackingFrac: 0.0, lineHeightFrac: 1.26, entrance: "slide-y", entranceMs: 380, staggerMs: 150,
     overshoot: 0.12, emphasisMotion: "scale-punch", hold: "none", exit: "fade", exitMs: 300,
@@ -143,7 +143,7 @@ const KINETIC_PRESET_SPECS = [
   { id: "diagonal-stack", fontId: "bebas", casing: "upper", baseWeight: 400, emphasisWeight: 400,
     trackingFrac: 0.03, lineHeightFrac: 1.12, entrance: "slide-x", entranceMs: 300, staggerMs: 130,
     overshoot: 0.12, emphasisMotion: "hold", hold: "drift", exit: "fade", exitMs: 300,
-    accentColor: "#E5E7EB", shadow: true, supportAlpha: 0.78, blockRotateDeg: -3 },
+    accentColor: "#FCD34D", shadow: true, supportAlpha: 0.78, blockRotateDeg: -3 },
   // ════════ FAMILY D — CONVERSATIONAL (readable flow) ════════
   { id: "kinetic-sentence", fontId: "inter", casing: "none", baseWeight: 600, emphasisWeight: 800,
     trackingFrac: 0.0, lineHeightFrac: 1.32, entrance: "fade-rise", entranceMs: 280, staggerMs: 120,
@@ -156,7 +156,7 @@ const KINETIC_PRESET_SPECS = [
   { id: "mixed-weight", fontId: "inter", casing: "none", baseWeight: 400, emphasisWeight: 900,
     trackingFrac: 0.0, lineHeightFrac: 1.3, entrance: "fade-rise", entranceMs: 260, staggerMs: 70,
     overshoot: 0.12, emphasisMotion: "hold", hold: "active-word", exit: "fade", exitMs: 300,
-    accentColor: "#FFFFFF", shadow: true, supportAlpha: 0.78, blockRotateDeg: 0 },
+    accentColor: "#FBBF24", shadow: true, supportAlpha: 0.78, blockRotateDeg: 0 },
   { id: "sliding-sentence", fontId: "segoe", casing: "none", baseWeight: 600, emphasisWeight: 800,
     trackingFrac: 0.0, lineHeightFrac: 1.32, entrance: "slide-x", entranceMs: 320, staggerMs: 140,
     overshoot: 0.12, emphasisMotion: "scale-punch", hold: "drift", exit: "fade", exitMs: 300,
@@ -325,11 +325,6 @@ function emitKineticComposition(comp, geo, ctx) {
   // preset field is dead data); see settledAlpha below.
   const accent = ctx.settings.accentOverride || preset.accentColor;
 
-  // \fad(0, exitMs) only when the composition truly ENDS inside this window
-  // (a window-clipped composition continues in the NEXT chunk/segment — a
-  // fade at every window tail would pulse at every boundary).
-  const fadeOutMs = comp.endMs <= ctx.winEnd ? exitMs : 0;
-
   // ── per-word plan resolution (roles/timings come from the renderer plan;
   // the geometry word's wordIdx indexes the composition's flat word list) ──
   const wordInfo = (gw) => {
@@ -354,11 +349,44 @@ function emitKineticComposition(comp, geo, ctx) {
     return Math.max(comp.startMs, info.wordStartAbs - 60) + delay;
   };
 
+  // v1.33.2 ENTRANCE/EXIT CROSSFIRE FIX (mirror of motion.ts): a word whose
+  // entrance ran while the composition's exit fade was already live faded IN
+  // and OUT simultaneously — late words peaked at ~30% opacity ("not
+  // properly visible"). Fix: each word's entrance COMPRESSES to finish before
+  // the nominal exit window, and the exit fade DEFERS past the last entrance
+  // (shrinking to 0 when there is no room — full opacity beats a fade that
+  // erases the word).
+  const nominalExitStartAbs = comp.endMs - exitMs;
+  const enterPlan = new Map(); // wordIdx -> { enterStartAbs, enterMs }
+  let lastEnterEndAbs = -Infinity;
+  for (const gw of geo.words) {
+    const info = wordInfo(gw);
+    const es = enterStartAbs(gw, info);
+    const room = Math.max(80, nominalExitStartAbs - es - 40);
+    const eff = Math.max(60, Math.min(entranceMs, Math.round(room)));
+    enterPlan.set(gw.wordIdx | 0, { enterStartAbs: es, enterMs: eff });
+    if (es + eff > lastEnterEndAbs) lastEnterEndAbs = es + eff;
+  }
+  const effExitStartAbs = Math.max(nominalExitStartAbs, lastEnterEndAbs + 60);
+  // v1.33.2: the effective fade-out — only when the composition truly ENDS
+  // inside this window (a window-clipped composition continues in the NEXT
+  // chunk/segment; fading at every window tail would pulse at boundaries) —
+  // and only the DEFERRED window (comp end − effective exit start), never
+  // the raw preset exitMs; <40ms of fade is noise → no fade at all.
+  const endsInWindow = comp.endMs <= ctx.winEnd;
+  const rawFadeOutMs = endsInWindow
+    ? Math.max(0, Math.min(exitMs, Math.round(comp.endMs - effExitStartAbs)))
+    : 0;
+  const fadeOutMs = rawFadeOutMs >= 40 ? rawFadeOutMs : 0;
+
   // Settled alpha (§27 supporting muted tier). motion.ts hardcodes the
   // supporting multiplier at 0.82 — preset.supportAlpha is a dead field in
   // the preview painter — mirror the painter's actual number (v1.27.2).
+  // v1.33.2: emphasis words are EXEMPT — the accent-colored highlight must
+  // stay fully legible even in a supporting-tier phrase (the dimmed accent
+  // was the "colour highlight not showing properly" report).
   const settledAlpha = (info) => {
-    const num = info.role === "supporting" ? 0.82 : 1;
+    const num = info.role === "supporting" && !info.emphasis ? 0.82 : 1;
     return { num, hex: "&H" + hexByte(Math.round((1 - num) * 255)) + "&" };
   };
 
@@ -479,7 +507,9 @@ function emitKineticComposition(comp, geo, ctx) {
   if (perWordMode) {
     // ── PER-WORD MODE: ONE Dialogue PER WORD (\move carries the x-motion;
     // typewriter's reveal IS the Dialogue start time). Per-word Dialogues
-    // at the same time overlay fine in libass. ──
+    // at the same time overlay fine in libass. v1.33.2: each word's entrance
+    // duration is the COMPRESSED plan (enterPlan) so late words finish
+    // entering before the exit fade opens. ──
     for (const gw of geo.words) {
       const info = wordInfo(gw);
       const wt = escapeAssText(gw.text || "");
@@ -489,9 +519,11 @@ function emitKineticComposition(comp, geo, ctx) {
       const dAbs = enterStartAbs(gw, info);
       const d = Math.max(0, Math.round(dAbs - ctx.winStart)); // Dialogue start
       if (d >= relEnd) continue;
+      const plan = enterPlan.get(gw.wordIdx | 0) || { enterStartAbs: dAbs, enterMs: entranceMs };
+      const effEnt = plan.enterMs;
       // Entrance already complete when the window opens → settled \pos
       // (mid-composition chunk continuity, no re-animation).
-      const settled = dAbs + entranceMs <= ctx.winStart;
+      const settled = dAbs + effEnt <= ctx.winStart;
       const instant = preset.entrance === "typewriter"; // step alpha (no ramp)
 
       let head = "{\\an5";
@@ -499,21 +531,21 @@ function emitKineticComposition(comp, geo, ctx) {
         head += `\\pos(${cx},${cy})`;
       } else {
         const v0 = moveFromVector(gw, info, cx, cy);
-        head += `\\move(${v0.x0},${v0.y0},${cx},${cy},0,${entranceMs})`;
+        head += `\\move(${v0.x0},${v0.y0},${cx},${cy},0,${effEnt})`;
       }
       head += visualTags(info, gw);
       head += "\\alpha" + settledAlpha(info).hex;
       if (!settled && !instant) {
         // burst/converge from-scale (motion.ts 0.86/0.9 → 1).
         if (preset.entrance === "burst") {
-          head += `\\fscx86\\fscy86\\t(0,${entranceMs},\\fscx100\\fscy100)`;
+          head += `\\fscx86\\fscy86\\t(0,${effEnt},\\fscx100\\fscy100)`;
         } else if (preset.entrance === "converge") {
-          head += `\\fscx90\\fscy90\\t(0,${entranceMs},\\fscx100\\fscy100)`;
+          head += `\\fscx90\\fscy90\\t(0,${effEnt},\\fscx100\\fscy100)`;
         }
       }
       head += emphasisTags(info, d);
       head += pushDimTags(info, d);
-      const fadeIn = settled || instant ? 0 : entranceMs;
+      const fadeIn = settled || instant ? 0 : effEnt;
       if (fadeIn > 0 || fadeOutMs > 0) head += `\\fad(${fadeIn},${fadeOutMs})`;
       head += "}";
       events.push(dlg(d, relEnd, head + wt));
@@ -546,7 +578,8 @@ function emitKineticComposition(comp, geo, ctx) {
 
       // Line lead block: \an5 + absolute center + exit fade (+ the
       // clip-wipe rect animation — animated \clip via \t with two rect
-      // forms is the proven v1.17 mask-wipe recipe).
+      // forms is the proven v1.17 mask-wipe recipe). v1.33.2: the wipe ride
+      // the LINE-LEAD word's compressed entrance.
       let lead = `{\\an5\\pos(${cx},${cy})`;
       if (preset.entrance === "clip-wipe") {
         const x1 = Math.round(Math.min.apply(null, lineWords.map((w) => w.x)));
@@ -554,9 +587,10 @@ function emitKineticComposition(comp, geo, ctx) {
         const y1 = Math.round(first.y);
         const y2 = Math.round(first.y + first.h);
         const d0 = Math.max(0, Math.round(firstDAbs - ctx.winStart - S)); // = 0
+        const wipeEnt = (enterPlan.get(first.wordIdx | 0) || { enterMs: entranceMs }).enterMs;
         lead +=
           `\\clip(${x1},${y1},${x1},${y2})` +
-          `\\t(${d0},${d0 + entranceMs},\\clip(${x1},${y1},${x2},${y2}))`;
+          `\\t(${d0},${d0 + wipeEnt},\\clip(${x1},${y1},${x2},${y2}))`;
       }
       if (fadeOutMs > 0) lead += `\\fad(0,${fadeOutMs})`;
       lead += "}";
@@ -570,9 +604,13 @@ function emitKineticComposition(comp, geo, ctx) {
         const settled = settledAlpha(info);
         // \t times are ms RELATIVE TO THE DIALOGUE START (libass semantics).
         const d = Math.max(0, Math.round(dAbs - ctx.winStart - S));
+        // v1.33.2: per-word COMPRESSED entrance (mirror of the per-word mode
+        // + motion.ts) — late words pop fast instead of fading in under the
+        // already-running exit fade.
+        const effEnt = (enterPlan.get(gw.wordIdx | 0) || { enterMs: entranceMs }).enterMs;
         let block = "{" + visualTags(info, gw);
         let ts = "";
-        if (dAbs + entranceMs <= ctx.winStart) {
+        if (dAbs + effEnt <= ctx.winStart) {
           // Entrance already complete when the window opens → settled.
           block += "\\alpha" + settled.hex;
         } else {
@@ -585,23 +623,23 @@ function emitKineticComposition(comp, geo, ctx) {
               // the per-word routing is ever disabled again, alpha-only is
               // the documented inline degradation.
               block += "\\alpha&HFF&";
-              ts += `\\t(${d},${d + entranceMs},\\alpha${settled.hex})`;
+              ts += `\\t(${d},${d + effEnt},\\alpha${settled.hex})`;
               break;
             case "word-pop": {
               // 0.4→1 overshoot: alpha over the first 40% (motion.ts
               // alpha = min(1, et*2.5)), scale two-phase pop 115%→100%.
               block += "\\alpha&HFF&\\fscx40\\fscy40";
-              const aDur = Math.max(1, Math.round(entranceMs / 2.5));
+              const aDur = Math.max(1, Math.round(effEnt / 2.5));
               ts +=
                 `\\t(${d},${d + aDur},\\alpha${settled.hex})` +
-                `\\t(${d},${d + entranceMs},\\fscx115\\fscy115)` +
-                `\\t(${d + entranceMs},${d + Math.round(entranceMs * 1.3)},\\fscx100\\fscy100)`;
+                `\\t(${d},${d + effEnt},\\fscx115\\fscy115)` +
+                `\\t(${d + effEnt},${d + Math.round(effEnt * 1.3)},\\fscx100\\fscy100)`;
               break;
             }
             case "scale-slam": {
               // 2.4→1 slam in ≤120 ms (fast attack), alpha rides along.
               block += "\\alpha&HFF&\\fscx240\\fscy240";
-              const dur = Math.min(120, entranceMs);
+              const dur = Math.min(120, effEnt);
               ts += `\\t(${d},${d + dur},\\fscx100\\fscy100\\alpha${settled.hex})`;
               break;
             }
@@ -610,7 +648,7 @@ function emitKineticComposition(comp, geo, ctx) {
               const fromByte = hexByte(Math.round((1 - settled.num * 0.5) * 255));
               const blurFrom = Math.max(1, Math.round(10 * ctx.energy));
               block += `\\blur${blurFrom}\\fscx112\\fscy112\\alpha&H${fromByte}&`;
-              ts += `\\t(${d},${d + entranceMs},\\blur0\\fscx100\\fscy100\\alpha${settled.hex})`;
+              ts += `\\t(${d},${d + effEnt},\\blur0\\fscx100\\fscy100\\alpha${settled.hex})`;
               break;
             }
             case "flash": {
@@ -618,7 +656,7 @@ function emitKineticComposition(comp, geo, ctx) {
               // others 1.4× — motion.ts flash case).
               const fromPct = info.emphasis ? 190 : 140;
               block += `\\alpha&HFF&\\fscx${fromPct}\\fscy${fromPct}`;
-              ts += `\\t(${d},${d + entranceMs},\\fscx100\\fscy100\\alpha${settled.hex})`;
+              ts += `\\t(${d},${d + effEnt},\\fscx100\\fscy100\\alpha${settled.hex})`;
               break;
             }
             case "clip-wipe":
@@ -626,7 +664,7 @@ function emitKineticComposition(comp, geo, ctx) {
               // The line-level \clip rect does the wipe; the word rides an
               // alpha ramp (motion.ts alpha = min(1, et*1.6)).
               block += "\\alpha&HFF&";
-              const aDur = Math.max(1, Math.round(entranceMs / 1.6));
+              const aDur = Math.max(1, Math.round(effEnt / 1.6));
               ts += `\\t(${d},${d + aDur},\\alpha${settled.hex})`;
               break;
             }

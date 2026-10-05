@@ -2065,7 +2065,9 @@ function buildConcatArgs(o) {
       "-af", af.join(","),
       "-c:a", "aac", "-b:a", abr, "-ar", "48000",
       "-shortest",
-      "-movflags", "+faststart", "-y", o.outputPath,
+      // v1.33.2: the >1.5 GB faststart gate (see the tail of this builder).
+      ...(o.faststart !== false ? ["-movflags", "+faststart"] : []),
+      "-y", o.outputPath,
     ];
   }
   // v1.25 MULTI-MUSIC: the clip stack arrives as o.musicTracks
@@ -2187,7 +2189,12 @@ function buildConcatArgs(o) {
     args.push("-c:a", "aac", "-b:a", abr, "-ar", "48000", "-shortest");
   }
 
-  args.push("-movflags", "+faststart", "-y", o.outputPath);
+  // v1.33.2: `o.faststart === false` drops `-movflags +faststart` — the
+  // caller gates it for >1.5 GB expected outputs (the rewrite pass runs
+  // AFTER the last frame with no progress and looks like a hang; see
+  // main.js's FASTSTART GATING note).
+  const faststart = o.faststart !== false;
+  args.push(...(faststart ? ["-movflags", "+faststart"] : []), "-y", o.outputPath);
   return args;
 }
 

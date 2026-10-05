@@ -24,7 +24,7 @@ import { cn } from "@/lib/utils";
 /** v1.12.1: the renderer's build constant — compared against the REAL exe
  *  version (app.getVersion()) so a stale/hybrid install is impossible to
  *  miss. Keep in sync with package.json on every release. */
-const BUILD_VERSION = "1.33.1";
+const BUILD_VERSION = "1.33.2";
 
 export interface LastExport {
   path: string;
@@ -202,12 +202,18 @@ function parseTimemark(tm: string): number {
 }
 
 /** v1.14.2: friendly label for the export pipeline phase the backend
- *  reports alongside progress (see ExportProgress.phase). */
+ *  reports alongside progress (see ExportProgress.phase). v1.33.2 adds the
+ *  post-pool audio stages + the faststart finalize pass — every phase the
+ *  backend can report has an honest label so a moving/slow export is never
+ *  mistaken for a hang ("stuck at 100%"). */
 const PHASE_LABEL: Record<string, string> = {
   prepare: "preparing",
   video: "rendering video",
   audio: "mixing audio",
+  "audio-measure": "measuring loudness",
+  "audio-mix": "rendering audio mix",
   mux: "assembling",
+  finalize: "writing file header",
   done: "finishing",
 };
 

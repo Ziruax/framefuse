@@ -2612,6 +2612,14 @@ export default function Page() {
               : ""),
         );
       }
+      // v1.33.2: huge outputs skip the faststart rewrite (a silent whole-file
+      // IO pass after 100% that looks like a hang) — never silent, the toast
+      // says the file is complete and local playback is unaffected.
+      if ((res as { faststartSkipped?: boolean }).faststartSkipped) {
+        turboBits.push(
+          "large-file mode: streaming header skipped (file is complete; local playback unaffected)",
+        );
+      }
       toast.success(`Exported ${fmtBytes(res.size)}`, {
         description:
           turboBits.length > 0

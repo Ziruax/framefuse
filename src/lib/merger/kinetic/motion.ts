@@ -88,27 +88,37 @@ export function kineticWordTransforms(input: KineticMotionInput): KineticWordTra
   const stagger = preset.staggerMs;
   const exitMs = preset.exitMs;
 
-  // Push-stack: each phrase enters when its FIRST word is spoken and the
-  // previous phrase slides up + fades through its own exit window.
-  const phraseFirstWord = comp.phrases.map(
-    (ph) => ph.words[0]?.startMs ?? comp.startMs,
-  );
+  // v1.33.2 ENTRANCE/EXIT CROSSFIRE FIX: a word entering while the
+  // composition's exit fade was already running multiplied a rising alpha
+  // by a falling one — the last words of every tight composition peaked at
+  // ~30% opacity ("words not properly visible"). Two-part fix:
+  //   (a) each word's entrance COMPRESSES so it completes before the exit
+  //       window opens (min 60ms — a fast pop beats an invisible fade);
+  //   (b) the exit window DEFERS until the last entrance completed (words
+  //       keep full opacity to the end when there is no room to fade).
+  const nominalExitStart = comp.endMs - exitMs;
+  const enterWindows = comp.words.map((word, idx) => {
+    const phraseIdx = word.phraseIndex;
+    const delay = (phraseIdx * stagger) + (preset.entrance === "typewriter" ? idx * stagger : 0);
+    const enterStart = Math.max(comp.startMs, word.startMs - 60) + delay;
+    const room = Math.max(80, nominalExitStart - enterStart - 40);
+    const effMs = Math.max(60, Math.min(entranceMs, room));
+    return { enterStart, enterMs: effMs, enterEnd: enterStart + effMs };
+  });
+  const lastEnterEnd = enterWindows.reduce((m, w) => Math.max(m, w.enterEnd), -Infinity);
+  const exitStart = Math.max(nominalExitStart, lastEnterEnd + 60);
+  const noExitFade = exitStart >= comp.endMs - 40;
 
   comp.words.forEach((word, idx) => {
     const phrase = comp.phrases[word.phraseIndex];
     const role = phrase?.role ?? word.role;
-    const phraseIdx = word.phraseIndex;
-    const phraseStart = phraseFirstWord[phraseIdx] ?? word.startMs;
 
-    // Entrance window: stagger is PER PHRASE (the semantic unit, §22).
-    const delay = (phraseIdx * stagger) + (preset.entrance === "typewriter" ? idx * stagger : 0);
-    const enterStart = Math.max(comp.startMs, word.startMs - 60) + delay;
-    const enterEnd = enterStart + entranceMs;
+    // Entrance window (§22 stagger + v1.33.2 compressed duration).
+    const { enterStart, enterEnd } = enterWindows[idx];
     const et = clamp01((currentMs - enterStart) / (enterEnd - enterStart));
 
-    // Exit window (whole composition).
-    const exitStart = comp.endMs - exitMs;
-    const xt = clamp01((currentMs - exitStart) / exitMs);
+    // Exit window (whole composition; deferred past the last entrance).
+    const xt = noExitFade ? 0 : clamp01((currentMs - exitStart) / exitMs);
 
     // Emphasis event window: the word's own spoken moment (§21).
     const emphT = clamp01((currentMs - word.startMs) / Math.max(160, word.endMs - word.startMs));
@@ -286,8 +296,11 @@ export function kineticWordTransforms(input: KineticMotionInput): KineticWordTra
       }
     }
 
-    // Supporting words render muted (§27 color tiers).
-    if (role === "supporting") t.alpha *= 0.82;
+    // Supporting words render muted (§27 color tiers) — EXCEPT emphasis
+    // words (v1.33.2): the accent-colored highlight must stay fully legible
+    // even when its phrase is a supporting tier (the dimmed accent was the
+    // "colour highlight not showing properly" report).
+    if (role === "supporting" && !word.emphasis) t.alpha *= 0.82;
 
     out.push(t);
   });

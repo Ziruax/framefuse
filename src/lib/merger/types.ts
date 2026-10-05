@@ -414,7 +414,8 @@ export interface ExportProgress {
    * context to render an honest time estimate instead of a bare percent:
    *   - elapsed: wall-clock seconds since the export started
    *   - total:   total timeline seconds (the "@ 00:12 / 00:42" denominator)
-   *   - phase:   "prepare" | "video" | "audio" | "mux" | "done"
+   *   - phase:   "prepare" | "video" | "audio" | "audio-measure" |
+   *              "audio-mix" | "mux" | "finalize" | "done"
    *   - rate:    overall processing speed in × real-time (content-seconds
    *              per wall-second — the same number ffmpeg prints as speed=)
    */

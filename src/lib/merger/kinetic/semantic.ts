@@ -197,6 +197,12 @@ export function groupPhrases(words: string[]): SemanticGroup[] {
  * Pick the composition's TOP emphasis word(s): the global emphasis winner
  * is the highest-scoring content word; `never` returns more than 2 so the
  * frame keeps clear hierarchy (§28 — do not over-animate).
+ * v1.33.2: a composition of ≥4 words with NOTHING above the semantic bar
+ * (plain narration — no emotional/revelation/conflict vocabulary) used to
+ * get NO emphasis at all, so the accent/highlight color never appeared on
+ * entire stretches of captions ("colour highlight not showing properly").
+ * Fallback: the highest-scoring CONTENT word wins as the single accent —
+ * semantic (never a stop word) without flooding every word with color.
  */
 export function pickEmphasisWords(words: string[]): number[] {
   const scored = words.map((w, i) => scoreWord(w, i === words.length - 1));
@@ -206,6 +212,10 @@ export function pickEmphasisWords(words: string[]): number[] {
     if (scored[idx].score < 4) break; // below the semantic bar → no emphasis
     winners.push(idx);
     if (winners.length >= 2) break;
+  }
+  if (winners.length === 0 && words.length >= 4) {
+    const top = ranked.find((i) => scored[i].content) ?? ranked[0];
+    if (top != null && scored[top].score >= 2) return [top];
   }
   return winners;
 }

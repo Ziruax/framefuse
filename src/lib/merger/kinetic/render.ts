@@ -127,7 +127,14 @@ export function layoutKineticComposition(
         cur = [{ item, x: 0 }];
         curW = item.width;
       } else {
-        cur.push({ item, x: curW });
+        // v1.33.2 SPACING FIX: a word appended AFTER the first one on the
+        // line must start one space past the previous word's right edge —
+        // `curW` (the wrap cursor) IS that right edge, and the space width
+        // is only counted in `next`/`curW`, never in the pushed x. The old
+        // `x: curW` made the FIRST pair of every line touch edge-to-edge
+        // ("She|never" rendered as one merged word); pairs 2..n were fine,
+        // so every 2-4-word line had a 50% chance of a visibly missing gap.
+        cur.push({ item, x: cur.length === 0 ? curW : curW + spaceW });
         curW = next;
       }
     }

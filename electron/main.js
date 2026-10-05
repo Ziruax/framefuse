@@ -738,8 +738,14 @@ function pruneLoudnessDisk() {
  * (energy per unit time is unchanged by time-stretch), so measuring the
  * pre-atempo window is equivalent to the two-step's post-atempo WAV.
  * v1.14.5: disk-cached per path|mtime|size|window (see the block above).
+ * v1.33.2: DURATION-AWARE timeout — the old flat 60s cap was fine for
+ * song-length sources, but a 1h9m track decodes at ~40-90× realtime on a
+ * weak CPU (100-140s), so EVERY long-audio export had its measurement
+ * killed at 60s and silently fell back to the SLOWER dynamic loudnorm in
+ * the final mux (the "export crawls after 95%" amplifiers). The timeout
+ * now scales with the source duration (60s floor, 5min cap).
  */
-function measureLoudnessAsync(p, win) {
+function measureLoudnessAsync(p, win, timeoutMs) {
   if (typeof p !== "string" || !p) return Promise.resolve(null);
   // Temp WAVs (the two-step clip extracts + master-mix renders) live under
   // tempDir and never repeat — bypass the cache for them entirely.
@@ -764,6 +770,14 @@ function measureLoudnessAsync(p, win) {
   const seekArgs = win && Number(win.durMs) > 0
     ? ["-ss", (Math.max(0, Number(win.ssMs) || 0) / 1000).toFixed(3), "-t", (Number(win.durMs) / 1000).toFixed(3)]
     : [];
+  // v1.33.2: 60s floor + ~0.025s per media-second (covers ≥40× realtime
+  // decode+analysis on weak CPUs), capped at 5 min so a genuinely stuck
+  // measurement still dies.
+  const durSec = win && Number(win.durMs) > 0 ? Number(win.durMs) / 1000 : 0;
+  const timeout =
+    Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+      ? Math.max(20000, Math.min(300000, Number(timeoutMs)))
+      : Math.max(60000, Math.min(300000, 60000 + durSec * 25));
   loudnessCacheStats.misses += 1;
   return ffmpegCapture(
     [
@@ -773,7 +787,7 @@ function measureLoudnessAsync(p, win) {
       "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
       "-f", "null", "-",
     ],
-    60000,
+    timeout,
   ).then((r) => {
     const out = r && r.out ? r.out : "";
     const start = out.lastIndexOf("{");
@@ -808,16 +822,21 @@ function measureLoudnessAsync(p, win) {
  * same chunk discipline as the duration probes: a 100-clip project must not
  * spawn 100 ffmpeg children at once on a weak machine).
  * Returns { clip: [measure|null per clip WAV], music: measure|null }.
+ * v1.33.2: `totalSec` scales each measurement's timeout (long-audio exports
+ * measured for real instead of timing out at the flat 60s and falling back
+ * to the slower dynamic loudnorm in the mux).
  */
-async function measureLoudnormContext(clipAudioJobs, audioPath) {
+async function measureLoudnormContext(clipAudioJobs, audioPath, totalSec) {
   const clip = new Array(clipAudioJobs.length).fill(null);
   let music = null;
   const tasks = [];
+  const durSec = Number.isFinite(Number(totalSec)) && Number(totalSec) > 0 ? Number(totalSec) : 0;
+  const timeout = Math.max(60000, Math.min(300000, 60000 + durSec * 25));
   clipAudioJobs.forEach((j, k) => tasks.push({ kind: "clip", k, p: j.wavPath }));
   if (audioPath) tasks.push({ kind: "music", p: audioPath });
   for (let c = 0; c < tasks.length; c += 8) {
     const chunk = tasks.slice(c, c + 8);
-    const res = await Promise.all(chunk.map((t) => measureLoudnessAsync(t.p)));
+    const res = await Promise.all(chunk.map((t) => measureLoudnessAsync(t.p, null, timeout)));
     chunk.forEach((t, i) => {
       if (t.kind === "clip") clip[t.k] = res[i];
       else music = res[i];
@@ -2779,12 +2798,16 @@ function encoderGlobalArgs(encoderName) {
 // stderr "time=" parsing; `onTime` receives fractional seconds. Every live
 // child registers itself in `activeProcs` so cancel-export / pool failure /
 // the leak guard can kill the WHOLE set (v4.9 killed a single child).
-function runFfmpeg(args, totalSec, onTime) {
+function runFfmpeg(args, totalSec, onTime, opts) {
   return new Promise((resolve, reject) => {
     const proc = spawn(ffmpegPath, args, { windowsHide: true });
     activeProcs.add(proc);
     let stderr = "";
     let stderrTail = "";
+    let sawTotal = false;        // out_time reached totalSec (encode done)
+    let finalizeNotified = false;
+    let finalizeTimer = null;
+    const onFinalize = opts && typeof opts.onFinalize === "function" ? opts.onFinalize : null;
     proc.stderr.on("data", (data) => {
       const s = data.toString();
       if (onTime && totalSec > 0) {
@@ -2792,13 +2815,34 @@ function runFfmpeg(args, totalSec, onTime) {
         if (m) {
           const sec = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4]) / 100;
           onTime(Math.min(sec, totalSec));
+          // v1.33.2 (stuck-at-100% report): when every frame is muxed
+          // (out_time == total) the process can STILL run for a long silent
+          // stretch — `-movflags +faststart` rewrites the WHOLE file to move
+          // the moov atom up front (a pure IO pass: minutes for multi-GB
+          // outputs on spinning disks). The progress bar sits at 100% with
+          // no explanation and looks hung. Detect the tail: once out_time
+          // hits total, if the process is still alive 1.5s later it is in
+          // the finalize pass → notify once so the caller can flip the
+          // phase to "finalize" (the UI then says what is happening).
+          if (!sawTotal && sec >= totalSec - 0.25) {
+            sawTotal = true;
+            if (onFinalize) {
+              finalizeTimer = setTimeout(() => {
+                if (!finalizeNotified) {
+                  finalizeNotified = true;
+                  try { onFinalize(); } catch (_) { /* best-effort phase flip */ }
+                }
+              }, 1500);
+            }
+          }
         }
       }
       stderr += s;
       stderrTail = (stderrTail + s).slice(-4000);
     });
-    proc.on("error", (err) => { activeProcs.delete(proc); reject(new Error(err.message)); });
+    proc.on("error", (err) => { if (finalizeTimer) clearTimeout(finalizeTimer); activeProcs.delete(proc); reject(new Error(err.message)); });
     proc.on("exit", (code, signal) => {
+      if (finalizeTimer) clearTimeout(finalizeTimer);
       activeProcs.delete(proc);
       if (signal === "SIGKILL" || signal === "SIGTERM") { reject(new Error("Export cancelled")); return; }
       if (code !== 0) {
@@ -6171,15 +6215,32 @@ ipcMain.handle("export-native", async (event, opts) => {
           ...(spAudioPath ? ["-map", "1:a:0"] : []),
           "-c", "copy",
           ...(spAudioPath ? ["-shortest"] : []),
-          "-movflags", "+faststart",
+          // v1.33.2: same >1.5 GB faststart gate as the two-step mux (the
+          // whole-file moov rewrite runs after the last frame with zero
+          // progress output and looks like a hang at 100%).
+          ...((() => {
+            let chunkBytes = 0;
+            for (const p of chunkFiles) { try { chunkBytes += fs.statSync(p).size; } catch (_) {} }
+            const audioBytes = spAudioPath ? (abr * 1000 / 8) * totalSec : 0;
+            return chunkBytes + audioBytes > 1.5 * 1024 * 1024 * 1024 ? [] : ["-movflags", "+faststart"];
+          })()),
           outputPath,
         ];
         const muxStageStart = Date.now();
+        let spFinalizeNotified = false;
         prof.beginStage("mux");
         try {
           await runFfmpeg(muxArgs, totalSec, (sec) => {
             const frac = 0.965 + 0.035 * Math.min(1, sec / Math.max(0.01, totalSec));
             sendProgress(frac * 100, sec, etaFor(frac));
+          }, {
+            onFinalize: () => {
+              if (spFinalizeNotified) return;
+              spFinalizeNotified = true;
+              exportPhase = "finalize";
+              sendProgress(100, totalSec, undefined);
+              console.log("[Export] finalize: concat muxed — ffmpeg is rewriting the file header (faststart)");
+            },
           });
         } catch (err) {
           prof.endStage("mux");
@@ -6359,7 +6420,7 @@ ipcMain.handle("export-native", async (event, opts) => {
     // sum. A failed probe falls back to the requested duration for that
     // clip, and the whole total falls back when nothing is measurable.
     exportPhase = "audio";
-    sendProgress(96, totalSec, etaFor(0.96));
+    sendProgress(95.4, totalSec, etaFor(0.954));
     // Probes run in bounded chunks (8 at a time) — a 100-clip project must
     // not spawn 100 ffmpeg children simultaneously on a weak machine.
     const clipDurProbe = [];
@@ -6404,8 +6465,17 @@ ipcMain.handle("export-native", async (event, opts) => {
     const legacyMusicPath2 = hasMusicClips ? null : audioPath;
     if (audio && audio.normalize && (clipAudioJobs.length > 0 || musicCount > 0)) {
       prof.beginStage("loudness");
-      loudnormCtx = await measureLoudnormContext(clipAudioJobs, legacyMusicPath2);
+      // v1.33.2 (stuck-at-100% report): the measurement pass can run MINUTES
+      // on hour-long audio — it used to sit frozen at a bare "96%" with the
+      // phase chip still saying "mixing audio". The phase now says exactly
+      // what is running and the bar moves to 95.5 while the (duration-scaled,
+      // v1.33.2) measurements decode each source.
+      exportPhase = "audio-measure";
+      sendProgress(95.5, totalSec, etaFor(0.955));
+      loudnormCtx = await measureLoudnormContext(clipAudioJobs, legacyMusicPath2, actualTotalSec);
       prof.endStage("loudness");
+      exportPhase = "audio";
+      sendProgress(96, totalSec, etaFor(0.96));
       const branchCount = clipAudioJobs.length + musicCount;
       const clipsUsable = (loudnormCtx.clip || []).every((m) => G.loudnessGainDb(m) != null);
       const musicUsable = !legacyMusicPath2 || G.loudnessGainDb(loudnormCtx.music) != null;
@@ -6484,8 +6554,29 @@ ipcMain.handle("export-native", async (event, opts) => {
           })),
           mixWavPath,
         });
-        await runFfmpeg(renderArgs, actualTotalSec, () => {});
-        const masterMeasure = await measureLoudnessAsync(mixWavPath);
+        // v1.33.2 (stuck-at-100% report): the master-mix render of an
+        // hour-long timeline takes MINUTES on weak CPUs and previously ran
+        // with a NO-OP progress callback — the bar sat frozen at 96% with no
+        // phase change while ffmpeg decoded+mixed the full duration. The
+        // out_time now drives 96 → 96.5 with an explicit "mixing audio"
+        // phase so the bar visibly moves and the ETA is honest.
+        exportPhase = "audio-mix";
+        let mixNotified = false;
+        await runFfmpeg(renderArgs, actualTotalSec, (sec) => {
+          if (!mixNotified) {
+            mixNotified = true;
+            console.log(
+              `[Export] master-bus mix render: ${(actualTotalSec / 60).toFixed(1)} min of audio → temp WAV (progress 96→96.5%)`,
+            );
+          }
+          sendProgress(96 + 0.5 * Math.min(1, sec / Math.max(0.01, actualTotalSec)), sec, etaFor(0.9625));
+        });
+        exportPhase = "audio";
+        sendProgress(96.6, totalSec, etaFor(0.966));
+        // v1.33.2: duration-scaled timeout (a 69-min mix WAV measures in
+        // 100-140s on weak CPUs — the flat 60s cap killed it and silently
+        // fell back to the slow dynamic loudnorm in the final mux).
+        const masterMeasure = await measureLoudnessAsync(mixWavPath, null, 60000 + actualTotalSec * 25);
         if (fs.existsSync(mixWavPath) && fs.statSync(mixWavPath).size > 44) {
           masterMix = { wavPath: mixWavPath, loudnorm: masterMeasure };
         }
@@ -6515,6 +6606,29 @@ ipcMain.handle("export-native", async (event, opts) => {
     // (mix -t, apad whole_dur, fade alignment); the FILE end follows the
     // visuals. Loop-to-fill projects never hit this case (the loop clip
     // extends the video to the audio's end).
+    // v1.33.2 FASTSTART GATING (stuck-at-100% report): `-movflags
+    // +faststart` rewrites the ENTIRE output to move the moov atom to the
+    // front — an IO pass of 2× the file size that runs AFTER the last frame
+    // is muxed (progress already says 100%, nothing updates, and the export
+    // LOOKS hung). Measured on a real 2.07 GB / 69-min loop-fill export: the
+    // rewrite alone can take minutes on spinning disks. The flag only
+    // matters for progressive-download STREAMING (web players); local
+    // players (VLC/PotPlayer/WMP/editors) seek fine with moov-at-end, and
+    // uploaders re-encode anyway. Outputs expected to exceed 1.5 GB skip
+    // the rewrite — the result payload says so (faststartSkipped).
+    const expectedVideoBytes = clipPaths.reduce((n, p) => {
+      try { return n + fs.statSync(p).size; } catch (_) { return n; }
+    }, 0);
+    const expectedAudioBytes = (abr * 1000 / 8) * actualTotalSec;
+    const expectedOutBytes = expectedVideoBytes + expectedAudioBytes;
+    const skipFaststart = expectedOutBytes > 1.5 * 1024 * 1024 * 1024;
+    if (skipFaststart) {
+      console.log(
+        `[Export] faststart skipped: expected output ≈ ${(expectedOutBytes / 1024 / 1024 / 1024).toFixed(2)} GB > 1.5 GB ` +
+          `(-movflags +faststart would rewrite the whole file after 100% — moov stays at end; local playback unaffected)`,
+      );
+    }
+
     const concatArgs = G.buildConcatArgs({
       concatListPath,
       audioPath: legacyMusicPath2,
@@ -6540,16 +6654,31 @@ ipcMain.handle("export-native", async (event, opts) => {
       // v1.25: any multi-music stack forces the amix graph path (the legacy
       // single -af chain can only filter ONE input).
       newAudioGraph: anyVideoAudio || sfxList.length > 0 || voiceoverList.length > 0 || hasMusicClips,
+      // v1.33.2: >1.5 GB outputs drop the faststart rewrite (see above).
+      ...(skipFaststart ? { faststart: false } : {}),
     });
 
     exportPhase = "mux";
     prof.beginStage("mux");
+    let finalizeNotified = false;
     await runFfmpeg(concatArgs, actualTotalSec, (sec) => {
-      const frac = 0.96 + 0.04 * Math.min(1, sec / Math.max(0.01, actualTotalSec));
-      // v5 fix (pre-existing v4.9 bug): sendProgress takes PERCENT — the old
-      // code passed the 0.96..1.0 fraction, so the bar dipped 96 → ~1 → 100
-      // during the mux. Payload shape (progress/fps/eta/timemark) unchanged.
+      // v1.33.2: the mux maps to 96.5 → 99.7 (NOT 100) — 100% now appears
+      // only when the process truly finishes or enters the labeled finalize
+      // pass, so "100%" never again means "silently still working".
+      const frac = 0.965 + 0.032 * Math.min(1, sec / Math.max(0.01, actualTotalSec));
       sendProgress(frac * 100, sec, etaFor(frac));
+    }, {
+      onFinalize: () => {
+        if (finalizeNotified) return;
+        finalizeNotified = true;
+        // faststart's second pass (moov rewrite) — the phase chip now says
+        // exactly what the silent tail is instead of a frozen "100%".
+        exportPhase = "finalize";
+        sendProgress(100, actualTotalSec, undefined);
+        console.log(
+          "[Export] finalize: every frame muxed — ffmpeg is rewriting the file header (faststart; can take a minute on large files)",
+        );
+      },
     });
     prof.endStage("mux");
 
@@ -6609,6 +6738,10 @@ ipcMain.handle("export-native", async (event, opts) => {
       // v1.14.6 (user directive): the audio-normalize state that actually
       // ran — false = loudnorm fully bypassed (the toast proves it).
       audioNormalize: !!(audio && audio.normalize),
+      // v1.33.2: faststart was skipped for a >1.5 GB expected output (the
+      // whole-file moov rewrite runs after 100% with no progress and looks
+      // like a hang; local playback is unaffected by moov-at-end).
+      ...(skipFaststart ? { faststartSkipped: true } : {}),
       hwCaps: hwProfile.hwCaps || undefined,
       profile: prof.finish({ path: outputPath, size, contentSec: actualTotalSec, mode: "two-step" }),
     };
