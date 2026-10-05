@@ -20,6 +20,12 @@ const nextConfig: NextConfig = {
     ignoreBuildErrors: true,
   },
   reactStrictMode: false,
+  // v1.28: the webpack build worker OOM-killed at ~3.5 GB RSS in the 4 GB
+  // build container once the kinetic modules joined the page graph. This
+  // flag (serial cache + no in-memory webpack cache + reduced source maps)
+  // is Next's documented knob for memory-constrained builders; the emitted
+  // static bundle is unchanged.
+  ...(isDev ? {} : { experimental: { webpackMemoryOptimizations: true } }),
   // Fix "ignored package-lock.json in home directory" warning on Windows
   turbopack: {
     root: __dirname,
