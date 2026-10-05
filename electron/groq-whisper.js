@@ -283,6 +283,7 @@ async function extractAudioForGroq(ffmpegPath, inputPath, outDir, onStage) {
 function classifyGroqError(status, bodyText, maskedKey) {
   let apiMessage = "";
   let errType = "";
+  let errCode = "";
   let bodyIsJson = false;
   try {
     const j = JSON.parse(bodyText);
@@ -290,8 +291,13 @@ function classifyGroqError(status, bodyText, maskedKey) {
     apiMessage = (e && typeof e.message === "string" && e.message) ||
       (j && typeof j.message === "string" ? j.message : "") || "";
     errType = (e && typeof e.type === "string" && e.type) || "";
+    errCode = (e && typeof e.code === "string" && e.code) || "";
     bodyIsJson = true;
   } catch (_) { /* non-JSON body */ }
+  // v1.32: a response is a GENUINE Groq API answer only when the documented
+  // error envelope (error.type / error.code — console.groq.com/docs/errors)
+  // is present. The bare {"error":{"message":"Forbidden"}} has neither and
+  // is the edge/interceptor family.
   const raw = apiMessage ? ` [${apiMessage}]` : "";
   const keyPart = maskedKey ? ` (${maskedKey})` : "";
   switch (status) {
@@ -314,8 +320,20 @@ function classifyGroqError(status, bodyText, maskedKey) {
       }
       return `Groq refused access for this key${keyPart} — a permission restriction (suspended organization or a model not enabled for this key; check console.groq.com)${raw}`;
     }
-    case 404:
-      return `Groq model not found — whisper-large-v3 access may not be enabled for this key${raw}`;
+    case 404: {
+      // v1.32: split the two 404 families. A GENUINE Groq 404 carries the
+      // documented JSON envelope WITH error.type ("The model … does not
+      // exist") — model availability. A 404 WITHOUT that envelope was
+      // NEVER produced by Groq's API: something between this app and
+      // api.groq.com (OS proxy, VPN, antivirus web-filter, captive portal)
+      // swallowed the request and answered itself. That is the exact
+      // signature of "the key authenticates (GET /models works) but the
+      // real transcription returns 404" on interceptor machines.
+      if (bodyIsJson && (errType || errCode)) {
+        return `Groq does not recognize the model for this key${keyPart}${raw}`;
+      }
+      return `The endpoint answered 404 — but this response did NOT come from Groq's API (no Groq error envelope). Something on this machine or network (a proxy, VPN, or antivirus "web protection" that scans HTTPS) intercepted the request and answered it — the key is fine (it just authenticated) and the model is current. Fix: disable HTTPS/TLS scanning for this app in your antivirus, turn the VPN/proxy off (or on), or use a different network${raw}`;
+    }
     case 413:
       return `Groq says the audio upload is too large (25 MB cap)${raw}`;
     case 429:
@@ -345,6 +363,26 @@ function parseGroqErrorBody(bodyText) {
   }
 }
 
+/** v1.32: is this body a GENUINE Groq API answer? Groq's documented error
+ *  envelope always carries error.type (and often error.code). The bare
+ *  {"error":{"message":"Forbidden"}} and any non-JSON body are NOT from
+ *  the Groq API layer (edge block / proxy / interceptor). */
+function isGenuineGroqErrorBody(bodyText) {
+  const p = parseGroqErrorBody(bodyText);
+  return p.isJson && !!(p.type || p.code);
+}
+
+/** v1.32 TRANSPORT FAILOVER trigger: a 401/403/404 that the Groq API did
+ *  not genuinely produce. When the first attempt rode Chromium's net stack
+ *  (which honors the OS proxy), the caller re-issues the request through
+ *  plain Node https — direct, proxy-ignoring — before surfacing anything. */
+function transportFailoverWorthy(status, bodyText) {
+  return (
+    (status === 404 || status === 401 || status === 403) &&
+    !isGenuineGroqErrorBody(bodyText)
+  );
+}
+
 /** Run one multipart transcription request.
  *
  * @param {object} o
@@ -371,10 +409,13 @@ function groqTranscribe(o) {
     err && err.status === 400 &&
     /timestamp|granularit|word[-_ ]level/i.test(String(err.apiMessage || err.message || ""));
 
-  /** 404 model-not-found / decommisioned-model — swap to the other whisper. */
-  const isModel404 = (err) =>
-    err && err.status === 404 &&
-    /model|decommission/i.test(String(err.apiMessage || err.message || ""));
+  /** v1.22→v1.32: a 404 retries with the other whisper model. v1.22 gated
+   *  this on the message naming "model"/"decommission" — but a genuine
+   *  Groq 404 body does not always match that regex (and an intercepted 404
+   *  has no body at all), so the retry silently never fired. ANY 404 now
+   *  gets exactly one alternate-model attempt (bounded, silent, logged
+   *  through the status message). */
+  const isModel404 = (err) => err && err.status === 404;
 
   // v1.22 RESILIENCE (the "error while transcribing" fixes):
   //   A) the turbo model has rejected word-level timestamps for some
@@ -426,8 +467,10 @@ function groqTranscribe(o) {
   })();
 }
 
-/** One raw multipart request (no retries — groqTranscribe owns those). */
-function groqTranscribeOnce(o, modelId, wantWordTimestamps, language) {
+/** One raw multipart request (no retries — groqTranscribe owns those).
+ *  v1.32 `transportMode`: "auto" (Chromium net inside Electron — honors the
+ *  OS proxy) or "node" (plain Node https — direct, proxy-ignoring). */
+function groqTranscribeOnceRaw(o, modelId, wantWordTimestamps, language, transportMode) {
   return new Promise((resolve, reject) => {
     const { apiKey, filePath } = o;
     const onProgress = typeof o.onProgress === "function" ? o.onProgress : null;
@@ -474,6 +517,7 @@ function groqTranscribeOnce(o, modelId, wantWordTimestamps, language) {
         host: GROQ_API_HOST,
         path: TRANSCRIBE_PATH,
         method: "POST",
+        transport: transportMode === "node" ? "node" : undefined,
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": `multipart/form-data; boundary=${boundary}`,
@@ -510,6 +554,20 @@ function groqTranscribeOnce(o, modelId, wantWordTimestamps, language) {
             );
             err.status = res.statusCode;
             err.apiMessage = apiMessage;
+            // v1.32 TRANSPORT FAILOVER: a 401/403/404 WITHOUT a genuine
+            // Groq error envelope did not come from Groq's API. On a
+            // Chromium-net attempt (which honors the OS proxy) that smells
+            // like an interceptor answering for Groq — mark it so the
+            // wrapper retries the identical request through direct Node
+            // https (proxy-ignoring).
+            if (
+              transportMode !== "node" &&
+              req &&
+              req._usingElectron &&
+              transportFailoverWorthy(res.statusCode, body)
+            ) {
+              err._transportFailover = true;
+            }
             reject(err);
             return;
           }
@@ -636,6 +694,32 @@ function groqTranscribeOnce(o, modelId, wantWordTimestamps, language) {
   });
 }
 
+/** One multipart transcription request WITH the v1.32 transport failover:
+ *  when the Chromium-net attempt (which honors the OS proxy) yields an
+ *  interceptor-shaped response — 401/403/404 with NO genuine Groq error
+ *  envelope — the IDENTICAL request is re-issued through plain Node https,
+ *  which ignores the OS proxy and connects directly. On proxy/AV/VPN
+ *  machines where the GET /models passes (the key "authenticates") but the
+ *  POST upload is answered by the interceptor (the "transcription returns
+ *  404" signature), the direct retry is the request Groq actually
+ *  receives. */
+function groqTranscribeOnce(o, modelId, wantWordTimestamps, language) {
+  return groqTranscribeOnceRaw(o, modelId, wantWordTimestamps, language, "auto").catch(
+    (err) => {
+      if (!err || !err._transportFailover) throw err;
+      const onProgress = typeof o.onProgress === "function" ? o.onProgress : null;
+      if (onProgress) {
+        onProgress({
+          progress: 60,
+          status:
+            "Response looked intercepted — retrying the upload through a direct connection (bypassing the system proxy)…",
+        });
+      }
+      return groqTranscribeOnceRaw(o, modelId, wantWordTimestamps, language, "node");
+    },
+  );
+}
+
 // ---------------------------------------------------------------------------
 // v1.30 END-TO-END KEY PROBE — a REAL transcription request.
 //
@@ -687,17 +771,18 @@ function buildProbeBody(modelId) {
   return { boundary, body };
 }
 
-/** POST the embedded silence to /audio/transcriptions. Resolves
- *  { ok:boolean, message:string } — ok ONLY on a real 200. */
-function groqTranscribeProbe(apiKey, modelId) {
+/** POST the embedded silence to /audio/transcriptions (one raw attempt).
+ *  v1.32 resolves { ok, message, status, genuine, failover } so the
+ *  orchestrator can retry through the other transport / other model. */
+function probeOnce(apiKey, modelId, transportMode) {
   return new Promise((resolve) => {
-    const model = normalizeGroqModel(modelId);
-    const { boundary, body } = buildProbeBody(model);
+    const { boundary, body } = buildProbeBody(modelId);
     const req = createRequest(
       {
         host: GROQ_API_HOST,
         path: TRANSCRIBE_PATH,
         method: "POST",
+        transport: transportMode === "node" ? "node" : undefined,
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": `multipart/form-data; boundary=${boundary}`,
@@ -716,6 +801,12 @@ function groqTranscribeProbe(apiKey, modelId) {
           resolve({
             ok: false,
             message: classifyGroqError(res.statusCode, bodyText, maskApiKey(apiKey)),
+            status: res.statusCode,
+            genuine: isGenuineGroqErrorBody(bodyText),
+            failover:
+              transportMode !== "node" &&
+              !!(req && req._usingElectron) &&
+              transportFailoverWorthy(res.statusCode, bodyText),
           });
         });
       },
@@ -727,6 +818,39 @@ function groqTranscribeProbe(apiKey, modelId) {
       resolve({ ok: false, message: err instanceof Error ? err.message : String(err) }),
     );
     req.end(body);
+  });
+}
+
+/** Validate the REAL transcription path end to end (v1.30 + v1.32):
+ *  1. one probe POST through the default transport (Chromium net inside
+ *     Electron — honors the OS proxy);
+ *  2. an interceptor-shaped failure (401/403/404 without a genuine Groq
+ *     error envelope) retries the identical POST through direct Node
+ *     https, which ignores the OS proxy;
+ *  3. a GENUINE model-availability 404 retries once with the OTHER whisper
+ *     model (Groq decommissions models; the stored selection may age out).
+ *  Resolves { ok:boolean, message:string } — ok ONLY on a real 200. */
+function groqTranscribeProbe(apiKey, modelId) {
+  const model = normalizeGroqModel(modelId);
+  return probeOnce(apiKey, model, "auto").then((r) => {
+    if (r.ok) return r;
+    if (r.failover) {
+      // The Chromium-net path (OS-proxy-honoring) got an answer Groq never
+      // sent — re-issue the probe directly.
+      return probeOnce(apiKey, model, "node").then((r2) => {
+        if (r2.ok) return r2;
+        if (r2.status === 404 && r2.genuine) {
+          return probeOnce(apiKey, alternateGroqModel(model), "node");
+        }
+        return r2;
+      });
+    }
+    if (r.status === 404 && r.genuine) {
+      // Genuine Groq 404: the model is not available for this key — one
+      // silent attempt with the other whisper model.
+      return probeOnce(apiKey, alternateGroqModel(model), "auto");
+    }
+    return r;
   });
 }
 
@@ -815,6 +939,8 @@ module.exports = {
   extractAudioForGroq,
   classifyGroqError,
   parseGroqErrorBody,
+  isGenuineGroqErrorBody,
+  transportFailoverWorthy,
   transportName,
   groqTranscribe,
   groqTestKey,

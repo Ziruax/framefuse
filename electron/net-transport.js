@@ -37,6 +37,20 @@
 //   req.write(chunk, cb?) / req.end(data?, cb?) / req.destroy(err?)
 //   req.on("error", fn) / req.once("drain", fn) / req.setTimeout(ms, fn)
 //
+// v1.32 — TRANSPORT FAILOVER SUPPORT. Real-world diagnosis: a machine can
+// have a system-level interceptor (VPN, antivirus "web protection", content
+// filter) that Chromium's net stack — which HONORS the OS proxy — routes
+// through. Small GETs pass the interceptor, but multipart/POST uploads can
+// get swallowed and answered by the interceptor itself (a 404 Groq never
+// sent). The fix is dual-path: callers now pass opts.transport —
+//   "auto" (default) — electron-net when available, else Node https
+//   "node"        — ALWAYS plain Node https, which IGNORES the OS proxy and
+//                    connects directly (the bypass path)
+// and the provider clients retry a suspicious response (a 404/401/403 whose
+// body is NOT a genuine provider error envelope) once through the OTHER
+// transport. The adapter exposes `_usingElectron` so callers can tell which
+// path actually served the request.
+//
 // This module stays a PLAIN Node module: the electron require is guarded
 // and only succeeds inside the Electron main process.
 
@@ -82,6 +96,8 @@ function passThroughResponse(res) {
  * @param {string} opts.path             e.g. "/openai/v1/models"
  * @param {object} [opts.headers]        header → string value
  * @param {number} [opts.port=443]
+ * @param {string} [opts.transport]       "auto" (default) | "node" (force the
+ *                                        direct, proxy-bypassing path)
  * @param {(res:import("http").IncomingMessage)=>void} onResponse
  *        Fired once when response HEADERS arrive (the https.request
  *        callback contract).
@@ -93,7 +109,12 @@ function createRequest(opts, onResponse) {
   let raw = null;
   let usingElectron = false;
 
-  if (electronNet) {
+  // v1.32: "node" forces the direct Node https path — the caller is
+  // retrying a response it suspects an OS-proxy-level interceptor produced;
+  // Node's https ignores the OS proxy and connects directly.
+  const forceNode = opts.transport === "node";
+
+  if (electronNet && !forceNode) {
     try {
       raw = electronNet.request({
         method: opts.method || "GET",

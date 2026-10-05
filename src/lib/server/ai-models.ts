@@ -234,20 +234,21 @@ export async function testProviderKey(
    *  Cloudflare EDGE refusing the connection (IP-range block): the key was
    *  never checked and the console will show zero requests. A non-JSON
    *  401/403 is a network-level block that never reached the provider. */
-  const parseApiError = (body: string): { api: string; errType: string; isJson: boolean } => {
+  const parseApiError = (body: string): { api: string; errType: string; errCode: string; isJson: boolean } => {
     try {
-      const j = JSON.parse(body) as { error?: { message?: string; type?: string }; message?: string };
+      const j = JSON.parse(body) as { error?: { message?: string; type?: string; code?: string }; message?: string };
       return {
         api: j.error?.message ?? j.message ?? "",
         errType: j.error?.type ?? "",
+        errCode: j.error?.code ?? "",
         isJson: true,
       };
     } catch {
-      return { api: "", errType: "", isJson: false };
+      return { api: "", errType: "", errCode: "", isJson: false };
     }
   };
   const classifyGroq = (status: number, body: string) => {
-    const { api, errType, isJson } = parseApiError(body);
+    const { api, errType, errCode, isJson } = parseApiError(body);
     const raw = api ? ` [${api}]` : "";
     if (status === 401 || status === 403) {
       // (1) Non-JSON (HTML challenge / plain text): the request was blocked
@@ -270,7 +271,17 @@ export async function testProviderKey(
       }
       return `Groq refused access for this key (${maskKey(trimmed, 7)}) — a permission restriction (suspended org or restricted model)${raw}`;
     }
-    if (status === 404) return `Groq model not found — this model may not be enabled for your key${raw}`;
+    if (status === 404) {
+      // v1.32: a GENUINE Groq 404 (JSON envelope WITH error.type/code) is
+      // model availability. A 404 WITHOUT that envelope never came from
+      // Groq's API — an intermediary (OS proxy, VPN, antivirus web-filter)
+      // answered the upload itself. That is the "key authenticates but the
+      // real transcription 404s" signature on interceptor machines.
+      if (isJson && (errType || errCode)) {
+        return `Groq does not recognize the model for this key${raw}`;
+      }
+      return `The transcription endpoint answered 404 — but this response did NOT come from Groq's API (no Groq error envelope). Something on this machine or network (a proxy, VPN, or antivirus "web protection" that scans HTTPS) intercepted the upload and answered it — the key is fine (it just authenticated) and the model is current. Fix: disable HTTPS/TLS scanning for this app in your antivirus, toggle the VPN/proxy, or use another network${raw}`;
+    }
     if (status === 429) return `Groq rate limit reached — wait a moment and test again${raw}`;
     if (status >= 500) return `Groq server error (${status}) — usually transient, try again${raw}`;
     return `Groq request failed (HTTP ${status})${raw}`;
@@ -298,19 +309,37 @@ export async function testProviderKey(
         opts?.model?.trim() && GROQ_WHISPER_MODELS.some((m) => m.id === opts?.model?.trim())
           ? (opts?.model?.trim() as string)
           : WHISPER_DEFAULT;
-      const probeForm = new FormData();
-      probeForm.append(
-        "file",
-        new Blob([Buffer.from(PROBE_MP3_B64, "base64")], { type: "audio/mpeg" }),
-        "probe.mp3",
-      );
-      probeForm.append("model", model);
-      probeForm.append("response_format", "json");
-      const probeRes = await fetchWithTimeout(GROQ_TRANSCRIBE_URL, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${trimmed}` },
-        body: probeForm,
-      });
+      const runProbe = async (modelId: string) => {
+        const probeForm = new FormData();
+        probeForm.append(
+          "file",
+          new Blob([Buffer.from(PROBE_MP3_B64, "base64")], { type: "audio/mpeg" }),
+          "probe.mp3",
+        );
+        probeForm.append("model", modelId);
+        probeForm.append("response_format", "json");
+        return fetchWithTimeout(GROQ_TRANSCRIBE_URL, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${trimmed}` },
+          body: probeForm,
+        });
+      };
+      // v1.32: a 404 on the probe first gets ONE silent retry with the OTHER
+      // whisper model (Groq decommissions models — a stored selection can
+      // age out) before the failure is surfaced.
+      let probedModel = model;
+      let probeRes = await runProbe(probedModel);
+      if (probeRes.status === 404) {
+        const alt =
+          probedModel === "whisper-large-v3" ? "whisper-large-v3-turbo" : "whisper-large-v3";
+        const altRes = await runProbe(alt);
+        if (altRes.ok) {
+          probeRes = altRes;
+          probedModel = alt;
+        } else {
+          probeRes = altRes;
+        }
+      }
       if (!probeRes.ok) {
         const body = await probeRes.text().catch(() => "");
         return {
@@ -321,7 +350,7 @@ export async function testProviderKey(
       }
       return {
         ok: true,
-        message: `Key works — real transcription verified end to end (${model}; the key, the model and the upload all passed)`,
+        message: `Key works — real transcription verified end to end (${probedModel}; the key, the model and the upload all passed)`,
         models: whisper,
       };
     }

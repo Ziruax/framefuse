@@ -310,9 +310,9 @@ async function groqWhisper(
     let errType = "";
     let isJson = false;
     try {
-      const j = JSON.parse(body) as { error?: { message?: string; type?: string }; message?: string };
+      const j = JSON.parse(body) as { error?: { message?: string; type?: string; code?: string }; message?: string };
       api = j.error?.message ?? j.message ?? "";
-      errType = j.error?.type ?? "";
+      errType = j.error?.type ?? j.error?.code ?? "";
       isJson = true;
     } catch { /* non-JSON body */ }
     const raw = api ? ` [${api}]` : "";
@@ -349,7 +349,25 @@ async function groqWhisper(
         403,
       );
     }
-    // 404 (model access), 413 (too large), 429 (rate limit), 5xx…
+    // v1.32: the two 404 families. A GENUINE Groq 404 (JSON envelope with
+    // error.type/code) = model availability → the caller retries with the
+    // other whisper model. A 404 WITHOUT that envelope NEVER came from
+    // Groq's API — an intermediary (proxy/VPN/antivirus) answered the
+    // upload itself: the "key authenticates but the real transcription
+    // 404s" signature.
+    if (res.status === 404) {
+      if (isJson && errType) {
+        throw new TranscribeFailure(
+          `Groq does not recognize the whisper model for this key${raw}`,
+          404,
+        );
+      }
+      throw new TranscribeFailure(
+        `The transcription endpoint answered 404 — but this did NOT come from Groq's API (no Groq error envelope): a proxy, VPN, or antivirus web-filter on this machine intercepted the upload. The key is fine and the model is current. Fix: disable HTTPS/TLS scanning in your antivirus, toggle the VPN/proxy, or use another network${raw}`,
+        502,
+      );
+    }
+    // 413 (too large), 429 (rate limit), 5xx…
     throw new TranscribeFailure(
       `Groq Whisper ${res.status}${raw ? ` ${raw}` : `: ${body.slice(0, 200)}`}`,
       res.status === 429 ? 429 : 502,
@@ -402,6 +420,10 @@ async function groqTranscribePart(
 
   const utterances: DubUtterance[] = [];
   let detected = "";
+  // v1.32: one 404 swaps the whisper model for the REST of the part (Groq
+  // decommissions models — a stored selection can age out).
+  let activeModel = model;
+  let modelSwapped = false;
   for (const chunk of chunks) {
     const size = fs.statSync(chunk.path).size;
     if (size > GROQ_MAX_BYTES) {
@@ -410,7 +432,23 @@ async function groqTranscribePart(
         413,
       );
     }
-    const json = await groqWhisper(chunk.path, groqKey, model, language);
+    let json: GroqVerboseJson;
+    try {
+      json = await groqWhisper(chunk.path, groqKey, activeModel, language);
+    } catch (err) {
+      if (
+        err instanceof TranscribeFailure &&
+        err.status === 404 &&
+        !modelSwapped
+      ) {
+        modelSwapped = true;
+        activeModel =
+          activeModel === "whisper-large-v3" ? "whisper-large-v3-turbo" : "whisper-large-v3";
+        json = await groqWhisper(chunk.path, groqKey, activeModel, language);
+      } else {
+        throw err;
+      }
+    }
     if (!detected) detected = groqLanguageName(json.language);
     const offsetMs = Math.round(chunk.offsetSec * 1000);
     const segs = (json.segments ?? []).filter(

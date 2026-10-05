@@ -105,6 +105,7 @@ function normalizeTextModel(id) {
 function classifyChatError(status, bodyText, maskedKey) {
   let apiMessage = "";
   let errType = "";
+  let errCode = "";
   let bodyIsJson = false;
   try {
     const j = JSON.parse(bodyText);
@@ -112,6 +113,7 @@ function classifyChatError(status, bodyText, maskedKey) {
     apiMessage = (e && typeof e.message === "string" && e.message) ||
       (j && typeof j.message === "string" ? j.message : "") || "";
     errType = (e && typeof e.type === "string" && e.type) || "";
+    errCode = (e && typeof e.code === "string" && e.code) || "";
     bodyIsJson = true;
   } catch (_) { /* non-JSON body */ }
   const raw = apiMessage ? ` [${apiMessage}]` : "";
@@ -129,8 +131,17 @@ function classifyChatError(status, bodyText, maskedKey) {
         return `Groq rejected the API key${keyPart} — re-save the key in Settings → Default AI models (console.groq.com → API Keys)${raw}`;
       }
       return `Groq refused access for this key${keyPart} — a permission restriction (suspended organization or a model not enabled for this key)${raw}`;
-    case 404:
-      return `Groq model not found — this chat model may not be enabled for your key (decommissioned models 404)${raw}`;
+    case 404: {
+      // v1.32: a GENUINE Groq 404 (JSON envelope WITH error.type/code) is
+      // model availability (decommissioned models 404). Without that
+      // envelope the response came from an INTERCEPTOR (OS proxy / VPN /
+      // antivirus web-filter) — the "chat returns 404 while the key test
+      // passes" signature on those machines.
+      if (bodyIsJson && (errType || errCode)) {
+        return `Groq does not recognize this chat model for your key (decommissioned models 404)${raw}`;
+      }
+      return `The chat endpoint answered 404 — but this response did NOT come from Groq's API (no Groq error envelope). A proxy, VPN, or antivirus "web protection" that scans HTTPS on this machine intercepted the request and answered it — the key is fine and the model is current. Fix: disable HTTPS/TLS scanning for this app in your antivirus, toggle the VPN/proxy, or use a different network${raw}`;
+    }
     case 400:
       return `Groq rejected the chat request (bad parameters or unsupported option)${raw}`;
     case 429:
@@ -161,6 +172,20 @@ function isNetworkError(err) {
   if (err.code && NET_ERROR_CODES.has(err.code)) return true;
   const msg = String(err.message || err);
   return /socket hang up|timed out|connection|network/i.test(msg);
+}
+
+/** v1.32: is this body a GENUINE Groq API answer (documented error envelope
+ *  with error.type/error.code)? The bare {"error":{"message":"Forbidden"}}
+ *  and non-JSON bodies are NOT from the Groq API layer. */
+function isGenuineGroqErrorBody(bodyText) {
+  try {
+    const j = JSON.parse(bodyText);
+    const e = j && typeof j.error === "object" && j.error ? j.error : null;
+    return !!((e && typeof e.type === "string" && e.type) ||
+      (e && typeof e.code === "string" && e.code));
+  } catch (_) {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +277,7 @@ function validateMessages(messages) {
   });
 }
 
-function chatRequestOnce(o) {
+function chatRequestOnceRaw(o, transportMode) {
   const { apiKey, modelId, messages, temperature, maxTokens, jsonMode, timeoutMs, ctl } = o;
   return new Promise((resolve, reject) => {
     const payload = {
@@ -270,6 +295,7 @@ function chatRequestOnce(o) {
         host: GROQ_API_HOST,
         path: CHAT_PATH,
         method: "POST",
+        transport: transportMode === "node" ? "node" : undefined,
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
@@ -291,13 +317,27 @@ function chatRequestOnce(o) {
           const bodyText = Buffer.concat(chunks).toString("utf8");
           if (res.statusCode !== 200) {
             // v1.29: masked fingerprint of the key this request carried.
-            reject(makeChatError(
+            const chatErr = makeChatError(
               classifyChatError(res.statusCode, bodyText, maskApiKey(apiKey)),
               {
                 status: res.statusCode,
                 retryable: res.statusCode === 429 || res.statusCode >= 500,
               },
-            ));
+            );
+            // v1.32 TRANSPORT FAILOVER: a 401/403/404 WITHOUT a genuine
+            // Groq envelope did not come from Groq — on the Chromium-net
+            // path (OS-proxy-honoring) it smells like an interceptor
+            // answering for Groq. Mark for one direct-Node retry.
+            if (
+              transportMode !== "node" &&
+              req &&
+              req._usingElectron &&
+              (res.statusCode === 404 || res.statusCode === 401 || res.statusCode === 403) &&
+              !isGenuineGroqErrorBody(bodyText)
+            ) {
+              chatErr._transportFailover = true;
+            }
+            reject(chatErr);
             return;
           }
           let j;
@@ -340,6 +380,18 @@ function chatRequestOnce(o) {
     });
 
     req.end(body);
+  });
+}
+
+/** One chat request WITH the v1.32 transport failover: an interceptor-shaped
+ *  response (401/403/404 with NO genuine Groq envelope) on the Chromium-net
+ *  path is retried once through plain Node https — direct, OS-proxy-ignoring.
+ *  On proxy/AV machines where GET /models passes but POSTs are answered by
+ *  the interceptor, this is the request Groq actually receives. */
+function chatRequestOnce(o) {
+  return chatRequestOnceRaw(o, "auto").catch((err) => {
+    if (!err || !err._transportFailover) throw err;
+    return chatRequestOnceRaw(o, "node");
   });
 }
 

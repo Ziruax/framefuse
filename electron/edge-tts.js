@@ -82,6 +82,7 @@ const fs = require("fs");
 const path = require("path");
 const https = require("https");
 const tls = require("tls");
+const net = require("net");
 const crypto = require("crypto");
 
 const SPEECH_HOST = "speech.platform.bing.com";
@@ -117,7 +118,9 @@ const MAX_LONG_TEXT_LEN = 1500000;
 const LONG_CHUNK_LEN = 2800;
 const VOICES_TIMEOUT_MS = 15000;
 const SYNTH_TIMEOUT_MS = 25000;
-const HANDSHAKE_TIMEOUT_MS = 10000;
+// v1.32: 15 s (was 10) — the handshake window now also covers the system
+// proxy CONNECT/SOCKS tunnel setup before TLS even starts.
+const HANDSHAKE_TIMEOUT_MS = 15000;
 /** In-flight cap — extra synthesize() callers wait in a FIFO queue. */
 const MAX_CONCURRENT_SYNTH = 3;
 /** Sanity guards for the raw frame parser (service frames are ~KB sized). */
@@ -168,6 +171,234 @@ function generateSecMsgEC() {
     .update(ticks.toString() + TRUSTED_CLIENT_TOKEN, "utf8")
     .digest("hex")
     .toUpperCase();
+}
+
+// ---------------------------------------------------------------------------
+// v1.32 SYSTEM-PROXY TUNNEL — make the raw-TLS WSS path proxy-aware.
+//
+// WHY: Node's tls module IGNORES the OS proxy configuration. On machines
+// whose only working internet route is a system proxy (VPN client, corporate
+// PAC, antivirus "web protection"), every raw-Node connection dies while the
+// browser — and Electron's Chromium net stack — works fine. That is the
+// "TTS synthesis failed" family: the app is otherwise online but the WSS
+// connection to speech.platform.bing.com can never be established directly.
+//
+// HOW: inside the Electron main process we ask Chromium which proxy it
+// WOULD use for the target host (session.resolveProxy — PAC/system-config
+// aware), then
+//   • PROXY / HTTPS lines → an HTTP CONNECT tunnel, TLS over the tunnel
+//   • SOCKS5 lines       → a minimal no-auth SOCKS5 client, TLS over it
+//   • DIRECT             → the direct connection, exactly as before
+// In plain Node (web routes, smoke tests) there is no session — we stay
+// direct. Any tunnel failure falls back to DIRECT, so a broken proxy config
+// can never behave worse than the pre-v1.32 code.
+// ---------------------------------------------------------------------------
+
+/** Electron session (main process) or false when unavailable. Cached. */
+let electronSessionCache; // undefined = not probed yet
+function electronSession() {
+  if (electronSessionCache !== undefined) return electronSessionCache;
+  try {
+    if (process.versions && process.versions.electron) {
+      const electron = require("electron");
+      electronSessionCache =
+        electron && typeof electron === "object" && electron.session &&
+          typeof electron.session.resolveProxy === "function"
+          ? electron.session
+          : false;
+    } else {
+      electronSessionCache = false;
+    }
+  } catch (_) {
+    electronSessionCache = false;
+  }
+  return electronSessionCache;
+}
+
+let proxyLineCache = { at: 0, host: "", line: "DIRECT" };
+
+/** Chromium's proxy verdict for `host`, cached 30 s. "DIRECT" when we
+ *  cannot ask (plain Node) or Chromium cannot decide. */
+async function resolveProxyLine(host) {
+  const session = electronSession();
+  if (!session) return "DIRECT";
+  const now = Date.now();
+  if (proxyLineCache.host === host && now - proxyLineCache.at < 30000) {
+    return proxyLineCache.line;
+  }
+  try {
+    const line = await session.resolveProxy(`https://${host}/`);
+    proxyLineCache = { at: now, host, line: line || "DIRECT" };
+    return proxyLineCache.line;
+  } catch (_) {
+    return "DIRECT";
+  }
+}
+
+/** "PROXY 10.0.0.1:8080; DIRECT" → { kind: "http"|"socks5", host, port }
+ *  or null for DIRECT / unparseable / SOCKS4 (unsupported). */
+function parseProxyLine(line) {
+  const s = String(line || "").trim();
+  if (!s || /^direct$/i.test(s)) return null;
+  const first = s.split(";")[0].trim();
+  const m = /^(PROXY|HTTPS|SOCKS4A|SOCKS4|SOCKS5|SOCKS)\s+(\[?[^\]\s]+\]?):(\d+)$/i.exec(first);
+  if (!m) return null;
+  const word = m[1].toUpperCase();
+  if (word === "SOCKS5") return { kind: "socks5", host: m[2].replace(/^[\[\]]/g, ""), port: parseInt(m[3], 10) };
+  if (word === "PROXY" || word === "HTTPS") {
+    return { kind: "http", host: m[2].replace(/^[\[\]]/g, ""), port: parseInt(m[3], 10) };
+  }
+  return null; // SOCKS4 — unsupported, treat as direct
+}
+
+/** HTTP CONNECT tunnel through `proxy` → a plain socket wired to host:port. */
+function connectThroughHttpProxy(proxy, host, port, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect({ host: proxy.host, port: proxy.port });
+    let buf = Buffer.alloc(0);
+    let done = false;
+    const finish = (err, socket) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      sock.removeAllListeners("data");
+      sock.removeAllListeners("error");
+      if (err) {
+        try { sock.destroy(); } catch (_) { /* already gone */ }
+        reject(err);
+      } else {
+        resolve(socket);
+      }
+    };
+    const timer = setTimeout(
+      () => finish(new Error(`the system proxy ${proxy.host}:${proxy.port} timed out during CONNECT`)),
+      timeoutMs,
+    );
+    sock.on("error", (err) =>
+      finish(new Error(`could not reach the system proxy ${proxy.host}:${proxy.port}: ${err.message}`)));
+    sock.on("data", (d) => {
+      buf = Buffer.concat([buf, d]);
+      const sep = buf.indexOf("\r\n\r\n");
+      if (sep === -1) {
+        if (buf.length > 8192) finish(new Error("proxy CONNECT response too large"));
+        return;
+      }
+      const head = buf.slice(0, sep).toString("latin1");
+      const m = /^HTTP\/\d\.\d\s+(\d{3})/.exec(head);
+      if (m && m[1] === "200") {
+        finish(null, sock);
+      } else {
+        finish(
+          new Error(`the system proxy refused CONNECT to ${host}:${port} (HTTP ${m ? m[1] : "unparseable"})`),
+        );
+      }
+    });
+    sock.write(`CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\n\r\n`);
+  });
+}
+
+/** Minimal no-auth SOCKS5 client → a plain socket wired to host:port. */
+function connectThroughSocks5(proxy, host, port, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    const sock = net.connect({ host: proxy.host, port: proxy.port });
+    let buf = Buffer.alloc(0);
+    let sent = false;
+    let done = false;
+    const finish = (err, socket) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      sock.removeAllListeners("data");
+      sock.removeAllListeners("error");
+      if (err) {
+        try { sock.destroy(); } catch (_) { /* already gone */ }
+        reject(err);
+      } else {
+        resolve(socket);
+      }
+    };
+    const timer = setTimeout(
+      () => finish(new Error(`the SOCKS proxy ${proxy.host}:${proxy.port} timed out`)),
+      timeoutMs,
+    );
+    sock.on("error", (err) =>
+      finish(new Error(`could not reach the SOCKS proxy ${proxy.host}:${proxy.port}: ${err.message}`)));
+    sock.on("data", (d) => {
+      buf = Buffer.concat([buf, d]);
+      if (!sent) {
+        // --- greeting reply: VER=05 METHOD=00 (no auth) ---
+        if (buf.length < 2) return;
+        if (buf[0] !== 0x05) {
+          finish(new Error("the SOCKS proxy is not speaking SOCKS5"));
+          return;
+        }
+        if (buf[1] !== 0x00) {
+          finish(new Error("the SOCKS proxy requires authentication (unsupported)"));
+          return;
+        }
+        buf = buf.slice(2);
+        sent = true;
+        // --- CONNECT request: VER=5 CMD=1 RSV=0 ATYP=3 (domain) ---
+        const hostBuf = Buffer.from(host, "utf8");
+        const req = Buffer.alloc(7 + hostBuf.length);
+        req[0] = 0x05;
+        req[1] = 0x01;
+        req[2] = 0x00;
+        req[3] = 0x03;
+        req[4] = hostBuf.length;
+        hostBuf.copy(req, 5);
+        req.writeUInt16BE(port, 5 + hostBuf.length);
+        sock.write(req);
+      }
+      // --- connect reply (may arrive in the same chunk as the greeting) ---
+      if (buf.length < 4) return;
+      if (buf[1] !== 0x00) {
+        finish(new Error(`the SOCKS proxy refused the connection (code 0x${buf[1].toString(16)})`));
+        return;
+      }
+      const atyp = buf[3];
+      let addrLen;
+      if (atyp === 0x01) addrLen = 4;
+      else if (atyp === 0x04) addrLen = 16;
+      else if (atyp === 0x03) {
+        if (buf.length < 5) return;
+        addrLen = 1 + buf[4];
+      } else {
+        finish(new Error("SOCKS reply had an unknown address type"));
+        return;
+      }
+      if (buf.length < 4 + addrLen + 2) return;
+      finish(null, sock);
+    });
+    // greeting: VER=5, ONE method, NO-AUTH
+    sock.write(Buffer.from([0x05, 0x01, 0x00]));
+  });
+}
+
+/** v1.32: open the TLS socket to `host`:443 — through the system proxy when
+ *  Chromium reports one, else direct. Tunnel failures fall back to DIRECT
+ *  (the pre-v1.32 behavior) so a stale proxy config never regresses. */
+async function openProxiedTls(host, alpnProtocols) {
+  let line = "DIRECT";
+  try {
+    line = await resolveProxyLine(host);
+  } catch (_) {
+    line = "DIRECT";
+  }
+  const proxy = parseProxyLine(line);
+  if (!proxy) {
+    return tls.connect({ host, port: 443, servername: host, ALPNProtocols: alpnProtocols });
+  }
+  try {
+    const raw =
+      proxy.kind === "socks5"
+        ? await connectThroughSocks5(proxy, host, 443)
+        : await connectThroughHttpProxy(proxy, host, 443);
+    return tls.connect({ sock: raw, servername: host, ALPNProtocols: alpnProtocols });
+  } catch (_) {
+    // The proxy path failed → direct, exactly the pre-v1.32 behavior.
+    return tls.connect({ host, port: 443, servername: host, ALPNProtocols: alpnProtocols });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,41 +1340,47 @@ function attemptSynthesis(opts) {
       parser.write(chunk);
     }
 
-    sock = tls.connect(
-      {
-        host: SPEECH_HOST,
-        port: 443,
-        servername: SPEECH_HOST,
-        // Pin HTTP/1.1 via ALPN so the raw request/response framing holds.
-        ALPNProtocols: ["http/1.1"],
-      },
-      () => {
-        if (settled) return;
+    // v1.32: the TLS connection now goes THROUGH THE SYSTEM PROXY when
+    // Chromium reports one (session.resolveProxy — PAC/VPN/AV aware). Node's
+    // tls module ignores the OS proxy, which is exactly why synthesis died
+    // with "TTS synthesis failed" on proxy-routed machines while everything
+    // browser-based kept working. DIRECT → the original direct connection.
+    openProxiedTls(SPEECH_HOST, ["http/1.1"])
+      .then((tlsSock) => {
+        if (settled) {
+          try { tlsSock.destroy(); } catch (_) { /* superseded */ }
+          return;
+        }
+        sock = tlsSock;
+        sock.on("data", onSocketData);
+        sock.on("error", (err) => {
+          if (settled) return;
+          const msg = new Error(
+            `Edge TTS connection error: ${err && err.message ? err.message : err}`,
+          );
+          if (!handshakeDone) msg.retryable = true; // → one fresh retry
+          finish(msg);
+        });
+        sock.on("close", () => {
+          if (settled) return;
+          const msg = new Error(
+            "Edge TTS connection closed unexpectedly before the audio finished",
+          );
+          if (!handshakeDone) msg.retryable = true;
+          finish(msg);
+        });
         try {
           sock.setNoDelay(true);
         } catch (_) {
           /* older TLS stacks */
         }
         sock.write(handshakeRequest);
-      },
-    );
-    sock.on("data", onSocketData);
-    sock.on("error", (err) => {
-      if (settled) return;
-      const msg = new Error(
-        `Edge TTS connection error: ${err && err.message ? err.message : err}`,
-      );
-      if (!handshakeDone) msg.retryable = true; // → one fresh retry
-      finish(msg);
-    });
-    sock.on("close", () => {
-      if (settled) return;
-      const msg = new Error(
-        "Edge TTS connection closed unexpectedly before the audio finished",
-      );
-      if (!handshakeDone) msg.retryable = true;
-      finish(msg);
-    });
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err : new Error(String(err));
+        msg.retryable = true; // connect-phase failure → fresh retry
+        finish(msg);
+      });
   });
 }
 
@@ -1287,7 +1524,10 @@ async function synthesize(o) {
     if (opts.abortRef && opts.abortRef._cancelled) throw cancelledError();
     let mp3Bytes = null;
     let words = null;
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    // v1.32: 3 attempts (was 2). Each attempt regenerates Sec-MS-GEC,
+    // ConnectionId AND now re-resolves the system proxy — a flappy VPN or
+    // AV proxy gets three genuinely fresh chances.
+    for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         const attemptResult = await attemptSynthesis(opts);
         mp3Bytes = attemptResult.mp3;
@@ -1298,9 +1538,23 @@ async function synthesize(o) {
           (err && err.cancelled) ||
           (opts.abortRef && opts.abortRef._cancelled);
         const retryable = !!(err && err.retryable);
-        if (cancelled || !retryable || attempt === 2) throw err;
-        // 403-ish failure / handshake stall — ONE full retry. The retry
-        // regenerates Sec-MS-GEC + ConnectionId inside attemptSynthesis.
+        if (cancelled || !retryable || attempt === 3) {
+          if (!cancelled && err instanceof Error) {
+            // v1.32: exhausted retryable failures get the actionable hints —
+            // the three real-world causes are a region block on the
+            // speech endpoint, a proxy/VPN/AV interception, or a badly
+            // wrong system clock (the DRM token is time-based).
+            err.message =
+              `${err.message} — after ${attempt} attempt${attempt === 1 ? "" : "s"}. ` +
+                "If this keeps failing: (1) toggle your VPN/proxy or disable antivirus HTTPS-scanning for this app, " +
+                "(2) check your system clock is correct (the speech DRM token is time-based), " +
+                "(3) try another network — Microsoft's speech endpoint is blocked in some regions";
+          }
+          throw err;
+        }
+        // 403-ish failure / handshake stall / connect error — fresh retry.
+        // The retry regenerates Sec-MS-GEC + ConnectionId inside
+        // attemptSynthesis and re-resolves the proxy inside openProxiedTls.
       }
     }
     const result = {
