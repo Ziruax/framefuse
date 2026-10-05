@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 import { testProviderKey } from "@/lib/server/ai-models";
+import { resolveGroqKey } from "@/lib/server/groq-sdk-client";
 
 export const runtime = "nodejs";
 
@@ -19,7 +20,9 @@ export async function POST(req: NextRequest) {
       { status: 400 },
     );
   }
-  const key = typeof body.key === "string" ? body.key : "";
+  // v1.33: Settings key → GROQ_API_KEY env fallback (user brief Part 2 —
+  //  the key stays server-side, never a NEXT_PUBLIC_ variable).
+  const key = resolveGroqKey(typeof body.key === "string" ? body.key : undefined);
   // v1.30: the Groq test now probes a REAL transcription with the selected
   // whisper model — the Settings tab sends its sttGroqModel pick.
   const model = typeof body.model === "string" ? body.model : undefined;

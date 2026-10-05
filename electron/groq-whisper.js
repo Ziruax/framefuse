@@ -41,7 +41,9 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
-const { createRequest, transportName } = require("./net-transport");
+const { transportName } = require("./net-transport");
+const { sdkClient, transportsDiffer } = require("./groq-fetch-adapter");
+const { validateAudioFile } = require("./audio-format");
 
 const GROQ_API_HOST = "api.groq.com";
 const TRANSCRIBE_PATH = "/openai/v1/audio/transcriptions";
@@ -106,16 +108,23 @@ function groqConfigPath(userDataDir) {
 }
 
 function loadGroqConfig(userDataDir) {
+  let cfg = { apiKey: "", model: DEFAULT_GROQ_MODEL };
   try {
     const raw = fs.readFileSync(groqConfigPath(userDataDir), "utf8");
-    const cfg = JSON.parse(raw);
-    return {
-      apiKey: typeof cfg.apiKey === "string" ? cfg.apiKey : "",
-      model: normalizeGroqModel(cfg.model),
+    const parsed = JSON.parse(raw);
+    cfg = {
+      apiKey: typeof parsed.apiKey === "string" ? parsed.apiKey : "",
+      model: normalizeGroqModel(parsed.model),
     };
-  } catch (_) {
-    return { apiKey: "", model: DEFAULT_GROQ_MODEL };
+  } catch (_) { /* defaults */ }
+  // v1.33 (user brief Part 2): GROQ_API_KEY from the environment is the
+  // fallback when no key was saved in Settings — the SDK's own default
+  // resolution order, honored by the app's config layer too.
+  if (!cfg.apiKey.trim() && process.env.GROQ_API_KEY && process.env.GROQ_API_KEY.trim()) {
+    cfg.apiKey = process.env.GROQ_API_KEY.trim();
+    cfg.fromEnv = true;
   }
+  return cfg;
 }
 
 function saveGroqConfig(userDataDir, patch) {
@@ -383,6 +392,88 @@ function transportFailoverWorthy(status, bodyText) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// v1.33 GROQ SDK LAYER (user brief: use the official groq-sdk).
+//
+// groqTranscribeOnceRaw / probeOnce / groqTestKey now issue their requests
+// through the SDK client (groq-fetch-adapter.js), which rides the app's
+// net-transport: Chromium net inside Electron (OS-proxy-honoring) and,
+// on the v1.32 failover retry, direct Node https. The SDK's structured
+// errors (.status, .error parsed body, APIConnectionError) feed the SAME
+// classifier as before — the verdicts are unchanged, the request engine
+// is official.
+// ---------------------------------------------------------------------------
+
+/** Derive the v1.33 structured job code (AudioJobError shape) from a
+ *  classified Groq failure. */
+function groqJobCode(status, bodyText, genuine) {
+  if (!status) return "GROQ_CONNECTION";
+  if (status === 404) return genuine ? "GROQ_MODEL_NOT_FOUND" : "GROQ_INTERCEPTED_404";
+  if (status === 401) return genuine ? "GROQ_KEY_REJECTED" : "GROQ_BLOCKED_BEFORE_PROVIDER";
+  if (status === 403) {
+    if (genuine) return "GROQ_PERMISSION";
+    return bodyText ? "GROQ_EDGE_BLOCK" : "GROQ_BLOCKED_BEFORE_PROVIDER";
+  }
+  if (status === 413) return "GROQ_FILE_TOO_LARGE";
+  if (status === 429) return "GROQ_RATE_LIMIT";
+  if (status >= 500) return "GROQ_SERVER_ERROR";
+  if (status === 400) return "GROQ_BAD_REQUEST";
+  return "GROQ_REQUEST_FAILED";
+}
+
+/** Map a groq-sdk error (APIError family / APIConnectionError) to the app's
+ *  classified Error with status, apiMessage, the v1.32 transport-failover
+ *  marker and the v1.33 structured job shape attached. */
+function mapSdkError(e, apiKey, transportMode) {
+  const status = e && typeof e.status === "number" ? e.status : 0;
+  const bodyText = e && e.error ? safeJsonStringify(e.error) : "";
+  let apiMessage = "";
+  try {
+    const j = JSON.parse(bodyText);
+    apiMessage = (j && j.error && typeof j.error.message === "string" && j.error.message) ||
+      (j && typeof j.message === "string" ? j.message : "") || "";
+  } catch (_) { /* non-JSON body */ }
+  const genuine = isGenuineGroqErrorBody(bodyText);
+  let message;
+  if (!status) {
+    message = `Could not reach api.groq.com: ${e && e.message ? e.message : e}` +
+      " — a network-level failure (VPN/proxy/firewall or the provider is down)";
+  } else {
+    message = classifyGroqError(status, bodyText, maskApiKey(apiKey));
+  }
+  const err = new Error(message);
+  err.status = status;
+  err.apiMessage = apiMessage;
+  err.cause = e;
+  // v1.32 TRANSPORT FAILOVER at the SDK layer: an interceptor-shaped
+  // response (401/403/404 with NO genuine Groq envelope) on the
+  // OS-proxy-honoring transport retries once through direct Node https.
+  if (
+    transportMode !== "node" &&
+    transportsDiffer() &&
+    status &&
+    transportFailoverWorthy(status, bodyText)
+  ) {
+    err._transportFailover = true;
+  }
+  err.job = {
+    service: "groq",
+    code: groqJobCode(status, bodyText, genuine),
+    message,
+    retryable: status === 429 || status >= 500 || !status,
+  };
+  return err;
+}
+
+/** JSON.stringify that never throws (SDK bodies may contain cycles). */
+function safeJsonStringify(v) {
+  try {
+    return JSON.stringify(v);
+  } catch (_) {
+    return "";
+  }
+}
+
 /** Run one multipart transcription request.
  *
  * @param {object} o
@@ -425,6 +516,29 @@ function groqTranscribe(o) {
   //      model (turbo ↔ v3) — silent, logged through the status message.
   //   Everything else propagates VERBATIM (the classified, actionable text).
   return (async () => {
+    // v1.33 PRE-UPLOAD VALIDATION (user brief "Part 3"): the file must
+    // exist, be non-empty, sniff as REAL audio (magic bytes — never the
+    // extension) and fit the upload cap, BEFORE any network work. The cap
+    // is configurable (o.maxBytes) with the 24.5 MB server default.
+    const vv = validateAudioFile(o.filePath, {
+      maxBytes:
+        typeof o.maxBytes === "number" && o.maxBytes > 0
+          ? Math.floor(o.maxBytes)
+          : GROQ_MAX_UPLOAD_BYTES,
+    });
+    if (!vv.ok) {
+      const err = new Error(vv.message);
+      err.status = 400;
+      err.job = { service: "groq", code: vv.code, message: vv.message, retryable: false };
+      throw err;
+    }
+    if (!o.apiKey || !String(o.apiKey).trim()) {
+      const msg = "No Groq API key is configured — save one in Settings → Default AI models (console.groq.com → API Keys)";
+      const err = new Error(msg);
+      err.status = 401;
+      err.job = { service: "groq", code: "GROQ_KEY_MISSING", message: msg, retryable: false };
+      throw err;
+    }
     try {
       return await groqTranscribeOnce(o, requestedModel, true, language);
     } catch (err) {
@@ -467,231 +581,106 @@ function groqTranscribe(o) {
   })();
 }
 
-/** One raw multipart request (no retries — groqTranscribe owns those).
- *  v1.32 `transportMode`: "auto" (Chromium net inside Electron — honors the
- *  OS proxy) or "node" (plain Node https — direct, proxy-ignoring). */
-function groqTranscribeOnceRaw(o, modelId, wantWordTimestamps, language, transportMode) {
-  return new Promise((resolve, reject) => {
-    const { apiKey, filePath } = o;
-    const onProgress = typeof o.onProgress === "function" ? o.onProgress : null;
-    const fileName = path.basename(filePath) || "audio.mp3";
-    const fileBytes = fs.statSync(filePath).size;
+/** One transcription request through the OFFICIAL groq-sdk (no retries —
+ *  groqTranscribe owns those). v1.33: the SDK client rides the app's
+ *  net-transport via groq-fetch-adapter (Chromium net inside Electron —
+ *  honors the OS proxy; "node" mode = direct Node https, the v1.32
+ *  proxy-bypassing failover path). Upload progress + cancellation + the
+ *  classified/structured error mapping all survive the SDK layer.
+ *  @param {"auto"|"node"} transportMode */
+async function groqTranscribeOnceRaw(o, modelId, wantWordTimestamps, language, transportMode) {
+  const { apiKey, filePath } = o;
+  const onProgress = typeof o.onProgress === "function" ? o.onProgress : null;
 
-    const boundary = `----FrameFuseGroq${crypto.randomBytes(16).toString("hex")}`;
-    const crlf = "\r\n";
-
-    const textParts = [];
-    const field = (name, value) => {
-      textParts.push(
-        `--${boundary}${crlf}` +
-          `Content-Disposition: form-data; name="${name}"${crlf}${crlf}` +
-          `${value}${crlf}`,
-      );
+  // Cancellation: the SDK forwards {signal} into our fetch adapter, which
+  // destroys the request. (o.abortRef.abort is still callable immediately.)
+  const abortCtl = new AbortController();
+  if (o.abortRef && typeof o.abortRef === "object") {
+    o.abortRef.abort = () => {
+      try { abortCtl.abort(new Error("Transcription cancelled")); } catch (_) { /* gone */ }
     };
-    field("model", modelId);
-    field("response_format", "verbose_json");
-    // Word-level timestamps are requested when the caller wants them AND
-    // the model supports them; the segment granularity rides along. When
-    // the timestamp set is omitted entirely Groq defaults to segments —
-    // still parseable, just evenly-distributed word timing.
-    if (wantWordTimestamps) {
-      field("timestamp_granularities[]", "word");
-      field("timestamp_granularities[]", "segment");
-    }
-    if (language) field("language", language);
+  }
 
-    const fileHeader =
-      `--${boundary}${crlf}` +
-      `Content-Disposition: form-data; name="file"; filename="${fileName}"${crlf}` +
-      `Content-Type: audio/mpeg${crlf}${crlf}`;
-    const closing = `--${boundary}--${crlf}`;
-
-    const head = Buffer.concat([
-      Buffer.from(textParts.join(""), "utf8"),
-      Buffer.from(fileHeader, "utf8"),
-    ]);
-    const totalBytes = head.length + fileBytes + Buffer.byteLength(closing);
-
-    const req = createRequest(
-      {
-        host: GROQ_API_HOST,
-        path: TRANSCRIBE_PATH,
-        method: "POST",
-        transport: transportMode === "node" ? "node" : undefined,
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": `multipart/form-data; boundary=${boundary}`,
-          // Node transport: exact framing. Electron transport: Chromium owns
-          // this header (it is skipped there — chunked upload, valid HTTP).
-          "Content-Length": String(totalBytes),
-        },
-      },
-      (res) => {
-        const chunks = [];
-        let bytes = 0;
-        res.on("data", (d) => {
-          chunks.push(d);
-          bytes += d.length;
-          if (bytes > 20 * 1024 * 1024) {
-            req.destroy();
-            reject(new Error("Groq response exceeded 20 MB — aborted"));
-          }
-        });
-        res.on("end", () => {
-          const body = Buffer.concat(chunks).toString("utf8");
-          if (res.statusCode !== 200) {
-            // v1.22: attach the machine-readable facts so groqTranscribe's
-            // retry layer can classify (400 timestamps / 404 model).
-            // v1.29: thread the MASKED form of the key we actually sent so
-            // the rejection message names the culprit key.
-            let apiMessage = "";
-            try {
-              const j = JSON.parse(body);
-              apiMessage = j?.error?.message || j?.message || "";
-            } catch (_) { /* non-JSON body */ }
-            const err = new Error(
-              classifyGroqError(res.statusCode, body, maskApiKey(apiKey)),
-            );
-            err.status = res.statusCode;
-            err.apiMessage = apiMessage;
-            // v1.32 TRANSPORT FAILOVER: a 401/403/404 WITHOUT a genuine
-            // Groq error envelope did not come from Groq's API. On a
-            // Chromium-net attempt (which honors the OS proxy) that smells
-            // like an interceptor answering for Groq — mark it so the
-            // wrapper retries the identical request through direct Node
-            // https (proxy-ignoring).
-            if (
-              transportMode !== "node" &&
-              req &&
-              req._usingElectron &&
-              transportFailoverWorthy(res.statusCode, body)
-            ) {
-              err._transportFailover = true;
-            }
-            reject(err);
-            return;
-          }
-          try {
-            const j = JSON.parse(body);
-            const words = Array.isArray(j.words) ? j.words : null;
-            const segments = Array.isArray(j.segments) ? j.segments : [];
-            let outChunks = [];
-            let wordLevel = false;
-            if (words && words.length > 0) {
-              wordLevel = true;
-              outChunks = words.map((w) => ({
-                text: String(w.word || "").trim(),
-                timestamp: [
-                  typeof w.start === "number" ? w.start : null,
-                  typeof w.end === "number" ? w.end : null,
-                ],
-              }));
-            } else if (segments.length > 0) {
-              wordLevel = false;
-              outChunks = segments.map((s) => ({
-                text: String(s.text || "").trim(),
-                timestamp: [
-                  typeof s.start === "number" ? s.start : null,
-                  typeof s.end === "number" ? s.end : null,
-                ],
-              }));
-            }
-            // Drop empty texts (trailing punctuation-only tokens).
-            outChunks = outChunks.filter((c) => c.text && c.text.length > 0);
-            resolve({
-              chunks: outChunks,
-              language:
-                typeof j.language === "string" && j.language ? j.language : null,
-              wordLevel,
-              durationMs:
-                typeof j.duration === "number" ? Math.round(j.duration * 1000) : 0,
-              text: typeof j.text === "string" ? j.text : "",
-            });
-          } catch (err) {
-            reject(new Error(`Could not parse the Groq response: ${err.message}`));
-          }
-        });
-      },
-    );
-
-    // Cancel hook — used by whisper:cancel (destroys the socket; the exit
-    // handler rejects with a cancellation sentinel).
-    if (o.abortRef && typeof o.abortRef === "object") {
-      o.abortRef.abort = () => {
-        try { req.destroy(new Error("Transcription cancelled")); } catch (_) {}
-      };
-    }
-
-    const CONNECT_TIMEOUT_MS = 30000;
-    req.setTimeout(CONNECT_TIMEOUT_MS, () => {
-      req.destroy(new Error("Could not reach api.groq.com (connection timed out)"));
-    });
-
-    req.on("error", (err) => {
-      reject(err instanceof Error ? err : new Error(String(err)));
-    });
-
-    // Write the multipart body with backpressure + upload progress.
-    let uploaded = 0;
-    const sendProgress = (n) => {
+  const fileBytes = fs.statSync(filePath).size;
+  const { client } = sdkClient(apiKey, transportMode, {
+    timeoutMs: 120000,
+    onUploadProgress: ({ uploaded, total }) => {
       if (!onProgress) return;
-      const pct = Math.min(60, 25 + Math.round((n / totalBytes) * 35));
+      const t = Math.max(total || fileBytes, 1);
+      const pct = Math.min(60, 25 + Math.round((uploaded / t) * 35));
       onProgress({
         progress: pct,
-        status: `Uploading audio to Groq (${(n / 1048576).toFixed(1)} / ${(totalBytes / 1048576).toFixed(1)} MB)…`,
+        status: `Uploading audio to Groq (${(uploaded / 1048576).toFixed(1)} / ${(t / 1048576).toFixed(1)} MB)…`,
       });
-    };
-    req.write(head);
-    uploaded += head.length;
-    sendProgress(uploaded);
-    const CHUNK = 1024 * 512;
-    let offset = 0;
-    const fd = fs.openSync(filePath, "r");
-    const writeNext = () => {
-      if (req.destroyed) { try { fs.closeSync(fd); } catch (_) {} return; }
-      if (offset >= fileBytes) {
-        req.end(closing, () => {
-          try { fs.closeSync(fd); } catch (_) {}
-        });
-        onProgress?.({
-          progress: 65,
-          status: `Groq ${modelId} is transcribing…`,
-        });
-        return;
-      }
-      const len = Math.min(CHUNK, fileBytes - offset);
-      const buf = Buffer.allocUnsafe(len);
-      const n = fs.readSync(fd, buf, 0, len, offset);
-      if (n <= 0) {
-        try { fs.closeSync(fd); } catch (_) {}
-        req.destroy(new Error("Audio file changed while uploading"));
-        return;
-      }
-      offset += n;
-      const ok = req.write(buf, () => {
-        uploaded += n;
-        sendProgress(uploaded);
-      });
-      if (!ok) {
-        // Backpressure: resume on drain. The 400 ms fallback timer covers
-        // transports whose write() returns false but 'drain' is late/absent
-        // (Chromium's net stack has its own buffering) — without it a
-        // missing drain would stall the upload forever.
-        let resumed = false;
-        const go = () => {
-          if (resumed) return;
-          resumed = true;
-          clearTimeout(fallback);
-          writeNext();
-        };
-        req.once("drain", go);
-        const fallback = setTimeout(go, 400);
-      } else {
-        writeNext();
-      }
-    };
-    writeNext();
+    },
   });
+
+  try {
+    const startedAt = Date.now();
+    const response = await client.audio.transcriptions.create(
+      {
+        file: fs.createReadStream(filePath),
+        model: modelId,
+        // verbose_json: the only format that carries language/duration +
+        // the word/segment timestamps the app's caption engine consumes.
+        response_format: "verbose_json",
+        ...(wantWordTimestamps ? { timestamp_granularities: ["word", "segment"] } : {}),
+        ...(language ? { language } : {}),
+        temperature: 0,
+      },
+      { signal: abortCtl.signal },
+    );
+    onProgress?.({ progress: 65, status: `Groq ${modelId} is transcribing…` });
+
+    if (!response || typeof response.text !== "string") {
+      const err = new Error("Groq returned a transcription response without text — the API answer was not the documented shape");
+      err.status = 200;
+      err.job = { service: "groq", code: "GROQ_RESPONSE_INVALID", message: err.message, retryable: false };
+      throw err;
+    }
+    const words = Array.isArray(response.words) ? response.words : null;
+    const segments = Array.isArray(response.segments) ? response.segments : [];
+    let outChunks = [];
+    let wordLevel = false;
+    if (words && words.length > 0) {
+      wordLevel = true;
+      outChunks = words.map((w) => ({
+        text: String((w && w.word) || "").trim(),
+        timestamp: [
+          w && typeof w.start === "number" ? w.start : null,
+          w && typeof w.end === "number" ? w.end : null,
+        ],
+      }));
+    } else if (segments.length > 0) {
+      wordLevel = false;
+      outChunks = segments.map((s) => ({
+        text: String((s && s.text) || "").trim(),
+        timestamp: [
+          s && typeof s.start === "number" ? s.start : null,
+          s && typeof s.end === "number" ? s.end : null,
+        ],
+      }));
+    }
+    // Drop empty texts (trailing punctuation-only tokens).
+    outChunks = outChunks.filter((c) => c.text && c.text.length > 0);
+    return {
+      chunks: outChunks,
+      language:
+        response.language && typeof response.language === "string" ? response.language : null,
+      wordLevel,
+      durationMs:
+        typeof response.duration === "number" ? Math.round(response.duration * 1000)
+          : Date.now() - startedAt,
+      text: typeof response.text === "string" ? response.text : "",
+    };
+  } catch (e) {
+    if (abortCtl.signal.aborted) {
+      const err = new Error("Transcription cancelled");
+      err.cancelled = true;
+      throw err;
+    }
+    throw mapSdkError(e, apiKey, transportMode);
+  }
 }
 
 /** One multipart transcription request WITH the v1.32 transport failover:
@@ -741,84 +730,37 @@ function groqTranscribeOnce(o, modelId, wantWordTimestamps, language) {
 const PROBE_MP3_B64 =
   "SUQzBAAAAAAAIlRTU0UAAAAOAAADTGF2ZjYxLjcuMTAzAAAAAAAAAAAAAAD/81jAAAAAAAAAAAAASW5mbwAAAA8AAAAeAAAJJAAbGxsjIyMrKyszMzMzOzs7QkJCSkpKSlJSUlpaWmJiYmJqampycnJ6enp6gYGBiYmJkZGRkZmZmaGhoampqamxsbG5ubnAwMDAyMjI0NDQ2NjY2ODg4Ojo6PDw8PD4+Pj///8AAAAATGF2YzYxLjE5AAAAAAAAAAAAAAAAJALAAAAAAAAACSSDldJ3AAAAAAAAAAAAAAD/8yjEAAAAA0gAAAAATEFNRTMuMTAwVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjEOwAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjEdgAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjEsQAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
 
-/** Build the probe multipart body (same builder style as
- *  groqTranscribeOnce — field order: model, response_format, then file). */
-function buildProbeBody(modelId) {
-  const boundary = `----FrameFuseProbe${crypto.randomBytes(12).toString("hex")}`;
-  const crlf = "\r\n";
-  const fileBytes = Buffer.from(PROBE_MP3_B64, "base64");
-  const parts = [];
-  const field = (name, value) => {
-    parts.push(
-      `--${boundary}${crlf}` +
-        `Content-Disposition: form-data; name="${name}"${crlf}${crlf}` +
-        `${value}${crlf}`,
-    );
-  };
-  field("model", modelId);
-  field("response_format", "json");
-  const fileHeader =
-    `--${boundary}${crlf}` +
-    `Content-Disposition: form-data; name="file"; filename="probe.mp3"${crlf}` +
-    `Content-Type: audio/mpeg${crlf}${crlf}`;
-  const closing = `--${boundary}--${crlf}`;
-  const body = Buffer.concat([
-    Buffer.from(parts.join(""), "utf8"),
-    Buffer.from(fileHeader, "utf8"),
-    fileBytes,
-    Buffer.from(closing, "utf8"),
-  ]);
-  return { boundary, body };
-}
-
-/** POST the embedded silence to /audio/transcriptions (one raw attempt).
- *  v1.32 resolves { ok, message, status, genuine, failover } so the
- *  orchestrator can retry through the other transport / other model. */
-function probeOnce(apiKey, modelId, transportMode) {
-  return new Promise((resolve) => {
-    const { boundary, body } = buildProbeBody(modelId);
-    const req = createRequest(
-      {
-        host: GROQ_API_HOST,
-        path: TRANSCRIBE_PATH,
-        method: "POST",
-        transport: transportMode === "node" ? "node" : undefined,
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": `multipart/form-data; boundary=${boundary}`,
-          "Content-Length": String(body.length),
-        },
-      },
-      (res) => {
-        const chunks = [];
-        res.on("data", (d) => chunks.push(d));
-        res.on("end", () => {
-          const bodyText = Buffer.concat(chunks).toString("utf8");
-          if (res.statusCode === 200) {
-            resolve({ ok: true, message: "" });
-            return;
-          }
-          resolve({
-            ok: false,
-            message: classifyGroqError(res.statusCode, bodyText, maskApiKey(apiKey)),
-            status: res.statusCode,
-            genuine: isGenuineGroqErrorBody(bodyText),
-            failover:
-              transportMode !== "node" &&
-              !!(req && req._usingElectron) &&
-              transportFailoverWorthy(res.statusCode, bodyText),
-          });
-        });
-      },
-    );
-    req.setTimeout(20000, () => {
-      req.destroy(new Error("Probe timed out connecting to api.groq.com"));
+/** POST the embedded silence to /audio/transcriptions through the OFFICIAL
+ *  groq-sdk (one raw attempt). v1.32 resolves { ok, message, status, genuine,
+ *  failover } so the orchestrator can retry through the other transport /
+ *  other model. */
+async function probeOnce(apiKey, modelId, transportMode) {
+  try {
+    const { client } = sdkClient(apiKey, transportMode, { timeoutMs: 20000 });
+    const probeBytes = Buffer.from(PROBE_MP3_B64, "base64");
+    await client.audio.transcriptions.create({
+      file: new File([probeBytes], "probe.mp3", { type: "audio/mpeg" }),
+      model: modelId,
+      response_format: "json",
     });
-    req.on("error", (err) =>
-      resolve({ ok: false, message: err instanceof Error ? err.message : String(err) }),
-    );
-    req.end(body);
-  });
+    return { ok: true, message: "" };
+  } catch (e) {
+    const status = e && typeof e.status === "number" ? e.status : 0;
+    const bodyText = e && e.error ? safeJsonStringify(e.error) : "";
+    return {
+      ok: false,
+      message: status
+        ? classifyGroqError(status, bodyText, maskApiKey(apiKey))
+        : `Could not reach api.groq.com: ${e && e.message ? e.message : e}`,
+      status,
+      genuine: isGenuineGroqErrorBody(bodyText),
+      failover:
+        transportMode !== "node" &&
+        transportsDiffer() &&
+        status &&
+        transportFailoverWorthy(status, bodyText),
+    };
+  }
 }
 
 /** Validate the REAL transcription path end to end (v1.30 + v1.32):
@@ -854,72 +796,45 @@ function groqTranscribeProbe(apiKey, modelId) {
   });
 }
 
-/** Validate a key END TO END (v1.30):
- *  1. GET /openai/v1/models — does the key authenticate at all?
+/** Validate a key END TO END (v1.30 + v1.33 SDK):
+ *  1. GET /openai/v1/models (client.models.list) — does the key authenticate?
  *  2. POST the 1s probe to /openai/v1/audio/transcriptions with the
  *     selected whisper model — does TRANSCRIPTION actually work?
  *  Resolves { ok:boolean, message:string, whisperModels:string[] }. */
-function groqTestKey(apiKey, opts) {
+async function groqTestKey(apiKey, opts) {
   const model = normalizeGroqModel(opts && opts.model);
-  return new Promise((resolve) => {
-    const req = createRequest(
-      {
-        host: GROQ_API_HOST,
-        path: MODELS_PATH,
-        method: "GET",
-        headers: { Authorization: `Bearer ${apiKey}` },
-      },
-      (res) => {
-        const chunks = [];
-        res.on("data", (d) => chunks.push(d));
-        res.on("end", () => {
-          const body = Buffer.concat(chunks).toString("utf8");
-          if (res.statusCode !== 200) {
-            // v1.29: masked fingerprint of the key we just probed.
-            resolve({
-              ok: false,
-              message: classifyGroqError(res.statusCode, body, maskApiKey(apiKey)),
-              whisperModels: [],
-            });
-            return;
-          }
-          let whisperModels = [];
-          try {
-            const j = JSON.parse(body);
-            whisperModels = (Array.isArray(j.data) ? j.data : [])
-              .map((m) => m && m.id)
-              .filter((id) => typeof id === "string" && id.startsWith("whisper"));
-          } catch (_) { /* non-fatal */ }
-          // v1.30: /models passing is no longer enough — run the REAL
-          // transcription probe so "key works" means "transcription works".
-          groqTranscribeProbe(apiKey, model).then((probe) => {
-            if (probe.ok) {
-              resolve({
-                ok: true,
-                message: `Key works — real transcription verified end to end (${model}; the key, the model and the upload all passed)`,
-                whisperModels,
-              });
-              return;
-            }
-            // Auth OK but transcription failed — a DIFFERENT problem, and
-            // the message must say so (not "rejected key").
-            resolve({
-              ok: false,
-              message: `The key authenticates, but a real transcription test failed: ${probe.message}`,
-              whisperModels,
-            });
-          });
-        });
-      },
-    );
-    req.setTimeout(15000, () => {
-      req.destroy(new Error("Connection to api.groq.com timed out"));
-    });
-    req.on("error", (err) =>
-      resolve({ ok: false, message: err.message, whisperModels: [] }),
-    );
-    req.end();
-  });
+  const whisperModels = [];
+  try {
+    const { client } = sdkClient(apiKey, "auto", { timeoutMs: 15000 });
+    const page = await client.models.list();
+    const models = page && typeof page[Symbol.iterator] === "function"
+      ? [...page]
+      : Array.isArray(page && page.data) ? page.data : [];
+    for (const m of models) {
+      const id = m && typeof m.id === "string" ? m.id : "";
+      if (id.startsWith("whisper")) whisperModels.push(id);
+    }
+  } catch (e) {
+    const mapped = mapSdkError(e, apiKey, "auto");
+    return { ok: false, message: mapped.message, whisperModels };
+  }
+  // v1.30: /models passing is no longer enough — run the REAL
+  // transcription probe so "key works" means "transcription works".
+  const probe = await groqTranscribeProbe(apiKey, model);
+  if (probe.ok) {
+    return {
+      ok: true,
+      message: `Key works — real transcription verified end to end (${model}; the key, the model and the upload all passed)`,
+      whisperModels,
+    };
+  }
+  // Auth OK but transcription failed — a DIFFERENT problem, and the
+  // message must say so (not "rejected key").
+  return {
+    ok: false,
+    message: `The key authenticates, but a real transcription test failed: ${probe.message}`,
+    whisperModels,
+  };
 }
 
 module.exports = {
@@ -945,4 +860,8 @@ module.exports = {
   groqTranscribe,
   groqTestKey,
   groqTranscribeProbe,
+  groqJobCode,
+  mapSdkError,
+  validateAudioFile,
+  safeJsonStringify,
 };

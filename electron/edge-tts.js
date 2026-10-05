@@ -84,6 +84,7 @@ const https = require("https");
 const tls = require("tls");
 const net = require("net");
 const crypto = require("crypto");
+const { isMp3Buffer } = require("./audio-format");
 
 const SPEECH_HOST = "speech.platform.bing.com";
 const TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
@@ -399,6 +400,150 @@ async function openProxiedTls(host, alpnProtocols) {
     // The proxy path failed → direct, exactly the pre-v1.32 behavior.
     return tls.connect({ host, port: 443, servername: host, ALPNProtocols: alpnProtocols });
   }
+}
+
+// ---------------------------------------------------------------------------
+// v1.33 PACKAGE ENGINE — edge-tts-universal (user directive: adopt the
+// maintained community implementation as the PRIMARY synthesis engine).
+//
+// WHY: the service protocol (Sec-MS-GEC DRM token, WSS framing, metadata
+// stream) is UNOFFICIAL and Microsoft changes it periodically. A community
+// package that tracks those changes is more durable than a private
+// implementation. Its `Communicate` class supports a PROXY URL
+// (HttpsProxyAgent) — on machines where Chromium reports an HTTP(S) system
+// proxy we hand it over; when Chromium reports SOCKS5 (the package's agent
+// cannot do SOCKS) or DIRECT we run the package direct — and the RAW
+// v1.32 client below remains the fallback engine: it owns the SOCKS5
+// tunnel, the mstts voice STYLES (the package has no express-as support)
+// and the exact word-metadata contract the app already verified.
+//
+// Failure contract: the package's typed errors (WebSocketError,
+// NoAudioReceived, EdgeTTSException) are TRANSIENT (connection/service) →
+// one package retry, then the raw engine. ValueError (invalid voice) and
+// validation failures are NOT retryable — they surface directly.
+// ---------------------------------------------------------------------------
+
+/** The package, loaded lazily so this module stays requireable even if
+ *  node_modules is partially staged (smoke tests, packaging edge cases). */
+function loadTtsPackage() {
+  try {
+    return require("edge-tts-universal");
+  } catch (err) {
+    const e = new Error(
+      `The edge-tts-universal package is not available (${err.message}) — ` +
+        `falling back to the built-in Edge speech client`,
+    );
+    e.retryable = true; // the built-in client may still succeed
+    throw e;
+  }
+}
+
+/** Chromium's system-proxy verdict, converted to the package's proxy URL
+ *  format (http://host:port for HTTP CONNECT proxies). SOCKS5 → null
+ *  (the raw engine handles SOCKS natively). DIRECT/unavailable → null. */
+async function packageProxyUrl() {
+  try {
+    const line = await resolveProxyLine(SPEECH_HOST);
+    const proxy = parseProxyLine(line);
+    if (!proxy || proxy.kind !== "http") return null;
+    return `http://${proxy.host}:${proxy.port}`;
+  } catch (_) {
+    return null;
+  }
+}
+
+/** +15 → "+15%", -10 → "-10%" (the package's prosody string format). */
+const pctStr = (n) => `${n >= 0 ? "+" : ""}${Math.round(n)}%`;
+/** +2 → "+2Hz", -5 → "-5Hz". */
+const hzStr = (n) => `${n >= 0 ? "+" : ""}${Math.round(n)}Hz`;
+
+/** Is this package error transient (retry / fallback) or terminal? */
+function packageErrorIsTransient(err) {
+  if (!err) return false;
+  const name = err.constructor && err.constructor.name;
+  if (name === "ValueError") return false; // invalid voice/text — fix the input
+  if (name === "WebSocketError" || name === "NoAudioReceived" || name === "EdgeTTSException") return true;
+  // Network-layer: ECONNRESET/ETIMEDOUT/EAI_AGAIN/socket hang up…
+  return /socket|connect|network|timeout|timed out|ECONN|EAI_|hang up|EHOSTUNREACH|ENETUNREACH/i.test(
+    String(err.message || err),
+  );
+}
+
+/** Map a package error to a plain Error carrying the structured job shape
+ *  (v1.33 user brief: service / code / message / retryable). */
+function packageError(err, opts, engineLabel) {
+  const voice = opts && opts.voice ? opts.voice : "";
+  const name = err && err.constructor && err.constructor.name;
+  let code = "TTS_SERVICE_ERROR";
+  if (name === "ValueError") code = "TTS_INVALID_VOICE";
+  else if (name === "NoAudioReceived") code = "TTS_NO_AUDIO_RESULT";
+  else if (name === "WebSocketError") code = "TTS_CONNECTION_FAILED";
+  const msg =
+    name === "ValueError"
+      ? `Voice "${voice}" is not a valid Edge neural voice — pick one from the voice list (Settings → Text to speech)`
+      : `${engineLabel}: ${err && err.message ? err.message : String(err)}`;
+  const e = new Error(msg);
+  e.retryable = packageErrorIsTransient(err);
+  e.job = {
+    service: "edge-tts",
+    code,
+    message: msg,
+    retryable: e.retryable,
+  };
+  return e;
+}
+
+/**
+ * One synthesis attempt through the edge-tts-universal package.
+ * @returns {Promise<{mp3:Buffer, words:Array<{text,offsetMs,durationMs}>}>}
+ * @throws structured Error (err.job = {service,code,message,retryable})
+ */
+async function synthesizeViaPackage(opts) {
+  const pkg = loadTtsPackage();
+  const proxy = await packageProxyUrl();
+  const audioParts = [];
+  const words = [];
+  let sawAudio = false;
+  let comm;
+  try {
+    // NOTE: the constructor itself validates the voice (ValueError) — it
+    // must live INSIDE this try or the error escapes unmapped.
+    comm = new pkg.Communicate(opts.text, {
+      voice: opts.voice,
+      rate: pctStr(opts.ratePct || 0),
+      volume: pctStr(opts.volumePct || 0),
+      pitch: hzStr(opts.pitchHz || 0),
+      ...(proxy ? { proxy } : {}),
+      connectionTimeout: HANDSHAKE_TIMEOUT_MS,
+    });
+    for await (const chunk of comm.stream()) {
+      if (opts.abortRef && opts.abortRef._cancelled) {
+        throw cancelledError();
+      }
+      if (chunk && chunk.type === "audio" && chunk.data) {
+        sawAudio = true;
+        audioParts.push(Buffer.isBuffer(chunk.data) ? chunk.data : Buffer.from(chunk.data));
+      } else if (chunk && chunk.type === "WordBoundary") {
+        words.push({
+          text: String(chunk.text || "").trim(),
+          offsetMs: Math.round((Number(chunk.offset) || 0) / 10000),
+          durationMs: Math.round((Number(chunk.duration) || 0) / 10000),
+        });
+      }
+    }
+  } catch (err) {
+    if (err && err.cancelled) throw err;
+    throw packageError(err, opts, "Edge TTS (edge-tts-universal engine)");
+  }
+  if (!sawAudio || audioParts.length === 0) {
+    const e = new Error(
+      "Edge TTS (edge-tts-universal engine): the service returned no audio for this request",
+    );
+    e.retryable = true;
+    e.job = { service: "edge-tts", code: "TTS_NO_AUDIO_RESULT", message: e.message, retryable: true };
+    throw e;
+  }
+  return { mp3: Buffer.concat(audioParts), words: words.filter((w) => w.text) };
 }
 
 // ---------------------------------------------------------------------------
@@ -761,7 +906,7 @@ function buildSsml(o) {
   // (existing callers — dub-workflow — see no change at all).
   return (
     `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis'` +
-    `${o.style ? ` xmlns:mstts='https://www.w3.org/2001/mstts'` : ""} ` +
+    `${o.style ? ` xmlns:mstts='http://www.w3.org/2001/mstts'` : ""} ` +
     `xml:lang='${escapeXml(locale)}'>` +
     `<voice name='${escapeXml(o.voice)}'>` +
     `${styled}` +
@@ -1511,7 +1656,20 @@ function normalizeSynthOptions(o) {
  *          words = per-word timings from the WordBoundary metadata stream.
  */
 async function synthesize(o) {
-  const opts = normalizeSynthOptions(o); // throws → rejected promise
+  let opts;
+  try {
+    opts = normalizeSynthOptions(o); // throws → structured rejection below
+  } catch (err) {
+    // v1.33 structured input validation (user brief): empty text / missing
+    // voice / oversized text are TERMINAL (never retried) and carry the
+    // AudioJobError shape.
+    const msg = err instanceof Error ? err.message : String(err);
+    const code = /non-empty string/.test(msg) ? "TTS_EMPTY_TEXT"
+      : /voice is required/.test(msg) ? "TTS_VOICE_REQUIRED"
+        : /caps\s+a request at/.test(msg) ? "TTS_TEXT_TOO_LONG" : "TTS_INVALID_INPUT";
+    err.job = { service: "edge-tts", code, message: msg, retryable: false };
+    throw err;
+  }
   // Early-cancel stub so abortRef.abort is always callable, even before the
   // socket exists (or while the request waits for an engine slot).
   if (opts.abortRef) {
@@ -1524,54 +1682,185 @@ async function synthesize(o) {
     if (opts.abortRef && opts.abortRef._cancelled) throw cancelledError();
     let mp3Bytes = null;
     let words = null;
-    // v1.32: 3 attempts (was 2). Each attempt regenerates Sec-MS-GEC,
-    // ConnectionId AND now re-resolves the system proxy — a flappy VPN or
-    // AV proxy gets three genuinely fresh chances.
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    let engineUsed = "raw-client";
+    // Call-local: the package engine's captured error (concurrent jobs
+    // never see each other's notes — this is a per-call context).
+    let packageEngineNote = null;
+    // v1.33: set when a voice style was dropped because the service
+    // rejected express-as — surfaced via result.warnings, never silent.
+    let styleDegraded = null;
+
+    // v1.33 ENGINE DISPATCH (user brief: edge-tts-universal is the primary
+    // engine). mstts voice STYLES need the raw client's express-as SSML
+    // (the package has no style support) — style requests skip the package.
+    // A TRANSIENT package failure (connection/service — the package's own
+    // typed errors) falls back to the raw client; terminal package errors
+    // (invalid voice, invalid input) surface immediately, and the ORIGINAL
+    // package error is captured on the fallback's success path for the log.
+    if (!opts.style) {
       try {
-        const attemptResult = await attemptSynthesis(opts);
-        mp3Bytes = attemptResult.mp3;
-        words = attemptResult.words;
-        break;
+        const pkgResult = await synthesizeViaPackage(opts);
+        mp3Bytes = pkgResult.mp3;
+        words = pkgResult.words;
+        engineUsed = "edge-tts-universal";
       } catch (err) {
-        const cancelled =
-          (err && err.cancelled) ||
-          (opts.abortRef && opts.abortRef._cancelled);
-        const retryable = !!(err && err.retryable);
-        if (cancelled || !retryable || attempt === 3) {
-          if (!cancelled && err instanceof Error) {
-            // v1.32: exhausted retryable failures get the actionable hints —
-            // the three real-world causes are a region block on the
-            // speech endpoint, a proxy/VPN/AV interception, or a badly
-            // wrong system clock (the DRM token is time-based).
-            err.message =
-              `${err.message} — after ${attempt} attempt${attempt === 1 ? "" : "s"}. ` +
-                "If this keeps failing: (1) toggle your VPN/proxy or disable antivirus HTTPS-scanning for this app, " +
-                "(2) check your system clock is correct (the speech DRM token is time-based), " +
-                "(3) try another network — Microsoft's speech endpoint is blocked in some regions";
-          }
-          throw err;
-        }
-        // 403-ish failure / handshake stall / connect error — fresh retry.
-        // The retry regenerates Sec-MS-GEC + ConnectionId inside
-        // attemptSynthesis and re-resolves the proxy inside openProxiedTls.
+        if (err && err.cancelled) throw err;
+        const transient = !!(err && err.retryable);
+        if (!transient) throw err; // invalid voice/input — terminal
+        // Transient package failure → the raw engine (v1.32 proxy-tunneled
+        // client) takes over below. The ORIGINAL package error is captured
+        // (brief requirement: never lose the first failure's cause).
+        packageEngineNote = err.message;
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[edge-tts] package engine failed (transient) — falling back to the built-in client: ${err.message}`,
+        );
       }
     }
+
+    if (mp3Bytes == null) {
+      // v1.32: 3 attempts (was 2). Each attempt regenerates Sec-MS-GEC,
+      // ConnectionId AND now re-resolves the system proxy — a flappy VPN or
+      // AV proxy gets three genuinely fresh chances.
+      // v1.33 STYLE DEGRADATION: the speech service has DROPPED the
+      // mstts:express-as element (close 1007 "SSML is invalid" — live-verified
+      // 2026-10 with both namespace forms). Since no app surface sends styles
+      // (the TTS Studio presets are pure prosody), a style request that the
+      // service rejects degrades to the STYLELESS SSML once — never silently:
+      // the result carries a warnings entry the UI can show.
+      let styleStripped = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const attemptResult = await attemptSynthesis(opts);
+          mp3Bytes = attemptResult.mp3;
+          words = attemptResult.words;
+          engineUsed = packageEngineNote
+            ? "raw-client (after package engine failure)"
+            : "raw-client";
+          if (styleStripped) styleDegraded = styleStripped;
+          break;
+        } catch (err) {
+          if (
+            opts.style &&
+            /ssml is invalid/i.test(String((err && err.message) || ""))
+          ) {
+            styleStripped = opts.style;
+            opts.style = null; // degrade once, warn in the result
+            // The SSML is PRE-BUILT in normalizeSynthOptions — rebuilding it
+            // is what actually drops the express-as element.
+            opts.ssml = buildSsml({
+              text: opts.text,
+              voice: opts.voice,
+              locale: opts.locale,
+              ratePct: opts.ratePct,
+              pitchHz: opts.pitchHz,
+              volumePct: opts.volumePct,
+              style: null,
+            });
+            continue;
+          }
+          const cancelled =
+            (err && err.cancelled) ||
+            (opts.abortRef && opts.abortRef._cancelled);
+          const retryable = !!(err && err.retryable);
+          if (cancelled || !retryable || attempt === 3) {
+            if (!cancelled && err instanceof Error) {
+              // v1.32: exhausted retryable failures get the actionable hints —
+              // the three real-world causes are a region block on the
+              // speech endpoint, a proxy/VPN/AV interception, or a badly
+              // wrong system clock (the DRM token is time-based).
+              err.message =
+                `${err.message} — after ${attempt} attempt${attempt === 1 ? "" : "s"}. ` +
+                  "If this keeps failing: (1) toggle your VPN/proxy or disable antivirus HTTPS-scanning for this app, " +
+                  "(2) check your system clock is correct (the speech DRM token is time-based), " +
+                  "(3) try another network — Microsoft's speech endpoint is blocked in some regions";
+              err.job = err.job || {
+                service: "edge-tts",
+                code: "TTS_SERVICE_ERROR",
+                message: err.message,
+                retryable: false,
+              };
+            }
+            throw err;
+          }
+          // 403-ish failure / handshake stall / connect error — fresh retry.
+          // The retry regenerates Sec-MS-GEC + ConnectionId inside
+          // attemptSynthesis and re-resolves the proxy inside openProxiedTls.
+        }
+      }
+    }
+
+    // v1.33 OUTPUT VALIDATION (user brief): NEVER report success until the
+    // audio is real — nonzero size AND a valid MP3 signature (ID3 tag or
+    // MPEG frame sync). Applies to BOTH engines.
+    if (!mp3Bytes || !Buffer.isBuffer(mp3Bytes) || mp3Bytes.length < 100) {
+      const e = new Error(
+        `TTS produced ${mp3Bytes ? mp3Bytes.length : 0} bytes — too small to be audio (engine: ${engineUsed})`,
+      );
+      e.job = {
+        service: "edge-tts",
+        code: "TTS_AUDIO_TOO_SMALL",
+        message: e.message,
+        retryable: false,
+      };
+      throw e;
+    }
+    if (!isMp3Buffer(mp3Bytes)) {
+      const e = new Error(
+        `TTS output is not recognized as MP3 (no ID3 tag or MPEG frame sync; engine: ${engineUsed}) — the speech service returned an unexpected payload`,
+      );
+      e.job = {
+        service: "edge-tts",
+        code: "TTS_OUTPUT_NOT_RECOGNIZED_AS_MP3",
+        message: e.message,
+        retryable: false,
+      };
+      throw e;
+    }
+
     const result = {
       filePath: null,
       bytes: mp3Bytes,
       bytesLen: mp3Bytes.length,
       words: words || [],
+      engine: engineUsed,
+      warnings: styleDegraded
+        ? [
+            `The speech service no longer accepts voice styles — "${styleDegraded}" was ignored and the audio was synthesized with the default delivery.`,
+          ]
+        : [],
     };
     if (opts.outFile) {
+      // v1.33 ATOMIC WRITE (user brief): a unique temporary file per job,
+      // fsync, THEN rename — a half-written destination can never be
+      // mistaken for a finished one, and concurrent jobs cannot collide.
+      const dir = path.dirname(opts.outFile);
+      const temporary = `${opts.outFile}.${process.pid}-${Date.now()}-${crypto
+        .randomBytes(4)
+        .toString("hex")}.tmp`;
       try {
-        fs.mkdirSync(path.dirname(opts.outFile), { recursive: true });
-        fs.writeFileSync(opts.outFile, mp3Bytes);
+        fs.mkdirSync(dir, { recursive: true });
+        const fd = fs.openSync(temporary, "w");
+        try {
+          fs.writeSync(fd, mp3Bytes);
+          fs.fsyncSync(fd);
+        } finally {
+          fs.closeSync(fd);
+        }
+        fs.renameSync(temporary, opts.outFile);
         result.filePath = opts.outFile;
       } catch (err) {
-        throw new Error(
+        try { fs.unlinkSync(temporary); } catch (_) { /* never existed */ }
+        const e = new Error(
           `Could not write the TTS output file "${opts.outFile}": ${err.message}`,
         );
+        e.job = {
+          service: "edge-tts",
+          code: "TTS_WRITE_FAILED",
+          message: e.message,
+          retryable: false,
+        };
+        throw e;
       }
     }
     return result;

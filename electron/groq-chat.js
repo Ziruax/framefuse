@@ -35,14 +35,11 @@
 
 "use strict";
 
-const { createRequest } = require("./net-transport");
-const { GROQ_API_HOST, maskApiKey, transportName } = require("./groq-whisper");
+const { maskApiKey, transportName, groqJobCode, safeJsonStringify } = require("./groq-whisper");
+const { sdkClient, transportsDiffer } = require("./groq-fetch-adapter");
 
-const CHAT_PATH = "/openai/v1/chat/completions";
-const MODELS_PATH = "/openai/v1/models";
 
 /** Sanity cap on the response body (chat completions are KBs, not MBs). */
-const MAX_RESPONSE_BYTES = 10 * 1024 * 1024;
 
 /** Retry backoff for retryable failures: 1.5s, then 4s, then 8s, 16s… */
 const BACKOFF_DELAYS_MS = [1500, 4000];
@@ -162,17 +159,6 @@ function makeChatError(message, { status = 0, retryable = false } = {}) {
   return err;
 }
 
-const NET_ERROR_CODES = new Set([
-  "ECONNRESET", "ETIMEDOUT", "EAI_AGAIN", "ECONNREFUSED", "ENOTFOUND",
-  "EPIPE", "EHOSTUNREACH", "ENETUNREACH", "ECONNABORTED",
-]);
-
-function isNetworkError(err) {
-  if (!err) return false;
-  if (err.code && NET_ERROR_CODES.has(err.code)) return true;
-  const msg = String(err.message || err);
-  return /socket hang up|timed out|connection|network/i.test(msg);
-}
 
 /** v1.32: is this body a GENUINE Groq API answer (documented error envelope
  *  with error.type/error.code)? The bare {"error":{"message":"Forbidden"}}
@@ -277,110 +263,83 @@ function validateMessages(messages) {
   });
 }
 
-function chatRequestOnceRaw(o, transportMode) {
+/** One chat request through the OFFICIAL groq-sdk (no retries — groqChat
+ *  owns those). v1.33: the SDK client rides the app's net-transport via
+ *  groq-fetch-adapter (Chromium net inside Electron — honors the OS proxy;
+ *  "node" mode = direct Node https, the v1.32 failover path). Timeout,
+ *  cancellation (ctl), classification and the structured job shape all
+ *  survive the SDK layer. */
+async function chatRequestOnceRaw(o, transportMode) {
   const { apiKey, modelId, messages, temperature, maxTokens, jsonMode, timeoutMs, ctl } = o;
-  return new Promise((resolve, reject) => {
-    const payload = {
-      model: modelId,
-      messages,
-      temperature,
-      max_tokens: maxTokens,
-    };
-    if (jsonMode) payload.response_format = { type: "json_object" };
-    const body = Buffer.from(JSON.stringify(payload), "utf8");
-
-    let timer = null;
-    const req = createRequest(
-      {
-        host: GROQ_API_HOST,
-        path: CHAT_PATH,
-        method: "POST",
-        transport: transportMode === "node" ? "node" : undefined,
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-          "Content-Length": String(body.length),
-        },
+  const { client } = sdkClient(apiKey, transportMode, {
+    timeoutMs: Math.max(1000, timeoutMs),
+  });
+  const abortCtl = new AbortController();
+  if (ctl && typeof ctl === "object") {
+    // Back-compat with the raw-socket cancel path: groqChat calls
+    // ctl.req.destroy(Error(CANCEL_MSG)) — route that into the abort.
+    ctl.req = {
+      destroy: (e) => {
+        try { abortCtl.abort(e instanceof Error ? e : new Error(String(e))); } catch (_) { /* gone */ }
       },
-      (res) => {
-        const chunks = [];
-        let bytes = 0;
-        res.on("data", (d) => {
-          chunks.push(d);
-          bytes += d.length;
-          if (bytes > MAX_RESPONSE_BYTES) {
-            req.destroy(new Error("Groq chat response exceeded 10 MB"));
-          }
-        });
-        res.on("end", () => {
-          clearTimeout(timer);
-          const bodyText = Buffer.concat(chunks).toString("utf8");
-          if (res.statusCode !== 200) {
-            // v1.29: masked fingerprint of the key this request carried.
-            const chatErr = makeChatError(
-              classifyChatError(res.statusCode, bodyText, maskApiKey(apiKey)),
-              {
-                status: res.statusCode,
-                retryable: res.statusCode === 429 || res.statusCode >= 500,
-              },
-            );
-            // v1.32 TRANSPORT FAILOVER: a 401/403/404 WITHOUT a genuine
-            // Groq envelope did not come from Groq — on the Chromium-net
-            // path (OS-proxy-honoring) it smells like an interceptor
-            // answering for Groq. Mark for one direct-Node retry.
-            if (
-              transportMode !== "node" &&
-              req &&
-              req._usingElectron &&
-              (res.statusCode === 404 || res.statusCode === 401 || res.statusCode === 403) &&
-              !isGenuineGroqErrorBody(bodyText)
-            ) {
-              chatErr._transportFailover = true;
-            }
-            reject(chatErr);
-            return;
-          }
-          let j;
-          try {
-            j = JSON.parse(bodyText);
-          } catch (err) {
-            // A 200 with an unparseable body is almost always a transient
-            // gateway hiccup — retryable.
-            reject(makeChatError(`Could not parse the Groq chat response: ${err.message}`, { retryable: true }));
-            return;
-          }
-          const choice = j && Array.isArray(j.choices) ? j.choices[0] : null;
-          if (!choice || typeof choice !== "object" || !choice.message) {
-            reject(makeChatError("Groq returned an empty chat completion", { retryable: true }));
-            return;
-          }
-          resolve({
-            content: typeof choice.message.content === "string" ? choice.message.content : "",
-            finishReason: typeof choice.finish_reason === "string" ? choice.finish_reason : null,
-            usage: j && typeof j.usage === "object" && j.usage ? j.usage : null,
-          });
-        });
+    };
+  }
+  const payload = {
+    model: modelId,
+    messages,
+    temperature,
+    max_tokens: maxTokens,
+  };
+  if (jsonMode) payload.response_format = { type: "json_object" };
+  try {
+    const j = await client.chat.completions.create(payload, { signal: abortCtl.signal });
+    const choice = j && Array.isArray(j.choices) ? j.choices[0] : null;
+    if (!choice || typeof choice !== "object" || !choice.message) {
+      throw makeChatError("Groq returned an empty chat completion", { retryable: true });
+    }
+    return {
+      content: typeof choice.message.content === "string" ? choice.message.content : "",
+      finishReason: typeof choice.finish_reason === "string" ? choice.finish_reason : null,
+      usage: j && typeof j.usage === "object" && j.usage ? j.usage : null,
+    };
+  } catch (e) {
+    if (e && e.name === "AbortError" && e.cause && String(e.cause.message) === CANCEL_MSG) {
+      throw makeChatError(CANCEL_MSG, { retryable: false });
+    }
+    if (e && e.name === "AbortError") {
+      throw makeChatError("Groq chat request timed out", { retryable: true });
+    }
+    const status = e && typeof e.status === "number" ? e.status : 0;
+    const bodyText = e && e.error ? safeJsonStringify(e.error) : "";
+    const chatErr = makeChatError(
+      status
+        ? classifyChatError(status, bodyText, maskApiKey(apiKey))
+        : `Groq chat request failed: ${e && e.message ? e.message : e}`,
+      {
+        status,
+        retryable: status === 429 || status >= 500 || !status,
       },
     );
-    ctl.req = req;
-
-    // Total-request timeout (connect + headers + body).
-    timer = setTimeout(() => {
-      try { req.destroy(new Error("Groq chat request timed out")); } catch (_) { /* already gone */ }
-    }, Math.max(1000, timeoutMs));
-
-    req.on("error", (err) => {
-      clearTimeout(timer);
-      const msg = err && err.message ? err.message : String(err);
-      if (msg === CANCEL_MSG) {
-        reject(makeChatError(msg, { retryable: false }));
-        return;
-      }
-      reject(makeChatError(`Groq chat request failed: ${msg}`, { retryable: isNetworkError(err) }));
-    });
-
-    req.end(body);
-  });
+    // v1.32 TRANSPORT FAILOVER at the SDK layer: an interceptor-shaped
+    // response (401/403/404 with NO genuine Groq envelope) on the
+    // OS-proxy-honoring transport retries once through direct Node https.
+    if (
+      transportMode !== "node" &&
+      transportsDiffer() &&
+      (status === 404 || status === 401 || status === 403) &&
+      !isGenuineGroqErrorBody(bodyText)
+    ) {
+      chatErr._transportFailover = true;
+    }
+    // v1.33 structured job shape.
+    chatErr.job = {
+      service: "groq",
+      code: groqJobCode(status, bodyText, isGenuineGroqErrorBody(bodyText)),
+      message: chatErr.message,
+      retryable: chatErr.retryable,
+    };
+    throw chatErr;
+  }
 }
 
 /** One chat request WITH the v1.32 transport failover: an interceptor-shaped
@@ -502,49 +461,27 @@ async function groqChat(o) {
  *  Best-effort: resolves [] (with a console.warn) when the key is bad or
  *  the network fails — callers use this to grey out options, not to
  *  validate keys (groqTestKey does that). */
-function groqListTextModels(apiKey) {
-  return new Promise((resolve) => {
-    if (typeof apiKey !== "string" || !apiKey.trim()) {
-      resolve([]);
-      return;
+async function groqListTextModels(apiKey) {
+  if (typeof apiKey !== "string" || !apiKey.trim()) return [];
+  try {
+    const { client } = sdkClient(apiKey, "auto", { timeoutMs: 15000 });
+    const page = await client.models.list();
+    const models = page && typeof page[Symbol.iterator] === "function"
+      ? [...page]
+      : Array.isArray(page && page.data) ? page.data : [];
+    const ids = new Set();
+    for (const m of models) {
+      if (m && typeof m.id === "string") ids.add(m.id);
     }
-    const req = createRequest(
-      {
-        host: GROQ_API_HOST,
-        path: MODELS_PATH,
-        method: "GET",
-        headers: { Authorization: `Bearer ${apiKey}` },
-      },
-      (res) => {
-        const chunks = [];
-        res.on("data", (d) => chunks.push(d));
-        res.on("end", () => {
-          const body = Buffer.concat(chunks).toString("utf8");
-          if (res.statusCode !== 200) {
-            console.warn(`[groq-chat] Could not list models (HTTP ${res.statusCode}): ${classifyChatError(res.statusCode, body, maskApiKey(apiKey))}`);
-            resolve([]);
-            return;
-          }
-          const ids = new Set();
-          try {
-            const j = JSON.parse(body);
-            for (const m of Array.isArray(j.data) ? j.data : []) {
-              if (m && typeof m.id === "string") ids.add(m.id);
-            }
-          } catch (_) { /* best-effort */ }
-          resolve(GROQ_TEXT_MODELS.filter((m) => ids.has(m.id)).map((m) => m.id));
-        });
-      },
+    return GROQ_TEXT_MODELS.filter((m) => ids.has(m.id)).map((m) => m.id);
+  } catch (e) {
+    const status = e && typeof e.status === "number" ? e.status : 0;
+    const bodyText = e && e.error ? safeJsonStringify(e.error) : "";
+    console.warn(
+      `[groq-chat] Could not list models${status ? ` (HTTP ${status})` : ""}: ${status ? classifyChatError(status, bodyText, maskApiKey(apiKey)) : String(e && e.message || e)}`,
     );
-    req.setTimeout(15000, () => {
-      req.destroy(new Error("Connection to api.groq.com timed out"));
-    });
-    req.on("error", (err) => {
-      console.warn(`[groq-chat] Could not list models: ${err && err.message ? err.message : err}`);
-      resolve([]);
-    });
-    req.end();
-  });
+    return [];
+  }
 }
 
 module.exports = {

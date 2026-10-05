@@ -109,7 +109,10 @@ export async function POST(req: NextRequest) {
     // persisted server-side.
     const formProvider = String(form.get("provider") ?? "builtin");
     const provider = formProvider === "groq" ? "groq" : "builtin";
-    const groqKey = String(form.get("groqKey") ?? "").trim();
+    // v1.33: request key → GROQ_API_KEY env fallback (user brief Part 2).
+    const groqKey =
+      String(form.get("groqKey") ?? "").trim() ||
+      (typeof process.env.GROQ_API_KEY === "string" ? process.env.GROQ_API_KEY.trim() : "");
     const groqModelRaw = String(form.get("groqModel") ?? "").trim();
     const groqModel = ["whisper-large-v3", "whisper-large-v3-turbo"].includes(groqModelRaw)
       ? groqModelRaw
@@ -147,7 +150,20 @@ export async function POST(req: NextRequest) {
     });
   } catch (err) {
     if (err instanceof TranscribeFailure) {
-      return bad(err.message, err.status);
+      // v1.33 (user brief Part 5): structured job details ride the JSON.
+      return NextResponse.json(
+        {
+          ok: false,
+          error: err.message,
+          job: (err as TranscribeFailure & { job?: { service: string; code: string; message: string; retryable: boolean } }).job ?? {
+            service: "groq",
+            code: "GROQ_REQUEST_FAILED",
+            message: err.message,
+            retryable: false,
+          },
+        },
+        { status: err.status },
+      );
     }
     const message = err instanceof Error ? err.message : "Transcription failed";
     return bad(message, 500);

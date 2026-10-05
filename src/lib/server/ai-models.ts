@@ -10,6 +10,7 @@
  */
 
 import { zaiChatText } from "./zai";
+import { groqClient, sdkErrorFacts, groqJobError, resolveGroqKey } from "./groq-sdk-client";
 
 // ---------------------------------------------------------------------------
 // Catalogs
@@ -118,36 +119,36 @@ async function fetchWithTimeout(url: string, init: RequestInit): Promise<Respons
   }
 }
 
+/** v1.33: the official groq-sdk is the chat request engine (user brief).
+ *  The route-level key resolution (Settings key → GROQ_API_KEY env) happens
+ *  in the request layer; here the key must already be resolved. */
 async function groqChat(
   system: string,
   user: string,
   req: TextProviderRequest,
   maxTokens: number,
 ): Promise<string> {
-  const res = await fetchWithTimeout(GROQ_CHAT_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${req.groqKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: req.model,
+  const key = resolveGroqKey(req.groqKey);
+  if (!key) throw new Error("No Groq key configured (Settings or GROQ_API_KEY)");
+  const client = groqClient(key);
+  try {
+    const completion = await client.chat.completions.create({
+      model: req.model ?? GROQ_DEFAULT,
       messages: [
         { role: "system", content: system },
         { role: "user", content: user },
       ],
       temperature: 0.2,
       max_tokens: maxTokens,
-    }),
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Groq ${res.status}: ${body.slice(0, 300)}`);
+    });
+    return completion.choices?.[0]?.message?.content ?? "";
+  } catch (e) {
+    const f = sdkErrorFacts(e);
+    if (f.status) {
+      throw new Error(`Groq ${f.status}: ${f.bodyText.slice(0, 300) || f.apiMessage}`);
+    }
+    throw new Error(`Groq connection failed: ${String((e as Error).message)}`);
   }
-  const j = (await res.json()) as {
-    choices?: { message?: { content?: string } }[];
-  };
-  return j.choices?.[0]?.message?.content ?? "";
 }
 
 async function geminiChat(
@@ -218,7 +219,7 @@ export async function testProviderKey(
   provider: "groq" | "gemini",
   key: string,
   opts?: { model?: string },
-): Promise<{ ok: boolean; message: string; models: string[] }> {
+): Promise<{ ok: boolean; message: string; models: string[]; job?: { service: string; code: string; message: string; retryable: boolean } }> {
   const trimmed = key.trim();
   if (!trimmed) return { ok: false, message: "No key provided", models: [] };
   // v1.29: mask the key in rejection messages so users can tell WHICH key
@@ -288,18 +289,25 @@ export async function testProviderKey(
   };
   try {
     if (provider === "groq") {
-      // Step 1 — does the key authenticate at all?
-      const res = await fetchWithTimeout("https://api.groq.com/openai/v1/models", {
-        headers: { Authorization: `Bearer ${trimmed}` },
-      });
-      if (!res.ok) {
-        const body = await res.text().catch(() => "");
-        return { ok: false, message: classifyGroq(res.status, body), models: [] };
+      // v1.33: the OFFICIAL groq-sdk is the request engine (user brief).
+      const client = groqClient(trimmed);
+      // Step 1 — does the key authenticate at all? (GET /models via SDK)
+      let whisper: string[] = [];
+      try {
+        const page = await client.models.list();
+        const listed = (page as { data?: { id?: string }[] }).data ?? [];
+        whisper = listed
+          .map((m) => m.id ?? "")
+          .filter((id) => id.startsWith("whisper"));
+      } catch (e) {
+        const f = sdkErrorFacts(e);
+        return {
+          ok: false,
+          message: f.status ? classifyGroq(f.status, f.bodyText) : `Could not reach api.groq.com: ${String((e as Error).message)}`,
+          models: [],
+          job: f.status ? groqJobError(f.status, f.bodyText, !!(f.errType), classifyGroq(f.status, f.bodyText)) : { service: "groq", code: "GROQ_CONNECTION", message: String((e as Error).message), retryable: true },
+        };
       }
-      const j = (await res.json()) as { data?: { id?: string }[] };
-      const whisper = (j.data ?? [])
-        .map((m) => m.id ?? "")
-        .filter((id) => id.startsWith("whisper"));
       // Step 2 (v1.30) — a REAL transcription probe: POST the embedded
       // 1-second silent MP3 to /audio/transcriptions with the selected
       // whisper model (same endpoint + multipart contract as production
@@ -309,20 +317,22 @@ export async function testProviderKey(
         opts?.model?.trim() && GROQ_WHISPER_MODELS.some((m) => m.id === opts?.model?.trim())
           ? (opts?.model?.trim() as string)
           : WHISPER_DEFAULT;
-      const runProbe = async (modelId: string) => {
-        const probeForm = new FormData();
-        probeForm.append(
-          "file",
-          new Blob([Buffer.from(PROBE_MP3_B64, "base64")], { type: "audio/mpeg" }),
-          "probe.mp3",
-        );
-        probeForm.append("model", modelId);
-        probeForm.append("response_format", "json");
-        return fetchWithTimeout(GROQ_TRANSCRIBE_URL, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${trimmed}` },
-          body: probeForm,
-        });
+      const runProbe = async (
+        modelId: string,
+      ): Promise<{ ok: boolean; status: number; bodyText: string }> => {
+        try {
+          await client.audio.transcriptions.create({
+            file: new File([Buffer.from(PROBE_MP3_B64, "base64")], "probe.mp3", {
+              type: "audio/mpeg",
+            }),
+            model: modelId,
+            response_format: "json",
+          });
+          return { ok: true, status: 200, bodyText: "" };
+        } catch (e) {
+          const f = sdkErrorFacts(e);
+          return { ok: false, status: f.status, bodyText: f.bodyText };
+        }
       };
       // v1.32: a 404 on the probe first gets ONE silent retry with the OTHER
       // whisper model (Groq decommissions models — a stored selection can
@@ -333,19 +343,22 @@ export async function testProviderKey(
         const alt =
           probedModel === "whisper-large-v3" ? "whisper-large-v3-turbo" : "whisper-large-v3";
         const altRes = await runProbe(alt);
-        if (altRes.ok) {
-          probeRes = altRes;
-          probedModel = alt;
-        } else {
-          probeRes = altRes;
-        }
+        probeRes = altRes;
+        if (altRes.ok) probedModel = alt;
       }
       if (!probeRes.ok) {
-        const body = await probeRes.text().catch(() => "");
+        const classified = classifyGroq(probeRes.status, probeRes.bodyText);
+        let probeGenuine = false;
+        try {
+          probeGenuine = !!(JSON.parse(probeRes.bodyText) as { error?: { type?: string; code?: string } }).error?.type;
+        } catch {
+          probeGenuine = false;
+        }
         return {
           ok: false,
-          message: `The key authenticates, but a real transcription test failed: ${classifyGroq(probeRes.status, body)}`,
+          message: `The key authenticates, but a real transcription test failed: ${classified}`,
           models: whisper,
+          job: groqJobError(probeRes.status, probeRes.bodyText, probeGenuine, classified),
         };
       }
       return {

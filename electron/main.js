@@ -1022,6 +1022,14 @@ ipcMain.handle("whisper:transcribe", async (event, payload) => {
       if (msg.includes("cancelled")) throw err;
       whisperState.lastError = `groq: ${msg}`;
       whisperState.lastErrorAt = Date.now();
+      // v1.33 (user brief "Part 5"): the FULL underlying exception — with
+      // the structured job code (service/code/retryable) — goes to the
+      // application log; the renderer gets the actionable message.
+      // eslint-disable-next-line no-console
+      console.error(
+        `[audio-job] groq transcription failed: ${err && err.job ? `${err.job.code} (retryable=${err.job.retryable})` : "unclassified"} — ${msg}`,
+        err && err.stack ? `\n${err.stack}` : "",
+      );
       throw err;
     } finally {
       whisperRuns.delete(runId);
@@ -1331,6 +1339,18 @@ ipcMain.handle("tts:voices", async () => {
   return { voices: await ttsVoicesOnce(), pairs: TTS.voicePairsByLocale() };
 });
 
+/** v1.33 (user brief "Part 5"): structured audio-job logging — the FULL
+ *  underlying exception (stack + job code) goes to the application log;
+ *  the renderer keeps receiving the actionable message text. */
+function logAudioJob(action, err) {
+  const job = err && err.job;
+  // eslint-disable-next-line no-console
+  console.error(
+    `[audio-job] ${action} failed: ${job ? `${job.service}/${job.code} (retryable=${job.retryable})` : "unclassified"} — ${err && err.message ? err.message : err}`,
+    err && err.stack ? `\n${err.stack}` : "",
+  );
+}
+
 /** { voice, text?, style? } → { bytes: ArrayBuffer, bytesLen } — a SHORT
  *  sample, never written to disk. Text is trimmed to ≤300 chars; the
  *  caller passes a locale-appropriate sample for non-Latin voices. */
@@ -1354,6 +1374,9 @@ ipcMain.handle("tts:preview", async (_event, payload) => {
       bytes: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength),
       bytesLen: r.bytesLen,
     };
+  } catch (err) {
+    logAudioJob("tts:preview", err);
+    throw err;
   } finally {
     if (ttsPreviewAbortRef === abortRef) ttsPreviewAbortRef = null;
   }
@@ -1386,7 +1409,13 @@ ipcMain.handle("tts:synthesize", async (_event, payload) => {
     tempDir,
     `vo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp3`,
   );
-  const r = await TTS.synthesize({ text, voice, ratePct, pitchHz, volumePct, style, outFile: outPath });
+  let r;
+  try {
+    r = await TTS.synthesize({ text, voice, ratePct, pitchHz, volumePct, style, outFile: outPath });
+  } catch (err) {
+    logAudioJob("tts:synthesize", err);
+    throw err;
+  }
   let durationMs = 0;
   try {
     const info = await probeMediaAsync(outPath);
@@ -1448,26 +1477,32 @@ ipcMain.handle("tts:synthesize-long", async (event, payload) => {
   };
   try {
     const totalChars = text.length;
-    const r = await TTS.synthesizeLong({
-      text,
-      voice,
-      ratePct,
-      pitchHz,
-      volumePct,
-      style,
-      abortRef,
-      onProgress: (prog) => {
-        // Chunk-level heartbeat → the renderer's progress bar.
-        sendProgress({
-          phase: "synth",
-          status: "synthesizing",
-          chunkIndex: prog.chunkIndex,
-          chunkCount: prog.chunkCount,
-          charsDone: prog.charsDone,
-          totalChars,
-        });
-      },
-    });
+    let r;
+    try {
+      r = await TTS.synthesizeLong({
+        text,
+        voice,
+        ratePct,
+        pitchHz,
+        volumePct,
+        style,
+        abortRef,
+        onProgress: (prog) => {
+          // Chunk-level heartbeat → the renderer's progress bar.
+          sendProgress({
+            phase: "synth",
+            status: "synthesizing",
+            chunkIndex: prog.chunkIndex,
+            chunkCount: prog.chunkCount,
+            charsDone: prog.charsDone,
+            totalChars,
+          });
+        },
+      });
+    } catch (err) {
+      logAudioJob("tts:synthesize-long", err);
+      throw err;
+    }
     ensureTempDir();
     const outPath = path.join(tempDir, `ttslong_${Date.now()}.mp3`);
     try {

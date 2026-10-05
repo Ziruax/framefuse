@@ -15,6 +15,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import { zaiAsrFile, zaiChatText } from "./zai";
+import { groqClient, sdkErrorFacts, validateAudioFileServer } from "./groq-sdk-client";
 
 const execFileAsync = promisify(execFile);
 
@@ -46,6 +47,9 @@ export interface DubTranscriptResult {
 /** Error carrying an HTTP status for the route layer. */
 export class TranscribeFailure extends Error {
   status: number;
+  /** v1.33 structured job details (service/code/retryable) — surfaced in
+   *  the route's error JSON. */
+  job?: { service: string; code: string; message: string; retryable: boolean };
   constructor(message: string, status = 500) {
     super(message);
     this.status = status;
@@ -252,7 +256,6 @@ async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, i: number
 // v1.27 Groq Whisper engine (real word timestamps)
 // ---------------------------------------------------------------------------
 
-const GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions";
 const GROQ_MAX_BYTES = 24 * 1024 * 1024; // stay under the 25 MB request cap
 /** 16 kHz mono 16-bit WAV = 32 kB/s → 24 MB ≈ 12.4 min; use 10-min chunks. */
 const GROQ_CHUNK_SEC = 600;
@@ -286,26 +289,38 @@ interface GroqVerboseJson {
  *  calls, regenerating the key changes nothing); JSON WITH error.type = the
  *  genuine Groq API answered (401 = key refused, 403 = permission
  *  restriction). */
+/** v1.33: the official groq-sdk is the request engine (user brief) — same
+ *  endpoint, same multipart contract, same classified errors; the request
+ *  now also validates the audio file (magic bytes) BEFORE upload. */
 async function groqWhisper(
   wavPath: string,
   groqKey: string,
   model: string,
   language?: string,
 ): Promise<GroqVerboseJson> {
-  const form = new FormData();
-  form.append("file", new Blob([await fs.promises.readFile(wavPath)], { type: "audio/wav" }), "audio.wav");
-  form.append("model", model);
-  form.append("response_format", "verbose_json");
-  form.append("timestamp_granularities[]", "word");
-  form.append("timestamp_granularities[]", "segment");
-  if (language && language !== "auto") form.append("language", language);
-  const res = await fetch(GROQ_TRANSCRIBE_URL, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${groqKey}` },
-    body: form,
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
+  // Pre-upload validation (user brief Part 3): the chunk file must exist,
+  // be non-empty and sniff as REAL audio before any network work.
+  const vv = validateAudioFileServer(wavPath);
+  if (!vv.ok) {
+    throw new TranscribeFailure(vv.message ?? "The audio chunk failed validation", 400);
+  }
+  const client = groqClient(groqKey);
+  let res: { ok: boolean; status: number; body: string };
+  try {
+    const json = await client.audio.transcriptions.create({
+      file: fs.createReadStream(wavPath),
+      model,
+      response_format: "verbose_json",
+      timestamp_granularities: ["word", "segment"],
+      ...(language && language !== "auto" ? { language } : {}),
+    });
+    return json as GroqVerboseJson;
+  } catch (e) {
+    const f = sdkErrorFacts(e);
+    res = { ok: false, status: f.status, body: f.bodyText };
+  }
+  {
+    const body = res.body;
     let api = "";
     let errType = "";
     let isJson = false;
@@ -315,6 +330,12 @@ async function groqWhisper(
       errType = j.error?.type ?? j.error?.code ?? "";
       isJson = true;
     } catch { /* non-JSON body */ }
+    if (!res.status) {
+      throw new TranscribeFailure(
+        `Could not reach api.groq.com — a network-level failure (VPN/proxy/firewall or the provider is down)`,
+        502,
+      );
+    }
     const raw = api ? ` [${api}]` : "";
     const masked =
       groqKey.length <= 11
@@ -323,31 +344,41 @@ async function groqWhisper(
     if (res.status === 401 || res.status === 403) {
       // (1) non-JSON: never reached Groq.
       if (!isJson) {
-        throw new TranscribeFailure(
+        const t = new TranscribeFailure(
           `The request to api.groq.com was BLOCKED before reaching Groq (status ${res.status}, non-JSON response — VPN, proxy, firewall or TLS interception) — the key was never checked${raw}`,
           502,
         );
+        t.job = { service: "groq", code: "GROQ_BLOCKED_BEFORE_PROVIDER", message: t.message, retryable: false };
+        throw t;
       }
       // (2) bare JSON without error.type: the Cloudflare EDGE refused the
       // connection — the key was never checked, the console will show zero
       // requests. The action is a NETWORK change, not a key change.
       if (!errType) {
-        throw new TranscribeFailure(
+        const t = new TranscribeFailure(
           `Groq's network edge (Cloudflare) REFUSED the connection (${res.status} Forbidden) — the request never reached Groq's API, so the key was never checked and console.groq.com will show ZERO requests (expected, not a bug). Cloudflare blocks whole IP ranges when a neighbor on your ISP/VPN range trips abuse rules. Fix: switch networks (phone hotspot), toggle VPN/proxy on/off, or retry in ~15 minutes${raw}`,
           502,
         );
+        t.job = { service: "groq", code: "GROQ_EDGE_BLOCK", message: t.message, retryable: false };
+        throw t;
       }
       // (3) the genuine Groq API answered.
       if (res.status === 401) {
-        throw new TranscribeFailure(
+        const t = new TranscribeFailure(
           `Groq rejected the API key (${masked}) — re-save a valid key from console.groq.com → API Keys${raw}`,
           401,
         );
+        t.job = { service: "groq", code: "GROQ_KEY_REJECTED", message: t.message, retryable: false };
+        throw t;
       }
-      throw new TranscribeFailure(
-        `Groq refused access for this key (${masked}) — a permission restriction (suspended organization or a model not enabled for this key)${raw}`,
-        403,
-      );
+      {
+        const t = new TranscribeFailure(
+          `Groq refused access for this key (${masked}) — a permission restriction (suspended organization or a model not enabled for this key)${raw}`,
+          403,
+        );
+        t.job = { service: "groq", code: "GROQ_PERMISSION", message: t.message, retryable: false };
+        throw t;
+      }
     }
     // v1.32: the two 404 families. A GENUINE Groq 404 (JSON envelope with
     // error.type/code) = model availability → the caller retries with the
@@ -357,15 +388,21 @@ async function groqWhisper(
     // 404s" signature.
     if (res.status === 404) {
       if (isJson && errType) {
-        throw new TranscribeFailure(
+        const t = new TranscribeFailure(
           `Groq does not recognize the whisper model for this key${raw}`,
           404,
         );
+        t.job = { service: "groq", code: "GROQ_MODEL_NOT_FOUND", message: t.message, retryable: true };
+        throw t;
       }
-      throw new TranscribeFailure(
-        `The transcription endpoint answered 404 — but this did NOT come from Groq's API (no Groq error envelope): a proxy, VPN, or antivirus web-filter on this machine intercepted the upload. The key is fine and the model is current. Fix: disable HTTPS/TLS scanning in your antivirus, toggle the VPN/proxy, or use another network${raw}`,
-        502,
-      );
+      {
+        const t = new TranscribeFailure(
+          `The transcription endpoint answered 404 — but this did NOT come from Groq's API (no Groq error envelope): a proxy, VPN, or antivirus web-filter on this machine intercepted the upload. The key is fine and the model is current. Fix: disable HTTPS/TLS scanning in your antivirus, toggle the VPN/proxy, or use another network${raw}`,
+          502,
+        );
+        t.job = { service: "groq", code: "GROQ_INTERCEPTED_404", message: t.message, retryable: false };
+        throw t;
+      }
     }
     // 413 (too large), 429 (rate limit), 5xx…
     throw new TranscribeFailure(
@@ -373,7 +410,6 @@ async function groqWhisper(
       res.status === 429 ? 429 : 502,
     );
   }
-  return (await res.json()) as GroqVerboseJson;
 }
 
 /** Groq language name → the transcript's English display form. */
