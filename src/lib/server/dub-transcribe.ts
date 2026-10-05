@@ -278,12 +278,14 @@ interface GroqVerboseJson {
 }
 
 /** One Groq Whisper call → verbose JSON (segments + word timestamps).
- *  v1.30: Groq's auth failures are 403 {"error":{"message":"Forbidden"}}
- *  (JSON — live-verified) and NEVER appear in the user's Groq console
- *  request logs, so the error text must carry the masked key fingerprint
- *  + actionable guidance instead of a raw status dump. A NON-JSON 401/403
- *  is a network-level block (VPN/proxy/Cloudflare) — different diagnosis,
- *  the key was never checked. */
+ *  v1.31: THREE 401/403 families (research-verified — see the notes in
+ *  electron/groq-whisper.js classifyGroqError): non-JSON = intercepted
+ *  before Groq; bare JSON WITHOUT error.type (the 33-byte
+ *  {"error":{"message":"Forbidden"}}) = Groq's CLOUDFLARE EDGE refusing
+ *  the connection (IP-range block — key never checked, console shows zero
+ *  calls, regenerating the key changes nothing); JSON WITH error.type = the
+ *  genuine Groq API answered (401 = key refused, 403 = permission
+ *  restriction). */
 async function groqWhisper(
   wavPath: string,
   groqKey: string,
@@ -305,9 +307,12 @@ async function groqWhisper(
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     let api = "";
+    let errType = "";
     let isJson = false;
     try {
-      api = (JSON.parse(body) as { error?: { message?: string } }).error?.message ?? "";
+      const j = JSON.parse(body) as { error?: { message?: string; type?: string }; message?: string };
+      api = j.error?.message ?? j.message ?? "";
+      errType = j.error?.type ?? "";
       isJson = true;
     } catch { /* non-JSON body */ }
     const raw = api ? ` [${api}]` : "";
@@ -316,15 +321,32 @@ async function groqWhisper(
         ? `${groqKey.slice(0, 3)}…`
         : `${groqKey.slice(0, 7)}…${groqKey.slice(-4)}`;
     if (res.status === 401 || res.status === 403) {
+      // (1) non-JSON: never reached Groq.
       if (!isJson) {
         throw new TranscribeFailure(
-          `The request to api.groq.com was BLOCKED before reaching Groq (status ${res.status}, non-JSON response — VPN, proxy, firewall or Cloudflare) — the key was never checked${raw}`,
+          `The request to api.groq.com was BLOCKED before reaching Groq (status ${res.status}, non-JSON response — VPN, proxy, firewall or TLS interception) — the key was never checked${raw}`,
           502,
         );
       }
+      // (2) bare JSON without error.type: the Cloudflare EDGE refused the
+      // connection — the key was never checked, the console will show zero
+      // requests. The action is a NETWORK change, not a key change.
+      if (!errType) {
+        throw new TranscribeFailure(
+          `Groq's network edge (Cloudflare) REFUSED the connection (${res.status} Forbidden) — the request never reached Groq's API, so the key was never checked and console.groq.com will show ZERO requests (expected, not a bug). Cloudflare blocks whole IP ranges when a neighbor on your ISP/VPN range trips abuse rules. Fix: switch networks (phone hotspot), toggle VPN/proxy on/off, or retry in ~15 minutes${raw}`,
+          502,
+        );
+      }
+      // (3) the genuine Groq API answered.
+      if (res.status === 401) {
+        throw new TranscribeFailure(
+          `Groq rejected the API key (${masked}) — re-save a valid key from console.groq.com → API Keys${raw}`,
+          401,
+        );
+      }
       throw new TranscribeFailure(
-        `Groq rejected the API key (${masked}) — re-save a valid key from console.groq.com → API Keys${raw}`,
-        401,
+        `Groq refused access for this key (${masked}) — a permission restriction (suspended organization or a model not enabled for this key)${raw}`,
+        403,
       );
     }
     // 404 (model access), 413 (too large), 429 (rate limit), 5xx…

@@ -38,7 +38,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const https = require("https");
+const { createRequest } = require("./net-transport");
 
 const GEMINI_API_HOST = "generativelanguage.googleapis.com";
 const GENERATE_PATH_ROOT = "/v1beta/models/";
@@ -158,9 +158,13 @@ function geminiConfigPayload(userDataDir) {
 // ---------------------------------------------------------------------------
 
 /** Classify a Gemini API failure into an actionable message.
- *  v1.29: `maskedKey` ("AIza…k9xY2") is appended to the 401/403 text so
- *  the user can see WHICH stored key was rejected (auth-rejected requests
- *  never show up in usage metrics). */
+ *  v1.29: `maskedKey` ("AIza…k9xY2") appended to key-shaped failures.
+ *  v1.31: (a) "User location is not supported" (the well-known Gemini
+ *  geo-restriction — Google answers 400 with that message) gets its own
+ *  actionable text: VPN or a different provider; (b) 403 splits into a
+ *  genuine Google JSON answer (key restriction) vs a non-JSON network
+ *  interception (mirrors the Groq research — the request never reached
+ *  Google, the key was never checked). */
 function classifyGeminiError(status, bodyText, maskedKey) {
   let apiMessage = "";
   let bodyIsJson = false;
@@ -179,10 +183,15 @@ function classifyGeminiError(status, bodyText, maskedKey) {
       if (/api[ _-]?key/i.test(apiMessage) && /(not valid|invalid)/i.test(apiMessage)) {
         return `Gemini rejected the API key${keyPart} — re-save the key in Settings → Default AI models (aistudio.google.com/apikey)${raw}`;
       }
+      // v1.31: Gemini's geo-restriction — Google refuses API use from
+      // unsupported regions with exactly this message.
+      if (/location is not supported/i.test(apiMessage)) {
+        return `Google does not offer the Gemini API in your region — connect through a VPN (any supported country) or switch the script provider to Groq${raw}`;
+      }
       return `Gemini rejected the request (invalid request — check the prompt and parameters)${raw}`;
     case 401:
     case 403:
-      // v1.30: a non-JSON 401/403 (HTML/plain) is a network-level block —
+      // A non-JSON 401/403 (HTML/plain) is a network-level block —
       // the request never reached Google; the key was never checked.
       if (!bodyIsJson) {
         return `The request to Google was BLOCKED before reaching the Gemini API (status ${status}, non-JSON response — VPN, proxy or firewall) — the key was never checked${raw}`;
@@ -235,7 +244,7 @@ function geminiRequestOnce(o) {
     const body = Buffer.from(JSON.stringify(payload), "utf8");
 
     let timer = null;
-    const req = https.request(
+    const req = createRequest(
       {
         host: GEMINI_API_HOST,
         path: `${GENERATE_PATH_ROOT}${encodeURIComponent(modelId)}:generateContent`,
@@ -243,7 +252,7 @@ function geminiRequestOnce(o) {
         headers: {
           "x-goog-api-key": apiKey,
           "Content-Type": "application/json",
-          "Content-Length": body.length,
+          "Content-Length": String(body.length),
         },
       },
       (res) => {
@@ -500,7 +509,7 @@ function geminiTestKey(input) {
       });
       return;
     }
-    const req = https.request(
+    const req = createRequest(
       {
         host: GEMINI_API_HOST,
         path: MODELS_PATH,

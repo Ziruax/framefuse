@@ -65,14 +65,16 @@ export interface AiModelOption {
   hint: string;
 }
 
-/** Groq chat models (script writing — free tier friendly). */
+/** Groq chat models (script writing — free tier friendly).
+ *  v1.31: refreshed against console.groq.com/docs/models — gemma2-9b-it
+ *  and qwen/qwen3-32b are DECOMMISSIONED (404 on call); qwen3.8-27b is
+ *  the current multilingual model. */
 export const GROQ_TEXT_MODELS: AiModelOption[] = [
   { id: "llama-3.3-70b-versatile", label: "Llama 3.3 70B", hint: "Groq default — best quality" },
   { id: "llama-3.1-8b-instant", label: "Llama 3.1 8B", hint: "Instant — very fast" },
   { id: "openai/gpt-oss-120b", label: "GPT-OSS 120B", hint: "OpenAI open-weight 120B" },
   { id: "openai/gpt-oss-20b", label: "GPT-OSS 20B", hint: "OpenAI open-weight 20B" },
-  { id: "qwen/qwen3-32b", label: "Qwen 3 32B", hint: "Strong multilingual" },
-  { id: "gemma2-9b-it", label: "Gemma 2 9B", hint: "Light multilingual" },
+  { id: "qwen/qwen3.8-27b", label: "Qwen 3.8 27B", hint: "Strong multilingual" },
 ];
 
 /** Google Gemini text models (script writing — generous free tier). */

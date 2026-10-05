@@ -39,9 +39,9 @@
 
 const fs = require("fs");
 const path = require("path");
-const https = require("https");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
+const { createRequest, transportName } = require("./net-transport");
 
 const GROQ_API_HOST = "api.groq.com";
 const TRANSCRIBE_PATH = "/openai/v1/audio/transcriptions";
@@ -254,49 +254,66 @@ async function extractAudioForGroq(ffmpegPath, inputPath, outDir, onStage) {
 }
 
 // ---------------------------------------------------------------------------
-// HTTPS plumbing (raw https.request — upload progress + no deps).
+// HTTP plumbing (net-transport: Chromium network stack inside Electron —
+// browser TLS fingerprint + system proxy — https.request in plain Node).
 // ---------------------------------------------------------------------------
 
 /** Classify a Groq API failure into an actionable message.
- *  v1.29: `maskedKey` ("gsk_AbC…9xY2") is appended to the 401/403 text so
- *  the user can SEE which stored key was rejected. Auth-rejected requests
- *  do NOT appear in console.groq.com usage, so without the fingerprint the
- *  "my key is accurate and no API call was made" confusion is unresolvable
- *  (the v1.28 Test button could pass on a localStorage key while
- *  transcription sent a DIFFERENT device key).
- *  v1.30: a 401/403 whose body is NOT Groq's JSON error envelope is a
- *  network-level block (Cloudflare HTML challenge, VPN, corporate proxy,
- *  TLS interception) — the request never REACHED Groq, so the key was never
- *  checked. Live-verified: Groq's own auth rejection is always JSON
- *  (403 {"error":{"message":"Forbidden"}}) — an HTML/plain 403 is someone
- *  else's. Classifying those as "rejected key" is exactly what sent the
- *  user to a console that CAN'T show the failure. */
+ *  v1.29: `maskedKey` ("gsk_AbC…9xY2") appended to 401/403 text so the user
+ *  can SEE which stored key was rejected.
+ *  v1.30: non-JSON 401/403 = network-level block.
+ *  v1.31 (THE REAL ROOT-CAUSE FIX): three DISTINCT 401/403 families —
+ *  (1) non-JSON body: intercepted before Groq (VPN/proxy/TLS-interception);
+ *  (2) JSON WITHOUT the documented error.type envelope — the bare
+ *      {"error":{"message":"Forbidden"}} (33 bytes) — is Groq's CLOUDFLARE
+ *      EDGE refusing the CONNECTION, not the Groq API answering. LIVE-VERIFIED
+ *      from this codebase: that exact body returns for EVERY path, method and
+ *      key shape — including requests with NO Authorization header and
+ *      nonexistent paths — i.e. an IP-range-level block, while the Groq API's
+ *      own errors always carry {message, type} per console.groq.com/docs/
+ *      errors. Edge-blocked requests never reach the API, never show in
+ *      console.groq.com request logs (the user's "zero API calls" mystery),
+ *      and the key was NEVER checked — regenerating it changes nothing.
+ *      This is what both previous "Groq rejected the API key" mislabels
+ *      actually were on the failing machines.
+ *  (3) JSON WITH error.type: the genuine Groq API answered — 401 = key
+ *      refused, 403 = permission restriction (suspended org / restricted
+ *      model).
+ */
 function classifyGroqError(status, bodyText, maskedKey) {
   let apiMessage = "";
+  let errType = "";
   let bodyIsJson = false;
   try {
     const j = JSON.parse(bodyText);
-    apiMessage = j?.error?.message || j?.message || "";
+    const e = j && typeof j.error === "object" && j.error ? j.error : null;
+    apiMessage = (e && typeof e.message === "string" && e.message) ||
+      (j && typeof j.message === "string" ? j.message : "") || "";
+    errType = (e && typeof e.type === "string" && e.type) || "";
     bodyIsJson = true;
   } catch (_) { /* non-JSON body */ }
   const raw = apiMessage ? ` [${apiMessage}]` : "";
   const keyPart = maskedKey ? ` (${maskedKey})` : "";
   switch (status) {
     case 401:
-    case 403:
-      // NON-JSON body (HTML challenge page / plain text): blocked in front
-      // of Groq. Groq never saw the request — console.groq.com correctly
-      // shows nothing, and the key is NOT the problem.
+    case 403: {
+      // (1) non-JSON: never reached Groq.
       if (!bodyIsJson) {
-        return `The request to api.groq.com was BLOCKED before reaching Groq (status ${status}, non-JSON response — VPN, proxy, firewall or Cloudflare) — the key was never checked${raw}`;
+        return `The request to api.groq.com was BLOCKED before reaching Groq (status ${status}, non-JSON response — VPN, proxy, firewall or TLS interception) — the key was never checked${raw}`;
       }
-      // Groq returns 403 (not 401) for invalid/revoked keys — live-verified
-      // v1.29 against api.groq.com: a bogus Bearer gets
-      // 403 {"error":{"message":"Forbidden"}}. The docs' 401 is the
-      // "missing credentials" twin; both mean the key was refused.
-      // (Rejected requests never appear in console.groq.com request logs —
-      // an empty log there neither confirms nor denies this failure.)
-      return `Groq rejected the API key${keyPart} — re-save the key in Settings → Default AI models (console.groq.com → API Keys)${raw}`;
+      // (2) bare JSON without error.type: the Cloudflare EDGE refused the
+      // connection. The key was never checked; the console will (correctly)
+      // show zero requests. THIS is the failure family behind "my key is
+      // accurate but Groq rejects it, and no API call appears in the console".
+      if (!errType) {
+        return `Groq's network edge (Cloudflare) REFUSED the connection (${status} Forbidden) — the request never reached Groq's API, so the key was never checked and console.groq.com will show ZERO requests (that is expected, not a bug). Cloudflare blocks whole IP ranges when any neighbor on your ISP/VPN range trips abuse rules, and Groq cannot whitelist individual IPs. Fix, in order: (1) switch networks (try a phone hotspot), (2) toggle your VPN/proxy on or off, (3) retry after ~15 minutes. Your key itself is almost certainly fine${raw}`;
+      }
+      // (3) the genuine Groq API answered.
+      if (status === 401) {
+        return `Groq rejected the API key${keyPart} — re-save the key in Settings → Default AI models (console.groq.com → API Keys)${raw}`;
+      }
+      return `Groq refused access for this key${keyPart} — a permission restriction (suspended organization or a model not enabled for this key; check console.groq.com)${raw}`;
+    }
     case 404:
       return `Groq model not found — whisper-large-v3 access may not be enabled for this key${raw}`;
     case 413:
@@ -308,6 +325,23 @@ function classifyGroqError(status, bodyText, maskedKey) {
         return `Groq server error (${status}) — usually transient, try again${raw}`;
       }
       return `Groq request failed (HTTP ${status})${raw}`;
+  }
+}
+
+/** Parse Groq's JSON error envelope (message + type + code) — shared with
+ *  the retry layer so it can detect edge-block vs genuine API errors. */
+function parseGroqErrorBody(bodyText) {
+  try {
+    const j = JSON.parse(bodyText);
+    const e = j && typeof j.error === "object" && j.error ? j.error : null;
+    return {
+      isJson: true,
+      message: (e && typeof e.message === "string" && e.message) || "",
+      type: (e && typeof e.type === "string" && e.type) || "",
+      code: (e && typeof e.code === "string" && e.code) || "",
+    };
+  } catch (_) {
+    return { isJson: false, message: "", type: "", code: "" };
   }
 }
 
@@ -435,7 +469,7 @@ function groqTranscribeOnce(o, modelId, wantWordTimestamps, language) {
     ]);
     const totalBytes = head.length + fileBytes + Buffer.byteLength(closing);
 
-    const req = https.request(
+    const req = createRequest(
       {
         host: GROQ_API_HOST,
         path: TRANSCRIBE_PATH,
@@ -443,7 +477,9 @@ function groqTranscribeOnce(o, modelId, wantWordTimestamps, language) {
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": `multipart/form-data; boundary=${boundary}`,
-          "Content-Length": totalBytes,
+          // Node transport: exact framing. Electron transport: Chromium owns
+          // this header (it is skipped there — chunked upload, valid HTTP).
+          "Content-Length": String(totalBytes),
         },
       },
       (res) => {
@@ -579,7 +615,19 @@ function groqTranscribeOnce(o, modelId, wantWordTimestamps, language) {
         sendProgress(uploaded);
       });
       if (!ok) {
-        req.once("drain", writeNext);
+        // Backpressure: resume on drain. The 400 ms fallback timer covers
+        // transports whose write() returns false but 'drain' is late/absent
+        // (Chromium's net stack has its own buffering) — without it a
+        // missing drain would stall the upload forever.
+        let resumed = false;
+        const go = () => {
+          if (resumed) return;
+          resumed = true;
+          clearTimeout(fallback);
+          writeNext();
+        };
+        req.once("drain", go);
+        const fallback = setTimeout(go, 400);
       } else {
         writeNext();
       }
@@ -645,7 +693,7 @@ function groqTranscribeProbe(apiKey, modelId) {
   return new Promise((resolve) => {
     const model = normalizeGroqModel(modelId);
     const { boundary, body } = buildProbeBody(model);
-    const req = https.request(
+    const req = createRequest(
       {
         host: GROQ_API_HOST,
         path: TRANSCRIBE_PATH,
@@ -653,7 +701,7 @@ function groqTranscribeProbe(apiKey, modelId) {
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": `multipart/form-data; boundary=${boundary}`,
-          "Content-Length": body.length,
+          "Content-Length": String(body.length),
         },
       },
       (res) => {
@@ -690,7 +738,7 @@ function groqTranscribeProbe(apiKey, modelId) {
 function groqTestKey(apiKey, opts) {
   const model = normalizeGroqModel(opts && opts.model);
   return new Promise((resolve) => {
-    const req = https.request(
+    const req = createRequest(
       {
         host: GROQ_API_HOST,
         path: MODELS_PATH,
@@ -766,6 +814,8 @@ module.exports = {
   encodeCompactAudio,
   extractAudioForGroq,
   classifyGroqError,
+  parseGroqErrorBody,
+  transportName,
   groqTranscribe,
   groqTestKey,
   groqTranscribeProbe,

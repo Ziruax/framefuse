@@ -35,8 +35,8 @@
 
 "use strict";
 
-const https = require("https");
-const { GROQ_API_HOST, maskApiKey } = require("./groq-whisper");
+const { createRequest } = require("./net-transport");
+const { GROQ_API_HOST, maskApiKey, transportName } = require("./groq-whisper");
 
 const CHAT_PATH = "/openai/v1/chat/completions";
 const MODELS_PATH = "/openai/v1/models";
@@ -49,7 +49,11 @@ const BACKOFF_DELAYS_MS = [1500, 4000];
 
 const CANCEL_MSG = "Chat request cancelled";
 
-/** The free-tier-friendly chat models, in UI order. */
+/** The free-tier-friendly chat models, in UI order.
+ *  v1.31: REFRESHED against console.groq.com/docs/models — gemma2-9b-it
+ *  and qwen/qwen3-32b are DECOMMISSIONED (they 404 on call: Groq's list is
+ *  live-checked at https://api.groq.com/openai/v1/models). qwen/qwen3.8-27b
+ *  is the current multilingual workhorse ($0.80/$4.00 per 1M tokens). */
 const GROQ_TEXT_MODELS = [
   {
     id: "llama-3.3-70b-versatile",
@@ -72,14 +76,9 @@ const GROQ_TEXT_MODELS = [
     hint: "Lighter open-weight",
   },
   {
-    id: "qwen/qwen3-32b",
-    label: "Qwen 3 32B",
+    id: "qwen/qwen3.8-27b",
+    label: "Qwen 3.8 27B",
     hint: "Strong multilingual",
-  },
-  {
-    id: "gemma2-9b-it",
-    label: "Gemma 2 9B",
-    hint: "Compact Google model",
   },
 ];
 const DEFAULT_TEXT_MODEL = "llama-3.3-70b-versatile";
@@ -94,18 +93,25 @@ function normalizeTextModel(id) {
 // ---------------------------------------------------------------------------
 
 /** Classify a Groq chat-completion failure into an actionable message.
- *  v1.29: `maskedKey` ("gsk_AbC…9xY2") is appended to the 401/403 text so
- *  the user can see WHICH stored key was rejected (auth-rejected requests
- *  never show up in console.groq.com usage).
- *  v1.30: a 401/403 with a NON-JSON body is a network-level block
- *  (VPN/proxy/Cloudflare) — the request never reached Groq, so the key was
- *  never checked (live-verified: Groq's own auth failures are always JSON). */
+ *  v1.29: `maskedKey` ("gsk_AbC…9xY2") appended to the 401/403 text.
+ *  v1.30: non-JSON 401/403 = network-level block.
+ *  v1.31: THREE families (mirrors groq-whisper's classifyGroqError — see
+ *  the research notes there): non-JSON = intercepted before Groq; bare
+ *  JSON WITHOUT error.type (the 33-byte {"error":{"message":"Forbidden"}})
+ *  = Groq's CLOUDFLARE EDGE refused the connection (IP-range block — key
+ *  never checked, console shows zero calls, regenerating the key changes
+ *  nothing); JSON WITH error.type = the genuine Groq API answered
+ *  (401 = key refused, 403 = permission restriction). */
 function classifyChatError(status, bodyText, maskedKey) {
   let apiMessage = "";
+  let errType = "";
   let bodyIsJson = false;
   try {
     const j = JSON.parse(bodyText);
-    apiMessage = j?.error?.message || j?.message || "";
+    const e = j && typeof j.error === "object" && j.error ? j.error : null;
+    apiMessage = (e && typeof e.message === "string" && e.message) ||
+      (j && typeof j.message === "string" ? j.message : "") || "";
+    errType = (e && typeof e.type === "string" && e.type) || "";
     bodyIsJson = true;
   } catch (_) { /* non-JSON body */ }
   const raw = apiMessage ? ` [${apiMessage}]` : "";
@@ -114,11 +120,17 @@ function classifyChatError(status, bodyText, maskedKey) {
     case 401:
     case 403:
       if (!bodyIsJson) {
-        return `The request to api.groq.com was BLOCKED before reaching Groq (status ${status}, non-JSON response — VPN, proxy, firewall or Cloudflare) — the key was never checked${raw}`;
+        return `The request to api.groq.com was BLOCKED before reaching Groq (status ${status}, non-JSON response — VPN, proxy, firewall or TLS interception) — the key was never checked${raw}`;
       }
-      return `Groq rejected the API key${keyPart} — re-save the key in Settings → Default AI models (console.groq.com → API Keys)${raw}`;
+      if (!errType) {
+        return `Groq's network edge (Cloudflare) REFUSED the connection (${status} Forbidden) — the request never reached Groq's API, so the key was never checked and console.groq.com will show ZERO requests (expected, not a bug). Cloudflare blocks whole IP ranges when a neighbor on your ISP/VPN range trips abuse rules; Groq cannot whitelist IPs. Fix: switch networks (phone hotspot), toggle VPN/proxy on/off, or retry in ~15 minutes. Chat AND transcription share this route, so both fail together${raw}`;
+      }
+      if (status === 401) {
+        return `Groq rejected the API key${keyPart} — re-save the key in Settings → Default AI models (console.groq.com → API Keys)${raw}`;
+      }
+      return `Groq refused access for this key${keyPart} — a permission restriction (suspended organization or a model not enabled for this key)${raw}`;
     case 404:
-      return `Groq model not found — this chat model may not be enabled for your key${raw}`;
+      return `Groq model not found — this chat model may not be enabled for your key (decommissioned models 404)${raw}`;
     case 400:
       return `Groq rejected the chat request (bad parameters or unsupported option)${raw}`;
     case 429:
@@ -253,7 +265,7 @@ function chatRequestOnce(o) {
     const body = Buffer.from(JSON.stringify(payload), "utf8");
 
     let timer = null;
-    const req = https.request(
+    const req = createRequest(
       {
         host: GROQ_API_HOST,
         path: CHAT_PATH,
@@ -261,7 +273,7 @@ function chatRequestOnce(o) {
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
-          "Content-Length": body.length,
+          "Content-Length": String(body.length),
         },
       },
       (res) => {
@@ -386,17 +398,33 @@ async function groqChat(o) {
   });
 
   let attempt = 0;
+  let activeModelId = modelId;
+  let modelSwapped = false;
   for (;;) {
     if (ctl.aborted) throw makeChatError(CANCEL_MSG);
     let result;
     try {
       result = await chatRequestOnce({
-        apiKey, modelId, messages, temperature, maxTokens, jsonMode, timeoutMs, ctl,
+        apiKey, modelId: activeModelId, messages, temperature, maxTokens, jsonMode, timeoutMs, ctl,
       });
     } catch (err) {
       const msg = err && err.message ? err.message : String(err);
       if (ctl.aborted || msg === CANCEL_MSG) throw makeChatError(CANCEL_MSG);
-      if (!err.retryable || attempt >= retries) throw err;
+      // v1.31: a 404 means the model id is gone (Groq decommissions models
+      // — e.g. gemma2-9b-it / qwen3-32b in 2026) or not enabled for this
+      // key. One silent retry on the DEFAULT model keeps the dub/script
+      // workflow alive instead of dying on a stored stale preference.
+      if (err.status === 404 && !modelSwapped && activeModelId !== DEFAULT_TEXT_MODEL) {
+        modelSwapped = true;
+        activeModelId = DEFAULT_TEXT_MODEL;
+        continue;
+      }
+      if (!err.retryable || attempt >= retries) {
+        if (modelSwapped) {
+          err.message = `${err.message} (already retried on ${DEFAULT_TEXT_MODEL} after ${modelId} was not found)`;
+        }
+        throw err;
+      }
       const delayMs = attempt < BACKOFF_DELAYS_MS.length
         ? BACKOFF_DELAYS_MS[attempt]
         : Math.min(16000, BACKOFF_DELAYS_MS[BACKOFF_DELAYS_MS.length - 1] * Math.pow(2, attempt - BACKOFF_DELAYS_MS.length + 1));
@@ -410,7 +438,7 @@ async function groqChat(o) {
     }
     let content = result.content;
     if (jsonMode && typeof content === "string") content = stripCodeFences(content);
-    return { content, finishReason: result.finishReason, usage: result.usage };
+    return { content, finishReason: result.finishReason, usage: result.usage, modelUsed: activeModelId };
   }
 }
 
@@ -428,7 +456,7 @@ function groqListTextModels(apiKey) {
       resolve([]);
       return;
     }
-    const req = https.request(
+    const req = createRequest(
       {
         host: GROQ_API_HOST,
         path: MODELS_PATH,

@@ -34,8 +34,7 @@ export const GROQ_TEXT_MODELS: ServerModelOption[] = [
   { id: "llama-3.1-8b-instant", label: "Llama 3.1 8B", hint: "Instant — very fast" },
   { id: "openai/gpt-oss-120b", label: "GPT-OSS 120B", hint: "OpenAI open-weight 120B" },
   { id: "openai/gpt-oss-20b", label: "GPT-OSS 20B", hint: "OpenAI open-weight 20B" },
-  { id: "qwen/qwen3-32b", label: "Qwen 3 32B", hint: "Strong multilingual" },
-  { id: "gemma2-9b-it", label: "Gemma 2 9B", hint: "Light multilingual" },
+  { id: "qwen/qwen3.8-27b", label: "Qwen 3.8 27B", hint: "Strong multilingual" },
 ];
 
 export const GEMINI_TEXT_MODELS: ServerModelOption[] = [
@@ -227,32 +226,49 @@ export async function testProviderKey(
   // auth-rejected request never shows up in the provider's usage console).
   const maskKey = (k: string, head: number) =>
     k.length <= head + 4 ? `${k.slice(0, 3)}…` : `${k.slice(0, head)}…${k.slice(-4)}`;
-  /** v1.30: parse the error message out of a provider body, and note
-   *  whether the body is the provider's JSON envelope at all. Groq's own
-   *  auth failures are ALWAYS JSON (403 {"error":{"message":"Forbidden"}}) —
-   *  a non-JSON 401/403 is a network-level block (VPN/proxy/Cloudflare)
-   *  that never reached the provider. */
-  const parseApiError = (body: string): { api: string; isJson: boolean } => {
+  /** v1.31: parse the error message out of a provider body, note whether
+   *  the body is the provider's JSON envelope at all, and capture the
+   *  documented error.type field. Groq's own API errors ALWAYS carry
+   *  {message, type} (console.groq.com/docs/errors). A JSON 401/403 WITHOUT
+   *  type — the bare {"error":{"message":"Forbidden"}} — is Groq's
+   *  Cloudflare EDGE refusing the connection (IP-range block): the key was
+   *  never checked and the console will show zero requests. A non-JSON
+   *  401/403 is a network-level block that never reached the provider. */
+  const parseApiError = (body: string): { api: string; errType: string; isJson: boolean } => {
     try {
+      const j = JSON.parse(body) as { error?: { message?: string; type?: string }; message?: string };
       return {
-        api: (JSON.parse(body) as { error?: { message?: string } }).error?.message ?? "",
+        api: j.error?.message ?? j.message ?? "",
+        errType: j.error?.type ?? "",
         isJson: true,
       };
     } catch {
-      return { api: "", isJson: false };
+      return { api: "", errType: "", isJson: false };
     }
   };
   const classifyGroq = (status: number, body: string) => {
-    const { api, isJson } = parseApiError(body);
+    const { api, errType, isJson } = parseApiError(body);
     const raw = api ? ` [${api}]` : "";
     if (status === 401 || status === 403) {
-      // Non-JSON (HTML challenge / plain text): the request was blocked
-      // BEFORE Groq — the key was never checked, and Groq's console will
-      // rightly show nothing. Never call this a key problem.
+      // (1) Non-JSON (HTML challenge / plain text): the request was blocked
+      // BEFORE Groq — the key was never checked.
       if (!isJson) {
-        return `The request to api.groq.com was BLOCKED before reaching Groq (status ${status}, non-JSON response — VPN, proxy, firewall or Cloudflare) — the key was never checked${raw}`;
+        return `The request to api.groq.com was BLOCKED before reaching Groq (status ${status}, non-JSON response — VPN, proxy, firewall or TLS interception) — the key was never checked${raw}`;
       }
-      return `Groq rejected the API key (${maskKey(trimmed, 7)}) — re-save a valid key from console.groq.com → API Keys${raw}`;
+      // (2) v1.31: JSON WITHOUT error.type — the bare
+      // {"error":{"message":"Forbidden"}} — is Groq's CLOUDFLARE EDGE
+      // refusing the connection (IP-range block), NOT the Groq API. The key
+      // was never checked; console.groq.com will show ZERO requests. This is
+      // the true root cause behind "my key is accurate but Groq rejects it,
+      // and no API call appears in the console".
+      if (!errType) {
+        return `Groq's network edge (Cloudflare) REFUSED the connection (${status} Forbidden) — the request never reached Groq's API, so the key was never checked and console.groq.com will show ZERO requests (expected, not a bug). Cloudflare blocks whole IP ranges when a neighbor on your ISP/VPN range trips abuse rules. Fix: switch networks (phone hotspot), toggle VPN/proxy on/off, or retry in ~15 minutes${raw}`;
+      }
+      // (3) JSON WITH error.type — the genuine Groq API answered.
+      if (status === 401) {
+        return `Groq rejected the API key (${maskKey(trimmed, 7)}) — re-save a valid key from console.groq.com → API Keys${raw}`;
+      }
+      return `Groq refused access for this key (${maskKey(trimmed, 7)}) — a permission restriction (suspended org or restricted model)${raw}`;
     }
     if (status === 404) return `Groq model not found — this model may not be enabled for your key${raw}`;
     if (status === 429) return `Groq rate limit reached — wait a moment and test again${raw}`;
@@ -318,6 +334,14 @@ export async function testProviderKey(
       // 401/403 for restricted ones) — route all key-shaped failures to
       // the same actionable text.
       const { api, isJson } = parseApiError(body);
+      // v1.31: Gemini's geo-restriction gets its own actionable text.
+      if (/location is not supported/i.test(api)) {
+        return {
+          ok: false,
+          message: `Google does not offer the Gemini API in your region — connect through a VPN (any supported country) or switch the provider to Groq${api ? ` [${api}]` : ""}`,
+          models: [],
+        };
+      }
       const keyish =
         res.status === 401 ||
         res.status === 403 ||
