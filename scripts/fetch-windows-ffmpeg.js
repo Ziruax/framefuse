@@ -105,11 +105,21 @@ function downloadTo(url, destPath) {
     // housekeeping prunes generated dirs) — a missing dir must reject cleanly,
     // never crash the process with an uncaught stream exception.
     try { fs.mkdirSync(path.dirname(destPath), { recursive: true }); } catch {}
+    // Build-machine guard: a source that trickles (observed: gyan.dev direct
+    // at ~55 KB/s) must not pin the phase while two fast CDN fallbacks wait.
+    // Env-gated so release behavior is unchanged unless opted in.
+    const timeoutMs = Number(process.env.FFMPEG_DOWNLOAD_TIMEOUT_MS) || 0;
     const file = fs.createWriteStream(destPath);
     file.on("error", reject);
     let total = 0;
-    const get = (u, redirectsLeft = 8) =>
-      https
+    const timer = timeoutMs
+      ? setTimeout(() => {
+          try { req.destroy(new Error(`download exceeded ${Math.round(timeoutMs / 1000)}s (FFMPEG_DOWNLOAD_TIMEOUT_MS) — trying the next source`)); } catch {}
+        }, timeoutMs)
+      : null;
+    let req = null;
+    const get = (u, redirectsLeft = 8) => {
+      req = https
         .get(u, (res) => {
           if (
             res.statusCode >= 300 &&
@@ -133,15 +143,18 @@ function downloadTo(url, destPath) {
           total = Number(res.headers["content-length"]) || 0;
           res.pipe(file);
           file.on("finish", () => {
+            if (timer) clearTimeout(timer);
             file.close(() => {
               try { resolve(fs.statSync(destPath).size); } catch (err) { reject(err); }
             });
           });
         })
         .on("error", (err) => {
+          if (timer) clearTimeout(timer);
           try { file.destroy(); } catch {}
           reject(err);
         });
+    };
     get(url);
   });
 }
