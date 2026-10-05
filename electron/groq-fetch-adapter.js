@@ -190,14 +190,28 @@ function makeGroqFetch(transportMode, opts) {
  */
 const clientCache = new Map();
 
+/** v1.33 VENDOR LOADER: the packaged app packs ZERO node_modules (build
+ *  config `!node_modules`) — the SDK ships as a self-contained bundle at
+ *  electron/vendor/groq-sdk.cjs (scripts/bundle-vendor-libs.js). The dev
+ *  layout prefers the real package; MODULE_NOT_FOUND falls to the vendor.
+ *  Bundling order matters: vendor last so dev always exercises the fresh
+ *  package while the ASAR gets the deterministic bundle. */
+function loadGroqSdk() {
+  try {
+    const m = require("groq-sdk");
+    return (m && m.default) || m;
+  } catch (_) {
+    return require("./vendor/groq-sdk.cjs");
+  }
+}
+
 /** @returns {import("groq-sdk").default} */
 function sdkClient(apiKey, transportMode, opts) {
   const mode = transportMode === "node" ? "node" : "auto";
   const cacheKey = `${apiKey}|${mode}`;
   let entry = clientCache.get(cacheKey);
   if (entry) return entry;
-  // Lazy require keeps plain-Node smoke tests free of the SDK if unused.
-  const Groq = require("groq-sdk").default || require("groq-sdk");
+  const Groq = loadGroqSdk();
   const client = new Groq({
     apiKey,
     maxRetries: 0, // the app owns retry policy (classification-aware)

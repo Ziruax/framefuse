@@ -426,8 +426,14 @@ async function openProxiedTls(host, alpnProtocols) {
 /** The package, loaded lazily so this module stays requireable even if
  *  node_modules is partially staged (smoke tests, packaging edge cases). */
 function loadTtsPackage() {
+  // v1.33 VENDOR LOADER: dev layout prefers the real package; the packaged
+  // app (zero node_modules by build config) loads the self-contained bundle
+  // at electron/vendor/edge-tts-universal.cjs (scripts/bundle-vendor-libs.js).
   try {
     return require("edge-tts-universal");
+  } catch (_) { /* fall through to the vendor bundle */ }
+  try {
+    return require("./vendor/edge-tts-universal.cjs");
   } catch (err) {
     const e = new Error(
       `The edge-tts-universal package is not available (${err.message}) — ` +
