@@ -2609,3 +2609,25 @@ Stage Summary:
 - v1.27.0 SHIPPED: https://github.com/Ziruax/framefuse/releases/tag/v1.27.0 (release id 403404589, published, 3 assets uploaded) — the first release since v1.23.0.
 - DURABLE BUILD FIX: electron static exports must route through scripts/build-next-electron.js while src/app/api exists (API routes are web-preview-only; the packaged app talks IPC).
 - OPERATIONAL: z-ai-web-dev-sdk node_modules copy must be re-made after any node_modules regeneration (cp -rL ~/.bun/install/global/node_modules/z-ai-web-dev-sdk node_modules/).
+
+---
+Task ID: 14 (v1.27.1 hotfix — launch crash)
+Agent: main (Z.ai Code)
+Task: User: installed v1.27.0 crashes at launch — "SyntaxError: Identifier 'hasMusic' has already been declared" at electron/export-graph.js:2042 (Uncaught Exception in the main process)
+
+Work Log:
+- ROOT CAUSE: buildConcatArgs (electron/export-graph.js) had TWO `const hasMusic` declarations in the SAME function scope — line 2008 (`!!o.audioPath`, the v5.2 original) and line 2042 (`!!o.audioPath || hasMusicClips`, the v1.25 multi-music upgrade meant to REPLACE it). V8 rejects redeclarations at parse time → main.js line 28's require() of export-graph.js killed the whole main process at launch. Introduced in commit db1f54f (v1.25.0).
+- WHY EVERY GATE MISSED IT: eslint.config.mjs ignores `electron/**`; tsc has ignoreBuildErrors + the electron folder is plain JS; `next build` never parses electron/ (copied into the ASAR verbatim); the web dev preview never loads electron/*.js. The installed app's first launch was the FIRST time V8 parsed the file.
+- FIX: removed the stale line-2008 declaration (nothing used hasMusic between 2008 and 2041; every downstream usage assumes the broader v1.25 definition — loopMusic/else-if/musicCount are hasMusicClips-guarded, the amix gate at 2074 needs the OR, buildAudioMixGraph's hasMusic is `!hasMusicClips && hasMusic`).
+- REGRESSION: 7-scenario argv test on buildConcatArgs (legacy single music + loop stream_loop, multi-music 2 inputs, clip-audio amix graph, masterMix early return, multi-music+amix, legacy music+amix, silent project no -c:a) — ALL PASS.
+- NEW GATE: scripts/check-electron-js.js — `node --check` (full V8 parse, the exact error class main hits at require time) over all 13 electron/*.js files; wired into package.json `electron:build` (before electron-builder) AND `lint` (`eslint . && node scripts/check-electron-js.js`). All 13 files clean.
+- REBUILD v1.27.1 (version bump: package.json + Header BUILD_VERSION + layout title): static export (api-move wrapper) → gpu-worker → wasm → parse gate → ffmpeg (cached) → engine RUST_ENGINE_SKIP=1 (reused CI binary) → NSIS. dist/FrameFuse Setup 1.27.1.exe 220,189,276 B + blockmap + latest.yml, rcedit 1.27.1.0.
+- PACKAGED-FILE VERIFICATION: extracted electron/export-graph.js from the new ASAR → node --check PASSES; engine binary inside ASAR sha256 abbea0b1593ccd630218e669bcf50f6f63ced63227edf003853d8e0db4a19aef (EXACT match to the CI smoke-tested artifact).
+- PUBLISHED: commit 459631c pushed → release 403424740 tag v1.27.1 "FrameFuse v1.27.1 — launch-crash hotfix", 3 assets uploaded, THREE-WAY sha512 VERIFIED (P7cBWlyUDy1S…, size exact). LIVE: https://github.com/Ziruax/framefuse/releases/tag/v1.27.1
+- v1.27.0 release body PATCHED with a ⚠️ top banner: "This build crashes at launch … use v1.27.1 instead" (API PATCH 200, verified in release list).
+- Dev server restarted (double-fork daemon, HTTP 200, title "FrameFuse v1.27.1 — Windows Desktop Video Studio", 0 page errors).
+
+Stage Summary:
+- v1.27.0 was DOA (main-process parse crash); v1.27.1 SHIPS the fix + a permanent parse gate on every electron JS file (build + lint), so a redeclaration/syntax error in the main-process folder can never reach a packaged build again.
+- Users on broken v1.27.0: run the v1.27.1 installer over the same dir (no autoupdate — the app died before electron-updater could load).
+- Standing operational notes remain: re-copy z-ai-web-dev-sdk after node_modules regeneration; electron static exports must route through scripts/build-next-electron.js while src/app/api exists.
