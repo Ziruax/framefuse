@@ -379,15 +379,21 @@ struct PreparedCue {
 pub struct PreparedCaptions {
     cues: Vec<PreparedCue>,
     style: CaptionsTimeline,
-    /// (word text, color idx) → bitmap. idx 0 = normal, 1 = highlight,
-    /// 2..5 = color-cycle palette.
-    bitmaps: HashMap<(String, u8), Bitmap>,
+    /// word text → per-color-variant bitmaps (index 0 = normal,
+    /// 1 = highlight, 2..5 = color-cycle palette). v2.1: keyed by String
+    /// ONLY so `layers_at` can look a word up by `&str` with ZERO
+    /// allocation (the v2.0 `(String, u8)` tuple key forced a fresh String
+    /// per word per frame just to probe the map).
+    bitmaps: HashMap<String, [Option<Bitmap>; COLOR_SLOTS]>,
     /// Solid 1×1 fills by hex (bg box + spotlight) — created ONCE so the
     /// GPU texture cache sees stable ids (per-frame fresh ids would churn
     /// the LRU and realloc textures every frame).
     fills: HashMap<String, Bitmap>,
     line_h: f64,
 }
+
+/// Color variants rasterized per word: 0 normal, 1 highlight, 2..5 palette.
+const COLOR_SLOTS: usize = 6;
 
 /// Load the caption font from the timeline's font table (falls back to
 /// "sans", mirroring text.rs).
@@ -639,7 +645,10 @@ impl PreparedCaptions {
     }
 
     fn word_bitmap(&self, text: &str, idx: u8) -> Option<&Bitmap> {
-        self.bitmaps.get(&(text.to_string(), idx))
+        self.bitmaps
+            .get(text)
+            .and_then(|v| v.get(idx as usize))
+            .and_then(Option::as_ref)
     }
 
     fn fill(&self, hex: &str) -> Bitmap {
@@ -696,24 +705,28 @@ pub fn prepare(timeline: &Timeline, cw: u32, ch: u32) -> Result<Option<PreparedC
 
     // Layout per cue.
     let mut cues_out: Vec<PreparedCue> = Vec::with_capacity(style.cues.len());
-    // Bitmap cache: (text, idx) -> Bitmap. We pre-rasterize while laying out.
-    let mut bitmaps: HashMap<(String, u8), Bitmap> = HashMap::new();
+    // Bitmap cache: word text → per-color bitmaps. Pre-rasterized during layout.
+    let mut bitmaps: HashMap<String, [Option<Bitmap>; COLOR_SLOTS]> = HashMap::new();
 
-    let rasterize_into = |text: &str, idx: u8, bitmaps: &mut HashMap<(String, u8), Bitmap>| {
+    let rasterize_into = |text: &str, idx: u8, bitmaps: &mut HashMap<String, [Option<Bitmap>; COLOR_SLOTS]>| {
+        let slot = (idx as usize).min(COLOR_SLOTS - 1);
+        let entry = bitmaps
+            .entry(text.to_string())
+            .or_insert([const { None }; COLOR_SLOTS]);
+        if entry[slot].is_some() {
+            return;
+        }
         let color = match idx {
             0 => text_col,
             1 => highlight_col.unwrap_or(text_col),
             i if (2..=5).contains(&i) => palette_cols[(i - 2) as usize],
             _ => text_col,
         };
-        let key = (text.to_string(), idx);
-        if let std::collections::hash_map::Entry::Vacant(e) = bitmaps.entry(key) {
-            let (bmp, _, _) = PreparedCaptions::rasterize_word(
-                &font, text, color, outline, outline_w, shadow_col_a, shadow_px,
-                font_px, spacing, line_h,
-            );
-            e.insert(bmp);
-        }
+        let (bmp, _, _) = PreparedCaptions::rasterize_word(
+            &font, text, color, outline, outline_w, shadow_col_a, shadow_px,
+            font_px, spacing, line_h,
+        );
+        entry[slot] = Some(bmp);
     };
 
     let stack_mode = word_mode == "stack";
@@ -901,10 +914,14 @@ pub fn layers_at(pc: &PreparedCaptions, now_ms: f64, cw: u32, ch: u32) -> Vec<Te
     let word_mode = pc.style.word_mode.as_str();
     let anim = pc.style.animation.as_str();
     let color_cycle = anim == "color-cycle";
-    let bg = pc.style.bg_color.clone();
+    // v2.1: borrow instead of cloning the Option<String> per frame.
+    let bg = pc.style.bg_color.as_deref();
     let bg_alpha = pc.style.bg_alpha.clamp(0.0, 1.0);
     let bg_pad = pc.style.bg_padding_px.max(0.0);
     let line_h = pc.line_h;
+    // v2.1: borrow (was a fresh String per spotlight word per frame).
+    let default_spot: &str = "#FDE047";
+    let spot_col = pc.style.highlight_color.as_deref().unwrap_or(default_spot);
 
     for cue in &pc.cues {
         if now_ms < cue.start_ms || now_ms >= cue.end_ms {
@@ -967,7 +984,7 @@ pub fn layers_at(pc: &PreparedCaptions, now_ms: f64, cw: u32, ch: u32) -> Vec<Te
                 _ => ch_f - block_h - pos_y,
             };
             // bg box spans the stack block
-            if let Some(bg_hex) = &bg {
+            if let Some(bg_hex) = bg {
                 if bg_alpha > 0.01 {
                     let fill = pc.fill(bg_hex);
                     let bw = cue.max_line_w.min(cw_f * 0.92) + bg_pad * 2.0;
@@ -1016,7 +1033,7 @@ pub fn layers_at(pc: &PreparedCaptions, now_ms: f64, cw: u32, ch: u32) -> Vec<Te
 
         // ── modes: off / word (karaoke) — the wrapped block layout ──
         // bg box behind the block.
-        if let Some(bg_hex) = &bg {
+        if let Some(bg_hex) = bg {
             if bg_alpha > 0.01 {
                 let fill = pc.fill(bg_hex);
                 let box_w = (cue.block_w + bg_pad * 2.0).round().max(1.0) as u32;
@@ -1062,12 +1079,7 @@ pub fn layers_at(pc: &PreparedCaptions, now_ms: f64, cw: u32, ch: u32) -> Vec<Te
             };
             // spotlight box behind the active word
             if t.spotlight {
-                let spot_col = pc
-                    .style
-                    .highlight_color
-                    .clone()
-                    .unwrap_or_else(|| "#FDE047".to_string());
-                let fill = pc.fill(&spot_col);
+                let fill = pc.fill(spot_col);
                 let grow = 0.6 + 0.4 * t.scale.min(1.0);
                 let bw = ((pw.w + bg_pad * 2.0) * grow).round().max(1.0) as u32;
                 let bh = ((pw.line_h + bg_pad * 0.6) * grow).round().max(1.0) as u32;
@@ -1230,8 +1242,8 @@ mod tests {
         let xs: Vec<f64> = cue.words.iter().map(|w| w.x).collect();
         assert!(xs.windows(2).all(|p| p[1] > p[0]), "xs increasing: {:?}", xs);
         // bitmaps cached for normal + highlight variants (word mode)
-        assert!(pc.bitmaps.contains_key(&("THE".to_string(), 0u8)));
-        assert!(pc.bitmaps.contains_key(&("THE".to_string(), 1u8)));
+        assert!(pc.bitmaps.get("THE").map(|v| v[0].is_some()).unwrap_or(false));
+        assert!(pc.bitmaps.get("THE").map(|v| v[1].is_some()).unwrap_or(false));
     }
 
     #[test]

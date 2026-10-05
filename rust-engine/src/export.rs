@@ -3,7 +3,7 @@
 //! STAGE PIPELINE (the wall clock is max(stage), not sum(stage)):
 //!   [producer thread]  decode-ahead: video decode (threaded avcodec) +
 //!                      RGBA convert + layer building (incl. the native
-//!                      transition plan)  ──sync_channel(4)──▶
+//!                      transition plan)  ──sync_channel(8)──▶
 //!   [consumer thread]  wgpu composite (ONE submit/frame) → GPU YUV →
 //!                      plane memcpy → avcodec encode → mux.
 //!   [audio thread]     all audio decode + mixdown runs IN PARALLEL with
@@ -29,12 +29,12 @@ use crate::ffmpeg_ffi::*;
 use crate::ffi_offsets::*;
 use crate::kinetic::{self, PreparedKinetic};
 use crate::text::TextRenderer;
-use crate::timeline::{Segment, Timeline};
+use crate::timeline::{ChromaKey, Segment, Timeline};
 use rayon::prelude::*;
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::sync_channel;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Progress event pushed through the ThreadsafeFunction (adapted in lib.rs).
@@ -80,6 +80,62 @@ impl Drop for SwsGuard {
     }
 }
 
+// ── v2.1 RGBA buffer pool ──────────────────────────────────────────────────
+// The producer converts every decoded video frame to a full-frame RGBA
+// `Bitmap` (4 B/px — 8.3 MB at 1080p). v2.0 allocated a fresh zeroed Vec
+// per frame and freed it on the consumer side: on Windows/MSVC the CRT
+// serves 8 MB blocks via VirtualAlloc, so every frame paid commit +
+// first-touch page faults + decommit. The pool hands the SAME buffers
+// back: the consumer pushes the spent Arcs after a frame is fully
+// rendered/encoded, the producer `Arc::try_unwrap`s one out and sws
+// overwrites it in place. Alloc-free steady state, bounded by in-flight
+// frames; any leftover reference simply falls back to a fresh allocation
+// (never a correctness hazard).
+#[derive(Default)]
+pub(crate) struct RgbaPool {
+    inner: Mutex<Vec<Arc<Vec<u8>>>>,
+}
+
+impl RgbaPool {
+    /// Hard cap — deeper than the producer↔consumer in-flight window on
+    /// purpose so a burst never evicts usable buffers.
+    const CAP: usize = 16;
+
+    fn take(&self, len: usize) -> Vec<u8> {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some(arc) = guard.pop() {
+            // Only unwrap buffers nobody else references; entries that
+            // still have clones (held-frame cache keeps one for a frame)
+            // are simply discarded — the next pop may unwrap.
+            if let Ok(mut v) = Arc::try_unwrap(arc) {
+                if v.len() == len {
+                    return v; // sws_scale overwrites every byte
+                }
+                // dimension change (rare): re-init once, still reusing the
+                // allocation's capacity when it fits.
+                v.clear();
+                v.resize(len, 0);
+                return v;
+            }
+        }
+        vec![0u8; len]
+    }
+
+    fn put(&self, buf: Arc<Vec<u8>>) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.len() < Self::CAP {
+            guard.push(buf);
+        }
+    }
+}
+
+// FF_DEBUG_CAPTIONS is consulted PER FRAME — cache the env probe (a lock +
+// allocation) behind a OnceLock instead of re-reading it 300+ times.
+static CAPTIONS_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn captions_debug_enabled() -> bool {
+    *CAPTIONS_DEBUG.get_or_init(|| std::env::var("FF_DEBUG_CAPTIONS").is_ok())
+}
+
 // ── video source decoder (LIVES ON THE PRODUCER THREAD) ───────────────────
 
 pub struct VideoSource {
@@ -91,6 +147,16 @@ pub struct VideoSource {
     pkt: PtrGuard,
     sws: Option<SwsGuard>,
     sws_key: (i32, i32, i32),
+    /// v2.1: shared recycling pool for the RGBA output buffers (see RgbaPool).
+    pool: Option<Arc<RgbaPool>>,
+    /// v2.1 held-frame cache: when the timeline's output frame maps to the
+    /// SAME decoded source frame as the previous call (frame-hold: source
+    /// fps < output fps, speed < 1, EOF tail), the RGBA snapshot is reused
+    /// as-is — skipping both the sws pass AND the GPU texture re-upload
+    /// (same Bitmap id → dynamic-slot reuse). Keyed by (pts, w, h, fmt),
+    /// invalidated on seek, bypassed for NOPTS frames.
+    held: Option<Bitmap>,
+    held_key: Option<(i64, i32, i32, i32)>,
     #[allow(dead_code)] // source topology — diagnostics + future smart render paths
     pub width: u32,
     #[allow(dead_code)]
@@ -107,7 +173,7 @@ pub struct VideoSource {
 unsafe impl Send for VideoSource {}
 
 impl VideoSource {
-    pub fn new(ff: Arc<FFmpegLibs>, path: &str) -> Result<Self, String> {
+    pub fn new(ff: Arc<FFmpegLibs>, path: &str, pool: Option<Arc<RgbaPool>>) -> Result<Self, String> {
         let c_path = CString::new(path).map_err(|e| format!("bad path: {}", e))?;
         let mut fc: *mut u8 = std::ptr::null_mut();
         let r = unsafe {
@@ -158,6 +224,9 @@ impl VideoSource {
             pkt,
             sws: None,
             sws_key: (0, 0, 0),
+            pool,
+            held: None,
+            held_key: None,
             width: src_w,
             height: src_h,
             fps: if fps.is_finite() && fps > 1.0 && fps < 240.0 { fps } else { 30.0 },
@@ -221,7 +290,9 @@ impl VideoSource {
     }
 
     /// Decode forward until the LATEST frame at/just-before `t` is current.
-    /// Returns the RGBA bitmap snapshot for compositing.
+    /// Returns the RGBA bitmap snapshot for compositing. When the decode
+    /// loop ends on the SAME source frame as the previous call, the cached
+    /// snapshot is reused (byte-identical — the input frame is identical).
     pub fn ensure_frame(&mut self, t: f64) -> Result<Option<Bitmap>, String> {
         let cur_t = self.frame_pts_sec();
         if self.cur_src_t < 0.0 || (t + 0.001) < cur_t - 0.75 {
@@ -235,6 +306,8 @@ impl VideoSource {
             self.have_frame = false;
             self.eof = false;
             self.cur_src_t = -1.0;
+            self.held = None;
+            self.held_key = None;
             self.ff.frame_unref(&self.frame);
         }
         // decode until the next frame's pts exceeds t (or EOF)
@@ -269,7 +342,29 @@ impl VideoSource {
         if !self.have_frame {
             return Ok(None);
         }
-        self.to_rgba().map(Some)
+        // v2.1 held-frame reuse: identical source frame → identical snapshot.
+        let pts = self.ff.frame_pts(self.frame.raw);
+        let key = (
+            pts,
+            self.ff.frame_width(self.frame.raw),
+            self.ff.frame_height(self.frame.raw),
+            self.ff.frame_format(self.frame.raw),
+        );
+        if pts >= 0 && self.held_key == Some(key) {
+            if let Some(b) = &self.held {
+                return Ok(Some(b.clone()));
+            }
+        }
+        let bmp = self.to_rgba()?;
+        if pts >= 0 {
+            self.held = Some(bmp.clone());
+            self.held_key = Some(key);
+        } else {
+            // NOPTS frames cannot be keyed safely — never cache them.
+            self.held = None;
+            self.held_key = None;
+        }
+        Ok(Some(bmp))
     }
 
     fn to_rgba(&mut self) -> Result<Bitmap, String> {
@@ -299,7 +394,14 @@ impl VideoSource {
             self.sws = Some(SwsGuard { raw: ctx, free: self.ff.syms.sws_freeContext });
             self.sws_key = key;
         }
-        let mut out = vec![0u8; w as usize * h as usize * 4];
+        let n = w as usize * h as usize * 4;
+        // v2.1: recycled pool buffer (or a fresh one the first frames). The
+        // Arc is brand new here → exclusive &mut access is guaranteed.
+        let mut data: Arc<Vec<u8>> = match &self.pool {
+            Some(p) => Arc::new(p.take(n)),
+            None => Arc::new(vec![0u8; n]),
+        };
+        let out = Arc::get_mut(&mut data).expect("fresh Arc is exclusively owned");
         let frame = self.frame.raw;
         unsafe {
             let mut src_planes: [*const u8; 8] = [std::ptr::null(); 8];
@@ -323,7 +425,7 @@ impl VideoSource {
                 return Err(format!("sws_scale returned {} (expected {})", r, h));
             }
         }
-        Ok(Bitmap::new(out, w as u32, h as u32))
+        Ok(Bitmap::from_shared(data, w as u32, h as u32))
     }
 }
 
@@ -843,13 +945,26 @@ pub fn run_pipeline(
     let v_tb = ff.stream_time_base(vstream);
     let a_tb = if astream.is_null() { Rational::new(1, sr) } else { ff.stream_time_base(astream) };
     let v_tb_enc = Rational::new(1000, (timeline.fps * 1000.0).round().max(1.0) as i32);
+    // Stream slots are fixed after write_header — resolve the muxer indices
+    // once instead of scanning the stream array for EVERY packet written.
+    let v_idx = vstream_idx_of(oc.raw, vstream, &ff);
+    let a_idx = if astream.is_null() { -1 } else { vstream_idx_of(oc.raw, astream, &ff) };
 
-    // ── AVFrame ring (encoder buffering makes ONE reused frame copy every
-    //    frame via make_writable — a ring amortizes it to ~never) ─────────
-    const FRAME_RING: usize = 10;
+    // ── AVFrame ring ─────────────────────────────────────────────────────
+    // v2.1: ring sized against the encoder's in-flight window (budget
+    // ~160 MB of frame buffers, clamped 12..56). v2.0's fixed ring of 10
+    // made async encoders (NVENC reffs input frames until their packet is
+    // ready: lookahead 16-32 + b-frames + delay; QSV async_depth +
+    // look_ahead_depth 40) hold MORE frames than the ring — every single
+    // frame then took the av_frame_make_writable slow path (full-plane
+    // copy + re-alloc). A ring larger than the in-flight window makes
+    // make_writable a no-op. Worst case (window > ring) is exactly the old
+    // behavior — never worse.
+    let frame_bytes = (cw as usize * ch as usize * 3 / 2).max(1);
+    let frame_ring_size = ((160 * 1024 * 1024) / frame_bytes).clamp(12, 56);
     let frame_fmt = venc.pix_fmt;
-    let mut frame_ring: Vec<PtrGuard> = Vec::with_capacity(FRAME_RING);
-    for _ in 0..FRAME_RING {
+    let mut frame_ring: Vec<PtrGuard> = Vec::with_capacity(frame_ring_size);
+    for _ in 0..frame_ring_size {
         let f = ff.frame_alloc()?;
         unsafe {
             wr_i32(f.raw, AVFRAME_WIDTH, cw as i32);
@@ -982,17 +1097,30 @@ pub fn run_pipeline(
     }
 
     // ── PRODUCER THREAD (decode-ahead + layer building) ──────────────────
-    let (tx, rx) = sync_channel::<ProducerMsg>(4);
+    // v2.1: (a) the RGBA buffer pool closes the producer↔consumer loop;
+    // (b) the channel depth is 8 (was 4) — the producer absorbs decode/sws
+    // jitter across more frames, and with pooled buffers the in-flight
+    // memory is reused rather than multiplied.
+    let rgba_pool = Arc::new(RgbaPool::default());
+    // Overlay chroma keys are immutable per segment — Arc them ONCE instead
+    // of deep-cloning the {color: String, …} struct into every frame's layer.
+    let overlay_chroma: Vec<Option<Arc<ChromaKey>>> = overlays
+        .iter()
+        .map(|&oi| timeline.segments[oi].chroma.clone().map(Arc::new))
+        .collect();
+    let (tx, rx) = sync_channel::<ProducerMsg>(8);
     {
         let ff = ff.clone();
         let timeline = timeline.clone();
         let base = base.clone();
         let overlays = overlays.clone();
+        let overlay_chroma = overlay_chroma;
         let image_bitmaps = image_bitmaps.clone();
         let texts = texts.clone();
         let prepared_captions = prepared_captions.clone();
         let prepared_kinetic = prepared_kinetic.clone();
         let watermark = watermark.clone();
+        let rgba_pool = rgba_pool.clone();
         std::thread::Builder::new()
             .name("framefuse-producer".into())
             .spawn(move || {
@@ -1005,7 +1133,7 @@ pub fn run_pipeline(
                     let seg = &timeline.segments[i];
                     if seg.media_type == "video" && !video_sources.contains_key(&i) {
                         let t0 = Instant::now();
-                        match VideoSource::new(ff.clone(), &seg.path) {
+                        match VideoSource::new(ff.clone(), &seg.path, Some(rgba_pool.clone())) {
                             Ok(src) => {
                                 video_sources.insert(i, src);
                             }
@@ -1030,6 +1158,7 @@ pub fn run_pipeline(
                         t,
                         &base,
                         &overlays,
+                        &overlay_chroma,
                         &image_bitmaps,
                         &mut video_sources,
                         &texts,
@@ -1107,7 +1236,7 @@ pub fn run_pipeline(
                 // ── fill the AVFrame ──
                 let t1 = Instant::now();
                 let avframe = &frame_ring[ring_pos];
-                ring_pos = (ring_pos + 1) % FRAME_RING;
+                ring_pos = (ring_pos + 1) % frame_ring_size;
                 unsafe {
                     let r = (ff.syms.av_frame_make_writable)(avframe.raw);
                     if r < 0 {
@@ -1121,9 +1250,18 @@ pub fn run_pipeline(
                             let w = cw as usize;
                             let h = ch as usize;
                             let h2 = (h + 1) / 2;
+                            // v2.1: when both sides are tight (typical: even
+                            // widths — 1920, 1280 — with 32-aligned
+                            // av_frame_get_buffer linesizes) the whole plane
+                            // is ONE memcpy instead of a per-row loop.
                             let copy_plane = |dst: *mut u8, dst_ls: i32, src: &[u8], src_stride: usize, rows: usize, row_bytes: usize| {
+                                let dst_ls = dst_ls.max(1) as usize;
+                                if dst_ls == row_bytes && src_stride == row_bytes && src.len() >= rows * row_bytes {
+                                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst, rows * row_bytes);
+                                    return;
+                                }
                                 for row in 0..rows {
-                                    let d = dst.add(row * dst_ls.max(1) as usize);
+                                    let d = dst.add(row * dst_ls);
                                     let s = &src[row * src_stride..row * src_stride + row_bytes];
                                     std::ptr::copy_nonoverlapping(s.as_ptr(), d, row_bytes);
                                 }
@@ -1141,11 +1279,16 @@ pub fn run_pipeline(
                                 let uv_row_bytes = w;
                                 copy_plane(ff.frame_data(avframe.raw, 0), ff.frame_linesize(avframe.raw, 0), &frame_bytes[..y_plane_bytes], y_stride, h, w);
                                 let dst = ff.frame_data(avframe.raw, 1);
-                                let dst_ls = ff.frame_linesize(avframe.raw, 1);
-                                for row in 0..uv_rows {
-                                    let d = dst.add(row * dst_ls.max(1) as usize);
-                                    let s = &frame_bytes[y_plane_bytes + row * y_stride..y_plane_bytes + row * y_stride + uv_row_bytes];
-                                    std::ptr::copy_nonoverlapping(s.as_ptr(), d, uv_row_bytes);
+                                let dst_ls = ff.frame_linesize(avframe.raw, 1).max(1) as usize;
+                                if dst_ls == uv_row_bytes && y_stride == uv_row_bytes {
+                                    let uv = &frame_bytes[y_plane_bytes..y_plane_bytes + uv_rows * uv_row_bytes];
+                                    std::ptr::copy_nonoverlapping(uv.as_ptr(), dst, uv.len());
+                                } else {
+                                    for row in 0..uv_rows {
+                                        let d = dst.add(row * dst_ls);
+                                        let s = &frame_bytes[y_plane_bytes + row * y_stride..y_plane_bytes + row * y_stride + uv_row_bytes];
+                                        std::ptr::copy_nonoverlapping(s.as_ptr(), d, uv_row_bytes);
+                                    }
                                 }
                             }
                         }
@@ -1183,7 +1326,7 @@ pub fn run_pipeline(
                     loop {
                         let s = (ff.syms.avcodec_send_frame)(venc.ctx.raw, avframe.raw);
                         if s == AVERROR_EAGAIN {
-                            if drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, &v_tb_enc, &v_tb, &mut wrote_packets)? == 0 {
+                            if drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets)? == 0 {
                                 return Err("video send_frame stuck on EAGAIN".into());
                             }
                             continue;
@@ -1196,7 +1339,20 @@ pub fn run_pipeline(
                 }
                 // drain encoder → mux (EAGAIN-aware: NVENC async delay is
                 // INTACT now, packets arrive a few frames later)
-                drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, &v_tb_enc, &v_tb, &mut wrote_packets)?;
+                drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets)?;
+
+                // v2.1: hand the frame's VIDEO-layer RGBA buffers back to the
+                // producer's pool. The compositor has fully consumed them
+                // (GPU uploads copy at submit time; the CPU rasterizer is
+                // synchronous) and the encoded YUV lives in the AVFrame ring.
+                // Static (image/text) layers are NOT recycled — they are
+                // long-lived and must never be overwritten.
+                for layer in layers.iter() {
+                    if layer.dynamic {
+                        rgba_pool.put(layer.bitmap.data.clone());
+                    }
+                }
+
                 compositor_ms += t0.elapsed().as_millis() as i64;
                 encode_ms += t1.elapsed().as_millis() as i64;
 
@@ -1224,7 +1380,7 @@ pub fn run_pipeline(
             return Err(format!("video flush: {}", ff.err2str(s)));
         }
     }
-    drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, &v_tb_enc, &v_tb, &mut wrote_packets)?;
+    drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets)?;
     // ── AUDIO PHASE (mix ran in parallel — join it now) ──────────────────
     let mut audio_ms: i64 = 0;
     if let Some(ref _ae) = aenc {
@@ -1256,6 +1412,11 @@ pub fn run_pipeline(
                 }
             }
             let mut sample_pos = 0usize;
+            // v2.1: audio-phase progress throttled to ~8/s like the video
+            // loop — one event per 1024-sample AAC frame was ~47 TSFN calls
+            // per second of audio (thousands per export), all crossing the
+            // napi boundary for purely informational updates.
+            let mut last_emit_a = std::time::Duration::from_secs(0);
             while sample_pos < mixed.len() {
                 let take = frame_size.min((mixed.len() - sample_pos) / chn);
                 if take == 0 {
@@ -1291,7 +1452,7 @@ pub fn run_pipeline(
                         return Err(format!("audio receive_packet: {}", ff.err2str(pr)));
                     }
                     ff.packet_rescale_ts(pkt.raw, Rational::new(1, sr), a_tb);
-                    ff.packet_set_stream_index(pkt.raw, vstream_idx_of(oc.raw, astream, &ff));
+                    ff.packet_set_stream_index(pkt.raw, a_idx);
                     let w = unsafe { (ff.syms.av_interleaved_write_frame)(oc.raw, pkt.raw) };
                     ff.packet_unref(pkt.raw);
                     if w < 0 {
@@ -1299,13 +1460,18 @@ pub fn run_pipeline(
                     }
                 }
                 sample_pos += take * chn;
-                let frac = (sample_pos as f64 / mixed.len().max(1) as f64).min(1.0);
-                progress(ProgressEvent {
-                    phase: "audio".into(),
-                    percent: 92.0 + 6.0 * frac,
-                    fps: 0.0,
-                    timemark_sec: total_sec,
-                });
+                let el = a0.elapsed();
+                let last_chunk = sample_pos >= mixed.len();
+                if sample_pos == take * chn || last_chunk || el - last_emit_a > std::time::Duration::from_millis(125) {
+                    last_emit_a = el;
+                    let frac = (sample_pos as f64 / mixed.len().max(1) as f64).min(1.0);
+                    progress(ProgressEvent {
+                        phase: "audio".into(),
+                        percent: 92.0 + 6.0 * frac,
+                        fps: 0.0,
+                        timemark_sec: total_sec,
+                    });
+                }
             }
             // flush audio encoder
             unsafe {
@@ -1320,7 +1486,7 @@ pub fn run_pipeline(
                             break;
                         }
                         ff.packet_rescale_ts(pkt.raw, Rational::new(1, sr), a_tb);
-                        ff.packet_set_stream_index(pkt.raw, vstream_idx_of(oc.raw, astream, &ff));
+                        ff.packet_set_stream_index(pkt.raw, a_idx);
                         let w = (ff.syms.av_interleaved_write_frame)(oc.raw, pkt.raw);
                         ff.packet_unref(pkt.raw);
                         if w < 0 {
@@ -1380,6 +1546,9 @@ fn build_frame_job(
     t: f64,
     base: &[usize],
     overlays: &[usize],
+    // Pre-Arc'd chroma keys, position-aligned with `overlays` (v2.1: no
+    // per-frame `ChromaKey { color: String }` clones).
+    overlay_chroma: &[Option<Arc<ChromaKey>>],
     image_bitmaps: &std::collections::HashMap<usize, Bitmap>,
     video_sources: &mut std::collections::HashMap<usize, VideoSource>,
     texts: &[(usize, TextLayer, f64, f64, f64)],
@@ -1390,7 +1559,7 @@ fn build_frame_job(
     cw: u32,
     ch: u32,
 ) -> Result<FrameJob, String> {
-    let mut layers: Vec<Layer> = Vec::new();
+    let mut layers: Vec<Layer> = Vec::with_capacity(2 + overlays.len());
     let mut fade_gain = 1.0f32;
     let mut background = compositor::parse_hex_color(&timeline.background_color);
     // true while a DISSOLVE head is blending: overlays stay at full opacity
@@ -1502,7 +1671,7 @@ fn build_frame_job(
 
     // ── overlay lanes in track order (dip fades apply to them too — the
     //    CLI runs dips AFTER the overlay composite) ──────────────────────
-    for &oi in overlays.iter() {
+    for (ov_pos, &oi) in overlays.iter().enumerate() {
         let seg = &timeline.segments[oi];
         let win_start = seg.start_ms;
         let win_end = if seg.end_ms > win_start { seg.end_ms } else { win_start + seg.duration_ms };
@@ -1546,7 +1715,7 @@ fn build_frame_job(
                 crop: (0.0, 0.0, 1.0, 1.0),
                 dest,
                 alpha: (seg.opacity as f32) * ov_gain,
-                chroma: seg.chroma.clone(),
+                chroma: overlay_chroma.get(ov_pos).and_then(|c| c.clone()),
                 dynamic: seg.media_type == "video",
             });
         }
@@ -1554,7 +1723,7 @@ fn build_frame_job(
 
     // ── texts (pre-rasterized, NEVER dip-faded — the layering contract:
     //    captions/headlines render above dip/bookend fades) + watermark ──
-    let mut text_layers: Vec<TextLayer> = Vec::new();
+    let mut text_layers: Vec<TextLayer> = Vec::with_capacity(8 + texts.len());
     for (_, layer, start, end, fade) in texts.iter() {
         let (start, end, fade) = (*start, *end, *fade);
         if now_ms < start || now_ms >= end {
@@ -1585,7 +1754,7 @@ fn build_frame_job(
         text_layers.push(wm.clone());
     }
 
-    if std::env::var("FF_DEBUG_CAPTIONS").is_ok() && !text_layers.is_empty() {
+    if captions_debug_enabled() && !text_layers.is_empty() {
         eprintln!(
             "[captions-dbg] frame {} ({}ms): {} text layers: {:?}",
             k,
@@ -1601,7 +1770,8 @@ fn build_frame_job(
 }
 
 /// Drain the video encoder into the muxer. Returns how many packets were
-/// written (0 when the encoder has none yet — EAGAIN).
+/// written (0 when the encoder has none yet — EAGAIN). `v_idx` is the
+/// pre-resolved muxer stream index (fixed after write_header).
 #[allow(clippy::too_many_arguments)]
 fn drain_video_encoder(
     ff: &FFmpegLibs,
@@ -1609,10 +1779,12 @@ fn drain_video_encoder(
     pkt: *mut u8,
     oc: *mut u8,
     vstream: *mut u8,
+    v_idx: i32,
     v_tb_enc: &Rational,
     v_tb: &Rational,
     wrote_packets: &mut u64,
 ) -> Result<usize, String> {
+    let _ = vstream; // retained for signature clarity; index is precomputed
     let mut n = 0usize;
     loop {
         let pr = unsafe { (ff.syms.avcodec_receive_packet)(ctx, pkt) };
@@ -1623,7 +1795,7 @@ fn drain_video_encoder(
             return Err(format!("video receive_packet: {}", ff.err2str(pr)));
         }
         ff.packet_rescale_ts(pkt, *v_tb_enc, *v_tb);
-        ff.packet_set_stream_index(pkt, vstream_idx_of(oc, vstream, ff));
+        ff.packet_set_stream_index(pkt, v_idx);
         let w = unsafe { (ff.syms.av_interleaved_write_frame)(oc, pkt) };
         ff.packet_unref(pkt);
         if w < 0 {

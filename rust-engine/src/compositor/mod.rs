@@ -62,6 +62,17 @@ impl Bitmap {
             id: NEXT_BITMAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
+
+    /// v2.1: wrap an ALREADY-OWNED shared buffer (e.g. recycled out of the
+    /// producer's RGBA pool) — same fresh-id semantics as `new`, zero copy.
+    pub fn from_shared(data: Arc<Vec<u8>>, w: u32, h: u32) -> Self {
+        Bitmap {
+            data,
+            w,
+            h,
+            id: NEXT_BITMAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
 }
 
 /// One draw call: bitmap → (crop window) → (dest rect) with alpha/chroma.
@@ -74,8 +85,10 @@ pub struct Layer {
     pub dest: (f32, f32, f32, f32),
     /// Multiply alpha (fade / overlay opacity).
     pub alpha: f32,
-    /// Chroma key applied before alpha blend.
-    pub chroma: Option<ChromaKey>,
+    /// Chroma key applied before alpha blend. v2.1: Arc — the key is
+    /// immutable per segment, so per-frame layer building is a refcount
+    /// bump instead of a `ChromaKey { color: String }` deep clone.
+    pub chroma: Option<Arc<ChromaKey>>,
     /// v2: true for VIDEO-layer content (a fresh Bitmap id per decoded
     /// frame) — the GPU compositor uploads these through a pooled slot
     /// instead of the static LRU texture cache. Images/texts stay false.
