@@ -2005,7 +2005,6 @@ function buildConcatArgs(o) {
   const clipAudio = Array.isArray(o.clipAudio)
     ? o.clipAudio.filter((c) => c && typeof c.wavPath === "string" && c.wavPath)
     : [];
-  const hasMusic = !!o.audioPath;
   // v1.2: export audio bitrate ladder (invalid/omitted → 192 = v1.1).
   const abr = [96, 128, 192, 256, 320].includes(Number(o.audioKbps))
     ? `${Number(o.audioKbps)}k`

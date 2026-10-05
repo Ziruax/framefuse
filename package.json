@@ -1,6 +1,6 @@
 {
   "name": "framefuse",
-  "version": "1.27.0",
+  "version": "1.27.1",
   "private": true,
   "description": "Multi-track Windows video studio with fast native export.",
   "main": "electron/main.js",
@@ -11,7 +11,7 @@
     "clean": "node scripts/clean.js",
     "build": "npm run clean && node scripts/build-next-electron.js && node scripts/build-gpu-worker.js && node scripts/copy-wasm.js",
     "start": "next start",
-    "lint": "eslint .",
+    "lint": "eslint . && node scripts/check-electron-js.js",
     "test:export-parity": "bun scripts/test-export-parity.ts",
     "bench:export": "node scripts/bench-export.js",
     "bench:ab": "node scripts/ab-export-bench.js",
@@ -21,7 +21,7 @@
     "electron:dev": "concurrently -k \"npm run dev\" \"wait-on http://localhost:3000 && electron electron/main.js\"",
     "fetch:ffmpeg": "node scripts/fetch-windows-ffmpeg.js",
     "postinstall": "node scripts/patch-electron-builder.js",
-    "electron:build": "npm run clean && node scripts/build-next-electron.js && node scripts/build-gpu-worker.js && node scripts/copy-wasm.js && node scripts/fetch-windows-ffmpeg.js && node scripts/build-rust-engine.js && electron-builder --win nsis --publish never",
+    "electron:build": "npm run clean && node scripts/build-next-electron.js && node scripts/build-gpu-worker.js && node scripts/copy-wasm.js && node scripts/check-electron-js.js && node scripts/fetch-windows-ffmpeg.js && node scripts/build-rust-engine.js && electron-builder --win nsis --publish never",
     "build:rust": "node scripts/build-rust-engine.js"
   },
   "trustedDependencies": [
