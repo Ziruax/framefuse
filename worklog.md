@@ -2587,3 +2587,25 @@ Stage Summary:
 - Groq Whisper path gives REAL word timestamps (best timing input); the builtin cloud ASR stays keyless with estimated timings.
 - Web caption generation unlocked (no more "desktop app only" wall).
 - Verified: lint clean, tsc clean (my files), agent-browser E2E (Settings render/persist, gear jumps, TTS dedupe, captions generate → test-speech.whisper.srt, full dub pipeline → VO lane "VO DUB S1 3.7s"), mobile 390px no overflow, no console errors.
+
+---
+Task ID: 13 (v1.27.0 release — the missing publish)
+Agent: main (Z.ai Code)
+Task: User: "latest version v1.27.0 is not pushed to github release — no version after v1.23.0 is released"
+
+Work Log:
+- STATE: v1.27.0 code was committed (815d589) but 3 commits unpushed; dist/ + staged engine + z-ai-sdk copy wiped by housekeeping; node_modules intact (bun install no-op, patches applied); dev server down.
+- Pushed main (db1f54f → 815d589) → CI run 37268779168: Job 1 (Rust engine MSVC + E2E smoke) SUCCESS, Job 2 (best-effort installer) failed as expected (local build is canonical).
+- Restored z-ai-web-dev-sdk (manual copy from bun global, node_modules copy regenerated).
+- Downloaded CI artifact 11327886043 (rust-engine-win32-x64): framefuse-engine.win32-x64.node 11,842,048 B, smoke PASSED (h264+150frames+aac, rust-gpu), sha256 abbea0b1593ccd630218e669bcf50f6f63ced63227edf003853d8e0db4a19aef → staged to rust-engine/.
+- BUILD BLOCKER FOUND+FIXED: `next build --webpack` failed — "export const dynamic force-static/revalidate not configured on route /api/dub/models with output:export". The v1.26/v1.27 web-preview API routes (src/app/api: tts/dub/ai POST handlers) cannot exist under production output:"export" (dev tolerates them; the packaged app loads out/index.html via file://). FIX: scripts/build-next-electron.js — moves src/app/api aside → npx next build --webpack → restores in finally (stale-backup aware; refuses to build on ambiguous state). package.json build + electron:build now route through it. Static export then succeeded (5/5 pages).
+- Build chain: clean → build-next-electron → gpu-worker (out/gpu-worker.js 356.9 KB) → copy-wasm (skip: transformers absent, whisper-local intentionally removed) → fetch-windows-ffmpeg (dlls+cli OK) → build-rust-engine (RUST_ENGINE_SKIP=1) → electron-builder --win nsis: rcedit-native applied 1.27.0.0 + icon; NSIS + blockmap complete.
+- VERIFIED: dist triple (FrameFuse Setup 1.27.0.exe 220,189,724 B + .blockmap + latest.yml v1.27.0 sha512); ASAR contains out/index.html + electron/main.js + rust-engine/framefuse-engine.win32-x64.node (extracted sha256 EXACT match to the CI artifact); win-unpacked resources ffmpeg/ffmpeg-static/fonts/app-update.yml in place.
+- Tooling commit fb532f2 (wrapper + ship script) pushed before publishing so the tag tree is complete.
+- PUBLISHED: scripts/publish-release-1.27.0.js → release 403404589, tag v1.27.0 @ fb532f2, assets FrameFuse-Setup-1.27.0.exe + blockmap + latest.yml (dupe-aware curl uploads), THREE-WAY sha512 VERIFIED (local == latest.yml == re-downloaded, size exact). Release body rolls up v1.24→v1.27 (dark studio, TTS Studio, QWERTY Hindi/Urdu, multi-track timeline, Dub Studio, Settings hub, Groq Whisper, word-to-word timing).
+- Dev server restarted (double-fork daemon, HTTP 200). agent-browser E2E: landing renders (title FrameFuse v1.27.0), Studio loads, rail shows "Text to speech" + "Dubbing & voice" + "Settings & AI models"; Settings tab renders Groq/Gemini key rows + caption-transcription provider (Built-in/Groq Whisper) + dubbing-script provider (Built-in/Groq/Gemini) + model picker; TTS tab has ZERO "voiceover" occurrences (dedupe confirmed) with voice search/gender/picker/presets; dev.log clean (GET / + /api/dub/models + /api/tts/voices all 200, 0 errors).
+
+Stage Summary:
+- v1.27.0 SHIPPED: https://github.com/Ziruax/framefuse/releases/tag/v1.27.0 (release id 403404589, published, 3 assets uploaded) — the first release since v1.23.0.
+- DURABLE BUILD FIX: electron static exports must route through scripts/build-next-electron.js while src/app/api exists (API routes are web-preview-only; the packaged app talks IPC).
+- OPERATIONAL: z-ai-web-dev-sdk node_modules copy must be re-made after any node_modules regeneration (cp -rL ~/.bun/install/global/node_modules/z-ai-web-dev-sdk node_modules/).
