@@ -625,6 +625,11 @@ async function exportViaFFmpeg(
       fontStyle: preset.fontStyle,
       // Colors
       textColor: captionSettings.customColor || preset.textColor,
+      // v1.27.2 KINETIC PARITY: the kinetic painter resolves its BASE color
+      // as customColor || "#FFFFFF" (NOT the caption preset's textColor) —
+      // ship the raw override so both export renderers (Rust baseColor,
+      // ASS textColor) resolve exactly the color the preview shows.
+      customColor: captionSettings.customColor ?? null,
       borderColor: preset.borderColor || "#000000",
       borderWidth: preset.borderWidth,
       highlightColor: preset.highlightColor || null,

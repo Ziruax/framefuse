@@ -3847,7 +3847,13 @@ function buildAssDocument(cues, cs, headlines, width, height, segStartMs, segEnd
         compositions: kineticCompositions,
         geometry: kineticGeoList,
         settings: cs.kinetic,
-        textColor: cs.textColor || "#FFFFFF",
+        // v1.27.2 preview parity: the kinetic painter resolves its base color
+        // as customColor || "#FFFFFF" (kinetic/render.ts drawKineticComposition) —
+        // NOT the caption preset's textColor. cs.customColor ships the raw
+        // user override (native.ts payload); unset → white, exactly what the
+        // preview shows. The LEGACY caption loop below still uses cs.textColor
+        // (its own parity contract).
+        textColor: (cs && cs.customColor) || "#FFFFFF",
         width,
         height,
         winStart,
@@ -3991,10 +3997,18 @@ function buildAssDocument(cues, cs, headlines, width, height, segStartMs, segEnd
 // ---------------------------------------------------------------------------
 ipcMain.handle("export-ass-file", async (event, opts) => {
   try {
-    const { cues, captionSettings, headlines, width, height } = opts;
+    // v1.27.2 KINETIC PARITY: the sidecar must carry the SAME kinetic
+    // choreography the burn-in exports carry (the user sees kinetic captions
+    // in the preview — a plain-caption .ass sidecar is the classic
+    // "export ≠ preview" drift). The renderer payload (page.tsx
+    // exportAssSidecar) needs to ship `kineticCompositions` +
+    // `kineticGeometry` + `captionSettings.kinetic`; when present they flow
+    // straight into buildAssDocument (kinetic events replace the legacy cue
+    // lines exactly like the burn-in path). Old payloads stay legacy.
+    const { cues, captionSettings, headlines, width, height, kineticCompositions, kineticGeometry } = opts || {};
     const hasHl = Array.isArray(headlines) && headlines.length > 0;
     if ((!cues || cues.length === 0) && !hasHl) return null;
-    const doc = buildAssDocument(cues || [], captionSettings, headlines, width, height, null, null, null);
+    const doc = buildAssDocument(cues || [], captionSettings, headlines, width, height, null, null, null, undefined, Array.isArray(kineticCompositions) ? kineticCompositions : undefined, Array.isArray(kineticGeometry) ? kineticGeometry : undefined);
     if (!doc) return null;
 
     const res = await dialog.showSaveDialog(mainWindow, {
@@ -4173,6 +4187,14 @@ ipcMain.handle("export-native", async (event, opts) => {
 
   const captionsEnabled = !!captionSettings?.enabled && subtitleCues && subtitleCues.length > 0;
   const headlinesEnabled = Array.isArray(headlines) && headlines.some((h) => h && h.text && h.endMs > h.startMs);
+  // v1.27.2 KINETIC PARITY: the renderer measured the kinetic geometry at
+  // the REQUESTED export dims; CONSTRAINED-CPU fast mode can re-assign
+  // width/height below (the smart pipeline's pieces build ASS documents at
+  // the downscaled dims = PlayRes) — this binding is rescaled in lockstep
+  // (exactly like the watermark rects) so every \pos/\fs stays in the right
+  // coordinate space. The pre-fast-mode call sites (two-step + chunk jobs,
+  // built at the ORIGINAL dims) also read it before any reassignment.
+  let kineticGeoList = Array.isArray(kineticGeometry) ? kineticGeometry : undefined;
   const totalMs = segments.reduce((sum, s) => Math.max(sum, s.endMs ?? (s.startMs ?? 0) + s.durationMs), 0) || segments.reduce((sum, s) => sum + s.durationMs, 0);
   const totalSec = totalMs / 1000;
 
@@ -4737,7 +4759,7 @@ ipcMain.handle("export-native", async (event, opts) => {
           headlinesEnabled ? headlineGeometry : undefined,
           // v1.18 kinetic typography (rides captions — captionsEnabled gate):
           captionsEnabled ? kineticCompositions : undefined,
-          captionsEnabled ? kineticGeometry : undefined,
+          captionsEnabled ? kineticGeoList : undefined,
         );
       }
 
@@ -5049,7 +5071,7 @@ ipcMain.handle("export-native", async (event, opts) => {
               headlinesEnabled ? headlineGeometry : undefined,
               // v1.18 kinetic typography (rides captions — captionsEnabled gate):
               captionsEnabled ? kineticCompositions : undefined,
-              captionsEnabled ? kineticGeometry : undefined,
+              captionsEnabled ? kineticGeoList : undefined,
             );
             chunkAssSuffix = doc
               ? writeAssFile(doc, `${String(i).padStart(4, "0")}_${String(k).padStart(2, "0")}`)
@@ -5484,6 +5506,44 @@ ipcMain.handle("export-native", async (event, opts) => {
               wm.w = Math.round(wm.w * s);
               wm.h = Math.round(wm.h * s);
             }
+            // v1.27.2 KINETIC PARITY: same rule for the renderer-measured
+            // kinetic geometry — every word rect/fontPx/block field was
+            // measured against the REQUESTED dims and the smart pipeline's
+            // ASS pieces are built at the fast dims (PlayRes = fw×fh); the
+            // native Rust path already ran (early return) on the ORIGINAL
+            // payload, so only this CLI-side copy is rescaled. Without it
+            // every \pos/\fs lands in the wrong coordinate space (kinetic
+            // captions misplaced + oversized on fast-mode exports).
+            if (kineticGeoList && kineticGeoList.length) {
+              const scaleKin = (v) => Math.round((Number(v) || 0) * s);
+              kineticGeoList = kineticGeoList.map((g) =>
+                g && typeof g === "object"
+                  ? {
+                      ...g,
+                      fontPx: scaleKin(g.fontPx),
+                      lineHeight: scaleKin(g.lineHeight),
+                      blockLeft: scaleKin(g.blockLeft),
+                      blockTop: scaleKin(g.blockTop),
+                      blockW: scaleKin(g.blockW),
+                      blockH: scaleKin(g.blockH),
+                      lines: Array.isArray(g.lines)
+                        ? g.lines.map((l) =>
+                            l && typeof l === "object"
+                              ? { ...l, fontPx: scaleKin(l.fontPx), y: scaleKin(l.y), h: scaleKin(l.h) }
+                              : l,
+                          )
+                        : g.lines,
+                      words: Array.isArray(g.words)
+                        ? g.words.map((w) =>
+                            w && typeof w === "object"
+                              ? { ...w, x: scaleKin(w.x), y: scaleKin(w.y), w: scaleKin(w.w), h: scaleKin(w.h), fontPx: scaleKin(w.fontPx) }
+                              : w,
+                          )
+                        : g.words,
+                    }
+                  : g,
+              );
+            }
           }
         }
 
@@ -5734,7 +5794,7 @@ ipcMain.handle("export-native", async (event, opts) => {
               headlinesEnabled ? headlineGeometry : undefined,
               // v1.18 kinetic typography (rides captions — captionsEnabled gate):
               captionsEnabled ? kineticCompositions : undefined,
-              captionsEnabled ? kineticGeometry : undefined,
+              captionsEnabled ? kineticGeoList : undefined,
             );
             pieceAssSuffix = doc ? writeAssFile(doc, `sm${String(pi).padStart(3, "0")}`) : null;
           }

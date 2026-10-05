@@ -104,8 +104,17 @@ fn word_transform(
     let scale_ref = ch / 1080.0;
     let mut t = KineticTransform::default();
 
-    let entrance_ms = if preset.entrance_ms.max(60.0) < 60.0 { 60.0 } else { preset.entrance_ms };
-    let entrance_ms = if motion_level == "subtle" { entrance_ms * 1.2 } else { entrance_ms };
+    // motion.ts: entranceMs = Math.max(60, entranceMs * (subtle ? 1.2 : 1)) —
+    // the subtle stretch applies BEFORE the 60ms floor (v1.27.2: exact mirror;
+    // the old two-step form clamped first, stretching <50ms presets 20% longer
+    // than the preview — unreachable with the shipped 90ms+ presets but wrong).
+    let entrance_ms = (preset.entrance_ms
+        * if motion_level == "subtle" {
+            1.2
+        } else {
+            1.0
+        })
+    .max(60.0);
     let stagger = preset.stagger_ms;
     let exit_ms = preset.exit_ms;
 
@@ -666,6 +675,32 @@ mod tests {
         // 1850ms = 60% through the emphasis window: the scale-punch peak.
         let t = word_transform(&c, &c.preset, w, 2, 1850.0, "dynamic", 1080.0, Some("center"), Some(2050.0));
         assert!(t.scale > 1.0);
+    }
+
+    #[test]
+    fn subtle_stretches_entrance_exactly_1_2x() {
+        // motion.ts: entranceMs = max(60, entranceMs * (subtle ? 1.2 : 1)) —
+        // the subtle stretch applies BEFORE the 60ms floor. Regression lock
+        // for the v1.27.2 exact-mirror fix (the old two-step form clamped
+        // first, stretching sub-50ms presets past the preview's window).
+        // NOTE: subtle ALSO scales energy 0.6, so offsets aren't a clean
+        // signal — alpha (energy-independent) is.
+        let mut c = comp(preset("fade-rise", "fade", "none"));
+        c.preset.entrance_ms = 100.0;
+        let w = &c.words[0]; // enterStart = max(1000, 1100-60) = 1040
+        // 60ms into the window: dynamic et=0.6 → alpha 0.936; subtle
+        // et=60/120=0.5 → alpha 0.875 — the stretch measurably slows it.
+        let dyn_t = word_transform(&c, &c.preset, w, 0, 1100.0, "dynamic", 1080.0, Some("center"), Some(2050.0));
+        let sub_t = word_transform(&c.clone(), &c.preset, w, 0, 1100.0, "subtle", 1080.0, Some("center"), Some(2050.0));
+        assert!(dyn_t.alpha > 0.93 && dyn_t.alpha < 0.94);
+        assert!(sub_t.alpha > 0.87 && sub_t.alpha < 0.88);
+        assert!(sub_t.alpha < dyn_t.alpha - 0.03);
+        // floor case: entrance 40ms + subtle → window = max(60, 48) = 60 (not 72)
+        let mut c2 = comp(preset("fade-rise", "fade", "none"));
+        c2.preset.entrance_ms = 40.0;
+        let t = word_transform(&c2, &c2.preset, &c2.words[0], 0, 1106.0, "subtle", 1080.0, Some("center"), Some(2050.0));
+        assert!((t.alpha - 1.0).abs() < 1e-6, "floor: entrance settled by 66ms");
+        assert!(t.offset_y.abs() < 1e-6);
     }
 
     #[test]

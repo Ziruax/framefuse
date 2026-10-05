@@ -17,19 +17,23 @@
 //     preset font (FONT_ASS_NAMES mirrors the renderer's FONT_OPTIONS
 //     ffmpegName table), Fontsize = the measured base fontPx, Alignment 5
 //     (all positioning is absolute inline \pos/\move anyway).
-//   - INLINE MODE (entrances without x-motion: fade-rise, word-pop,
-//     scale-slam, slide-y, clip-wipe, blur-focus, flash, push): ONE
-//     Dialogue per LINE, \an5\pos(lineCenter) anchoring, each word in its
-//     own {...} block carrying \fs (phrase scale) + \b (phrase weight) +
-//     \1c (accent for emphasis words) + \alpha (supporting muted tier, §27)
-//     + the entrance \t choreography. \t/\move times are MILLISECONDS
-//     RELATIVE TO THE DIALOGUE START. Per-word \fscx changes shift later
-//     words in the line (libass layout) — inherent, accepted (the v1.17
-//     emitter had the same class of asymmetry).
-//   - PER-WORD MODE (slide-x/burst/converge — x-motion; typewriter —
-//     sequential reveal): ONE Dialogue PER WORD with \an5\move(from →
-//     measured word center, d, d+entranceMs) (typewriter: static \pos, the
-//     Dialogue start time IS the reveal).
+//   - PER-WORD MODE (ANY entrance with positional motion — x OR y: slide-x,
+//     burst, converge, typewriter, fade-rise, slide-y, push): ONE Dialogue
+//     PER WORD with \an5\move(from → measured word center, 0, entranceMs)
+//     (typewriter: static \pos, the Dialogue start time IS the reveal).
+//     v1.27.2 parity: fade-rise/slide-y/push previously degraded to
+//     alpha-only INLINE lines (y-motion "not representable" inline) — but
+//     per-word \move DOES express it, so they now ride the per-word path
+//     with the exact motion.ts e=0 offsets (36/42/30 · energy · role).
+//   - INLINE MODE (scale/blur/clip entrances without positional motion:
+//     word-pop, scale-slam, clip-wipe, blur-focus, flash): ONE Dialogue per
+//     LINE, \an5\pos(lineCenter) anchoring, each word in its own {...}
+//     block carrying \fs (phrase scale) + \b (phrase weight) + \1c (accent
+//     for emphasis words) + \alpha (supporting muted tier, §27) + the
+//     entrance \t choreography. \t/\move times are MILLISECONDS RELATIVE
+//     TO THE DIALOGUE START. Per-word \fscx changes shift later words in the
+//     line (libass layout) — inherent, accepted (the v1.17 emitter had the
+//     same class of asymmetry).
 //   - Exit: \fad(0, exitMs) on every Dialogue (motion.ts exit window) —
 //     only when the composition actually ENDS inside the window (a
 //     window-clipped composition continues in the next chunk; fading at
@@ -39,14 +43,29 @@
 //   - \frz<blockRotateDeg> in every word block (diagonal presets).
 //
 // DELIBERATE ASS-approximation deviations from motion.ts (documented):
-//   - fade-rise/slide-y/push y-offsets are not representable inline (\pos
-//     is not animatable outside \move) → alpha-only entrance.
-//   - push-out phrase dim drops the upward drift (\pos static) → dim only.
-//   - easeOutBack/easeOutCubic easing curves → linear \t interpolation
-//     (word-pop overshoot via the two-phase 115%→100% recipe).
+//   - easeOutBack/easeOutCubic easing curves → linear \t/\move/\fad
+//     interpolation (word-pop overshoot via the two-phase 115%→100% recipe;
+//     scale-slam slam in ≤120ms).
+//   - push-out phrase dim drops the upward drift (static \pos) → dim only.
 //   - hold "active-word"/"active-accent" (per-frame state) → skipped; the
-//     emphasis accent color is static on emphasis words instead.
+//     emphasis accent color is static on emphasis words instead (matches
+//     the painter, which colors emphasis words permanently).
 //   - exit slide-down/scale-out/collapse/push-out variants → \fad (fade).
+//
+// v1.27.2 PREVIEW-PARITY fixes (the painter in kinetic/render.ts is the
+// source of truth — these bring the emitter BACK in line with it):
+//   - Style Outline → 0 and Spacing → 0: the painter draws NO stroke and
+//     measures with NO letter-spacing (trackingFrac is a dead preset field
+//     in the painter); the old 2px stroke + tracking made burned words
+//     visibly heavier/wider than the preview AND shifted libass line
+//     layout away from the measured geometry.
+//   - Supporting-tier settled alpha → 0.82 hardcoded (motion.ts's actual
+//     multiplier; preset.supportAlpha was never read by the painter).
+//   - push-out dimming fires for push entrance OR push-out exit (motion.ts's
+//     `entrance === "push" || exit === "push-out"` condition).
+//   - Per-word \b now thresholds the word's EFFECTIVE measured weight
+//     (geo word weight — inline emphasis bumps included), not the phrase
+//     weight.
 //
 // Self-contained CommonJS (ZERO Electron imports) so it is directly
 // testable: node -e "const K=require('./electron/kinetic-ass.js'); ..."
@@ -301,7 +320,9 @@ function emitKineticComposition(comp, geo, ctx) {
   );
   const stagger = preset.staggerMs || 0;
   const exitMs = preset.exitMs || 0;
-  const supportAlpha = preset.supportAlpha != null ? preset.supportAlpha : 0.78;
+  // NOTE: preset.supportAlpha is deliberately NOT read — motion.ts hardcodes
+  // the supporting-tier multiplier at 0.82 and the painter follows it (the
+  // preset field is dead data); see settledAlpha below.
   const accent = ctx.settings.accentOverride || preset.accentColor;
 
   // \fad(0, exitMs) only when the composition truly ENDS inside this window
@@ -333,22 +354,25 @@ function emitKineticComposition(comp, geo, ctx) {
     return Math.max(comp.startMs, info.wordStartAbs - 60) + delay;
   };
 
-  // Settled alpha (§27 supporting muted tier).
+  // Settled alpha (§27 supporting muted tier). motion.ts hardcodes the
+  // supporting multiplier at 0.82 — preset.supportAlpha is a dead field in
+  // the preview painter — mirror the painter's actual number (v1.27.2).
   const settledAlpha = (info) => {
-    const num = info.role === "supporting" ? supportAlpha : 1;
+    const num = info.role === "supporting" ? 0.82 : 1;
     return { num, hex: "&H" + hexByte(Math.round((1 - num) * 255)) + "&" };
   };
 
   // Per-word static visual tags: \fs (the measured phrase font), \b (the
-  // plan phrase weight — inline emphasis weights are baked into the plan),
+  // word's EFFECTIVE measured weight — inline emphasis bumps included),
   // \1c (accent for emphasis words), \frz (diagonal block rotation).
   const visualTags = (info, gw) => {
     const phraseWeight =
       info.phrase && typeof info.phrase.weight === "number"
         ? info.phrase.weight
         : preset.baseWeight;
+    const effWeight = Number(gw.weight) > 0 ? Math.round(Number(gw.weight)) : phraseWeight;
     const colorBgr = info.emphasis ? hexToAssBgr(accent) : hexToAssBgr(ctx.textColor);
-    let s = `\\fs${Math.round(Number(gw.fontPx) || 40)}\\b${phraseWeight >= 600 ? 1 : 0}\\1c${colorBgr}&`;
+    let s = `\\fs${Math.round(Number(gw.fontPx) || 40)}\\b${effWeight >= 600 ? 1 : 0}\\1c${colorBgr}&`;
     if (preset.blockRotateDeg) s += `\\frz${preset.blockRotateDeg}`;
     return s;
   };
@@ -380,7 +404,9 @@ function emitKineticComposition(comp, geo, ctx) {
     return last;
   };
   const pushDimTags = (info, sRel) => {
-    if (preset.entrance !== "push") return "";
+    // motion.ts condition: push entrance OR push-out exit (either arms the
+    // dim; the upward drift needs \pos animation → dim-only approximation).
+    if (preset.entrance !== "push" && preset.exit !== "push-out") return "";
     const peAbs = phraseLastEndAbs(info.phraseIdx);
     if (!Number.isFinite(peAbs)) return "";
     const dimByte = hexByte(Math.round((1 - settledAlpha(info).num * 0.55) * 255));
@@ -391,7 +417,10 @@ function emitKineticComposition(comp, geo, ctx) {
   const dlg = (start, end, text) =>
     `Dialogue: 0,${assFmtTime(start / 1000)},${assFmtTime(end / 1000)},KineticC${ctx.styleIdx},,0,0,0,,${text}`;
 
-  // motion.ts from-vector for the x-motion entrances (per-word \move).
+  // motion.ts from-vector for the positional entrances (per-word \move).
+  // x-motion: slide-x/burst/converge. y-motion (v1.27.2): fade-rise/slide-y/
+  // push — the exact motion.ts e=0 offsets, rising/alternating/pushing into
+  // place instead of the old alpha-only degradation.
   const moveFromVector = (gw, info, cx, cy) => {
     const idx = gw.wordIdx | 0;
     if (preset.entrance === "slide-x") {
@@ -407,20 +436,45 @@ function emitKineticComposition(comp, geo, ctx) {
         y0: cy + Math.round(v.dy * 46 * ctx.energy * re),
       };
     }
-    // converge — words fly IN from outside toward their anchor.
-    const v = burstVector(idx);
-    return {
-      x0: cx + Math.round(v.dx * 90 * ctx.energy),
-      y0: cy + Math.round(v.dy * 60 * ctx.energy),
-    };
+    if (preset.entrance === "converge") {
+      // converge — words fly IN from outside toward their anchor.
+      const v = burstVector(idx);
+      return {
+        x0: cx + Math.round(v.dx * 90 * ctx.energy),
+        y0: cy + Math.round(v.dy * 60 * ctx.energy),
+      };
+    }
+    if (preset.entrance === "fade-rise") {
+      // motion.ts: offsetY = (1-e) * 36 * energy * roleEnergy (rises up).
+      return {
+        x0: cx,
+        y0: cy + Math.round(36 * ctx.energy * roleEnergyOf(info.role)),
+      };
+    }
+    if (preset.entrance === "slide-y") {
+      // motion.ts: offsetY = (1-e) * 42 * energy * (idx even ? up : down).
+      return {
+        x0: cx,
+        y0: cy + Math.round(42 * ctx.energy * (idx % 2 === 0 ? -1 : 1)),
+      };
+    }
+    // push — motion.ts: offsetY = (1-e) * 30 * energy (phrase rises in).
+    return { x0: cx, y0: cy + Math.round(30 * ctx.energy) };
   };
 
   const events = [];
+  // v1.27.2: ANY positional entrance rides the per-word \move path (x-motion
+  // slide-x/burst/converge; y-motion fade-rise/slide-y/push; typewriter's
+  // reveal IS the Dialogue start). Scale/blur/clip entrances keep the
+  // one-Dialogue-per-LINE inline form (their transforms are inline tags).
   const perWordMode =
     preset.entrance === "slide-x" ||
     preset.entrance === "burst" ||
     preset.entrance === "converge" ||
-    preset.entrance === "typewriter";
+    preset.entrance === "typewriter" ||
+    preset.entrance === "fade-rise" ||
+    preset.entrance === "slide-y" ||
+    preset.entrance === "push";
 
   if (perWordMode) {
     // ── PER-WORD MODE: ONE Dialogue PER WORD (\move carries the x-motion;
@@ -458,6 +512,7 @@ function emitKineticComposition(comp, geo, ctx) {
         }
       }
       head += emphasisTags(info, d);
+      head += pushDimTags(info, d);
       const fadeIn = settled || instant ? 0 : entranceMs;
       if (fadeIn > 0 || fadeOutMs > 0) head += `\\fad(${fadeIn},${fadeOutMs})`;
       head += "}";
@@ -525,8 +580,10 @@ function emitKineticComposition(comp, geo, ctx) {
             case "fade-rise":
             case "slide-y":
             case "push":
-              // y-offset motion is not representable inline (\pos is not
-              // animatable) → alpha-only animation (documented deviation).
+              // DEFENSIVE FALLBACK ONLY — these entrances ride PER-WORD mode
+              // (real \move y-motion) and never reach the inline switch; if
+              // the per-word routing is ever disabled again, alpha-only is
+              // the documented inline degradation.
               block += "\\alpha&HFF&";
               ts += `\\t(${d},${d + entranceMs},\\alpha${settled.hex})`;
               break;
@@ -587,16 +644,21 @@ function emitKineticComposition(comp, geo, ctx) {
   if (events.length === 0) return null;
 
   // ── ONE ASS Style per composition (Alignment 5 middle-center; all real
-  // positioning is absolute inline \pos/\move — margins are zero). Thin
-  // text stroke for readability (directive §26 contrast): the canvas
-  // presets draw shadow-only, the ASS mirror keeps a 2px-equivalent stroke. ──
+  // positioning is absolute inline \pos/\move — margins are zero). v1.27.2
+  // preview parity: the canvas painter draws shadow-ONLY — NO text stroke
+  // and NO letter-spacing (it never reads trackingFrac, and the geometry was
+  // measured without it) — so Outline=0/Spacing=0 or libass renders heavier,
+  // wider words than the preview and re-flows lines away from the measured
+  // geometry. Shadow ≈ the painter's rgba(0,0,0,0.55) soft glow → BackColour
+  // at 0.55 alpha with the same 3px·hScale depth the native Rust renderer
+  // bakes into its strips. ──
   const hScale = ctx.height / 1080;
   const fontPx = Math.round(Number(geo.fontPx) || 40);
   const fontName = String(ctx.resolveFont(ctx.settings.fontOverride || preset.fontId) || "Segoe UI");
   const bold = preset.emphasisWeight >= 600 ? -1 : 0;
-  const outline = Math.max(1, Math.round(2 * hScale));
+  const outline = 0;
   const shadowVal = preset.shadow ? Math.max(1, Math.round(3 * hScale)) : 0;
-  const spacing = Math.round((preset.trackingFrac || 0) * fontPx);
+  const spacing = 0;
   const primary = hexToAssColor(ctx.textColor);
   const outlineColour = hexToAssColor("#000000");
   // Canvas painter shadow: rgba(0,0,0,0.55) → BackColour at alpha 0.55.

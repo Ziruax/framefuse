@@ -479,10 +479,19 @@ export function buildKineticPlan(
       if (w.endMs <= w.startMs) w.endMs = w.startMs + 120;
     }
 
+    // v1.27.2 parity fix: the composition must live at least as long as its
+    // LAST SPOKEN WORD — word ends can run past the cue end (Groq segments,
+    // edited cues); a composition that ends mid-word makes the painter drop
+    // the word entirely (its entrance never begins inside the window) and
+    // the ASS/Rust exports drop it identically. Extending the end keeps
+    // preview and export showing the full caption.
+    const lastWordEndMs = wordPlans.reduce((m, w) => Math.max(m, w.endMs), -Infinity);
+    const compEndMs = Math.max(seg.endMs, seg.startMs + 400, lastWordEndMs);
+
     compositions.push({
       cueIndex: seg.cueIndices[0],
       startMs: seg.startMs,
-      endMs: Math.max(seg.endMs, seg.startMs + 400),
+      endMs: compEndMs,
       presetId: preset.id,
       classification: label,
       intensity,
