@@ -1979,6 +1979,89 @@ export interface HeadlineExportGeometry {
   lines: HeadlineExportLine[];
 }
 
+// ---------------------------------------------------------------------------
+// v1.28 kinetic .ass sidecar payload — extracted from the burn-in builder so
+// page.tsx can reuse the EXACT same plan + measured geometry WITHOUT adding
+// new module edges to the app-router entry (a direct dynamic import of the
+// kinetic modules from page.tsx blew up the webpack build worker's memory).
+// ---------------------------------------------------------------------------
+
+/** Build the kinetic payload for the .ass sidecar export: the same
+ *  deterministic plan + DOM-measured geometry at the export resolution the
+ *  burn-in path ships. Returns empty fields when kinetic is off or the cues
+ *  have no word timings (the sidecar then stays a plain-caption export). */
+export async function buildKineticSidecarPayload(
+  cues: Array<{
+    startMs: number;
+    endMs: number;
+    text: string;
+    words?: Array<{ text: string; startMs: number; endMs: number }>;
+  }>,
+  captionSettings: {
+    kinetic?: KineticCaptionSettings;
+    fontSizeScale?: number;
+    customColor?: string;
+  },
+  width: number,
+  height: number,
+): Promise<{
+  kineticCompositions?: KineticCuePayload[];
+  kineticGeometry?: KineticGeoComposition[];
+}> {
+  const kineticSettings = captionSettings.kinetic;
+  if (!kineticSettings?.enabled || !cues.some((c) => c.words?.length)) {
+    return {};
+  }
+  await ensureKineticFontsLoaded();
+  const kineticCues: KineticCueInput[] = cues.map((c) => ({
+    startMs: c.startMs,
+    endMs: c.endMs,
+    text: c.text,
+    words: c.words?.map((w) => ({
+      text: w.text,
+      startMs: w.startMs,
+      endMs: w.endMs,
+    })),
+  }));
+  const plan = buildKineticPlan(kineticCues, kineticSettings);
+  const compositions = plan.compositions.map<KineticCuePayload>((comp) => ({
+    presetId: comp.presetId,
+    classification: comp.classification,
+    intensity: comp.intensity,
+    startMs: comp.startMs,
+    endMs: comp.endMs,
+    words: comp.words.map((w) => ({
+      text: w.text,
+      startMs: w.startMs,
+      endMs: w.endMs,
+      role: w.role,
+      emphasis: w.emphasis,
+      phraseIndex: w.phraseIndex,
+    })),
+    phrases: comp.phrases.map((p) => ({
+      role: p.role,
+      scale: p.scale,
+      weight: p.weight,
+      align: p.align,
+      indentFrac: p.indentFrac,
+    })),
+  }));
+  const geometry =
+    measureKineticPlanDom(
+      plan,
+      kineticSettings,
+      {
+        fontSizeScale: captionSettings.fontSizeScale || 1,
+        customColor: captionSettings.customColor,
+        fontOverride: kineticSettings.fontOverride,
+        accentOverride: kineticSettings.accentOverride,
+      },
+      width,
+      height,
+    ) ?? undefined;
+  return { kineticCompositions: compositions, kineticGeometry: geometry };
+}
+
 /**
  * Measure every headline item at the EXPORT resolution using the same font
  * strings + wrap rules the painter uses — the export payload carries this

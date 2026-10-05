@@ -53,6 +53,7 @@ import {
   type SfxItem,
 } from "@/lib/merger/sfx";
 import {
+  buildKineticSidecarPayload,
   exportNative,
   isElectron,
   measureHeadlinesForExport,
@@ -3305,63 +3306,15 @@ export default function Page() {
       // v1.28 kinetic parity: the sidecar carries the SAME kinetic
       // choreography the burn-in exports carry (plan + measured geometry at
       // the export resolution) — before this, kinetic projects exported a
-      // plain-caption .ass.
-      let kineticCompositions: unknown[] | undefined;
-      let kineticGeometry: unknown[] | undefined;
-      if (captionSettings.kinetic?.enabled && subtitles.cues.some((c) => c.words?.length)) {
-        const { buildKineticPlan } = await import("@/lib/merger/kinetic/engine");
-        const { measureKineticPlanDom, ensureKineticFontsLoaded } = await import(
-          "@/lib/merger/kinetic/render"
-        );
-        type KineticCueInput = Parameters<typeof buildKineticPlan>[0][number];
-        await ensureKineticFontsLoaded();
-        const kineticCues: KineticCueInput[] = subtitles.cues.map((c) => ({
-          startMs: c.startMs,
-          endMs: c.endMs,
-          text: c.text,
-          words: c.words?.map((w) => ({
-            text: w.text,
-            startMs: w.startMs,
-            endMs: w.endMs,
-          })),
-        }));
-        const plan = buildKineticPlan(kineticCues, captionSettings.kinetic);
-        kineticCompositions = plan.compositions.map((comp) => ({
-          presetId: comp.presetId,
-          classification: comp.classification,
-          intensity: comp.intensity,
-          startMs: comp.startMs,
-          endMs: comp.endMs,
-          words: comp.words.map((w) => ({
-            text: w.text,
-            startMs: w.startMs,
-            endMs: w.endMs,
-            role: w.role,
-            emphasis: w.emphasis,
-            phraseIndex: w.phraseIndex,
-          })),
-          phrases: comp.phrases.map((p) => ({
-            role: p.role,
-            scale: p.scale,
-            weight: p.weight,
-            align: p.align,
-            indentFrac: p.indentFrac,
-          })),
-        }));
-        kineticGeometry =
-          measureKineticPlanDom(
-            plan,
-            captionSettings.kinetic,
-            {
-              fontSizeScale: captionSettings.fontSizeScale || 1,
-              customColor: captionSettings.customColor,
-              fontOverride: captionSettings.kinetic.fontOverride,
-              accentOverride: captionSettings.kinetic.accentOverride,
-            },
-            dims.w,
-            dims.h,
-          ) ?? undefined;
-      }
+      // plain-caption .ass. The builder lives in native.ts (already in the
+      // static graph — importing the kinetic modules directly here blew up
+      // the webpack build worker's memory).
+      const { kineticCompositions, kineticGeometry } = await buildKineticSidecarPayload(
+        subtitles.cues,
+        captionSettings,
+        dims.w,
+        dims.h,
+      );
       const res = await api.exportAssFile({
         cues: subtitles.cues.map((c) => ({
           startMs: c.startMs,

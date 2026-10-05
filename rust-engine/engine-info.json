@@ -13,13 +13,13 @@
     "success": true,
     "engineUsed": "rust-gpu",
     "encoderName": "libx264",
-    "durationMs": 4770,
+    "durationMs": 5025,
     "frames": 150,
-    "compositorMs": 3490,
-    "encodeMs": 1,
-    "decodeMs": 19,
-    "audioMs": 104,
-    "sizeBytes": 885554,
+    "compositorMs": 3485,
+    "encodeMs": 9,
+    "decodeMs": 21,
+    "audioMs": 100,
+    "sizeBytes": 886259,
     "adapter": "Microsoft Basic Render Driver",
     "ffmpegFamily": "61/61/59/8/5"
   },
@@ -38,12 +38,12 @@
     },
     "format": {
       "duration": "5.013000",
-      "size": "885554"
+      "size": "886259"
     },
-    "outputBytes": 885554
+    "outputBytes": 886259
   },
   "assertionsPassed": true,
   "assertionFailures": [],
-  "wallMs": 5172,
-  "generatedAt": "2026-10-05T05:43:45.318Z"
+  "wallMs": 5417,
+  "generatedAt": "2026-10-05T07:59:21.583Z"
 }
