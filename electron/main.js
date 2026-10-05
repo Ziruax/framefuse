@@ -1103,9 +1103,12 @@ ipcMain.handle("whisper:groq-set", async (_event, payload) => {
   return groqConfigPayload();
 });
 
-/** Verify a key (the saved one, or a candidate passed in for validation
- *  BEFORE saving). { ok, message, whisperModels } — whisperModels is the
- *  account's available whisper-* ids (informational). */
+/** Verify a key END TO END (the saved one, or a candidate passed in for
+ * validation BEFORE saving). { ok, message, whisperModels } — v1.30: the
+ * check is GET /models (auth) + a REAL 1-second transcription probe on
+ * /audio/transcriptions with the user's selected whisper model, so
+ * "key works" means transcription actually works. whisperModels is the
+ * account's available whisper-* ids (informational). */
 ipcMain.handle("whisper:groq-test", async (_event, payload) => {
   const cfg = GQ.loadGroqConfig(app.getPath("userData"));
   const candidate =
@@ -1119,7 +1122,13 @@ ipcMain.handle("whisper:groq-test", async (_event, payload) => {
       whisperModels: [],
     };
   }
-  return GQ.groqTestKey(candidate);
+  // v1.30: probe with the model the app will actually use (payload's pick,
+  // else the saved config's) — a per-model access problem surfaces here.
+  const model =
+    payload && typeof payload.model === "string" && payload.model
+      ? payload.model
+      : cfg.model;
+  return GQ.groqTestKey(candidate, { model });
 });
 
 // ── v1.20 GEMINI SCRIPT WRITING ──────────────────────────────────────────

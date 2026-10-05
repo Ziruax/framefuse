@@ -277,7 +277,13 @@ interface GroqVerboseJson {
   words?: GroqWord[];
 }
 
-/** One Groq Whisper call → verbose JSON (segments + word timestamps). */
+/** One Groq Whisper call → verbose JSON (segments + word timestamps).
+ *  v1.30: Groq's auth failures are 403 {"error":{"message":"Forbidden"}}
+ *  (JSON — live-verified) and NEVER appear in the user's Groq console
+ *  request logs, so the error text must carry the masked key fingerprint
+ *  + actionable guidance instead of a raw status dump. A NON-JSON 401/403
+ *  is a network-level block (VPN/proxy/Cloudflare) — different diagnosis,
+ *  the key was never checked. */
 async function groqWhisper(
   wavPath: string,
   groqKey: string,
@@ -298,9 +304,33 @@ async function groqWhisper(
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
+    let api = "";
+    let isJson = false;
+    try {
+      api = (JSON.parse(body) as { error?: { message?: string } }).error?.message ?? "";
+      isJson = true;
+    } catch { /* non-JSON body */ }
+    const raw = api ? ` [${api}]` : "";
+    const masked =
+      groqKey.length <= 11
+        ? `${groqKey.slice(0, 3)}…`
+        : `${groqKey.slice(0, 7)}…${groqKey.slice(-4)}`;
+    if (res.status === 401 || res.status === 403) {
+      if (!isJson) {
+        throw new TranscribeFailure(
+          `The request to api.groq.com was BLOCKED before reaching Groq (status ${res.status}, non-JSON response — VPN, proxy, firewall or Cloudflare) — the key was never checked${raw}`,
+          502,
+        );
+      }
+      throw new TranscribeFailure(
+        `Groq rejected the API key (${masked}) — re-save a valid key from console.groq.com → API Keys${raw}`,
+        401,
+      );
+    }
+    // 404 (model access), 413 (too large), 429 (rate limit), 5xx…
     throw new TranscribeFailure(
-      `Groq Whisper ${res.status}: ${body.slice(0, 300)}`,
-      res.status === 401 ? 401 : 502,
+      `Groq Whisper ${res.status}${raw ? ` ${raw}` : `: ${body.slice(0, 200)}`}`,
+      res.status === 429 ? 429 : 502,
     );
   }
   return (await res.json()) as GroqVerboseJson;

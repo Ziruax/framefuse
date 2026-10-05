@@ -98,6 +98,14 @@ export function normalizeTextProvider(raw: unknown): TextProviderRequest {
 // ---------------------------------------------------------------------------
 
 const GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_TRANSCRIBE_URL = "https://api.groq.com/openai/v1/audio/transcriptions";
+
+/** v1.30 — 1 second of 16 kbps mono silence (2,384 B) as base64. The key
+ *  test POSTs this to /audio/transcriptions so "key works" is verified with
+ *  a REAL transcription request (same multipart contract as production).
+ *  Groq's minimum billed length is 10s → one Test click bills ~$0.0001. */
+const PROBE_MP3_B64 =
+  "SUQzBAAAAAAAIlRTU0UAAAAOAAADTGF2ZjYxLjcuMTAzAAAAAAAAAAAAAAD/81jAAAAAAAAAAAAASW5mbwAAAA8AAAAeAAAJJAAbGxsjIyMrKyszMzMzOzs7QkJCSkpKSlJSUlpaWmJiYmJqampycnJ6enp6gYGBiYmJkZGRkZmZmaGhoampqamxsbG5ubnAwMDAyMjI0NDQ2NjY2ODg4Ojo6PDw8PD4+Pj///8AAAAATGF2YzYxLjE5AAAAAAAAAAAAAAAAJALAAAAAAAAACSSDldJ3AAAAAAAAAAAAAAD/8yjEAAAAA0gAAAAATEFNRTMuMTAwVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjEOwAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjEdgAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjEsQAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
 const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta";
 const PROVIDER_TIMEOUT_MS = 120_000;
 
@@ -210,6 +218,7 @@ export async function providerChatText(
 export async function testProviderKey(
   provider: "groq" | "gemini",
   key: string,
+  opts?: { model?: string },
 ): Promise<{ ok: boolean; message: string; models: string[] }> {
   const trimmed = key.trim();
   if (!trimmed) return { ok: false, message: "No key provided", models: [] };
@@ -218,21 +227,41 @@ export async function testProviderKey(
   // auth-rejected request never shows up in the provider's usage console).
   const maskKey = (k: string, head: number) =>
     k.length <= head + 4 ? `${k.slice(0, 3)}…` : `${k.slice(0, head)}…${k.slice(-4)}`;
-  const classifyGroq = (status: number, body: string) => {
-    let api = "";
+  /** v1.30: parse the error message out of a provider body, and note
+   *  whether the body is the provider's JSON envelope at all. Groq's own
+   *  auth failures are ALWAYS JSON (403 {"error":{"message":"Forbidden"}}) —
+   *  a non-JSON 401/403 is a network-level block (VPN/proxy/Cloudflare)
+   *  that never reached the provider. */
+  const parseApiError = (body: string): { api: string; isJson: boolean } => {
     try {
-      api = (JSON.parse(body) as { error?: { message?: string } }).error?.message ?? "";
-    } catch { /* non-JSON */ }
+      return {
+        api: (JSON.parse(body) as { error?: { message?: string } }).error?.message ?? "",
+        isJson: true,
+      };
+    } catch {
+      return { api: "", isJson: false };
+    }
+  };
+  const classifyGroq = (status: number, body: string) => {
+    const { api, isJson } = parseApiError(body);
     const raw = api ? ` [${api}]` : "";
     if (status === 401 || status === 403) {
+      // Non-JSON (HTML challenge / plain text): the request was blocked
+      // BEFORE Groq — the key was never checked, and Groq's console will
+      // rightly show nothing. Never call this a key problem.
+      if (!isJson) {
+        return `The request to api.groq.com was BLOCKED before reaching Groq (status ${status}, non-JSON response — VPN, proxy, firewall or Cloudflare) — the key was never checked${raw}`;
+      }
       return `Groq rejected the API key (${maskKey(trimmed, 7)}) — re-save a valid key from console.groq.com → API Keys${raw}`;
     }
+    if (status === 404) return `Groq model not found — this model may not be enabled for your key${raw}`;
     if (status === 429) return `Groq rate limit reached — wait a moment and test again${raw}`;
     if (status >= 500) return `Groq server error (${status}) — usually transient, try again${raw}`;
     return `Groq request failed (HTTP ${status})${raw}`;
   };
   try {
     if (provider === "groq") {
+      // Step 1 — does the key authenticate at all?
       const res = await fetchWithTimeout("https://api.groq.com/openai/v1/models", {
         headers: { Authorization: `Bearer ${trimmed}` },
       });
@@ -244,9 +273,39 @@ export async function testProviderKey(
       const whisper = (j.data ?? [])
         .map((m) => m.id ?? "")
         .filter((id) => id.startsWith("whisper"));
+      // Step 2 (v1.30) — a REAL transcription probe: POST the embedded
+      // 1-second silent MP3 to /audio/transcriptions with the selected
+      // whisper model (same endpoint + multipart contract as production
+      // transcription, per console.groq.com/docs/speech-to-text). "Key
+      // works" now means TRANSCRIPTION works, end to end.
+      const model =
+        opts?.model?.trim() && GROQ_WHISPER_MODELS.some((m) => m.id === opts?.model?.trim())
+          ? (opts?.model?.trim() as string)
+          : WHISPER_DEFAULT;
+      const probeForm = new FormData();
+      probeForm.append(
+        "file",
+        new Blob([Buffer.from(PROBE_MP3_B64, "base64")], { type: "audio/mpeg" }),
+        "probe.mp3",
+      );
+      probeForm.append("model", model);
+      probeForm.append("response_format", "json");
+      const probeRes = await fetchWithTimeout(GROQ_TRANSCRIBE_URL, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${trimmed}` },
+        body: probeForm,
+      });
+      if (!probeRes.ok) {
+        const body = await probeRes.text().catch(() => "");
+        return {
+          ok: false,
+          message: `The key authenticates, but a real transcription test failed: ${classifyGroq(probeRes.status, body)}`,
+          models: whisper,
+        };
+      }
       return {
         ok: true,
-        message: `Key works — ${whisper.length ? `Whisper available: ${whisper.join(", ")}` : "key authenticated"}`,
+        message: `Key works — real transcription verified end to end (${model}; the key, the model and the upload all passed)`,
         models: whisper,
       };
     }
@@ -258,10 +317,7 @@ export async function testProviderKey(
       // Google returns 400 with "API key not valid" for bad keys (and
       // 401/403 for restricted ones) — route all key-shaped failures to
       // the same actionable text.
-      let api = "";
-      try {
-        api = (JSON.parse(body) as { error?: { message?: string } }).error?.message ?? "";
-      } catch { /* non-JSON */ }
+      const { api, isJson } = parseApiError(body);
       const keyish =
         res.status === 401 ||
         res.status === 403 ||
@@ -270,6 +326,13 @@ export async function testProviderKey(
         return {
           ok: false,
           message: `Gemini rejected the API key (${maskKey(trimmed, 4)}) — re-save a valid key from aistudio.google.com/apikey${api ? ` [${api}]` : ""}`,
+          models: [],
+        };
+      }
+      if (!isJson && (res.status === 401 || res.status === 403)) {
+        return {
+          ok: false,
+          message: `The request to Google was BLOCKED before reaching the Gemini API (status ${res.status}, non-JSON response — VPN, proxy or firewall) — the key was never checked`,
           models: [],
         };
       }

@@ -96,18 +96,26 @@ function normalizeTextModel(id) {
 /** Classify a Groq chat-completion failure into an actionable message.
  *  v1.29: `maskedKey` ("gsk_AbC…9xY2") is appended to the 401/403 text so
  *  the user can see WHICH stored key was rejected (auth-rejected requests
- *  never show up in console.groq.com usage). */
+ *  never show up in console.groq.com usage).
+ *  v1.30: a 401/403 with a NON-JSON body is a network-level block
+ *  (VPN/proxy/Cloudflare) — the request never reached Groq, so the key was
+ *  never checked (live-verified: Groq's own auth failures are always JSON). */
 function classifyChatError(status, bodyText, maskedKey) {
   let apiMessage = "";
+  let bodyIsJson = false;
   try {
     const j = JSON.parse(bodyText);
     apiMessage = j?.error?.message || j?.message || "";
+    bodyIsJson = true;
   } catch (_) { /* non-JSON body */ }
   const raw = apiMessage ? ` [${apiMessage}]` : "";
   const keyPart = maskedKey ? ` (${maskedKey})` : "";
   switch (status) {
     case 401:
     case 403:
+      if (!bodyIsJson) {
+        return `The request to api.groq.com was BLOCKED before reaching Groq (status ${status}, non-JSON response — VPN, proxy, firewall or Cloudflare) — the key was never checked${raw}`;
+      }
       return `Groq rejected the API key${keyPart} — re-save the key in Settings → Default AI models (console.groq.com → API Keys)${raw}`;
     case 404:
       return `Groq model not found — this chat model may not be enabled for your key${raw}`;

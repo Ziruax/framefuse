@@ -20,6 +20,9 @@ export async function POST(req: NextRequest) {
     );
   }
   const key = typeof body.key === "string" ? body.key : "";
-  const r = await testProviderKey(provider, key);
+  // v1.30: the Groq test now probes a REAL transcription with the selected
+  // whisper model — the Settings tab sends its sttGroqModel pick.
+  const model = typeof body.model === "string" ? body.model : undefined;
+  const r = await testProviderKey(provider, key, { model });
   return NextResponse.json(r, { status: r.ok ? 200 : 400 });
 }

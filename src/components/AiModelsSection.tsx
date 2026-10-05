@@ -142,7 +142,7 @@ function ModelSelect({
 type KeyBridge = {
   whisperGroqGet?: () => Promise<{ hasKey: boolean; maskedKey: string; model?: string }>;
   whisperGroqSet?: (p: { apiKey?: string; model?: string }) => Promise<{ hasKey: boolean; maskedKey: string }>;
-  whisperGroqTest?: (p: { apiKey?: string }) => Promise<{ ok: boolean; message: string }>;
+  whisperGroqTest?: (p: { apiKey?: string; model?: string }) => Promise<{ ok: boolean; message: string }>;
   geminiGet?: () => Promise<{ hasKey: boolean; maskedKey: string }>;
   geminiSet?: (p: { apiKey: string }) => Promise<{ hasKey: boolean; maskedKey: string }>;
   geminiTest?: (p: { apiKey?: string }) => Promise<{ ok: boolean; message: string }>;
@@ -378,6 +378,9 @@ function KeyRow({ provider }: { provider: "groq" | "gemini" }) {
     //     localStorage mirror is NEVER sent from desktop — it may be a
     //     different key, which is exactly the v1.28 "test passed but
     //     transcription said the key was rejected" bug.
+    // v1.30: the Groq test rides the selected whisper model — the main
+    // process probes a REAL 1-second transcription on that model, so
+    // "key works" means transcription works (auth + model + upload).
     const typed = editing ? stripWrappingQuotes(input) : "";
     if (typed) {
       const problem = isGroq ? groqKeyProblem(typed) : geminiKeyProblem(typed);
@@ -395,7 +398,9 @@ function KeyRow({ provider }: { provider: "groq" | "gemini" }) {
         // Desktop — the main-process check (real https, no CORS). An empty
         // payload means "test the key saved on this device".
         const r = isGroq
-          ? await bridge.whisperGroqTest?.(typed ? { apiKey: typed } : {})
+          ? await bridge.whisperGroqTest?.(
+              typed ? { apiKey: typed, model: ai.sttGroqModel } : { model: ai.sttGroqModel },
+            )
           : await bridge.geminiTest?.(typed ? { apiKey: typed } : {});
         ok = !!r?.ok;
         message = r?.message ?? "";
@@ -406,7 +411,11 @@ function KeyRow({ provider }: { provider: "groq" | "gemini" }) {
         const res = await fetch("/api/ai/test", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ provider, key: candidate }),
+          body: JSON.stringify({
+            provider,
+            key: candidate,
+            ...(isGroq && ai.sttGroqModel ? { model: ai.sttGroqModel } : {}),
+          }),
         });
         const j = (await res.json()) as { ok?: boolean; message?: string; error?: string };
         ok = res.ok && !!j.ok;
@@ -424,7 +433,7 @@ function KeyRow({ provider }: { provider: "groq" | "gemini" }) {
     } finally {
       setBusy("");
     }
-  }, [editing, input, isGroq, savedKey, provider, bridge]);
+  }, [editing, input, isGroq, savedKey, provider, bridge, ai.sttGroqModel]);
 
   const remove = useCallback(async () => {
     setBusy("save");

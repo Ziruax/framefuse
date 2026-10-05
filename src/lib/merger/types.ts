@@ -1516,8 +1516,10 @@ declare global {
       whisperGroqGet?: () => Promise<GroqConfigPayload>;
       /** { apiKey?: string ("" clears), model?: string } → same payload as get. */
       whisperGroqSet?: (p: { apiKey?: string; model?: string }) => Promise<GroqConfigPayload>;
-      /** { apiKey?: string } → { ok, message, whisperModels } — key check. */
-      whisperGroqTest?: (p: { apiKey?: string }) => Promise<{
+      /** { apiKey?, model? } → { ok, message, whisperModels } — v1.30: the
+       *  check probes a REAL 1-second transcription with the given whisper
+       *  model (empty apiKey = test the key saved on this device). */
+      whisperGroqTest?: (p: { apiKey?: string; model?: string }) => Promise<{
         ok: boolean;
         message: string;
         whisperModels: string[];

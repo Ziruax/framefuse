@@ -163,9 +163,11 @@ function geminiConfigPayload(userDataDir) {
  *  never show up in usage metrics). */
 function classifyGeminiError(status, bodyText, maskedKey) {
   let apiMessage = "";
+  let bodyIsJson = false;
   try {
     const j = JSON.parse(bodyText);
     apiMessage = j?.error?.message || j?.message || "";
+    bodyIsJson = true;
   } catch (_) { /* non-JSON body */ }
   const raw = apiMessage ? ` [${apiMessage}]` : "";
   const keyPart = maskedKey ? ` (${maskedKey})` : "";
@@ -180,6 +182,11 @@ function classifyGeminiError(status, bodyText, maskedKey) {
       return `Gemini rejected the request (invalid request — check the prompt and parameters)${raw}`;
     case 401:
     case 403:
+      // v1.30: a non-JSON 401/403 (HTML/plain) is a network-level block —
+      // the request never reached Google; the key was never checked.
+      if (!bodyIsJson) {
+        return `The request to Google was BLOCKED before reaching the Gemini API (status ${status}, non-JSON response — VPN, proxy or firewall) — the key was never checked${raw}`;
+      }
       return `Gemini rejected the API key${keyPart} — re-save the key in Settings → Default AI models (aistudio.google.com/apikey)${raw}`;
     case 404:
       return `Gemini model not found — pick another model in the dropdown${raw}`;

@@ -263,22 +263,39 @@ async function extractAudioForGroq(ffmpegPath, inputPath, outDir, onStage) {
  *  do NOT appear in console.groq.com usage, so without the fingerprint the
  *  "my key is accurate and no API call was made" confusion is unresolvable
  *  (the v1.28 Test button could pass on a localStorage key while
- *  transcription sent a DIFFERENT device key). */
+ *  transcription sent a DIFFERENT device key).
+ *  v1.30: a 401/403 whose body is NOT Groq's JSON error envelope is a
+ *  network-level block (Cloudflare HTML challenge, VPN, corporate proxy,
+ *  TLS interception) — the request never REACHED Groq, so the key was never
+ *  checked. Live-verified: Groq's own auth rejection is always JSON
+ *  (403 {"error":{"message":"Forbidden"}}) — an HTML/plain 403 is someone
+ *  else's. Classifying those as "rejected key" is exactly what sent the
+ *  user to a console that CAN'T show the failure. */
 function classifyGroqError(status, bodyText, maskedKey) {
   let apiMessage = "";
+  let bodyIsJson = false;
   try {
     const j = JSON.parse(bodyText);
     apiMessage = j?.error?.message || j?.message || "";
+    bodyIsJson = true;
   } catch (_) { /* non-JSON body */ }
   const raw = apiMessage ? ` [${apiMessage}]` : "";
   const keyPart = maskedKey ? ` (${maskedKey})` : "";
   switch (status) {
     case 401:
     case 403:
+      // NON-JSON body (HTML challenge page / plain text): blocked in front
+      // of Groq. Groq never saw the request — console.groq.com correctly
+      // shows nothing, and the key is NOT the problem.
+      if (!bodyIsJson) {
+        return `The request to api.groq.com was BLOCKED before reaching Groq (status ${status}, non-JSON response — VPN, proxy, firewall or Cloudflare) — the key was never checked${raw}`;
+      }
       // Groq returns 403 (not 401) for invalid/revoked keys — live-verified
       // v1.29 against api.groq.com: a bogus Bearer gets
       // 403 {"error":{"message":"Forbidden"}}. The docs' 401 is the
       // "missing credentials" twin; both mean the key was refused.
+      // (Rejected requests never appear in console.groq.com request logs —
+      // an empty log there neither confirms nor denies this failure.)
       return `Groq rejected the API key${keyPart} — re-save the key in Settings → Default AI models (console.groq.com → API Keys)${raw}`;
     case 404:
       return `Groq model not found — whisper-large-v3 access may not be enabled for this key${raw}`;
@@ -571,9 +588,107 @@ function groqTranscribeOnce(o, modelId, wantWordTimestamps, language) {
   });
 }
 
-/** Validate an API key (GET /openai/v1/models). Resolves
- *  { ok:boolean, message:string, whisperModels:string[] }. */
-function groqTestKey(apiKey) {
+// ---------------------------------------------------------------------------
+// v1.30 END-TO-END KEY PROBE — a REAL transcription request.
+//
+// GET /models proves the key AUTHENTICATES, but the user-facing complaint is
+// "transcription is not working". The probe POSTs a tiny embedded 1-second
+// silent MP3 to /openai/v1/audio/transcriptions with the user's selected
+// whisper model — the exact same endpoint, auth header and multipart field
+// contract the real transcription uses (per console.groq.com/docs/speech-to-text:
+// POST multipart file + model; Bearer key). Three distinct outcomes:
+//   • 401/403 JSON  → Groq refused the key (this NEVER appears in the
+//     console's request logs — an empty log can't rule it out)
+//   • 401/403 non-JSON → blocked before Groq (VPN/proxy/Cloudflare)
+//   • 200 → the key authenticates AND transcription works, end to end.
+// The probe is 2.3 KB of 16 kbps silence — Groq's minimum billed length is
+// 10s, so one Test click bills 10s of whisper time (~$0.0001 on turbo).
+// ---------------------------------------------------------------------------
+
+/** 1s of 16 kbps mono silence (2,384 B) — the probe audio. */
+const PROBE_MP3_B64 =
+  "SUQzBAAAAAAAIlRTU0UAAAAOAAADTGF2ZjYxLjcuMTAzAAAAAAAAAAAAAAD/81jAAAAAAAAAAAAASW5mbwAAAA8AAAAeAAAJJAAbGxsjIyMrKyszMzMzOzs7QkJCSkpKSlJSUlpaWmJiYmJqampycnJ6enp6gYGBiYmJkZGRkZmZmaGhoampqamxsbG5ubnAwMDAyMjI0NDQ2NjY2ODg4Ojo6PDw8PD4+Pj///8AAAAATGF2YzYxLjE5AAAAAAAAAAAAAAAAJALAAAAAAAAACSSDldJ3AAAAAAAAAAAAAAD/8yjEAAAAA0gAAAAATEFNRTMuMTAwVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjEOwAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjEdgAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjEsQAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVUxBTUUzLjEwMFVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVX/8yjExAAAA0gAAAAAVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
+
+/** Build the probe multipart body (same builder style as
+ *  groqTranscribeOnce — field order: model, response_format, then file). */
+function buildProbeBody(modelId) {
+  const boundary = `----FrameFuseProbe${crypto.randomBytes(12).toString("hex")}`;
+  const crlf = "\r\n";
+  const fileBytes = Buffer.from(PROBE_MP3_B64, "base64");
+  const parts = [];
+  const field = (name, value) => {
+    parts.push(
+      `--${boundary}${crlf}` +
+        `Content-Disposition: form-data; name="${name}"${crlf}${crlf}` +
+        `${value}${crlf}`,
+    );
+  };
+  field("model", modelId);
+  field("response_format", "json");
+  const fileHeader =
+    `--${boundary}${crlf}` +
+    `Content-Disposition: form-data; name="file"; filename="probe.mp3"${crlf}` +
+    `Content-Type: audio/mpeg${crlf}${crlf}`;
+  const closing = `--${boundary}--${crlf}`;
+  const body = Buffer.concat([
+    Buffer.from(parts.join(""), "utf8"),
+    Buffer.from(fileHeader, "utf8"),
+    fileBytes,
+    Buffer.from(closing, "utf8"),
+  ]);
+  return { boundary, body };
+}
+
+/** POST the embedded silence to /audio/transcriptions. Resolves
+ *  { ok:boolean, message:string } — ok ONLY on a real 200. */
+function groqTranscribeProbe(apiKey, modelId) {
+  return new Promise((resolve) => {
+    const model = normalizeGroqModel(modelId);
+    const { boundary, body } = buildProbeBody(model);
+    const req = https.request(
+      {
+        host: GROQ_API_HOST,
+        path: TRANSCRIBE_PATH,
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": `multipart/form-data; boundary=${boundary}`,
+          "Content-Length": body.length,
+        },
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (d) => chunks.push(d));
+        res.on("end", () => {
+          const bodyText = Buffer.concat(chunks).toString("utf8");
+          if (res.statusCode === 200) {
+            resolve({ ok: true, message: "" });
+            return;
+          }
+          resolve({
+            ok: false,
+            message: classifyGroqError(res.statusCode, bodyText, maskApiKey(apiKey)),
+          });
+        });
+      },
+    );
+    req.setTimeout(20000, () => {
+      req.destroy(new Error("Probe timed out connecting to api.groq.com"));
+    });
+    req.on("error", (err) =>
+      resolve({ ok: false, message: err instanceof Error ? err.message : String(err) }),
+    );
+    req.end(body);
+  });
+}
+
+/** Validate a key END TO END (v1.30):
+ *  1. GET /openai/v1/models — does the key authenticate at all?
+ *  2. POST the 1s probe to /openai/v1/audio/transcriptions with the
+ *     selected whisper model — does TRANSCRIPTION actually work?
+ *  Resolves { ok:boolean, message:string, whisperModels:string[] }. */
+function groqTestKey(apiKey, opts) {
+  const model = normalizeGroqModel(opts && opts.model);
   return new Promise((resolve) => {
     const req = https.request(
       {
@@ -603,10 +718,24 @@ function groqTestKey(apiKey) {
               .map((m) => m && m.id)
               .filter((id) => typeof id === "string" && id.startsWith("whisper"));
           } catch (_) { /* non-fatal */ }
-          resolve({
-            ok: true,
-            message: "Key works — Whisper is available on this account",
-            whisperModels,
+          // v1.30: /models passing is no longer enough — run the REAL
+          // transcription probe so "key works" means "transcription works".
+          groqTranscribeProbe(apiKey, model).then((probe) => {
+            if (probe.ok) {
+              resolve({
+                ok: true,
+                message: `Key works — real transcription verified end to end (${model}; the key, the model and the upload all passed)`,
+                whisperModels,
+              });
+              return;
+            }
+            // Auth OK but transcription failed — a DIFFERENT problem, and
+            // the message must say so (not "rejected key").
+            resolve({
+              ok: false,
+              message: `The key authenticates, but a real transcription test failed: ${probe.message}`,
+              whisperModels,
+            });
           });
         });
       },
@@ -639,4 +768,5 @@ module.exports = {
   classifyGroqError,
   groqTranscribe,
   groqTestKey,
+  groqTranscribeProbe,
 };
