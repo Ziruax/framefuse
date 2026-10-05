@@ -2802,3 +2802,20 @@ Work Log:
 
 Stage Summary:
 - All 7 complaints verified end-to-end: (1) voiceover role selection, (2) images append + free placement in absolute mode, (3) no audio auto-trim + video loop-to-fill (real ffmpeg 40s proof), (4) audio-only timeline visible + playable + video spans via loop, (5) key-truth fix, (6) text remover fully tested, (7) dubbing E2E complete + the punctuation-line dub crash fixed.
+
+---
+Task ID: 16-final (v1.29.0 release)
+Agent: main (Z.ai Code)
+Task: Ship v1.29.0 — all 7 user complaints fixed and E2E-verified.
+
+Work Log:
+- Version bump 1.29.0 (package.json, Header BUILD_VERSION, layout title). Commit 8c7c4f2 pushed.
+- BUILD: first attempt OOM-killed (Next 16.3 worker + main both ballooning; the stale /tmp/bisect-d git worktree from a prior session held a full source copy in page cache — the same pressure class as the v1.28 OOM saga). Removed the stale worktree → clean retry: full electron:build chain green (resources parked, api moved aside, RUST_ENGINE_SKIP=1 reused the CI binary).
+- PACKAGED-FILE VERIFICATION: ASAR engine sha256 d03e5d8495586d89195cad8fd3de2f2414f94f432fbb29f194158ba80c06a2b2 (EXACT match to the CI smoke-tested v2.1 artifact); all 7 new-logic markers PRESENT in the packaged electron files (dub skip guard, export stream_loop, payloadTotalMs max, masked-key classifier, rust base-loop gate, gemini 400 routing, singlepass loop); all 12 extracted electron files node --check clean; rcedit 1.29.0.0 in the exe.
+- PUBLISHED: release 403635098 tag v1.29.0 @ 177441b, 3 assets (FrameFuse-Setup-1.29.0.exe 220,202,555 B + blockmap + latest.yml), THREE-WAY sha512 VERIFIED (3IWMdmMQkQ6N…). LIVE: https://github.com/Ziruax/framefuse/releases/tag/v1.29.0
+- CI: Job 1 "Rust engine build + E2E smoke (MSVC)" completed SUCCESS on the release commit (0 failed steps); Job 2 (installer + A/B bench, best-effort) left running per standing policy.
+- Dev server restarted (HTTP 200, title "FrameFuse v1.29.0 — Windows Desktop Video Studio"); fresh-session browser verification: 7s speech video + 30s voiceover import → 30s timeline, transport enabled, 0 page/console errors.
+
+Stage Summary:
+- v1.29.0 SHIPPED: voiceover roles + loop-to-fill + audio-extended timelines (real-ffmpeg 40.000s proof), absolute-mode image placement, audio-only playback, key-truth Groq/Gemini errors with masked keys + migration, dub resilience (un-speakable lines skip), text remover real-ffmpeg verified (inpaint/blur/cover), dubbing E2E complete.
+- Standing notes: remove stale git worktrees before big builds (page-cache OOM); engine binary reuse pattern (RUST_ENGINE_SKIP=1 + sha verify) while rust-engine/src is unchanged; publish template scripts/publish-release-1.29.0.js.
