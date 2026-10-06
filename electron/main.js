@@ -2798,6 +2798,21 @@ function encoderGlobalArgs(encoderName) {
 // stderr "time=" parsing; `onTime` receives fractional seconds. Every live
 // child registers itself in `activeProcs` so cancel-export / pool failure /
 // the leak guard can kill the WHOLE set (v4.9 killed a single child).
+// v1.33.3 STALL WATCHDOG (stuck-at-100% follow-up): a wedged ffmpeg — a
+// filled disk, antivirus locking the output, a filter-level deadlock —
+// emits NO stderr output at all while the exit event never fires, so the
+// progress bar freezes at its last value forever (on the mux that is 100%
+// with phase "finalize") and the export promise NEVER settles: the UI
+// shows "stuck at 100%, no video" with no error, ever. The watchdog bounds
+// BOTH silent windows and converts them into an honest, actionable error:
+//   - pre-total:  no output at all for stallMs (300s default) while the
+//     timeline is not yet encoded → the process is dead, not slow — a
+//     healthy encode emits a progress line every ~0.5s even at 0.1×;
+//   - post-total: the finalize pass (faststart moov rewrite / mux flush)
+//     is legitimately silent — bounded by finalizeMs (15 min default:
+//     covers a <1.5 GB rewrite on a very slow HDD) before the kill.
+// >1.5 GB outputs skip faststart entirely (v1.33.2 gate), so the post-total
+// window is seconds in the normal case.
 function runFfmpeg(args, totalSec, onTime, opts) {
   return new Promise((resolve, reject) => {
     const proc = spawn(ffmpegPath, args, { windowsHide: true });
@@ -2808,7 +2823,30 @@ function runFfmpeg(args, totalSec, onTime, opts) {
     let finalizeNotified = false;
     let finalizeTimer = null;
     const onFinalize = opts && typeof opts.onFinalize === "function" ? opts.onFinalize : null;
+    const stallMs = opts && Number(opts.stallMs) > 0 ? Number(opts.stallMs) : 300000;
+    const finalizeMs = opts && Number(opts.finalizeMs) > 0 ? Number(opts.finalizeMs) : 900000;
+    let lastOutputAt = Date.now(); // any stderr chunk = life
+    let totalReachedAt = null;     // wall-clock when out_time hit totalSec
+    let exited = false;
+    let stallKilled = false;
+    const stallWatchdog = setInterval(() => {
+      if (exited || stallKilled) return;
+      const now = Date.now();
+      const silent = totalReachedAt != null
+        ? now - Math.max(totalReachedAt, lastOutputAt) > finalizeMs
+        : now - lastOutputAt > stallMs;
+      if (silent) {
+        stallKilled = true;
+        console.warn(
+          `[Export] STALL WATCHDOG: ffmpeg produced no output for ${
+            Math.round((now - (totalReachedAt != null ? Math.max(totalReachedAt, lastOutputAt) : lastOutputAt)) / 1000)
+          }s ${totalReachedAt != null ? "in the finalize pass" : "(encode not finished)"} — killing the process`
+        );
+        try { proc.kill("SIGKILL"); } catch (_) { /* already gone */ }
+      }
+    }, 5000);
     proc.stderr.on("data", (data) => {
+      lastOutputAt = Date.now();
       const s = data.toString();
       if (onTime && totalSec > 0) {
         const m = s.match(/time=(\d+):(\d{2}):(\d{2})\.(\d{2})/);
@@ -2826,6 +2864,7 @@ function runFfmpeg(args, totalSec, onTime, opts) {
           // phase to "finalize" (the UI then says what is happening).
           if (!sawTotal && sec >= totalSec - 0.25) {
             sawTotal = true;
+            if (totalReachedAt == null) totalReachedAt = Date.now();
             if (onFinalize) {
               finalizeTimer = setTimeout(() => {
                 if (!finalizeNotified) {
@@ -2840,10 +2879,33 @@ function runFfmpeg(args, totalSec, onTime, opts) {
       stderr += s;
       stderrTail = (stderrTail + s).slice(-4000);
     });
-    proc.on("error", (err) => { if (finalizeTimer) clearTimeout(finalizeTimer); activeProcs.delete(proc); reject(new Error(err.message)); });
-    proc.on("exit", (code, signal) => {
+    proc.on("error", (err) => {
+      exited = true;
+      clearInterval(stallWatchdog);
       if (finalizeTimer) clearTimeout(finalizeTimer);
       activeProcs.delete(proc);
+      reject(new Error(err.message));
+    });
+    proc.on("exit", (code, signal) => {
+      exited = true;
+      clearInterval(stallWatchdog);
+      if (finalizeTimer) clearTimeout(finalizeTimer);
+      activeProcs.delete(proc);
+      // v1.33.3: the watchdog's kill must NEVER be misreported as a
+      // user cancel — it is a failure with a cause and diagnostics.
+      if (stallKilled) {
+        const lines = stderrTail.trim().split("\n").slice(-4).join("\n");
+        const phaseLabel = totalReachedAt != null
+          ? "while finalizing the output file"
+          : "before finishing the encode";
+        reject(new Error(
+          `The export stalled: ffmpeg stopped producing any output ${phaseLabel} and was terminated. ` +
+            `Common causes: the destination disk filled up, antivirus software locked or quarantined the output file, ` +
+            `or extremely slow disk IO while writing. Free disk space, add an exclusion for the output folder, and retry. ` +
+            `Last ffmpeg output:\n${lines || "(none — the process froze before writing anything)"}`
+        ));
+        return;
+      }
       if (signal === "SIGKILL" || signal === "SIGTERM") { reject(new Error("Export cancelled")); return; }
       if (code !== 0) {
         const lines = stderrTail.trim().split("\n");
@@ -2853,6 +2915,42 @@ function runFfmpeg(args, totalSec, onTime, opts) {
       resolve();
     });
   });
+}
+
+/** v1.33.3 (stuck-at-100% follow-up): VERIFY the export before declaring
+ * success. The mux exiting 0 is not proof the file is playable: a full
+ * disk truncates mid-write, antivirus can quarantine the output, and a
+ * killed writer leaves a headerless husk. A missing/truncated output now
+ * FAILS the export honestly (with the likely cause) instead of reporting
+ * success with no video — the exact "stuck at 100%, no output" shape.
+ * Returns the verified size; throws a plain-language error otherwise. */
+async function verifyExportOutputAsync(outputPath, expectedTotalSec, stageLabel) {
+  let size = 0;
+  try { size = fs.statSync(outputPath).size; } catch (_) { size = 0; }
+  if (!(size > 1024)) {
+    throw new Error(
+      `${stageLabel}: the export finished but no output file exists (${size} bytes at ${outputPath}). ` +
+        `The destination disk may be full, or antivirus quarantined the file — check free space and the folder, then retry.`
+    );
+  }
+  // Duration check: ffprobe reads the container header (~instant). A probe
+  // FAILURE is not an export failure (ffprobe can be blocked) — only a
+  // confidently-wrong duration fails the export.
+  try {
+    const vprobe = await probeMediaAsync(outputPath);
+    const gotSec = vprobe && vprobe.durationMs ? vprobe.durationMs / 1000 : 0;
+    if (gotSec > 0 && expectedTotalSec > 5 &&
+        Math.abs(gotSec - expectedTotalSec) > Math.max(4, expectedTotalSec * 0.02)) {
+      throw new Error(
+        `${stageLabel}: the output file is ${gotSec.toFixed(1)}s long but the timeline is ${expectedTotalSec.toFixed(1)}s — ` +
+          `the write was cut short. The destination disk most likely filled up mid-export; free space and retry.`
+      );
+    }
+  } catch (e) {
+    if (e && typeof e.message === "string" && e.message.startsWith(stageLabel + ":")) throw e;
+    // probe unavailable/blocked — the size check above still applies
+  }
+  return size;
 }
 
 // ---------------------------------------------------------------------------
@@ -6257,8 +6355,10 @@ ipcMain.handle("export-native", async (event, opts) => {
         exportPhase = "done";
         sendProgress(100, totalSec, 0);
         for (const f of tempFiles) { try { fs.unlinkSync(f); } catch (_) {} }
-        let size = 0;
-        try { size = fs.statSync(outputPath).size; } catch {}
+        // v1.33.3: verify the output exists + is complete before success
+        // (a truncated/missing file fails honestly instead of "success
+        // with no video").
+        const size = await verifyExportOutputAsync(outputPath, totalSec, "Export");
         return {
           path: outputPath,
           size,
@@ -6688,8 +6788,10 @@ ipcMain.handle("export-native", async (event, opts) => {
     // Cleanup
     for (const f of tempFiles) { try { fs.unlinkSync(f); } catch (_) {} }
 
-    let size = 0;
-    try { size = fs.statSync(outputPath).size; } catch {}
+    // v1.33.3: verify the output exists + is complete before success (a
+    // truncated/missing file fails honestly instead of "success with no
+    // video" - the exact stuck-at-100% report shape).
+    const size = await verifyExportOutputAsync(outputPath, actualTotalSec, "Export");
     // v1.1 TURBO: the result carries the performance story so the UI can
     // show users WHY the export was fast (encoder + stream-copy counts).
     // v1.4.1: keyframeCuts = copied clips that entered the fast path via a
