@@ -346,6 +346,32 @@ async function main() {
     extraAudio: [],
     music: null,
   }).then((out) => {
+    // v1.33.7 DIAGNOSTIC: the overlay's actual bbox center per sampled frame
+    // (the GPU path moved the overlay faster than the timeline on CI —
+    // this dump pins the real motion curve per compositor).
+    {
+      const frames = rgbFrames(out, W, H);
+      const centers = [];
+      for (const k of [0, 12, 24, 36, 48, 60, 72, 84, 96, 108]) {
+        const f = frames[k];
+        if (!f) { centers.push(`f${k}:—`); continue; }
+        let minX = 1e9, maxX = -1, minY = 1e9, maxY = -1, n = 0;
+        for (let y = 0; y < H; y++) {
+          for (let x = 0; x < W; x++) {
+            const o = (y * W + x) * 3;
+            if (f[o + 1] - Math.max(f[o], f[o + 2]) > 40) {
+              n++;
+              if (x < minX) minX = x;
+              if (x > maxX) maxX = x;
+              if (y < minY) minY = y;
+              if (y > maxY) maxY = y;
+            }
+          }
+        }
+        centers.push(n ? `f${k}:(${((minX+maxX)/2/W).toFixed(2)},${((minY+maxY)/2/H).toFixed(2)})` : `f${k}:none`);
+      }
+      console.log(`[motion-diag] overlay centers: ${centers.join(" ")}`);
+    }
     const greenAt = (idx, px, py) => {
       const f = rgbFrame(out, W, H, idx);
       if (!f || f.length < (py * W + px) * 3 + 3) return -1;
