@@ -402,9 +402,15 @@ export function sanitizeItemEdits(
     if (edit.overlayLoop === true) {
       clean.overlayLoop = true;
     }
-    // v5.8: loop the BASE-lane video source to fill the timeline end.
+    // v5.8: loop the BASE-lane source to fill the timeline end (videos
+    // repeat, v1.33.6 images hold the still).
     if (edit.loop === true) {
       clean.loop = true;
+    }
+    // v1.33.6: in the library but NOT on the timeline (timeline removal
+    // keeps the imported media — this flag hides the clip).
+    if (edit.timelineHidden === true) {
+      clean.timelineHidden = true;
     }
     if (
       edit.overlay &&

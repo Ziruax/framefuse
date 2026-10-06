@@ -170,6 +170,11 @@ interface MediaPanelProps {
   videoDurations?: Record<string, number>;
   /** v5: patch one item's edit (partial merge at the parent). */
   onSetItemEdit?: (id: string, patch: Partial<ItemEdit>) => void;
+  /** v1.33.6: imported media NOT currently on the timeline (removed from the
+   *  timeline but kept in the library — restorable). */
+  libraryItems?: { id: string; fileName: string; url: string; mediaType: "image" | "video" }[];
+  /** v1.33.6: put a hidden library item back on the timeline. */
+  onRestoreToTimeline?: (id: string) => void;
   /** v5: SFX items currently on the timeline. */
   sfxItems?: SfxItem[];
   /** v5: add an SFX at the playhead (parent creates the item). */
@@ -265,6 +270,8 @@ export function MediaPanelBase({
   itemEdits,
   videoDurations,
   onSetItemEdit,
+  libraryItems,
+  onRestoreToTimeline,
   sfxItems,
   onAddSfx,
   onUpdateSfx,
@@ -2300,6 +2307,85 @@ export function MediaPanelBase({
               />
             )}
 
+            {/* v1.33.6: "NOT ON TIMELINE" — imported media the user removed
+                from the TIMELINE (removal now keeps the library entry).
+                Each row restores the item to its timeline slot; the trash
+                removes it from the project entirely. */}
+            {libraryItems != null &&
+              libraryItems.length > 0 &&
+              onRestoreToTimeline != null &&
+              mediaTab !== "audio" &&
+              mediaTab !== "subs" && (
+              <div
+                className="mt-2 rounded-lg border p-2"
+                style={{ borderColor: "#2b2723", backgroundColor: "#211e1a" }}
+              >
+                <div className="mb-1.5 flex items-center gap-1.5">
+                  <Layers className="size-3 shrink-0" style={{ color: "#a8a29e" }} />
+                  <span
+                    className="text-[9px] font-semibold uppercase tracking-[0.12em]"
+                    style={{ color: "#a8a29e" }}
+                  >
+                    Not on timeline ({libraryItems.length})
+                  </span>
+                  <span className="text-[9px]" style={{ color: "#78716c" }}>
+                    removed from the timeline — media kept here
+                  </span>
+                </div>
+                <div className="space-y-1">
+                  {libraryItems.map((it) => (
+                    <div
+                      key={it.id}
+                      className="flex items-center gap-1.5 rounded-md border px-1.5 py-1"
+                      style={{ borderColor: "#2b2723", backgroundColor: "#26221e" }}
+                    >
+                      {it.url ? (
+                        <img
+                          src={it.url}
+                          alt=""
+                          className="size-6 shrink-0 rounded object-cover"
+                          draggable={false}
+                        />
+                      ) : it.mediaType === "video" ? (
+                        <Video className="size-4 shrink-0" style={{ color: "#78716c" }} />
+                      ) : (
+                        <ImageIcon className="size-4 shrink-0" style={{ color: "#78716c" }} />
+                      )}
+                      <span
+                        className="min-w-0 flex-1 truncate text-[10px]"
+                        style={{ color: "#d6d3d1" }}
+                        title={it.fileName}
+                      >
+                        {it.fileName}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => onRestoreToTimeline(it.id)}
+                        className="flex shrink-0 items-center gap-1 rounded border px-1.5 py-0.5 text-[9px] font-semibold transition-colors hover:border-orange-400/60 hover:bg-orange-500/20"
+                        style={{ borderColor: "#2b2723", color: "#fdba74" }}
+                        title="Put this media back on the timeline"
+                      >
+                        <Plus className="size-2.5" />
+                        Add
+                      </button>
+                      {onRemove != null && (
+                        <button
+                          type="button"
+                          onClick={() => onRemove(it.id)}
+                          className="flex shrink-0 items-center justify-center rounded p-1 transition-colors hover:bg-rose-500/30"
+                          style={{ color: "#78716c" }}
+                          aria-label={`Delete ${it.fileName} from the project`}
+                          title="Remove from the project entirely"
+                        >
+                          <Trash2 className="size-3" />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* Warnings — v1.3: segment-relevant tabs only. */}
             {warnings.length > 0 && mediaTab !== "audio" && mediaTab !== "subs" && (
               <div
@@ -2828,12 +2914,13 @@ function ClipSettings({
           </p>
         </div>
 
-        {/* v5.8: LOOP-TO-FILL (base-lane VIDEO) — the clip repeats until the
+        {/* v5.8: LOOP-TO-FILL (base lane) — the clip repeats until the
             timeline end. THE fix for "10s video + 1h audio": turn this on
-            and the visuals repeat to match the audio's length. The overlay
-            lane keeps its own overlayLoop twin (see Overlay window below);
-            images never loop. */}
-        {!onOverlay && isVideo && (
+            and the visuals repeat to match the audio's length. v1.33.6:
+            IMAGES loop too — a single still held to the timeline end ("1
+            image for the whole 69-min audio"). The overlay lane keeps its
+            own overlayLoop twin (see Overlay window below). */}
+        {!onOverlay && (
           <div
             className="rounded-md border p-2"
             style={{ borderColor: "#2b2723", backgroundColor: "#211e1a" }}
@@ -2843,13 +2930,13 @@ function ClipSettings({
                 className="flex items-center gap-1 text-[8px] font-semibold uppercase tracking-[0.12em]"
                 style={{ color: "#78716c" }}
               >
-                <Repeat className="size-2.5" /> Loop to fill
+                <Repeat className="size-2.5" /> {isVideo ? "Loop to fill" : "Hold to timeline end"}
               </span>
               <span
                 className="text-[9px] font-semibold"
                 style={{ color: edit?.loop === true ? "#2dd4bf" : "#8f887f" }}
               >
-                {edit?.loop === true ? "looping" : "plays once"}
+                {edit?.loop === true ? (isVideo ? "looping" : "held to the end") : isVideo ? "plays once" : "default duration"}
               </span>
             </div>
             <button
@@ -2877,12 +2964,20 @@ function ClipSettings({
                       color: "#8f887f",
                     }
               }
-              title="Repeat this clip until the timeline end — a short video fills a long voiceover; the trim start is where each repeat begins"
+              title={
+                isVideo
+                  ? "Repeat this clip until the timeline end — a short video fills a long voiceover; the trim start is where each repeat begins"
+                  : "Hold this image until the timeline end — one image covers the whole audio (e.g. a 69-minute voiceover)"
+              }
             >
               <Repeat className="size-2.5" />
               {edit?.loop === true
-                ? "Looping to the timeline end"
-                : "Loop to the timeline end"}
+                ? isVideo
+                  ? "Looping to the timeline end"
+                  : "Held to the timeline end"
+                : isVideo
+                  ? "Loop to the timeline end"
+                  : "Hold to the timeline end"}
             </button>
           </div>
         )}

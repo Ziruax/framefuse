@@ -24,7 +24,7 @@ import { cn } from "@/lib/utils";
 /** v1.12.1: the renderer's build constant — compared against the REAL exe
  *  version (app.getVersion()) so a stale/hybrid install is impossible to
  *  miss. Keep in sync with package.json on every release. */
-const BUILD_VERSION = "1.33.5";
+const BUILD_VERSION = "1.33.6";
 
 export interface LastExport {
   path: string;
@@ -505,21 +505,49 @@ export function Header({
               </span>
             )}
             {exportProgress?.timemark ? (
-              <span className="hidden sm:inline" style={{ color: "#a8a29e" }}>
+              <span
+                className="hidden lg:inline"
+                style={{ color: "#a8a29e" }}
+                title={
+                  `Timeline position ${fmtTimecode(parseTimemark(exportProgress.timemark))}` +
+                  (exportProgress?.total
+                    ? ` of ${fmtTimecode(exportProgress.total * 1000)} (content, not wall-clock)`
+                    : " (content, not wall-clock)")
+                }
+              >
                 @ {fmtTimecode(parseTimemark(exportProgress.timemark))}
                 {exportProgress?.total
                   ? ` / ${fmtTimecode(exportProgress.total * 1000)}`
                   : ""}
               </span>
             ) : null}
+            {/* v1.33.6: WALL-CLOCK elapsed — the user reads "@ 00:12 / 00:42"
+              as a stopwatch, but that line is CONTENT position (it races at
+              25× realtime then crawls). The honest elapsed counter ships
+              here; the content position stays (tooltip'd) for power users. */}
+            {exportProgress?.elapsed != null &&
+            Number.isFinite(exportProgress.elapsed) ? (
+              <span
+                className="hidden tabular-nums sm:inline"
+                style={{ color: "#d6d3d1" }}
+                title="Wall-clock time since the export started"
+              >
+                {fmtElapsed(exportProgress.elapsed)} elapsed
+              </span>
+            ) : null}
             {/* ETA — the headline number the user asked for; "estimating…"
-                until the backend unlocks it rather than silently nothing. */}
+                until the backend unlocks it rather than silently nothing.
+                v1.33.6: an ETA of exactly 0 is only honest at completion —
+                the old all-run model emitted 0 near the band tops while
+                minutes of mux/finalize remained (the "ETA shows 0s after
+                95%" report). In flight, 0 reads as "estimating…". */}
             {exportProgress?.eta != null &&
-            Number.isFinite(exportProgress.eta) ? (
+            Number.isFinite(exportProgress.eta) &&
+            (exportProgress.eta > 0 || exportProgress.phase === "done") ? (
               <span
                 className="tabular-nums"
                 style={{ color: "#fb923c", fontWeight: 600 }}
-                title="Estimated time remaining"
+                title="Estimated time remaining (this phase)"
               >
                 ETA {fmtElapsed(exportProgress.eta)}
               </span>

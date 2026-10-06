@@ -3278,17 +3278,20 @@ export function TimelineRuler({
             : undefined,
           disabled: onEditItem == null,
         });
-        // v5.8: BASE-lane VIDEO loop-to-fill — the clip repeats until the
-        // timeline end (the 10s-video + 1h-voiceover case: the visuals
-        // repeat to match the audio). Overlay clips keep their own
-        // overlayLoop twin above; images never loop.
-        if (seg.mediaType === "video") {
+        // v5.8: BASE-lane loop-to-fill — the clip repeats (video) or holds
+        // (image) until the timeline end (the 10s-video + 1h-voiceover
+        // case: the visuals repeat to match the audio; v1.33.6: a single
+        // image also spans the whole audio). Overlay clips keep their own
+        // overlayLoop twin above.
+        {
           items.push({
             icon: Repeat,
             label:
               seg.loop === true
                 ? "Stop looping clip"
-                : "Loop to fill timeline",
+                : seg.mediaType === "video"
+                  ? "Loop to fill timeline"
+                  : "Hold image to timeline end",
             onClick: onEditItem
               ? () =>
                   onEditItem(seg.id, {
@@ -3304,8 +3307,12 @@ export function TimelineRuler({
         {
           icon: Trash2,
           // v5.5: generic label — the selection may mix clips, SFX pills
-          //  and the music clip.
-          label: multi ? `Delete ${sel.length} selected` : "Delete",
+          //  and the music clip. v1.33.6: visual clips are REMOVED FROM THE
+          // TIMELINE but stay in the media library (restorable) — the label
+          // says exactly that.
+          label: multi
+            ? `Remove ${sel.length} from timeline`
+            : "Remove from timeline",
           kbd: "Del",
           danger: true,
           onClick: multi

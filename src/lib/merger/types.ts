@@ -171,13 +171,20 @@ export interface ItemEdit {
    *  source window at 2× becomes a 5s timeline clip. Images and overlay-lane
    * clips resolve speed 1 (the export overlay graph is speed-1 by design). */
   speed?: number;
-  /** v5.8: loop the BASE-lane video source so the clip FILLS the timeline
-   *  end (loop-to-fill) — the base-lane twin of overlayLoop. A 10s video +
-   *  a 1h voiceover: turn this on and the video repeats until the audio's
-   *  end. The item edit (`ItemEdit.loop`) is the user toggle; the RESOLVED
-   *  flag here (true only on track-0 video segments) is what the preview
-   *  (modular currentTime) and the export (-stream_loop -1) consume. */
+  /** v5.8: loop the BASE-lane source so the clip FILLS the timeline end
+   * (loop-to-fill) — the base-lane twin of overlayLoop. A 10s video +
+   * a 1h voiceover: turn this on and the video repeats until the audio's
+   * end. v1.33.6: IMAGES loop too (a single still held to the timeline
+   * end — "1 image for the whole 69-min audio" needs no video source).
+   * The item edit (`ItemEdit.loop`) is the user toggle; the RESOLVED flag
+   * (true only on track-0 segments) is what the preview and the export
+   * consume. */
   loop?: boolean;
+  /** v1.33.6: the item is in the media LIBRARY but NOT on the timeline —
+   * removing a clip from the timeline hides it here instead of deleting
+   * the imported media (restore = clear the flag). Rides itemEdits so undo
+   * and project files keep it. */
+  timelineHidden?: boolean;
   /** v5.2: loop the overlay source so it spans the full clip window even
    *  when the source is shorter than the timeline duration (green-screen
    *  clips stretched to the whole video). Export uses -stream_loop -1;

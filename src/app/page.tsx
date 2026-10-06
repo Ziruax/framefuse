@@ -777,7 +777,25 @@ export default function Page() {
             mediaType: "video",
           });
         } else {
-          skipped.push(it.file.name);
+          // v1.33.6: unparseable IMAGES get the same duration-kind fallback
+          // (sequential default 5 s, adjustable + loopable). They used to be
+          // DROPPED entirely — "images without a naming format" never
+          // reached the timeline OR the media panel.
+          ents.push({
+            id: it.id,
+            fileName: it.file.name,
+            file: it.file,
+            parsed: {
+              kind: "duration",
+              startMs: null,
+              endMs: null,
+              durationMs: null,
+              raw: it.file.name,
+            },
+            order,
+            thumbnailUrl: it.url,
+            mediaType: "image",
+          });
         }
         return;
       }
@@ -807,7 +825,10 @@ export default function Page() {
   const rawTimeline = useMemo(
     () =>
       buildTimeline(
-        entries,
+        // v1.33.6: timeline-hidden items stay in the media LIBRARY but never
+        // reach the timeline (removing a clip from the timeline keeps the
+        // imported media; restoring clears the flag).
+        entries.filter((e) => itemEdits[e.id]?.timelineHidden !== true),
         overrides,
         kenBurns,
         motionOverrides,
@@ -839,7 +860,7 @@ export default function Page() {
   const timeline = useMemo(
     () =>
       buildTimeline(
-        entries,
+        entries.filter((e) => itemEdits[e.id]?.timelineHidden !== true),
         overrides,
         kenBurns,
         motionOverrides,
@@ -895,7 +916,7 @@ export default function Page() {
     audioExtHintShownRef.current = true;
     toast.info("Timeline now runs to the audio's end", {
       description:
-        "Turn on Loop on a video clip to fill the visuals — right-click a video clip or use its clip settings.",
+        "Turn on Loop on a video clip (or Hold on an image) to fill the visuals — right-click the clip or use its clip settings.",
     });
   }, [audioExtEndMs, rawTimeline.totalMs, timeline.segments]);
   /** Display segments + the virtual disclaimer clip at [0, N) — the preview
@@ -2265,9 +2286,22 @@ export default function Page() {
   const exportRef = useRef<() => void>(() => {});
 
   const handleExport = useCallback(async () => {
-    if (timeline.segments.length === 0) {
-      toast.error("Add images first");
+    // v1.33.6 AUDIO-ONLY EXPORT: a timeline with no visual segments but a
+    // music/voice-over/SFX track exports fine now (the main process renders
+    // the video track as black over the audio's timeline). Only a project
+    // with NEITHER visuals nor audio is empty.
+    const hasAudioOnlyProject =
+      timeline.segments.length === 0 &&
+      (musicClips.length > 0 || displayVoItems.length > 0 || sfxItems.length > 0);
+    if (timeline.segments.length === 0 && !hasAudioOnlyProject) {
+      toast.error("Add media first");
       return;
+    }
+    if (hasAudioOnlyProject) {
+      toast.info("Exporting audio-only timeline", {
+        description:
+          "No visual clips on the timeline — the video track renders as black over the audio's full length.",
+      });
     }
     // If captions are enabled but no subtitles are loaded, warn (don't abort).
     if (
@@ -2643,6 +2677,8 @@ export default function Page() {
     displaySubtitles,
     displayHeadlines,
     displaySfxItems,
+    displayVoItems,
+    sfxItems,
     items,
     musicClips,
     settings,
@@ -3024,7 +3060,7 @@ export default function Page() {
             description:
               added.length > 1
                 ? "Each track is an independent clip on the Audio lane — drag, loop, mix or remove them individually."
-                : "Drag the clip on the Audio lane to reposition it; add more tracks any time.",
+                : "Drag to reposition · music LOOPS to the timeline's current length — for a long narration use the “Voiceover audio” import so the audio defines the timeline.",
           },
         );
       }
@@ -3855,6 +3891,44 @@ export default function Page() {
     [requestHistoryPush],
   );
 
+  /** v1.33.6: remove a clip from the TIMELINE but KEEP it in the media
+   *  library (the reported "removing a clip deletes my imported media").
+   *  Sets the itemEdits' timelineHidden flag — undo-safe (itemEdits live in
+   * the history snapshot) and project-file-safe (the serializer keeps it).
+   *  The Media panel lists hidden items under "Not on timeline" with a
+   *  restore button; the panel's own trash still removes them fully. */
+  const hideFromTimeline = useCallback(
+    (id: string) => {
+      requestHistoryPush();
+      setItemEdits((prev) => ({ ...prev, [id]: { ...prev[id], timelineHidden: true } }));
+      setSelectedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : prev));
+    },
+    [requestHistoryPush],
+  );
+
+  /** v1.33.6: restore a library item back onto the timeline (clears the
+   *  timelineHidden flag — the item resumes its slot + edits). */
+  const restoreToTimeline = useCallback(
+    (id: string) => {
+      requestHistoryPush();
+      setItemEdits((prev) => {
+        if (!(id in prev)) return prev;
+        const next = { ...prev };
+        const { timelineHidden: _hidden, ...rest } = next[id];
+        next[id] = rest;
+        return next;
+      });
+    },
+    [requestHistoryPush],
+  );
+
+  /** v1.33.6: the media LIBRARY section's item list — imported items that
+   *  are NOT currently on the timeline (hidden via timelineHidden). */
+  const libraryItems = useMemo(
+    () => items.filter((it) => itemEdits[it.id]?.timelineHidden === true),
+    [items, itemEdits],
+  );
+
   const removeItem = useCallback((id: string) => {
     requestHistoryPush();
     // The object URL stays alive (undo-safe) — revoked on unmount only.
@@ -4049,6 +4123,40 @@ export default function Page() {
       setSelectedIds([]);
     },
     [requestHistoryPush, removeItem, clearBeatInfo, clearWaveform],
+  );
+
+  /** v1.33.6: batch timeline removal (the ruler's multi-select Delete) —
+   *  visual clips HIDE (media stays in the library); SFX and music clips
+   *  still remove (they are timeline-native placements, not library items). */
+  const removeItemsFromTimeline = useCallback(
+    (ids: string[]) => {
+      if (ids.length === 0) return;
+      const liveSfx = stateRef.current?.sfxItems ?? [];
+      const sfxIds = new Set(ids.filter((id) => liveSfx.some((s) => s.id === id)));
+      const liveMusic = stateRef.current?.musicClips ?? [];
+      const musicIds = new Set(ids.filter((id) => liveMusic.some((c) => c.id === id)));
+      const visualIds = ids.filter((id) => !sfxIds.has(id) && !musicIds.has(id));
+      if (visualIds.length > 0) {
+        requestHistoryPush();
+        setItemEdits((prev) => {
+          const next = { ...prev };
+          for (const id of visualIds) next[id] = { ...next[id], timelineHidden: true };
+          return next;
+        });
+      }
+      const rest = ids.filter((id) => sfxIds.has(id) || musicIds.has(id));
+      if (rest.length > 0) removeItems(rest);
+      if (visualIds.length > 0) {
+        setSelectedIds([]);
+        toast.success(
+          visualIds.length === 1
+            ? "Removed from timeline — kept in Media"
+            : `Removed ${visualIds.length} clips from timeline — kept in Media`,
+          { description: "Restore them from the Media panel's “Not on timeline” section (Ctrl+Z also works)." },
+        );
+      }
+    },
+    [requestHistoryPush, removeItems],
   );
 
   const overrideDuration = useCallback((id: string, durationMs: number) => {
@@ -5650,8 +5758,11 @@ const handleRandomTransitionMix = useCallback(() => {
       removeDisclaimer();
       return;
     }
-    removeItem(seg.id);
-  }, [activeSegment, removeItem, removeDisclaimer]);
+    // v1.33.6: timeline removal keeps the imported media — the clip hides
+    // from the timeline and lands in the Media panel's "Not on timeline"
+    // library section (restorable). Full deletion stays in the panel.
+    hideFromTimeline(seg.id);
+  }, [activeSegment, hideFromTimeline, removeDisclaimer]);
   const splitAtPlayheadRef = useRef(splitAtPlayhead);
   const removeActiveRef = useRef(removeActiveSegment);
   useEffect(() => {
@@ -6254,6 +6365,15 @@ const handleConvertSubtitlesToNative = useCallback(() => {
                   itemEdits={itemEdits}
                   videoDurations={videoDurations}
                   onSetItemEdit={handleSetItemEdit}
+                  // v1.33.6: the "Not on timeline" library section (timeline
+                  // removal keeps the imported media — restorable).
+                  libraryItems={libraryItems.map((it) => ({
+                    id: it.id,
+                    fileName: it.file.name,
+                    url: it.url,
+                    mediaType: it.mediaType,
+                  }))}
+                  onRestoreToTimeline={restoreToTimeline}
                   sfxItems={displaySfxItems}
                   onAddSfx={handleAddSfx}
                   onUpdateSfx={handleUpdateSfx}
@@ -6484,12 +6604,12 @@ const handleConvertSubtitlesToNative = useCallback(() => {
               videoDurations={videoDurations}
               onSplit={splitAtPlayhead}
               onDuplicate={duplicateItem}
-              onRemove={removeItem}
+              onRemove={hideFromTimeline}
               activeSegment={activeSegment}
               // ---- v5.4: multi-select (click / Ctrl / Shift / marquee) ----
               selectedIds={selectedIds}
               onSelectionChange={setSelectedIds}
-              onRemoveMany={removeItems}
+              onRemoveMany={removeItemsFromTimeline}
               // ---- v5.5: group move + clipboard ----
               onGroupMove={handleGroupMove}
               onCopySelection={copySelection}

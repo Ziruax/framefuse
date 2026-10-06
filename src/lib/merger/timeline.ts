@@ -212,10 +212,12 @@ function resolveEntry(
   // v5.2: loop the overlay source so short green-screen clips can span the
   // whole video (export -stream_loop -1, preview wraps currentTime).
   const overlayLoop = edit?.overlayLoop === true && track >= 1;
-  // v5.8: loop-to-fill for BASE-lane VIDEOS (the overlayLoop twin). The
+  // v5.8: loop-to-fill for BASE-lane sources (the overlayLoop twin). The
   // timeline builder extends a looping clip's end to fillEndMs; preview +
-  // export repeat the source. Images and overlay-lane items never loop.
-  const baseLoop = edit?.loop === true && mediaType === "video" && track === 0;
+  // export repeat the source. v1.33.6: IMAGES loop too — a single still
+  // held to the timeline end ("1 image for the whole audio"). Overlay-lane
+  // items never loop.
+  const baseLoop = edit?.loop === true && track === 0;
   return {
     entry: e,
     mediaType,
@@ -262,7 +264,7 @@ function makeSegment(
     sourceDurationMs: r.sourceDurationMs,
     speed: r.speed,
     overlayLoop: r.overlayLoop,
-    // v5.8: resolved loop-to-fill (base-lane videos only — see ResolvedEntry.
+    // v5.8: resolved loop-to-fill (base-lane clips — see ResolvedEntry.
     // baseLoop). Undefined everywhere else so payloads/JSON stay minimal.
     ...(r.baseLoop ? { loop: true as const } : {}),
     chroma: r.chroma,
@@ -555,18 +557,20 @@ export function buildTimeline(
     segments.push(...overlaySegs);
   }
 
-  // v5.8: LOOP-TO-FILL — base-lane VIDEO segments whose edit sets
-  // `loop: true` are stretched so their end reaches `fillEndMs` (the final
-  // timeline duration the caller computed from the raw segment end + the
-  // non-loop audio end). The fill window is a FINAL duration — like an
-  // explicit override it is NOT divided by speed; trimInMs is unchanged and
-  // the source simply repeats from the trim window (preview wraps
-  // currentTime, export uses -stream_loop -1). makeSegment already flagged
-  // these `seg.loop = true`; the extension here also re-derives durationMs.
+  // v5.8: LOOP-TO-FILL — base-lane segments whose edit sets `loop: true`
+  // are stretched so their end reaches `fillEndMs` (the final timeline
+  // duration the caller computed from the raw segment end + the non-loop
+  // audio end). The fill window is a FINAL duration — like an explicit
+  // override it is NOT divided by speed; trimInMs is unchanged and the
+  // source simply repeats from the trim window (preview wraps
+  // currentTime, export uses -stream_loop -1). v1.33.6: a looping IMAGE
+  // just extends its still window — no source repetition needed (the
+  // static chain emits the whole window from one decode). makeSegment
+  // already flagged these `seg.loop = true`; the extension here also
+  // re-derives durationMs.
   if (fillEndMs && fillEndMs > 0) {
     for (const seg of segments) {
       if ((seg.track ?? 0) !== 0) continue; // base lane only
-      if (seg.mediaType !== "video") continue; // videos only
       if (seg.loop !== true) continue; // the edit's loop flag
       const endMs = Math.max(seg.startMs + 200, fillEndMs);
       if (endMs > seg.endMs) {

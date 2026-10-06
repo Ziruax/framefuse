@@ -4601,7 +4601,21 @@ ipcMain.handle("export-native", async (event, opts) => {
   let fps = Number(reqFps) || 30;
 
   if (!outputPath) throw new Error("No output path");
-  if (!segments || segments.length === 0) throw new Error("No segments");
+  // v1.33.6 AUDIO-ONLY EXPORT: zero visual segments is legal when the project
+  // carries audio (music/voice-over/SFX) — the video track renders as black
+  // over the audio's timeline (the tail-filler machinery in both pool
+  // paths). The hard error stays only for a genuinely empty project.
+  if (!segments || segments.length === 0) {
+    const hasAnyAudioInput =
+      musicClipList.length > 0 ||
+      (typeof audioPath === "string" && audioPath) ||
+      (Array.isArray(voiceovers) && voiceovers.some((v) => v && typeof v.wavPath === "string")) ||
+      (Array.isArray(sfx) && sfx.some((s) => s && typeof s.wavPath === "string"));
+    if (!hasAnyAudioInput) throw new Error("No segments");
+    console.log(
+      "[Export] audio-only timeline: 0 visual segment(s) — the video track renders as black over the audio's timeline",
+    );
+  }
 
   if (!ffmpegPath || !fs.existsSync(ffmpegPath)) {
     throw new Error("FFmpeg not found. The bundled FFmpeg binary is missing or corrupted. Please reinstall FrameFuse. Expected at: " + ffmpegPath);
@@ -4760,16 +4774,34 @@ ipcMain.handle("export-native", async (event, opts) => {
   function sendProgress(percent, timemarkSec, etaSec) {
     if (event.sender && !event.sender.isDestroyed()) {
       const elapsedSec = (Date.now() - startTime) / 1000;
+      // v1.33.6 (stuck-at-100% report — full-handler repro): 100% is RESERVED
+      // for the actual completion event. The v1.33.4 finalize crawl topped at
+      // 99.7 + 0.27×0.95 = 99.96, which a one-decimal display rounds to
+      // "100.0%" while the faststart rewrite is still running — and the old
+      // Math.min(100, …) clamp also flattened the (buggy, double-counted) pool
+      // fraction onto a pinned 100% half-way through the encode. Every
+      // in-flight value now clamps at 99.9; only a real 100 (the done event)
+      // can show 100.
+      const shownPct = Math.max(0, Math.min(percent >= 100 ? 100 : 99.9, percent));
+      // v1.33.6: ETA 0 is only honest at completion — the all-run model
+      // rounds to 0 near the band tops while minutes of mux/finalize remain
+      // (the "ETA shows 0s after 95%" report). An in-flight 0 reads as
+      // "estimating…" instead.
+      const shownEta =
+        etaSec === 0 && exportPhase !== "done" ? undefined : etaSec;
       event.sender.send("export-progress", {
-        progress: Math.max(0, Math.min(100, percent)),
+        progress: shownPct,
         fps: 0,
-        eta: etaSec,
+        eta: shownEta,
         // v1.14.1 (user directive: "NaN:NaN in the frontend"): the timemark
         // is sent as a plain parseable "H:MM:SS.cc" string — the old
         // `.replace(".", ",")` ASS-style comma decimal made the renderer's
         // parseTimemark produce NaN and the chip render "@ NaN:NaN" on
         // EVERY export since v1.2.
         timemark: timemarkSec != null ? assFmtTime(timemarkSec) : undefined,
+        // v1.33.6: the honest wall-clock elapsed ships on every event (the
+        // UI now renders elapsed + ETA; the content timemark alone read as
+        // a "stopwatch that races then crawls").
         // v1.14.2 additions (all optional — older shells ignore them):
         elapsed: Math.round(elapsedSec * 10) / 10,
         total: totalSec > 0 ? totalSec : undefined,
@@ -6623,9 +6655,85 @@ ipcMain.handle("export-native", async (event, opts) => {
           throw err;
         }
 
+        // ── v1.33.6 SMART-PATH TAIL FILLER (the no-loop audio-extended
+        // timeline): the plan's frame law models the FULL timeline (the
+        // parallel-pass planner slices [0, totalMs) even when the visuals end
+        // early), so the VISUAL extent comes from the SEGMENTS — max end of
+        // any base segment. The audio bus rendered to the audio-extended
+        // total; without a filler the mux's -shortest ends the FILE at the
+        // visual end (10s video + 69-min audio → a 10s file → the verify's
+        // bogus "disk filled up" error). A black tail (with the tail's
+        // caption window) now completes the video stream to the full
+        // timeline, same as the two-step path.
+        const segVisualEndSec = segments.reduce(
+          (m, s) => Math.max(m, ((Number(s && s.startMs) || 0) + (Number(s && s.durationMs) || 0)) / 1000),
+          0,
+        );
+        const spVisualSec = Math.max(
+          0,
+          Math.min(plan.totalFrames > 0 && fps > 0 ? plan.totalFrames / fps : totalSec, segVisualEndSec),
+        );
+        let spFillRan = false;
+        if (spAudioPath && totalSec > spVisualSec + 1.5) {
+          const spFillMs = Math.round((totalSec - spVisualSec) * 1000);
+          const spFillerPath = path.join(tempDir, `tailfill_${Date.now()}.mp4`);
+          tempFiles.push(spFillerPath);
+          chunkFiles.push(spFillerPath);
+          let spFillerAss = null;
+          if (captionsEnabled || headlinesEnabled) {
+            const doc = buildAssDocument(
+              captionsEnabled ? subtitleCues : [],
+              captionsEnabled ? captionSettings : null,
+              headlinesEnabled ? headlines : null,
+              width, height, Math.round(spVisualSec * 1000), Math.round(totalSec * 1000), spFillMs,
+              headlinesEnabled ? headlineGeometry : undefined,
+              captionsEnabled ? kineticCompositions : undefined,
+              captionsEnabled ? kineticGeoList : undefined,
+            );
+            spFillerAss = doc ? writeAssFile(doc, "sptail") : null;
+          }
+          exportPhase = "video";
+          console.log(
+            `[Export] tail filler (smart): visuals end at ${spVisualSec.toFixed(1)}s but the timeline is ${totalSec.toFixed(1)}s — rendering ${((totalSec - spVisualSec) / 60).toFixed(1)} min of black${spFillerAss ? " (captions continue)" : ""}`,
+          );
+          prof.beginStage("tail-fill");
+          const spFillEta = { lastSec: 0, lastAt: 0, rate: 0 };
+          await runFfmpeg(
+            [
+              "-f", "lavfi", "-i",
+              `color=c=black:s=${width}x${height}:r=${Math.round(fps)}:d=${(spFillMs / 1000).toFixed(3)}`,
+              "-vf", [...(spFillerAss ? [spFillerAss] : []), "setsar=1", "format=yuv420p"].join(","),
+              "-map", "0:v",
+              "-t", (spFillMs / 1000).toFixed(3),
+              ...encArgs,
+              "-r", String(Math.round(fps)),
+              "-an",
+              "-threads", String(threadsPer > 0 ? Math.round(threadsPer) : 0),
+              "-y", spFillerPath,
+            ],
+            spFillMs / 1000,
+            (sec) => {
+              const now = Date.now();
+              if (sec > spFillEta.lastSec + 0.5 && now > spFillEta.lastAt) {
+                const inst = (sec - spFillEta.lastSec) / ((now - spFillEta.lastAt) / 1000);
+                if (inst > 0) spFillEta.rate = spFillEta.rate > 0 ? 0.3 * spFillEta.rate + 0.7 * inst : inst;
+                spFillEta.lastSec = sec;
+                spFillEta.lastAt = now;
+              }
+              const etaSec = spFillEta.rate > 0.01
+                ? Math.min(3600, Math.round(Math.max(0, spFillMs / 1000 - sec) / spFillEta.rate))
+                : undefined;
+              sendProgress(96 + 0.7 * Math.min(1, sec / Math.max(0.01, spFillMs / 1000)), sec, etaSec);
+            },
+            { maxMs: Math.min(7200000, Math.max(600000, (spFillMs / 1000) * 750)) },
+          );
+          prof.endStage("tail-fill");
+          spFillRan = true;
+        }
+
         // ── PHASE 4: concat demuxer stitch + mux (instant, -c copy) ───────
         exportPhase = "mux";
-        sendProgress(96.9, totalSec, etaFor(0.969));
+        sendProgress(96.9, totalSec, undefined); // v1.33.6: phase-local ETA only (smart path)
         const spConcatPath = path.join(tempDir, `concat_${Date.now()}.txt`);
         tempFiles.push(spConcatPath);
         fs.writeFileSync(
@@ -6664,7 +6772,7 @@ ipcMain.handle("export-native", async (event, opts) => {
           ...(spSkipFaststart ? [] : ["-movflags", "+faststart"]),
           outputPath,
         ];
-        const spVideoSec = plan.totalFrames > 0 && fps > 0 ? plan.totalFrames / fps : totalSec;
+        const spVideoSec = spFillRan ? totalSec : spVisualSec;
         const spMuxBandSec = Math.max(0.01, Math.min(spVideoSec, totalSec));
         const muxStageStart = Date.now();
         prof.beginStage("mux");
@@ -6679,7 +6787,7 @@ ipcMain.handle("export-native", async (event, opts) => {
               console.log("[Export] finalize: concat muxed — ffmpeg is rewriting the file header (faststart moov rewrite)");
             },
             onFinalizeProgress: (f) => {
-              sendProgress(99.7 + 0.27 * Math.min(0.95, Math.max(0, f)), totalSec, undefined);
+              sendProgress(99.7 + 0.2 * Math.min(0.95, Math.max(0, f)), totalSec, undefined); // v1.33.6: caps at 99.9 — "100.0" was a rounding lie
             },
             finalizeEstimateMs: Math.max(15000, Math.min(600000, (spExpectedOutBytes / (25 * 1024 * 1024)) * 2500)),
             finalizeMs: spSkipFaststart
@@ -6821,8 +6929,19 @@ ipcMain.handle("export-native", async (event, opts) => {
       lastEmit = now;
       let doneMs = 0;
       for (let k = 0; k < poolJobs.length; k++) doneMs += clipFrac[k] * poolJobs[k].durationMs;
-      const frac = doneMs / Math.max(1, totalMs);
-      sendProgress(frac * 95, doneMs / 1000, etaFor(frac));
+      // v1.33.6 (stuck-at-100% ROOT CAUSE — full-handler repro): the fraction
+      // is the pool's OWN completion, NOT doneMs / totalMs. A loop-to-fill
+      // export puts TWO full-timeline-sized jobs in the pool (the -stream_loop
+      // video encode AND the whole-timeline PCM audio extraction), so the old
+      // totalMs denominator double-counted the work: frac climbed to 2.0,
+      // sendProgress's clamp pinned the bar at 100% with ETA 0 HALF-WAY
+      // through the pool, and the timemark ran to 2× the timeline (the user's
+      // "smooth to 95%, then slow, stuck at 100%" + "time estimate moves too
+      // fast"). The timemark is also clamped to the timeline now.
+      const poolWorkMs =
+        poolJobs.reduce((n, j) => n + Math.max(1, Number(j.durationMs) || 1), 0) || 1;
+      const frac = Math.min(1, doneMs / poolWorkMs);
+      sendProgress(frac * 95, Math.min(totalSec, doneMs / 1000), etaFor(frac));
     };
     exportPhase = "video";
     prof.setPool({
@@ -6867,7 +6986,7 @@ ipcMain.handle("export-native", async (event, opts) => {
     // sum. A failed probe falls back to the requested duration for that
     // clip, and the whole total falls back when nothing is measurable.
     exportPhase = "audio";
-    sendProgress(95.4, totalSec, etaFor(0.954));
+    sendProgress(95.4, totalSec, undefined); // v1.33.6: etaFor is pool-fraction based — dishonest past the pool
     // Probes run in bounded chunks (8 at a time) — a 100-clip project must
     // not spawn 100 ffmpeg children simultaneously on a weak machine.
     const clipDurProbe = [];
@@ -6880,6 +6999,7 @@ ipcMain.handle("export-native", async (event, opts) => {
     }
     let actualTotalSec = totalSec;
     let concatVideoSec = null; // v1.33.4: the ACCEPTED probed video length (the mux band denominator)
+    let tailFillerMs = 0;     // v1.33.6: visuals END EARLY (no loop, audio-extended) → black-tail fill
     if (clipDurProbe.length > 0 && clipDurProbe.every((d) => d > 0)) {
       const actualMs = clipDurProbe.reduce((a, b) => a + b, 0);
       // Guard: a wildly-off measurement (bad probe) must never skew the
@@ -6887,7 +7007,101 @@ ipcMain.handle("export-native", async (event, opts) => {
       if (Math.abs(actualMs - totalMs) <= totalMs * 0.02 + 1000) {
         actualTotalSec = actualMs / 1000;
         concatVideoSec = actualMs / 1000;
+      } else if (actualMs > 0 && actualMs < totalMs - 1500) {
+        // v1.33.6 (the "output is 10.0s long but the timeline is 4174.8s"
+        // report): the visuals are SHORTER than the audio-extended timeline
+        // and nothing loops to fill them. The old path let the mux's
+        // -shortest truncate the FILE at the visual end and the final verify
+        // then failed with a bogus "destination disk filled up" diagnosis.
+        // A BLACK TAIL segment now renders (captions still burn — its ASS
+        // window covers the tail) so the video stream covers the FULL
+        // timeline, exactly like a real NLE's empty-sequence black.
+        concatVideoSec = actualMs / 1000;
+        tailFillerMs = totalMs - actualMs;
       }
+    } else if (clipPaths.length === 0 && totalMs > 0) {
+      // v1.33.6 AUDIO-ONLY timeline: no visual segments at all — the whole
+      // video track is the black filler over the audio.
+      concatVideoSec = 0;
+      tailFillerMs = totalMs;
+    }
+    if (tailFillerMs > 0) {
+      const tailDurSec = tailFillerMs / 1000;
+      const visualEndMs = Math.max(0, Math.round(totalMs - tailFillerMs));
+      const fillerPath = path.join(tempDir, `tailfill_${Date.now()}.mp4`);
+      tempFiles.push(fillerPath);
+      clipPaths.push(fillerPath);
+      // The tail's caption window (same builder + window semantics as any
+      // chunk — cues inside the tail still burn, locked to the audio).
+      let fillerAssSuffix = null;
+      if (captionsEnabled || headlinesEnabled) {
+        const doc = buildAssDocument(
+          captionsEnabled ? subtitleCues : [],
+          captionsEnabled ? captionSettings : null,
+          headlinesEnabled ? headlines : null,
+          width, height, visualEndMs, visualEndMs + tailFillerMs, tailFillerMs,
+          headlinesEnabled ? headlineGeometry : undefined,
+          captionsEnabled ? kineticCompositions : undefined,
+          captionsEnabled ? kineticGeoList : undefined,
+        );
+        fillerAssSuffix = doc ? writeAssFile(doc, "tailfill") : null;
+      }
+      // Same encode shape as any dirty chunk: recipe encoder args + fps +
+      // thread budget; the black lavfi source is already W×H at the project
+      // rate. -an keeps the concat clips video-only (the audio bus owns all
+      // audio); -t bounds the lavfi duration exactly.
+      const fillerVf = [
+        ...(fillerAssSuffix ? [fillerAssSuffix] : []),
+        "setsar=1",
+        "format=yuv420p",
+      ].join(",");
+      exportPhase = "video";
+      console.log(
+        `[Export] tail filler: visuals end at ${(visualEndMs / 1000).toFixed(1)}s but the timeline is ${(totalMs / 1000).toFixed(1)}s — rendering ${(tailDurSec / 60).toFixed(1)} min of black${fillerAssSuffix ? " (captions continue)" : ""} so the file covers the full timeline`,
+      );
+      prof.beginStage("tail-fill");
+      const fillEta = { lastSec: 0, lastAt: 0, rate: 0 };
+      try {
+        await runFfmpeg(
+          [
+            "-f", "lavfi", "-i",
+            `color=c=black:s=${width}x${height}:r=${Math.round(fps)}:d=${tailDurSec.toFixed(3)}`,
+            "-vf", fillerVf,
+            "-map", "0:v",
+            "-t", tailDurSec.toFixed(3),
+            ...encArgs,
+            "-r", String(Math.round(fps)),
+            "-an",
+            "-threads", String(threadBudget > 0 ? Math.round(threadBudget) : 0),
+            "-y", fillerPath,
+          ],
+          tailDurSec,
+          (sec) => {
+            const now = Date.now();
+            if (sec > fillEta.lastSec + 0.5 && now > fillEta.lastAt) {
+              const inst = (sec - fillEta.lastSec) / ((now - fillEta.lastAt) / 1000);
+              if (inst > 0) fillEta.rate = fillEta.rate > 0 ? 0.3 * fillEta.rate + 0.7 * inst : inst;
+              fillEta.lastSec = sec;
+              fillEta.lastAt = now;
+            }
+            const etaSec = fillEta.rate > 0.01
+              ? Math.min(3600, Math.round(Math.max(0, tailDurSec - sec) / fillEta.rate))
+              : undefined;
+            sendProgress(95 + 0.35 * Math.min(1, sec / Math.max(0.01, tailDurSec)), sec, etaSec);
+          },
+          { maxMs: Math.min(7200000, Math.max(600000, tailDurSec * 750)) },
+        );
+        // The filler is part of the concatenated video: the mux band now
+        // spans the FULL timeline (out_time reaches the end again).
+        concatVideoSec = totalSec;
+      } catch (err) {
+        if (err && err.message === "Export cancelled") throw err;
+        throw new Error(
+          `The tail-fill render (black segment after the last visual clip) failed: ${err.message}`,
+        );
+      }
+      prof.endStage("tail-fill");
+      exportPhase = "audio";
     }
 
     const concatListPath = path.join(tempDir, `concat_${Date.now()}.txt`);
@@ -6923,13 +7137,13 @@ ipcMain.handle("export-native", async (event, opts) => {
       // child emits "time=" ticks — see measureLoudnormContext) so the bar
       // visibly advances instead of freezing for the whole measurement.
       exportPhase = "audio-measure";
-      sendProgress(95.5, totalSec, etaFor(0.955));
+      sendProgress(95.5, totalSec, undefined); // v1.33.6: phase-local ETA only
       loudnormCtx = await measureLoudnormContext(clipAudioJobs, legacyMusicPath2, actualTotalSec, (frac) => {
-        sendProgress(95.5 + 0.5 * Math.min(1, Math.max(0, frac)), totalSec, etaFor(0.955 + 0.005 * Math.min(1, Math.max(0, frac))));
+        sendProgress(95.5 + 0.5 * Math.min(1, Math.max(0, frac)), totalSec, undefined); // v1.33.6: measure ticks carry no ETA
       });
       prof.endStage("loudness");
       exportPhase = "audio";
-      sendProgress(96, totalSec, etaFor(0.96));
+      sendProgress(96, totalSec, undefined); // v1.33.6: phase-local ETA only
       const branchCount = clipAudioJobs.length + musicCount;
       const clipsUsable = (loudnormCtx.clip || []).every((m) => G.loudnessGainDb(m) != null);
       const musicUsable = !legacyMusicPath2 || G.loudnessGainDb(loudnormCtx.music) != null;
@@ -7047,7 +7261,7 @@ ipcMain.handle("export-native", async (event, opts) => {
           maxMs: Math.min(7200000, Math.max(600000, actualTotalSec * 750)),
         });
         exportPhase = "audio";
-        sendProgress(96.5, totalSec, etaFor(0.965));
+        sendProgress(96.5, totalSec, undefined); // v1.33.6: phase-local ETA only
         // v1.33.2: duration-scaled timeout (a 69-min mix WAV measures in
         // 100-140s on weak CPUs — the flat 60s cap killed it and silently
         // fell back to the slow dynamic loudnorm in the final mux).
@@ -7069,7 +7283,7 @@ ipcMain.handle("export-native", async (event, opts) => {
           },
         );
         exportPhase = "audio";
-        sendProgress(96.9, totalSec, etaFor(0.969));
+        sendProgress(96.9, totalSec, undefined); // v1.33.6: phase-local ETA only — the all-run model says "0s" here
         if (fs.existsSync(mixWavPath) && fs.statSync(mixWavPath).size > 44) {
           masterMix = { wavPath: mixWavPath, loudnorm: masterMeasure };
         }
@@ -7234,7 +7448,7 @@ ipcMain.handle("export-native", async (event, opts) => {
         );
       },
       onFinalizeProgress: (f) => {
-        sendProgress(99.7 + 0.27 * Math.min(0.95, Math.max(0, f)), actualTotalSec, undefined);
+        sendProgress(99.7 + 0.2 * Math.min(0.95, Math.max(0, f)), actualTotalSec, undefined); // v1.33.6: caps at 99.9 — "100.0" was a rounding lie
       },
       finalizeEstimateMs: Math.max(15000, Math.min(600000, (expectedOutBytes / (25 * 1024 * 1024)) * 2500)),
       finalizeMs: skipFaststart
