@@ -30,10 +30,10 @@ for (const marker of ["stallWatchdog", "Starting second pass", "onFinalizeProgre
 console.log(`[test] sliced runFfmpeg (${runFfmpegSrc.length}B) — v1.33.4 markers present`);
 
 // ── slice measureLoudnessAsync + measureLoudnormContext ──
-const mStart = src.indexOf("function measureLoudnessAsync(p, win, timeoutMs, onTime)");
+const mStart = src.indexOf("const MEASURE_WINDOW_MAX_SEC = 120"); // v1.33.5: helpers + measureLoudnessAsync
 const mEnd = src.indexOf("ipcMain.handle(\"cancel-export\"", mStart);
 const measureSrc = src.slice(mStart, mEnd);
-for (const marker of ["print_format=json", "maxMs: timeout", "progressTotal", "-nostats" /* must NOT appear in argv */, "onProgress"]) {
+for (const marker of ["print_format=json", "maxMs: timeout", "resolveWindow", "shrinkMeasureWindow", "effectiveMeasureSec" /* v1.33.5 windowed policy */, "onProgress"]) {
   if (measureSrc.indexOf(marker) < 0) throw new Error(`sliced measure block lost the ${marker} marker`);
 }
 if (/\\"\-nostats\\"/.test(measureSrc) || /"-nostats",/.test(measureSrc)) {
@@ -45,6 +45,7 @@ console.log(`[test] sliced measureLoudnessAsync+Context (${measureSrc.length}B)`
 const realFfmpeg = "/usr/bin/ffmpeg";
 const activeProcs = new Set();
 const loudnessCacheStats = { hits: 0, misses: 0 };
+const killProc = (proc) => { try { proc.kill("SIGKILL"); } catch (_) {} }; // v1.33.5: runFfmpeg now routes watchdog kills through killProc (taskkill tree on win32)
 const stubs = {
   fs, path, os,
   spawn,
@@ -59,11 +60,12 @@ const stubs = {
   loudnessDisk: { entries: {} },
   loudnessCacheStats,
   probeMediaAsync: (p) => Promise.resolve({ durationMs: 30000 }),
+  killProc, // v1.33.5: runFfmpeg routes watchdog/maxMs kills through killProc
   console,
 };
 const factory = new Function(...Object.keys(stubs),
-  runFfmpegSrc + "\n" + measureSrc + "\nreturn { runFfmpeg, measureLoudnessAsync };");
-const { runFfmpeg, measureLoudnessAsync } = factory(...Object.values(stubs));
+  runFfmpegSrc + "\n" + measureSrc + "\nreturn { runFfmpeg, measureLoudnessAsync, effectiveMeasureSec };");
+const { runFfmpeg, measureLoudnessAsync, effectiveMeasureSec } = factory(...Object.values(stubs));
 // A SECOND instance bound to node (the fake-child scenarios drive argv via
 // `node -e`) — same sliced code, different binary.
 const nodeFactory = new Function(...Object.keys(stubs),
@@ -208,8 +210,9 @@ const fail = (name, why) => { failures++; console.log(`  FAIL ${name} — ${why}
     // measureLoudnormContext was sliced too — re-bind via the factory? Simpler:
     // call through the same closure by re-evaluating just the context fn.
     const ctxSrc = measureSrc.slice(measureSrc.indexOf("async function measureLoudnormContext"));
-    const ctxFactory = new Function("measureLoudnessAsync", ctxSrc + "\nreturn measureLoudnormContext;");
-    const measureLoudnormContext = ctxFactory(measureLoudnessAsync);
+    // v1.33.5: the context fn references effectiveMeasureSec — bind it too.
+    const ctxFactory = new Function("measureLoudnessAsync", "effectiveMeasureSec", ctxSrc + "\nreturn measureLoudnormContext;");
+    const measureLoudnormContext = ctxFactory(measureLoudnessAsync, effectiveMeasureSec);
     const res = await measureLoudnormContext(
       [{ wavPath: toneM4a, durationMs: 30000, volume: 1 }],
       null,

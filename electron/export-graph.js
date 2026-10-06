@@ -1267,7 +1267,17 @@ function buildAudioMixGraph(o) {
         const db = loudnessGainDb(loudnorm && loudnorm.music);
         if (db != null) m.push(`volume=${db}dB`);
       } else {
-        m.push(measuredLoudnormFilter(loudnorm && loudnorm.music) || "loudnorm=I=-16:TP=-1.5:LRA=11");
+        // v1.33.5 (stuck-at-100% root cause): a missing/unusable measurement
+        // NO LONGER falls back to single-pass DYNAMIC loudnorm — that filter
+        // is the slowest audio path that exists (ebur128 state + gain
+        // smoothing per frame; a 69-min track at 3-10× realtime = 7-23 min
+        // INSIDE the final mux with the bar pinned at its band top). The
+        // branch now rides its natural level (user volume + the master
+        // limiter still guard peaks) — the windowed v1.33.5 measurement
+        // makes null results rare, and an approximate level beats a
+        // half-hour stall every time.
+        const ln = measuredLoudnormFilter(loudnorm && loudnorm.music);
+        if (ln) m.push(ln);
       }
     }
     const musicVol = clampNum(audio.musicVolume, 0, 2, 1);
@@ -1465,16 +1475,31 @@ function buildAudioMixRenderArgs(o) {
   const hasMusicClips = musicTracks.length > 0;
   const hasMusic = !!o.audioPath;
   const loopMusic = hasMusic && !!(audio.musicLoop);
+  // v1.33.5 FINITE LOOP BOUNDS (same rationale as buildConcatArgs): the
+  // render's -t caps the output, but a FINITE loop count lets the inputs EOF
+  // on their own instead of leaning on the output cap to tear an infinite
+  // demuxer down. Unknown duration keeps -1 (the caller's maxMs bounds it).
+  const loopCountFor = (durSec) => {
+    const d = Number(durSec) > 0 ? Number(durSec) : 0;
+    if (d <= 0 || totalSec <= 0) return -1;
+    return Math.max(1, Math.ceil((totalSec + 2) / d));
+  };
   const args = [];
   let idx = 0;
   if (hasMusicClips) {
     musicTracks.forEach((t) => {
-      if (t.loop) args.push("-stream_loop", "-1");
+      if (t.loop) {
+        const n = loopCountFor(t.durSec);
+        args.push("-stream_loop", String(n));
+      }
       args.push("-i", t.path);
       idx += 1;
     });
   } else if (hasMusic) {
-    if (loopMusic) args.push("-stream_loop", "-1");
+    if (loopMusic) {
+      const n = loopCountFor(o.musicDurSec);
+      args.push("-stream_loop", String(n));
+    }
     args.push("-i", o.audioPath);
     idx = 1;
   }
@@ -2082,18 +2107,42 @@ function buildConcatArgs(o) {
   // v5.2: loop-to-fill — -stream_loop -1 makes the music input infinite;
   // -shortest (video stream) + apad=whole_dur cap the output at the video
   // length, so the track repeats until the video ends.
+  // v1.33.5: the loop count is FINITE when the duration is known (see the
+  // input-builder note above) — same audible behavior, self-terminating
+  // input.
   const loopMusic = !hasMusicClips && hasMusic && !!(o.audio && o.audio.musicLoop);
   const args = ["-f", "concat", "-safe", "0", "-i", o.concatListPath];
   // Input layout: 0 = concat video (audio-less clips), 1..N = music (clips
   // or the legacy single), then the pre-extracted clip-audio WAVs, then the
   // SFX WAVs, then the VO inputs.
+  // v1.33.5 FINITE LOOP BOUNDS: a `-stream_loop -1` music input is INFINITE —
+  // termination then leans entirely on -shortest tearing the amix graph
+  // down at the video end (verified to work on ffmpeg 7.x, but one edge
+  // away from an encode that can never EOF). With the source duration known
+  // (the caller probes), the loop count is bounded to just cover the
+  // timeline: ceil((totalSec + 2 s slack) / dur) — same audible result (the
+  // audio past the video end never reaches the file), and the input EOFs on
+  // its own. Unknown duration keeps -1 (the mux's hard maxMs + out-time
+  // stall guards bound that case).
+  const loopCountFor = (durSec) => {
+    const d = Number(durSec) > 0 ? Number(durSec) : 0;
+    const total = Number(o.totalSec) > 0 ? Number(o.totalSec) : 0;
+    if (d <= 0 || total <= 0) return -1;
+    return Math.max(1, Math.ceil((total + 2) / d));
+  };
   if (hasMusicClips) {
     musicTracks.forEach((t) => {
-      if (t.loop) args.push("-stream_loop", "-1");
+      if (t.loop) {
+        const n = loopCountFor(t.durSec);
+        args.push("-stream_loop", String(n));
+      }
       args.push("-i", t.path);
     });
   } else if (hasMusic) {
-    if (loopMusic) args.push("-stream_loop", "-1");
+    if (loopMusic) {
+      const n = loopCountFor(o.musicDurSec);
+      args.push("-stream_loop", String(n));
+    }
     args.push("-i", o.audioPath);
   }
   const musicIdx = 1;
@@ -2163,10 +2212,12 @@ function buildConcatArgs(o) {
     // volume knob rides on the normalized track, DAW-standard order).
     const af = [];
     if (o.audio && o.audio.normalize) {
-      af.push(
-        measuredLoudnormFilter(o.loudnorm && o.loudnorm.music) ||
-          "loudnorm=I=-16:TP=-1.5:LRA=11",
-      );
+      // v1.33.5 (stuck-at-100% root cause): NO dynamic-loudnorm fallback —
+      // a null measurement skips the filter (natural level + limiter)
+      // instead of engaging the slowest audio path inside the mux. See the
+      // buildAudioMixGraph note for the full rationale.
+      const ln = measuredLoudnormFilter(o.loudnorm && o.loudnorm.music);
+      if (ln) af.push(ln);
     }
     const musicVol = clampNum(o.audio && o.audio.musicVolume, 0, 2, 1);
     if (musicVol !== 1) af.push(`volume=${String(musicVol)}`);

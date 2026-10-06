@@ -714,6 +714,54 @@ function loudnessCacheKey(p, win, st) {
   return `${p}|${Math.round(st.mtimeMs)}|${st.size}|${winKey}`;
 }
 
+// ─── v1.33.5 (the stuck-at-100% REAL root cause) ───────────────────────────
+// The v1.33.2-v1.33.4 measurement budgets were calibrated to the assumption
+// "ebur128 runs hundreds of× realtime" — MEASURED REALITY on weak/throttled
+// CPUs: a 69-minute PCM source measures at ~44× in CPU bursts but drops to
+// single-digit× sustained. The v1.33.4 cap (90s + 40ms/s = 255s for a 4140s
+// source) therefore KILLED the measurement on every hour-long export, which
+// cascaded into the DEATH SPIRAL (each step slower than the one it replaced):
+//   measure killed → null → audioFastGain=false → FULL master-mix render
+//   (a second whole-timeline decode) → master measure killed AGAIN → the
+//   final mux runs DYNAMIC loudnorm (the slowest audio path that exists,
+//   ebur128 state + gain smoothing per frame) — 20-40+ minutes of post-95%
+//   grind with the bar pinned at 99.7+ ("stuck at 100%") on exactly the weak
+//   machines that can least afford it.
+// THE FIX (root cause, not symptom): measurement cost must be CONSTANT,
+// independent of timeline length. EBU R128 integrated loudness CONVERGES —
+// a 90 s representative window (starting 20 % into the material, past silent
+// intros and lead-in fades) lands within ~½ LU of the full-file measure,
+// which is inaudible on the STATIC gain the 2-pass recipe applies. Windows
+// ≤ 120 s still measure whole. The timeout survives as a backstop, never
+// as the plan — a healthy windowed measure takes single-digit seconds even
+// on a potato CPU.
+const MEASURE_WINDOW_MAX_SEC = 120; // ≤ this: measure the whole thing
+const MEASURE_WINDOW_SEC = 90;      // sampled window length above the cap
+/** Effective measured span (seconds) for a requested duration — the ONE
+ * policy every progress denominator and window decision shares, so the
+ * caller's frac math and measureLoudnessAsync's internal window can never
+ * disagree (a frozen-looking measure band was the v1.33.4 symptom when they
+ * did). Unknown duration (0) → null (whole file, bounded by the caps). */
+function effectiveMeasureSec(durSec) {
+  const d = Number(durSec) > 0 ? Number(durSec) : 0;
+  if (d <= 0) return null;
+  return d <= MEASURE_WINDOW_MAX_SEC ? d : Math.min(MEASURE_WINDOW_SEC, d);
+}
+/** The v1.33.5 measure window for a requested [startMs, startMs+durMs) span:
+ * whole when ≤ 120 s, else a 90 s sample starting 20 % into the span (clamped
+ * to its end). null when the duration is unknown → whole file. */
+function shrinkMeasureWindow(startMs, durMs) {
+  const d = (Number(durMs) || 0) / 1000;
+  if (!(d > 0)) return null;
+  const start = Math.max(0, (Number(startMs) || 0) / 1000);
+  if (d <= MEASURE_WINDOW_MAX_SEC) {
+    return { ssMs: Math.round(start * 1000), durMs: Math.round(d * 1000) };
+  }
+  const ssRel = Math.min(d * 0.2, Math.max(0, d - MEASURE_WINDOW_SEC));
+  const len = Math.min(MEASURE_WINDOW_SEC, d - ssRel);
+  return { ssMs: Math.round((start + ssRel) * 1000), durMs: Math.round(len * 1000) };
+}
+
 function pruneLoudnessDisk() {
   const keys = Object.keys(loudnessDisk.entries);
   if (keys.length <= 512) return;
@@ -758,6 +806,25 @@ function pruneLoudnessDisk() {
  */
 function measureLoudnessAsync(p, win, timeoutMs, onTime) {
   if (typeof p !== "string" || !p) return Promise.resolve(null);
+  // v1.33.5: resolve the EFFECTIVE window FIRST (the caller's requested span
+  // shrunk by the one shared policy; a whole-file request samples from the
+  // probed duration). This is the root-cause fix: the measured span is
+  // ≤ 90 s on long sources → the measure costs single-digit seconds on weak
+  // CPUs → the timeout never fires → the static-gain fast path always
+  // engages → no master-mix round trip, no dynamic loudnorm in the mux.
+  const resolveWindow = async () => {
+    if (win && Number(win.durMs) > 0) {
+      return shrinkMeasureWindow(win.ssMs, win.durMs);
+    }
+    // Whole-file request → sample from the probed duration (cached, capped).
+    try {
+      const pr = await probeMediaAsync(p);
+      const d = (Number(pr && pr.durationMs) || 0) / 1000;
+      if (d > 0) return shrinkMeasureWindow(0, d * 1000);
+    } catch (_) { /* unreadable → whole file, bounded by the caps */ }
+    return null;
+  };
+  return resolveWindow().then((effWin) => {
   // Temp WAVs (the two-step clip extracts + master-mix renders) live under
   // tempDir and never repeat — bypass the cache for them entirely.
   const isTemp = typeof tempDir === "string" && p.startsWith(tempDir);
@@ -766,7 +833,7 @@ function measureLoudnessAsync(p, win, timeoutMs, onTime) {
   if (!isTemp) {
     try {
       const st = fs.statSync(p);
-      key = loudnessCacheKey(p, win, st);
+      key = loudnessCacheKey(p, effWin, st);
       statOk = true;
     } catch (_) { /* unreadable now — measure uncached */ }
   }
@@ -775,29 +842,36 @@ function measureLoudnessAsync(p, win, timeoutMs, onTime) {
     const e = loudnessDisk.entries[key];
     if (e && e.m && Number.isFinite(Number(e.m.i))) {
       loudnessCacheStats.hits += 1;
+      if (onTime) { try { onTime(effWin ? effWin.durMs / 1000 : 0); } catch (_) {} }
       return Promise.resolve(e.m);
     }
   }
-  const seekArgs = win && Number(win.durMs) > 0
-    ? ["-ss", (Math.max(0, Number(win.ssMs) || 0) / 1000).toFixed(3), "-t", (Number(win.durMs) / 1000).toFixed(3)]
+  const seekArgs = effWin && Number(effWin.durMs) > 0
+    ? ["-ss", (Math.max(0, Number(effWin.ssMs) || 0) / 1000).toFixed(3), "-t", (Number(effWin.durMs) / 1000).toFixed(3)]
     : [];
   // v1.33.2: 60s floor + ~0.025s per media-second (covers ≥40× realtime
   // decode+analysis on weak CPUs), capped at 5 min so a genuinely stuck
   // measurement still dies. v1.33.4: 90s floor + 40ms/s, 10 min cap — weak
   // CPUs measured for real instead of degrading to the slow dynamic path.
-  const durSec = win && Number(win.durMs) > 0 ? Number(win.durMs) / 1000 : 0;
+  // v1.33.5: the budget scales with the EFFECTIVE window (≤ 90 s on long
+  // sources) — even a 2×-realtime potato finishes a 90 s window in 45 s,
+  // comfortably under the 120 s floor. The cap is now a backstop, not a plan.
+  const durSec = effWin && Number(effWin.durMs) > 0 ? Number(effWin.durMs) / 1000 : 0;
   const timeout =
     Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
-      ? Math.max(20000, Math.min(600000, Number(timeoutMs)))
-      : Math.max(90000, Math.min(600000, 90000 + durSec * 40));
+      ? Math.max(120000, Math.min(600000, Number(timeoutMs)))
+      : Math.max(120000, Math.min(600000, 120000 + durSec * 40));
   loudnessCacheStats.misses += 1;
   // v1.33.4: progress denominator — the window when seeked, else the probed
   // source duration (probe is cached; 0 = no live ticks, measurement still
-  // bounded by maxMs + the watchdog).
-  const progressTotal = durSec > 0
+  // bounded by maxMs + the watchdog). v1.33.5: the denominator IS the
+  // effective window (its length — the caller's band math divides by the
+  // same effectiveMeasureSec), so ticks reach 1.0 exactly when the measure
+  // ends and the band never looks frozen mid-measure.
+  const pt = durSec > 0
     ? Promise.resolve(durSec)
     : probeMediaAsync(p).then((pr) => (Number(pr && pr.durationMs) || 0) / 1000).catch(() => 0);
-  return progressTotal.then((pt) =>
+  return pt.then((ptSec) =>
     runFfmpeg(
       [
         // v1.33.4: -nostats REMOVED — the periodic stats line carries
@@ -808,7 +882,7 @@ function measureLoudnessAsync(p, win, timeoutMs, onTime) {
         "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
         "-f", "null", "-",
       ],
-      pt > 0 ? pt : 0,
+      ptSec > 0 ? ptSec : 0,
       onTime || null,
       {
         // A healthy measurement emits a stats line ~2×/s: a full minute of
@@ -848,6 +922,7 @@ function measureLoudnessAsync(p, win, timeoutMs, onTime) {
       return m;
     }).catch(() => null)
   ).catch(() => null);
+  });
 }
 
 /**
@@ -873,6 +948,14 @@ async function measureLoudnormContext(clipAudioJobs, audioPath, totalSec, onProg
   const timeout = Math.max(90000, Math.min(600000, 90000 + durSec * 40));
   clipAudioJobs.forEach((j, k) => tasks.push({ kind: "clip", k, p: j.wavPath, dur: (Number(j.durationMs) || 0) / 1000 }));
   if (audioPath) tasks.push({ kind: "music", p: audioPath, dur: durSec });
+  // v1.33.5: progress denominators use the EFFECTIVE measured span (the
+  // window policy shrinks hour-long sources to a 90 s sample — dividing the
+  // ticks by the FULL duration froze the band at ~2% while the windowed
+  // measure ran, the exact "frozen measure band" symptom v1.33.4 fixed for
+  // full-length decodes and would have re-introduced here).
+  for (const t of tasks) {
+    t.effDur = effectiveMeasureSec(t.dur) || t.dur;
+  }
   // v1.33.4: aggregate progress — mean of per-task decode fractions; a task
   // with no duration just reports 0 until it lands.
   const fracs = new Array(tasks.length).fill(0);
@@ -893,9 +976,9 @@ async function measureLoudnormContext(clipAudioJobs, audioPath, totalSec, onProg
       t.p,
       null,
       timeout,
-      t.dur > 0
+      t.effDur > 0
         ? (sec) => {
-            fracs[base + i] = Math.min(1, sec / Math.max(0.01, t.dur));
+            fracs[base + i] = Math.min(1, sec / Math.max(0.01, t.effDur));
             emit(false);
           }
         : null,
@@ -2903,6 +2986,7 @@ function runFfmpeg(args, totalSec, onTime, opts) {
     let finalizeCrawl = null;    // v1.33.4: the 1Hz crawl through the finalize window
     let finalizeStartedAt = null;
     let maxedOut = false;        // v1.33.4: killed by the maxMs duration cap
+    let outTimeStalled = false; // v1.33.5: killed by the out_time freeze guard
     const onFinalize = opts && typeof opts.onFinalize === "function" ? opts.onFinalize : null;
     const onFinalizeProgress = opts && typeof opts.onFinalizeProgress === "function" ? opts.onFinalizeProgress : null;
     const finalizeEstimateMs = opts && Number(opts.finalizeEstimateMs) > 0 ? Number(opts.finalizeEstimateMs) : 120000;
@@ -2910,11 +2994,21 @@ function runFfmpeg(args, totalSec, onTime, opts) {
     const finalizeMs = opts && Number(opts.finalizeMs) > 0 ? Number(opts.finalizeMs) : 900000;
     const maxMs = opts && Number(opts.maxMs) > 0 ? Number(opts.maxMs) : 0; // v1.33.4: 0 = no cap
     const noFinalizeOnTotal = !!(opts && opts.noFinalizeOnTotal); // faststart-off muxes: only the stderr line may fire finalize
+    // v1.33.5: OUT-TIME STALL GUARD — the v1.33.3 watchdog only fires on
+    // SILENCE (no stderr at all), but a wedged encode can keep printing
+    // stats forever while its position never advances (antivirus crawling
+    // every write, an IO-level deadlock, a filter that spins). While the
+    // timeline is not yet finished (totalSec > 0, total not reached) AND
+    // at least one time= tick has been seen, out_time FROZEN for this long
+    // = dead, not slow → kill with an honest error. 0 disables.
+    const outTimeStallMs = opts && Number(opts.outTimeStallMs) > 0 ? Number(opts.outTimeStallMs) : 0;
     const startedAt = Date.now();
     let lastOutputAt = Date.now(); // any stderr chunk = life
     let totalReachedAt = null;     // wall-clock when out_time hit totalSec
     let exited = false;
     let stallKilled = false;
+    let lastOutTimeSec = -1;       // v1.33.5: last parsed out_time position
+    let lastOutTimeAt = 0;         // wall-clock when it advanced
     const fireFinalize = (why) => {
       if (finalizeNotified || !onFinalize) return;
       finalizeNotified = true;
@@ -2944,7 +3038,24 @@ function runFfmpeg(args, totalSec, onTime, opts) {
         // fall back instead of surfacing a false "stalled" diagnosis.
         maxedOut = true;
         stallKilled = true;
-        try { proc.kill("SIGKILL"); } catch (_) { /* already gone */ }
+        killProc(proc); // v1.33.5: Windows needs taskkill /f /t for a clean tree kill
+        return;
+      }
+      // v1.33.5: the out-time freeze guard (see the block comment above) —
+      // only BEFORE the timeline total is reached (the finalize window is
+      // legitimately position-frozen and bounded by finalizeMs).
+      if (
+        outTimeStallMs > 0 && !sawTotal && totalSec > 0 &&
+        lastOutTimeSec >= 0 && lastOutTimeAt > 0 &&
+        now - lastOutTimeAt > outTimeStallMs
+      ) {
+        outTimeStalled = true;
+        stallKilled = true;
+        console.warn(
+          `[Export] OUT-TIME STALL GUARD: ffmpeg kept printing stats for ${Math.round((now - lastOutTimeAt) / 1000)}s ` +
+            `but the encode position is frozen at ${lastOutTimeSec.toFixed(1)}s of ${totalSec.toFixed(1)}s — killing the process`,
+        );
+        killProc(proc);
         return;
       }
       const silent = totalReachedAt != null
@@ -2957,7 +3068,7 @@ function runFfmpeg(args, totalSec, onTime, opts) {
             Math.round((now - (totalReachedAt != null ? Math.max(totalReachedAt, lastOutputAt) : lastOutputAt)) / 1000)
           }s ${totalReachedAt != null ? "in the finalize pass" : "(encode not finished)"} — killing the process`
         );
-        try { proc.kill("SIGKILL"); } catch (_) { /* already gone */ }
+        killProc(proc); // v1.33.5: taskkill tree-kill on Windows
       }
     }, 5000);
     proc.stderr.on("data", (data) => {
@@ -2968,6 +3079,13 @@ function runFfmpeg(args, totalSec, onTime, opts) {
         if (m) {
           const sec = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4]) / 100;
           onTime(Math.min(sec, totalSec));
+          // v1.33.5: track POSITION ADVANCEMENT for the out-time stall guard
+          // (stats can flow forever while the position is frozen — see the
+          // watchdog above).
+          if (sec > lastOutTimeSec + 0.05) {
+            lastOutTimeSec = sec;
+            lastOutTimeAt = Date.now();
+          }
           // v1.33.2 (stuck-at-100% report): when every frame is muxed
           // (out_time == total) the process can STILL run for a long silent
           // stretch — `-movflags +faststart` rewrites the WHOLE file to move
@@ -3030,6 +3148,18 @@ function runFfmpeg(args, totalSec, onTime, opts) {
       if (stallKilled) {
         if (maxedOut) {
           reject(new Error(`__FFMAX__ took longer than the allowed ${Math.round(maxMs / 1000)}s`));
+          return;
+        }
+        // v1.33.5: the out-time freeze guard — stats flowed but the encode
+        // position never advanced (its own honest diagnosis + remedy).
+        if (outTimeStalled) {
+          reject(new Error(
+            `The export stalled: ffmpeg kept reporting statistics but the encode position stopped advancing at ` +
+              `${lastOutTimeSec.toFixed(1)}s of a ${totalSec.toFixed(1)}s timeline for over ${Math.round(outTimeStallMs / 1000)}s and was terminated. ` +
+              `Common causes: antivirus software throttling or locking the output file mid-write, the destination disk ` +
+              `disconnecting or entering a fault state, or an IO-level deadlock. Add an exclusion for the output folder ` +
+              `(and the FrameFuse temp folder), check the destination disk, and retry.`
+          ));
           return;
         }
         const lines = stderrTail.trim().split("\n").slice(-4).join("\n");
@@ -4422,6 +4552,11 @@ ipcMain.handle("export-native", async (event, opts) => {
               startMs: Math.max(0, Math.round(Number(c.startMs) || 0)),
               volume: Math.max(0, Math.min(2, Number(c.volume) || 1)),
               loop: !!(c && c.loop),
+              // v1.33.5: the clip's duration rides along (the renderer ships
+              // it) — the mux builders use it for FINITE -stream_loop bounds
+              // so a looping track's input can EOF on its own instead of
+              // being infinite (-1). Probed at the call site when missing.
+              durationMs: Math.max(0, Math.round(Number(c.durationMs) || 0)),
               // v1.29: "music" | "voice" — voice = full-length narration-style
               // placement (loop is false there by contract). Informational for
               // the graph builders (branches are volume/fades/adelay either
@@ -4784,6 +4919,14 @@ ipcMain.handle("export-native", async (event, opts) => {
         if ((await probeMediaAsync(s.videoPath)).hasAudio) { anyVideoAudio = true; break; }
       }
     }
+    // v1.33.5: the legacy single music track's duration, probed ONCE (warm,
+    // 15 s-capped) — the mux + audio-bus builders use it for FINITE
+    // -stream_loop bounds so a looping track's input can EOF on its own
+    // instead of being infinite. Multi-music clips carry their own
+    // durationMs (probed per clip at the mux call site when missing).
+    const legacyMusicDurationSec = !hasMusicClips && typeof audioPath === "string" && audioPath
+      ? Math.max(0, (Number((await probeMediaAsync(audioPath)).durationMs) || 0) / 1000)
+      : 0;
 
     prof.beginStage("build");
 
@@ -6043,6 +6186,16 @@ ipcMain.handle("export-native", async (event, opts) => {
           const legacyMusicPath = hasMusicClips ? null : audioPath;
           if (legacyMusicPath) tasks.push({ kind: "music", p: legacyMusicPath, dur: totalSec, win: null });
           const spFrac = new Array(tasks.length).fill(0);
+          // v1.33.5: denominators use the EFFECTIVE measured span (windowed
+          // measures tick 0→1 over their ≤ 90 s sample — the full duration
+          // would freeze the planning band).
+          for (const task of tasks) {
+            task.effDur = effectiveMeasureSec(
+              task.win && Number(task.win.durMs) > 0
+                ? Number(task.win.durMs) / 1000
+                : task.dur,
+            ) || task.dur;
+          }
           for (let t = 0; t < tasks.length; t += 8) {
             const chunkT = tasks.slice(t, t + 8);
             const base = t;
@@ -6054,10 +6207,12 @@ ipcMain.handle("export-native", async (event, opts) => {
               // window-scaled default. (The old call passed NO timeout → a
               // flat 60s cap for the music file — the v1.33.2 long-audio
               // starvation bug, still live on the smart path until now.)
+              // v1.33.5: win=null is now sampled internally (90 s window)
+              // so the budget is comfortably above the real cost.
               task.win ? undefined : Math.max(90000, Math.min(600000, 90000 + (task.dur || totalSec) * 40)),
-              task.dur > 0
+              task.effDur > 0
                 ? (sec) => {
-                    spFrac[base + i] = Math.min(1, sec / Math.max(0.01, task.dur));
+                    spFrac[base + i] = Math.min(1, sec / Math.max(0.01, task.effDur));
                     let sum = 0;
                     for (let q = 0; q < spFrac.length; q++) sum += spFrac[q];
                     sendProgress(0.2 + 0.3 * (sum / spFrac.length), 0, undefined);
@@ -6362,8 +6517,11 @@ ipcMain.handle("export-native", async (event, opts) => {
                 audio,
                 audioPath: hasMusicClips ? null : audioPath,
                 // v1.25 MULTI-MUSIC: the N-clip music inputs (SFX-style
-                // branches; each loop clip's input gets -stream_loop -1).
+                // branches; each loop clip's input gets a FINITE
+                // -stream_loop count via its durationMs — v1.33.5).
                 musicTracks: hasMusicClips ? musicClipList : undefined,
+                // v1.33.5: the legacy track's duration (finite loop bound).
+                ...(!hasMusicClips && legacyMusicDurationSec > 0 ? { musicDurSec: legacyMusicDurationSec } : {}),
                 sfx: sfxList,
                 voiceovers: voiceoverList,
                 clipAudio: clipAudioBranches,
@@ -6856,8 +7014,13 @@ ipcMain.handle("export-native", async (event, opts) => {
         // phase change while ffmpeg decoded+mixed the full duration. The
         // out_time now drives 96 → 96.5 with an explicit "mixing audio"
         // phase so the bar visibly moves and the ETA is honest.
+        // v1.33.5: the ETA is now PHASE-LOCAL (a 1/s slope over the mix's own
+        // out_time) — the all-run etaFor() model said "seconds" at this
+        // point while the mix still needed minutes (the "time estimation is
+        // wrong" report). A hard duration cap also bounds the render.
         exportPhase = "audio-mix";
         let mixNotified = false;
+        const mixEta = { lastSec: 0, lastAt: 0, rate: 0 };
         await runFfmpeg(renderArgs, actualTotalSec, (sec) => {
           if (!mixNotified) {
             mixNotified = true;
@@ -6865,7 +7028,23 @@ ipcMain.handle("export-native", async (event, opts) => {
               `[Export] master-bus mix render: ${(actualTotalSec / 60).toFixed(1)} min of audio → temp WAV (progress 96→96.5%)`,
             );
           }
-          sendProgress(96 + 0.5 * Math.min(1, sec / Math.max(0.01, actualTotalSec)), sec, etaFor(0.9625));
+          const now = Date.now();
+          if (sec > mixEta.lastSec + 0.5 && now > mixEta.lastAt) {
+            const inst = (sec - mixEta.lastSec) / ((now - mixEta.lastAt) / 1000);
+            if (inst > 0) mixEta.rate = mixEta.rate > 0 ? 0.3 * mixEta.rate + 0.7 * inst : inst;
+            mixEta.lastSec = sec;
+            mixEta.lastAt = now;
+          }
+          const mixEtaSec = mixEta.rate > 0.01
+            ? Math.min(3600, Math.round(Math.max(0, actualTotalSec - sec) / mixEta.rate))
+            : undefined;
+          sendProgress(96 + 0.5 * Math.min(1, sec / Math.max(0.01, actualTotalSec)), sec, mixEtaSec);
+        }, {
+          // v1.33.5: the mix render is whole-timeline audio work — bounded
+          // hard (never an infinite child): 0.75×-realtime-equivalent + a
+          // 600 s floor, 2 h cap. A healthy mix runs far faster; a wedged
+          // one now dies with an honest error instead of pinning the bar.
+          maxMs: Math.min(7200000, Math.max(600000, actualTotalSec * 750)),
         });
         exportPhase = "audio";
         sendProgress(96.5, totalSec, etaFor(0.965));
@@ -6875,13 +7054,18 @@ ipcMain.handle("export-native", async (event, opts) => {
         // v1.33.4: 90s floor + 40ms/s (10 min cap) AND live progress — the
         // master-mix measurement band 96.5 → 96.9 now ticks with the decode
         // instead of freezing (the last frozen spot in the 95-100 band).
+        // v1.33.5: the mix WAV is measured through the SAME windowed policy
+        // (a 90 s representative sample) — constant cost, never times out,
+        // and the band denominator is the effective window so the ticks
+        // span the whole 96.5 → 96.9 band.
+        const masterEffSec = effectiveMeasureSec(actualTotalSec) || actualTotalSec;
         const masterMeasure = await measureLoudnessAsync(
           mixWavPath,
           null,
           Math.max(90000, Math.min(600000, 90000 + actualTotalSec * 40)),
           (sec) => {
             exportPhase = "audio-measure";
-            sendProgress(96.5 + 0.4 * Math.min(1, sec / Math.max(0.01, actualTotalSec)), sec, etaFor(0.967));
+            sendProgress(96.5 + 0.4 * Math.min(1, sec / Math.max(0.01, masterEffSec)), sec, undefined);
           },
         );
         exportPhase = "audio";
@@ -6938,12 +7122,34 @@ ipcMain.handle("export-native", async (event, opts) => {
       );
     }
 
+    // v1.33.5: music durations for the FINITE loop bounds — the renderer
+    // ships durationMs per music clip (probed per clip here when missing —
+    // cached, 15 s-capped); the legacy single track's duration was probed
+    // once at the top of the handler. Unknown durations keep -stream_loop -1
+    // (bounded by the mux's hard maxMs + out-time stall guards below).
+    const musicDurFor = async (mp) => {
+      try {
+        const pr = await probeMediaAsync(mp);
+        return (Number(pr && pr.durationMs) || 0) / 1000;
+      } catch (_) { return 0; }
+    };
+    const boundedMusicTracks = [];
+    for (const t of musicClipList) {
+      const durSec = (Number(t.durationMs) || 0) > 0
+        ? (Number(t.durationMs) / 1000)
+        : await musicDurFor(t.path);
+      boundedMusicTracks.push({ ...t, ...(durSec > 0 ? { durSec } : {}) });
+    }
+    const legacyMusicDurSec = legacyMusicDurationSec;
+
     const concatArgs = G.buildConcatArgs({
       concatListPath,
       audioPath: legacyMusicPath2,
       // v1.25 MULTI-MUSIC: N-clip music inputs (SFX-style graph branches; N
       // inputs with per-clip -stream_loop, indexes 1..N before the WAVs).
-      musicTracks: hasMusicClips ? musicClipList : undefined,
+      musicTracks: hasMusicClips ? boundedMusicTracks : undefined,
+      // v1.33.5: the legacy single track's duration (finite loop bounds).
+      ...(legacyMusicDurSec > 0 ? { musicDurSec: legacyMusicDurSec } : {}),
       audio,
       outputPath,
       totalSec: actualTotalSec,
@@ -6990,10 +7196,36 @@ ipcMain.handle("export-native", async (event, opts) => {
     //     tail is a sub-2s flush — the old 1.5s-heuristic "finalize" label
     //     was noise for them and is now suppressed).
     const muxBandSec = concatVideoSec || actualTotalSec;
+    // v1.33.5: PHASE-LOCAL ETA — etaFor()'s all-run fraction model is
+    // meaningless at 0.97+ ("seconds left" while a 69-min mux grinds for
+    // minutes — the "time estimation is wrong" report). The mux's own
+    // out_time slope drives the remaining-audio estimate.
+    const muxEta = { lastSec: 0, lastAt: 0, rate: 0 };
     await runFfmpeg(concatArgs, actualTotalSec, (sec) => {
       const frac = 0.97 + 0.027 * Math.min(1, sec / Math.max(0.01, muxBandSec));
-      sendProgress(frac * 100, sec, etaFor(frac));
+      const now = Date.now();
+      if (sec > muxEta.lastSec + 0.5 && now > muxEta.lastAt) {
+        const inst = (sec - muxEta.lastSec) / ((now - muxEta.lastAt) / 1000);
+        if (inst > 0) muxEta.rate = muxEta.rate > 0 ? 0.3 * muxEta.rate + 0.7 * inst : inst;
+        muxEta.lastSec = sec;
+        muxEta.lastAt = now;
+      }
+      const etaSec = muxEta.rate > 0.01
+        ? Math.min(3600, Math.round(Math.max(0, muxBandSec - sec) / muxEta.rate))
+        : undefined;
+      sendProgress(frac * 100, sec, etaSec);
     }, {
+      // v1.33.5: the mux gets the same hard duration cap as the mix render
+      // — the LAST unbounded child in the pipeline. 0.75×-realtime-
+      // equivalent + 600 s floor (2 h cap): a healthy mux (stream-copy
+      // video + AAC audio) runs far faster; anything past the cap dies
+      // with an honest error instead of pinning the bar at 99.7+ forever.
+      maxMs: Math.min(7200000, Math.max(600000, actualTotalSec * 750)),
+      // v1.33.5: out-time stall guard — stats can keep flowing (watchdog
+      // sees "life") while the encode position is FROZEN (antivirus
+      // crawling the writes, an IO-level wedge). 120 s without out_time
+      // advancing while the timeline is not yet finished = wedged → kill.
+      outTimeStallMs: 120000,
       onFinalize: () => {
         exportPhase = "finalize";
         sendProgress(99.7, actualTotalSec, undefined);

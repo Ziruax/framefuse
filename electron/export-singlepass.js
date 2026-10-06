@@ -1528,16 +1528,28 @@ function buildSinglePassPlan(o) {
       : [];
     const hasMusicClips = musicTracks.length > 0;
     const loopMusic = !hasMusicClips && !!(audioPath && audio && audio.musicLoop);
+    // v1.33.5 FINITE LOOP BOUNDS — see the combined-graph music inputs above.
+    const loopCountFor2 = (durSec) => {
+      const d = Number(durSec) > 0 ? Number(durSec) : 0;
+      if (d <= 0 || totalSec <= 0) return -1;
+      return Math.max(1, Math.ceil((totalSec + 2) / d));
+    };
     if (hasMusicClips) {
       musicTracks.forEach((t) => {
         inputs.push("-thread_queue_size", "512");
-        if (t.loop) inputs.push("-stream_loop", "-1");
+        if (t.loop) {
+          const n = loopCountFor2((Number(t.durationMs) || 0) / 1000);
+          inputs.push("-stream_loop", String(n));
+        }
         inputs.push("-i", t.path);
       });
       idx += musicTracks.length;
     } else if (audioPath) {
       inputs.push("-thread_queue_size", "512");
-      if (loopMusic) inputs.push("-stream_loop", "-1");
+      if (loopMusic) {
+        const n = loopCountFor2(o.musicDurSec);
+        inputs.push("-stream_loop", String(n));
+      }
       inputs.push("-i", audioPath);
     }
     const musicInputIdx = idx;
@@ -1850,21 +1862,36 @@ function buildSinglePassPlan(o) {
   if (hasAudioOut) {
     // v1.25 MULTI-MUSIC: N music inputs after the video inputs (each with
     // its own -stream_loop), else the legacy single music input.
+    // v1.33.5 FINITE LOOP BOUNDS: same policy as buildConcatArgs — a known
+    // source duration gets ceil((total+2)/dur) instead of -1 so the input
+    // EOFs on its own (the bus -t still caps the output; this removes the
+    // infinite-demuxer teardown dependency).
     const musicTracks = Array.isArray(o.musicTracks)
       ? o.musicTracks.filter((t) => t && typeof t.path === "string" && t.path)
       : [];
     const hasMusicClips = musicTracks.length > 0;
     const loopMusic = !hasMusicClips && !!(audioPath && audio && audio.musicLoop);
+    const loopCountFor = (durSec) => {
+      const d = Number(durSec) > 0 ? Number(durSec) : 0;
+      if (d <= 0 || totalSec <= 0) return -1;
+      return Math.max(1, Math.ceil((totalSec + 2) / d));
+    };
     if (hasMusicClips) {
       musicTracks.forEach((t) => {
         inputs.push("-thread_queue_size", "512");
-        if (t.loop) inputs.push("-stream_loop", "-1");
+        if (t.loop) {
+          const n = loopCountFor((Number(t.durationMs) || 0) / 1000);
+          inputs.push("-stream_loop", String(n));
+        }
         inputs.push("-i", t.path);
       });
       idx += musicTracks.length;
     } else if (audioPath) {
       inputs.push("-thread_queue_size", "512");
-      if (loopMusic) inputs.push("-stream_loop", "-1");
+      if (loopMusic) {
+        const n = loopCountFor(o.musicDurSec);
+        inputs.push("-stream_loop", String(n));
+      }
       inputs.push("-i", audioPath);
     }
     const musicInputIdx = idx;
