@@ -354,6 +354,26 @@ async function main() {
       }
     }
     console.log(`[static-diag] frame60 overlay bbox: ${n ? `x[${(minX/W).toFixed(2)}..${(maxX/W).toFixed(2)}] y[${(minY/H).toFixed(2)}..${(maxY/H).toFixed(2)}] n=${n}` : "none"}`);
+    // coarse 16x9 color grid (the frame's actual layout, compositor-blind)
+    if (f) {
+      const cells = [];
+      for (let gy = 0; gy < 9; gy++) {
+        const row = [];
+        for (let gx = 0; gx < 16; gx++) {
+          let r = 0, g = 0, b = 0, cnt = 0;
+          for (let y = Math.floor(gy * H / 9); y < Math.floor((gy + 1) * H / 9); y++) {
+            for (let x = Math.floor(gx * W / 16); x < Math.floor((gx + 1) * W / 16); x++) {
+              const o = (y * W + x) * 3;
+              r += f[o]; g += f[o + 1]; b += f[o + 2]; cnt++;
+            }
+          }
+          row.push(cnt ? `${Math.round(r / cnt).toString(16).padStart(2, "0")}${Math.round(g / cnt).toString(16).padStart(2, "0")}${Math.round(b / cnt).toString(16).padStart(2, "0")}` : "??????");
+        }
+        cells.push(row.join(" "));
+      }
+      console.log("[static-grid] frame60 16x9 avg colors (00ff00=lime, 000000=black):");
+      for (const row of cells) console.log("  " + row);
+    }
     // expected: x[0.41..0.59] y[0.25..0.75] (60x90 centered at 0.5,0.5)
     check(`static overlay: bbox centered (got ${n ? `${((minX+maxX)/2/W).toFixed(2)},${((minY+maxY)/2/H).toFixed(2)}` : "none"})`,
       n > 200 && Math.abs((minX+maxX)/2/W - 0.5) < 0.06 && Math.abs((minY+maxY)/2/H - 0.5) < 0.06);
