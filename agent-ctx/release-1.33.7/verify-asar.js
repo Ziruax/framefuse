@@ -134,9 +134,13 @@ check("router: loopSrc maps to base-lane segments", routerJs.includes("loopSrc: 
 check("router: motion keyframes map", routerJs.includes("motion.length >= 2 ? motion : []"));
 check("router: normalizeAudio + audioTargetLufs in the timeline", routerJs.includes("normalizeAudio: !!(audio.normalize)") && routerJs.includes("audioTargetLufs: -16"));
 {
-  let info = "";
-  try { info = asar.extractFile(ASAR, "rust-engine/engine-info.json").toString(); } catch {}
-  check("engine-info.json: CI engine 0.3.0", info.includes('"engineVersion": "0.3.0"'), info.slice(0, 80));
+  // engine-info.json is EXCLUDED from packaging by design (package.json
+  // "!rust-engine/engine-info.json") — the engine's identity is the sha256
+  // check above + the shipped source carrying the fix markers.
+  let wgsl = "";
+  try { wgsl = asar.extractFile(ASAR, "rust-engine/src/compositor/shaders/yuv.wgsl").toString(); } catch {}
+  check("yuv.wgsl (packaged source): the v0.3.1 chroma-indexing fix present",
+    wgsl.includes("v0.3.1 FIX") && wgsl.includes("let cq = gid.x"));
 }
 {
   let chunkText = "";
@@ -146,7 +150,7 @@ check("router: normalizeAudio + audioTargetLufs in the timeline", routerJs.inclu
       try { chunkText += asar.extractFile(ASAR, p.replace(/^\//, "")).toString(); } catch {}
     }
   } catch {}
-  check("out chunks: v1.33.7 time-UI directive (elapsed+ETA only)", chunkText.includes("just leave time elapsed and eta"));
+  check("out chunks: v1.33.7 time-UI (elapsed+ETA runtime labels)", chunkText.includes("Wall-clock time since the export started") && chunkText.includes("Estimated time remaining (this phase)"));
 }
 
 // ── 7. v1.33.4 markers ──
@@ -203,7 +207,7 @@ check("main.js: filler phase-local ETA + hard cap",
 // renderer sources (v1.33.6)
 {
   const headerSrc = fs.readFileSync(path.join(ROOT, "src", "components", "Header.tsx"), "utf8");
-  check("Header.tsx (source): BUILD_VERSION 1.33.6", headerSrc.includes('const BUILD_VERSION = "1.33.6"'));
+  check("Header.tsx (source): BUILD_VERSION 1.33.7", headerSrc.includes('const BUILD_VERSION = "1.33.7"'));
   check("Header.tsx (source): wall-clock elapsed chip", headerSrc.includes("v1.33.6: WALL-CLOCK elapsed"));
   check("Header.tsx (source): ETA 0 guard (in flight reads estimating)", headerSrc.includes("(exportProgress.eta > 0 || exportProgress.phase === \"done\")"));
   const pageSrc = fs.readFileSync(path.join(ROOT, "src", "app", "page.tsx"), "utf8");
@@ -218,5 +222,5 @@ check("main.js: filler phase-local ETA + hard cap",
   check("MediaPanel.tsx (source): Not-on-timeline library + image hold toggle", mpSrc.includes("Not on timeline") && mpSrc.includes("Hold to the timeline end"));
 }
 
-console.log(failures === 0 ? `\nASAR AUDIT v1.33.6: ALL CHECKS PASSED` : `\nASAR AUDIT v1.33.6: ${failures} FAILURE(S)`);
+console.log(failures === 0 ? `\nASAR AUDIT v1.33.7: ALL CHECKS PASSED` : `\nASAR AUDIT v1.33.6: ${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);

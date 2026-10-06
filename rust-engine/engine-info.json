@@ -1,5 +1,5 @@
 {
-  "engineVersion": "0.2.0",
+  "engineVersion": "0.3.0",
   "binary": "framefuse-engine.win32-x64.node",
   "loadedFrom": "D:\\a\\framefuse\\framefuse\\rust-engine\\framefuse-engine.win32-x64.node",
   "platform": {
@@ -13,13 +13,13 @@
     "success": true,
     "engineUsed": "rust-gpu",
     "encoderName": "libx264",
-    "durationMs": 3944,
+    "durationMs": 5488,
     "frames": 150,
-    "compositorMs": 3357,
+    "compositorMs": 3621,
     "encodeMs": 0,
-    "decodeMs": 21,
-    "audioMs": 101,
-    "sizeBytes": 894080,
+    "decodeMs": 15,
+    "audioMs": 82,
+    "sizeBytes": 292924,
     "adapter": "Microsoft Basic Render Driver",
     "ffmpegFamily": "61/61/59/8/5"
   },
@@ -38,12 +38,12 @@
     },
     "format": {
       "duration": "5.013000",
-      "size": "894080"
+      "size": "292924"
     },
-    "outputBytes": 894080
+    "outputBytes": 292924
   },
   "assertionsPassed": true,
   "assertionFailures": [],
-  "wallMs": 4319,
-  "generatedAt": "2026-10-05T21:07:38.161Z"
+  "wallMs": 5741,
+  "generatedAt": "2026-10-06T21:33:48.607Z"
 }

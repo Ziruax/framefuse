@@ -3100,3 +3100,22 @@ Stage Summary:
 - The stuck-at-100% family is now STRUCTURALLY eliminated on the Rust path: there are no post-95% child phases at all (audio mixes during video, "mux" is a trailer write, progress = frame fraction, ETA linear and honest — measured 0 bogus ETA events at full 69-min scale).
 - Engine hardening: phantom-drain guards (Debian assertion → release UB elsewhere), one-shot drains, loop-wrap seeks, serde defaults, BS.1770 stereo math, ±40dB loudnorm, streaming audio (1.7GB peak at 69-min, any length).
 - Pending: push → CI builds the Windows 0.3.0 engine (workflow runs the v3 feature test) → stage artifact → electron:build → ASAR audit → release v1.33.7 (the v1.33.6 publisher playbook).
+---
+Task ID: 27-final (v1.33.7 release completion + the CI-found GPU chroma bug)
+Agent: main (Z.ai Code)
+Task: Ship v1.33.7 (the Rust-everywhere engine release) to GitHub.
+
+Work Log:
+- CI cycles (5): the v3 feature test initially failed on the WINDOWS runner — the rgbFrame probe (select+vsync) read empty buffers on some ffmpeg builds (made portable: whole-file decode + index); then the motion checks exposed a REAL engine bug that only exists on the GPU compositor path.
+- **THE GPU CHROMA BUG (found via a 16×9 color-grid dump from CI)**: yuv.wgsl's PLANAR branch wrote U/V at the Y-plane column (x0/4 = 2 u32 per block) instead of the chroma column (x0/8 = 1 u32 per block) — a copy-paste indexing error: every chroma row's tail overflowed into the next row and the U plane's tail into V. Solid-color frames masked it completely (every written element carried the same value — that's why the yuv-color-test passed for months) while spatially-varying chroma garbled: full-canvas green tint, tinted blacks, washed overlays — ON EVERY GPU EXPORT with libx264 (planar YUV420P; the NV12/NVENC branch was correct). The CPU rasterizer path was always correct — which is why local (no-GPU sandbox) testing never saw it.
+- FIX: the chroma u32 column = gid.x (unique per invocation → no write races; the tail block's clamped re-samples land in the c_stride padding the consumer skips) + a permanent chroma-parity check in the v3 test (black base + lime overlay = spatially-varying chroma; corner must stay black, core must be saturated lime — catches this bug class forever).
+- CI GREEN (run 37534285576): engine 0.3.0 built, smoke PASS, color tests 4/4, v2 PASS, **v3 20/20** (chroma parity + both motion checks green on the real GPU path), installer job success.
+- Engine artifact 11445566646 staged (sha256 351d72ec00ff…; engine-info: engineUsed rust-gpu, assertionsPassed true, v3 log 20/20).
+- electron:build re-run (RUST_ENGINE_SKIP=1, ffmpeg staged from the tag-pinned gyan mirror — the "latest" gyan archive drifted to the FFmpeg 8 family (avcodec-63) and was correctly REJECTED by the family check): dist/FrameFuse Setup 1.33.7.exe 220.4MB + latest.yml + blockmap. The local Linux test binary accidentally packaged (9.6MB) — removed + re-packaged.
+- ASAR AUDIT v1.33.7: ALL 62 CHECKS PASSED — every v1.33.2–v1.33.6 marker retained + the new v1.33.7 markers (router v0.3 native gates + ENGINE_V03 guard + NaN guard + loopSrc/motion/normalizeAudio mappings, yuv.wgsl chroma-fix marker in the packaged source, engine sha256 == CI binary, time-UI runtime labels, version stamp 1.33.7).
+- scripts/publish-release-1.33.7.js: RELEASE 405183367 created at 6d42eba, 3 assets uploaded, three-way sha512 VERIFIED (93uDfEoGyAfN…, 220,390,730 bytes). releases/latest ⇒ v1.33.7, tag page HTTP 200.
+
+Stage Summary:
+- v1.33.7 IS LIVE: https://github.com/Ziruax/framefuse/releases/tag/v1.33.7 (installer FrameFuse-Setup-1.33.7.exe, 220.4MB).
+- THE COMPLETE ANSWER to the user's question shipped in code + measurements: the Rust engine (napi-rs + runtime-dlopened libav* — the user's blueprint, already) is THE export pipeline for every scenario; the CLI multi-phase path is demoted to the Safe-Mode fallback + 3 niche feature gates. Same encoders as the CLI, one native pass, no intermediates, GPU compositing + hardware-encoder probing, bounded memory, one honest progress model.
+- BONUS CRITICAL FIX: the GPU-path chroma corruption (green-tinted exports on every GPU/libx264 export since the GPU engine shipped) — found by the new full-frame chroma checks, fixed, verified on the Windows GPU runner.
