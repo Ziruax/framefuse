@@ -33,8 +33,23 @@
 //   ✓ v1.21 NATIVE KINETIC TYPOGRAPHY: the v1.18 kinetic-typography engine
 //     (per-word choreography over renderer-measured geometry) via
 //     rust-engine/src/kinetic.rs — an exact math port of kinetic/motion.ts
+//   ✓ v0.3 (v1.33.7) BASE-LANE LOOP-TO-FILL: a track-0 video marked `loop`
+//     wraps its decode position across the trimmed source span and loops
+//     its own audio on the native bus (the CLI `-stream_loop` parity) —
+//     engine v0.3, no gate.
+//   ✓ v0.3 (v1.33.7) AUDIO-EXTENDED TIMELINES: payload totalMs beyond the
+//     last visual end renders black-tail frames + a full-length audio bus
+//     (the engine always honored totalMs — the gate was the only blocker).
+//   ✓ v0.3 (v1.33.7) AUDIO-ONLY TIMELINES: zero visual segments with
+//     music/voice/SFX render black video over the audio's full length.
+//   ✓ v0.3 (v1.33.7) LOUDNORM: audio.normalize measures each measured-branch
+//     source IN-PROCESS (EBU R128 K-weighted gated LUFS, ≤90 s window —
+//     constant cost) and applies a static linear gain toward −16 LUFS + a
+//     measured master gain (the CLI clip/legacy-music semantics).
+//   ✓ v0.3 (v1.33.7) OVERLAY MOTION PATHS: ≥2 keyframes interpolate the
+//     overlay center piecewise-linearly (hold-first/hold-last).
 //   ✗ slide/wipe/circleopen transitions, burn-in text removal, v1.17
-//     kinetic Stack Text, loudnorm, overlay motion keyframes → CLI
+//     kinetic Stack Text, kinetic without geometry → CLI
 
 "use strict";
 
@@ -130,38 +145,86 @@ const XFADE_FAMILY_STYLES = new Set([
   "dissolve", "slide-left", "slide-right", "wipe-left", "wipe-right", "circleopen",
 ]);
 
+// v0.3 (v1.33.7): does the loaded engine know the NEW timeline fields
+// (loopSrc / motion / normalizeAudio / normalizeSrc / ExtraAudio.loopSrc)?
+// A hybrid install (new router + stale 0.2.0 binary) must NOT silently
+// degrade — looping would freeze on the last frame, normalize would skip.
+// Those scenarios route to the battle-tested CLI until the engine ships
+// 0.3.0+ (serde default keeps old binaries LOADABLE for everything else).
+const ENGINE_V03 = (() => {
+  try {
+    if (!rustEngine || typeof rustEngine.engineVersion !== "function") return false;
+    const parts = String(rustEngine.engineVersion()).split(".").map(Number);
+    const maj = parts[0] || 0;
+    const min = parts[1] || 0;
+    return maj > 0 || min >= 3;
+  } catch {
+    return false;
+  }
+})();
+
 function rustEligible(opts) {
   if (!rustEngine) return { ok: false, reason: rustEngineError || "engine not loaded" };
   const reasons = [];
 
   // v2: voiceovers + SFX ride the NATIVE audio bus (extraAudio) — no gate.
+  // v0.3 (v1.33.7): base-lane LOOP-TO-FILL, AUDIO-EXTENDED timelines,
+  // AUDIO-ONLY timelines, loudnorm and overlay motion paths are ALL NATIVE
+  // (engine v0.3) — the former gates are gone. The Rust path now covers
+  // every export scenario except the four below.
 
-  // v1.29 LOOP-TO-FILL (user complaints 3/4): a base-lane (track 0) video
-  // marked `loop` renders via the FFmpeg CLI's -stream_loop pipeline — the
-  // native engine has no base-lane loop support (its per-segment windows
-  // are bounded by the source). Looping projects ride the CLI path.
   const segList = Array.isArray(opts.segments) ? opts.segments : [];
-  if (segList.some((s) => s && (Number(s.track) || 0) === 0 && s.mediaType === "video" && s.loop === true)) {
-    reasons.push("base-loop");
+  const usableVisual = segList.some((s) => s && (s.videoPath || s.imagePath));
+  if (!usableVisual) {
+    // v0.3 AUDIO-ONLY: zero usable visual segments is fine when the project
+    // carries audio — the engine renders black video over the audio's full
+    // timeline. No audio at all → the CLI's honest "No segments" error.
+    const hasAudio =
+      (Array.isArray(opts.musicClips) && opts.musicClips.length > 0) ||
+      (typeof opts.audioPath === "string" && opts.audioPath) ||
+      (Array.isArray(opts.voiceovers) && opts.voiceovers.some((v) => v && typeof v.wavPath === "string" && v.wavPath)) ||
+      (Array.isArray(opts.sfx) && opts.sfx.some((x) => x && typeof x.wavPath === "string" && x.wavPath));
+    if (!hasAudio) reasons.push("empty-timeline");
   }
 
-  // v1.29 AUDIO-EXTENDED TIMELINE: when the renderer's authoritative
-  // totalMs EXCEEDS the last visual segment end (a voice/full-length audio
-  // track extends the timeline), the export must honor the audio-driven
-  // length — the native engine's segment-bounded compositor would trim the
-  // audio back to the visuals (the exact reported bug). Extended projects
-  // ride the FFmpeg CLI pipeline (its clocks already honor the payload).
-  if (Array.isArray(opts.segments) && opts.segments.length > 0) {
-    const segTotalMs = opts.segments.reduce(
+  // ── v0.3 scenario capabilities (engine-version guard) ───────────────
+  // Each flag below marks a payload that NEEDS a 0.3.0+ engine; a stale
+  // binary routes it to the CLI instead of silently degrading.
+  let needsV03 = false;
+  // base-lane loop-to-fill
+  if (segList.some((s) => s && (Number(s.track) || 0) === 0 && s.mediaType === "video" && s.loop === true)) {
+    needsV03 = true;
+  }
+  // audio-extended timeline (payload total beyond the visuals)
+  if (segList.length > 0) {
+    const segTotalMs = segList.reduce(
       (sum, s) => Math.max(sum, (s && (s.endMs ?? (s.startMs ?? 0) + (s.durationMs ?? 0))) || 0),
       0,
     );
     const payloadTotalMs = Number.isFinite(Number(opts.totalMs)) ? Math.max(0, Number(opts.totalMs)) : 0;
-    // 250 ms tolerance — packet-granularity rounding must not trip the gate.
-    if (payloadTotalMs > segTotalMs + 250) {
-      reasons.push("audio-extends-video");
-    }
+    if (payloadTotalMs > segTotalMs + 250) needsV03 = true;
   }
+  // audio-only timeline
+  if (!usableVisual) needsV03 = true;
+  // loudnorm
+  if (opts.audio && opts.audio.normalize) needsV03 = true;
+  // overlay motion paths (≥2 keyframes)
+  if (
+    Array.isArray(opts.overlays) &&
+    opts.overlays.some(
+      (o) => o && o.overlay && Array.isArray(o.overlay.motion) && o.overlay.motion.length >= 2,
+    )
+  ) {
+    needsV03 = true;
+  }
+  // music clips 2..N with loop (ExtraAudio.loopSrc)
+  if (
+    Array.isArray(opts.musicClips) &&
+    opts.musicClips.slice(1).some((c) => c && c.loop)
+  ) {
+    needsV03 = true;
+  }
+  if (needsV03 && !ENGINE_V03) reasons.push("engine-pre-0.3");
 
   const tr = opts.textRemoval;
   if (tr && tr.mode && tr.mode !== "none" && Array.isArray(tr.regions) && tr.regions.length > 0) {
@@ -196,8 +259,8 @@ function rustEligible(opts) {
     }
   }
 
-  const audio = opts.audio;
-  if (audio && audio.normalize) reasons.push("loudnorm");
+  // v0.3: loudnorm is NATIVE (in-process EBU R128 measurement + static
+  // linear gain toward −16 LUFS — engine v0.3). No gate.
 
   // v1.17 STACK TEXT: any headline with a stackStyle set rides the ASS/
   // libass CLI compositor (the kinetic recipes are libass tags — the Rust
@@ -223,15 +286,9 @@ function rustEligible(opts) {
     if (geo.length === 0) reasons.push("kinetic-no-geometry");
   }
 
-  // overlay motion keyframes (≥2 = an actual path; 1 = pinned, fine)
+  // v0.3: overlay motion paths (≥2 keyframes) are NATIVE — the engine
+  // interpolates the overlay center piecewise-linearly. No gate.
   const overlays = Array.isArray(opts.overlays) ? opts.overlays : [];
-  for (const o of overlays) {
-    const motion = o && o.overlay && Array.isArray(o.overlay.motion) ? o.overlay.motion : null;
-    if (motion && motion.length >= 2) {
-      reasons.push("overlay-motion");
-      break;
-    }
-  }
 
   if (reasons.length > 0) return { ok: false, reason: reasons.join(",") };
   return { ok: true };
@@ -475,9 +532,15 @@ function buildRustCaptions(opts, width, height) {
 
   const h = Math.max(16, height);
   const hScale = h / 1080;
+  // v1.33.7 NaN GUARD: `fontSize` is the preset's height fraction (the
+  // renderer always sends it), but a hand-crafted/legacy payload without
+  // it made Number(undefined) → NaN → JSON "null" → a Rust timeline PARSE
+  // ERROR and a silent CLI fallback (the safe-mode contract forbids that:
+  // an omitted caption size must degrade to a sane default, not NaN).
+  const rawFontPx = Number(cs.fontSize) * h * (Number(cs.fontSizeScale) || 1);
   const fontPx = Math.max(
     8,
-    Math.round(Number(cs.fontSize) * h * (Number(cs.fontSizeScale) || 1)),
+    Math.round(Number.isFinite(rawFontPx) && rawFontPx > 0 ? rawFontPx : 0.05 * h),
   );
 
   return {
@@ -720,10 +783,11 @@ function buildRustTimeline(opts) {
   // image timeline renders at the film rate; never silent: result carries it)
   const allImages = segments.every((s) => s && s.mediaType !== "video") && segments.length > 0;
   let slideshowFpsApplied = null;
-  // v1.29 AUDIO-EXTENDED TIMELINE: max(segments end, payload totalMs) — the
-  // renderer's authoritative total (audio-driven timelines) wins when it
-  // exceeds the visuals. (rustEligible already routes extended projects to
-  // the CLI pipeline; this keeps the timeline honest as defense-in-depth.)
+  // v0.3 (v1.33.7) AUDIO-EXTENDED / AUDIO-ONLY: max(segments end, payload
+  // totalMs) — the renderer's authoritative total (audio-driven timelines)
+  // ALWAYS wins; past the last visual segment the engine composites the
+  // background + captions across the full length (the CLI black-tail
+  // parity) and the native audio bus mixes to the same end.
   const segTotalMs = segments.reduce(
     (sum, s) =>
       Math.max(sum, s.endMs ?? (s.startMs ?? 0) + (s.durationMs ?? 0)),
@@ -800,6 +864,11 @@ function buildRustTimeline(opts) {
       chroma: null,
       opacity: 1,
       overlayLoop: false,
+      // v0.3 (v1.33.7) BASE-LANE LOOP-TO-FILL: the renderer already
+      // extended this segment's window to the fill end; the engine now
+      // wraps the decode position across the trimmed source span and loops
+      // the clip's own audio (the CLI `-stream_loop` parity).
+      loopSrc: isVideo && s.loop === true,
       hasAudio: isVideo,
       // v2 native transition plan
       transHeadMs: Number(plan.headMs) || 0,
@@ -816,6 +885,19 @@ function buildRustTimeline(opts) {
     const p = isVideo ? o.videoPath : o.imagePath;
     if (typeof p !== "string" || !p) return { error: "overlay missing source path" };
     const geo = overlayGeometryNorm(width, height, o.overlay);
+    // v0.3 (v1.33.7) OVERLAY MOTION PATH: ≥2 keyframes ride natively —
+    // the engine interpolates the overlay center piecewise-linearly
+    // (hold-first / hold-last), exactly like the renderer/CLI curves.
+    const motionRaw =
+      o.overlay && Array.isArray(o.overlay.motion) ? o.overlay.motion : [];
+    const motion = motionRaw
+      .filter((k) => k && Number.isFinite(k.x) && Number.isFinite(k.y))
+      .map((k) => ({
+        tMs: Math.max(0, Number(k.tMs) || 0),
+        x: Math.max(0, Math.min(1, Number(k.x))),
+        y: Math.max(0, Math.min(1, Number(k.y))),
+      }))
+      .sort((a, b) => a.tMs - b.tMs);
     rustSegments.push({
       id: String(o.id || `ovl${rustSegments.length}`),
       mediaType: isVideo ? "video" : "image",
@@ -841,10 +923,11 @@ function buildRustTimeline(opts) {
         : null,
       opacity: 1,
       overlayLoop: !!o.overlayLoop,
+      loopSrc: false,
+      motion: motion.length >= 2 ? motion : [],
       hasAudio: isVideo,
     });
   }
-  if (rustSegments.length === 0) return { error: "no segments" };
 
   // ── headlines → Rust texts ──
   const texts = (Array.isArray(opts.headlines) ? opts.headlines : [])
@@ -868,9 +951,12 @@ function buildRustTimeline(opts) {
   // ── music + master fades ──
   // v1.25 MULTI-MUSIC: prefer the `musicClips` stack (N placements). The
   // native engine's music channel takes clip 0 (full support incl. loop);
-  // the remaining clips ride the extraAudio bus (volume + start, no loop —
-  // a documented native-engine limitation; the FFmpeg graph is the full
-  // N-branch path). Legacy payloads (audioPath + audio.music*) unchanged.
+  // v0.3: the remaining clips ride the extraAudio bus WITH loop support
+  // (ExtraAudio.loopSrc — the "no loop in the native engine" limitation is
+  // gone). Legacy payloads (audioPath + audio.music*) unchanged — the
+  // legacy branch is the ONLY normalizeSrc music track (CLI parity: the CLI
+  // measures the legacy single-music input, music-clip placements are
+  // user-volume branches).
   const audio = opts.audio || {};
   const musicClipList = Array.isArray(opts.musicClips)
     ? opts.musicClips.filter((c) => c && typeof c.path === "string" && c.path)
@@ -883,10 +969,11 @@ function buildRustTimeline(opts) {
       volume: Math.max(0, Math.min(2, Number(first.volume) || 1)),
       startMs: Math.max(0, Number(first.startMs) || 0),
       loopTrack: !!first.loop,
+      normalizeSrc: false,
     };
     if (musicClipList.length > 1) {
       console.log(
-        `[RustEngine] ${musicClipList.length} music clips: clip 1 rides the music channel (loop support), ${musicClipList.length - 1} join the extra-audio bus (no loop in the native engine)`,
+        `[RustEngine] ${musicClipList.length} music clips: clip 1 rides the music channel, ${musicClipList.length - 1} join the extra-audio bus (both with loop support)`,
       );
     }
   } else if (opts.audioPath) {
@@ -895,6 +982,7 @@ function buildRustTimeline(opts) {
       volume: Math.max(0, Math.min(2, Number(audio.musicVolume) || 1)),
       startMs: Math.max(0, Number(audio.musicStartMs) || 0),
       loopTrack: !!audio.musicLoop,
+      normalizeSrc: true,
     };
   }
 
@@ -902,13 +990,15 @@ function buildRustTimeline(opts) {
   // placements → the native audio bus. MP3s arrive 24 kHz mono — the
   // engine's swresample stage upmixes to the 48 kHz stereo bus.
   const extraAudio = [];
-  // v1.25: music clips 2..N ride the extra-audio bus (see the note above).
+  // v1.25: music clips 2..N ride the extra-audio bus; v0.3: WITH loop
+  // (ExtraAudio.loopSrc — music-clip loop placements loop natively now).
   for (let mi = 1; mi < musicClipList.length; mi += 1) {
     const mc = musicClipList[mi];
     extraAudio.push({
       path: String(mc.path),
       startMs: Math.max(0, Number(mc.startMs) || 0),
       volume: Math.max(0, Math.min(2, Number(mc.volume) || 1)),
+      loopSrc: !!mc.loop,
     });
   }
   for (const v of voList) {
@@ -929,6 +1019,27 @@ function buildRustTimeline(opts) {
     console.log(
       `[RustEngine] native audio bus: ${voList.length} VO + ${sfxList.length} SFX track(s)` +
         ` · original audio ducked to ${(duckApplied * 100).toFixed(0)}%`,
+    );
+  }
+
+  // ── v0.3 (v1.33.7) AUDIO-ONLY: zero visual segments is legal when the
+  // project carries audio (music/voice-over/SFX) — the engine composites
+  // the background across the audio's full timeline. A completely empty
+  // project (no visuals AND no audio) still refuses (the CLI's "No
+  // segments" error stays the honest verdict).
+  const hasAnyAudioSource =
+    musicClipList.length > 0 ||
+    (typeof opts.audioPath === "string" && opts.audioPath) ||
+    voList.length > 0 ||
+    sfxList.length > 0;
+  if (rustSegments.length === 0 && !hasAnyAudioSource) {
+    return { error: "no segments" };
+  }
+  if (rustSegments.length === 0) {
+    console.log(
+      `[RustEngine] audio-only timeline: 0 visual segment(s) — the engine renders the background over the audio's full ${
+        (totalMs / 1000).toFixed(1)
+      }s timeline`,
     );
   }
 
@@ -975,6 +1086,11 @@ function buildRustTimeline(opts) {
     totalMs: Math.max(1, totalMs),
     fadeInMs: Math.max(0, Number(audio.fadeInMs) || 0),
     fadeOutMs: Math.max(0, Number(audio.fadeOutMs) || 0),
+    // v0.3 (v1.33.7) LOUDNORM: in-process EBU R128 K-weighted gated
+    // measurement + static linear gains toward −16 LUFS (engine v0.3) —
+    // the CLI clip/legacy-music semantics, no ffmpeg child.
+    normalizeAudio: !!(audio.normalize),
+    audioTargetLufs: -16,
     fonts: fontsMap,
     segments: rustSegments,
     music,

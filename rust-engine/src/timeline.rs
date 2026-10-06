@@ -57,6 +57,19 @@ pub struct Timeline {
     /// Stack Text headlines still ride the CLI/libass compositor.
     #[serde(default)]
     pub captions: Option<CaptionsTimeline>,
+    /// v0.3 AUDIO-EXTENDED / LOOP SCENARIOS: the engine renders the FULL
+    /// payload totalMs — frames past the last visual segment composite over
+    /// the background (the CLI's black-tail parity) and the audio bus mixes
+    /// to the same length. Combined with `Segment.loop_src` (base-lane
+    /// loop-to-fill) this covers the loop-video + long-voiceover timelines
+    /// that previously rode the FFmpeg-CLI pipeline.
+    #[serde(default)]
+    pub normalize_audio: bool,
+    /// v0.3: per-source loudness normalization target in LUFS (EBU R128
+    /// K-weighted gated measurement in-process — the ffmpeg loudnorm
+    /// parity without spawning a CLI child). Default −16 (social standard).
+    #[serde(default)]
+    pub audio_target_lufs: Option<f64>,
     /// v1.21 NATIVE KINETIC TYPOGRAPHY: the v1.18 kinetic-typography engine
     /// rendered natively (per-word choreography over renderer-measured
     /// geometry). The renderer measured every word rect with the SAME
@@ -223,7 +236,7 @@ pub struct CaptionWord {
 }
 
 /// v2: a placed audio source outside the segment/music lanes.
-#[derive(Deserialize, Debug, Clone, Default)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ExtraAudio {
     /// Absolute source path (WAV or MP3 — decoded + resampled to the bus).
@@ -232,9 +245,13 @@ pub struct ExtraAudio {
     pub start_ms: f64,
     /// 0..2 gain (1 = unity).
     pub volume: f64,
+    /// v0.3: loop the source across the remaining timeline (music-clip
+    /// placements on this bus — the music channel's loopTrack parity).
+    #[serde(default)]
+    pub loop_src: bool,
 }
 
-#[derive(Deserialize, Debug, Clone, Default)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Segment {
     pub id: String,
@@ -274,6 +291,20 @@ pub struct Segment {
     pub opacity: f64,
     /// Loop the overlay source across its window.
     pub overlay_loop: bool,
+    /// v0.3: base-lane LOOP-TO-FILL — repeat the trimmed source span across
+    /// the segment's whole timeline window (the CLI `-stream_loop` parity;
+    /// the overlay lane's `overlay_loop` mirror for track 0). When set, the
+    /// video decode position wraps modulo (sourceDuration − trimIn) and the
+    /// segment's own audio loops across the timeline on the audio bus.
+    #[serde(default)]
+    pub loop_src: bool,
+    /// v0.3: overlay MOTION PATH keyframes (piecewise-linear, hold-first /
+    /// hold-last — the same curve the renderer interpolates and the CLI
+    /// reproduces via overlay x/y time expressions). ≥2 keys override the
+    /// static geometry center (x/y) across the window; the scale (w) stays
+    /// from the geometry.
+    #[serde(default)]
+    pub motion: Vec<MotionKey>,
     /// Has an audio stream (video only).
     pub has_audio: bool,
     // ── v2 TRANSITION PLAN (baked by Electron — EXACT mirror of the CLI
@@ -300,6 +331,20 @@ pub struct Segment {
     /// Whole-video fade-out to black at the LAST segment (ms).
     #[serde(default)]
     pub bookend_end_ms: f64,
+}
+
+/// v0.3: one overlay motion-path keyframe (the v5.6 OverlayKeyframe —
+/// normalized 0..1 canvas-center coordinates, time local to the overlay's
+/// window).
+#[derive(Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MotionKey {
+    /// Time into the overlay clip's window, ms (≥ 0).
+    pub t_ms: f64,
+    /// Normalized 0..1 canvas center x.
+    pub x: f64,
+    /// Normalized 0..1 canvas center y.
+    pub y: f64,
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -335,13 +380,18 @@ pub struct ChromaKey {
     pub smoothness: f64,
 }
 
-#[derive(Deserialize, Debug, Clone, Default)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct MusicTrack {
     pub path: String,
     pub volume: f64,
     pub start_ms: f64,
     pub loop_track: bool,
+    /// v0.3: this track participates in loudness normalization (the CLI
+    /// measures the LEGACY single-music input only — music-clip placements
+    /// are user-volume SFX-style branches and stay untouched).
+    #[serde(default)]
+    pub normalize_src: bool,
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -420,5 +470,73 @@ impl Timeline {
     /// Total output frame count.
     pub fn total_frames(&self) -> u64 {
         ((self.total_ms / 1000.0) * self.fps).ceil().max(0.0) as u64
+    }
+}
+
+
+// v0.3.1 SENSIBLE DEFAULTS: serde's container-level `default` pulls every
+// MISSING field from Default::default() — the DERIVED impl gave opacity
+// 0.0 (invisible layers) and volume 0.0 (silent audio) for hand-crafted
+// timelines that omit them (the Electron router always sends them, but the
+// engine contract should not require that). One-alpha/unity-gain/live
+// defaults match the renderer's semantics.
+impl Default for Segment {
+    fn default() -> Self {
+        Segment {
+            id: String::new(),
+            media_type: "video".into(),
+            path: String::new(),
+            start_ms: 0.0,
+            end_ms: 0.0,
+            duration_ms: 0.0,
+            trim_in_ms: 0.0,
+            source_duration_ms: None,
+            speed: 1.0,
+            track: 0,
+            volume: 1.0,
+            source_width: None,
+            source_height: None,
+            source_fps: None,
+            ken_burns: None,
+            geometry: None,
+            chroma: None,
+            opacity: 1.0,
+            overlay_loop: false,
+            loop_src: false,
+            motion: Vec::new(),
+            has_audio: false,
+            trans_head_ms: 0.0,
+            trans_head_style: String::new(),
+            trans_tail_ms: 0.0,
+            trans_tail_style: String::new(),
+            bookend_start_ms: 0.0,
+            bookend_end_ms: 0.0,
+        }
+    }
+}
+
+
+// v0.3.1: unity-gain defaults (the derived 0.0 made an omitted volume
+// silent — see the Segment note above).
+impl Default for ExtraAudio {
+    fn default() -> Self {
+        ExtraAudio {
+            path: String::new(),
+            start_ms: 0.0,
+            volume: 1.0,
+            loop_src: false,
+        }
+    }
+}
+
+impl Default for MusicTrack {
+    fn default() -> Self {
+        MusicTrack {
+            path: String::new(),
+            volume: 1.0,
+            start_ms: 0.0,
+            loop_track: false,
+            normalize_src: false,
+        }
     }
 }

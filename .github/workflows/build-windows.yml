@@ -229,6 +229,25 @@ jobs:
           set -o pipefail
           node rust-engine/tools/v2-feature-test.js 2>&1 | tee rust-engine/feature-v2.log
 
+      # v3 engine feature test (v1.33.7 "Rust everywhere"): the five
+      # scenarios that previously rode the FFmpeg-CLI pipeline — base-lane
+      # LOOP-TO-FILL (seam-parity proof), AUDIO-EXTENDED black tail,
+      # AUDIO-ONLY timelines, in-process loudnorm (EBU R128), and overlay
+      # MOTION PATHS. Content-verified: durations, luma profiles, frame
+      # equality across the loop seam, audio levels, overlay greenness.
+      - name: Rust engine v3 feature test (loop + audio-extended + audio-only + loudnorm + motion)
+        shell: bash
+        env:
+          FF_TEST_FFMPEG: "resources/ffmpeg/win/ffmpeg.exe"
+          FF_TEST_FFPROBE: "resources/ffmpeg/win/ffprobe.exe"
+          FF_ENGINE_FFMPEG_DIR: "resources/ffmpeg/win/dll"
+          FF_TEST_MEDIA_DIR: "${{ runner.temp }}/fftest-v3"
+          FF_TEST_FONT: "C:/Windows/Fonts/arialbd.ttf"
+          FRAMEFUSE_ENGINE_ALLOW_SOFTWARE_GPU: "1"
+        run: |
+          set -o pipefail
+          node rust-engine/tools/v3-feature-test.js 2>&1 | tee rust-engine/feature-v3.log
+
       - name: Upload Rust engine artifact (.node + info + logs)
         if: always()
         uses: actions/upload-artifact@v4
@@ -240,6 +259,7 @@ jobs:
             rust-engine/build-windows.log
             rust-engine/smoke-windows.log
             rust-engine/feature-v2.log
+            rust-engine/feature-v3.log
             rust-engine/color-test.log
           if-no-files-found: warn
           retention-days: 14

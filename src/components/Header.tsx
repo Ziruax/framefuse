@@ -18,13 +18,13 @@ import {
   TriangleAlert,
 } from "lucide-react";
 import type { TimelineMode, ExportProgress, VideoSettings } from "@/lib/merger/types";
-import { fmtBytes, fmtTimecode } from "@/lib/merger/timeline";
+import { fmtBytes } from "@/lib/merger/timeline";
 import { cn } from "@/lib/utils";
 
 /** v1.12.1: the renderer's build constant — compared against the REAL exe
  *  version (app.getVersion()) so a stale/hybrid install is impossible to
  *  miss. Keep in sync with package.json on every release. */
-const BUILD_VERSION = "1.33.6";
+const BUILD_VERSION = "1.33.7";
 
 export interface LastExport {
   path: string;
@@ -168,8 +168,8 @@ const ENGINE_REASON_HINTS: [RegExp, string][] = [
   [/^stack-text$/, "stack-text headline"],
   [/^transition:/, "geometric transition"],
   [/^text-removal$/, "text removal"],
-  [/^loudnorm$/, "loudness normalization"],
-  [/^overlay-motion$/, "overlay motion path"],
+  [/^engine-pre-0\.3$/, "engine older than 0.3"],
+  [/^empty-timeline$/, "empty project"],
 ];
 function friendlyEngineReason(reason: string): string {
   const r = String(reason || "");
@@ -177,28 +177,6 @@ function friendlyEngineReason(reason: string): string {
     if (re.test(r)) return label;
   }
   return r || "engine unavailable";
-}
-
-/** Parse an ffmpeg timemark "H:MM:SS.cc" into milliseconds.
- *  v1.14.1 (user directive: "NaN:NaN in the frontend"): the v1.2-v1.14.0
- *  payloads carried ASS-style comma decimals ("0:00:04,16") — Number() on
- *  the comma produced NaN and the progress chip rendered "@ NaN:NaN" on
- *  EVERY export. Old-format strings are normalized (comma → dot) and any
- *  unparseable input collapses to 0 so a timecode can never render NaN. */
-function parseTimemark(tm: string): number {
-  const parts = String(tm)
-    .replace(",", ".")
-    .split(":")
-    .map(Number);
-  if (parts.length === 0 || parts.some((n) => !Number.isFinite(n))) return 0;
-  let h = 0,
-    m = 0,
-    s = 0;
-  if (parts.length === 3) [h, m, s] = parts;
-  else if (parts.length === 2) [m, s] = parts;
-  else if (parts.length === 1) [s] = parts;
-  else return 0;
-  return ((h * 60 + m) * 60 + s) * 1000;
 }
 
 /** v1.14.2: friendly label for the export pipeline phase the backend
@@ -504,27 +482,14 @@ export function Header({
                 {PHASE_LABEL[exportProgress.phase] ?? exportProgress.phase}
               </span>
             )}
-            {exportProgress?.timemark ? (
-              <span
-                className="hidden lg:inline"
-                style={{ color: "#a8a29e" }}
-                title={
-                  `Timeline position ${fmtTimecode(parseTimemark(exportProgress.timemark))}` +
-                  (exportProgress?.total
-                    ? ` of ${fmtTimecode(exportProgress.total * 1000)} (content, not wall-clock)`
-                    : " (content, not wall-clock)")
-                }
-              >
-                @ {fmtTimecode(parseTimemark(exportProgress.timemark))}
-                {exportProgress?.total
-                  ? ` / ${fmtTimecode(exportProgress.total * 1000)}`
-                  : ""}
-              </span>
-            ) : null}
-            {/* v1.33.6: WALL-CLOCK elapsed — the user reads "@ 00:12 / 00:42"
-              as a stopwatch, but that line is CONTENT position (it races at
-              25× realtime then crawls). The honest elapsed counter ships
-              here; the content position stays (tooltip'd) for power users. */}
+            {/* v1.33.7 (user directive: "remove timetaking / time would
+              take — just leave time elapsed and eta"): the content-position
+              line "@ 00:12 / 00:42" is GONE. It read as a stopwatch but was
+              CONTENT position — racing at multiples of realtime then
+              crawling near the end (the exact "moves too fast then super
+              slow" complaint) while its total misread as "total time it
+              would take". Elapsed (wall-clock) + ETA are the honest pair. */}
+            {/* v1.33.6: WALL-CLOCK elapsed — the honest stopwatch. */}
             {exportProgress?.elapsed != null &&
             Number.isFinite(exportProgress.elapsed) ? (
               <span

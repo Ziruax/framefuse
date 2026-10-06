@@ -51,6 +51,11 @@ pub const AVFMTCTX_STREAMS: usize = 48;
 pub const AVFMTCTX_NB_STREAMS: usize = 44;
 pub const AVFMTCTX_OFORMAT: usize = 16;
 pub const AVFMTCTX_PB: usize = 32;
+// int64_t duration in AV_TIME_BASE (µs): av_class(0) iformat(8) oformat(16)
+// priv_data(24) pb(32) ctx_flags(40) nb_streams(44) streams(48)
+// filename[1024](56) url(1080) start_time(1088) duration(1096) — the
+// PB/NB_STREAMS/STREAMS anchors above pin this prefix exactly.
+pub const AVFMTCTX_DURATION: usize = 1096;
 pub const AVOFMT_FLAGS: usize = 44;
 pub const AVCHANNELLAYOUT_ORDER: usize = 0;
 pub const AVCHANNELLAYOUT_NB_CHANNELS: usize = 4;

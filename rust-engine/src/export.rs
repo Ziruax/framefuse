@@ -167,6 +167,11 @@ pub struct VideoSource {
     cur_src_t: f64,
     have_frame: bool,
     eof: bool,
+    /// v0.3 LOOP-TO-FILL: the source length in seconds, pinned from the last
+    /// decoded frame's pts at EOF — the authoritative span for the caller's
+    /// modulo wrap when the payload's `sourceDurationMs` is absent (no
+    /// AVFormatContext.duration offset needed — EOF is ground truth).
+    measured_duration: f64,
 }
 /// The decoder + format contexts are created, used, and dropped by EXACTLY
 /// one thread (the producer) — safe to move there at spawn time.
@@ -215,6 +220,17 @@ impl VideoSource {
         let src_h = ff.par_height(par).max(1) as u32;
         let frame = ff.frame_alloc()?;
         let pkt = ff.packet_alloc()?;
+        // v0.3: container duration as the INITIAL hint (AVFormatContext
+        // offset-derived: the PB/NB_STREAMS/STREAMS anchors pin the prefix,
+        // filename[1024] then url/start_time → duration @ 1096). EOF pins the
+        // authoritative value over this.
+        let mut duration_hint = 0f64;
+        unsafe {
+            let d_us = ((fc.raw as *const u8).add(AVFMTCTX_DURATION) as *const i64).read_unaligned();
+            if d_us > 0 {
+                duration_hint = d_us as f64 / 1_000_000.0;
+            }
+        }
         Ok(VideoSource {
             ff,
             fc,
@@ -234,6 +250,7 @@ impl VideoSource {
             cur_src_t: -1.0,
             have_frame: false,
             eof: false,
+            measured_duration: if duration_hint.is_finite() && duration_hint > 0.05 && duration_hint < 86400.0 { duration_hint } else { 0.0 },
         })
     }
 
@@ -245,11 +262,31 @@ impl VideoSource {
         (pts as f64) * self.stream_tb.as_f64()
     }
 
+    /// v0.3: the source length in seconds — the container hint until EOF
+    /// pins the authoritative value (the last decoded frame's pts).
+    pub fn duration(&self) -> f64 {
+        self.measured_duration
+    }
+
     fn decode_one(&mut self) -> Result<bool, String> {
         // returns true when a NEW frame is available in self.frame
         loop {
             let fr = unsafe { (self.ff.syms.avcodec_receive_frame)(self.dec.raw, self.frame.raw) };
             if fr == 0 {
+                // v0.3.1 PHANTOM-FRAME GUARD: frame-threaded decoders emit a
+                // DRAIN SENTINEL at EOF — receive_frame returns 0 with a
+                // "frame" whose planes are NULL and w/h=0/1, format −1
+                // (AV_PIX_FMT_NONE). Trusting it feeds sws_getContext an
+                // invalid pix_fmt → av_pix_fmt_desc_get(NULL) → the Debian
+                // assertion abort (release builds: UB). Skip and keep
+                // decoding — a real frame (or EOF) follows.
+                let d0 = unsafe { self.ff.frame_data(self.frame.raw, 0) };
+                let fw = self.ff.frame_width(self.frame.raw);
+                let ffmt = self.ff.frame_format(self.frame.raw);
+                if d0.is_null() || fw <= 0 || ffmt < 0 {
+                        self.ff.frame_unref(&self.frame);
+                    continue;
+                }
                 self.have_frame = true;
                 return Ok(true);
             }
@@ -258,10 +295,24 @@ impl VideoSource {
                 loop {
                     let pr = unsafe { (self.ff.syms.av_read_frame)(self.fc.raw, self.pkt.raw) };
                     if pr == AVERROR_EOF {
-                        let s = unsafe { (self.ff.syms.avcodec_send_packet)(self.dec.raw, std::ptr::null()) };
-                        self.eof = true;
-                        if s < 0 && s != AVERROR_EOF {
-                            return Err(format!("decode flush: {}", self.ff.err2str(s)));
+                        // v0.3.1: the drain-NULL goes ONCE (a second
+                        // send_packet(NULL) after the drain started resets
+                        // frame-thread state and the decoder EAGAINs
+                        // forever). After the one-shot: keep returning
+                        // "no more input" — the drain frames are already
+                        // flowing out of receive_frame.
+                        if !self.eof {
+                            let s = unsafe { (self.ff.syms.avcodec_send_packet)(self.dec.raw, std::ptr::null()) };
+                            self.eof = true;
+                            if s < 0 && s != AVERROR_EOF {
+                                return Err(format!("decode flush: {}", self.ff.err2str(s)));
+                            }
+                            // frame-threaded decoders buffer up to
+                            // thread_count frames AND send_packet(NULL)
+                            // clears the output frame — the drain loop's
+                            // receive_frame calls (phantom-guarded) return
+                            // the remaining REAL frames and repopulate it.
+                            continue;
                         }
                         return Ok(false);
                     }
@@ -283,6 +334,7 @@ impl VideoSource {
                 continue;
             }
             if fr == AVERROR_EOF {
+                self.eof = true;
                 return Ok(false);
             }
             return Err(format!("receive_frame: {}", self.ff.err2str(fr)));
@@ -295,14 +347,20 @@ impl VideoSource {
     /// snapshot is reused (byte-identical — the input frame is identical).
     pub fn ensure_frame(&mut self, t: f64) -> Result<Option<Bitmap>, String> {
         let cur_t = self.frame_pts_sec();
-        if self.cur_src_t < 0.0 || (t + 0.001) < cur_t - 0.75 {
+        // v0.3.1 LOOP-WRAP SEEK: after EOF the drain can leave the frame
+        // CLEARED (pts NOPTS → cur_t −1) while cur_src_t still tracks the
+        // last REAL decoded position — a loop wrap to an earlier t must
+        // still seek backwards. Use the max of the two as the reference.
+        let seek_ref = cur_t.max(self.cur_src_t);
+        if self.cur_src_t < 0.0 || (t + 0.001) < seek_ref - 0.75 {
             // seek backwards (or first use): land slightly before the target
             let target = (t - 0.5).max(0.0);
             let ts = (target / self.stream_tb.as_f64()).round() as i64;
-            unsafe {
-                (self.ff.syms.av_seek_frame)(self.fc.raw, self.vstream, ts, AVSEEK_FLAG_BACKWARD);
+            let sr = unsafe {
+                let r = (self.ff.syms.av_seek_frame)(self.fc.raw, self.vstream, ts, AVSEEK_FLAG_BACKWARD);
                 (self.ff.syms.avcodec_flush_buffers)(self.dec.raw);
-            }
+                r
+            };
             self.have_frame = false;
             self.eof = false;
             self.cur_src_t = -1.0;
@@ -341,6 +399,35 @@ impl VideoSource {
         }
         if !self.have_frame {
             return Ok(None);
+        }
+        // v0.3.1 CLEARED-FRAME GUARD: avcodec_send_packet(NULL) (the drain
+        // start) and the drain tail can leave the output frame EMPTY
+        // (planes NULL, w 0, format AV_PIX_FMT_NONE) while have_frame is
+        // still true. Running to_rgba on that state feeds sws_getContext an
+        // invalid pix_fmt (av_pix_fmt_desc_get → NULL → the Debian
+        // av_assert0 abort; release builds: UB). The last REAL frame's
+        // snapshot lives in the held cache — hold-last-frame semantics.
+        {
+            let fw = self.ff.frame_width(self.frame.raw);
+            let ffmt = self.ff.frame_format(self.frame.raw);
+            let fd0 = unsafe { self.ff.frame_data(self.frame.raw, 0) };
+            if fd0.is_null() || fw <= 0 || ffmt < 0 {
+                if let Some(b) = &self.held {
+                    return Ok(Some(b.clone()));
+                }
+                return Ok(None);
+            }
+        }
+        // v0.3 LOOP-TO-FILL: EOF pins the authoritative source length (the
+        // last decoded frame's pts) — the caller's modulo wrap uses it when
+        // the payload's sourceDurationMs (and the container hint) are
+        // absent. Overwrites the container hint when they disagree (EOF
+        // always wins — it is ground truth).
+        if self.eof {
+            let d = self.frame_pts_sec();
+            if d > 0.05 && d > self.measured_duration {
+                self.measured_duration = d;
+            }
         }
         // v2.1 held-frame reuse: identical source frame → identical snapshot.
         let pts = self.ff.frame_pts(self.frame.raw);
@@ -621,6 +708,10 @@ fn open_video_encoder(
             let preset = match quality {
                 "cinema" => "slow",
                 "balanced" => "medium",
+                // v1.33.7: the CLI's speed tiers (draft/fastMode on
+                // constrained CPUs) drop to ultrafast — the engine honors
+                // the same ladder so a draft export is a DRAFT everywhere.
+                "draft" | "fast" => "ultrafast",
                 _ => "veryfast",
             };
             let _ = ff.dict_set(&mut dict, "preset", preset);
@@ -1004,6 +1095,16 @@ pub fn run_pipeline(
     let pkt = ff.packet_alloc()?;
 
     // ── AUDIO THREAD (decode + mix runs DURING the video loop) ──────────
+    // v0.3 REWORK: (1) base-lane LOOP-TO-FILL segments loop their own audio
+    // across the timeline (the CLI `-stream_loop` parity); (2) per-source
+    // loudness normalization when `timeline.normalize_audio` — the EBU R128
+    // K-weighted gated measurement runs IN-PROCESS (audio::windowed_lufs, ≤90 s
+    // sample — constant cost) and applies a STATIC linear gain toward the
+    // target (−16 LUFS default), CLI clip/legacy-music semantics: extra-audio
+    // (voiceover/SFX/music-clip) placements are NEVER measured; (3) tracks mix
+    // ONE AT A TIME into the output buffer — a large decoded source is dropped
+    // right after its pass, so peak RAM = mix + largest track (not the SUM of
+    // all tracks); small sources still decode in parallel (rayon).
     let (audio_tx, audio_rx) = std::sync::mpsc::channel::<Result<Vec<f32>, String>>();
     {
         let ff = ff.clone();
@@ -1011,85 +1112,308 @@ pub fn run_pipeline(
         std::thread::Builder::new()
             .name("framefuse-audio".into())
             .spawn(move || {
-                let jobs: Vec<usize> = timeline
-                    .segments
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| s.has_audio && s.volume > 0.001)
-                    .map(|(i, _)| i)
-                    .collect();
-                let results: Vec<(usize, Result<PcmBuffer, String>)> = jobs
-                    .par_iter()
-                    .map(|&i| {
-                        let s = &timeline.segments[i];
-                        let pcm = audio::decode_audio(&ff, &s.path, timeline.sample_rate, timeline.audio_channels);
-                        (i, pcm)
-                    })
-                    .collect();
-                let mut tracks: Vec<Track> = Vec::new();
-                for (i, res) in results {
-                    let seg = &timeline.segments[i];
-                    match res {
-                        Ok(pcm) => {
-                            tracks.push(Track {
-                                data: pcm.samples.clone(),
-                                start_sample: (seg.start_ms / 1000.0 * timeline.sample_rate as f64).round() as i64,
-                                gain: seg.volume.clamp(0.0, 2.0) as f32,
-                                speed: seg.speed,
-                                loop_src: false,
-                            });
-                        }
-                        Err(e) => {
-                            if !e.contains("no audio stream") {
-                                log::warn!("[rust-engine] audio decode `{}`: {}", seg.path, e);
-                            }
-                        }
+                struct AudioJob {
+                    path: String,
+                    start_ms: f64,
+                    volume: f64,
+                    speed: f64,
+                    loop_src: bool,
+                    /// CLI parity: clip audio + LEGACY music normalize;
+                    /// voiceover/SFX/music-clip placements never.
+                    normalize: bool,
+                    tag: String,
+                }
+                let mut jobs: Vec<AudioJob> = Vec::new();
+                for s in timeline.segments.iter() {
+                    if s.has_audio && s.volume > 0.001 && !s.path.is_empty() {
+                        jobs.push(AudioJob {
+                            path: s.path.clone(),
+                            start_ms: s.start_ms,
+                            volume: s.volume,
+                            speed: s.speed,
+                            loop_src: s.loop_src,
+                            normalize: true,
+                            tag: format!("clip:{}", s.id),
+                        });
                     }
                 }
-                // global music
                 if let Some(music) = &timeline.music {
                     if !music.path.is_empty() && std::path::Path::new(&music.path).exists() {
-                        match audio::decode_audio(&ff, &music.path, timeline.sample_rate, timeline.audio_channels) {
-                            Ok(pcm) => tracks.push(Track {
-                                data: pcm.samples.clone(),
-                                start_sample: (music.start_ms / 1000.0 * timeline.sample_rate as f64).round() as i64,
-                                gain: music.volume.clamp(0.0, 2.0) as f32,
-                                speed: 1.0,
-                                loop_src: music.loop_track,
-                            }),
-                            Err(e) => log::warn!("[rust-engine] music decode: {}", e),
-                        }
+                        jobs.push(AudioJob {
+                            path: music.path.clone(),
+                            start_ms: music.start_ms,
+                            volume: music.volume,
+                            speed: 1.0,
+                            loop_src: music.loop_track,
+                            normalize: music.normalize_src,
+                            tag: "music".into(),
+                        });
                     }
                 }
-                // v2 EXTRA AUDIO: voiceovers + SFX — mixed like every other
-                // placed track (absolute timeline, own gain, never ducked).
                 for ea in timeline.extra_audio.iter() {
                     if ea.path.is_empty() || !std::path::Path::new(&ea.path).exists() {
                         continue;
                     }
-                    match audio::decode_audio(&ff, &ea.path, timeline.sample_rate, timeline.audio_channels) {
-                        Ok(pcm) => tracks.push(Track {
-                            data: pcm.samples.clone(),
-                            start_sample: (ea.start_ms.max(0.0) / 1000.0 * timeline.sample_rate as f64).round() as i64,
-                            gain: ea.volume.clamp(0.0, 2.0) as f32,
-                            speed: 1.0,
-                            loop_src: false,
-                        }),
-                        Err(e) => log::warn!("[rust-engine] extra audio decode `{}`: {}", ea.path, e),
-                    }
+                    jobs.push(AudioJob {
+                        path: ea.path.clone(),
+                        start_ms: ea.start_ms.max(0.0),
+                        volume: ea.volume,
+                        speed: 1.0,
+                        loop_src: ea.loop_src,
+                        normalize: false,
+                        tag: "extra".into(),
+                    });
                 }
 
-                let out = if tracks.is_empty() {
+                let out = if jobs.is_empty() {
                     Ok(Vec::new())
                 } else {
-                    let total_samples = (timeline.total_ms / 1000.0 * timeline.sample_rate as f64).ceil() as usize;
-                    Ok(audio::mixdown(
-                        &tracks,
-                        total_samples,
-                        timeline.audio_channels as usize,
-                        ((timeline.fade_in_ms / 1000.0) * timeline.sample_rate as f64).round() as usize,
-                        ((timeline.fade_out_ms / 1000.0) * timeline.sample_rate as f64).round() as usize,
-                    ))
+                    let rate = timeline.sample_rate;
+                    let chans = timeline.audio_channels as usize;
+                    let total_samples =
+                        (timeline.total_ms / 1000.0 * rate as f64).ceil() as usize;
+                    let mut out: Vec<f32> = vec![0f32; total_samples * chans];
+                    let mut any_audio = false;
+                    let mut any_normalized = false;
+                    let target_lufs = timeline.audio_target_lufs.unwrap_or(-16.0);
+
+                    // v0.3 memory cap: sources ≥ LARGE_SOURCE_BYTES decode one
+                    // at a time (mixed + dropped before the next); smaller
+                    // sources batch-decode in parallel.
+                    const LARGE_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+                    let file_bytes = |p: &str| {
+                        std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+                    };
+                    let (small, large): (Vec<usize>, Vec<usize>) = (0..jobs.len())
+                        .partition(|&ji| file_bytes(&jobs[ji].path) < LARGE_SOURCE_BYTES);
+
+                    let mut mix_job = |job: &AudioJob, pcm: PcmBuffer| {
+                        if pcm.samples.is_empty() {
+                            return;
+                        }
+                        any_audio = true;
+                        let mut gain = job.volume.clamp(0.0, 2.0) as f32;
+                        if timeline.normalize_audio && job.normalize {
+                            let measured = audio::windowed_lufs(&pcm.samples, pcm.channels, rate);
+                            if let Some(lufs) = measured
+                            {
+                                let db = target_lufs - lufs;
+                                if lufs > -70.0 && lufs < 0.0 && db.abs() <= 40.0 {
+                                    gain *= 10f64.powf(db / 20.0) as f32;
+                                    any_normalized = true;
+                                    log::info!(
+                                        "[rust-engine] loudnorm `{}`: measured {:.1} LUFS → {:+.1} dB (target {:.0})",
+                                        job.tag,
+                                        lufs,
+                                        db,
+                                        target_lufs
+                                    );
+                                }
+                            }
+                        }
+                        let track = Track {
+                            data: pcm.samples,
+                            start_sample: (job.start_ms / 1000.0 * rate as f64).round() as i64,
+                            gain,
+                            speed: job.speed,
+                            loop_src: job.loop_src,
+                        };
+                        audio::mix_into(&mut out, &track, chans);
+                        // `track` (and its PCM Arc) drops HERE — the next large
+                        // source starts with this one already freed.
+                    };
+
+                    // small sources: parallel decode, then mix (order-free)
+                    if !small.is_empty() {
+                        let decoded: Vec<Result<PcmBuffer, String>> = small
+                            .par_iter()
+                            .map(|&ji| {
+                                let j = &jobs[ji];
+                                audio::decode_audio(&ff, &j.path, rate, timeline.audio_channels)
+                            })
+                            .collect();
+                        for (k, res) in decoded.into_iter().enumerate() {
+                            match res {
+                                Ok(pcm) => mix_job(&jobs[small[k]], pcm),
+                                Err(e) => {
+                                    if !e.contains("no audio stream") {
+                                        log::warn!(
+                                            "[rust-engine] audio decode `{}`: {}",
+                                            jobs[small[k]].path,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // v0.3.1 large sources: STREAMING decode + mix — peak
+                    // RAM = mix + ONE window (~23 MB at 60 s) instead of mix
+                    // + the whole decoded track (a 69-min source is 1.6 GB;
+                    // mix + track blew past low-RAM machines). The decoder
+                    // stays open across windows (sample-accurate stitching);
+                    // loop sources replay from the start each cycle.
+                    drop(mix_job); // the streaming path owns out/flags now
+                    const AUDIO_WINDOW_SEC: f64 = 60.0;
+                    for &ji in large.iter() {
+                        let j = &jobs[ji];
+                        let window_frames = (AUDIO_WINDOW_SEC * rate as f64) as usize;
+
+                        // (a) loudness measurement FIRST — a dedicated 90 s
+                        // window at 20 % in (constant cost, never the whole
+                        // file), on its own stream instance.
+                        let mut gain = j.volume.clamp(0.0, 2.0) as f32;
+                        if timeline.normalize_audio && j.normalize {
+                            let dur = audio::audio_duration_sec(&ff, &j.path);
+                            if dur > 0.5 {
+                                let start_sec = if dur <= 120.0 { 0.0 } else { dur * 0.20 };
+                                let measure = audio::AudioStream::open(ff.clone(), &j.path, rate, timeline.audio_channels)
+                                    .and_then(|mut ms| ms.seek_sec(start_sec).map(|_| ms))
+                                    .and_then(|mut ms| {
+                                        let mut buf: Vec<f32> = Vec::new();
+                                        let want = (90.0 * rate as f64) as usize * chans.max(1);
+                                        while buf.len() < want {
+                                            match ms.next_window(window_frames) {
+                                                Ok(w) => {
+                                                    if w.samples.is_empty() { break; }
+                                                    buf.extend_from_slice(&w.samples);
+                                                }
+                                                Err(e) => return Err(e),
+                                            }
+                                        }
+                                        Ok(buf)
+                                    });
+                                if let Ok(buf) = measure {
+                                    if !buf.is_empty() {
+                                        if let Some(lufs) = audio::windowed_lufs(&buf, chans, rate) {
+                                            let db = target_lufs - lufs;
+                                            if lufs > -70.0 && lufs < 0.0 && db.abs() <= 40.0 {
+                                                gain *= 10f64.powf(db / 20.0) as f32;
+                                                any_normalized = true;
+                                                log::info!(
+                                                    "[rust-engine] loudnorm `{}`: measured {:.1} LUFS → {:+.1} dB (target {:.0})",
+                                                    j.tag, lufs, db, target_lufs
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // (b) the streaming mix
+                        match audio::AudioStream::open(ff.clone(), &j.path, rate, timeline.audio_channels) {
+                            Ok(mut stream) => {
+                                let t_start = (j.start_ms / 1000.0 * rate as f64).round() as i64;
+                                let out_frames = out.len() / chans.max(1);
+                                let mut mixed_any = false;
+                                // loop cycles map source frame f of cycle k to
+                                // out_sample = t_start + (k*L + f)/speed — the
+                                // v0.2 mix_into wrap math (local = k*L + f,
+                                // mod L). `loop_off` accumulates k*L.
+                                let mut loop_off: usize = 0;
+                                'cycles: loop {
+                                    let mut cycle_frames: usize = 0; // frames this cycle
+                                    loop {
+                                        let before = stream.pass_frames();
+                                        match stream.next_window(window_frames) {
+                                            Ok(w) => {
+                                                let wf = w.samples.len() / chans.max(1);
+                                                if wf == 0 {
+                                                    break; // EOF — cycle done
+                                                }
+                                                let _ = &wf;
+                                                let base = loop_off + before;
+                                                let out_start = t_start
+                                                    + ((base as f64 / j.speed.max(0.01)).round() as i64);
+                                                if out_start < out_frames as i64 {
+                                                    let track = Track {
+                                                        data: w.samples.clone(),
+                                                        start_sample: out_start,
+                                                        gain,
+                                                        speed: j.speed,
+                                                        loop_src: false, // cycles handle looping
+                                                    };
+                                                    audio::mix_into(&mut out, &track, chans);
+                                                    mixed_any = true;
+                                                } else {
+                                                    // this job can no longer contribute
+                                                    break 'cycles;
+                                                }
+                                                cycle_frames += wf;
+                                            }
+                                            Err(e) => {
+                                                log::warn!("[rust-engine] audio stream window `{}`: {}", j.path, e);
+                                                break 'cycles;
+                                            }
+                                        }
+                                    }
+                                    if !j.loop_src {
+                                        break 'cycles;
+                                    }
+                                    // loop: replay while the timeline has room
+                                    if cycle_frames == 0 {
+                                        break 'cycles; // zero-length source — nothing to loop
+                                    }
+                                    if t_start + (((loop_off + cycle_frames) as f64 / j.speed.max(0.01)).round() as i64) >= out_frames as i64 {
+                                        break 'cycles; // a full replay would start past the end
+                                    }
+                                    loop_off += cycle_frames;
+                                    match stream.seek_start() {
+                                        Ok(()) => continue 'cycles,
+                                        Err(e) => {
+                                            log::warn!("[rust-engine] audio loop seek `{}`: {}", j.path, e);
+                                            break 'cycles;
+                                        }
+                                    }
+                                }
+                                if mixed_any {
+                                    any_audio = true;
+                                }
+                            }
+                            Err(e) => {
+                                if !e.contains("no audio stream") {
+                                    log::warn!("[rust-engine] audio decode `{}`: {}", j.path, e);
+                                }
+                            }
+                        }
+                    }
+
+
+                    if !any_audio {
+                        Ok(Vec::new())
+                    } else {
+                        // v0.3 MASTER-BUS normalization: measure the ACTUAL mix
+                        // (windowed, constant cost) and apply one static gain
+                        // toward the target — strictly better than the CLI's
+                        // pre-mix energy ESTIMATE. Only when per-source gains
+                        // ran (CLI parity: normalize with nothing measured =
+                        // normalize bypassed).
+                        if timeline.normalize_audio && any_normalized {
+                            if let Some(mix_lufs) = audio::windowed_lufs(&out, chans, rate) {
+                                let db = target_lufs - mix_lufs;
+                                if mix_lufs > -70.0 && mix_lufs < 0.0 && db.abs() <= 40.0 {
+                                    let g = 10f64.powf(db / 20.0) as f32;
+                                    for v in out.iter_mut() {
+                                        *v *= g;
+                                    }
+                                    log::info!(
+                                        "[rust-engine] loudnorm master: mix measured {:.1} LUFS → {:+.1} dB",
+                                        mix_lufs,
+                                        db
+                                    );
+                                }
+                            }
+                        }
+                        audio::finish_mix(
+                            &mut out,
+                            total_samples,
+                            chans,
+                            ((timeline.fade_in_ms / 1000.0) * rate as f64).round() as usize,
+                            ((timeline.fade_out_ms / 1000.0) * rate as f64).round() as usize,
+                        );
+                        Ok(out)
+                    }
                 };
                 let _ = audio_tx.send(out);
             })
@@ -1539,6 +1863,34 @@ pub fn run_pipeline(
 
 // ── the frame builder (runs ON THE PRODUCER THREAD) ────────────────────────
 
+/// v0.3: the overlay motion-path center at `local_ms` into the window.
+/// Piecewise-linear over `seg.motion` (hold-first / hold-last, ≥2 keys
+/// engage); fewer keys return the static geometry center unchanged.
+fn motion_center(seg: &Segment, local_ms: f64, fx: f64, fy: f64) -> (f64, f64) {
+    let keys = &seg.motion;
+    if keys.len() < 2 {
+        return (fx, fy);
+    }
+    let t = local_ms.max(0.0);
+    if t <= keys[0].t_ms {
+        return (keys[0].x, keys[0].y);
+    }
+    let last = &keys[keys.len() - 1];
+    if t >= last.t_ms {
+        return (last.x, last.y);
+    }
+    for w in 1..keys.len() {
+        if t <= keys[w].t_ms {
+            let a = &keys[w - 1];
+            let b = &keys[w];
+            let span = (b.t_ms - a.t_ms).max(1e-6);
+            let f = ((t - a.t_ms) / span).clamp(0.0, 1.0);
+            return (a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f);
+        }
+    }
+    (last.x, last.y)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_frame_job(
     k: u64,
@@ -1648,7 +2000,22 @@ fn build_frame_job(
         let bitmap: Option<Bitmap> = if seg.media_type == "image" {
             image_bitmaps.get(&i).cloned()
         } else {
-            let src_t = (seg.trim_in_ms / 1000.0) + local_t * seg.speed;
+            // v0.3 LOOP-TO-FILL: wrap the decode position across the trimmed
+            // source span (the CLI `-stream_loop` parity; the overlay lane's
+            // `overlay_loop` mirror). Span = sourceDurationMs (payload) with
+            // the decoder's EOF-pinned duration as the fallback.
+            let payload_dur = seg.source_duration_ms.unwrap_or(0.0) / 1000.0;
+            let src_dur = if payload_dur > 0.05 {
+                payload_dur
+            } else {
+                video_sources.get(&i).map(|vs| vs.duration()).unwrap_or(0.0)
+            };
+            let trim = seg.trim_in_ms / 1000.0;
+            let mut src_t = trim + local_t * seg.speed;
+            if seg.loop_src && src_dur > 0.05 {
+                let span = (src_dur - trim).max(0.05);
+                src_t = trim + ((local_t * seg.speed) % span);
+            }
             let t0 = Instant::now();
             let b = video_sources.get_mut(&i).and_then(|vs| vs.ensure_frame(src_t).ok().flatten());
             *decode_ms += t0.elapsed().as_millis() as i64;
@@ -1682,10 +2049,18 @@ fn build_frame_job(
         let bitmap: Option<Bitmap> = if seg.media_type == "image" {
             image_bitmaps.get(&oi).cloned()
         } else {
-            let src_dur = seg.source_duration_ms.unwrap_or(0.0) / 1000.0;
+            // v0.3: payload duration with the decoder's EOF-pinned duration
+            // as the fallback (base-lane loop parity).
+            let payload_dur = seg.source_duration_ms.unwrap_or(0.0) / 1000.0;
+            let src_dur = if payload_dur > 0.05 {
+                payload_dur
+            } else {
+                video_sources.get(&oi).map(|vs| vs.duration()).unwrap_or(0.0)
+            };
             let mut src_t = seg.trim_in_ms / 1000.0 + local_t * seg.speed;
-            if seg.overlay_loop && src_dur > 0.05 {
-                src_t = seg.trim_in_ms / 1000.0 + ((local_t * seg.speed) % src_dur);
+            if (seg.overlay_loop || seg.loop_src) && src_dur > 0.05 {
+                let span = (src_dur - seg.trim_in_ms / 1000.0).max(0.05);
+                src_t = seg.trim_in_ms / 1000.0 + ((local_t * seg.speed) % span);
             }
             let t0 = Instant::now();
             let b = video_sources.get_mut(&oi).and_then(|vs| vs.ensure_frame(src_t).ok().flatten());
@@ -1703,9 +2078,14 @@ fn build_frame_job(
             };
             let gx = if geo.x > 0.0 { geo.x as f64 } else { 0.5 };
             let gy = if geo.y > 0.0 { geo.y as f64 } else { 0.5 };
+            // v0.3 MOTION PATH: ≥2 keyframes override the center across the
+            // window (piecewise-linear, hold-first / hold-last — the same
+            // curve the renderer interpolates and the CLI emits as overlay
+            // x/y time expressions). The scale (gw/gh) stays from geometry.
+            let (mx, my) = motion_center(seg, now_ms - win_start, gx, gy);
             let dest = (
-                ((gx - gw / 2.0).clamp(0.0, 1.0)) as f32,
-                ((gy - gh / 2.0).clamp(0.0, 1.0)) as f32,
+                ((mx - gw / 2.0).clamp(0.0, 1.0)) as f32,
+                ((my - gh / 2.0).clamp(0.0, 1.0)) as f32,
                 gw as f32,
                 gh as f32,
             );
