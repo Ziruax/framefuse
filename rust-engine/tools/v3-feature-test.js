@@ -86,14 +86,27 @@ function frameDiff(a, b) {
   return sum / a.length;
 }
 
-/** RGB frame bytes at a given frame index. */
+/** RGB frames — whole-file rawvideo decode, indexed (portable: no
+ *  select/-vsync filter chain; some ffmpeg builds reorder or drop frames
+ *  through select+passthrough and the probes read empty buffers). */
+const rgbCache = new Map();
+function rgbFrames(file, w, h) {
+  if (rgbCache.has(file)) return rgbCache.get(file);
+  const r = spawnSync(FFMPEG, ["-v", "error", "-i", file, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], {
+    timeout: 120000,
+    maxBuffer: 512 * 1024 * 1024,
+  });
+  const fb = w * h * 3;
+  const out = [];
+  for (let i = 0; i * fb + fb <= (r.stdout ? r.stdout.length : 0); i++) {
+    out.push(r.stdout.subarray(i * fb, (i + 1) * fb));
+  }
+  rgbCache.set(file, out);
+  return out;
+}
 function rgbFrame(file, w, h, idx) {
-  const r = spawnSync(
-    FFMPEG,
-    ["-v", "error", "-i", file, "-vf", `select=eq(n\\,${idx})`, "-vsync", "0", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
-    { timeout: 120000, maxBuffer: 256 * 1024 * 1024 },
-  );
-  return r.stdout ? r.stdout.subarray(0, w * h * 3) : Buffer.alloc(0);
+  const fr = rgbFrames(file, w, h);
+  return fr[idx] || Buffer.alloc(0);
 }
 
 function meanVolumeDb(file) {
