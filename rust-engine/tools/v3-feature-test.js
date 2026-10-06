@@ -377,6 +377,22 @@ async function main() {
     // expected: x[0.41..0.59] y[0.25..0.75] (60x90 centered at 0.5,0.5)
     check(`static overlay: bbox centered (got ${n ? `${((minX+maxX)/2/W).toFixed(2)},${((minY+maxY)/2/H).toFixed(2)}` : "none"})`,
       n > 200 && Math.abs((minX+maxX)/2/W - 0.5) < 0.06 && Math.abs((minY+maxY)/2/H - 0.5) < 0.06);
+    // v0.3.1 CHROMA PARITY (the yuv.wgsl planar-indexing bug): a black base
+    // + lime overlay is SPATIALLY-VARYING chroma — the corners must stay
+    // BLACK (no green tint) and the overlay core must be saturated lime.
+    // (Solid-color frames pass color tests even with the old corruption —
+    // only spatial variation exposes a plane-indexing bug.)
+    const cornerGreen = f ? (f[((0 * W) + 2) * 3 + 1] - Math.max(f[(2 * 3)], f[(2 * 3) + 2])) : 0;
+    let coreG = 0, coreN = 0;
+    if (f) {
+      for (let y = 80; y < 100; y++) for (let x = 150; x < 170; x++) {
+        const o = (y * W + x) * 3;
+        coreG += f[o + 1] - Math.max(f[o], f[o + 2]); coreN++;
+      }
+    }
+    const coreGreen = coreN ? coreG / coreN : 0;
+    check(`static overlay: chroma parity — corner black (greenness ${cornerGreen}), core lime (greenness ${coreGreen.toFixed(0)})`,
+      cornerGreen < 20 && coreGreen > 180);
   });
 
   // ── 5. OVERLAY MOTION PATH ──────────────────────────────────────────────

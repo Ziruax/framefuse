@@ -117,13 +117,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         out[uv_row + xq + 1u] = byte(u_of(c2), 0u) | byte(v_of(c2), 8u)
             | byte(u_of(c3), 16u) | byte(v_of(c3), 24u);
     } else {
-        // planar U and V: one u32 of each per invocation (4 chroma samples)
+        // planar U and V: one u32 of each per invocation (4 chroma samples).
+        // v0.3.1 FIX: the chroma u32 column is x0/8 (ONE u32 per block =
+        // gid.x), NOT the Y plane's xq = x0/4 (TWO u32 per block) — the
+        // copy-pasted index wrote chroma at DOUBLE columns: each row's tail
+        // overflowed into the next row and the U plane's tail into V.
+        // Solid-color frames masked it completely (every written element
+        // carried the same value — the color test passed for months while
+        // REAL spatially-varying chroma garbled: a full-canvas green tint,
+        // tinted blacks, washed overlays). gid.x is unique per invocation
+        // per row → no write races; the tail block's clamped re-samples
+        // land in the c_stride padding the consumer's row memcpy skips.
         let cy = y0 / 2u;
+        let cq = gid.x; // x0 / 8 — the CHROMA u32 column
         let u_row = params.u_plane + (cy * params.c_stride) / 4u;
         let v_row = params.v_plane + (cy * params.c_stride) / 4u;
-        out[u_row + xq] = byte(u_of(c0), 0u) | byte(u_of(c1), 8u)
+        out[u_row + cq] = byte(u_of(c0), 0u) | byte(u_of(c1), 8u)
             | byte(u_of(c2), 16u) | byte(u_of(c3), 24u);
-        out[v_row + xq] = byte(v_of(c0), 0u) | byte(v_of(c1), 8u)
+        out[v_row + cq] = byte(v_of(c0), 0u) | byte(v_of(c1), 8u)
             | byte(v_of(c2), 16u) | byte(v_of(c3), 24u);
     }
 }
