@@ -321,6 +321,44 @@ async function main() {
     normDb > -30 && normDb < -4,
   );
 
+  // ── 4b. STATIC OVERLAY CONTROL (compositor geometry, no motion) ────────
+  // isolates GPU-vs-CPU dest semantics: a lime overlay pinned at the
+  // geometry center (0.5, 0.5) must land at the canvas center on EVERY
+  // compositor (the motion scenario's failures must be motion-only).
+  await exportTimeline("staticovl", {
+    ...baseTimeline,
+    totalMs: 4000,
+    segments: [
+      {
+        id: "s1", mediaType: "video", path: black4,
+        startMs: 0, endMs: 4000, durationMs: 4000, trimInMs: 0, speed: 1, track: 0,
+        volume: 1, sourceDurationMs: 4000, hasAudio: false, loopSrc: false,
+      },
+      {
+        id: "ovlS", mediaType: "image", path: ovPng,
+        startMs: 0, endMs: 4000, durationMs: 4000, trimInMs: 0, speed: 1, track: 1,
+        volume: 0, hasAudio: false, loopSrc: false, overlayLoop: false, opacity: 1,
+        geometry: { x: 0.5, y: 0.5, w: 0.1875, h: 0 },
+      },
+    ],
+    extraAudio: [], music: null,
+  }).then((out) => {
+    const g = greenAt => greenAt; // (placeholder for symmetry)
+    const frames = rgbFrames(out, W, H);
+    const f = frames[60];
+    let minX = 1e9, maxX = -1, minY = 1e9, maxY = -1, n = 0;
+    if (f) {
+      for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+        const o = (y * W + x) * 3;
+        if (f[o + 1] - Math.max(f[o], f[o + 2]) > 40) { n++; if (x<minX)minX=x; if (x>maxX)maxX=x; if (y<minY)minY=y; if (y>maxY)maxY=y; }
+      }
+    }
+    console.log(`[static-diag] frame60 overlay bbox: ${n ? `x[${(minX/W).toFixed(2)}..${(maxX/W).toFixed(2)}] y[${(minY/H).toFixed(2)}..${(maxY/H).toFixed(2)}] n=${n}` : "none"}`);
+    // expected: x[0.41..0.59] y[0.25..0.75] (60x90 centered at 0.5,0.5)
+    check(`static overlay: bbox centered (got ${n ? `${((minX+maxX)/2/W).toFixed(2)},${((minY+maxY)/2/H).toFixed(2)}` : "none"})`,
+      n > 200 && Math.abs((minX+maxX)/2/W - 0.5) < 0.06 && Math.abs((minY+maxY)/2/H - 0.5) < 0.06);
+  });
+
   // ── 5. OVERLAY MOTION PATH ──────────────────────────────────────────────
   await exportTimeline("motion", {
     ...baseTimeline,
@@ -368,7 +406,7 @@ async function main() {
             }
           }
         }
-        centers.push(n ? `f${k}:(${((minX+maxX)/2/W).toFixed(2)},${((minY+maxY)/2/H).toFixed(2)})` : `f${k}:none`);
+        centers.push(n ? `f${k}:[${(minX/W).toFixed(2)}..${(maxX/W).toFixed(2)},${(minY/H).toFixed(2)}..${(maxY/H).toFixed(2)}]n=${n}` : `f${k}:none`);
       }
       console.log(`[motion-diag] overlay centers: ${centers.join(" ")}`);
     }
