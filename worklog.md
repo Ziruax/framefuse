@@ -3025,3 +3025,18 @@ Stage Summary:
 - Post-95% wall time for the user's scenario: ~20-40 min → ~2-4 min (25.8× realtime end-to-end on this weak sandbox CPU); every phase ticks; every failure mode is an honest error, never a pinned bar.
 - Artifacts: agent-ctx/export-repro/v1335-amix-hang-test.js, v1335-fullscale-test.js, v1335-scenario-matrix.js, v1334-pipeline-test.js (updated), agent-ctx/v1335-verified.png.
 - Pending: v1.33.5 release publish (electron:build + ASAR audit + three-way sha512) — same playbook as v1.33.4.
+---
+Task ID: 25-final (v1.33.5 release completion)
+Agent: main (Z.ai Code)
+Task: Ship v1.33.5 (stuck-at-100% root-cause release) to GitHub
+
+Work Log:
+- electron:build chain re-run with staged assets (RUST_ENGINE_SKIP=1, ffmpeg staged intact — 169MB exe + DLLs); rcedit stamped FrameFuse.exe 1.33.5.0; NSIS dist/FrameFuse Setup 1.33.5.exe.
+- ASAR AUDIT v1.33.5: ALL CHECKS PASSED — every v1.33.2/3/4 marker retained + 16 new v1.33.5 markers (window policy constants + shrinkMeasureWindow/effectiveMeasureSec, resolveWindow-first, 120s floor, effDur denominators both paths, masterEffSec, OUT-TIME STALL GUARD, killProc taskkill routing, mux/mix hard maxMs caps ×2, outTimeStallMs 120000, phase-local muxEta/mixEta, legacyMusicDurationSec, musicClipList durationMs, no dynamic-loudnorm fallback string anywhere in export-graph, finite loopCountFor ×3 files, masterMix measured-loudnorm retention) + engine sha256 == CI smoke-tested binary + packaged ffmpeg/DLLs + version stamp 1.33.5.
+- Commit 03b8d64 pushed; RELEASE 404722705 created with 3 assets; three-way sha512 VERIFIED (umcRy6crbdv1…, 220,357,755 B); releases/latest (auth-token) ⇒ v1.33.5; tag page HTTP 200.
+- Dev server HTTP 200, title "FrameFuse v1.33.5 — Windows Desktop Video Studio", agent-browser reload: zero console/page errors, final screenshot agent-ctx/v1335-final-verified.png.
+
+Stage Summary:
+- v1.33.5 IS LIVE: https://github.com/Ziruax/framefuse/releases/tag/v1.33.5 (installer FrameFuse-Setup-1.33.5.exe, 220.4 MB).
+- The complete end-to-end pipeline audit found and fixed the TRUE root cause (loudnorm measurement throughput on weak CPUs → the dynamic-loudnorm death spiral), eliminated every infinite-work path (windowed measures, no dynamic fallback, finite loop bounds, hard caps, out-time stall guard, taskkill tree kills), and made the ETA phase-local honest.
+- Verified at the user's exact scale (4140s, 25.8× realtime end-to-end) + a 7-scenario matrix + the full v1.33.4 regression suite.
