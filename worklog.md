@@ -3061,3 +3061,19 @@ Stage Summary:
 - Media panel: any image imports (no naming format needed), single images can hold the full audio length, timeline removal keeps media in a restorable library section.
 - Artifacts: agent-ctx/export-repro/v1336-fullhandler-test.js (loop|noloop|audioonly), agent-ctx/v1336-verified.png.
 - Pending: v1.33.6 release publish (electron:build + ASAR audit + three-way sha512 + GitHub release) — same playbook as v1.33.5.
+---
+Task ID: 26-final (v1.33.6 release completion)
+Agent: main (Z.ai Code)
+Task: Ship v1.33.6 to GitHub
+
+Work Log:
+- electron:build chain run with staged assets (RUST_ENGINE_SKIP=1; the CI smoke-tested engine artifact re-staged — source unchanged since the v1.33.2 CI run, sha256 367c910d…; Windows ffmpeg 169MB + 5 FFmpeg 7.1 DLLs fetched fresh); rcedit stamped FrameFuse.exe 1.33.6.0; NSIS dist/FrameFuse Setup 1.33.6.exe (220.1 MB).
+- ASAR AUDIT v1.33.6: ALL 54 CHECKS PASSED — every v1.33.2/3/4/5 marker retained + the new v1.33.6 markers (pool-own-fraction fix, 99.9 in-flight clamp, ETA-0→estimating, milestone etaFor removal, 0.2 crawl cap, two-step + smart tail fillers with ASS caption windows, audio-only gate, filler ETA+cap) + out/ chunk strings (elapsed, estimating, Not on timeline, Hold to the timeline end, Exporting audio-only timeline) + renderer source markers + engine sha + ffmpeg/DLLs + version stamp.
+- Commit cffced7 pushed; RELEASE 404918060 created with 3 assets; three-way sha512 VERIFIED (Ghrn0p04WTrQ…, 220,123,450 bytes); releases/latest ⇒ v1.33.6; tag page HTTP 200.
+- Dev server HTTP 200, title "FrameFuse v1.33.6 — Windows Desktop Video Studio", agent-browser reload: zero console/page errors (agent-ctx/v1336-verified.png).
+
+Stage Summary:
+- v1.33.6 IS LIVE: https://github.com/Ziruax/framefuse/releases/tag/v1.33.6 (installer FrameFuse-Setup-1.33.6.exe, 220.1 MB).
+- The stuck-at-100% saga is closed with a MEASURED root cause (full-handler repro): the pool progress double-count → clamped 100% + ETA 0 + 2× timemark. Fixed + verified at the user's exact scale; the bar can no longer show 100% before the file is done.
+- No-loop long-audio exports now complete to the FULL timeline (black tail with captions) instead of erroring; audio-only projects export.
+- Media panel: any-filename images, single-image hold-to-end, timeline removal keeps imported media (restorable "Not on timeline" section).
