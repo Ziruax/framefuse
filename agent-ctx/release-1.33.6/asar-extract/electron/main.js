@@ -4776,8 +4776,8 @@ ipcMain.handle("export-native", async (event, opts) => {
       const elapsedSec = (Date.now() - startTime) / 1000;
       // v1.33.6 (stuck-at-100% report — full-handler repro): 100% is RESERVED
       // for the actual completion event. The v1.33.4 finalize crawl topped at
-      // 99.96 (0.27 band), which a one-decimal display rounded to "100.0%"
-      // while the faststart rewrite was still running — and the old
+      // 99.7 + 0.27×0.95 = 99.96, which a one-decimal display rounds to
+      // "100.0%" while the faststart rewrite is still running — and the old
       // Math.min(100, …) clamp also flattened the (buggy, double-counted) pool
       // fraction onto a pinned 100% half-way through the encode. Every
       // in-flight value now clamps at 99.9; only a real 100 (the done event)
