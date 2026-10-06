@@ -1,6 +1,6 @@
 {
   "name": "framefuse",
-  "version": "1.33.3",
+  "version": "1.33.4",
   "private": true,
   "description": "Multi-track Windows video studio with fast native export.",
   "main": "electron/main.js",

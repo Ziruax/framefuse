@@ -742,10 +742,21 @@ function pruneLoudnessDisk() {
  * song-length sources, but a 1h9m track decodes at ~40-90× realtime on a
  * weak CPU (100-140s), so EVERY long-audio export had its measurement
  * killed at 60s and silently fell back to the SLOWER dynamic loudnorm in
- * the final mux (the "export crawls after 95%" amplifiers). The timeout
- * now scales with the source duration (60s floor, 5min cap).
+ * the final mux (the "export crawls after 95%" amplifiers).
+ * v1.33.4 (stuck-at-100% root-cause release): the measurement now runs
+ * through runFfmpeg instead of the raw capture path, which buys THREE
+ * fixes for the exact reported symptom — (1) LIVE PROGRESS: -nostats is
+ * dropped so ffmpeg's periodic "time=" lines drive onTime (the measure
+ * phases used to sit at a FROZEN 95.5/96.6 for minutes on hour-long
+ * sources with no explanation — "after 95% it became slow"); (2) the
+ * child registers in activeProcs so cancel-export kills it; (3) the stall
+ * watchdog applies (a healthy measure emits stats ~2Hz — 60s of silence
+ * means dead). The duration cap is now opts.maxMs and the timeout formula
+ * is more generous (90s floor + 40ms/media-sec, 10 min cap — the old
+ * 25ms/s starved weak CPUs into the SLOWER dynamic-loudnorm fallback, a
+ * death spiral: slower machine → timed-out measurement → even slower mux).
  */
-function measureLoudnessAsync(p, win, timeoutMs) {
+function measureLoudnessAsync(p, win, timeoutMs, onTime) {
   if (typeof p !== "string" || !p) return Promise.resolve(null);
   // Temp WAVs (the two-step clip extracts + master-mix renders) live under
   // tempDir and never repeat — bypass the cache for them entirely.
@@ -772,49 +783,71 @@ function measureLoudnessAsync(p, win, timeoutMs) {
     : [];
   // v1.33.2: 60s floor + ~0.025s per media-second (covers ≥40× realtime
   // decode+analysis on weak CPUs), capped at 5 min so a genuinely stuck
-  // measurement still dies.
+  // measurement still dies. v1.33.4: 90s floor + 40ms/s, 10 min cap — weak
+  // CPUs measured for real instead of degrading to the slow dynamic path.
   const durSec = win && Number(win.durMs) > 0 ? Number(win.durMs) / 1000 : 0;
   const timeout =
     Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
-      ? Math.max(20000, Math.min(300000, Number(timeoutMs)))
-      : Math.max(60000, Math.min(300000, 60000 + durSec * 25));
+      ? Math.max(20000, Math.min(600000, Number(timeoutMs)))
+      : Math.max(90000, Math.min(600000, 90000 + durSec * 40));
   loudnessCacheStats.misses += 1;
-  return ffmpegCapture(
-    [
-      "-hide_banner", "-nostats",
-      ...seekArgs,
-      "-i", p,
-      "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
-      "-f", "null", "-",
-    ],
-    timeout,
-  ).then((r) => {
-    const out = r && r.out ? r.out : "";
-    const start = out.lastIndexOf("{");
-    if (start < 0) return null;
-    const end = out.indexOf("}", start);
-    if (end < 0) return null;
-    let j = null;
-    try { j = JSON.parse(out.slice(start, end + 1)); } catch (_) { return null; }
-    const num = (v) => {
-      const n = Number(v);
-      return Number.isFinite(n) ? n : null;
-    };
-    const i = num(j.input_i);
-    const lra = num(j.input_lra);
-    const tp = num(j.input_tp);
-    const th = num(j.input_thresh);
-    if (i == null || lra == null || tp == null || th == null) return null;
-    const m = { i, lra, tp, thresh: th, offset: num(j.target_offset) };
-    if (statOk && key) {
-      loadLoudnessDisk();
-      loudnessDisk.entries[key] = { t: Date.now(), m };
-      pruneLoudnessDisk();
-      loudnessDiskDirty = true;
-      scheduleLoudnessDiskSave();
-    }
-    return m;
-  }).catch(() => null);
+  // v1.33.4: progress denominator — the window when seeked, else the probed
+  // source duration (probe is cached; 0 = no live ticks, measurement still
+  // bounded by maxMs + the watchdog).
+  const progressTotal = durSec > 0
+    ? Promise.resolve(durSec)
+    : probeMediaAsync(p).then((pr) => (Number(pr && pr.durationMs) || 0) / 1000).catch(() => 0);
+  return progressTotal.then((pt) =>
+    runFfmpeg(
+      [
+        // v1.33.4: -nostats REMOVED — the periodic stats line carries
+        // "time=" which drives onTime (live measure progress).
+        "-hide_banner",
+        ...seekArgs,
+        "-i", p,
+        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
+        "-f", "null", "-",
+      ],
+      pt > 0 ? pt : 0,
+      onTime || null,
+      {
+        // A healthy measurement emits a stats line ~2×/s: a full minute of
+        // complete silence means the process is dead, not slow.
+        stallMs: 60000,
+        // The duration-scaled cap (was the ffmpegCapture flat timeout):
+        // exceeding it rejects with the __FFMAX__ marker → caught below →
+        // null → the caller's graceful fallback (same semantics as the old
+        // timeout, now with live progress + cancellation on the way).
+        maxMs: timeout,
+      },
+    ).then((r) => {
+      const out = r && r.stderr ? r.stderr : "";
+      const start = out.lastIndexOf("{");
+      if (start < 0) return null;
+      const end = out.indexOf("}", start);
+      if (end < 0) return null;
+      let j = null;
+      try { j = JSON.parse(out.slice(start, end + 1)); } catch (_) { return null; }
+      const num = (v) => {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
+      };
+      const i = num(j.input_i);
+      const lra = num(j.input_lra);
+      const tp = num(j.input_tp);
+      const th = num(j.input_thresh);
+      if (i == null || lra == null || tp == null || th == null) return null;
+      const m = { i, lra, tp, thresh: th, offset: num(j.target_offset) };
+      if (statOk && key) {
+        loadLoudnessDisk();
+        loudnessDisk.entries[key] = { t: Date.now(), m };
+        pruneLoudnessDisk();
+        loudnessDiskDirty = true;
+        scheduleLoudnessDiskSave();
+      }
+      return m;
+    }).catch(() => null)
+  ).catch(() => null);
 }
 
 /**
@@ -825,19 +858,51 @@ function measureLoudnessAsync(p, win, timeoutMs) {
  * v1.33.2: `totalSec` scales each measurement's timeout (long-audio exports
  * measured for real instead of timing out at the flat 60s and falling back
  * to the slower dynamic loudnorm in the mux).
+ * v1.33.4: `onProgress(frac 0..1)` aggregates the per-source decode
+ * positions (each child now emits live "time=" ticks — see
+ * measureLoudnessAsync) so the audio-measure band MOVES instead of freezing
+ * at 95.5 while minutes of hour-long sources are analyzed. The timeout is
+ * also more generous (90s floor + 40ms/media-sec, 10 min cap): the old
+ * 25ms/s starved weak CPUs into the SLOWER dynamic-loudnorm fallback.
  */
-async function measureLoudnormContext(clipAudioJobs, audioPath, totalSec) {
+async function measureLoudnormContext(clipAudioJobs, audioPath, totalSec, onProgress) {
   const clip = new Array(clipAudioJobs.length).fill(null);
   let music = null;
   const tasks = [];
   const durSec = Number.isFinite(Number(totalSec)) && Number(totalSec) > 0 ? Number(totalSec) : 0;
-  const timeout = Math.max(60000, Math.min(300000, 60000 + durSec * 25));
-  clipAudioJobs.forEach((j, k) => tasks.push({ kind: "clip", k, p: j.wavPath }));
-  if (audioPath) tasks.push({ kind: "music", p: audioPath });
+  const timeout = Math.max(90000, Math.min(600000, 90000 + durSec * 40));
+  clipAudioJobs.forEach((j, k) => tasks.push({ kind: "clip", k, p: j.wavPath, dur: (Number(j.durationMs) || 0) / 1000 }));
+  if (audioPath) tasks.push({ kind: "music", p: audioPath, dur: durSec });
+  // v1.33.4: aggregate progress — mean of per-task decode fractions; a task
+  // with no duration just reports 0 until it lands.
+  const fracs = new Array(tasks.length).fill(0);
+  let lastEmit = 0;
+  const emit = (force) => {
+    if (!onProgress) return;
+    const now = Date.now();
+    if (!force && now - lastEmit < 100) return; // ≤10 Hz progress IPC
+    lastEmit = now;
+    let sum = 0;
+    for (let i = 0; i < fracs.length; i++) sum += fracs[i];
+    try { onProgress(tasks.length > 0 ? sum / tasks.length : 0); } catch (_) { /* best-effort */ }
+  };
   for (let c = 0; c < tasks.length; c += 8) {
     const chunk = tasks.slice(c, c + 8);
-    const res = await Promise.all(chunk.map((t) => measureLoudnessAsync(t.p, null, timeout)));
+    const base = c;
+    const res = await Promise.all(chunk.map((t, i) => measureLoudnessAsync(
+      t.p,
+      null,
+      timeout,
+      t.dur > 0
+        ? (sec) => {
+            fracs[base + i] = Math.min(1, sec / Math.max(0.01, t.dur));
+            emit(false);
+          }
+        : null,
+    )));
     chunk.forEach((t, i) => {
+      fracs[base + i] = 1;
+      emit(true);
       if (t.kind === "clip") clip[t.k] = res[i];
       else music = res[i];
     });
@@ -2809,8 +2874,21 @@ function encoderGlobalArgs(encoderName) {
 //     timeline is not yet encoded → the process is dead, not slow — a
 //     healthy encode emits a progress line every ~0.5s even at 0.1×;
 //   - post-total: the finalize pass (faststart moov rewrite / mux flush)
-//     is legitimately silent — bounded by finalizeMs (15 min default:
-//     covers a <1.5 GB rewrite on a very slow HDD) before the kill.
+//     is legitimately silent — bounded by finalizeMs (default below)
+//     before the kill.
+// v1.33.4 (the stuck-at-100% root-cause release) adds THREE more hooks:
+//   - opts.maxMs: a hard wall-clock cap on the whole child (measurement
+//     passes keep their duration-scaled bound — the kill rejects with a
+//     distinct "exceeded the allowed time" message the caller can map to
+//     its graceful fallback instead of a user-facing export error);
+//   - faststart's own stderr line ("Starting second pass: moving the moov
+//     atom…") now triggers onFinalize EXACTLY when the moov rewrite starts
+//     (the 1.5s-after-total guess stays as the fallback);
+//   - opts.onFinalizeProgress(frac): a ~1Hz honest crawl through the
+//     finalize window (the moov rewrite is a pure in-place byte shift with
+//     NO progress output — verified on real ffmpeg: no temp file, constant
+//     file size — so the crawl is time-based against an IO estimate; the
+//     bar MOVES and 100% is still reserved for the actual exit).
 // >1.5 GB outputs skip faststart entirely (v1.33.2 gate), so the post-total
 // window is seconds in the normal case.
 function runFfmpeg(args, totalSec, onTime, opts) {
@@ -2822,16 +2900,53 @@ function runFfmpeg(args, totalSec, onTime, opts) {
     let sawTotal = false;        // out_time reached totalSec (encode done)
     let finalizeNotified = false;
     let finalizeTimer = null;
+    let finalizeCrawl = null;    // v1.33.4: the 1Hz crawl through the finalize window
+    let finalizeStartedAt = null;
+    let maxedOut = false;        // v1.33.4: killed by the maxMs duration cap
     const onFinalize = opts && typeof opts.onFinalize === "function" ? opts.onFinalize : null;
+    const onFinalizeProgress = opts && typeof opts.onFinalizeProgress === "function" ? opts.onFinalizeProgress : null;
+    const finalizeEstimateMs = opts && Number(opts.finalizeEstimateMs) > 0 ? Number(opts.finalizeEstimateMs) : 120000;
     const stallMs = opts && Number(opts.stallMs) > 0 ? Number(opts.stallMs) : 300000;
     const finalizeMs = opts && Number(opts.finalizeMs) > 0 ? Number(opts.finalizeMs) : 900000;
+    const maxMs = opts && Number(opts.maxMs) > 0 ? Number(opts.maxMs) : 0; // v1.33.4: 0 = no cap
+    const noFinalizeOnTotal = !!(opts && opts.noFinalizeOnTotal); // faststart-off muxes: only the stderr line may fire finalize
+    const startedAt = Date.now();
     let lastOutputAt = Date.now(); // any stderr chunk = life
     let totalReachedAt = null;     // wall-clock when out_time hit totalSec
     let exited = false;
     let stallKilled = false;
+    const fireFinalize = (why) => {
+      if (finalizeNotified || !onFinalize) return;
+      finalizeNotified = true;
+      if (finalizeTimer) { clearTimeout(finalizeTimer); finalizeTimer = null; }
+      finalizeStartedAt = Date.now();
+      try { onFinalize(); } catch (_) { /* best-effort phase flip */ }
+      if (onFinalizeProgress) {
+        // v1.33.4: the moov rewrite / mux flush is byte-shifting work with
+        // no ffmpeg progress output — crawl the band on a wall-clock basis
+        // against the size-derived IO estimate so the bar visibly moves
+        // (capped at 95% of the estimate: the real end is the exit event,
+        // never a timer).
+        finalizeCrawl = setInterval(() => {
+          if (exited) return;
+          const frac = Math.min(0.95, (Date.now() - finalizeStartedAt) / Math.max(1000, finalizeEstimateMs));
+          try { onFinalizeProgress(frac); } catch (_) { /* best-effort */ }
+        }, 1000);
+      }
+      if (why) console.log(`[Export] finalize pass began (${why})`);
+    };
     const stallWatchdog = setInterval(() => {
       if (exited || stallKilled) return;
       const now = Date.now();
+      if (maxMs > 0 && now - startedAt > maxMs) {
+        // v1.33.4: the caller-imposed duration cap (measurement passes):
+        // killed HERE and reported as its own error class so the caller can
+        // fall back instead of surfacing a false "stalled" diagnosis.
+        maxedOut = true;
+        stallKilled = true;
+        try { proc.kill("SIGKILL"); } catch (_) { /* already gone */ }
+        return;
+      }
       const silent = totalReachedAt != null
         ? now - Math.max(totalReachedAt, lastOutputAt) > finalizeMs
         : now - lastOutputAt > stallMs;
@@ -2862,26 +2977,41 @@ function runFfmpeg(args, totalSec, onTime, opts) {
           // hits total, if the process is still alive 1.5s later it is in
           // the finalize pass → notify once so the caller can flip the
           // phase to "finalize" (the UI then says what is happening).
+          // v1.33.4: faststart-OFF muxes suppress this heuristic entirely
+          // (their tail is a <2s flush — the label would be noise); the
+          // "Starting second pass" stderr line below is the exact trigger
+          // when the moov rewrite actually runs.
           if (!sawTotal && sec >= totalSec - 0.25) {
             sawTotal = true;
             if (totalReachedAt == null) totalReachedAt = Date.now();
-            if (onFinalize) {
-              finalizeTimer = setTimeout(() => {
-                if (!finalizeNotified) {
-                  finalizeNotified = true;
-                  try { onFinalize(); } catch (_) { /* best-effort phase flip */ }
-                }
-              }, 1500);
+            if (onFinalize && !noFinalizeOnTotal && !finalizeTimer) {
+              finalizeTimer = setTimeout(() => fireFinalize("out_time reached the timeline end"), 1500);
             }
           }
         }
       }
+      // v1.33.4: faststart announces its second pass on stderr — the moov
+      // rewrite starts EXACTLY here (verified on real ffmpeg 7.x: the
+      // rewrite is an in-place shift, no temp file, no size change, no
+      // progress lines). Fire the finalize notification from the message
+      // itself so the phase label + crawl begin at the true moment.
+      if (onFinalize && !finalizeNotified && s.indexOf("Starting second pass") >= 0) {
+        fireFinalize("faststart moov rewrite — ffmpeg 'Starting second pass'");
+      }
       stderr += s;
       stderrTail = (stderrTail + s).slice(-4000);
+    });
+    proc.stdout.on("data", (d) => {
+      // v1.33.4: measurement passes parse the loudnorm JSON summary which
+      // ffmpeg prints on stdout in some builds — capture it too (encode
+      // jobs print nothing on stdout; zero cost).
+      const s = d.toString();
+      if (s) { stderr += s; stderrTail = (stderrTail + s).slice(-4000); }
     });
     proc.on("error", (err) => {
       exited = true;
       clearInterval(stallWatchdog);
+      clearInterval(finalizeCrawl);
       if (finalizeTimer) clearTimeout(finalizeTimer);
       activeProcs.delete(proc);
       reject(new Error(err.message));
@@ -2889,11 +3019,19 @@ function runFfmpeg(args, totalSec, onTime, opts) {
     proc.on("exit", (code, signal) => {
       exited = true;
       clearInterval(stallWatchdog);
+      clearInterval(finalizeCrawl);
       if (finalizeTimer) clearTimeout(finalizeTimer);
       activeProcs.delete(proc);
       // v1.33.3: the watchdog's kill must NEVER be misreported as a
       // user cancel — it is a failure with a cause and diagnostics.
+      // v1.33.4: maxMs kills are their own class (callers fall back
+      // gracefully — a measurement that outlived its budget is not an
+      // export failure).
       if (stallKilled) {
+        if (maxedOut) {
+          reject(new Error(`__FFMAX__ took longer than the allowed ${Math.round(maxMs / 1000)}s`));
+          return;
+        }
         const lines = stderrTail.trim().split("\n").slice(-4).join("\n");
         const phaseLabel = totalReachedAt != null
           ? "while finalizing the output file"
@@ -2912,7 +3050,10 @@ function runFfmpeg(args, totalSec, onTime, opts) {
         reject(new Error(lines.slice(-6).join("\n") || `FFmpeg error code ${code}`));
         return;
       }
-      resolve();
+      // v1.33.4: resolve the accumulated output so measurement callers can
+      // parse the loudnorm JSON (no existing caller consumed the value —
+      // this is purely additive).
+      resolve({ stderr });
     });
   });
 }
@@ -5880,10 +6021,18 @@ ipcMain.handle("export-native", async (event, opts) => {
         let spMasterGainDb = null;
         if (audio && audio.normalize && (clipAudioBranches.length > 0 || musicCount > 0)) {
           prof.beginStage("loudness");
+          // v1.33.4: the planning-stage measurements can take minutes on
+          // hour-long sources — the phase chip now says "measuring loudness"
+          // and the bar ticks 0 → 0.5% with the per-task decode fractions
+          // (previously this whole stage ran under the bare "prepare" label
+          // with a frozen 0% — indistinguishable from a hang).
+          exportPhase = "audio-measure";
+          sendProgress(0.2, 0, undefined);
           const measures = { clip: new Array(clipAudioBranches.length).fill(null), music: null };
           const tasks = clipAudioBranches.map((c, k) => ({
             kind: "clip", k,
             p: segments[c.inputIdx].videoPath,
+            dur: (Number(segments[c.inputIdx].durationMs) || 0) / 1000,
             win: {
               ssMs: segInfo[c.inputIdx].trimInMs,
               durMs: (Number(segments[c.inputIdx].durationMs) || 0) * (segInfo[c.inputIdx].speed !== 1 ? segInfo[c.inputIdx].speed : 1),
@@ -5892,16 +6041,37 @@ ipcMain.handle("export-native", async (event, opts) => {
           // v1.25: only the LEGACY single-music input is measured (the N-clip
           // branches carry no loudnorm — SFX-style user-volume placements).
           const legacyMusicPath = hasMusicClips ? null : audioPath;
-          if (legacyMusicPath) tasks.push({ kind: "music", p: legacyMusicPath, win: null });
+          if (legacyMusicPath) tasks.push({ kind: "music", p: legacyMusicPath, dur: totalSec, win: null });
+          const spFrac = new Array(tasks.length).fill(0);
           for (let t = 0; t < tasks.length; t += 8) {
             const chunkT = tasks.slice(t, t + 8);
-            const res = await Promise.all(chunkT.map((task) => measureLoudnessAsync(task.p, task.win)));
+            const base = t;
+            const res = await Promise.all(chunkT.map((task, i) => measureLoudnessAsync(
+              task.p,
+              task.win,
+              // v1.33.4: the MUSIC branch (win=null — whole file) gets the
+              // duration-scaled budget; windowed clip branches keep the
+              // window-scaled default. (The old call passed NO timeout → a
+              // flat 60s cap for the music file — the v1.33.2 long-audio
+              // starvation bug, still live on the smart path until now.)
+              task.win ? undefined : Math.max(90000, Math.min(600000, 90000 + (task.dur || totalSec) * 40)),
+              task.dur > 0
+                ? (sec) => {
+                    spFrac[base + i] = Math.min(1, sec / Math.max(0.01, task.dur));
+                    let sum = 0;
+                    for (let q = 0; q < spFrac.length; q++) sum += spFrac[q];
+                    sendProgress(0.2 + 0.3 * (sum / spFrac.length), 0, undefined);
+                  }
+                : null,
+            )));
             chunkT.forEach((task, r) => {
+              spFrac[base + r] = 1;
               if (task.kind === "clip") measures.clip[task.k] = res[r];
               else measures.music = res[r];
             });
           }
           prof.endStage("loudness");
+          exportPhase = "video";
           spLoudnorm = measures;
           const branchCount = clipAudioBranches.length + musicCount;
           const clipsUsable = measures.clip.every((m) => G.loudnessGainDb(m) != null);
@@ -6297,7 +6467,7 @@ ipcMain.handle("export-native", async (event, opts) => {
 
         // ── PHASE 4: concat demuxer stitch + mux (instant, -c copy) ───────
         exportPhase = "mux";
-        sendProgress(96.5, totalSec, etaFor(0.965));
+        sendProgress(96.9, totalSec, etaFor(0.969));
         const spConcatPath = path.join(tempDir, `concat_${Date.now()}.txt`);
         tempFiles.push(spConcatPath);
         fs.writeFileSync(
@@ -6305,6 +6475,26 @@ ipcMain.handle("export-native", async (event, opts) => {
           chunkFiles.map((p) => `file '${p.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`).join("\n"),
           "utf-8",
         );
+        // v1.33.4: the faststart gate + the size-derived finalize budget are
+        // hoisted (both feed the progress mapping AND the argv) and the mux
+        // band is re-mapped 97 → 99.7 with the VIDEO length as the
+        // denominator (a -shortest audio-extended timeline caps out_time at
+        // the video end — the old audio-extended denominator could never
+        // reach 1 and the bar stalled below the band top). The finalize pass
+        // (faststart moov rewrite) fires from ffmpeg's own "Starting second
+        // pass" stderr line with a live crawl to 99.97 — 100% stays reserved
+        // for the actual exit.
+        let spChunkBytes = 0;
+        for (const p of chunkFiles) { try { spChunkBytes += fs.statSync(p).size; } catch (_) {} }
+        const spAudioBytes = spAudioPath ? (abr * 1000 / 8) * totalSec : 0;
+        const spExpectedOutBytes = spChunkBytes + spAudioBytes;
+        const spSkipFaststart = spExpectedOutBytes > 1.5 * 1024 * 1024 * 1024;
+        if (spSkipFaststart) {
+          console.log(
+            `[Export] faststart skipped: expected output ≈ ${(spExpectedOutBytes / 1024 / 1024 / 1024).toFixed(2)} GB > 1.5 GB ` +
+              `(-movflags +faststart would rewrite the whole file after 100% — moov stays at end; local playback unaffected)`,
+          );
+        }
         const muxArgs = [
           "-y",
           "-f", "concat", "-safe", "0", "-i", spConcatPath,
@@ -6313,32 +6503,31 @@ ipcMain.handle("export-native", async (event, opts) => {
           ...(spAudioPath ? ["-map", "1:a:0"] : []),
           "-c", "copy",
           ...(spAudioPath ? ["-shortest"] : []),
-          // v1.33.2: same >1.5 GB faststart gate as the two-step mux (the
-          // whole-file moov rewrite runs after the last frame with zero
-          // progress output and looks like a hang at 100%).
-          ...((() => {
-            let chunkBytes = 0;
-            for (const p of chunkFiles) { try { chunkBytes += fs.statSync(p).size; } catch (_) {} }
-            const audioBytes = spAudioPath ? (abr * 1000 / 8) * totalSec : 0;
-            return chunkBytes + audioBytes > 1.5 * 1024 * 1024 * 1024 ? [] : ["-movflags", "+faststart"];
-          })()),
+          ...(spSkipFaststart ? [] : ["-movflags", "+faststart"]),
           outputPath,
         ];
+        const spVideoSec = plan.totalFrames > 0 && fps > 0 ? plan.totalFrames / fps : totalSec;
+        const spMuxBandSec = Math.max(0.01, Math.min(spVideoSec, totalSec));
         const muxStageStart = Date.now();
-        let spFinalizeNotified = false;
         prof.beginStage("mux");
         try {
           await runFfmpeg(muxArgs, totalSec, (sec) => {
-            const frac = 0.965 + 0.035 * Math.min(1, sec / Math.max(0.01, totalSec));
+            const frac = 0.97 + 0.027 * Math.min(1, sec / spMuxBandSec);
             sendProgress(frac * 100, sec, etaFor(frac));
           }, {
             onFinalize: () => {
-              if (spFinalizeNotified) return;
-              spFinalizeNotified = true;
               exportPhase = "finalize";
-              sendProgress(100, totalSec, undefined);
-              console.log("[Export] finalize: concat muxed — ffmpeg is rewriting the file header (faststart)");
+              sendProgress(99.7, totalSec, undefined);
+              console.log("[Export] finalize: concat muxed — ffmpeg is rewriting the file header (faststart moov rewrite)");
             },
+            onFinalizeProgress: (f) => {
+              sendProgress(99.7 + 0.27 * Math.min(0.95, Math.max(0, f)), totalSec, undefined);
+            },
+            finalizeEstimateMs: Math.max(15000, Math.min(600000, (spExpectedOutBytes / (25 * 1024 * 1024)) * 2500)),
+            finalizeMs: spSkipFaststart
+              ? 90000
+              : Math.max(150000, Math.min(600000, 60000 + (spExpectedOutBytes / (25 * 1024 * 1024)) * 2500)),
+            noFinalizeOnTotal: spSkipFaststart,
           });
         } catch (err) {
           prof.endStage("mux");
@@ -6532,12 +6721,14 @@ ipcMain.handle("export-native", async (event, opts) => {
       clipDurProbe.push(...ds);
     }
     let actualTotalSec = totalSec;
+    let concatVideoSec = null; // v1.33.4: the ACCEPTED probed video length (the mux band denominator)
     if (clipDurProbe.length > 0 && clipDurProbe.every((d) => d > 0)) {
       const actualMs = clipDurProbe.reduce((a, b) => a + b, 0);
       // Guard: a wildly-off measurement (bad probe) must never skew the
       // mix — only accept when within 2% + 1s of the requested timeline.
       if (Math.abs(actualMs - totalMs) <= totalMs * 0.02 + 1000) {
         actualTotalSec = actualMs / 1000;
+        concatVideoSec = actualMs / 1000;
       }
     }
 
@@ -6570,9 +6761,14 @@ ipcMain.handle("export-native", async (event, opts) => {
       // phase chip still saying "mixing audio". The phase now says exactly
       // what is running and the bar moves to 95.5 while the (duration-scaled,
       // v1.33.2) measurements decode each source.
+      // v1.33.4: the measure band 95.5 → 96.0 is now LIVE (each measurement
+      // child emits "time=" ticks — see measureLoudnormContext) so the bar
+      // visibly advances instead of freezing for the whole measurement.
       exportPhase = "audio-measure";
       sendProgress(95.5, totalSec, etaFor(0.955));
-      loudnormCtx = await measureLoudnormContext(clipAudioJobs, legacyMusicPath2, actualTotalSec);
+      loudnormCtx = await measureLoudnormContext(clipAudioJobs, legacyMusicPath2, actualTotalSec, (frac) => {
+        sendProgress(95.5 + 0.5 * Math.min(1, Math.max(0, frac)), totalSec, etaFor(0.955 + 0.005 * Math.min(1, Math.max(0, frac))));
+      });
       prof.endStage("loudness");
       exportPhase = "audio";
       sendProgress(96, totalSec, etaFor(0.96));
@@ -6672,11 +6868,24 @@ ipcMain.handle("export-native", async (event, opts) => {
           sendProgress(96 + 0.5 * Math.min(1, sec / Math.max(0.01, actualTotalSec)), sec, etaFor(0.9625));
         });
         exportPhase = "audio";
-        sendProgress(96.6, totalSec, etaFor(0.966));
+        sendProgress(96.5, totalSec, etaFor(0.965));
         // v1.33.2: duration-scaled timeout (a 69-min mix WAV measures in
         // 100-140s on weak CPUs — the flat 60s cap killed it and silently
         // fell back to the slow dynamic loudnorm in the final mux).
-        const masterMeasure = await measureLoudnessAsync(mixWavPath, null, 60000 + actualTotalSec * 25);
+        // v1.33.4: 90s floor + 40ms/s (10 min cap) AND live progress — the
+        // master-mix measurement band 96.5 → 96.9 now ticks with the decode
+        // instead of freezing (the last frozen spot in the 95-100 band).
+        const masterMeasure = await measureLoudnessAsync(
+          mixWavPath,
+          null,
+          Math.max(90000, Math.min(600000, 90000 + actualTotalSec * 40)),
+          (sec) => {
+            exportPhase = "audio-measure";
+            sendProgress(96.5 + 0.4 * Math.min(1, sec / Math.max(0.01, actualTotalSec)), sec, etaFor(0.967));
+          },
+        );
+        exportPhase = "audio";
+        sendProgress(96.9, totalSec, etaFor(0.969));
         if (fs.existsSync(mixWavPath) && fs.statSync(mixWavPath).size > 44) {
           masterMix = { wavPath: mixWavPath, loudnorm: masterMeasure };
         }
@@ -6760,25 +6969,46 @@ ipcMain.handle("export-native", async (event, opts) => {
 
     exportPhase = "mux";
     prof.beginStage("mux");
-    let finalizeNotified = false;
+    // v1.33.4 (stuck-at-100% root-cause release) — the mux band is
+    // RE-MAPPED and the finalize pass is now VISIBLE and bounded:
+    //   - the band runs 97 → 99.7 (0.027 width, above every audio-phase
+    //     band so progress never regresses); 100% is emitted ONLY by the
+    //     actual process exit (or the labeled finalize crawl below);
+    //   - the denominator is the CONCAT VIDEO length when the probes
+    //     accepted it: a -shortest audio-extended timeline caps out_time
+    //     at the video end, so the old audio-extended denominator could
+    //     never reach 1 and the bar stalled below the band top while the
+    //     mux worked;
+    //   - faststart's own "Starting second pass" stderr line fires the
+    //     finalize label EXACTLY when the moov rewrite begins (verified:
+    //     the rewrite is an in-place byte shift — no temp file, no size
+    //     change, no progress lines — so the crawl is time-based against
+    //     a size-derived IO estimate, capped at 99.97%);
+    //   - the finalize WATCHDOG is now size-scaled (60s + 2.5× the bytes
+    //     at ~25MB/s, clamped 2.5-10 min) instead of the flat 15 min, and
+    //     faststart-off muxes get a tight 90s tail bound (their post-total
+    //     tail is a sub-2s flush — the old 1.5s-heuristic "finalize" label
+    //     was noise for them and is now suppressed).
+    const muxBandSec = concatVideoSec || actualTotalSec;
     await runFfmpeg(concatArgs, actualTotalSec, (sec) => {
-      // v1.33.2: the mux maps to 96.5 → 99.7 (NOT 100) — 100% now appears
-      // only when the process truly finishes or enters the labeled finalize
-      // pass, so "100%" never again means "silently still working".
-      const frac = 0.965 + 0.032 * Math.min(1, sec / Math.max(0.01, actualTotalSec));
+      const frac = 0.97 + 0.027 * Math.min(1, sec / Math.max(0.01, muxBandSec));
       sendProgress(frac * 100, sec, etaFor(frac));
     }, {
       onFinalize: () => {
-        if (finalizeNotified) return;
-        finalizeNotified = true;
-        // faststart's second pass (moov rewrite) — the phase chip now says
-        // exactly what the silent tail is instead of a frozen "100%".
         exportPhase = "finalize";
-        sendProgress(100, actualTotalSec, undefined);
+        sendProgress(99.7, actualTotalSec, undefined);
         console.log(
-          "[Export] finalize: every frame muxed — ffmpeg is rewriting the file header (faststart; can take a minute on large files)",
+          `[Export] finalize: every frame muxed — ffmpeg is rewriting the file header (faststart${skipFaststart ? " (unexpected — gate said skip)" : "; can take a minute on large files"})`,
         );
       },
+      onFinalizeProgress: (f) => {
+        sendProgress(99.7 + 0.27 * Math.min(0.95, Math.max(0, f)), actualTotalSec, undefined);
+      },
+      finalizeEstimateMs: Math.max(15000, Math.min(600000, (expectedOutBytes / (25 * 1024 * 1024)) * 2500)),
+      finalizeMs: skipFaststart
+        ? 90000
+        : Math.max(150000, Math.min(600000, 60000 + (expectedOutBytes / (25 * 1024 * 1024)) * 2500)),
+      noFinalizeOnTotal: skipFaststart,
     });
     prof.endStage("mux");
 

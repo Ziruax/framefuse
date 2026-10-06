@@ -24,7 +24,7 @@ import { cn } from "@/lib/utils";
 /** v1.12.1: the renderer's build constant — compared against the REAL exe
  *  version (app.getVersion()) so a stale/hybrid install is impossible to
  *  miss. Keep in sync with package.json on every release. */
-const BUILD_VERSION = "1.33.3";
+const BUILD_VERSION = "1.33.4";
 
 export interface LastExport {
   path: string;
@@ -238,7 +238,12 @@ export function Header({
   const pct = exportProgress?.progress ?? 0;
   // v1.8.2: sub-10% shows ONE DECIMAL — a 19-minute export spends its first
   // minutes below 1% and an integer "0%" read as "stuck / not working".
-  const pctLabel = pct < 10 && pct > 0 ? pct.toFixed(1) : pct.toFixed(0);
+  // v1.33.4: ≥99% ALSO shows one decimal — the final band runs 99.7 → 99.97
+  // (mux top + the faststart finalize crawl) and the rounded integer label
+  // said "100%" the whole time, which reads as "done but stuck" while real
+  // work continues. The exact decimal is the honest signal that something
+  // is still happening.
+  const pctLabel = (pct < 10 && pct > 0) || pct >= 99 ? pct.toFixed(1) : pct.toFixed(0);
   // v4.5 export estimate: bitrate × duration / 8 → MB cap (CRF encodes
   // usually come out smaller; NVENC maxrate caps near this).
   const estMb = settings ? (settings.bitrateMbps * (totalMs / 1000)) / 8 : 0;
