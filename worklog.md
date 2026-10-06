@@ -2940,3 +2940,23 @@ Work Log:
 Stage Summary:
 - Export: no infinite hang existed — the "stuck at 100% video not exported" was the faststart whole-file rewrite + slow audio stages with zero feedback (+ measurement timeouts degrading to slower paths). Now: >1.5GB outputs skip the rewrite entirely, every stage has an honest phase + moving progress, 100% only means done.
 - Kinetic: three real bugs fixed (zero-gap first-pair, entrance/exit crossfire invisibility, accent visibility) — verified end-to-end with real ffmpeg burns and visual inspection.
+
+---
+Task ID: 22 (v1.33.2 release — "latest windows build is not released on github release")
+Agent: main (Z.ai Code)
+Task: User: the latest Windows build is not on GitHub Releases. The v1.33.2 fixes (export stuck-at-100% + kinetic captions) were committed/pushed (f5c08e1) but the release run never happened — build + publish v1.33.2.
+
+Work Log:
+- Confirmed via GitHub API: latest release was v1.33.1; CI run 37386101726 on f5c08e1 (the v1.33.2 commit) is GREEN (Rust engine MSVC + E2E smoke + best-effort installer both success).
+- Housekeeping had wiped the staged engine/ffmpeg/z-ai-sdk + dist + dev server: restored z-ai-web-dev-sdk from the bun global (0.0.18), downloaded CI artifact 11379970590 (rust-engine-win32-x64 from the f5c08e1 run) → staged rust-engine/framefuse-engine.win32-x64.node (11,828,224 B, sha256 367c910d5456f1ab…; SMOKE PASSED + V2 FEATURE TEST PASSED logs verified inside the artifact).
+- fetch-windows-ffmpeg.js: 10-min gyan trickle → re-ran with FFMPEG_DOWNLOAD_TIMEOUT_MS=90000 (the v1.33.1 guard): py7zr rejected gyan's BCJ2, pinned BtbN n7.1 asset 404'd + API 403 rate-limit → the tag-pinned gyan GitHub MIRROR (7.1.1 full_build-shared) staged all 5 DLLs; BtbN master zip staged ffmpeg.exe (161MB) + ffprobe.exe.
+- electron:build chain step-by-step: clean → next build (12s clean) → gpu-worker (357KB) → copy-wasm (self-skip) → vendor bundles (edge-tts 652KB + groq-sdk 85KB) → 16 electron files node --check OK → RUST_ENGINE_SKIP=1.
+- electron-builder first attempt died "wine is required" — housekeeping's node_modules regeneration lost the postinstall patches; re-ran scripts/patch-electron-builder.js (nsis-uninstaller-native + winpackager-rcedit-native) → build passed: rcedit-native FrameFuse.exe 1.33.2.0 + icon, dist/FrameFuse Setup 1.33.2.exe (220,349,064 B) + blockmap + dash-named latest.yml.
+- ASAR AUDIT (agent-ctx/release-1.33.2/verify-asar.js) — ALL PASSED: v1.33.2 export markers in packaged main.js (>1.5GB faststart gate, finalize phase detector, 96.5→99.7 mux remap, duration-scaled loudnorm) + export-graph.js (faststart gate param); kinetic markers in kinetic-ass.js (ENTRANCE/EXIT CROSSFIRE FIX + effExitStartAbs, #FCD34D/#FBBF24 accents, no white/near-white accent left, emphasis dim exemption); node --check clean; engine sha256 EXACT match to the smoke-tested CI binary; packaged ffmpeg.exe 169MB + ffprobe + 5 FFmpeg 7.1 DLLs; version 1.33.2; static export present.
+- scripts/publish-release-1.33.2.js (Task-45 playbook: push-first guard, dupe-aware curl uploads, three-way sha512): RELEASE 404446542 created at 605a6e9, 3 assets uploaded (FrameFuse-Setup-1.33.2.exe / latest.yml / blockmap), sha512 local == latest.yml == re-downloaded VERIFIED (Ybvs9iAGagTq…, 220,349,064 B). RELEASES/LATEST endpoint => v1.33.2.
+- Dev server restarted: HTTP 200, title "FrameFuse v1.33.2 — Windows Desktop Video Studio".
+
+Stage Summary:
+- v1.33.2 IS LIVE: https://github.com/Ziruax/framefuse/releases/tag/v1.33.2 (NSIS installer only, per the standing directive; install-over is fine).
+- The missed step was ONLY the release run — the code fixes were already on main; this session restored the housekeeping-wiped build inputs (engine from the green CI artifact of the exact commit, ffmpeg staging, z-ai-sdk, electron-builder wine patches) and shipped.
+- Standing notes: FFMPEG_DOWNLOAD_TIMEOUT_MS=90000 is now REQUIRED for fetch-windows-ffmpeg on this sandbox (gyan direct trickles; the tag-pinned gyan GitHub mirror is the live DLL source — BtbN "latest" pruned n7.1, its pinned URL 404s and unauthenticated API discovery is 403-rate-limited); re-run scripts/patch-electron-builder.js after any node_modules regeneration before electron-builder; publish template now scripts/publish-release-1.33.2.js.
