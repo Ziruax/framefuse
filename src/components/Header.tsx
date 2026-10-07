@@ -20,11 +20,14 @@ import {
 import type { TimelineMode, ExportProgress, VideoSettings } from "@/lib/merger/types";
 import { fmtBytes } from "@/lib/merger/timeline";
 import { cn } from "@/lib/utils";
+import pkg from "../../package.json";
 
 /** v1.12.1: the renderer's build constant — compared against the REAL exe
  *  version (app.getVersion()) so a stale/hybrid install is impossible to
- *  miss. Keep in sync with package.json on every release. */
-const BUILD_VERSION = "1.33.7";
+ *  miss. v1.33.9: derived from package.json at build time (Next inlines the
+ *  JSON) — the "1.33.7 vs 1.33.8" false-mismatch chip can never happen
+ *  again; the constant and the exe stamp are one source. */
+const BUILD_VERSION = pkg.version as string;
 
 export interface LastExport {
   path: string;
@@ -38,6 +41,9 @@ export interface LastExport {
   gpuFrameRenderMs?: number;
   audioSkipped?: boolean;
   softwareFallback?: boolean;
+  /** v1.33.9: the Rust engine's packet-dedup fast path that ran
+   * ("loop-cycle: …" / "static-tail: …"), when the native engine exported. */
+  rustDedup?: string;
   jsCompositorOverheadMs?: number;
   gpuDecodeWaitMs?: number;
   workerRuntime?: "worker" | "main-thread";
@@ -119,6 +125,11 @@ export interface LastExport {
 interface HeaderProps {
   mode: TimelineMode | null;
   imageCount: number;
+  /** v1.33.9: export eligibility — ANY content (visual clips, music,
+   * voiceovers, SFX). The old imageCount === 0 gate greyed out the Export
+   * button for AUDIO-ONLY projects, which have exported fine since
+   * v1.33.6 — the feature was unreachable from the primary button. */
+  canExport: boolean;
   isExporting: boolean;
   exportProgress: ExportProgress | null;
   lastExport: LastExport | null;
@@ -198,6 +209,7 @@ const PHASE_LABEL: Record<string, string> = {
 export function Header({
   mode,
   imageCount,
+  canExport,
   isExporting,
   exportProgress,
   lastExport,
@@ -777,7 +789,7 @@ export function Header({
       )}
 
       {/* v4.5: live export estimate — what the Export button will produce. */}
-      {!isExporting && imageCount > 0 && totalMs > 0 && settings && (
+      {!isExporting && canExport && totalMs > 0 && settings && (
         <div
           className="hidden shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border px-2.5 py-1 text-[10px] font-medium tabular-nums md:flex"
           style={{
@@ -800,11 +812,11 @@ export function Header({
         <button
           type="button"
           onClick={onExport}
-          disabled={imageCount === 0}
+          disabled={!canExport}
           className={cn(
             "ff-btn-export flex h-10 items-center gap-2 rounded-[10px] px-4 text-[13px] font-semibold transition-all",
             "active:scale-[0.97] active:brightness-90",
-            imageCount === 0 && "cursor-not-allowed opacity-40 grayscale",
+            !canExport && "cursor-not-allowed opacity-40 grayscale",
           )}
           title={
             inElectron

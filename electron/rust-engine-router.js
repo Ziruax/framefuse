@@ -1250,8 +1250,22 @@ async function runRustExport(opts, event, { ffmpegPath, cpuCount, sendCliProgres
       rustAudioMs: res.audioMs,
       totalWallMs: res.durationMs,
       ffmpegFamily: res.ffmpegFamily,
+      // v1.33.9: which packet-dedup fast path ran — the completion report
+      // carries it so a slow export is diagnosable at a glance (dedup
+      // vetoed by captions/ken-burns/overlays = honest per-frame work).
+      rustDedup: res.dedup || undefined,
     };
   } catch (err) {
+    // v1.33.9: a USER CANCEL is not a failure — the old code caught
+    // "cancelled" like any runtime error, returned null, and the
+    // export-native handler fell into the CLI pipeline, silently
+    // RESTARTING the whole encode from scratch (the first Cancel click
+    // just switched the badge to "FFmpeg CLI"). The sentinel re-throws so
+    // the handler aborts the export the user asked to abort.
+    if (err && err.message === "cancelled") {
+      console.log("[RustEngine] export cancelled by user — aborting (NO CLI fallback)");
+      throw err;
+    }
     console.error(
       `[RustEngine] export failed after ${Date.now() - startedAt}ms — falling back to FFmpeg CLI:`,
       (err && err.message) || err,

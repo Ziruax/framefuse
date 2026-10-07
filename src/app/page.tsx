@@ -9,6 +9,7 @@ import {
   type ChangeEvent,
 } from "react";
 import { toast } from "@/lib/toast";
+import pkg from "../../package.json";
 // v1.25: QWERTY (romanized) Hindi/Urdu transliteration — Hinglish → Devanagari,
 // Roman Urdu → Nastaliq — for script writing, captions and TTS input.
 import { transliterate, isLikelyRomanized } from "@/lib/translit";
@@ -194,8 +195,10 @@ const DISCLAIMER_DEFAULT_MS = 2000;
 
 /** v1.14.2: renderer build stamp — the desktop-only landing carries it so a
  * browser visitor sees which build is live (in Electron, Header separately
- * cross-checks it against the exe's app.getVersion()). */
-const BUILD_VERSION = "1.28.0";
+ * cross-checks it against the exe's app.getVersion()). v1.33.9: derived
+ * from package.json — the landing stamp can never drift from the shipped
+ * version again. */
+const BUILD_VERSION = pkg.version as string;
 
 // ---------------------------------------------------------------------------
 // v1.23 FLOW — the left navigation rail. One dock, six phases: the media
@@ -840,12 +843,17 @@ export default function Page() {
   /** v1.29: the furthest end of any NON-loop audio clip (role "voice"
    *  implies non-loop; a legacy music clip with loop turned off also
    *  extends — that's exactly the 1h9m-audio-vs-10s-video complaint).
-   *  Loop/music clips never extend the timeline (music loops to fill). */
+   *  Loop/music clips never extend the timeline (music loops to fill).
+   *  v1.33.9 BUG FIX: the old predicate `c.loop || c.role === "music"`
+   *  skipped music clips EVEN AFTER the user turned looping off — "Stop
+   *  looping" on a music clip silently did nothing to the timeline length
+   *  (contradicting the comment above and the clip's own tooltip). Only an
+   *  ACTUALLY-looping clip is skipped now. */
   const audioExtEndMs = useMemo(
     () =>
       musicClips.reduce(
         (m, c) =>
-          c.loop || c.role === "music"
+          c.loop
             ? m
             : Math.max(
                 m,
@@ -2286,6 +2294,11 @@ export default function Page() {
   const exportRef = useRef<() => void>(() => {});
 
   const handleExport = useCallback(async () => {
+    // v1.33.9: re-entry guard — the Header button hides while exporting, but
+    // the File→Export menu accelerator can still fire and start a SECOND
+    // concurrent export (two save dialogs, abortRef overwritten so Cancel
+    // only kills the newest). One export at a time.
+    if (isExporting) return;
     // v1.33.6 AUDIO-ONLY EXPORT: a timeline with no visual segments but a
     // music/voice-over/SFX track exports fine now (the main process renders
     // the video track as black over the audio's timeline). Only a project
@@ -2456,7 +2469,33 @@ export default function Page() {
         // v1.15: burn-in text removal (default OFF — the main process
         // sanitizes it into a no-op when disabled/empty).
         textRemoval,
-        onProgress: (p) => setExportProgress(p),
+        onProgress: (p) =>
+          setExportProgress((prev) => {
+            // v1.33.9: MERGE instead of replace. The engine emits its ETA
+            // only when the 3-second rate window elapses (~1 in 24 events)
+            // and the CLI path can carry eta:undefined while ramping — the
+            // old whole-object replacement made the ETA chip flip between a
+            // number and "estimating…" every 125 ms (the "eta not getting
+            // an exact number" report). The latch below keeps the LAST good
+            // estimate visible until the backend sends a fresh one.
+            const next = { ...prev, ...p } as typeof prev;
+            const prevEta = prev?.eta;
+            const etaMissing =
+              next.eta == null ||
+              !Number.isFinite(next.eta) ||
+              (next.eta as number) <= 0;
+            if (
+              etaMissing &&
+              prevEta != null &&
+              Number.isFinite(prevEta) &&
+              prevEta > 0 &&
+              prev?.phase === next.phase &&
+              next.phase !== "done"
+            ) {
+              next.eta = prevEta;
+            }
+            return next;
+          }),
         signal: ac.signal,
       });
       setLastExport({
@@ -2475,6 +2514,8 @@ export default function Page() {
         hwRejectReason: res.hwRejectReason,
         audioSkipped: res.audioSkipped,
         softwareFallback: res.softwareFallback,
+        // v1.33.9: the dedup fast-path label (completion report + tooltip).
+        rustDedup: res.rustDedup,
         // v1.1 TURBO telemetry (desktop only — browser exports omit these).
         encoder: res.encoder,
         elapsedSec: res.elapsedSec,
@@ -2538,6 +2579,14 @@ export default function Page() {
         );
       }
       if (res.encoder) turboBits.push(res.encoder);
+      // v1.33.9: the Rust engine's packet-dedup fast path — one line that
+      // answers "was this the fast path?" at a glance (and, when absent
+      // over a looped/static timeline, points at what vetoed it).
+      if (res.rustDedup) {
+        turboBits.push(`dedup ${res.rustDedup}`);
+      } else if (res.mode === "rust-native") {
+        turboBits.push("dedup off — time-varying content (captions/text/ken-burns) over the visuals");
+      }
       // v1.13: the adaptive hardware tier — WHICH engine class ran the
       // encode ("Tier 3 · constrained CPU · ultrafast"). The field report
       // showed users could not tell whether the new engine was active; this
@@ -2690,6 +2739,12 @@ export default function Page() {
     watermarkSettings,
     inElectron,
     disclaimer,
+    // v1.33.9: the two payload fields whose deps were missing — changing
+    // text-removal settings (or the dub duck factor) alone used to export
+    // with the STALE value because the callback identity never changed.
+    textRemoval,
+    dubDuck,
+    isExporting,
   ]);
 
   // Keep exportRef in sync so menu accelerators call the latest version
@@ -2806,6 +2861,13 @@ export default function Page() {
           return { ...prev, aspect: next };
         });
       };
+      // v1.33.9: declared BEFORE finish (and defaulted to a no-op) so the
+      // no-document early-exit path can never hit a TDZ reference — finish
+      // itself now guarantees the probe <video> is released on EVERY exit
+      // path. The old seek-timeout (4 s) and global-timeout (8 s) fallbacks
+      // called finish WITHOUT cleanupEl, leaking one element + blob src per
+      // stalled/undecodable video.
+      let cleanupEl: () => void = () => {};
       const finish = (
         durationMs: number | null,
         dims: { w: number; h: number } | null,
@@ -2827,6 +2889,7 @@ export default function Page() {
         if (thumb) {
           setVideoThumbnails((prev) => ({ ...prev, [id]: thumb }));
         }
+        cleanupEl();
       };
       if (typeof document === "undefined") {
         finish(null, null, null);
@@ -2836,7 +2899,7 @@ export default function Page() {
       v.muted = true;
       v.playsInline = true;
       v.preload = "metadata";
-      const cleanupEl = () => {
+      cleanupEl = () => {
         v.onloadedmetadata = null;
         v.onseeked = null;
         v.onerror = null;
@@ -5243,9 +5306,18 @@ const handleRandomTransitionMix = useCallback(() => {
 
   const saveProject = useCallback(async () => {
     try {
-      if (items.length === 0) {
+      // v1.33.9: audio-only projects (music/voiceover, zero visuals) are
+      // real projects — the guard now checks for ANY content. The old
+      // items.length === 0 gate made an audio-only project impossible to
+      // save even though it exports fine.
+      const hasProjectContent =
+        items.length > 0 ||
+        musicClips.length > 0 ||
+        voiceovers.length > 0 ||
+        sfxItems.length > 0;
+      if (!hasProjectContent) {
         toast.error("Nothing to save yet", {
-          description: "Add images first — the project stores your full storyboard.",
+          description: "Add media or audio first — the project stores your full storyboard.",
         });
         return;
       }
@@ -5301,9 +5373,18 @@ const handleRandomTransitionMix = useCallback(() => {
       return;
     }
     try {
-      if (items.length === 0) {
+      // v1.33.9: audio-only projects (music/voiceover, zero visuals) are
+      // real projects — the guard now checks for ANY content. The old
+      // items.length === 0 gate made an audio-only project impossible to
+      // save even though it exports fine.
+      const hasProjectContent =
+        items.length > 0 ||
+        musicClips.length > 0 ||
+        voiceovers.length > 0 ||
+        sfxItems.length > 0;
+      if (!hasProjectContent) {
         toast.error("Nothing to save yet", {
-          description: "Add images first — the project stores your full storyboard.",
+          description: "Add media or audio first — the project stores your full storyboard.",
         });
         return;
       }
@@ -5904,11 +5985,15 @@ const handleRandomTransitionMix = useCallback(() => {
       ) {
         // v5.4: the SELECTION wins over the playhead clip (editor standard
         // — Del acts on what the user picked); falls back to the active clip.
+        // v1.33.9: the selection path now routes through
+        // removeItemsFromTimeline (the toolbar-trash behavior) — the old
+        // removeItems call PERMANENTLY DELETED the selected media from the
+        // library, silently bypassing the v1.33.6 "keep imported media"
+        // contract every time Delete was pressed with a multi-selection.
         e.preventDefault();
         const sel = selectedIdsRef.current;
         if (sel.length > 0) {
-          removeItems(sel);
-          setSelectedIds([]);
+          removeItemsFromTimeline(sel);
         } else {
           removeActiveRef.current();
         }
@@ -5916,7 +6001,7 @@ const handleRandomTransitionMix = useCallback(() => {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [togglePlay, seek, stepSegment, undo, redo, removeItems, copySelection, pasteClipboard, closeShortcuts, setPreviewRate]);
+  }, [togglePlay, seek, stepSegment, undo, redo, removeItems, removeItemsFromTimeline, copySelection, pasteClipboard, closeShortcuts, setPreviewRate]);
 
   // ---- Cleanup object URLs on unmount -------------------------------------
   // URLs are deliberately kept alive during the whole session so undo can
@@ -6168,6 +6253,14 @@ const handleConvertSubtitlesToNative = useCallback(() => {
       <Header
         mode={timeline.mode}
         imageCount={timeline.segments.length}
+        // v1.33.9: audio-only projects (music/VO/SFX, zero visuals) can
+        // export since v1.33.6 — the button must reflect that.
+        canExport={
+          timeline.segments.length > 0 ||
+          musicClips.length > 0 ||
+          displayVoItems.length > 0 ||
+          sfxItems.length > 0
+        }
         isExporting={isExporting}
         exportProgress={exportProgress}
         lastExport={lastExport}

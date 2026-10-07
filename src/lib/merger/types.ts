@@ -489,6 +489,10 @@ export interface ExportResult {
   framesEncoded?: number;
   audioSkipped?: boolean;
   softwareFallback?: boolean;
+  /** v1.33.9: the Rust engine's packet-dedup fast path that ran
+   * ("loop-cycle: N unique frames cloned across the timeline" /
+   * "static-tail: N live frames…") — set only on rust-native results. */
+  rustDedup?: string;
   gpuFrameRenderMs?: number;
   /** v1.15.2 (worker migration): jsCompositorOverheadMs = mean per-frame
    *  PURE JS compositing cost (paint wall minus decode waits — the number a

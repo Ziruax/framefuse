@@ -81,6 +81,9 @@ pub struct ExportResult {
     pub adapter: Option<String>,
     /// Loaded FFmpeg shared-library family (e.g. "61/61/59/8/5").
     pub ffmpeg_family: String,
+    /// v0.4.1: which packet-dedup fast path ran ("loop-cycle …",
+    /// "static-tail …"), or None when every frame was encoded live.
+    pub dedup: Option<String>,
 }
 
 #[napi]
@@ -198,6 +201,7 @@ pub fn export_video(
                             size_bytes: o.size_bytes as f64,
                             adapter: o.adapter,
                             ffmpeg_family,
+                            dedup: o.dedup,
                         })
                     });
                 }

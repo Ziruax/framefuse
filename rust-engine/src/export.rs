@@ -63,6 +63,11 @@ pub struct ExportOutcome {
     pub audio_ms: i64,
     pub size_bytes: u64,
     pub adapter: Option<String>,
+    /// v0.4.1: which packet-dedup fast path ran ("loop-cycle …" /
+    /// "static-tail …" / "static-image …"), or None when every frame was
+    /// encoded live. Surfaced to the completion report so a slow export is
+    /// diagnosable at a glance (dedup vetoed by captions/ken-burns/etc.).
+    pub dedup: Option<String>,
 }
 
 // ── v0.4 AUDIO MEMORY: the finished mix's backing store ────────────────────
@@ -1298,6 +1303,17 @@ pub fn run_pipeline(
         total_frames,
         texts.is_empty() && prepared_captions.is_none() && prepared_kinetic.is_none() && watermark.is_none(),
     );
+    // v0.4.1: the label rides to the ExportOutcome — the completion report
+    // tells the user WHICH fast path ran (or that none did, and why that is
+    // honest: time-varying content over the loop).
+    let dedup_report: Option<String> = dedup.as_ref().map(|d| match d.kind {
+        DedupKind::LoopCycle => {
+            format!("loop-cycle: {} unique frames cloned across the timeline", d.cycle_frames)
+        }
+        DedupKind::StaticTail => {
+            format!("static-tail: {} live frames, the rest cloned from one packet", d.encode_frames)
+        }
+    });
     if let Some(d) = &dedup {
         match d.kind {
             DedupKind::LoopCycle => {
@@ -1418,6 +1434,13 @@ pub fn run_pipeline(
     // v0.4 honest ETA: sliding rate window (frame mark + time) instead of
     // the whole-run (100-pct)/pct×elapsed extrapolation.
     let mut rate_mark: Option<(u64, Instant)> = None;
+    // v0.4.1: the last computed video-phase ETA, carried forward onto
+    // EVERY progress event. The engine used to emit eta only on the
+    // ~3-second rate-window events (≈1 in 24 events) — the UI's
+    // "estimating…" placeholder dominated and the number flashed for
+    // 125 ms every 3 s, unreadable (the "eta not getting an exact number"
+    // report). A slightly stale estimate beats a hidden one.
+    let mut last_eta_ms: Option<i64> = None;
 
     while let Ok(msg) = rx.recv() {
         match msg {
@@ -1609,6 +1632,9 @@ pub fn run_pipeline(
                             }
                         }
                     }
+                    // v0.4.1: carry the last computed estimate forward
+                    eta_ms = eta_ms.or(last_eta_ms);
+                    last_eta_ms = eta_ms;
                     progress(ProgressEvent {
                         phase: "video".into(),
                         percent: 1.0 + 90.0 * frac,
@@ -1936,6 +1962,7 @@ pub fn run_pipeline(
         audio_ms,
         size_bytes: size,
         adapter,
+        dedup: dedup_report,
     })
 }
 
@@ -2344,12 +2371,74 @@ fn detect_loop_dedup(
     if total_frames < 64 || !quiet_visuals || !overlays.is_empty() {
         return None;
     }
+    // ── mode 0 (v0.4.1): STATIC IMAGE — one composite frame repeated ──
+    // A single image held across the whole timeline (no ken-burns, no
+    // text, no chroma, speed 1) is ONE unique frame: encode frame 0 and
+    // clone its packet for the rest. The "1 image + 69-min voiceover"
+    // case drops from hours of per-frame compositing to one frame +
+    // memcpy clones (the StaticTail machinery already does exactly this).
+    if let Some(plan) = detect_static_image(timeline, base, total_frames) {
+        return Some(plan);
+    }
     // ── mode 1: LOOP-CYCLE (the user's looped-video scenario) ──────────
     if let Some(plan) = detect_loop_cycle(timeline, base, ff, total_frames) {
         return Some(plan);
     }
     // ── mode 2: STATIC-TAIL (audio-extended timelines) ──────────────
     detect_static_tail(timeline, base, total_frames)
+}
+
+/// v0.4.1 STATIC-IMAGE plan: a single base-lane IMAGE spanning the whole
+/// timeline with nothing time-varying over it. Frame 0 is the only unique
+/// composite — encode it, clone its packet for the remaining frames
+/// (the StaticTail clone loop, with encode_frames = 1).
+fn detect_static_image(
+    timeline: &Timeline,
+    base: &[usize],
+    total_frames: u64,
+) -> Option<LoopDedupPlan> {
+    if base.len() != 1 {
+        return None;
+    }
+    let seg = &timeline.segments[base[0]];
+    if seg.media_type != "image" {
+        return None;
+    }
+    // speed ≠ 1 rescales the (static) source each frame — not repeatable
+    if (seg.speed - 1.0).abs() > 1e-6 {
+        return None;
+    }
+    if seg.start_ms > 1.0 {
+        return None;
+    }
+    let seg_end = if seg.end_ms > seg.start_ms { seg.end_ms } else { seg.start_ms + seg.duration_ms };
+    if seg_end + 2.0 < timeline.total_ms {
+        return None; // the image must span the whole timeline
+    }
+    // ken-burns zoom/pan makes every frame unique
+    if let Some(kb) = &seg.ken_burns {
+        if kb.enabled {
+            return None;
+        }
+    }
+    if seg.trans_head_ms > 0.0 || seg.trans_tail_ms > 0.0 {
+        return None;
+    }
+    if seg.bookend_start_ms > 0.0 || seg.bookend_end_ms > 0.0 {
+        return None;
+    }
+    if seg.chroma.is_some() {
+        return None;
+    }
+    if total_frames < 64 {
+        return None;
+    }
+    Some(LoopDedupPlan {
+        kind: DedupKind::StaticTail,
+        cycle_frames: 1,
+        encode_frames: 1,
+        snap_span_sec: None,
+    })
 }
 
 fn detect_loop_cycle(

@@ -896,7 +896,17 @@ export function MediaPanelBase({
       <div className="ff-scroll flex-1 overflow-y-auto">
         {/* v1.3: the empty state follows the ACTIVE TAB — each tab teaches
             its own next action instead of the generic dropzone. */}
-        {segments.length === 0 && mediaTab !== "audio" && mediaTab !== "subs" && (
+        {/* v1.3 MEDIA TABS — library views (All / Videos / Images / Audio /
+          Subs) with live counts. The classic mixed library lives under "All";
+          v1.33.9: the EMPTY state requires the LIBRARY to be empty too —
+          timeline-hidden items ("Not on timeline") still count as media, so
+          removing the last clip no longer swaps the panel to the big
+          "Drop files here" zone (which read as "my imported media is
+          GONE"). */}
+        {segments.length === 0 &&
+          (libraryItems?.length ?? 0) === 0 &&
+          mediaTab !== "audio" &&
+          mediaTab !== "subs" && (
           <div className="p-4">
             <div
               onDragOver={(e) => {
@@ -1065,8 +1075,14 @@ export function MediaPanelBase({
         {/* Segment list — v1.3: the outer block stays mounted whenever any
             media exists; the SEGMENT-specific pieces (dropzone, summaries,
             grid/list) are gated to the media tabs so the Audio / Subs tabs
-            show their own cards without the clip library. */}
-        {segments.length > 0 && (
+            show their own cards without the clip library.
+            v1.33.9 BUG FIX: "any media exists" now includes the LIBRARY —
+            timeline-hidden items kept the media alive but the block's
+            segments.length > 0 gate unmounted the whole stack (including
+            the "Not on timeline" restore section) the moment the last
+            VISIBLE clip was removed. The panel then showed the empty
+            dropzone: imported media LOOKED deleted. */}
+        {(segments.length > 0 || (libraryItems?.length ?? 0) > 0) && (
           <div className="space-y-1.5 p-3">
             {/* Dropzone (compact) when segments exist — media tabs only. */}
             {showMediaList && (
