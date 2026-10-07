@@ -122,8 +122,49 @@ pub fn export_video(
 
     // 0. Parse the timeline BEFORE touching FFmpeg — a malformed payload
     //    must not look like a DLL problem.
-    let timeline: timeline::Timeline = serde_json::from_str(&timeline_json)
-        .map_err(|e| Error::new(napi::Status::InvalidArg, format!("Timeline parse error: {}", e)))?;
+    //    v0.4.2 LENIENT PARSE: `serde_json::from_str` first (exact errors,
+    //    fast path); on failure, repair null/NaN/string-number values on the
+    //    known numeric keys (timeline::coerce_numeric_nulls) and retry. A
+    //    single null f64 (the v1.33.9 "invalid type: null, expected f64 at
+    //    column 1350" report — a NaN that JSON.stringify serialized as null)
+    //    must NEVER route the whole export to the slow CLI fallback; it
+    //    degrades to the field's documented default instead.
+    let timeline: timeline::Timeline = match serde_json::from_str(&timeline_json) {
+        Ok(t) => t,
+        Err(first_err) => {
+            let mut value: serde_json::Value = match serde_json::from_str(&timeline_json) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Err(Error::new(
+                        napi::Status::InvalidArg,
+                        format!("Timeline parse error: {} (json is not valid JSON)", first_err),
+                    ));
+                }
+            };
+            let repaired = timeline::coerce_numeric_nulls(&mut value);
+            match serde_json::from_value(value) {
+                Ok(t) => {
+                    if repaired > 0 {
+                        eprintln!(
+                            "[framefuse-engine] timeline lenient-parse repaired {} numeric field(s) after: {}",
+                            repaired, first_err
+                        );
+                    }
+                    t
+                }
+                Err(second_err) => {
+                    // Include the JSON excerpt at the reported position so the
+                    // offending FIELD is identifiable from the error alone
+                    // (serde reports "line 1 column N" for one-line JSON).
+                    let snippet = error_snippet(&timeline_json, &second_err);
+                    Err(Error::new(
+                        napi::Status::InvalidArg,
+                        format!("Timeline parse error: {}{}", second_err, snippet),
+                    ))?
+                }
+            }
+        }
+    };
     let total_sec = timeline.total_ms / 1000.0;
 
     // 1. Initialize Runtime FFmpeg FFI (DIRECTIVE 3) — synchronous, on the
@@ -227,4 +268,30 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
     } else {
         "unknown panic payload".to_string()
     }
+}
+
+/// v0.4.2: extract "line L column C" from a serde error and return a
+/// ` near: "<excerpt>"` suffix naming the offending field — a bare
+/// "invalid type: null, expected f64 at line 1 column 1350" is a needle in
+/// a 1-2 KB haystack; this makes any future parse failure self-diagnosing
+/// straight from the badge text.
+fn error_snippet(json: &str, err: &serde_json::Error) -> String {
+    let pos = err.line() as usize;
+    let col = err.column() as usize;
+    // serde columns are 1-based char positions on the reported LINE —
+    // one-line timeline JSON: offset = col - 1.
+    let _ = pos;
+    let idx = col.saturating_sub(1).min(json.len());
+    let from = idx.saturating_sub(70);
+    let to = (idx + 40).min(json.len());
+    let excerpt = &json[from..to];
+    let marker_at = idx - from;
+    let mut marked = String::new();
+    for (i, ch) in excerpt.char_indices() {
+        if i == marker_at {
+            marked.push('◀');
+        }
+        marked.push(ch);
+    }
+    format!(" near: \"{}\"", marked.replace('\n', " "))
 }

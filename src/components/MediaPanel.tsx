@@ -125,6 +125,13 @@ interface MediaPanelProps {
   onRemoveMusicClip: (id: string) => void;
   onRemoveSubtitles: () => void;
   onRemove: (id: string) => void;
+  /** v1.33.9: remove a segment from the TIMELINE while KEEPING the media
+   *  in the project library (the "Not on timeline" section) — the row
+   *  trash buttons route here when provided. The old hard `onRemove`
+   *  permanently deleted the imported media (the user's "removing a clip
+   *  deleted my imported file" report — the same fix the keyboard Delete
+   *  got). Falls back to `onRemove` for callers that don't distinguish. */
+  onRemoveFromTimeline?: (id: string) => void;
   onOverride: (id: string, durationMs: number) => void;
   onClearOverride: (id: string) => void;
   onReorder: (id: string, dir: -1 | 1) => void;
@@ -243,6 +250,7 @@ export function MediaPanelBase({
   onRemoveMusicClip,
   onRemoveSubtitles,
   onRemove,
+  onRemoveFromTimeline,
   onOverride,
   onClearOverride,
   onReorder,
@@ -1360,12 +1368,16 @@ export function MediaPanelBase({
                           type="button"
                           onClick={(e) => {
                             e.stopPropagation();
-                            onRemove(seg.id);
+                            // v1.33.9: grid-view trash = timeline removal
+                            // (media kept in the library) — same fix as the
+                            // list view + keyboard Delete.
+                            if (onRemoveFromTimeline) onRemoveFromTimeline(seg.id);
+                            else onRemove(seg.id);
                           }}
                           className="flex items-center justify-center rounded bg-black/70 p-1 backdrop-blur-sm transition-colors hover:bg-rose-500/40"
                           style={{ color: "#d6d3d1" }}
                           aria-label={`Remove segment ${idx + 1}`}
-                          title="Remove"
+                          title="Remove from timeline (media stays in the library)"
                         >
                           <Trash2 className="size-3" />
                         </button>
@@ -1985,11 +1997,19 @@ export function MediaPanelBase({
                     </button>
                     <button
                       type="button"
-                      onClick={() => onRemove(seg.id)}
+                      onClick={() =>
+                        // v1.33.9: the LIST-view row trash removes from the
+                        // TIMELINE and keeps the media (library "Not on
+                        // timeline" section) — `onRemove` permanently
+                        // deleted the imported file.
+                        onRemoveFromTimeline
+                          ? onRemoveFromTimeline(seg.id)
+                          : onRemove(seg.id)
+                      }
                       className="rounded-md p-1.5 opacity-40 transition-all hover:bg-rose-500/15 hover:text-rose-400 group-hover:opacity-100"
                       style={{ color: "#8f887f" }}
                       aria-label={`Remove segment ${idx + 1}`}
-                      title="Remove"
+                      title="Remove from timeline (media stays in the library)"
                     >
                       <Trash2 className="size-3.5" />
                     </button>

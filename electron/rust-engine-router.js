@@ -537,7 +537,12 @@ function buildRustCaptions(opts, width, height) {
   // it made Number(undefined) → NaN → JSON "null" → a Rust timeline PARSE
   // ERROR and a silent CLI fallback (the safe-mode contract forbids that:
   // an omitted caption size must degrade to a sane default, not NaN).
-  const rawFontPx = Number(cs.fontSize) * h * (Number(cs.fontSizeScale) || 1);
+  // v1.33.9: the SAME guard now covers EVERY numeric leaf here — the old
+  // `x != null ? x : d` pattern let a NaN (null ≠ null, NaN ≠ null) flow
+  // into Math.max/Math.round → NaN → JSON null (the engine's lenient
+  // parse now repairs it, but the payload should never carry it).
+  const numOr = (v, d) => (typeof v === "number" && Number.isFinite(v) ? v : d);
+  const rawFontPx = numOr(cs.fontSize, 0.05) * h * (numOr(cs.fontSizeScale, 1) || 1);
   const fontPx = Math.max(
     8,
     Math.round(Number.isFinite(rawFontPx) && rawFontPx > 0 ? rawFontPx : 0.05 * h),
@@ -551,17 +556,17 @@ function buildRustCaptions(opts, width, height) {
     borderColor: String(cs.borderColor || "#000000"),
     borderWidthPx: Math.max(0, Math.round(Number(cs.borderWidth) || 0) * hScale),
     bgColor: cs.bgColor ? String(cs.bgColor) : null,
-    bgAlpha: Math.max(0, Math.min(1, Number(cs.bgAlpha != null ? cs.bgAlpha : 1))),
-    bgPaddingPx: Math.max(0, Math.round(Number(cs.bgPadding != null ? cs.bgPadding : 12) * hScale)),
+    bgAlpha: Math.max(0, Math.min(1, numOr(cs.bgAlpha, 1))),
+    bgPaddingPx: Math.max(0, Math.round(numOr(cs.bgPadding, 12) * hScale)),
     shadow: !!(cs.shadow),
     shadowColor: String(cs.shadowColor || "#000000"),
-    shadowPx: Math.max(1, Math.round((Number(cs.shadowBlur != null ? cs.shadowBlur : 3) || 3) * hScale)),
+    shadowPx: Math.max(1, Math.round((numOr(cs.shadowBlur, 3) || 3) * hScale)),
     textTransform: String(cs.textTransform || "none"),
     letterSpacingPx: Math.max(0, Math.round(Number(cs.letterSpacing) || 0) * hScale),
     alignment: String(cs.alignment || "center"),
     position: String(cs.customPosition || cs.position || "bottom"),
-    positionY: Math.max(0, Math.round((cs.positionY != null ? Number(cs.positionY) : 50) * hScale)),
-    maxWidthFrac: Math.max(0.1, Math.min(1, Number(cs.maxWidth) || 0.84)),
+    positionY: Math.max(0, Math.round(numOr(cs.positionY, 50) * hScale)),
+    maxWidthFrac: Math.max(0.1, Math.min(1, numOr(cs.maxWidth, 0.84))),
     wordMode: String(cs.wordMode || "off"),
     animation: String(cs.animation || "none"),
     cues: cues
@@ -917,8 +922,12 @@ function buildRustTimeline(opts) {
       chroma: o.chroma
         ? {
             color: String(o.chroma.color || "#00b140"),
-            similarity: Math.max(0, Math.min(1, Number(o.chroma.similarity) ?? 0.31)),
-            smoothness: Math.max(0, Math.min(1, Number(o.chroma.smoothness) ?? 0.08)),
+            // v1.33.9: `Number(x) ?? d` let a NaN through (?? catches only
+            // null/undefined, NOT NaN) → Math.min(1, NaN) = NaN → JSON
+            // null. Finite-or-default semantics match the Rust
+            // lenient-parse table.
+            similarity: Math.max(0, Math.min(1, (typeof o.chroma.similarity === "number" && Number.isFinite(o.chroma.similarity) ? o.chroma.similarity : 0.31))),
+            smoothness: Math.max(0, Math.min(1, (typeof o.chroma.smoothness === "number" && Number.isFinite(o.chroma.smoothness) ? o.chroma.smoothness : 0.08))),
           }
         : null,
       opacity: 1,
@@ -1102,7 +1111,54 @@ function buildRustTimeline(opts) {
     captions: kinetic ? null : captions,
     kinetic,
   };
+  // v1.33.9 NaN SWEEP (the "Timeline parse error: invalid type: null,
+  // expected f64" root-cause belt-and-braces): `JSON.stringify` silently
+  // serializes NaN/Infinity as null, and the Rust schema's numeric fields
+  // are non-Option — ONE leaked NaN anywhere (a renderer bug, a restored
+  // project, a hand-crafted payload) used to fail the whole engine parse
+  // and route the export to the SLOW CLI fallback. The engine 0.4.2
+  // lenient-parse now repairs these too, but the payload must never carry
+  // them in the first place. Same key/default table as
+  // rust-engine/src/timeline.rs NUMERIC_DEFAULTS.
+  sanitizeTimelineNumbers(timeline);
   return { timeline, slideshowFpsApplied, fps };
+}
+
+// The numeric-leaf defaults (camelCase JSON names — mirrors Rust
+// timeline.rs NUMERIC_DEFAULTS). Applied ONLY to existing keys whose value
+// is not a finite number; never invents fields.
+const TIMELINE_NUMERIC_DEFAULTS = {
+  fps: 30, bitrateMbps: 0, totalMs: 0, fadeInMs: 0, fadeOutMs: 0,
+  startMs: 0, endMs: 0, durationMs: 0, trimInMs: 0, speed: 1, volume: 1,
+  opacity: 1, transHeadMs: 0, transTailMs: 0, bookendStartMs: 0, bookendEndMs: 0,
+  zoomMax: 1.06, x: 0.5, y: 0.5, w: 0.3, h: 0, similarity: 0.31, smoothness: 0.08,
+  size: 72, fadeMs: 250, fontSizePx: 48, borderWidthPx: 0, bgAlpha: 1,
+  bgPaddingPx: 12, shadowPx: 3, letterSpacingPx: 0, positionY: 50, maxWidthFrac: 0.84,
+  entranceMs: 300, staggerMs: 110, overshoot: 0, exitMs: 300, supportAlpha: 0.78,
+  fontPx: 40, tMs: 0,
+};
+
+/** Replace non-finite numbers on the known numeric keys with their defaults
+ *  (in place). Never throws; strings/bools on those keys pass through (the
+ *  engine's lenient parse coerces numeric strings; wrong-typed payloads are
+ *  a different failure class surfaced by serde). */
+function sanitizeTimelineNumbers(node) {
+  if (Array.isArray(node)) {
+    for (const item of node) sanitizeTimelineNumbers(item);
+    return;
+  }
+  if (node && typeof node === "object") {
+    for (const key of Object.keys(node)) {
+      const v = node[key];
+      if (key in TIMELINE_NUMERIC_DEFAULTS) {
+        if (typeof v === "number" && !Number.isFinite(v)) {
+          node[key] = TIMELINE_NUMERIC_DEFAULTS[key];
+          continue;
+        }
+      }
+      if (v && typeof v === "object") sanitizeTimelineNumbers(v);
+    }
+  }
 }
 
 // ── the runner (DIRECTIVE 5) ───────────────────────────────────────────────

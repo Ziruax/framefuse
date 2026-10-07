@@ -6427,6 +6427,12 @@ const handleConvertSubtitlesToNative = useCallback(() => {
                   onRemoveMusicClip={removeMusicClip}
                   onRemoveSubtitles={removeSubtitles}
                   onRemove={removeItem}
+                  // v1.33.9: the media-panel row/grid trash removes from the
+                  // TIMELINE and keeps the media in the library — `onRemove`
+                  // alone permanently deleted the imported file (the keyboard
+                  // Delete got this fix first; the visible trash buttons are
+                  // the same action and must agree).
+                  onRemoveFromTimeline={(id) => removeItemsFromTimeline([id])}
                   onOverride={overrideDuration}
                   onClearOverride={clearOverride}
                   onReorder={reorderItem}

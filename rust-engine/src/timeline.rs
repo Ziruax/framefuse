@@ -7,6 +7,121 @@
 //! error.
 
 use serde::Deserialize;
+use serde_json::Value;
+
+/// v0.4.2 LENIENT PARSE TABLE (the v1.33.9 "Timeline parse error: invalid
+/// type: null, expected f64" fix). The JSON contract's numeric fields are
+/// non-Option f64 on the Rust side, but the Electron router (or a
+/// hand-crafted/legacy payload, or a NaN that `JSON.stringify` silently
+/// serializes as `null`) can hand us a null. One null used to fail the WHOLE
+/// `serde_json::from_str` — the export then fell into the slow FFmpeg-CLI
+/// fallback with only a badge hint (the user's "image loop + 10-min audio"
+/// report: parse error at column 1350 AND a hours-long CLI export). The
+/// contract's own docs say "a malformed timeline must never panic, only
+/// error" — this table makes the common corruption (null/NaN/string-number
+/// on a numeric key) REPAIR itself into the documented default instead.
+///
+/// Keyed by the camelCase JSON name (context-agnostic: `startMs` means 0 in
+/// every struct that carries it; `sanitized()` re-clamps everything after).
+const NUMERIC_DEFAULTS: &[(&str, f64)] = &[
+    // Timeline
+    ("fps", 30.0),
+    ("bitrateMbps", 0.0),
+    ("totalMs", 0.0),
+    ("fadeInMs", 0.0),
+    ("fadeOutMs", 0.0),
+    // Segment (+ cues/words/kinetic share startMs/endMs)
+    ("startMs", 0.0),
+    ("endMs", 0.0),
+    ("durationMs", 0.0),
+    ("trimInMs", 0.0),
+    ("speed", 1.0),
+    ("volume", 1.0),
+    ("opacity", 1.0),
+    ("transHeadMs", 0.0),
+    ("transTailMs", 0.0),
+    ("bookendStartMs", 0.0),
+    ("bookendEndMs", 0.0),
+    // KenBurns
+    ("zoomMax", 1.06),
+    // OverlayGeometry / TextOverlay / Watermark / kinetic words / motion
+    ("x", 0.5),
+    ("y", 0.5),
+    ("w", 0.3),
+    ("h", 0.0),
+    // ChromaKey
+    ("similarity", 0.31),
+    ("smoothness", 0.08),
+    // TextOverlay
+    ("size", 72.0),
+    ("fadeMs", 250.0),
+    // CaptionsTimeline
+    ("fontSizePx", 48.0),
+    ("borderWidthPx", 0.0),
+    ("bgAlpha", 1.0),
+    ("bgPaddingPx", 12.0),
+    ("shadowPx", 3.0),
+    ("letterSpacingPx", 0.0),
+    ("positionY", 50.0),
+    ("maxWidthFrac", 0.84),
+    // Kinetic spec / words
+    ("entranceMs", 300.0),
+    ("staggerMs", 110.0),
+    ("overshoot", 0.0),
+    ("exitMs", 300.0),
+    ("supportAlpha", 0.78),
+    ("fontPx", 40.0),
+    // MotionKey
+    ("tMs", 0.0),
+];
+
+/// Repair pass: walk a parsed timeline `Value`, replacing null / non-finite
+/// / numeric-STRING values on the known numeric keys with their defaults.
+/// Returns how many fields were repaired (diagnostics; 0 = clean input).
+pub fn coerce_numeric_nulls(v: &mut Value) -> usize {
+    let mut repaired = 0usize;
+    coerce_walk(v, &mut repaired);
+    repaired
+}
+
+fn coerce_walk(v: &mut Value, repaired: &mut usize) {
+    match v {
+        Value::Object(map) => {
+            for (key, val) in map.iter_mut() {
+                let needs_fix = val.is_null()
+                    || match val.as_f64() {
+                        Some(f) => !f.is_finite(),
+                        None => false,
+                    };
+                if needs_fix {
+                    if let Some((_, default)) = NUMERIC_DEFAULTS.iter().find(|(k, _)| k == key) {
+                        *val = Value::from(*default);
+                        *repaired += 1;
+                        continue;
+                    }
+                }
+                // numeric strings on numeric keys ("16" where f64 expected)
+                if let Value::String(s) = &val {
+                    let trimmed = s.trim();
+                    if let Ok(num) = trimmed.parse::<f64>() {
+                        if num.is_finite() && NUMERIC_DEFAULTS.iter().any(|(k, _)| k == key) {
+                            *val = Value::from(num);
+                            *repaired += 1;
+                            continue;
+                        }
+                    }
+                }
+                coerce_walk(val, repaired);
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                coerce_walk(item, repaired);
+            }
+        }
+        _ => {}
+    }
+}
 
 #[derive(Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase", default)]
