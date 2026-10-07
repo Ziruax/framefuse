@@ -2516,6 +2516,9 @@ export default function Page() {
         softwareFallback: res.softwareFallback,
         // v1.33.9: the dedup fast-path label (completion report + tooltip).
         rustDedup: res.rustDedup,
+        // v1.34.0: the compositor benchmark verdict (GPU vs CPU raster — the
+        // engine health answer to "why did/Didn't the GPU compositor run").
+        rustCompositorNote: res.rustCompositorNote,
         // v1.1 TURBO telemetry (desktop only — browser exports omit these).
         encoder: res.encoder,
         elapsedSec: res.elapsedSec,
@@ -2585,7 +2588,16 @@ export default function Page() {
       if (res.rustDedup) {
         turboBits.push(`dedup ${res.rustDedup}`);
       } else if (res.mode === "rust-native") {
-        turboBits.push("dedup off — time-varying content (captions/text/ken-burns) over the visuals");
+        // v1.34.0: captions NO LONGER veto the fast path (engine 0.5.1's
+        // caption-runs) — the honest remaining vetoes are the truly
+        // time-varying layers.
+        turboBits.push("dedup off — animated captions, ken-burns, text or overlays over the visuals");
+      }
+      // v1.34.0: the compositor benchmark verdict — one line that answers
+      // "is the GPU compositor helping THIS machine?" (engine 0.5.1 picks
+      // the faster path before the encode loop and reports why).
+      if (res.rustCompositorNote) {
+        turboBits.push(res.rustCompositorNote);
       }
       // v1.13: the adaptive hardware tier — WHICH engine class ran the
       // encode ("Tier 3 · constrained CPU · ultrafast"). The field report

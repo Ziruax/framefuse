@@ -1310,6 +1310,10 @@ async function runRustExport(opts, event, { ffmpegPath, cpuCount, sendCliProgres
       // carries it so a slow export is diagnosable at a glance (dedup
       // vetoed by captions/ken-burns/overlays = honest per-frame work).
       rustDedup: res.dedup || undefined,
+      // v1.34.0: WHY the compositor is GPU or CPU — engine 0.5.1's benchmark
+      // verdict ("gpu composite 7.9 fps < cpu raster 61 fps → cpu
+      // rasterizer"), the answer to "why is my GPU compositor slow".
+      rustCompositorNote: res.compositorNote || undefined,
     };
   } catch (err) {
     // v1.33.9: a USER CANCEL is not a failure — the old code caught

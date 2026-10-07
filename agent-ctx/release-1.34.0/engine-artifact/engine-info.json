@@ -1,0 +1,50 @@
+{
+  "engineVersion": "0.5.1",
+  "binary": "framefuse-engine.win32-x64.node",
+  "loadedFrom": "D:\\a\\framefuse\\framefuse\\rust-engine\\framefuse-engine.win32-x64.node",
+  "platform": {
+    "os": "win32",
+    "arch": "x64",
+    "node": "20.20.2"
+  },
+  "ffmpegDir": "resources/ffmpeg/win/dll",
+  "probeFfmpegFamily": "61/61/59/8/5",
+  "result": {
+    "success": true,
+    "engineUsed": "rust-cpu",
+    "encoderName": "libx264",
+    "durationMs": 1316,
+    "frames": 150,
+    "compositorMs": 604,
+    "encodeMs": 134,
+    "decodeMs": 36,
+    "audioMs": 115,
+    "sizeBytes": 306649,
+    "adapter": "Microsoft Basic Render Driver",
+    "ffmpegFamily": "61/61/59/8/5",
+    "compositorNote": "gpu composite 185.0 fps < cpu raster 222.4 fps → cpu rasterizer"
+  },
+  "ffprobe": {
+    "video": {
+      "codec_name": "h264",
+      "width": 640,
+      "height": 360,
+      "r_frame_rate": "30/1",
+      "nb_read_frames": "150"
+    },
+    "audio": {
+      "codec_name": "aac",
+      "sample_rate": "48000",
+      "channels": 2
+    },
+    "format": {
+      "duration": "5.013000",
+      "size": "306649"
+    },
+    "outputBytes": 306649
+  },
+  "assertionsPassed": true,
+  "assertionFailures": [],
+  "wallMs": 1640,
+  "generatedAt": "2026-10-07T22:08:59.291Z"
+}
