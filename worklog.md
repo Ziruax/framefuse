@@ -3145,3 +3145,24 @@ Stage Summary:
 - One unified pipeline stays: the Rust native engine (the libav* blueprint) is THE export path; FFmpeg-CLI remains only the Safe-Mode fallback.
 - Artifacts: agent-ctx/export-repro-v04/ (v04-matrix.js, v04-compact.js, mem-diag2.js, repro logs).
 - Next: commit, push → CI (build-windows.yml rebuilds the engine + runs the full test suite), then publish v1.33.8 (publisher scripts/publish-release-1.33.8.js, three-way sha512).
+
+---
+Task ID: 1 (continuation — CI + release)
+Agent: main (Z.ai Code)
+Task: ship v1.33.8 (engine v0.4.0) — CI bisect, the critical FFI offset fix, and the release.
+
+Work Log:
+- CI run 75 (v0.4.0) SEGFAULTED in the v3 feature test on Windows (exit 139); run 76 (with FF_TRACE instrumentation) passed the dedup scenarios but failed loudnorm (Δ=0.0dB). Bisect traces: garbage `dur_probe` values (e.g. 9.09e12 s) from audio_duration_sec.
+- ROOT CAUSE (the deepest of this release): FFmpeg 7.0 REMOVED the deprecated `char filename[1024]` from AVFormatContext — every field after `streams` shifted down 1032 bytes. AVFMTCTX_DURATION was 1096 (generated from pre-7.0 headers) — it read HEAP GARBAGE. Pre-v0.4 that read was only a harmless "hint" (EOF pinning + payload sourceDurationMs always overrode it); v0.4's decoded-size audio gate made it behavior-driving: garbage durations sent every source down the streaming path with absurd seek targets → the Windows SEGFAULT (demuxer seek) and the loudnorm measurement miss (Δ=0). Empirically pinned via ctypes + 7z-extracted probe: duration @ 104, bit_rate @ 112 (header field order). Fixed ffi_offsets.rs (104) — the run-75 crash AND the loudnorm failure both disappear.
+- FF_TRACE stage traces + audio-path diagnostics added to export.rs (env-gated, default off).
+- Local re-verification after the offset fix: v3 20/20 (loudnorm +30.9dB), v2 PASS, smoke PASS, compact matrix ALL PASS.
+- CI run (8dda8bf) GREEN on Windows: v3 20/20 with loudnorm Δ=30.9dB.
+- The local electron:build OOMs on this 4GB sandbox (Next 16 build worker, 3.3GB anon — even with resources/ parked per the v1.28 note), so the release ships the CI-BUILT installer: workflow upload glob extended to carry latest.yml + blockmap (ab93a0e) → CI run 37604569762 GREEN.
+- ASAR AUDIT on the final installer (7z-extracted NSIS → app.asar): 21/21 — v1.33.8 markers (visualTotalSec honesty, etaMs NUMBER passthrough), retained v1.33.4-7 regression markers, FFmpeg 7.1 DLLs, static export, engine sha256 21307353… EXACTLY the CI smoke-tested binary (engine-info engineVersion 0.4.0).
+- PUBLISHED: release 405647587 tag v1.33.8 (commit ab93a0e), 3 assets (FrameFuse-Setup-1.33.8.exe 244,035,423 B / latest.yml / blockmap), three-way sha512 VERIFIED (9oH1YyixZiR7…). LIVE: https://github.com/Ziruax/framefuse/releases/tag/v1.33.8
+
+Stage Summary:
+- v1.33.8 SHIPPED: the app-close OOM crash (file-backed mix + decoded-size streaming gate), the 60-80-min looped export (static-loop + static-tail packet dedup), honest phase-local ETA, and the audio-extended false disk-full error.
+- CRITICAL latent FFI bug found + fixed: AVFMTCTX_DURATION was reading heap garbage since the FFmpeg 7.x struct shift (filename[1024] removal) — harmless until v0.4 made it behavior-driving; this also explains both Windows CI failures.
+- Engine binaries are per-run (non-reproducible): each release ships ITS CI run's smoke-tested binary; verify per-release (engine.sha in agent-ctx/release-1.33.8/).
+- Playbook note: on the 4GB sandbox, ship the CI-built installer (workflow carries exe+yml+blockmap) instead of the local electron:build (OOMs).
