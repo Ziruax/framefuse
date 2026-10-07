@@ -1,8 +1,0 @@
-{
-  "name": "framefuse-engine",
-  "version": "0.1.0",
-  "description": "FrameFuse native Rust export engine (napi-rs). Loads framefuse-engine.<platform>-<arch>.node",
-  "main": "index.js",
-  "private": true,
-  "license": "MIT"
-}
