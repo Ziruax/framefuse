@@ -1,0 +1,47 @@
+[package]
+name = "framefuse-engine"
+version = "0.4.2"
+edition = "2021"
+description = "FrameFuse native export engine: wgpu compositor + runtime-FFI FFmpeg encode, loaded by Electron via N-API"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+# ── DIRECTIVE 1: The "No-Link" Rule ─────────────────────────────────────────
+# NO ffmpeg-next, NO ffmpeg-sys, NO bindgen at build time. FFmpeg shared
+# libraries (avcodec/avformat/avutil/swscale/swresample) are dlopen'ed at
+# RUNTIME via libloading from the app's bundled ffmpeg dir — this keeps the
+# cargo build pure-Rust (works with cargo-xwin cross-compilation and native
+# MSVC alike) and guarantees the SAME encoder set the CLI uses (h264_nvenc /
+# h264_qsv / h264_amf travel inside those DLLs).
+
+[features]
+default = ["gpu"]
+# wgpu hardware compositor; disable with --no-default-features for a pure-CPU
+# build (cross-compile smoke tests, CI fallback matrix).
+gpu = ["dep:wgpu"]
+
+[dependencies]
+napi = { version = "2", features = ["async", "tokio_rt", "error_anyhow"] }
+napi-derive = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libloading = "0.8"
+wgpu = { version = "0.19", optional = true }
+image = "0.25"
+fast_image_resize = "3"
+fontdue = "0.8"
+rayon = "1.8"
+log = "0.4"
+env_logger = "0.11"
+memmap2 = "0.9.11"
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

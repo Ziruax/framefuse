@@ -1,0 +1,7760 @@
+// electron/main.js — FrameFuse v4.1 main process
+// Two-step export: Step 1 encodes each segment (with captions), Step 2 concats (-c copy)
+// This avoids CLI length limits (each ffmpeg call has a short filter string)
+//
+// v4.1 highlights:
+//   - GPU encoding (NVENC/QSV/AMF) with runtime probe + CPU fallback — 3-10× faster
+//   - Zoompan geometry EXACTLY matches the canvas preview (centered pan starts,
+//     1.1× supersample baseline, easeInOutSine)
+//   - Real-time export progress parsed from ffmpeg "time=" stderr + ETA
+//   - Audio post-processing: loudnorm normalize, fade in/out, apad (audio no
+//     longer truncates the video when shorter)
+//   - ASS export parity for all 21 kinetic animations incl. karaoke-safe tags
+//     + word "stack" mode + new viral pack (slam, glitch, spin, flip, elastic,
+//     color-cycle, spotlight, swing, squash, zoom-words)
+//   - .ass sidecar export IPC
+const {
+  app, BrowserWindow, ipcMain, dialog, Menu, shell,
+} = require("electron");
+const path = require("path");
+const fs = require("fs");
+const os = require("os");
+const { spawn, execFile } = require("child_process");
+
+// v5.0: pure FFmpeg graph/arg builders (CommonJS, zero requires — also
+// imported directly by /home/z/harness/export-graph-harness.js). Holds the
+// transition tables + the v4.9 clip-argv builders (verbatim, moved here)
+// plus the new video / overlay / chroma / SFX / parallel-pool graph math.
+const G = require("./export-graph");
+// v6: the SINGLE-PASS whole-timeline graph builder (pure — shared with the
+// bun verification harness exactly like export-graph).
+const SP = require("./export-singlepass");
+// v1.15/v1.20: Groq Whisper API — the ONLY transcription engine (cloud STT,
+// user's own key stored on-device in userData/groq.json — never in project
+// files).
+const GQ = require("./groq-whisper");
+// v1.16 RUST NATIVE ENGINE (runtime-FFI): wgpu compositor + dlopen'ed FFmpeg
+// encode, replacing the CLI IPC hop. The router module owns eligibility,
+// timeline adaptation and the CLI Safe-Mode fallback; a failed load is NOT
+// an error — exports silently ride the FFmpeg-CLI pipeline (DIRECTIVE 5).
+const RUST = require("./rust-engine-router");
+console.log("[RustEngine]", JSON.stringify(RUST.rustEngineStatus()));
+
+// v1.21 BUNDLED FONTS: the caption/kinetic web families ship as static TTFs
+// (public/fonts → extraResources "fonts" in the packaged app). libass gets
+// them via the subtitles filter's fontsdir option; the Rust engine resolves
+// the same files by path (rust-engine-router BUNDLED_FONT_FAMILIES).
+let _bundledFontsDirCache;
+function bundledFontsDirForAss() {
+  if (_bundledFontsDirCache !== undefined) return _bundledFontsDirCache;
+  let dir = null;
+  const candidates = [];
+  try {
+    candidates.push(path.join(process.resourcesPath || "", "fonts"));
+  } catch {}
+  try {
+    candidates.push(path.join(app.getAppPath(), "public", "fonts"));
+  } catch {}
+  candidates.push(path.join(__dirname, "..", "public", "fonts"));
+  for (const c of candidates) {
+    try {
+      if (c && fs.existsSync(c)) {
+        dir = c;
+        break;
+      }
+    } catch {}
+  }
+  _bundledFontsDirCache = dir;
+  return dir;
+}
+
+// v1.18 ICON FIX (taskbar): Windows groups + icons the RUNNING app by its
+// AppUserModelID. Without this call Electron windows fall back to a
+// process-derived AUMID, and Windows 10/11 then renders a BLANK/WHITE
+// taskbar icon for the live window even when the exe + shortcut icons are
+// perfect. Must match electron-builder's appId (it writes the same AUMID
+// into the shortcuts during install).
+app.setAppUserModelId("com.framefuse.app");
+// v1.17 STACK TEXT (kinetic headline typography): the plain-JS mirror of
+// src/lib/merger/stackTextPresets.ts + the kinetic ASS emitter (recipes from
+// STACK_STYLE_ASS_DOC / STACK_LAYOUT_ASS_DOC). Consumed by
+// buildHeadlineEvents() for items with a kinetic stackStyle AND renderer-
+// measured geometry; everything else keeps the legacy v4.2 emitter.
+const StackText = require("./stack-text-ass");
+// v1.18 KINETIC CAPTIONS (kinetic typography): the plain-JS ASS mirror of
+// src/lib/merger/kinetic/{presets,motion}.ts (emission-relevant subset) +
+// the per-word override-tag emitter. Consumed by buildAssDocument() when
+// cs.kinetic.enabled AND the renderer's compositions + measured geometry
+// are present; kinetic replaces the legacy caption path for covered cues.
+const KineticASS = require("./kinetic-ass");
+// v1.17 VOICEOVER + DUB: the Edge TTS engine (task 57-b, live-verified) and
+// the Groq transcribe→translate→synthesize orchestrator (task 57-c). Both
+// are plain Node modules with zero Electron imports; this file owns the IPC
+// surface, temp-file lifetimes and the Groq-key reuse (same userData/groq.json
+// as whisper — there is no second key UI).
+const TTS = require("./edge-tts");
+const DUB = require("./dub-workflow");
+// v1.20 SCRIPT WRITING: the Google Gemini generateContent client (userData/
+// gemini.json key storage — the same 0600 on-device discipline as groq.json)
+// + direct access to the Groq chat client: script:generate routes to either
+// provider, script:models serves both catalogs.
+const GM = require("./gemini-chat");
+const GC = require("./groq-chat");
+
+// Resolve the FFmpeg binary path. v1.5: a FULL bundled build (staged by
+// scripts/fetch-windows-ffmpeg.js into resources/ffmpeg/<plat>/) is PREFERRED
+// over ffmpeg-static — it carries ffprobe.exe (fastProbe) plus the hardware
+// encoders (h264_nvenc/h264_qsv/h264_amf) and libass that the minimal
+// ffmpeg-static builds lack. ffmpeg-static remains the packaged fallback;
+// the system PATH is the last resort.
+const FFMPEG_PLAT_DIR =
+  process.platform === "win32" ? "win" : process.platform === "darwin" ? "mac" : "linux";
+let ffmpegPath;
+if (app.isPackaged) {
+  const exeName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
+  const altName = process.platform === "win32" ? "ffmpeg" : "ffmpeg.exe";
+  const candidates = [
+    // v1.5 full build via electron-builder extraResources (resources/ffmpeg)
+    path.join(process.resourcesPath, "ffmpeg", FFMPEG_PLAT_DIR, exeName),
+    path.join(process.resourcesPath, "ffmpeg", FFMPEG_PLAT_DIR, altName),
+    path.join(process.resourcesPath, "ffmpeg", exeName),
+    path.join(process.resourcesPath, "ffmpeg-static", exeName),
+    path.join(process.resourcesPath, "ffmpeg-static", altName),
+    path.join(process.resourcesPath, "app.asar.unpacked", "node_modules", "ffmpeg-static", exeName),
+    path.join(process.resourcesPath, "app.asar.unpacked", "node_modules", "ffmpeg-static", altName),
+    path.join(process.resourcesPath, "app", "node_modules", "ffmpeg-static", exeName),
+  ];
+  ffmpegPath = candidates.find((p) => {
+    try { return fs.existsSync(p); } catch { return false; }
+  });
+  if (!ffmpegPath) {
+    console.error("FFmpeg not found at any candidate path:", candidates);
+    ffmpegPath = candidates[0];
+  }
+} else {
+  const exeName = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
+  const devCandidates = [
+    // v1.5 dev: the staged full build next to the repo (fetch-windows-ffmpeg)
+    path.join(__dirname, "..", "resources", "ffmpeg", FFMPEG_PLAT_DIR, exeName),
+    path.join(process.cwd(), "resources", "ffmpeg", FFMPEG_PLAT_DIR, exeName),
+  ];
+  ffmpegPath = devCandidates.find((p) => {
+    try { return fs.existsSync(p); } catch { return false; }
+  });
+  if (!ffmpegPath) {
+    try {
+      ffmpegPath = require("ffmpeg-static");
+    } catch (e) {
+      ffmpegPath = "ffmpeg";
+    }
+    if (process.platform === "win32" && ffmpegPath && !ffmpegPath.endsWith(".exe")) {
+      try { if (fs.existsSync(ffmpegPath + ".exe")) ffmpegPath += ".exe"; } catch (_) {}
+    }
+  }
+}
+const ffmpegBuildKind = /resources[\\/]ffmpeg([\\/]|$)/.test(String(ffmpegPath))
+  ? "bundled-full"
+  : /ffmpeg-static/.test(String(ffmpegPath)) ? "ffmpeg-static" : "system-path";
+console.log(`[FFMPEG] Using: ${ffmpegPath} (${ffmpegBuildKind}) exists:`, (() => { try { return fs.existsSync(ffmpegPath); } catch { return false; } })());
+
+// v1.15.2 (A/B bench): FRAMEFUSE_LOAD_STATIC forces the packaged-style
+// out/index.html load even when running unpacked (npx electron .) — the
+// bench driver uses it so the worker bundle + static assets load exactly
+// as they do from the installer.
+const isDev = !app.isPackaged && process.env.FRAMEFUSE_LOAD_STATIC !== "1";
+let mainWindow = null;
+// v5.0: ALL live ffmpeg children (step-1 runs a parallel pool now). Cancel
+// kills everything in the set; a leak guard at export end verifies the set
+// is empty so no zombie encoders survive a failed/cancelled export.
+const activeProcs = new Set();
+const tempDir = path.join(os.tmpdir(), "framefuse-tmp");
+
+function ensureTempDir() {
+  if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
+  return tempDir;
+}
+
+function createWindow() {
+  // v7 FIX B: window icon resolution — dev uses build/icon.ico; packaged
+  // prefers <resources>/icon.ico (extraResources, a REAL file) and falls
+  // back to the asar copy (Electron reads asar paths transparently).
+  const iconCandidates = app.isPackaged
+    ? [
+        path.join(process.resourcesPath, "icon.ico"),
+        path.join(__dirname, "..", "build", "icon.ico"),
+      ]
+    : [path.join(__dirname, "..", "build", "icon.ico")];
+  let iconPath = iconCandidates.find((p) => {
+    try { return fs.existsSync(p); } catch (_) { return false; }
+  });
+  if (!iconPath) iconPath = undefined;
+
+  mainWindow = new BrowserWindow({
+    width: 1400, height: 900, minWidth: 1100, minHeight: 720,
+    backgroundColor: "#0a0a0a", title: "FrameFuse v1",
+    autoHideMenuBar: false,
+    icon: iconPath,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true, nodeIntegration: false, sandbox: false,
+      backgroundThrottling: false,
+    },
+  });
+  if (isDev) mainWindow.loadURL("http://localhost:3000");
+  else {
+    const file = path.join(__dirname, "..", "out", "index.html");
+    if (fs.existsSync(file)) mainWindow.loadFile(file);
+    else mainWindow.loadURL("file://" + file);
+  }
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith("http")) { shell.openExternal(url); return { action: "deny" }; }
+    return { action: "allow" };
+  });
+  mainWindow.on("closed", () => { mainWindow = null; });
+}
+
+function buildApplicationMenu() {
+  const isMac = process.platform === "darwin";
+  Menu.setApplicationMenu(Menu.buildFromTemplate([
+    ...(isMac ? [{ role: "appMenu" }] : []),
+    { label: "File", submenu: [
+      { label: "New Project", accelerator: "CmdOrCtrl+Alt+N", click: () => mainWindow && mainWindow.webContents.send("menu:new-project") },
+      { label: "Open Project…", accelerator: "CmdOrCtrl+O", click: () => mainWindow && mainWindow.webContents.send("menu:open-project") },
+      { label: "Save Project", accelerator: "CmdOrCtrl+S", click: () => mainWindow && mainWindow.webContents.send("menu:save-project") },
+      { label: "Save Project As…", accelerator: "CmdOrCtrl+Shift+S", click: () => mainWindow && mainWindow.webContents.send("menu:save-project-as") },
+      { type: "separator" },
+      { label: "Add Images…", click: () => mainWindow && mainWindow.webContents.send("menu:add-images") },
+      { label: "Add Video…", click: () => mainWindow && mainWindow.webContents.send("menu:add-video") },
+      { label: "Add Audio…", click: () => mainWindow && mainWindow.webContents.send("menu:add-audio") },
+      { type: "separator" },
+      { label: "Export MP4…", accelerator: "CmdOrCtrl+E", click: () => mainWindow && mainWindow.webContents.send("menu:export") },
+      { type: "separator" },
+      isMac ? { role: "close" } : { role: "quit" },
+    ]},
+    { label: "Edit", submenu: [{ role: "undo" }, { role: "redo" }, { type: "separator" }, { role: "cut" }, { role: "copy" }, { role: "paste" }, { role: "selectAll" }] },
+    { label: "View", submenu: [{ role: "reload" }, { role: "forceReload" }, { role: "toggleDevTools" }, { type: "separator" }, { role: "resetZoom" }, { role: "zoomIn" }, { role: "zoomOut" }, { type: "separator" }, { role: "togglefullscreen" }] },
+    { label: "Window", submenu: [{ role: "minimize" }, { role: "zoom" }] },
+    { label: "Help", submenu: [
+      { label: "About", click: () => { dialog.showMessageBox(mainWindow, { type: "info", title: "About", message: `FrameFuse v${app.getVersion()}`, detail: "Multi-track video studio — video clips, chroma key, native Whisper captions, GPU-accelerated FFmpeg export.", buttons: ["OK"] }); } },
+      { label: "Naming Guide", click: () => mainWindow && mainWindow.webContents.send("menu:naming-guide") },
+    ]},
+  ]));
+}
+
+// IPC helpers
+ipcMain.handle("is-electron", () => true);
+
+// v1.12.1: the REAL running-exe facts for the "am I on the new build?"
+// check. app.getVersion() reads the rcedit-stamped version resource of the
+// ACTUAL executable — if the renderer's build constant disagrees, the
+// install is stale/hybrid and the UI flags it. Also carries the CPU count
+// (the fact that decides the parallel-pool width) for the Export-tab
+// diagnostics strip.
+// v1.15.3 lie detector: app-info also carries the GPU-process summary —
+// vendor/model + every video-encode-related field app.getGPUInfo exposes
+// (the chrome://gpu "Video Acceleration" twin). On a Windows GPU box this
+// is the ground truth for "is a hardware H.264 encoder even visible to
+// Chromium" — the renderer-side require-hardware probe is the spec-side
+// check, this is the driver-side check.
+async function gpuVideoSummary() {
+  try {
+    const info = await app.getGPUInfo("complete");
+    if (!info || typeof info !== "object") return "gpu info unavailable";
+    const bits = [];
+    const gpu = info.gpu || {};
+    const vendor = [gpu.vendor, gpu.vendorString, gpu.deviceString, gpu.driverVendor, gpu.driverVersion]
+      .filter(Boolean).join(" · ");
+    if (vendor) bits.push(vendor);
+    // Defensive scan — the exact key set differs across Chromium versions
+    // (videoEncodeAcceleratorSupportedProfiles and successors); log whatever
+    // video/encode keys exist, never assume a shape.
+    const scan = (obj, prefix) => {
+      if (!obj || typeof obj !== "object") return;
+      for (const [k, v] of Object.entries(obj)) {
+        if (/video|encode/i.test(k)) {
+          const s = JSON.stringify(v);
+          bits.push(`${prefix}${k}: ${s && s.length > 260 ? s.slice(0, 260) + "…" : s}`);
+        }
+      }
+    };
+    scan(info, "");
+    scan(gpu, "gpu.");
+    if (info.featureStatus) {
+      for (const [k, v] of Object.entries(info.featureStatus)) {
+        if (/video|encode/i.test(k)) bits.push(`featureStatus.${k}: ${v}`);
+      }
+    }
+    if (bits.length === 0) {
+      bits.push("no video-encode fields exposed by this Electron's GPUInfo — check chrome://gpu manually");
+    }
+    return bits.join(" | ");
+  } catch (e) {
+    return `gpu info failed: ${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
+ipcMain.handle("app-info", async () => {
+  // v1.14.1: the ACCURATE CPU topology — physical cores AND logical
+  // threads (os.cpus().length alone counts SMT threads, so a 4C/8T box
+  // reported "8 CPU cores" — the user-side "detection is not accurate"
+  // report). `cpus` stays the logical count for v1.12.1 compatibility.
+  const topo = await detectCpuTopology();
+  return {
+    version: app.getVersion(),
+    electron: process.versions.electron,
+    node: process.versions.node,
+    platform: process.platform,
+    cpus: topo.logical,
+    cpuPhysicalCores: topo.effectivePhysical,
+    cpuLogicalCores: topo.logical,
+    cpuModel: topo.model,
+    cpuTopology: topo.note,
+    gpuInfo: await gpuVideoSummary(),
+  };
+});
+
+// Diagnostics — lets the renderer verify ffmpeg is reachable (v5.1: async —
+// the old execSync blocked the main process up to 10 s on slow disks).
+// v1.5: also reports WHICH build is in use (bundled-full / ffmpeg-static /
+// system-path), the hardware encoders it was compiled with, libass, and
+// whether ffprobe resolved — the exact facts that decide export speed on a
+// given install (full build → NVENC/QSV/AMF possible + fast JSON probes).
+ipcMain.handle("ffmpeg-status", async () => {
+  try {
+    if (!ffmpegPath || !fs.existsSync(ffmpegPath)) {
+      return { ok: false, path: ffmpegPath || "(none)", version: null, error: "FFmpeg binary not found at expected path. Try reinstalling FrameFuse." };
+    }
+    const r = await ffmpegCapture(["-version"], 10000);
+    const firstLine = r.out.split("\n")[0] || "";
+    const caps = { hasNvenc: false, hasQsv: false, hasAmf: false, hasLibass: false };
+    try {
+      const enc = await ffmpegCapture(["-hide_banner", "-encoders"], 12000);
+      caps.hasNvenc = /h264_nvenc\b/.test(enc.out);
+      caps.hasQsv = /h264_qsv\b/.test(enc.out);
+      caps.hasAmf = /h264_amf\b/.test(enc.out);
+    } catch (_) { /* capability scan is best-effort */ }
+    try {
+      const flt = await ffmpegCapture(["-hide_banner", "-filters"], 12000);
+      caps.hasLibass = /libass/.test(flt.out);
+    } catch (_) { /* capability scan is best-effort */ }
+    let hasFfprobe = false;
+    try { hasFfprobe = !!(await ffprobeAvailable()); } catch (_) {}
+    return {
+      ok: r.code === 0,
+      path: ffmpegPath,
+      version: firstLine,
+      build: ffmpegBuildKind,
+      hasFfprobe,
+      ...caps,
+      error: r.code === 0 ? null : "FFmpeg did not respond in time.",
+    };
+  } catch (e) {
+    return { ok: false, path: ffmpegPath || "(none)", version: null, build: ffmpegBuildKind, error: e.message };
+  }
+});
+
+// v5.1: encoder badge for the export UI (result of the async GPU probe).
+// v8.1: carries the forced flag so the badge can say "probe bypassed".
+// v1.13: also carries the resolved Adaptive Hardware Matrix tier (label,
+// workers × threads, CPU model, subtitle treatment) so the Export tab can
+// state the exact pool shape BEFORE an export starts.
+ipcMain.handle("export-info", async () => {
+  const enc = await detectGpuEncoderAsync();
+  const prof = await getHardwareProfile();
+  const rust = RUST.rustEngineStatus();
+  return {
+    encoder: enc.label,
+    encoderName: enc.name,
+    forced: !!forcedEncoderKey,
+    tier: prof.tier,
+    tierLabel: prof.tierLabel,
+    workers: prof.workers,
+    threadsPerWorker: prof.threadsPerWorker,
+    filterWorkers: prof.filterWorkers,
+    cpuCount: prof.cpuCount,
+    cpuLogical: prof.cpuLogical,
+    cpuPhysical: prof.cpuPhysical,
+    cpuTopology: prof.cpuTopology,
+    cpuModel: prof.cpuModel,
+    optimizeSubtitles: prof.optimizeSubtitles,
+    // v1.18: the native engine status — loaded/binary/version (or the load
+    // error). The Export tab renders the engine badge from this.
+    rustEngine: {
+      loaded: !!rust.loaded,
+      version: rust.version || null,
+      binary: rust.binary || null,
+      error: rust.error || null,
+      // v1.22: the LAST bypass reason (gate/timeline/runtime) — the Export
+      // tab shows it instead of a silent "FFmpeg CLI".
+      lastFailure: rust.lastFailure || null,
+    },
+  };
+});
+
+// ── v1.22 ENGINE DIAGNOSTICS ───────────────────────────────────────────────
+// The "why is the Rust engine always falling back" answer, on demand:
+//   engine:status  → the load status + candidate paths + the last failure.
+//   engine:selftest→ a REAL 36-frame mini export through the engine in THIS
+//                    runtime (load path + DLL dir + wgpu adapter) — the
+//                    definitive health check with the exact error on failure.
+ipcMain.handle("engine:status", async () => {
+  const s = RUST.rustEngineStatus();
+  return {
+    loaded: !!s.loaded,
+    version: s.version || null,
+    binary: s.binary || null,
+    from: s.from || null,
+    error: s.error || null,
+    lastFailure: s.lastFailure || null,
+    diagnostics: s.diagnostics || null,
+  };
+});
+
+ipcMain.handle("engine:selftest", async () => {
+  try {
+    return await RUST.runRustSelfTest(ffmpegPath, ensureTempDir());
+  } catch (err) {
+    return {
+      ok: false,
+      stage: "ipc",
+      error: String((err && err.message) || err),
+      status: RUST.rustEngineStatus(),
+    };
+  }
+});
+
+// v8.1: force-encoder override (Export tab diagnostics). key ∈
+// {null, "nvenc", "qsv", "amf", "x264"} — null restores the v7 auto-probe.
+// Changing the key invalidates the session cache immediately and returns the
+// re-resolved encoder so the badge updates in one round trip.
+ipcMain.handle("export:set-force-encoder", async (_evt, key) => {
+  if (key !== null && !Object.prototype.hasOwnProperty.call(FORCE_ENCODER_MAP, key)) {
+    return { ok: false, error: `Unknown encoder key: ${String(key)}` };
+  }
+  forcedEncoderKey = key;
+  detectedEncoder = null;
+  encoderDetecting = null;
+  const enc = await detectGpuEncoderAsync();
+  const prof = await getHardwareProfile();
+  return { ok: true, forced: key, encoder: enc.label, encoderName: enc.name, tier: prof.tier, tierLabel: prof.tierLabel, workers: prof.workers, threadsPerWorker: prof.threadsPerWorker };
+});
+
+ipcMain.handle("save-temp-image", async (_evt, { name, bytes }) => {
+  ensureTempDir();
+  const ext = path.extname(name) || ".jpg";
+  const p = path.join(tempDir, `img_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
+  // v5.2 PERF: async write — the sync variant blocked the main-process event
+  // loop for the duration of every media upload (hundreds of MB = seconds).
+  await fs.promises.writeFile(p, Buffer.from(bytes));
+  return p;
+});
+
+ipcMain.handle("save-temp-audio", async (_evt, { name, bytes }) => {
+  ensureTempDir();
+  const ext = path.extname(name) || ".mp3";
+  const p = path.join(tempDir, `aud_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
+  await fs.promises.writeFile(p, Buffer.from(bytes));
+  return p;
+});
+
+// v5.0: video sources for the multi-track timeline — same pattern as
+// save-temp-audio (temp dir, unique name, write bytes, return path). The
+// returned path feeds the base-lane video clips AND overlay compositing;
+// cleanup-temp removes it with everything else in the dir.
+ipcMain.handle("save-temp-video", async (_evt, { name, bytes }) => {
+  ensureTempDir();
+  const ext = path.extname(name) || ".mp4";
+  const p = path.join(tempDir, `vid_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
+  await fs.promises.writeFile(p, Buffer.from(bytes));
+  return p;
+});
+
+ipcMain.handle("cleanup-temp", async () => {
+  try { if (fs.existsSync(tempDir)) for (const f of fs.readdirSync(tempDir)) try { fs.unlinkSync(path.join(tempDir, f)); } catch (_) {} return true; } catch { return false; }
+});
+
+ipcMain.handle("choose-output", async () => {
+  const res = await dialog.showSaveDialog(mainWindow, {
+    title: "Export MP4", defaultPath: `framefuse_${Date.now()}.mp4`,
+    filters: [{ name: "MP4 Video", extensions: ["mp4"] }],
+  });
+  if (res.canceled || !res.filePath) return null;
+  if (!res.filePath.toLowerCase().endsWith(".mp4")) res.filePath += ".mp4";
+  return res.filePath;
+});
+
+
+// ---------------------------------------------------------------------------
+// v5.1 NATIVE PROJECT FILES — save/open dialogs + recents (userData).
+// The renderer keeps its self-contained .framefuse.json document (media
+// inlined); these handlers just give it NATIVE file dialogs, a current-path
+// short-circuit for Cmd+S, and a persisted recents list for the menu.
+// ---------------------------------------------------------------------------
+function recentsPath() {
+  return path.join(app.getPath("userData"), "framefuse-recent-projects.json");
+}
+
+function loadRecentProjects() {
+  try {
+    const raw = fs.readFileSync(recentsPath(), "utf-8");
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter((e) => e && typeof e.path === "string" && fs.existsSync(e.path))
+      .slice(0, 8);
+  } catch (_) { return []; }
+}
+
+function saveRecentProjects(list) {
+  try {
+    fs.mkdirSync(path.dirname(recentsPath()), { recursive: true });
+    fs.writeFileSync(recentsPath(), JSON.stringify(list, null, 2), "utf-8");
+  } catch (_) { /* recents are best-effort */ }
+}
+
+function rememberProject(filePath) {
+  const list = loadRecentProjects().filter((e) => e.path !== filePath);
+  list.unshift({
+    path: filePath,
+    name: path.basename(filePath, path.extname(filePath)),
+    savedAt: Date.now(),
+  });
+  saveRecentProjects(list.slice(0, 8));
+}
+
+function defaultProjectName(doc) {
+  try {
+    const name = doc && typeof doc.name === "string" && doc.name ? doc.name : "untitled";
+    return name.replace(/[\\/:*?"<>|]+/g, "_").slice(0, 60);
+  } catch (_) { return "untitled"; }
+}
+
+async function saveProjectDialog(doc, currentPath) {
+  let filePath = currentPath || null;
+  if (!filePath) {
+    const res = await dialog.showSaveDialog(mainWindow, {
+      title: "Save FrameFuse Project",
+      defaultPath: `${defaultProjectName(doc)}.framefuse.json`,
+      filters: [{ name: "FrameFuse Project", extensions: ["framefuse.json", "json"] }],
+    });
+    if (res.canceled || !res.filePath) return null;
+    filePath = res.filePath;
+    if (!/\.json$/i.test(filePath)) filePath += ".framefuse.json";
+  }
+  fs.writeFileSync(filePath, JSON.stringify(doc));
+  rememberProject(filePath);
+  return { path: filePath, name: path.basename(filePath, path.extname(filePath)) };
+}
+
+ipcMain.handle("project:save", async (_e, { doc, currentPath }) => {
+  return saveProjectDialog(doc, currentPath || null);
+});
+
+ipcMain.handle("project:save-as", async (_e, { doc }) => {
+  return saveProjectDialog(doc, null);
+});
+
+ipcMain.handle("project:open", async () => {
+  const res = await dialog.showOpenDialog(mainWindow, {
+    title: "Open FrameFuse Project",
+    properties: ["openFile"],
+    filters: [{ name: "FrameFuse Project", extensions: ["framefuse.json", "json"] }],
+  });
+  if (res.canceled || !res.filePaths || res.filePaths.length === 0) return null;
+  const filePath = res.filePaths[0];
+  try {
+    const raw = fs.readFileSync(filePath, "utf-8");
+    const doc = JSON.parse(raw);
+    if (!doc || doc.app !== "framefuse") {
+      throw new Error("Not a FrameFuse project file");
+    }
+    rememberProject(filePath);
+    return { path: filePath, name: path.basename(filePath, path.extname(filePath)), doc };
+  } catch (err) {
+    throw new Error(`Could not open project: ${err.message}`);
+  }
+});
+
+ipcMain.handle("project:recent", () => loadRecentProjects());
+
+ipcMain.handle("project:remove-recent", (_e, { path: p }) => {
+  saveRecentProjects(loadRecentProjects().filter((e) => e.path !== p));
+  return true;
+});
+
+/** Kill one ffmpeg child (Windows needs taskkill for the whole tree). */
+function killProc(proc) {
+  try {
+    if (!proc || proc.exitCode !== null || proc.signalCode) return;
+    if (process.platform === "win32") {
+      spawn("taskkill", ["/pid", proc.pid, "/f", "/t"], { windowsHide: true });
+    } else {
+      proc.kill("SIGKILL");
+    }
+  } catch (_) { /* already gone */ }
+}
+
+/** Kill every live ffmpeg child (pool + step-2 mux). */
+function killAllProcs() {
+  for (const proc of Array.from(activeProcs)) killProc(proc);
+}
+
+/** Leak guard: an export must never leave ffmpeg children behind. */
+function leakGuard() {
+  if (activeProcs.size > 0) {
+    console.warn(`[framefuse] export ended with ${activeProcs.size} ffmpeg process(es) still alive — killing`);
+    killAllProcs();
+  }
+}
+
+/** Async stdout/stderr capture for ANY binary — NEVER blocks the main
+ *  process event loop (the v5.0 execSync/spawnSync probes froze the whole
+ *  app). Resolves { code, out } with out = stdout+stderr concatenated; a
+ *  timeout resolves code -1 with whatever was captured. v6: generalized
+ *  from ffmpegCapture so ffprobe rides the same discipline. */
+function captureExec(bin, args, timeoutMs = 12000) {
+  return new Promise((resolve) => {
+    let done = false;
+    let out = "";
+    let proc;
+    try {
+      proc = spawn(bin, args, { windowsHide: true });
+    } catch (err) {
+      resolve({ code: -1, out, error: err.message });
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      try { proc.kill("SIGKILL"); } catch (_) {}
+      resolve({ code: -1, out, timeout: true });
+    }, timeoutMs);
+    proc.stdout.on("data", (d) => { out += d.toString(); });
+    proc.stderr.on("data", (d) => { out += d.toString(); });
+    proc.on("error", (err) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve({ code: -1, out, error: err.message });
+    });
+    proc.on("exit", (code) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve({ code, out });
+    });
+  });
+}
+
+function ffmpegCapture(args, timeoutMs = 12000) {
+  return captureExec(ffmpegPath, args, timeoutMs);
+}
+
+// ---------------------------------------------------------------------------
+// v1.2 2-PASS MEASURED LOUDNORM — pass 1 (measurement)
+// ---------------------------------------------------------------------------
+// v1.14.5 PERMANENT LOUDNESS CACHE (export-speed plan §4). A loudness
+// measurement is a pure function of (file, window): keyed by
+// absolutePath|mtime|size|ssMs|durMs it never goes stale — the key itself
+// invalidates when the file changes. User sources are measured ONCE and
+// every later export (incl. after app restarts) reuses the numbers; the
+// two-step path's TEMP WAVs (unique names per export) are deliberately
+// bypassed so the cache never accumulates throwaway entries. Failures
+// (null measurements) are not cached — a retry next export is cheap and a
+// transient timeout must not freeze a wrong "unusable" verdict.
+// ---------------------------------------------------------------------------
+let loudnessDisk = null;           // { entries: { key: { t, m } } }
+let loudnessDiskDirty = false;
+let loudnessDiskTimer = null;
+const loudnessCacheStats = { hits: 0, misses: 0 }; // read by the export profiler
+
+function loudnessDiskPath() {
+  return path.join(app.getPath("userData"), "loudness-cache-v1.json");
+}
+
+function loadLoudnessDisk() {
+  if (loudnessDisk) return;
+  try {
+    loudnessDisk = JSON.parse(fs.readFileSync(loudnessDiskPath(), "utf8"));
+    if (!loudnessDisk || typeof loudnessDisk !== "object" || !loudnessDisk.entries) {
+      loudnessDisk = { entries: {} };
+    }
+  } catch (_) {
+    loudnessDisk = { entries: {} };
+  }
+}
+
+function scheduleLoudnessDiskSave() {
+  if (loudnessDiskTimer) return;
+  loudnessDiskTimer = setTimeout(() => {
+    loudnessDiskTimer = null;
+    if (!loudnessDiskDirty) return;
+    try {
+      fs.writeFileSync(loudnessDiskPath(), JSON.stringify(loudnessDisk));
+      loudnessDiskDirty = false;
+    } catch (_) { /* best-effort persistence */ }
+  }, 2000);
+}
+
+/** Synchronous flush — the export profiler calls this at the end of every
+ * export so a quick app close right after can never lose measurements. */
+function flushLoudnessDisk() {
+  if (loudnessDiskTimer) { clearTimeout(loudnessDiskTimer); loudnessDiskTimer = null; }
+  if (!loudnessDiskDirty || !loudnessDisk) return;
+  try {
+    fs.writeFileSync(loudnessDiskPath(), JSON.stringify(loudnessDisk));
+    loudnessDiskDirty = false;
+  } catch (_) { /* best-effort persistence */ }
+}
+
+function loudnessCacheKey(p, win, st) {
+  const winKey = win && Number(win.durMs) > 0
+    ? `${Math.max(0, Math.round(Number(win.ssMs) || 0))}|${Math.round(Number(win.durMs))}`
+    : "full";
+  return `${p}|${Math.round(st.mtimeMs)}|${st.size}|${winKey}`;
+}
+
+// ─── v1.33.5 (the stuck-at-100% REAL root cause) ───────────────────────────
+// The v1.33.2-v1.33.4 measurement budgets were calibrated to the assumption
+// "ebur128 runs hundreds of× realtime" — MEASURED REALITY on weak/throttled
+// CPUs: a 69-minute PCM source measures at ~44× in CPU bursts but drops to
+// single-digit× sustained. The v1.33.4 cap (90s + 40ms/s = 255s for a 4140s
+// source) therefore KILLED the measurement on every hour-long export, which
+// cascaded into the DEATH SPIRAL (each step slower than the one it replaced):
+//   measure killed → null → audioFastGain=false → FULL master-mix render
+//   (a second whole-timeline decode) → master measure killed AGAIN → the
+//   final mux runs DYNAMIC loudnorm (the slowest audio path that exists,
+//   ebur128 state + gain smoothing per frame) — 20-40+ minutes of post-95%
+//   grind with the bar pinned at 99.7+ ("stuck at 100%") on exactly the weak
+//   machines that can least afford it.
+// THE FIX (root cause, not symptom): measurement cost must be CONSTANT,
+// independent of timeline length. EBU R128 integrated loudness CONVERGES —
+// a 90 s representative window (starting 20 % into the material, past silent
+// intros and lead-in fades) lands within ~½ LU of the full-file measure,
+// which is inaudible on the STATIC gain the 2-pass recipe applies. Windows
+// ≤ 120 s still measure whole. The timeout survives as a backstop, never
+// as the plan — a healthy windowed measure takes single-digit seconds even
+// on a potato CPU.
+const MEASURE_WINDOW_MAX_SEC = 120; // ≤ this: measure the whole thing
+const MEASURE_WINDOW_SEC = 90;      // sampled window length above the cap
+/** Effective measured span (seconds) for a requested duration — the ONE
+ * policy every progress denominator and window decision shares, so the
+ * caller's frac math and measureLoudnessAsync's internal window can never
+ * disagree (a frozen-looking measure band was the v1.33.4 symptom when they
+ * did). Unknown duration (0) → null (whole file, bounded by the caps). */
+function effectiveMeasureSec(durSec) {
+  const d = Number(durSec) > 0 ? Number(durSec) : 0;
+  if (d <= 0) return null;
+  return d <= MEASURE_WINDOW_MAX_SEC ? d : Math.min(MEASURE_WINDOW_SEC, d);
+}
+/** The v1.33.5 measure window for a requested [startMs, startMs+durMs) span:
+ * whole when ≤ 120 s, else a 90 s sample starting 20 % into the span (clamped
+ * to its end). null when the duration is unknown → whole file. */
+function shrinkMeasureWindow(startMs, durMs) {
+  const d = (Number(durMs) || 0) / 1000;
+  if (!(d > 0)) return null;
+  const start = Math.max(0, (Number(startMs) || 0) / 1000);
+  if (d <= MEASURE_WINDOW_MAX_SEC) {
+    return { ssMs: Math.round(start * 1000), durMs: Math.round(d * 1000) };
+  }
+  const ssRel = Math.min(d * 0.2, Math.max(0, d - MEASURE_WINDOW_SEC));
+  const len = Math.min(MEASURE_WINDOW_SEC, d - ssRel);
+  return { ssMs: Math.round((start + ssRel) * 1000), durMs: Math.round(len * 1000) };
+}
+
+function pruneLoudnessDisk() {
+  const keys = Object.keys(loudnessDisk.entries);
+  if (keys.length <= 512) return;
+  keys
+    .map((k) => ({ k, t: Number(loudnessDisk.entries[k] && loudnessDisk.entries[k].t) || 0 }))
+    .sort((a, b) => a.t - b.t)
+    .slice(0, keys.length - 512)
+    .forEach((e) => { delete loudnessDisk.entries[e.k]; });
+}
+
+/**
+ * Measure a file's loudness for 2-pass loudnorm: decodes audio ONLY (fast —
+ * ebur128 runs hundreds of× realtime) through `loudnorm … print_format=json`
+ * and parses the flat JSON summary the filter prints at the end.
+ * Resolves { i, lra, tp, thresh, offset } or null when nothing parseable
+ * (missing file, silent input measuring as -inf, timeout) — the graph then
+ * falls back to single-pass loudnorm for that branch.
+ * v6: `win` ({ ssMs, durMs }) measures a SEEKED SOURCE WINDOW (audio-only
+ * decode with -ss/-t) instead of the whole file — the single-pass path
+ * measures the base video inputs' own audio at their timeline windows
+ * without extracting PCM WAVs first. atempo preserves integrated loudness
+ * (energy per unit time is unchanged by time-stretch), so measuring the
+ * pre-atempo window is equivalent to the two-step's post-atempo WAV.
+ * v1.14.5: disk-cached per path|mtime|size|window (see the block above).
+ * v1.33.2: DURATION-AWARE timeout — the old flat 60s cap was fine for
+ * song-length sources, but a 1h9m track decodes at ~40-90× realtime on a
+ * weak CPU (100-140s), so EVERY long-audio export had its measurement
+ * killed at 60s and silently fell back to the SLOWER dynamic loudnorm in
+ * the final mux (the "export crawls after 95%" amplifiers).
+ * v1.33.4 (stuck-at-100% root-cause release): the measurement now runs
+ * through runFfmpeg instead of the raw capture path, which buys THREE
+ * fixes for the exact reported symptom — (1) LIVE PROGRESS: -nostats is
+ * dropped so ffmpeg's periodic "time=" lines drive onTime (the measure
+ * phases used to sit at a FROZEN 95.5/96.6 for minutes on hour-long
+ * sources with no explanation — "after 95% it became slow"); (2) the
+ * child registers in activeProcs so cancel-export kills it; (3) the stall
+ * watchdog applies (a healthy measure emits stats ~2Hz — 60s of silence
+ * means dead). The duration cap is now opts.maxMs and the timeout formula
+ * is more generous (90s floor + 40ms/media-sec, 10 min cap — the old
+ * 25ms/s starved weak CPUs into the SLOWER dynamic-loudnorm fallback, a
+ * death spiral: slower machine → timed-out measurement → even slower mux).
+ */
+function measureLoudnessAsync(p, win, timeoutMs, onTime) {
+  if (typeof p !== "string" || !p) return Promise.resolve(null);
+  // v1.33.5: resolve the EFFECTIVE window FIRST (the caller's requested span
+  // shrunk by the one shared policy; a whole-file request samples from the
+  // probed duration). This is the root-cause fix: the measured span is
+  // ≤ 90 s on long sources → the measure costs single-digit seconds on weak
+  // CPUs → the timeout never fires → the static-gain fast path always
+  // engages → no master-mix round trip, no dynamic loudnorm in the mux.
+  const resolveWindow = async () => {
+    if (win && Number(win.durMs) > 0) {
+      return shrinkMeasureWindow(win.ssMs, win.durMs);
+    }
+    // Whole-file request → sample from the probed duration (cached, capped).
+    try {
+      const pr = await probeMediaAsync(p);
+      const d = (Number(pr && pr.durationMs) || 0) / 1000;
+      if (d > 0) return shrinkMeasureWindow(0, d * 1000);
+    } catch (_) { /* unreadable → whole file, bounded by the caps */ }
+    return null;
+  };
+  return resolveWindow().then((effWin) => {
+  // Temp WAVs (the two-step clip extracts + master-mix renders) live under
+  // tempDir and never repeat — bypass the cache for them entirely.
+  const isTemp = typeof tempDir === "string" && p.startsWith(tempDir);
+  let statOk = false;
+  let key = null;
+  if (!isTemp) {
+    try {
+      const st = fs.statSync(p);
+      key = loudnessCacheKey(p, effWin, st);
+      statOk = true;
+    } catch (_) { /* unreadable now — measure uncached */ }
+  }
+  if (statOk && key) {
+    loadLoudnessDisk();
+    const e = loudnessDisk.entries[key];
+    if (e && e.m && Number.isFinite(Number(e.m.i))) {
+      loudnessCacheStats.hits += 1;
+      if (onTime) { try { onTime(effWin ? effWin.durMs / 1000 : 0); } catch (_) {} }
+      return Promise.resolve(e.m);
+    }
+  }
+  const seekArgs = effWin && Number(effWin.durMs) > 0
+    ? ["-ss", (Math.max(0, Number(effWin.ssMs) || 0) / 1000).toFixed(3), "-t", (Number(effWin.durMs) / 1000).toFixed(3)]
+    : [];
+  // v1.33.2: 60s floor + ~0.025s per media-second (covers ≥40× realtime
+  // decode+analysis on weak CPUs), capped at 5 min so a genuinely stuck
+  // measurement still dies. v1.33.4: 90s floor + 40ms/s, 10 min cap — weak
+  // CPUs measured for real instead of degrading to the slow dynamic path.
+  // v1.33.5: the budget scales with the EFFECTIVE window (≤ 90 s on long
+  // sources) — even a 2×-realtime potato finishes a 90 s window in 45 s,
+  // comfortably under the 120 s floor. The cap is now a backstop, not a plan.
+  const durSec = effWin && Number(effWin.durMs) > 0 ? Number(effWin.durMs) / 1000 : 0;
+  const timeout =
+    Number.isFinite(Number(timeoutMs)) && Number(timeoutMs) > 0
+      ? Math.max(120000, Math.min(600000, Number(timeoutMs)))
+      : Math.max(120000, Math.min(600000, 120000 + durSec * 40));
+  loudnessCacheStats.misses += 1;
+  // v1.33.4: progress denominator — the window when seeked, else the probed
+  // source duration (probe is cached; 0 = no live ticks, measurement still
+  // bounded by maxMs + the watchdog). v1.33.5: the denominator IS the
+  // effective window (its length — the caller's band math divides by the
+  // same effectiveMeasureSec), so ticks reach 1.0 exactly when the measure
+  // ends and the band never looks frozen mid-measure.
+  const pt = durSec > 0
+    ? Promise.resolve(durSec)
+    : probeMediaAsync(p).then((pr) => (Number(pr && pr.durationMs) || 0) / 1000).catch(() => 0);
+  return pt.then((ptSec) =>
+    runFfmpeg(
+      [
+        // v1.33.4: -nostats REMOVED — the periodic stats line carries
+        // "time=" which drives onTime (live measure progress).
+        "-hide_banner",
+        ...seekArgs,
+        "-i", p,
+        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
+        "-f", "null", "-",
+      ],
+      ptSec > 0 ? ptSec : 0,
+      onTime || null,
+      {
+        // A healthy measurement emits a stats line ~2×/s: a full minute of
+        // complete silence means the process is dead, not slow.
+        stallMs: 60000,
+        // The duration-scaled cap (was the ffmpegCapture flat timeout):
+        // exceeding it rejects with the __FFMAX__ marker → caught below →
+        // null → the caller's graceful fallback (same semantics as the old
+        // timeout, now with live progress + cancellation on the way).
+        maxMs: timeout,
+      },
+    ).then((r) => {
+      const out = r && r.stderr ? r.stderr : "";
+      const start = out.lastIndexOf("{");
+      if (start < 0) return null;
+      const end = out.indexOf("}", start);
+      if (end < 0) return null;
+      let j = null;
+      try { j = JSON.parse(out.slice(start, end + 1)); } catch (_) { return null; }
+      const num = (v) => {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
+      };
+      const i = num(j.input_i);
+      const lra = num(j.input_lra);
+      const tp = num(j.input_tp);
+      const th = num(j.input_thresh);
+      if (i == null || lra == null || tp == null || th == null) return null;
+      const m = { i, lra, tp, thresh: th, offset: num(j.target_offset) };
+      if (statOk && key) {
+        loadLoudnessDisk();
+        loudnessDisk.entries[key] = { t: Date.now(), m };
+        pruneLoudnessDisk();
+        loudnessDiskDirty = true;
+        scheduleLoudnessDiskSave();
+      }
+      return m;
+    }).catch(() => null)
+  ).catch(() => null);
+  });
+}
+
+/**
+ * Measure every audio source for the 2-pass loudnorm (bounded 8-parallel —
+ * same chunk discipline as the duration probes: a 100-clip project must not
+ * spawn 100 ffmpeg children at once on a weak machine).
+ * Returns { clip: [measure|null per clip WAV], music: measure|null }.
+ * v1.33.2: `totalSec` scales each measurement's timeout (long-audio exports
+ * measured for real instead of timing out at the flat 60s and falling back
+ * to the slower dynamic loudnorm in the mux).
+ * v1.33.4: `onProgress(frac 0..1)` aggregates the per-source decode
+ * positions (each child now emits live "time=" ticks — see
+ * measureLoudnessAsync) so the audio-measure band MOVES instead of freezing
+ * at 95.5 while minutes of hour-long sources are analyzed. The timeout is
+ * also more generous (90s floor + 40ms/media-sec, 10 min cap): the old
+ * 25ms/s starved weak CPUs into the SLOWER dynamic-loudnorm fallback.
+ */
+async function measureLoudnormContext(clipAudioJobs, audioPath, totalSec, onProgress) {
+  const clip = new Array(clipAudioJobs.length).fill(null);
+  let music = null;
+  const tasks = [];
+  const durSec = Number.isFinite(Number(totalSec)) && Number(totalSec) > 0 ? Number(totalSec) : 0;
+  const timeout = Math.max(90000, Math.min(600000, 90000 + durSec * 40));
+  clipAudioJobs.forEach((j, k) => tasks.push({ kind: "clip", k, p: j.wavPath, dur: (Number(j.durationMs) || 0) / 1000 }));
+  if (audioPath) tasks.push({ kind: "music", p: audioPath, dur: durSec });
+  // v1.33.5: progress denominators use the EFFECTIVE measured span (the
+  // window policy shrinks hour-long sources to a 90 s sample — dividing the
+  // ticks by the FULL duration froze the band at ~2% while the windowed
+  // measure ran, the exact "frozen measure band" symptom v1.33.4 fixed for
+  // full-length decodes and would have re-introduced here).
+  for (const t of tasks) {
+    t.effDur = effectiveMeasureSec(t.dur) || t.dur;
+  }
+  // v1.33.4: aggregate progress — mean of per-task decode fractions; a task
+  // with no duration just reports 0 until it lands.
+  const fracs = new Array(tasks.length).fill(0);
+  let lastEmit = 0;
+  const emit = (force) => {
+    if (!onProgress) return;
+    const now = Date.now();
+    if (!force && now - lastEmit < 100) return; // ≤10 Hz progress IPC
+    lastEmit = now;
+    let sum = 0;
+    for (let i = 0; i < fracs.length; i++) sum += fracs[i];
+    try { onProgress(tasks.length > 0 ? sum / tasks.length : 0); } catch (_) { /* best-effort */ }
+  };
+  for (let c = 0; c < tasks.length; c += 8) {
+    const chunk = tasks.slice(c, c + 8);
+    const base = c;
+    const res = await Promise.all(chunk.map((t, i) => measureLoudnessAsync(
+      t.p,
+      null,
+      timeout,
+      t.effDur > 0
+        ? (sec) => {
+            fracs[base + i] = Math.min(1, sec / Math.max(0.01, t.effDur));
+            emit(false);
+          }
+        : null,
+    )));
+    chunk.forEach((t, i) => {
+      fracs[base + i] = 1;
+      emit(true);
+      if (t.kind === "clip") clip[t.k] = res[i];
+      else music = res[i];
+    });
+  }
+  return { clip, music };
+}
+
+ipcMain.handle("cancel-export", async () => {
+  try {
+    killAllProcs();
+    // v1.16: also signal the Rust engine (its video loop checks per frame)
+    RUST.requestRustCancel();
+    return true;
+  } catch { return false; }
+});
+
+// ---------------------------------------------------------------------------
+// v1.15.1 GPU-Shift: the WebCodecs export stream sink (main-process side).
+// The renderer's mp4-muxer StreamTarget streams append-only bytes over IPC
+// (~5 MB chunks — ChunkSink contract): exportStart opens the file, ordered
+// exportChunk writes append, exportEnd flushes + closes and reports the
+// byte count. The renderer's sink guards sequential positions; the byte
+// accounting here cross-checks it. Abort semantics (engine-side): on cancel
+// the engine still calls exportEnd so the partial file closes cleanly.
+// ---------------------------------------------------------------------------
+let gpuExportStream = null; // active fs.WriteStream
+let gpuExportBytes = 0;
+let gpuExportPath = null;
+
+ipcMain.handle("gpu-export-start", (_evt, filePath) => {
+  if (typeof filePath !== "string" || filePath.length === 0) {
+    throw new Error("gpu-export-start: invalid output path");
+  }
+  if (gpuExportStream) {
+    try { gpuExportStream.destroy(); } catch { /* already closed */ }
+    gpuExportStream = null;
+  }
+  gpuExportStream = fs.createWriteStream(filePath, { flags: "w" });
+  gpuExportBytes = 0;
+  gpuExportPath = filePath;
+  gpuExportStream.on("error", (err) => {
+    console.error("[GPU-Export] stream write failed:", err.message);
+  });
+  console.log(`[GPU-Export] streaming WebCodecs export to ${filePath}`);
+  return true;
+});
+
+ipcMain.on("gpu-export-chunk", (_evt, buffer) => {
+  if (!gpuExportStream) return; // no active export (late chunk after abort)
+  try {
+    const buf = Buffer.from(buffer);
+    gpuExportStream.write(buf);
+    gpuExportBytes += buf.length;
+  } catch (err) {
+    console.error("[GPU-Export] chunk write failed:", err.message);
+  }
+});
+
+ipcMain.handle("gpu-export-end", async () => {
+  const ws = gpuExportStream;
+  if (!ws) return { bytes: 0, path: null };
+  gpuExportStream = null;
+  const bytes = gpuExportBytes;
+  const path = gpuExportPath;
+  gpuExportPath = null;
+  await new Promise((resolve, reject) => {
+    ws.end((err) => (err ? reject(err) : resolve()));
+  });
+  console.log(`[GPU-Export] stream closed — ${bytes} bytes written to ${path}`);
+  return { bytes, path };
+});
+
+// ---------------------------------------------------------------------------
+// v1.20 WHISPER — GROQ CLOUD ONLY.
+//
+// ALL local transcription engines are REMOVED (the onnxruntime
+// utilityProcess service, the faster-whisper Python sidecar, and the
+// renderer web worker). electron/groq-whisper.js — the Groq Whisper API
+// with the user's own on-device key (userData/groq.json, 0600) — is the
+// ONLY engine. No key saved -> a clear actionable error; API failure ->
+// the real error message surfaces (no silent fallback chain). The run
+// bookkeeping below still serves the Groq run's progress events, per-run
+// cancellation and diagnostics.
+// ---------------------------------------------------------------------------
+const whisperRuns = new Map(); // runId -> { resolve, reject, sender, clientRunId? }
+let whisperRunSeq = 0;
+
+/** v5.2 whisper diagnostics state — surfaced by the whisper:status IPC so
+ *  the settings panel can show engine health at a glance. */
+const whisperState = {
+  lastError: null,
+  lastErrorAt: 0,
+};
+
+function sendWhisperProgress(runId, progress, status, extra) {
+  const run = whisperRuns.get(runId);
+  const wc = run && run.sender;
+  if (wc && !wc.isDestroyed()) {
+    wc.send("whisper:progress", { progress, status, ...(extra || {}) });
+  }
+}
+
+ipcMain.handle("whisper:transcribe", async (event, payload) => {
+  const { name, bytes, language } = payload || {};
+  const sourcePath =
+    payload && typeof payload.sourcePath === "string" ? payload.sourcePath : null;
+  // v1.3 ZERO-COPY: a local on-disk source (webUtils path from the renderer)
+  // is addressed DIRECTLY — no renderer→main byte upload, no temp copy. The
+  // byte path remains for browser-side media / project-restored blobs.
+  let inputPath = null;
+  let tmpUploaded = null;
+  if (sourcePath && fs.existsSync(sourcePath)) {
+    inputPath = sourcePath;
+  } else {
+    if (!bytes || !bytes.byteLength) throw new Error("No audio data received");
+    ensureTempDir();
+    const ext = path.extname(name || "") || ".audio";
+    tmpUploaded = path.join(tempDir, `whisper_${Date.now()}_${Math.random().toString(36).slice(2, 8)}${ext}`);
+    fs.writeFileSync(tmpUploaded, Buffer.from(bytes));
+    inputPath = tmpUploaded;
+  }
+  const runId = ++whisperRunSeq;
+  // v5.2: the renderer passes a client runId (crypto.randomUUID) so a cancel
+  // can target THIS run without killing other queued runs.
+  const clientRunId =
+    payload && typeof payload.runId === "string" && payload.runId
+      ? payload.runId
+      : null;
+  try {
+    // ── GROQ WHISPER API — the ONLY transcription engine (v1.20) ────────
+    // No local fallback exists anymore: a missing key or an API failure
+    // throws with the real, actionable message (the renderer shows it in
+    // the failure toast) instead of silently degrading the result.
+    const groqCfg = GQ.loadGroqConfig(app.getPath("userData"));
+    if (!groqCfg.apiKey) {
+      throw new Error(
+        "No Groq API key saved. Open Settings → Default AI models and paste your free Groq API key (console.groq.com).",
+      );
+    }
+    const groqModel = GQ.normalizeGroqModel(
+      payload && typeof payload.groqModel === "string" && payload.groqModel
+        ? payload.groqModel
+        : groqCfg.model,
+    );
+    // Register the run for whisper:cancel BEFORE any await — the abort
+    // hook kills the in-flight HTTPS upload.
+    let cancelReject = null;
+    const cancelled = new Promise((_res, rej) => { cancelReject = rej; });
+    const runEntry = {
+      resolve: () => {},
+      reject: (e) => cancelReject(e),
+      sender: event.sender,
+      clientRunId,
+      lastMsgAt: Date.now(),
+      phase: "transcribe",
+      groqAbort: null,
+    };
+    whisperRuns.set(runId, runEntry);
+    let compactAudio = null;
+    try {
+      const groqResult = await Promise.race([
+        (async () => {
+          sendWhisperProgress(
+            runId, 8,
+            `Groq ${groqModel} — preparing audio…`,
+          );
+          compactAudio = await GQ.extractAudioForGroq(
+            ffmpegPath,
+            inputPath,
+            ensureTempDir(),
+            (s) => sendWhisperProgress(runId, 12, s),
+          );
+          const abortRef = { abort: null };
+          runEntry.groqAbort = () => { try { abortRef.abort(); } catch (_) {} };
+          const result = await GQ.groqTranscribe({
+            apiKey: groqCfg.apiKey,
+            model: groqModel,
+            filePath: compactAudio.filePath,
+            language,
+            onProgress: (p) => sendWhisperProgress(runId, p.progress, p.status),
+            abortRef,
+          });
+          sendWhisperProgress(runId, 80, "Aligning word timestamps…");
+          return result;
+        })(),
+        cancelled,
+      ]);
+      whisperState.lastError = null;
+      whisperState.lastErrorAt = 0;
+      return {
+        chunks: groqResult.chunks,
+        language: groqResult.language,
+        wordLevel: groqResult.wordLevel,
+        durationMs: groqResult.durationMs,
+        engine: "groq",
+      };
+    } catch (err) {
+      // v1.20: NO fallback chain — the real Groq error (invalid key, rate
+      // limit, file too large, network…) propagates to the renderer.
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("cancelled")) throw err;
+      whisperState.lastError = `groq: ${msg}`;
+      whisperState.lastErrorAt = Date.now();
+      // v1.33 (user brief "Part 5"): the FULL underlying exception — with
+      // the structured job code (service/code/retryable) — goes to the
+      // application log; the renderer gets the actionable message.
+      // eslint-disable-next-line no-console
+      console.error(
+        `[audio-job] groq transcription failed: ${err && err.job ? `${err.job.code} (retryable=${err.job.retryable})` : "unclassified"} — ${msg}`,
+        err && err.stack ? `\n${err.stack}` : "",
+      );
+      throw err;
+    } finally {
+      whisperRuns.delete(runId);
+      try { if (compactAudio) fs.unlinkSync(compactAudio.filePath); } catch (_) {}
+    }
+  } finally {
+    if (tmpUploaded) { try { fs.unlinkSync(tmpUploaded); } catch (_) {} }
+  }
+});
+
+ipcMain.handle("whisper:cancel", async (_event, payload) => {
+  const target =
+    payload && typeof payload === "object" && typeof payload.runId === "string"
+      ? payload.runId
+      : null;
+  if (target) {
+    // v5.2: cancel ONE renderer run (by its client runId) — other queued
+    // runs keep going. The in-flight Groq HTTPS upload is aborted via the
+    // tracked abort hook.
+    for (const [runId, run] of Array.from(whisperRuns)) {
+      if (run.clientRunId === target) {
+        whisperRuns.delete(runId);
+        try { if (run.groqAbort) run.groqAbort(); } catch (_) {}
+        run.reject(new Error("Transcription cancelled"));
+        return 1;
+      }
+    }
+    return 0; // already finished / never started — nothing to cancel
+  }
+  // Legacy behavior (no argument): reject ALL pending runs.
+  let cancelled = 0;
+  for (const [runId, run] of Array.from(whisperRuns)) {
+    whisperRuns.delete(runId);
+    try { if (run.groqAbort) run.groqAbort(); } catch (_) {}
+    run.reject(new Error("Transcription cancelled"));
+    cancelled++;
+  }
+  return cancelled;
+});
+
+// ── v1.20 whisper:status — Groq engine config (the only engine) ───────────
+// Same payload shape the settings panel consumes (hasKey/maskedKey/model/
+// models) — the local model-cache diagnostics are gone with the engines.
+ipcMain.handle("whisper:status", async () => groqConfigPayload());
+
+// ── v1.15 Groq Whisper API configuration IPC ────────────────────────────
+// The API key is the USER'S OWN, stored ONLY on this device (userData/
+// groq.json, mode 0600, never inside project files, never rendered raw —
+// the bridge returns a masked form). The renderer keeps an app-level cloud
+// MODEL preference in localStorage (groq is the only engine since v1.20).
+
+function groqConfigPayload() {
+  const cfg = GQ.loadGroqConfig(app.getPath("userData"));
+  return {
+    hasKey: !!cfg.apiKey,
+    maskedKey: GQ.maskApiKey(cfg.apiKey),
+    model: cfg.model,
+    models: GQ.GROQ_MODELS,
+  };
+}
+
+ipcMain.handle("whisper:groq-get", async () => groqConfigPayload());
+
+/** { apiKey?: string ("" clears), model?: "whisper-large-v3-turbo" | "whisper-large-v3" }
+ *  v1.29: the pasted key is NORMALIZED here (main-process backstop) — one
+ *  pair of wrapping quotes is stripped, and a key that still contains
+ *  internal whitespace/quotes THROWS (the renderer surfaces the message).
+ *  Malformed keys must never reach groq.json: they only produce a
+ *  "Groq rejected the API key" 403 later — with no trace in console usage. */
+ipcMain.handle("whisper:groq-set", async (_event, payload) => {
+  const patch = {};
+  if (payload && typeof payload.apiKey === "string") {
+    patch.apiKey = GQ.normalizeGroqApiKey(payload.apiKey);
+  }
+  if (payload && typeof payload.model === "string" && payload.model) {
+    patch.model = payload.model;
+  }
+  GQ.saveGroqConfig(app.getPath("userData"), patch);
+  return groqConfigPayload();
+});
+
+/** Verify a key END TO END (the saved one, or a candidate passed in for
+ * validation BEFORE saving). { ok, message, whisperModels } — v1.30: the
+ * check is GET /models (auth) + a REAL 1-second transcription probe on
+ * /audio/transcriptions with the user's selected whisper model, so
+ * "key works" means transcription actually works. whisperModels is the
+ * account's available whisper-* ids (informational). */
+ipcMain.handle("whisper:groq-test", async (_event, payload) => {
+  const cfg = GQ.loadGroqConfig(app.getPath("userData"));
+  const candidate =
+    payload && typeof payload.apiKey === "string" && payload.apiKey.trim()
+      ? payload.apiKey.trim()
+      : cfg.apiKey;
+  if (!candidate) {
+    return {
+      ok: false,
+      message: "No API key yet — paste a key from console.groq.com first",
+      whisperModels: [],
+    };
+  }
+  // v1.30: probe with the model the app will actually use (payload's pick,
+  // else the saved config's) — a per-model access problem surfaces here.
+  const model =
+    payload && typeof payload.model === "string" && payload.model
+      ? payload.model
+      : cfg.model;
+  return GQ.groqTestKey(candidate, { model });
+});
+
+// ── v1.20 GEMINI SCRIPT WRITING ──────────────────────────────────────────
+// The AI Script Writer generates narration scripts with a cloud text model.
+// DEFAULT provider is Google Gemini (gemini-3.5-flash-lite — fast + generous
+// free tier), with the wider Gemini family AND the existing Groq chat models
+// selectable in the UI. The Gemini key is the USER'S OWN, stored ONLY on
+// this device (userData/gemini.json, mode 0600, never inside project files)
+// — the bridge returns a masked form only, exactly like groq.json. The Groq
+// provider reuses the SAME key the Captions tab manages (GQ.loadGroqConfig)
+// — there is no second Groq key UI.
+
+/** Masked Gemini config for the renderer (never the raw key). */
+function geminiConfigPayloadMain() {
+  return GM.geminiConfigPayload(app.getPath("userData"));
+}
+
+ipcMain.handle("gemini:get", async () => geminiConfigPayloadMain());
+
+/** { apiKey } — a non-empty string is required (removal is gemini:clear).
+ *  Returns the masked payload after saving. */
+ipcMain.handle("gemini:set", async (_event, payload) => {
+  const p = payload || {};
+  if (typeof p.apiKey !== "string" || !p.apiKey.trim()) {
+    throw new Error("gemini:set expects a non-empty apiKey string");
+  }
+  GM.saveGeminiConfig(app.getPath("userData"), { apiKey: p.apiKey.trim() });
+  return geminiConfigPayloadMain();
+});
+
+/** Verify a key (the saved one, or a candidate passed in for validation
+ *  BEFORE saving) via GET /v1beta/models → { ok, message, modelCount }. */
+ipcMain.handle("gemini:test", async (_event, payload) => {
+  const p = payload || {};
+  const saved = GM.loadGeminiConfig(app.getPath("userData"));
+  const candidate =
+    typeof p.apiKey === "string" && p.apiKey.trim() ? p.apiKey.trim() : saved.apiKey;
+  if (!candidate) {
+    return {
+      ok: false,
+      message: "No API key yet — paste a key from aistudio.google.com/apikey first",
+      modelCount: 0,
+    };
+  }
+  return GM.geminiTestKey({ apiKey: candidate });
+});
+
+/** Remove gemini.json → { ok } (ok=false: there was no key to remove). */
+ipcMain.handle("gemini:clear", async () => {
+  return { ok: GM.removeGeminiConfig(app.getPath("userData")) };
+});
+
+/** Build the scriptwriter system prompt — ONE place, both providers.
+ *  Professional short-form scriptwriter: first-line hook, spoken-word style
+ *  (contractions, short sentences), explicit [pause] + EMPHASIS cues on key
+ *  beats, narration-ready plain text (NO markdown headings), length-aware
+ *  (~2.5 words per second of the target duration), tone + language aware. */
+function buildScriptSystemPrompt({ tone, durationSec, language }) {
+  const toneWord =
+    typeof tone === "string" && tone.trim() ? tone.trim() : "energetic";
+  const dur =
+    Number.isFinite(Number(durationSec)) && Number(durationSec) > 0
+      ? Math.round(Number(durationSec))
+      : 60;
+  const lang =
+    typeof language === "string" && language.trim() ? language.trim() : "English";
+  const targetWords = Math.round(dur * 2.5);
+  return [
+    "You are a professional short-form video scriptwriter.",
+    `Write ONE narration script for a ${dur}-second video, in a ${toneWord} tone.`,
+    "Requirements:",
+    "1. Hook the viewer in the very FIRST line — a bold claim, a question, or a vivid image that stops the scroll.",
+    "2. Spoken-word style: contractions, short punchy sentences, plain everyday vocabulary. It must sound natural when read aloud.",
+    "3. Mark dramatic beats with an explicit [pause] on its own line, and write the key words in CAPITALS for emphasis.",
+    "4. Narration-ready PLAIN TEXT only — no markdown headings, no bullet points, no scene directions, no timestamps, no labels.",
+    `5. Length-aware: aim for roughly ${targetWords} words total (about 2.5 words per second of the ${dur}-second runtime).`,
+    `6. Write the entire script in ${lang}.`,
+    "Return ONLY the script text — nothing before or after it.",
+  ].join("\n");
+}
+
+/** { provider: "gemini"|"groq", model, prompt, tone?, durationSec?, language? }
+ *  → { ok: true, text, model, provider } | { ok: false, error }. NEVER
+ *  throws — the renderer displays `error` inline. Gemini (the default) uses
+ *  the saved gemini.json key; Groq uses the saved groq.json key (the one
+ *  the Captions tab manages). */
+ipcMain.handle("script:generate", async (_event, payload) => {
+  const p = payload || {};
+  const provider = p.provider === "groq" ? "groq" : "gemini";
+  const prompt = typeof p.prompt === "string" ? p.prompt.trim() : "";
+  if (!prompt) {
+    return { ok: false, error: "Describe the video first — the prompt is empty" };
+  }
+  if (prompt.length > 2000) {
+    return { ok: false, error: `The prompt is ${prompt.length} characters — keep it under 2000` };
+  }
+  const model = typeof p.model === "string" ? p.model : "";
+  const systemPrompt = buildScriptSystemPrompt({
+    tone: p.tone,
+    durationSec: p.durationSec,
+    language: p.language,
+  });
+  const temperature = 0.8; // creative writing, not classification
+  try {
+    if (provider === "groq") {
+      const groqCfg = GQ.loadGroqConfig(app.getPath("userData"));
+      if (!groqCfg.apiKey) {
+        return {
+          ok: false,
+          error:
+            "No Groq API key saved — open Settings → Default AI models, paste your free key from console.groq.com, then retry.",
+        };
+      }
+      const res = await GC.groqChat({
+        apiKey: groqCfg.apiKey,
+        model,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: prompt },
+        ],
+        temperature,
+        maxTokens: 2048,
+      });
+      const text = typeof res.content === "string" ? res.content.trim() : "";
+      if (!text) {
+        return {
+          ok: false,
+          error: "The model returned an empty script — try again or pick another model",
+        };
+      }
+      return { ok: true, text, model: GC.normalizeTextModel(model), provider };
+    }
+    // Default provider: Google Gemini (saved key from userData/gemini.json).
+    const geminiCfg = GM.loadGeminiConfig(app.getPath("userData"));
+    if (!geminiCfg.apiKey) {
+      return {
+        ok: false,
+        error:
+          "No Gemini API key saved — get a free key at aistudio.google.com/apikey and paste it above.",
+      };
+    }
+    const res = await GM.geminiChat({
+      apiKey: geminiCfg.apiKey,
+      model,
+      systemPrompt,
+      userPrompt: prompt,
+      temperature,
+      maxOutputTokens: 4096, // generous: newer Gemini models spend part of
+      // the budget on internal thinking.
+    });
+    return { ok: true, text: res.text, model: GM.normalizeTextModel(model), provider };
+  } catch (err) {
+    return { ok: false, error: err && err.message ? err.message : String(err) };
+  }
+});
+
+/** Both providers' model catalogs + whether a key is saved for each —
+ *  picker data, no key needed. */
+ipcMain.handle("script:models", async () => {
+  const geminiCfg = GM.loadGeminiConfig(app.getPath("userData"));
+  const groqCfg = GQ.loadGroqConfig(app.getPath("userData"));
+  return {
+    gemini: {
+      models: GM.GEMINI_TEXT_MODELS,
+      default: GM.GEMINI_DEFAULT_TEXT_MODEL,
+      hasKey: !!geminiCfg.apiKey,
+    },
+    groq: {
+      models: GC.GROQ_TEXT_MODELS,
+      default: GC.DEFAULT_TEXT_MODEL,
+      hasKey: !!groqCfg.apiKey,
+    },
+  };
+});
+
+// ---------------------------------------------------------------------------
+// v1.17 VOICEOVER (Edge TTS) + TRANSLATE/DUB IPC.
+//
+// The TTS engine and the dub orchestrator live in their own modules; these
+// handlers own: the memoized voice catalog, single-flight previews (voice
+// browsing fires them rapid-fire), narration synthesis into the SAME temp
+// dir saveTempAudio uses (probeMediaAsync then measures the real MP3
+// duration), and ONE dub run at a time with whisper-style progress events
+// on the "dub:progress" channel. The Groq key is the SAME one the Captions
+// tab manages (GQ.loadGroqConfig) — dubbing never asks for a second key.
+// ---------------------------------------------------------------------------
+
+/** Memoized listVoices() promise (the module caches too; this saves the hop). */
+let ttsVoicesPromise = null;
+function ttsVoicesOnce() {
+  if (!ttsVoicesPromise) ttsVoicesPromise = Promise.resolve(TTS.listVoices());
+  return ttsVoicesPromise;
+}
+
+/** Single-flight guard for tts:preview — the previous preview is cancelled
+ *  when a new one starts so only the newest voice is ever heard. */
+let ttsPreviewAbortRef = null;
+
+ipcMain.handle("tts:voices", async () => {
+  return { voices: await ttsVoicesOnce(), pairs: TTS.voicePairsByLocale() };
+});
+
+/** v1.33 (user brief "Part 5"): structured audio-job logging — the FULL
+ *  underlying exception (stack + job code) goes to the application log;
+ *  the renderer keeps receiving the actionable message text. */
+function logAudioJob(action, err) {
+  const job = err && err.job;
+  // eslint-disable-next-line no-console
+  console.error(
+    `[audio-job] ${action} failed: ${job ? `${job.service}/${job.code} (retryable=${job.retryable})` : "unclassified"} — ${err && err.message ? err.message : err}`,
+    err && err.stack ? `\n${err.stack}` : "",
+  );
+}
+
+/** { voice, text?, style? } → { bytes: ArrayBuffer, bytesLen } — a SHORT
+ *  sample, never written to disk. Text is trimmed to ≤300 chars; the
+ *  caller passes a locale-appropriate sample for non-Latin voices. */
+ipcMain.handle("tts:preview", async (_event, payload) => {
+  const p = payload || {};
+  const voice = typeof p.voice === "string" ? p.voice.trim() : "";
+  if (!voice) throw new Error("No voice selected");
+  let text = typeof p.text === "string" ? p.text.trim().slice(0, 300) : "";
+  if (!text) text = "This is a preview of the selected voice.";
+  const style =
+    typeof p.style === "string" && p.style.trim() ? p.style.trim() : undefined;
+  if (ttsPreviewAbortRef && typeof ttsPreviewAbortRef.abort === "function") {
+    try { ttsPreviewAbortRef.abort(); } catch (_) { /* already dead */ }
+  }
+  const abortRef = { abort: null };
+  ttsPreviewAbortRef = abortRef;
+  try {
+    const r = await TTS.synthesize({ text, voice, style, abortRef });
+    const b = r.bytes || Buffer.alloc(0);
+    return {
+      bytes: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength),
+      bytesLen: r.bytesLen,
+    };
+  } catch (err) {
+    logAudioJob("tts:preview", err);
+    throw err;
+  } finally {
+    if (ttsPreviewAbortRef === abortRef) ttsPreviewAbortRef = null;
+  }
+});
+
+/** { text, voice, ratePct, pitchHz, volumePct, style? } → { filePath,
+ *  bytes: ArrayBuffer, durationMs, words } — full narration synthesis. The
+ *  MP3 lands in the shared temp dir (vo_<ts>_<rand>.mp3 — same lifecycle as
+ *  saveTempAudio files, wiped by cleanup-temp) and probeMediaAsync measures
+ *  its REAL duration (the 48 kbps mono MP3 ≈ 6000 B/s fallback only fires
+ *  when ffprobe is unavailable). words = per-word timings ({ text,
+ *  offsetMs, durationMs }) from the WordBoundary metadata stream. Scripts
+ *  longer than 3000 chars belong to tts:synthesize-long. */
+ipcMain.handle("tts:synthesize", async (_event, payload) => {
+  const p = payload || {};
+  const text = typeof p.text === "string" ? p.text.trim() : "";
+  const voice = typeof p.voice === "string" ? p.voice.trim() : "";
+  if (!voice) throw new Error("No voice selected");
+  if (!text) throw new Error("No narration text entered");
+  if (text.length > 3000) {
+    throw new Error(`Narration is ${text.length} characters — Edge TTS accepts up to 3000`);
+  }
+  const ratePct = Math.max(-95, Math.min(95, Number(p.ratePct) || 0));
+  const pitchHz = Math.max(-100, Math.min(100, Number(p.pitchHz) || 0));
+  const volumePct = Math.max(-100, Math.min(100, Number(p.volumePct) || 0));
+  const style =
+    typeof p.style === "string" && p.style.trim() ? p.style.trim() : undefined;
+  ensureTempDir();
+  const outPath = path.join(
+    tempDir,
+    `vo_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.mp3`,
+  );
+  let r;
+  try {
+    r = await TTS.synthesize({ text, voice, ratePct, pitchHz, volumePct, style, outFile: outPath });
+  } catch (err) {
+    logAudioJob("tts:synthesize", err);
+    throw err;
+  }
+  let durationMs = 0;
+  try {
+    const info = await probeMediaAsync(outPath);
+    if (info && Number(info.durationMs) > 0) durationMs = info.durationMs;
+  } catch (_) { /* probe failure → the byte-rate estimate below */ }
+  if (!(durationMs > 0)) durationMs = Math.round((r.bytesLen / 6000) * 1000);
+  const b = r.bytes || Buffer.alloc(0);
+  return {
+    filePath: outPath,
+    bytes: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength),
+    durationMs,
+    words: Array.isArray(r.words) ? r.words : [],
+  };
+});
+
+// ── v1.24 LONG-FORM TTS (≤ ~200 k words) ──────────────────────────────
+// One long run at a time (mutex, same shape as the dub workflow's): the
+// renderer sends the WHOLE script — synthesizeLong chunks on sentence
+// boundaries main-side, keeps 3 chunks in flight, streams progress on
+// "tts:progress", and merges ONE MP3. The merged bytes stay in the main
+// process (a 200k-word script is ~50 MB of MP3 — far too big for one IPC
+// reply); the renderer fetches them for playback via tts:read-audio.
+
+/** Active long-TTS run state — ONE synthesizeLong at a time. */
+const ttsLongState = {
+  running: false,
+  runId: null,        // the renderer's run id (progress + cancel matching)
+  activeAbort: null,  // { abort } handed to TTS.synthesizeLong
+};
+/** Hard input cap for tts:synthesize-long (~200,000 words). */
+const TTS_LONG_MAX_CHARS = 1500000;
+
+ipcMain.handle("tts:synthesize-long", async (event, payload) => {
+  if (ttsLongState.running) {
+    throw new Error("A long text-to-speech job is already running");
+  }
+  const p = payload || {};
+  const text = typeof p.text === "string" ? p.text : "";
+  if (!text.trim()) throw new Error("No narration text entered");
+  if (text.length > TTS_LONG_MAX_CHARS) {
+    throw new Error("Text too long — 200k word limit reached");
+  }
+  const voice = typeof p.voice === "string" ? p.voice.trim() : "";
+  if (!voice) throw new Error("No voice selected");
+  const runId = typeof p.runId === "string" ? p.runId : "";
+  const ratePct = Math.max(-95, Math.min(100, Number(p.ratePct) || 0));
+  const pitchHz = Math.max(-100, Math.min(100, Number(p.pitchHz) || 0));
+  const volumePct = Math.max(-100, Math.min(100, Number(p.volumePct) || 0));
+  const style =
+    typeof p.style === "string" && p.style.trim() ? p.style.trim() : undefined;
+  const abortRef = { abort: null };
+  ttsLongState.running = true;
+  ttsLongState.runId = runId || null;
+  ttsLongState.activeAbort = abortRef;
+  const sendProgress = (info) => {
+    if (event.sender && !event.sender.isDestroyed()) {
+      event.sender.send("tts:progress", Object.assign({ runId: ttsLongState.runId }, info));
+    }
+  };
+  try {
+    const totalChars = text.length;
+    let r;
+    try {
+      r = await TTS.synthesizeLong({
+        text,
+        voice,
+        ratePct,
+        pitchHz,
+        volumePct,
+        style,
+        abortRef,
+        onProgress: (prog) => {
+          // Chunk-level heartbeat → the renderer's progress bar.
+          sendProgress({
+            phase: "synth",
+            status: "synthesizing",
+            chunkIndex: prog.chunkIndex,
+            chunkCount: prog.chunkCount,
+            charsDone: prog.charsDone,
+            totalChars,
+          });
+        },
+      });
+    } catch (err) {
+      logAudioJob("tts:synthesize-long", err);
+      throw err;
+    }
+    ensureTempDir();
+    const outPath = path.join(tempDir, `ttslong_${Date.now()}.mp3`);
+    try {
+      fs.writeFileSync(outPath, r.bytes);
+    } catch (err) {
+      throw new Error(`Could not write the long narration file: ${err.message}`);
+    }
+    // Real duration via ffprobe; the 48 kbps CBR bytes/6000-s estimate only
+    // fires when ffprobe is unavailable (same fallback as tts:synthesize).
+    sendProgress({ phase: "probe", status: "probing" });
+    let durationMs = 0;
+    try {
+      const info = await probeMediaAsync(outPath);
+      if (info && Number(info.durationMs) > 0) durationMs = info.durationMs;
+    } catch (_) { /* probe failure → the byte-rate estimate below */ }
+    if (!(durationMs > 0)) durationMs = Math.round((r.bytesLen / 6000) * 1000);
+    sendProgress({
+      phase: "done",
+      status: "complete",
+      durationMs,
+      chunkCount: r.chunkCount,
+    });
+    return {
+      filePath: outPath,
+      fileName: path.basename(outPath),
+      bytesLen: r.bytesLen,
+      durationMs,
+      words: Array.isArray(r.words) ? r.words : [],
+      chunkCount: r.chunkCount,
+    };
+  } finally {
+    ttsLongState.running = false;
+    ttsLongState.runId = null;
+    ttsLongState.activeAbort = null;
+  }
+});
+
+/** { runId } → { ok, running } — abort the active long run. Guarded by
+ *  runId equality: a stale cancel from an older run is a no-op, as is a
+ *  cancel when nothing is running. */
+ipcMain.handle("tts:cancel-long", async (_event, payload) => {
+  const p = payload || {};
+  const runId = typeof p.runId === "string" ? p.runId : "";
+  if (!ttsLongState.running || !ttsLongState.activeAbort) {
+    return { ok: false, running: ttsLongState.running };
+  }
+  if (runId && ttsLongState.runId && runId !== ttsLongState.runId) {
+    return { ok: false, running: true }; // not this run's cancel
+  }
+  try { ttsLongState.activeAbort.abort(); } catch (_) { /* best effort */ }
+  return { ok: true, running: true };
+});
+
+/** { filePath } → { bytes: ArrayBuffer } — read an MP3 the main process
+ *  wrote into its temp dir (ttslong_*.mp3 / vo_*.mp3) so the renderer can
+ *  build a playback Blob. SECURITY: the path is resolved and must sit
+ *  INSIDE the FrameFuse temp dir — anything else (absolute escapes, ../
+ *  traversal, symlinks resolved elsewhere) is refused. Capped at 200 MB. */
+ipcMain.handle("tts:read-audio", async (_event, payload) => {
+  const p = payload || {};
+  // v1.33.1: tolerate a double-wrapped { filePath: { filePath } } payload
+  // (a stale caller shape) — normalize BEFORE the strict string check so
+  // a shape mismatch can never surface as "No audio file path given".
+  let requested = typeof p.filePath === "string" ? p.filePath.trim() : "";
+  if (!requested && p.filePath && typeof p.filePath === "object" &&
+      typeof p.filePath.filePath === "string") {
+    requested = p.filePath.filePath.trim();
+  }
+  if (!requested) throw new Error("No audio file path given");
+  const dir = path.resolve(ensureTempDir()) + path.sep;
+  const resolved = path.resolve(requested);
+  if (!resolved.startsWith(dir)) {
+    throw new Error("Audio can only be read from the app temp directory");
+  }
+  let st = null;
+  try {
+    st = fs.statSync(resolved);
+  } catch (_) {
+    throw new Error("Audio file not found");
+  }
+  if (!st.isFile()) throw new Error("Not an audio file");
+  if (st.size > 200 * 1024 * 1024) {
+    throw new Error("Audio file exceeds the 200 MB read cap");
+  }
+  const b = fs.readFileSync(resolved);
+  return { bytes: b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) };
+});
+
+/** Active dub run state (mirrors whisperState's role). ONE dub at a time. */
+const dubState = {
+  lastResult: null,   // { language, speakers, segments, at } — diagnostics
+  activeAbort: null,  // { abort } handed to DUB.runDub
+  running: false,
+};
+
+/** Payload: { segments:[{videoPath,startMs,endMs?}], sourceLanguage,
+ *  targetLanguage, targetLocale, groqModel, femaleVoice, maleVoice,
+ *  voiceMode ("single"|"multi"), singleVoice }.
+ *  Progress streams on "dub:progress" ({ phase, progress, status }).
+ *  On success every result segment carries its wav BYTES (ArrayBuffer) —
+ *  the renderer holds them in memory; the temp wav dir is deleted right
+ *  after the read (paths are transient, bytes are the truth). */
+ipcMain.handle("dub:start", async (event, payload) => {
+  if (dubState.running) {
+    throw new Error("A dub run is already in progress");
+  }
+  const p = payload || {};
+  // v1.26: a script-dub (Dub Studio stage 4) synthesizes the EDITED script
+  // only — no Whisper, no LLM — so neither key is required on that leg.
+  const scriptLines = Array.isArray(p.scriptLines) ? p.scriptLines : null;
+  // Same key + same friendly no-key message shape as the whisper handler.
+  const groqCfg = GQ.loadGroqConfig(app.getPath("userData"));
+  if (!scriptLines && !groqCfg.apiKey) {
+    throw new Error(
+      "No Groq API key saved — open Settings → Default AI models and paste your free key from console.groq.com.",
+    );
+  }
+  // v1.22: the Gemini text provider (speaker detection + translation).
+  // Whisper transcription stays Groq regardless; a Gemini run additionally
+  // requires the Gemini key (shared with the Script Writer).
+  const textProvider = p.textProvider === "gemini" ? "gemini" : "groq";
+  const geminiApiKey =
+    textProvider === "gemini" ? GM.loadGeminiConfig(app.getPath("userData")).apiKey : "";
+  if (!scriptLines && textProvider === "gemini" && !geminiApiKey) {
+    throw new Error(
+      "No Gemini API key saved — open Settings → Default AI models and paste your key from aistudio.google.com/apikey, or switch the script provider to Groq.",
+    );
+  }
+  const segs = (Array.isArray(p.segments) ? p.segments : [])
+    .map((s) => ({
+      videoPath: String((s && s.videoPath) || ""),
+      startMs: Math.max(0, Math.round(Number(s && s.startMs) || 0)),
+      endMs: Number.isFinite(Number(s && s.endMs)) ? Math.round(Number(s.endMs)) : undefined,
+    }))
+    .filter((s) => s.videoPath);
+  if (segs.length === 0 && !scriptLines) {
+    throw new Error("No video clips to dub — the timeline needs at least one video segment");
+  }
+  const abortRef = { abort: null };
+  dubState.running = true;
+  dubState.activeAbort = abortRef;
+  const sendProgress = (info) => {
+    if (event.sender && !event.sender.isDestroyed()) {
+      event.sender.send("dub:progress", info || {});
+    }
+  };
+  try {
+    const result = await DUB.runDub({
+      segments: segs,
+      // v1.26 Dub Studio stage-4 (script dub): the edited script + the
+      // per-speaker voice picks ride along; runDub skips the LLM leg.
+      scriptLines: scriptLines || undefined,
+      scriptVoices:
+        p.scriptVoices && typeof p.scriptVoices === "object" ? p.scriptVoices : undefined,
+      scriptLanguage:
+        typeof p.scriptLanguage === "string" && p.scriptLanguage ? p.scriptLanguage : undefined,
+      scriptSpeakerCount: Number.isInteger(p.scriptSpeakerCount) ? p.scriptSpeakerCount : undefined,
+      sourceLanguage:
+        typeof p.sourceLanguage === "string" && p.sourceLanguage ? p.sourceLanguage : "auto",
+      targetLanguage:
+        typeof p.targetLanguage === "string" && p.targetLanguage ? p.targetLanguage : "hi",
+      targetLocale:
+        typeof p.targetLocale === "string" && p.targetLocale ? p.targetLocale : "hi-IN",
+      groqModel:
+        typeof p.groqModel === "string" && p.groqModel ? p.groqModel : DUB.DEFAULT_TEXT_MODEL,
+      // v1.22 Gemini provider pass-through.
+      textProvider,
+      geminiModel:
+        typeof p.geminiModel === "string" && p.geminiModel
+          ? p.geminiModel
+          : DUB.GEMINI_DEFAULT_TEXT_MODEL,
+      geminiApiKey,
+      // speakerVoices: {0: female, 1: male} — absent entries stay "auto".
+      speakerVoices: {
+        ...(typeof p.femaleVoice === "string" && p.femaleVoice ? { 0: p.femaleVoice } : {}),
+        ...(typeof p.maleVoice === "string" && p.maleVoice ? { 1: p.maleVoice } : {}),
+      },
+      // v1.20 single-voice mode: one Edge-TTS voice reads every line and
+      // speaker detection is skipped entirely ("multi"/absent = legacy).
+      voiceMode: p.voiceMode === "single" ? "single" : "multi",
+      singleVoice: typeof p.singleVoice === "string" ? p.singleVoice.trim() : "",
+      tempDir: ensureTempDir(),
+      ffmpegPath,
+      ffprobePath: (await ffprobeAvailable()) || "ffprobe",
+      apiKey: groqCfg.apiKey,
+      onProgress: sendProgress,
+      abortRef,
+    });
+    // Read each wav's bytes INTO the result (cap ~200MB — realistically a
+    // dub track is a few MB), THEN delete the temp dir. Wav paths die here;
+    // the renderer keeps bytes for preview + re-upload at export.
+    let totalBytes = 0;
+    for (const seg of result.segments) {
+      const b = fs.readFileSync(seg.wavPath);
+      totalBytes += b.length;
+      if (totalBytes > 200 * 1024 * 1024) {
+        throw new Error("The dub track exceeds 200 MB — too long to attach to the timeline");
+      }
+      seg.bytes = b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+    }
+    DUB.cleanupDubTemp(result.dubDir);
+    dubState.lastResult = {
+      language: result.language,
+      speakers: result.speakers.length,
+      segments: result.segments.length,
+      warnings: result.warnings.length,
+      at: Date.now(),
+    };
+    return result;
+  } finally {
+    dubState.running = false;
+    dubState.activeAbort = null;
+  }
+});
+
+/** Abort the active dub run → { ok, running } (ok=false: nothing to cancel). */
+ipcMain.handle("dub:cancel", async () => {
+  if (!dubState.running || !dubState.activeAbort) {
+    return { ok: false, running: dubState.running };
+  }
+  try { dubState.activeAbort.abort(); } catch (_) { /* best effort */ }
+  return { ok: true, running: true };
+});
+
+// ---------------------------------------------------------------------------
+// v1.26 Dub Studio — the staged IPC surface. The three stages share the
+// dubState mutex, the dub:progress channel and dub:cancel with dub:start,
+// so exactly ONE dub-family operation runs at a time and every busy spinner
+// in the Dubbing tab is driven by the same progress events.
+//
+// dub:transcribe — stage 1: extract the timeline's audio + transcribe it at
+//   WORD level with Groq Whisper. Returns pure data (no files survive):
+//   { language, totalMs, wordCount, utterances:[{startMs,endMs,text,
+//   words:[{text,startMs,endMs}]}] }.
+// ---------------------------------------------------------------------------
+ipcMain.handle("dub:transcribe", async (event, payload) => {
+  if (dubState.running) {
+    throw new Error("A dub operation is already in progress");
+  }
+  const p = payload || {};
+  const groqCfg = GQ.loadGroqConfig(app.getPath("userData"));
+  if (!groqCfg.apiKey) {
+    throw new Error(
+      "No Groq API key saved — open Settings → Default AI models and paste your free key from console.groq.com.",
+    );
+  }
+  const segs = (Array.isArray(p.segments) ? p.segments : [])
+    .map((s) => ({
+      videoPath: String((s && s.videoPath) || ""),
+      startMs: Math.max(0, Math.round(Number(s && s.startMs) || 0)),
+      endMs: Number.isFinite(Number(s && s.endMs)) ? Math.round(Number(s.endMs)) : undefined,
+    }))
+    .filter((s) => s.videoPath);
+  if (segs.length === 0) {
+    throw new Error("No video clips to transcribe — the timeline needs at least one video segment");
+  }
+  const abortRef = { abort: null };
+  dubState.running = true;
+  dubState.activeAbort = abortRef;
+  const sendProgress = (info) => {
+    if (event.sender && !event.sender.isDestroyed()) {
+      event.sender.send("dub:progress", info || {});
+    }
+  };
+  try {
+    return await DUB.runDubTranscript({
+      segments: segs,
+      sourceLanguage:
+        typeof p.sourceLanguage === "string" && p.sourceLanguage ? p.sourceLanguage : "auto",
+      tempDir: ensureTempDir(),
+      ffmpegPath,
+      ffprobePath: (await ffprobeAvailable()) || "ffprobe",
+      apiKey: groqCfg.apiKey,
+      onProgress: sendProgress,
+      abortRef,
+    });
+  } finally {
+    dubState.running = false;
+    dubState.activeAbort = null;
+  }
+});
+
+/** dub:script — stage 2: transcript → speaker detection + translation → the
+ *  editable dubbing script ({ targetLanguage, targetLanguageName,
+ *  speakerCount, lines:[{i,startMs,endMs,speaker,sourceText,translatedText}],
+ *  warnings }). Groq provider needs the Groq key; Gemini needs the Gemini
+ *  key (no Whisper on this leg — the transcript already exists). */
+ipcMain.handle("dub:script", async (event, payload) => {
+  if (dubState.running) {
+    throw new Error("A dub operation is already in progress");
+  }
+  const p = payload || {};
+  const textProvider = p.textProvider === "gemini" ? "gemini" : "groq";
+  let apiKey = "";
+  if (textProvider === "gemini") {
+    const geminiApiKey = GM.loadGeminiConfig(app.getPath("userData")).apiKey;
+    if (!geminiApiKey) {
+      throw new Error(
+        "No Gemini API key saved — open Settings → Default AI models and paste your key from aistudio.google.com/apikey, or switch the script provider to Groq.",
+      );
+    }
+  } else {
+    apiKey = GQ.loadGroqConfig(app.getPath("userData")).apiKey;
+    if (!apiKey) {
+      throw new Error(
+        "No Groq API key saved — open Settings → Default AI models and paste your free key from console.groq.com.",
+      );
+    }
+  }
+  const abortRef = { abort: null };
+  dubState.running = true;
+  dubState.activeAbort = abortRef;
+  const sendProgress = (info) => {
+    if (event.sender && !event.sender.isDestroyed()) {
+      event.sender.send("dub:progress", info || {});
+    }
+  };
+  try {
+    return await DUB.runDubScript({
+      utterances: Array.isArray(p.utterances) ? p.utterances : [],
+      sourceLanguage:
+        typeof p.sourceLanguage === "string" && p.sourceLanguage ? p.sourceLanguage : "auto",
+      targetLanguage:
+        typeof p.targetLanguage === "string" && p.targetLanguage ? p.targetLanguage : "hi",
+      targetLocale:
+        typeof p.targetLocale === "string" && p.targetLocale ? p.targetLocale : "hi-IN",
+      groqModel:
+        typeof p.groqModel === "string" && p.groqModel ? p.groqModel : DUB.DEFAULT_TEXT_MODEL,
+      textProvider,
+      geminiModel:
+        typeof p.geminiModel === "string" && p.geminiModel
+          ? p.geminiModel
+          : DUB.GEMINI_DEFAULT_TEXT_MODEL,
+      geminiApiKey: textProvider === "gemini"
+        ? GM.loadGeminiConfig(app.getPath("userData")).apiKey
+        : "",
+      voiceMode: p.voiceMode === "single" ? "single" : "multi",
+      singleVoice: typeof p.singleVoice === "string" ? p.singleVoice.trim() : "",
+      apiKey,
+      onProgress: sendProgress,
+      abortRef,
+    });
+  } finally {
+    dubState.running = false;
+    dubState.activeAbort = null;
+  }
+});
+
+/** { models, default, langNames } — picker data, no key needed. */
+ipcMain.handle("dub:models", async () => ({
+  models: DUB.GROQ_TEXT_MODELS,
+  default: DUB.DEFAULT_TEXT_MODEL,
+  langNames: DUB.LANG_NAMES,
+  // v1.22: the Gemini option — models + whether a key is on this device
+  // (the dub provider picker uses it; the Gemini key is shared with the
+  // Script Writer and lives in userData/gemini.json).
+  gemini: {
+    models: DUB.GEMINI_TEXT_MODELS,
+    default: DUB.GEMINI_DEFAULT_TEXT_MODEL,
+    hasKey: !!GM.loadGeminiConfig(app.getPath("userData")).apiKey,
+  },
+}));
+
+// ---------------------------------------------------------------------------
+// GPU encoder detection + RUNTIME PROBE.
+// Listing an encoder isn't enough (drivers can be broken) — we actually
+// encode real test frames. Falls back to libx264 on any failure.
+//
+// v1.1 TURBO: the probe got a THROUGHPUT GATE. The old 3-frame 256×256
+// probe only caught "encoder missing/broken init" — but the far nastier
+// failure mode on Windows is a driver stack that ACCEPTS the encode and
+// then crawls at 0.5–5 fps (broken QSV on outdated Intel drivers, AMF on
+// half-installed Adrenalin, hybrid-GPU laptops with the iGPU parked).
+// A user on such a machine exported a 19-minute video for 5–10 HOURS —
+// the exact failure this gate exists to prevent. The probe now encodes
+// 48 frames of REAL 1080p30 content and REQUIRES ≥ 12 fps effective
+// throughput (healthy NVENC/QSV/AMF run 100–400+ fps; a healthy probe
+// completes in well under a second). Anything slower is treated as a
+// broken hardware path and the export rides the (fast, predictable)
+// CPU libx264 path instead.
+//
+// Probe order also changed: NVENC → AMF → QSV (QSV is the most commonly
+// broken of the three in the wild — it is probed LAST so a working AMF
+// is preferred over a QSV that might pass the tiny probe and crawl on
+// real content).
+// ---------------------------------------------------------------------------
+let detectedEncoder = null;      // resolved value (session cache)
+let encoderDetecting = null;     // in-flight promise
+
+// v8.1 FORCE-ENCODER BYPASS (diagnostic field tool). When set, the runtime
+// GPU probe is SKIPPED entirely and the named encoder is used verbatim —
+// the "is it the probe or the driver?" test. The only guard left is a
+// compile-time existence check of the encoder in the bundled FFmpeg build
+// (an instant -encoders grep): a not-in-build answer is actionable on its
+// own ("this binary cannot test the driver"), while a driver-level failure
+// surfaces as the real ffmpeg error in the export toast — exactly what
+// diagnosis needs. "x264" forces the CPU baseline; null restores auto-probe.
+let forcedEncoderKey = null;
+const FORCE_ENCODER_MAP = {
+  nvenc: { name: "h264_nvenc", label: "NVIDIA NVENC (forced)" },
+  qsv: { name: "h264_qsv", label: "Intel Quick Sync (forced)" },
+  amf: { name: "h264_amf", label: "AMD AMF (forced)" },
+  x264: { name: "libx264", label: "CPU libx264 (forced)" },
+};
+
+// v5.1: ALL detection is ASYNC (spawn, never execSync). The v5.0 code ran
+// execSync listEncoders + probeEncoder inside the export handler — up to
+// 25 s of a COMPLETELY FROZEN main process (no window events, no IPC) before
+// the first frame encoded. Detection now runs once at app start (warm) and
+// the export handler just awaits the cached promise.
+
+/** Async encoder list — parse the full -encoders table. */
+async function listEncodersAsync() {
+  const r = await ffmpegCapture(["-hide_banner", "-encoders"], 10000);
+  if (r.code !== 0) return [];
+  const out = r.out;
+  const order = [
+    { name: "h264_nvenc", label: "NVIDIA NVENC" },
+    { name: "h264_qsv", label: "Intel Quick Sync (QSV)" },
+    { name: "h264_amf", label: "AMD AMF" },
+  ];
+  return order.filter((e) => out.includes(e.name));
+}
+
+/** Runtime probe — actually encode REAL 1080p content and GATE ON
+ * THROUGHPUT (v1.1). Listed ≠ working (drivers can be broken), and a
+ * listed-but-crawling encoder is worse than none — see the header comment.
+ * 48 frames of 1080p30 testsrc2 ≈ 1.6 s of real video: healthy hardware
+ * paths finish in < 1 s; broken ones blow the 12 s timeout or the fps
+ * floor. Returns the measured fps (0 when rejected). v1.3: `extraArgs`
+ * lets the libx264 baseline probe match the real export preset
+ * (veryfast + crf 20) so the GPU-vs-CPU comparison is apples-to-apples.
+ * v7 Step 1: `preInputArgs` carries ffmpeg GLOBAL options that must ride
+ * BEFORE the input — Intel QSV on Windows needs an explicitly derived
+ * d3d11va→qsv device session or the encoder init can silently fail (the
+ * exact iGPU machines this pass targets). */
+async function probeEncoderAsync(name, extraArgs = [], preInputArgs = []) {
+  const FRAMES = 48;
+  const t0 = Date.now();
+  const r = await ffmpegCapture([
+    "-hide_banner", "-loglevel", "error",
+    ...preInputArgs,
+    "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30",
+    "-frames:v", String(FRAMES),
+    "-c:v", name, ...extraArgs, "-pix_fmt", "yuv420p",
+    "-f", "null", "-",
+  ], 12000);
+  if (r.code !== 0) return 0;
+  const sec = Math.max(0.001, (Date.now() - t0) / 1000);
+  return FRAMES / sec; // effective fps (probe includes encoder init)
+}
+
+/**
+ * v1.1: minimum effective probe throughput for a hardware encoder to be
+ * trusted with a real export (fps over the 48-frame 1080p probe).
+ * v1.3: raised 12 → 24 fps AND gated against the measured CPU baseline —
+ * a hardware encoder must be BOTH absolutely plausible (≥ 24 fps) and
+ * RELATIVELY better than the same machine's libx264 veryfast (≥ 1.2×) to
+ * be selected. A GPU path slower than the CPU alternative is exactly the
+ * "hardware acceleration" trap that turned exports into multi-hour jobs.
+ */
+const GPU_PROBE_MIN_FPS = 24;
+const GPU_VS_CPU_RATIO = 1.2;
+
+async function detectGpuEncoderAsync() {
+  // v8.1: forced encoder bypasses the throughput probe entirely. If the
+  // binary lacks the encoder we still return the forced pick — the export
+  // then fails with ffmpeg's real stderr (the diagnostic signal), and the
+  // log below states the build-level fact separately.
+  if (forcedEncoderKey) {
+    const spec = FORCE_ENCODER_MAP[forcedEncoderKey];
+    if (spec.name !== "libx264") {
+      try {
+        const build = await listEncodersAsync();
+        if (!build.some((e) => e.name === spec.name)) {
+          console.error(
+            `Export encoder: FORCED ${spec.name} is NOT compiled into this FFmpeg build — ` +
+            `the driver cannot be tested with this binary; the export will fail with ffmpeg's error`,
+          );
+        }
+      } catch (_) { /* best-effort build check */ }
+    }
+    console.log(`Export encoder: ${spec.label} — probe BYPASSED (forced via Export tab)`);
+    detectedEncoder = spec;
+    encoderDetecting = null;
+    return spec;
+  }
+  if (detectedEncoder) return detectedEncoder;
+  if (encoderDetecting) return encoderDetecting;
+  encoderDetecting = (async () => {
+    let pick = { name: "libx264", label: "CPU (libx264)" };
+    try {
+      const candidates = await listEncodersAsync();
+      // v1.3: measure the CPU baseline ONLY when a hardware candidate
+      // exists (CPU-only boxes skip the extra probe entirely).
+      let cpuFps = 0;
+      let cpuMeasured = false;
+      for (const cand of candidates) {
+        // v6: probe with the REAL tier args (gpuProbeSpec) so arg-shape
+        // failures (unsupported -multipass/-b_ref_mode on old drivers)
+        // disqualify the candidate here, never mid-export.
+        // v7 Step 1: QSV probes through an EXPLICIT d3d11va→qsv device
+        // derivation — without it, Quick Sync encoder init can silently
+        // fail on Windows iGPU driver stacks and the probe falls back to
+        // CPU even though the hardware encodes at 120+ fps. AMF needs no
+        // explicit device (it creates its own context); NVENC neither.
+        const spec = gpuProbeSpec(cand.name);
+        const fps = await probeEncoderAsync(cand.name, spec.enc, spec.pre);
+        if (fps >= GPU_PROBE_MIN_FPS) {
+          if (!cpuMeasured) {
+            // v1.12: the baseline matches the REAL social-tier export args
+            // (superfast + fastdecode + crf 22) so the GPU-vs-CPU
+            // comparison stays apples-to-apples with what ships.
+            cpuFps = await probeEncoderAsync("libx264", ["-preset", "superfast", "-tune", "fastdecode", "-crf", "22"]);
+            cpuMeasured = true;
+          }
+          if (fps >= Math.max(GPU_PROBE_MIN_FPS, cpuFps * GPU_VS_CPU_RATIO)) {
+            pick = cand;
+            console.log(`Export encoder: ${pick.label} (${pick.name}, probe ${fps.toFixed(0)} fps vs CPU ${cpuFps.toFixed(0)} fps)`);
+            break;
+          }
+          // Listed + passes the absolute floor but LOSES to the CPU —
+          // trust the predictable CPU path instead.
+          console.warn(`Export encoder: ${cand.name} probed ${fps.toFixed(1)} fps but CPU libx264 measures ${cpuFps.toFixed(0)} fps — using CPU (GPU not ≥ ${GPU_VS_CPU_RATIO}× faster)`);
+        } else if (fps > 0) {
+          // Probe completed but crawled — log it: this is exactly the
+          // machine state that used to turn exports into 5–10 hour jobs.
+          console.warn(`Export encoder: ${cand.name} probed OK but only ${fps.toFixed(1)} fps (< ${GPU_PROBE_MIN_FPS}) — treating as broken, trying next`);
+        }
+      }
+    } catch (_) { /* fall back to CPU */ }
+    detectedEncoder = pick;
+    if (pick.name === "libx264") console.log("Export encoder: CPU (libx264)");
+    return pick;
+  })();
+  return encoderDetecting;
+}
+
+// ---------------------------------------------------------------------------
+// v1.13 ADAPTIVE HARDWARE MATRIX (user directive) — three hardware tiers,
+// resolved once per export from the encoder probe + the CPU topology:
+//
+//   ┌── working NVENC / QSV / AMF? ──► TIER 1 · GPU ASIC (2 workers)
+//   ├── ≥ 6 logical cores ─────────► TIER 2 · modern multicore
+//   │   (min(4, cores/2) × 2-thread workers, superfast-class x264)
+//   └── ≤ 4 cores / legacy APU ─────► TIER 3 · constrained CPU
+//       (2 workers × 2 threads, ultrafast + -bf 0, low-cost subtitles)
+//
+// The field report that motivated this: v1.12's flat "≥4 cores → STRICTLY
+// 4 × 1-thread workers" was exactly wrong for 4-core dual-module APUs (AMD
+// A8-5550M-class Piledriver): 2 modules share 1 FPU + 1 L2 each, so 4
+// single-threaded ffmpeg processes thrashed the shared units harder than
+// the single process they replaced. One worker per physical module
+// (2 × 2 threads) is the shape those chips actually schedule well.
+// ---------------------------------------------------------------------------
+let hardwareProfileCache = null;
+
+// ---------------------------------------------------------------------------
+// v1.14.1 ACCURATE CPU TOPOLOGY (user directive: "cpu cores detecting is
+// not accurate"). os.cpus().length counts SMT THREADS — a 4C/8T machine
+// reported "8 CPU cores" (the v1.13 tier gate AND the About strip consumed
+// that inflated number). This resolver measures the REAL shape:
+//   • logical          — os.cpus().length (threads; what the OS schedules)
+//   • physical         — Windows: wmic NumberOfCores (fast) with a
+//                        PowerShell CIM fallback (wmic is gone on 24H2+);
+//                        both summed across sockets. Other platforms or
+//                        tool failure: an SMT heuristic.
+//   • effectivePhysical — the STRONG-core count the tier gate consumes.
+//                        AMD module-era chips (A4/A6/A8/A10/A12-xxxx APUs,
+//                        FX-, E-series — the A8-5550M class) expose 2
+//                        int-cores per module sharing 1 FPU + 1 L2, so
+//                        Windows' "4 cores" is 2 strong modules → logical/2.
+// The UI shows BOTH numbers ("2 cores · 4 threads") so it can be verified
+// against Task Manager → Performance → CPU.
+// ---------------------------------------------------------------------------
+let cpuTopologyCache = null;
+let cpuTopologyDetecting = null;
+
+function cpuTopologyNote(topo) {
+  if (topo.amdModule) {
+    const per = topo.logical / topo.effectivePhysical;
+    return `${topo.effectivePhysical} module${topo.effectivePhysical > 1 ? "s" : ""} · ${topo.logical} threads (AMD CMT: ${per} int-cores/module, shared FPU/L2)`;
+  }
+  if (topo.logical > topo.physical) return `${topo.physical} cores · ${topo.logical} threads (SMT)`;
+  return `${topo.physical} cores · ${topo.logical} threads`;
+}
+
+async function detectCpuTopology() {
+  if (cpuTopologyCache) return cpuTopologyCache;
+  if (cpuTopologyDetecting) return cpuTopologyDetecting;
+  cpuTopologyDetecting = (async () => {
+    const cpus = os.cpus() || [];
+    const logical = Math.max(1, cpus.length);
+    const model = (cpus[0] && cpus[0].model) || "unknown";
+    let physical = 0;
+    let source = "os";
+    if (process.platform === "win32") {
+      try {
+        const out = await new Promise((resolve, reject) => {
+          execFile(
+            "wmic",
+            ["cpu", "get", "NumberOfCores,NumberOfLogicalProcessors", "/format:csv"],
+            { timeout: 12000 },
+            (err, stdout) => (err ? reject(err) : resolve(String(stdout || ""))),
+          );
+        });
+        let cores = 0;
+        for (const line of out.split(/\r?\n/)) {
+          const cells = line.split(",").map((s) => s.trim());
+          if (cells.length >= 3 && /^\d+$/.test(cells[cells.length - 2]) && /^\d+$/.test(cells[cells.length - 1])) {
+            cores += parseInt(cells[cells.length - 2], 10);
+          }
+        }
+        if (cores > 0) { physical = cores; source = "wmic"; }
+      } catch (_) { /* try CIM below */ }
+      if (!(physical > 0)) {
+        try {
+          const out = await new Promise((resolve, reject) => {
+            execFile(
+              "powershell",
+              ["-NoProfile", "-Command", "(Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfCores -Sum).Sum"],
+              { timeout: 20000 },
+              (err, stdout) => (err ? reject(err) : resolve(String(stdout || ""))),
+            );
+          });
+          const cores = parseInt(out.trim(), 10);
+          if (cores > 0) { physical = cores; source = "cim"; }
+        } catch (_) { /* heuristic below */ }
+      }
+    }
+    // AMD module-era (Piledriver/Trinity/Richland APUs + FX) — NOT Ryzen
+    // (Ryzen cores are real, SMT optional, and wmic already told the truth).
+    const amdModule =
+      /amd/i.test(model) &&
+      !/ryzen|threadripper|epyc/i.test(model) &&
+      (/\bA[468]-\d{4}[A-Z]?\b/.test(model) ||
+        /\bA1[02]-\d{4}[A-Z]?\b/.test(model) ||
+        /\bE[12]-\d{3,4}\b/.test(model) ||
+        /\bFX-?\d{2,4}\b/.test(model) ||
+        /\bAPU\b/.test(model));
+    if (!(physical > 0)) {
+      // Heuristic fallback when the OS tools are unavailable.
+      if (amdModule) physical = Math.max(1, Math.round(logical / 2));
+      else if (/intel/i.test(model) && logical >= 4 && logical % 2 === 0 && /(i[3-9]|Xeon|Core)/i.test(model)) physical = logical / 2;
+      else physical = logical;
+      source = "heuristic";
+    }
+    const effectivePhysical = amdModule ? Math.max(1, Math.round(logical / 2)) : Math.max(1, physical);
+    const topo = { logical, physical: Math.max(1, physical), effectivePhysical, amdModule, model, source };
+    topo.note = cpuTopologyNote(topo);
+    console.log(`[Hardware] CPU topology: ${topo.note} · ${model} (${source})`);
+    cpuTopologyCache = topo;
+    return topo;
+  })();
+  return cpuTopologyDetecting;
+}
+// Warm the detection at startup (~100-300 ms, once per app launch) so the
+// first app-info / export-info / export call never waits on it.
+detectCpuTopology().catch(() => {});
+
+/** Pure tier resolver. Tier 1 is only reached when the FPS-gated encoder
+ * probe above verified a REAL working ASIC (listed ≠ working; a crawling
+ * encoder is worse than none).
+ *
+ * v1.14.1: the tier gate consumes STRONG physical cores (topology-aware),
+ * not SMT-thread-inflated logical counts:
+ *   • Tier 2 = ≥4 strong cores (covers 4C/4T and 4C/8T desktop/laptop
+ *     CPUs the old "≥6 logical" gate mis-filed into Tier 3).
+ *   • Tier 3 = ≤3 strong cores, INCLUDING the AMD module-era APUs
+ *     (effectivePhysical halves their int-core count). */
+function resolveHardwareProfile(gpuCapabilities, topo) {
+  const logical = Math.max(1, topo.logical);
+  const strongCores = Math.max(1, topo.effectivePhysical);
+  let profile;
+  if (gpuCapabilities.hasNvenc) {
+    profile = { tier: "TIER_1_GPU", tierLabel: "Tier 1 · GPU hardware encode", encoder: "h264_nvenc", workers: 2, threadsSpec: 6, optimizeSubtitles: false };
+  } else if (gpuCapabilities.hasQsv) {
+    profile = { tier: "TIER_1_GPU", tierLabel: "Tier 1 · GPU hardware encode", encoder: "h264_qsv", workers: 2, threadsSpec: 6, optimizeSubtitles: false };
+  } else if (gpuCapabilities.hasAmf) {
+    profile = { tier: "TIER_1_GPU", tierLabel: "Tier 1 · GPU hardware encode", encoder: "h264_amf", workers: 2, threadsSpec: 6, optimizeSubtitles: false };
+  } else if (strongCores >= 4) {
+    profile = { tier: "TIER_2_MODERN_CPU", tierLabel: "Tier 2 · modern multicore CPU", encoder: "libx264", workers: Math.max(2, Math.min(4, Math.floor(strongCores / 2))), threadsSpec: 2, optimizeSubtitles: false };
+  } else {
+    profile = { tier: "TIER_3_CONSTRAINED_CPU", tierLabel: "Tier 3 · constrained CPU", encoder: "libx264", workers: 2, threadsSpec: 2, optimizeSubtitles: true };
+  }
+  profile.cpuCount = logical; // v1.12.1 telemetry field: logical processors
+  profile.cpuLogical = logical;
+  profile.cpuPhysical = strongCores; // module-aware strong cores
+  profile.cpuModel = topo.model;
+  profile.cpuTopology = topo.note;
+  // threadsPerWorker: the tier spec, clamped so workers × threads never
+  // exceeds the logical thread count (a 2-core Tier-3 box → 1 thread each).
+  profile.threadsPerWorker = Math.max(1, Math.min(profile.threadsSpec, Math.floor(logical / profile.workers) || 1));
+  // v1.14.1 (user directive: "export speed significantly reduced"): the
+  // FILTER-pool width — PROCESS parallelism for filter-dominated
+  // timelines. Every ffmpeg's zoompan/scale/libass chain is single-threaded
+  // PER PROCESS, so process count — not x264 threads — is what fills the
+  // machine when filters dominate (image/Ken Burns storyboards). Tier 3
+  // widens to min(4, logical): the 4-thread dual-module APUs get the
+  // v1.12.1 shape back for exactly this workload (v1.13's 2×2 windows
+  // halved their filter throughput). Tier 1/2 keep the encode shape
+  // (Tier 2 already runs 3-4 workers; its x264 threading is the win).
+  // v1.15.0: Tier 1 (GPU ASIC encode) widens the FILTER pool too — the
+  // encoder moved to the GPU but the zoompan/scale/libass chains stay
+  // CPU-side and single-threaded PER PROCESS, so 2 filter processes left
+  // NVENC boxes CPU-starved on image/Ken Burns storyboards (the exact
+  // workload the Tier-3 recipe widened for in v1.14.1 — the GPU encode is
+  // nowhere near saturated when filters are the wall). Capped at 4 with
+  // a logical/2 floor; concurrent NVENC sessions are fine at 4 on any
+  // driver from 2023+ (5+ allowed), and filter-bound windows mean the
+  // ASIC never saturates (the v6 "sessions fight" doctrine applied to
+  // ENCODE-bound pools, not filter-bound ones).
+  profile.filterWorkers =
+    profile.tier === "TIER_3_CONSTRAINED_CPU"
+      ? Math.max(profile.workers, Math.min(4, logical))
+      : profile.tier === "TIER_1_GPU"
+        ? Math.max(3, Math.min(4, Math.floor(logical / 2)))
+        : profile.workers;
+  return profile;
+}
+
+/** Async wrapper — derives the GPU caps from the (cached, force-aware)
+ * encoder probe + the measured CPU topology, caches the profile per
+ * encoder+topology, and logs the selection once per resolution. */
+async function getHardwareProfile() {
+  const enc = await detectGpuEncoderAsync();
+  const topo = await detectCpuTopology();
+  const key = `${enc.name}|${topo.logical}|${topo.effectivePhysical}`;
+  if (hardwareProfileCache && hardwareProfileCache.key === key) {
+    return hardwareProfileCache.profile;
+  }
+  const gpuCapabilities = {
+    hasNvenc: enc.name === "h264_nvenc",
+    hasQsv: enc.name === "h264_qsv",
+    hasAmf: enc.name === "h264_amf",
+  };
+  const profile = resolveHardwareProfile(gpuCapabilities, topo);
+  // v1.14.5: the ffmpeg-level capability matrix (decode methods + GPU
+  // filters), detected separately from the encoder probe — carried on the
+  // profile + into the export result payload.
+  profile.hwCaps = await detectHwCapsAsync();
+  hardwareProfileCache = { key, profile };
+  console.log(
+    `[Hardware] ${profile.tier} — ${profile.encoder} · ${profile.workers} workers × ${profile.threadsPerWorker} thread(s)` +
+      `${profile.filterWorkers !== profile.workers ? ` (image-heavy exports widen to ${profile.filterWorkers}×1)` : ""}` +
+      ` · ${profile.cpuTopology} · ${profile.cpuModel}`,
+  );
+  return profile;
+}
+
+// ---------------------------------------------------------------------------
+// v1.4.2 HARDWARE DECODE PROBE — per source file, throughput-gated.
+//
+// v1.1 shipped hw decode UNCONDITIONALLY OFF (-hwaccel auto could silently
+// land on a WARP/broken-driver path decoding 1080p at ~1 fps). But CPU
+// decode of 4K/H.265 sources is a real bottleneck on the re-encode path —
+// so instead of a blanket flag, we MEASURE: decode 48 real frames of
+// the ACTUAL file twice (CPU vs -hwaccel <TOKEN>). Cached per path
+// (memory + the v1.14.4 disk verdict, 24 h TTL); any
+// error → never a failed export.
+//
+// v1.12 (user directive) — TRI-STATE verdict, d3d11va-first with a
+// graceful `-hwaccel auto` fallback:
+//   • d3d11va arm runs clean (exit 0) and is NOT SLOWER than the CPU arm
+//     (≤ +5 %) → ride the explicit token. v1.14.4 (field report: "after
+//     v12 and v13 export speed became terrible"): v1.12's relaxed "ride
+//     unless ≥ 1.5× slower" gate let a 10–50 %-slower d3d11va path drag
+//     every worker on exactly the constrained iGPUs it claimed to help —
+//     the "frees CPU cycles" theory only holds when the ASIC decode is
+//     real and fast; on old driver stacks the per-frame system-memory
+//     download IS the bottleneck. Ride hardware decode only when it
+//     measured not-slower.
+//   • d3d11va arm FAILS to run (non-zero exit — broken driver / missing
+//     D3D11) → fall back to `-hwaccel auto`: ffmpeg walks the remaining
+//     hwaccel methods and lands on software decode internally if none
+//     initialize. The export never depends on the hwaccel engaging.
+//   • d3d11va runs but slower than CPU → stay on pure CPU decode; the
+//     ≥ 1.5× case (the WARP pathology — a software D3D11 adapter as the
+//     default device) keeps its distinct log line because "auto" would
+//     select the same broken path again.
+// ---------------------------------------------------------------------------
+const hwDecodeCache = new Map();
+
+/** v1.14.4: the pure gate over the two measured arms. Kept separate (and
+ * exported) so the harness can unit-verify the policy WITHOUT spawning
+ * ffmpeg. Returns true (ride the token) / false (CPU) — the "auto" verdict
+ * is decided by the caller (init-failure arm, no timing to compare).
+ *
+ * THE v1.12 REGRESSION THIS REVERTS: "ride d3d11va unless it is ≥ 1.5×
+ * SLOWER" let a 10–50 %-slower hardware-decode path (old iGPU drivers,
+ * system-memory download on bandwidth-starved APUs) ride EVERY re-encode
+ * worker input — decode is a pipeline stage, so a slower arm drags the
+ * whole worker. v1.10/1.11 required hw decode to be ≥ 1.3× FASTER; v1.14.4
+ * rides it only when it measured NOT slower (≤ +5 % — measurement noise
+ * margin). The WARP pathology (≥ 1.5× slower) keeps its distinct log line
+ * so field reports stay diagnosable. */
+function hwDecodeGate(cpuMs, gpuMs) {
+  if (!(cpuMs > 0) || !(gpuMs > 0)) return false;
+  if (gpuMs <= cpuMs * 1.05) return true; // hw arm not slower → ride it
+  return false; // 1.05×–∞ slower → CPU decode
+}
+
+async function probeHwDecode(p) {
+  if (hwDecodeCache.has(p)) return hwDecodeCache.get(p);
+  // v1.14.4: DISK-persisted verdict (path|mtime|size, 24 h TTL) — the
+  // in-memory Map was session-only, so every app restart re-paid the two
+  // probe arms (2 × 72-frame 1080p decodes, 4–12 s per ≥20 s source on the
+  // constrained CPUs this probe gates) before the first frame encoded.
+  let diskKey = null;
+  try {
+    const st = fs.statSync(p);
+    diskKey = `${p}|${Math.round(st.mtimeMs)}|${st.size}`;
+    loadProbeDisk();
+    const hw = probeDisk.hwDecode || {};
+    const e = hw[diskKey];
+    if (
+      e &&
+      Date.now() - e.t < PROBE_TTL_MS &&
+      (e.verdict === true || e.verdict === false || e.verdict === "auto")
+    ) {
+      hwDecodeCache.set(p, e.verdict);
+      return e.verdict;
+    }
+  } catch (_) { /* no stat / unreadable disk cache — probe anyway */ }
+  // Tri-state: true → the explicit platform token (d3d11va on Windows);
+  // "auto" → d3d11va init-failed, graceful auto fallback; false → CPU.
+  let verdict = false;
+  try {
+    // v1.14.4: 72 → 48 frames — 33 % cheaper probe with the same verdict
+    // stability (the gate now compares medians of multi-second runs, not
+    // noise; WARP is ≥ 1.5× off and survives any frame count).
+    const FRAMES = 48;
+    const arm = (hw) => [
+      "-hide_banner", "-loglevel", "error",
+      ...(hw ? ["-hwaccel", G.HWACCEL_TOKEN] : []),
+      "-i", p,
+      "-map", "0:v:0",
+      "-frames:v", String(FRAMES),
+      "-f", "null", "-",
+    ];
+    const t0 = Date.now();
+    const cpu = await ffmpegCapture(arm(false), 20000);
+    if (cpu.code === 0) {
+      const cpuMs = Math.max(1, Date.now() - t0);
+      const t1 = Date.now();
+      const gpu = await ffmpegCapture(arm(true), 20000);
+      if (gpu.code !== 0) {
+        // D3D11VA init failed on this machine — the graceful auto fallback.
+        verdict = "auto";
+        console.log(`hw-decode probe ${p}: d3d11va init FAILED → -hwaccel auto fallback`);
+      } else {
+        const gpuMs = Math.max(1, Date.now() - t1);
+        if (hwDecodeGate(cpuMs, gpuMs)) {
+          verdict = true;
+          console.log(`hw-decode probe ${p}: cpu ${cpuMs}ms vs hw ${gpuMs}ms → ENABLED (hw not slower)`);
+        } else if (gpuMs >= cpuMs * 1.5) {
+          verdict = false;
+          console.log(`hw-decode probe ${p}: cpu ${cpuMs}ms vs hw ${gpuMs}ms → cpu (≥1.5× slower — WARP-like path, auto would pick it again)`);
+        } else {
+          verdict = false;
+          console.log(`hw-decode probe ${p}: cpu ${cpuMs}ms vs hw ${gpuMs}ms → cpu (hw ${(gpuMs / cpuMs).toFixed(2)}× slower — v1.14.4 gate: ride hw only when not slower)`);
+        }
+      }
+    }
+  } catch (_) { verdict = false; }
+  hwDecodeCache.set(p, verdict);
+  if (diskKey) {
+    try {
+      if (!probeDisk.hwDecode) probeDisk.hwDecode = {};
+      probeDisk.hwDecode[diskKey] = { t: Date.now(), verdict };
+      // Synchronous flush (not the 2 s debounced probeDisk save): hw-decode
+      // verdicts are rare (≤1 per ≥20 s source, 24 h TTL) and the sync write
+      // guarantees the verdict survives even a process that exits within the
+      // debounce window — the whole point of the disk cache.
+      fs.writeFileSync(probeDiskPath(), JSON.stringify(probeDisk));
+    } catch (_) { /* best-effort persistence */ }
+  }
+  return verdict;
+}
+
+/** Build encoder args for a quality-first, speed-optimized encode.
+ * v4.5: the `quality` profile ("draft" | "social" | "cinema" | "custom")
+ * drives CRF/cq + the encoder speed preset; `crf` is the explicit target
+ * used when quality === "custom". "social" keeps the exact v4.4 behavior.
+ * v6 PHASE 1 (throughput pass — the quality LADDER is unchanged: same
+ * CRF/CQ targets per tier, same yuv420p uniform output):
+ *   - NVENC: the constrained-VBR pair (-maxrate/-bufsize) is GONE — at a
+ *     CQ target it only added a rate-control pass (~15-25% throughput)
+ *     without changing the CQ-driven quality decisions. -multipass qres
+ *     keeps quarter-resolution rate decisions at a fraction of the cost.
+ *     b_ref_mode=middle rides the quality tiers (B-frames as refs, Pascal+
+ *     feature — the runtime probe validates the exact arg shape before an
+ *     encoder is ever trusted with a real export).
+ *   - libx264: draft drops veryfast → ultrafast (draft is explicitly the
+ *     speed tier); social/cinema presets unchanged.
+ * v1.12 (user directive): the libx264 speed tiers drop veryfast →
+ *   superfast + `-tune fastdecode` + crf 22 everywhere (not just the
+ *   ≤4-core low-end fallback). superfast disables the heavy motion-
+ *   estimation search patterns whose quality difference is negligible on
+ *   streaming platforms, roughly doubling encode throughput on budget
+ *   CPUs; fastdecode drops CABAC-side work that also slows the PREVIEW
+ *   decode of the exported file. cinema keeps its faster/crf 17 master
+ *   tier and draft keeps ultrafast — the speed tier stays the speed tier.
+ * v1.13 (Adaptive Hardware Matrix): the last param is the hardware TIER
+ *   string. Tier 3 (constrained CPUs) drops the speed tiers to ultrafast +
+ *   crf 24 + -bf 0; every CPU tier rides -g 60. GPU rows unchanged (the
+ *   runtime probe validated those exact arg shapes). */
+const QUALITY_ENCODER = {
+  draft:  { crf: 27, x264: "ultrafast", nvencPreset: "p1", nvencCq: 27, qsvQ: 27, amfI: 26, amfP: 28 },
+  // v1.12: social veryfast/crf20 → superfast/crf22 + -tune fastdecode (see
+  // encoderArgs) — the 46-min → sub-15-min push on the 4-core target.
+  social: { crf: 22, x264: "superfast", nvencPreset: "p4", nvencCq: 23, qsvQ: 23, amfI: 22, amfP: 24 },
+  // v5.2 SPEED: cinema x264 preset medium → faster. Open-source editors
+  // (Shotcut/Kdenlive) default to faster-class presets — ~2× faster than
+  // medium at a visually indistinguishable CRF 17 master.
+  cinema: { crf: 17, x264: "faster",  nvencPreset: "p6", nvencCq: 19, qsvQ: 19, amfI: 19, amfP: 21 },
+};
+
+function encoderArgs(encoderName, bitrateMbps, width, height, quality, crf, hardwareTier, speedProfile) {
+  const q = QUALITY_ENCODER[quality] || QUALITY_ENCODER.social;
+  const crfVal = quality === "custom" ? Math.max(14, Math.min(30, Number(crf) || 20)) : q.crf;
+  // v1.13: the old lowEnd boolean is now the hardware TIER string.
+  const t3 = hardwareTier === "TIER_3_CONSTRAINED_CPU";
+  // v1.14.5 FAST ENCODER PROFILE (export-speed plan §10): the render-cost
+  // strategy resolves "fast" for encode-bound exports — the speed knobs
+  // ride every encoder family (NVENC p1 + multipass/lookahead/AQ disabled;
+  // x264 drops to ultrafast on the speed tiers). Cinema is NEVER
+  // fast-profiled (it is explicitly the quality tier).
+  const fast = speedProfile === "fast" && quality !== "cinema";
+  switch (encoderName) {
+    case "h264_nvenc": {
+      // v6: unconstrained constant-quality VBR — no maxrate/bufsize, CQ per
+      // tier, quarter-res multipass; B-frames-as-refs on the quality tiers.
+      // v1.14.5 fast profile: p1 + -multipass disabled + lookahead/spatial-AQ
+      // off + no hq tune — the minimal-analysis shape for encode-bound
+      // timelines (the plan: "do not make the quality-oriented configuration
+      // your fastest export mode").
+      const cq = quality === "custom" ? crfVal : q.nvencCq;
+      const args = ["-c:v", "h264_nvenc", "-preset", fast ? "p1" : q.nvencPreset, "-rc", "vbr", "-cq", String(cq), "-b:v", "0"];
+      if (fast) {
+        args.push("-multipass", "disabled", "-rc-lookahead", "0", "-spatial_aq", "0");
+      } else {
+        args.push("-multipass", "qres");
+        if (quality !== "draft") args.push("-tune", "hq", "-b_ref_mode", "middle");
+      }
+      args.push("-pix_fmt", "yuv420p");
+      return args;
+    }
+    case "h264_qsv":
+      // v1.14.5: the fast profile keeps QSV's veryfast (already the fastest
+      // stable preset on iGPU stacks) — only the explicit knobs drop.
+      return ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", String(quality === "custom" ? crfVal : q.qsvQ), "-look_ahead", "0", "-pix_fmt", "yuv420p"];
+    case "h264_amf":
+      // v1.14.5: fast profile → AMF "speed" usage (the minimal-analysis tier).
+      return ["-c:v", "h264_amf", "-quality", quality === "cinema" ? "quality" : (fast ? "speed" : "balanced"), "-rc", "vbr_peak", "-qp_i", String(quality === "custom" ? crfVal : q.amfI), "-qp_p", String((quality === "custom" ? crfVal : q.amfP) + 2), "-b:v", `${bitrateMbps || 8}M`, "-pix_fmt", "yuv420p"];
+    default: {
+      // libx264 — v1.13 Adaptive Hardware Matrix. Tier 2 (≥6 modern
+      // cores) keeps the v1.12 ladder (superfast speed tiers + fastdecode;
+      // cinema keeps the faster-preset crf-17 master WITHOUT it). Tier 3
+      // (≤4 cores / dual-module APUs / budget quads) drops everything one
+      // notch: ultrafast + -bf 0 on the speed tiers (the B-frame motion
+      // search fights the shared module FPU for the same cycles), social
+      // rides crf 24 (ultrafast ≈ +2 CRF vs superfast at equal perceived
+      // quality — same picture, smaller file, none of the search cost),
+      // and cinema stays superfast to keep the crf-17 master watchable.
+      // Every CPU tier rides -g 60 (2 s GOPs at 30 fps — cheap seeking
+      // insurance on long exports).
+      let preset;
+      let tierCrf = crfVal;
+      if (t3) {
+        preset = quality === "cinema" ? "superfast" : "ultrafast";
+        if (quality === "social") tierCrf = 24;
+      } else {
+        // v1.14.5: the fast encoder profile drops the Tier-2 speed tiers one
+        // notch (superfast → ultrafast) — same shape Tier 3 already rides.
+        preset = quality === "cinema" ? q.x264 : (quality === "draft" || fast ? "ultrafast" : q.x264);
+      }
+      const args = ["-c:v", "libx264", "-preset", preset, "-crf", String(tierCrf)];
+      if (preset === "superfast" || preset === "ultrafast") {
+        args.push("-tune", "fastdecode");
+      }
+      args.push("-g", "60");
+      if (t3) args.push("-bf", "0");
+      args.push("-pix_fmt", "yuv420p");
+      return args;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// v1.14.5 RENDER-COST SCORE (export-speed plan §11 — Phase 9). Replaces the
+// duration-based Fast Mode trigger ("Tier 3 AND mostly dirty AND ≥240 s AND
+// 1080p AND not cinema") with a composite WORKLOAD score so a 3:59 export
+// no longer behaves completely differently from a 4:01 one: the boundary now
+// sits in total-work space, where effects/resolution/fps/duration all move
+// it together.
+//
+//   pixelCost = rendered pixel-frames (billions): W·H·fps·dirtySec — clean
+//               stream-copied spans cost ≈0 (they are remuxed, not rendered)
+//   effectCost = per-frame work multiplier: each active effect raises the
+//               cost of EVERY rendered frame (captions ≈ ×2, each overlay
+//               +0.4, chromakey +0.6, Ken Burns +0.15/img, transitions
+//               +0.1/boundary — capped contributions)
+//   score      = pixelCost × effectCost
+//
+//   LOW (< 3)        normal
+//   MEDIUM (3–8)     optimized (default machinery)
+//   HIGH (≥ 8)       fast encoder profile (+ slideshow 24 fps, separately)
+//   VERY HIGH (≥ 14) 720p-class fast mode (Tier 3 + no clean pieces + never
+//                    cinema + the never-silent toast/off switch)
+//
+// Audio is deliberately NOT in the score: the audio bus runs CONCURRENT
+// with the video pool (v1.14.2) — dropping resolution for an audio-bound
+// export would be the wrong lever. Its cost is recorded in the profiler
+// telemetry instead.
+// Calibration anchor: 1920×1080·30fps·240 s full-dirty effectless = 14.93 —
+// the exact v1.14.4 trigger case — sits just above the VERY HIGH line.
+// ---------------------------------------------------------------------------
+function estimateRenderCost(o) {
+  const width = Math.max(1, Number(o && o.width) || 1);
+  const height = Math.max(1, Number(o && o.height) || 1);
+  const fps = Math.max(1, Number(o && o.fps) || 30);
+  const durationSec = Math.max(0, Number(o && o.durationSec) || 0);
+  const dirtySec = Math.min(durationSec, Math.max(0, Number(o && o.dirtySec) || 0));
+  const pixelCost = (width * height * fps * dirtySec) / 1e9;
+  let effectCost = 1;
+  if (o && o.captions) effectCost += 1;
+  if (o && o.headlines) effectCost += 0.5;
+  effectCost += Math.min(8, Math.max(0, Number(o && o.overlayCount) || 0)) * 0.4;
+  effectCost += Math.min(8, Math.max(0, Number(o && o.chromaCount) || 0)) * 0.6;
+  effectCost += Math.min(40, Math.max(0, Number(o && o.kenBurnsCount) || 0)) * 0.15;
+  effectCost += Math.min(40, Math.max(0, Number(o && o.transitionCount) || 0)) * 0.1;
+  const score = pixelCost * effectCost;
+  const strategy = score >= 14 ? "VERY_HIGH" : score >= 8 ? "HIGH" : score >= 3 ? "MEDIUM" : "LOW";
+  return {
+    score: Math.round(score * 100) / 100,
+    pixelCost: Math.round(pixelCost * 100) / 100,
+    effectCost: Math.round(effectCost * 100) / 100,
+    strategy,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// v1.14.5 CAPABILITY MATRIX (export-speed plan Phase 7, detection half):
+// ffmpeg-level hardware DECODE methods + GPU FILTER availability, detected
+// SEPARATELY from the encoder probe (a machine can have "GPU encoder = yes,
+// GPU filter = no"). Routing on this matrix is the Release-C GPU-compositor
+// work; today it is logged + carried in the export result payload so field
+// reports state exactly what the build supports.
+// ---------------------------------------------------------------------------
+let hwCapsCache = null;
+let hwCapsDetecting = null;
+function detectHwCapsAsync() {
+  if (hwCapsCache) return Promise.resolve(hwCapsCache);
+  if (hwCapsDetecting) return hwCapsDetecting;
+  hwCapsDetecting = (async () => {
+    const caps = { hwaccels: [], gpuFilters: [] };
+    // `-hwaccels` is a sub-second listing, but on a fully-saturated 2-core
+    // box a fresh ffmpeg spawn can exceed a tight timeout — retry once
+    // before settling on the empty (best-effort) matrix.
+    const listHwaccels = async () => {
+      try {
+        const r = await ffmpegCapture(["-hide_banner", "-hwaccels"], 15000);
+        const lines = String((r && r.out) || "").split(/\r?\n/);
+        const hdr = lines.findIndex((l) => /^Hardware acceleration methods:/i.test(String(l).trim()));
+        return (hdr >= 0 ? lines.slice(hdr + 1) : lines)
+          .map((l) => String(l).trim())
+          .filter((l) => /^[a-z0-9_]+$/i.test(l));
+      } catch (_) { return []; }
+    };
+    caps.hwaccels = await listHwaccels();
+    if (caps.hwaccels.length === 0) caps.hwaccels = await listHwaccels();
+    try {
+      const r = await ffmpegCapture(["-hide_banner", "-filters"], 15000);
+      const text = String((r && r.out) || "");
+      const wanted = [
+        "scale_cuda", "overlay_cuda", "chromakey_cuda", "hwupload_cuda", "scale_npp",
+        "scale_qsv", "overlay_qsv", "vpp_qsv", "hwupload", "hwdownload", "hwmap",
+      ];
+      for (const n of wanted) {
+        if (text.includes(` ${n} `)) caps.gpuFilters.push(n);
+      }
+    } catch (_) { /* best-effort */ }
+    if (caps.hwaccels.length === 0) {
+      console.warn("[Hardware] capability matrix: ffmpeg -hwaccels returned nothing after 2 attempts — reporting an empty decode list (best-effort)");
+    }
+    hwCapsCache = caps;
+    console.log(
+      `[Hardware] capability matrix — decode: ${caps.hwaccels.join(", ") || "none listed"} · gpu filters: ${caps.gpuFilters.join(", ") || "none"}`,
+    );
+    return caps;
+  })();
+  return hwCapsDetecting;
+}
+
+// ---------------------------------------------------------------------------
+// v1.14.5 EXPORT PROFILER (export-speed plan §1 — Phase 0). Per-export
+// telemetry that answers "WHERE did the time go", not just "how far along":
+//   • stages        — wall ms per pipeline stage (encoder detect, build+probe,
+//                     srcFacts, loudness measurement, plan, audio bus, mux)
+//   • workers       — one record per pool job: kind (copy/dirty), wall ms,
+//                     frame count, graph classes (zoompan/subtitles/overlay/
+//                     chromakey/xfade — from the actual filter script)
+//   • classWallMs   — summed worker wall per class (the pool runs jobs in
+//                     parallel — read it as "CPU-seconds of that class")
+//   • cpu.busyPct   — sampled whole-process busy % (2 s EMA)
+//   • loudness      — cache hits/misses for the measurement passes
+// The full JSON lands in userData/export-profiles/ (last 20 kept + a
+// last.json copy); the result payload carries the compact summary.
+// ---------------------------------------------------------------------------
+function createExportProfiler(meta) {
+  const t0 = Date.now();
+  const prof = {
+    schema: 1,
+    startedAtIso: new Date(t0).toISOString(),
+    ...(meta || {}),
+    stages: {},
+    workers: [],
+    pool: { width: null, jobs: 0, copyJobs: 0, dirtyJobs: 0, threadsPerWorker: null },
+    cpu: { samples: 0, busyPct: null },
+    loudness: { hits: 0, misses: 0 },
+  };
+  const stageTimers = {};
+  prof.beginStage = (name) => { stageTimers[name] = Date.now(); };
+  prof.endStage = (name) => {
+    const s = stageTimers[name];
+    if (s == null) return;
+    prof.stages[name] = Math.round((prof.stages[name] || 0) + (Date.now() - s));
+    delete stageTimers[name];
+  };
+  prof.setStage = (name, ms) => { prof.stages[name] = Math.round(ms); };
+  prof.worker = (rec) => { prof.workers.push(rec); };
+  prof.setPool = (p) => { Object.assign(prof.pool, p); };
+
+  let cpuTimer = null;
+  let cpuPrev = null;
+  function sampleCpus() {
+    try { return os.cpus().map((c) => c.times); } catch (_) { return null; }
+  }
+  prof.startCpuSampler = () => {
+    cpuPrev = sampleCpus();
+    if (!cpuPrev) return;
+    cpuTimer = setInterval(() => {
+      try {
+        const now = sampleCpus();
+        if (!now || now.length !== cpuPrev.length) { cpuPrev = now || cpuPrev; return; }
+        let idle = 0;
+        let total = 0;
+        for (let i = 0; i < now.length; i++) {
+          const d = {
+            user: now[i].user - cpuPrev[i].user,
+            nice: now[i].nice - cpuPrev[i].nice,
+            sys: now[i].sys - cpuPrev[i].sys,
+            idle: now[i].idle - cpuPrev[i].idle,
+            irq: now[i].irq - cpuPrev[i].irq,
+          };
+          idle += d.idle;
+          total += d.user + d.nice + d.sys + d.idle + d.irq;
+        }
+        cpuPrev = now;
+        if (total > 0) {
+          const busy = 100 * (1 - idle / total);
+          prof.cpu.busyPct = prof.cpu.samples === 0 ? busy : prof.cpu.busyPct * 0.7 + busy * 0.3;
+          prof.cpu.samples += 1;
+        }
+      } catch (_) { /* best-effort */ }
+    }, 2000);
+  };
+  prof.stopCpuSampler = () => { if (cpuTimer) { clearInterval(cpuTimer); cpuTimer = null; } };
+
+  prof.finish = (resultInfo) => {
+    prof.stopCpuSampler();
+    prof.totalMs = Date.now() - t0;
+    flushLoudnessDisk();
+    prof.loudness = { hits: loudnessCacheStats.hits, misses: loudnessCacheStats.misses };
+    const classWall = {};
+    let frames = 0;
+    for (const w of prof.workers) {
+      const cls = w.copy ? "stream-copy" : (Array.isArray(w.classes) && w.classes.length ? w.classes.join("+") : "encode");
+      classWall[cls] = (classWall[cls] || 0) + (Number(w.wallMs) || 0);
+      frames += Number(w.frames) || 0;
+    }
+    prof.classWallMs = classWall;
+    prof.framesEncoded = frames;
+    prof.contentSec = Number(resultInfo && resultInfo.contentSec) || 0;
+    prof.speedX = prof.totalMs > 0 && prof.contentSec > 0
+      ? Math.round((prof.contentSec / (prof.totalMs / 1000)) * 100) / 100
+      : null;
+    prof.output = {
+      path: resultInfo && resultInfo.path,
+      sizeBytes: Number(resultInfo && resultInfo.size) || 0,
+      mode: resultInfo && resultInfo.mode,
+    };
+    let file = null;
+    try {
+      const dir = path.join(app.getPath("userData"), "export-profiles");
+      fs.mkdirSync(dir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      file = path.join(dir, `profile-${stamp}.json`);
+      fs.writeFileSync(file, JSON.stringify(prof, null, 2));
+      fs.writeFileSync(path.join(dir, "last.json"), JSON.stringify(prof, null, 2));
+      const kept = fs.readdirSync(dir).filter((f) => /^profile-.*\.json$/.test(f)).sort();
+      for (const f of kept.slice(0, Math.max(0, kept.length - 20))) {
+        try { fs.unlinkSync(path.join(dir, f)); } catch (_) {}
+      }
+    } catch (_) { /* best-effort — profiling never fails an export */ }
+    const stageStr = Object.entries(prof.stages).map(([k, v]) => `${k} ${(v / 1000).toFixed(1)}s`).join(" · ");
+    const classStr = Object.entries(classWall).map(([k, v]) => `${k} ${(v / 1000).toFixed(1)}s`).join(" · ");
+    console.log(
+      `[Export] perf profile: ${file || "(not written)"} — total ${(prof.totalMs / 1000).toFixed(1)}s` +
+        `${stageStr ? ` · stages ${stageStr}` : ""}${classStr ? ` · worker wall ${classStr}` : ""}` +
+        ` · ${frames} frames · ${prof.speedX != null ? `${prof.speedX}×` : "?"} realtime` +
+        ` · cpu ${prof.cpu.busyPct != null ? `${Math.round(prof.cpu.busyPct)}%` : "?"}` +
+        ` · loudness cache ${prof.loudness.hits}h/${prof.loudness.misses}m`,
+    );
+    return {
+      file,
+      totalMs: prof.totalMs,
+      stages: prof.stages,
+      classWallMs: classWall,
+      framesEncoded: frames,
+      contentSec: prof.contentSec,
+      speedX: prof.speedX,
+      cpuBusyPct: prof.cpu.busyPct != null ? Math.round(prof.cpu.busyPct * 10) / 10 : null,
+      loudnessCache: prof.loudness,
+      pool: prof.pool,
+    };
+  };
+
+  prof.startCpuSampler();
+  return prof;
+}
+
+/** v6/v7: the exact probe argv for a GPU candidate — `pre` (ffmpeg GLOBAL
+ * options before the input: the Intel QSV d3d11va→qsv device derivation
+ * that Windows iGPU stacks need) + `enc` (the REAL tier encoder args so an
+ * arg-shape failure disqualifies the candidate at probe time, never
+ * mid-export). h264_amf needs no explicit device init — its encoder context
+ * is self-contained on Windows. */
+function gpuProbeSpec(name) {
+  if (name === "h264_nvenc") {
+    return {
+      pre: [],
+      enc: ["-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0", "-multipass", "qres", "-tune", "hq", "-b_ref_mode", "middle"],
+    };
+  }
+  if (name === "h264_qsv") {
+    return {
+      // v7 Step 1 (the exact flags): derive a QSV session from an explicit
+      // d3d11va device. Without this, QSV probing on Windows silently
+      // crashes and the iGPU falls back to CPU.
+      pre: ["-init_hw_device", "d3d11va=dx", "-init_hw_device", "qsv=qsv@dx"],
+      // The REAL export tier args (veryfast + global_quality) — probing the
+      // exact shape the export will run, same philosophy as the NVENC arm.
+      enc: ["-preset", "veryfast", "-global_quality", "23", "-look_ahead", "0"],
+    };
+  }
+  return { pre: [], enc: [] }; // h264_amf — self-contained encoder context
+}
+
+/** v7 Step 1: encoder-level ffmpeg GLOBAL options for the REAL export argv.
+ * QSV is selected only after the probe above SUCCEEDED with these exact
+ * device-init flags — so threading the same flags into every real encode
+ * (single-pass, chunked, two-step clip argv) guarantees the export runs in
+ * the environment that was measured. Every other encoder gets []. */
+function encoderGlobalArgs(encoderName) {
+  if (encoderName === "h264_qsv" && process.platform === "win32") {
+    return ["-init_hw_device", "d3d11va=dx", "-init_hw_device", "qsv=qsv@dx"];
+  }
+  return [];
+}
+
+// Helper: run ffmpeg and wait. `totalSec` enables real-time progress via
+// stderr "time=" parsing; `onTime` receives fractional seconds. Every live
+// child registers itself in `activeProcs` so cancel-export / pool failure /
+// the leak guard can kill the WHOLE set (v4.9 killed a single child).
+// v1.33.3 STALL WATCHDOG (stuck-at-100% follow-up): a wedged ffmpeg — a
+// filled disk, antivirus locking the output, a filter-level deadlock —
+// emits NO stderr output at all while the exit event never fires, so the
+// progress bar freezes at its last value forever (on the mux that is 100%
+// with phase "finalize") and the export promise NEVER settles: the UI
+// shows "stuck at 100%, no video" with no error, ever. The watchdog bounds
+// BOTH silent windows and converts them into an honest, actionable error:
+//   - pre-total:  no output at all for stallMs (300s default) while the
+//     timeline is not yet encoded → the process is dead, not slow — a
+//     healthy encode emits a progress line every ~0.5s even at 0.1×;
+//   - post-total: the finalize pass (faststart moov rewrite / mux flush)
+//     is legitimately silent — bounded by finalizeMs (default below)
+//     before the kill.
+// v1.33.4 (the stuck-at-100% root-cause release) adds THREE more hooks:
+//   - opts.maxMs: a hard wall-clock cap on the whole child (measurement
+//     passes keep their duration-scaled bound — the kill rejects with a
+//     distinct "exceeded the allowed time" message the caller can map to
+//     its graceful fallback instead of a user-facing export error);
+//   - faststart's own stderr line ("Starting second pass: moving the moov
+//     atom…") now triggers onFinalize EXACTLY when the moov rewrite starts
+//     (the 1.5s-after-total guess stays as the fallback);
+//   - opts.onFinalizeProgress(frac): a ~1Hz honest crawl through the
+//     finalize window (the moov rewrite is a pure in-place byte shift with
+//     NO progress output — verified on real ffmpeg: no temp file, constant
+//     file size — so the crawl is time-based against an IO estimate; the
+//     bar MOVES and 100% is still reserved for the actual exit).
+// >1.5 GB outputs skip faststart entirely (v1.33.2 gate), so the post-total
+// window is seconds in the normal case.
+function runFfmpeg(args, totalSec, onTime, opts) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(ffmpegPath, args, { windowsHide: true });
+    activeProcs.add(proc);
+    let stderr = "";
+    let stderrTail = "";
+    let sawTotal = false;        // out_time reached totalSec (encode done)
+    let finalizeNotified = false;
+    let finalizeTimer = null;
+    let finalizeCrawl = null;    // v1.33.4: the 1Hz crawl through the finalize window
+    let finalizeStartedAt = null;
+    let maxedOut = false;        // v1.33.4: killed by the maxMs duration cap
+    let outTimeStalled = false; // v1.33.5: killed by the out_time freeze guard
+    const onFinalize = opts && typeof opts.onFinalize === "function" ? opts.onFinalize : null;
+    const onFinalizeProgress = opts && typeof opts.onFinalizeProgress === "function" ? opts.onFinalizeProgress : null;
+    const finalizeEstimateMs = opts && Number(opts.finalizeEstimateMs) > 0 ? Number(opts.finalizeEstimateMs) : 120000;
+    const stallMs = opts && Number(opts.stallMs) > 0 ? Number(opts.stallMs) : 300000;
+    const finalizeMs = opts && Number(opts.finalizeMs) > 0 ? Number(opts.finalizeMs) : 900000;
+    const maxMs = opts && Number(opts.maxMs) > 0 ? Number(opts.maxMs) : 0; // v1.33.4: 0 = no cap
+    const noFinalizeOnTotal = !!(opts && opts.noFinalizeOnTotal); // faststart-off muxes: only the stderr line may fire finalize
+    // v1.33.5: OUT-TIME STALL GUARD — the v1.33.3 watchdog only fires on
+    // SILENCE (no stderr at all), but a wedged encode can keep printing
+    // stats forever while its position never advances (antivirus crawling
+    // every write, an IO-level deadlock, a filter that spins). While the
+    // timeline is not yet finished (totalSec > 0, total not reached) AND
+    // at least one time= tick has been seen, out_time FROZEN for this long
+    // = dead, not slow → kill with an honest error. 0 disables.
+    const outTimeStallMs = opts && Number(opts.outTimeStallMs) > 0 ? Number(opts.outTimeStallMs) : 0;
+    const startedAt = Date.now();
+    let lastOutputAt = Date.now(); // any stderr chunk = life
+    let totalReachedAt = null;     // wall-clock when out_time hit totalSec
+    let exited = false;
+    let stallKilled = false;
+    let lastOutTimeSec = -1;       // v1.33.5: last parsed out_time position
+    let lastOutTimeAt = 0;         // wall-clock when it advanced
+    const fireFinalize = (why) => {
+      if (finalizeNotified || !onFinalize) return;
+      finalizeNotified = true;
+      if (finalizeTimer) { clearTimeout(finalizeTimer); finalizeTimer = null; }
+      finalizeStartedAt = Date.now();
+      try { onFinalize(); } catch (_) { /* best-effort phase flip */ }
+      if (onFinalizeProgress) {
+        // v1.33.4: the moov rewrite / mux flush is byte-shifting work with
+        // no ffmpeg progress output — crawl the band on a wall-clock basis
+        // against the size-derived IO estimate so the bar visibly moves
+        // (capped at 95% of the estimate: the real end is the exit event,
+        // never a timer).
+        finalizeCrawl = setInterval(() => {
+          if (exited) return;
+          const frac = Math.min(0.95, (Date.now() - finalizeStartedAt) / Math.max(1000, finalizeEstimateMs));
+          try { onFinalizeProgress(frac); } catch (_) { /* best-effort */ }
+        }, 1000);
+      }
+      if (why) console.log(`[Export] finalize pass began (${why})`);
+    };
+    const stallWatchdog = setInterval(() => {
+      if (exited || stallKilled) return;
+      const now = Date.now();
+      if (maxMs > 0 && now - startedAt > maxMs) {
+        // v1.33.4: the caller-imposed duration cap (measurement passes):
+        // killed HERE and reported as its own error class so the caller can
+        // fall back instead of surfacing a false "stalled" diagnosis.
+        maxedOut = true;
+        stallKilled = true;
+        killProc(proc); // v1.33.5: Windows needs taskkill /f /t for a clean tree kill
+        return;
+      }
+      // v1.33.5: the out-time freeze guard (see the block comment above) —
+      // only BEFORE the timeline total is reached (the finalize window is
+      // legitimately position-frozen and bounded by finalizeMs).
+      if (
+        outTimeStallMs > 0 && !sawTotal && totalSec > 0 &&
+        lastOutTimeSec >= 0 && lastOutTimeAt > 0 &&
+        now - lastOutTimeAt > outTimeStallMs
+      ) {
+        outTimeStalled = true;
+        stallKilled = true;
+        console.warn(
+          `[Export] OUT-TIME STALL GUARD: ffmpeg kept printing stats for ${Math.round((now - lastOutTimeAt) / 1000)}s ` +
+            `but the encode position is frozen at ${lastOutTimeSec.toFixed(1)}s of ${totalSec.toFixed(1)}s — killing the process`,
+        );
+        killProc(proc);
+        return;
+      }
+      const silent = totalReachedAt != null
+        ? now - Math.max(totalReachedAt, lastOutputAt) > finalizeMs
+        : now - lastOutputAt > stallMs;
+      if (silent) {
+        stallKilled = true;
+        console.warn(
+          `[Export] STALL WATCHDOG: ffmpeg produced no output for ${
+            Math.round((now - (totalReachedAt != null ? Math.max(totalReachedAt, lastOutputAt) : lastOutputAt)) / 1000)
+          }s ${totalReachedAt != null ? "in the finalize pass" : "(encode not finished)"} — killing the process`
+        );
+        killProc(proc); // v1.33.5: taskkill tree-kill on Windows
+      }
+    }, 5000);
+    proc.stderr.on("data", (data) => {
+      lastOutputAt = Date.now();
+      const s = data.toString();
+      if (onTime && totalSec > 0) {
+        const m = s.match(/time=(\d+):(\d{2}):(\d{2})\.(\d{2})/);
+        if (m) {
+          const sec = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4]) / 100;
+          onTime(Math.min(sec, totalSec));
+          // v1.33.5: track POSITION ADVANCEMENT for the out-time stall guard
+          // (stats can flow forever while the position is frozen — see the
+          // watchdog above).
+          if (sec > lastOutTimeSec + 0.05) {
+            lastOutTimeSec = sec;
+            lastOutTimeAt = Date.now();
+          }
+          // v1.33.2 (stuck-at-100% report): when every frame is muxed
+          // (out_time == total) the process can STILL run for a long silent
+          // stretch — `-movflags +faststart` rewrites the WHOLE file to move
+          // the moov atom up front (a pure IO pass: minutes for multi-GB
+          // outputs on spinning disks). The progress bar sits at 100% with
+          // no explanation and looks hung. Detect the tail: once out_time
+          // hits total, if the process is still alive 1.5s later it is in
+          // the finalize pass → notify once so the caller can flip the
+          // phase to "finalize" (the UI then says what is happening).
+          // v1.33.4: faststart-OFF muxes suppress this heuristic entirely
+          // (their tail is a <2s flush — the label would be noise); the
+          // "Starting second pass" stderr line below is the exact trigger
+          // when the moov rewrite actually runs.
+          if (!sawTotal && sec >= totalSec - 0.25) {
+            sawTotal = true;
+            if (totalReachedAt == null) totalReachedAt = Date.now();
+            if (onFinalize && !noFinalizeOnTotal && !finalizeTimer) {
+              finalizeTimer = setTimeout(() => fireFinalize("out_time reached the timeline end"), 1500);
+            }
+          }
+        }
+      }
+      // v1.33.4: faststart announces its second pass on stderr — the moov
+      // rewrite starts EXACTLY here (verified on real ffmpeg 7.x: the
+      // rewrite is an in-place shift, no temp file, no size change, no
+      // progress lines). Fire the finalize notification from the message
+      // itself so the phase label + crawl begin at the true moment.
+      if (onFinalize && !finalizeNotified && s.indexOf("Starting second pass") >= 0) {
+        fireFinalize("faststart moov rewrite — ffmpeg 'Starting second pass'");
+      }
+      stderr += s;
+      stderrTail = (stderrTail + s).slice(-4000);
+    });
+    proc.stdout.on("data", (d) => {
+      // v1.33.4: measurement passes parse the loudnorm JSON summary which
+      // ffmpeg prints on stdout in some builds — capture it too (encode
+      // jobs print nothing on stdout; zero cost).
+      const s = d.toString();
+      if (s) { stderr += s; stderrTail = (stderrTail + s).slice(-4000); }
+    });
+    proc.on("error", (err) => {
+      exited = true;
+      clearInterval(stallWatchdog);
+      clearInterval(finalizeCrawl);
+      if (finalizeTimer) clearTimeout(finalizeTimer);
+      activeProcs.delete(proc);
+      reject(new Error(err.message));
+    });
+    proc.on("exit", (code, signal) => {
+      exited = true;
+      clearInterval(stallWatchdog);
+      clearInterval(finalizeCrawl);
+      if (finalizeTimer) clearTimeout(finalizeTimer);
+      activeProcs.delete(proc);
+      // v1.33.3: the watchdog's kill must NEVER be misreported as a
+      // user cancel — it is a failure with a cause and diagnostics.
+      // v1.33.4: maxMs kills are their own class (callers fall back
+      // gracefully — a measurement that outlived its budget is not an
+      // export failure).
+      if (stallKilled) {
+        if (maxedOut) {
+          reject(new Error(`__FFMAX__ took longer than the allowed ${Math.round(maxMs / 1000)}s`));
+          return;
+        }
+        // v1.33.5: the out-time freeze guard — stats flowed but the encode
+        // position never advanced (its own honest diagnosis + remedy).
+        if (outTimeStalled) {
+          reject(new Error(
+            `The export stalled: ffmpeg kept reporting statistics but the encode position stopped advancing at ` +
+              `${lastOutTimeSec.toFixed(1)}s of a ${totalSec.toFixed(1)}s timeline for over ${Math.round(outTimeStallMs / 1000)}s and was terminated. ` +
+              `Common causes: antivirus software throttling or locking the output file mid-write, the destination disk ` +
+              `disconnecting or entering a fault state, or an IO-level deadlock. Add an exclusion for the output folder ` +
+              `(and the FrameFuse temp folder), check the destination disk, and retry.`
+          ));
+          return;
+        }
+        const lines = stderrTail.trim().split("\n").slice(-4).join("\n");
+        const phaseLabel = totalReachedAt != null
+          ? "while finalizing the output file"
+          : "before finishing the encode";
+        reject(new Error(
+          `The export stalled: ffmpeg stopped producing any output ${phaseLabel} and was terminated. ` +
+            `Common causes: the destination disk filled up, antivirus software locked or quarantined the output file, ` +
+            `or extremely slow disk IO while writing. Free disk space, add an exclusion for the output folder, and retry. ` +
+            `Last ffmpeg output:\n${lines || "(none — the process froze before writing anything)"}`
+        ));
+        return;
+      }
+      if (signal === "SIGKILL" || signal === "SIGTERM") { reject(new Error("Export cancelled")); return; }
+      if (code !== 0) {
+        const lines = stderrTail.trim().split("\n");
+        reject(new Error(lines.slice(-6).join("\n") || `FFmpeg error code ${code}`));
+        return;
+      }
+      // v1.33.4: resolve the accumulated output so measurement callers can
+      // parse the loudnorm JSON (no existing caller consumed the value —
+      // this is purely additive).
+      resolve({ stderr });
+    });
+  });
+}
+
+/** v1.33.3 (stuck-at-100% follow-up): VERIFY the export before declaring
+ * success. The mux exiting 0 is not proof the file is playable: a full
+ * disk truncates mid-write, antivirus can quarantine the output, and a
+ * killed writer leaves a headerless husk. A missing/truncated output now
+ * FAILS the export honestly (with the likely cause) instead of reporting
+ * success with no video — the exact "stuck at 100%, no output" shape.
+ * v1.33.8: audio-extended timelines (audio longer than the visuals) are
+ * LEGAL and render full-length through the Rust engine; a short output
+ * that matches the VISUAL span is a video-track extension failure, NOT a
+ * disk-full — the error now says exactly that (the false "destination disk
+ * most likely filled up" report).
+ * Returns the verified size; throws a plain-language error otherwise. */
+async function verifyExportOutputAsync(outputPath, expectedTotalSec, stageLabel, visualTotalSec = 0) {
+  let size = 0;
+  try { size = fs.statSync(outputPath).size; } catch (_) { size = 0; }
+  if (!(size > 1024)) {
+    throw new Error(
+      `${stageLabel}: the export finished but no output file exists (${size} bytes at ${outputPath}). ` +
+        `The destination disk may be full, or antivirus quarantined the file — check free space and the folder, then retry.`
+    );
+  }
+  // Duration check: ffprobe reads the container header (~instant). A probe
+  // FAILURE is not an export failure (ffprobe can be blocked) — only a
+  // confidently-wrong duration fails the export.
+  try {
+    const vprobe = await probeMediaAsync(outputPath);
+    const gotSec = vprobe && vprobe.durationMs ? vprobe.durationMs / 1000 : 0;
+    if (gotSec > 0 && expectedTotalSec > 5 &&
+        Math.abs(gotSec - expectedTotalSec) > Math.max(4, expectedTotalSec * 0.02)) {
+      // v1.33.8: did the output stop EXACTLY at the visual span instead? That
+      // is the video-track extension failing (the audio got cut with it) —
+      // a completely different diagnosis (and remedy) from a full disk.
+      const visualMatch =
+        visualTotalSec > 5 && Math.abs(gotSec - visualTotalSec) <= Math.max(4, visualTotalSec * 0.02);
+      if (visualMatch && visualTotalSec + 4 < expectedTotalSec) {
+        throw new Error(
+          `${stageLabel}: the output is ${gotSec.toFixed(1)}s — it stopped at the last VISUAL frame instead of the ` +
+            `${expectedTotalSec.toFixed(1)}s timeline (the audio is longer than the visuals). The audio was cut short. ` +
+            `Set the video/image to Loop on the timeline so it fills the whole timeline, then retry — the native engine ` +
+            `renders the full audio length either way.`
+        );
+      }
+      throw new Error(
+        `${stageLabel}: the output file is ${gotSec.toFixed(1)}s long but the timeline is ${expectedTotalSec.toFixed(1)}s — ` +
+          `the write was cut short. The destination disk most likely filled up mid-export; free space and retry.`
+      );
+    }
+  } catch (e) {
+    if (e && typeof e.message === "string" && e.message.startsWith(stageLabel + ":")) throw e;
+    // probe unavailable/blocked — the size check above still applies
+  }
+  return size;
+}
+
+// ---------------------------------------------------------------------------
+// v6 PHASE 0 — FAST PROBE: ffprobe JSON (when resolvable) with an
+// mtime+size keyed cache (memory + userData disk, 24h TTL), falling back
+// to the battle-tested async `ffmpeg -i` stderr parser. Every consumer of
+// the old path-keyed cache (stream-copy gates, overlay loop math, audio
+// detection, duration probes) keeps the exact same probe SHAPE, so argv
+// construction is unchanged — only acquisition got faster and persistent.
+// A cached source file is probed ONCE per 24h across exports AND app
+// restarts (the v5.1 scheme re-probed every export because temp names were
+// unique; user sources are the hot path here).
+// ---------------------------------------------------------------------------
+const probeCache = new Map();      // "path|mtime|size" → probe shape
+const probeInFlight = new Map();   // path → Promise (same-tick dedup)
+const PROBE_TTL_MS = 24 * 3600 * 1000;
+let probeDisk = null;              // { entries: { key: { t, info } } }
+let probeDiskDirty = false;
+let probeDiskTimer = null;
+let ffprobeBin = null;             // resolved binary | false (unavailable)
+let ffprobeChecked = false;
+
+function probeDiskPath() {
+  return path.join(app.getPath("userData"), "probe-cache-v9.json");
+}
+
+function loadProbeDisk() {
+  if (probeDisk) return;
+  try {
+    probeDisk = JSON.parse(fs.readFileSync(probeDiskPath(), "utf8"));
+    if (!probeDisk || typeof probeDisk !== "object" || !probeDisk.entries) {
+      probeDisk = { entries: {} };
+    }
+  } catch (_) {
+    probeDisk = { entries: {} };
+  }
+}
+
+function scheduleProbeDiskSave() {
+  if (probeDiskTimer) return;
+  probeDiskTimer = setTimeout(() => {
+    probeDiskTimer = null;
+    if (!probeDiskDirty) return;
+    try {
+      fs.writeFileSync(probeDiskPath(), JSON.stringify(probeDisk));
+      probeDiskDirty = false;
+    } catch (_) { /* best-effort persistence */ }
+  }, 2000);
+}
+
+/** Resolve the ffprobe binary ONCE (async, evidence-based: must print a
+ *  real version line). Resolution matrix mirrors ffmpeg's: packaged
+ *  extraResources → asar.unpacked → ffprobe-static npm → PATH. The
+ *  in-flight promise is MEMOIZED — the export handler's parallel probe
+ *  warm-up would otherwise race the first detection (ffprobeChecked flips
+ *  before ffprobeBin resolves) and every concurrent probe would silently
+ *  fall back to the slower ffmpeg -i parser. */
+let ffprobeDetecting = null;
+function ffprobeAvailable() {
+  if (ffprobeDetecting) return ffprobeDetecting;
+  if (ffprobeChecked) return Promise.resolve(ffprobeBin);
+  ffprobeDetecting = (async () => {
+    const candidates = [];
+    const exeName = process.platform === "win32" ? "ffprobe.exe" : "ffprobe";
+    const altName = process.platform === "win32" ? "ffprobe" : "ffprobe.exe";
+    if (app.isPackaged) {
+      // v1.5: the full bundled build ships ffprobe NEXT to ffmpeg — before
+      // this, packaged installs had NO ffprobe at all (ffprobe-static is not
+      // a dependency) and every media probe silently fell back to the slow
+      // `ffmpeg -i` stderr parser.
+      candidates.push(
+        path.join(process.resourcesPath, "ffmpeg", FFMPEG_PLAT_DIR, exeName),
+        path.join(process.resourcesPath, "ffmpeg", FFMPEG_PLAT_DIR, altName),
+        path.join(process.resourcesPath, "ffmpeg", exeName),
+        path.join(process.resourcesPath, "ffprobe-static", exeName),
+        path.join(process.resourcesPath, "app.asar.unpacked", "node_modules", "ffprobe-static", exeName),
+      );
+    } else {
+      candidates.push(
+        path.join(__dirname, "..", "resources", "ffmpeg", FFMPEG_PLAT_DIR, exeName),
+        path.join(process.cwd(), "resources", "ffmpeg", FFMPEG_PLAT_DIR, exeName),
+      );
+    }
+    try {
+      const s = require("ffprobe-static");
+      if (s && s.path) candidates.push(s.path);
+    } catch (_) { /* optional dependency */ }
+    candidates.push("ffprobe"); // system PATH (dev boxes / Linux installs)
+    for (const c of candidates) {
+      const r = await captureExec(c, ["-version"], 8000);
+      if (r && r.code === 0 && /ffprobe version/i.test(r.out)) {
+        ffprobeBin = c;
+        console.log("FFprobe path:", c);
+        break;
+      }
+    }
+    if (!ffprobeBin) console.log("FFprobe: not available — probes use the ffmpeg -i parser (cached)");
+    ffprobeChecked = true; // resolved — later callers take the cheap path
+    return ffprobeBin;
+  })();
+  return ffprobeDetecting;
+}
+
+/** ffprobe -show_streams/-show_format JSON → the EXACT probe shape
+ *  videoProbeParser produces (width/height pre-swapped for ±90/±270
+ *  displaymatrix rotation, codec/pixFmt lowercase, fps from
+ *  avg_frame_rate with r_frame_rate fallback, durationMs from the
+ *  container format). Returns null on anything unparseable → the caller
+ *  falls back to the ffmpeg -i parser. */
+function parseFfprobeJson(text) {
+  let j = null;
+  try { j = JSON.parse(text); } catch (_) { return null; }
+  const streams = Array.isArray(j.streams) ? j.streams : [];
+  const out = {
+    hasAudio: false, width: 0, height: 0, durationMs: 0,
+    codec: "", pixFmt: "", fps: 0, rotated: false,
+    // v9 TRUE SMART RENDER: the codec's reorder depth — a stream-copy tail
+    // cut must subtract it from -t (the demuxer bounds on DTS, which lag
+    // PTS by b frames; uncorrected, every mid-file clean piece would drag
+    // b extra frames into the concat seam — duplicate content + DTS
+    // collisions). 0 = unknown/no B-frames (progressive).
+    bFrames: 0,
+  };
+  out.hasAudio = streams.some((s) => s && s.codec_type === "audio");
+  const v = streams.find((s) => s && s.codec_type === "video") || null;
+  if (v) {
+    out.codec = String(v.codec_name || "").toLowerCase();
+    out.pixFmt = String(v.pix_fmt || "").toLowerCase();
+    out.width = Number(v.width) || 0;
+    out.height = Number(v.height) || 0;
+    const parseRate = (r) => {
+      const m = /^(\d+)\/(\d+)$/.exec(String(r || ""));
+      if (m && Number(m[2]) > 0) return Number(m[1]) / Number(m[2]);
+      const n = Number(r);
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    };
+    out.fps = parseRate(v.avg_frame_rate) || parseRate(v.r_frame_rate);
+    // v1.14.5 (satisfied-transform skips): the REAL base rate (CFR check —
+    // avg == r on constant-rate sources; a VFR-at-average source keeps the
+    // fps filter) + the sample aspect ratio ("1:1" → 1; anything else /
+    // unset → 0 = keep setsar). Old probe-cache entries simply lack both →
+    // every skip condition stays false (the conservative full chain).
+    out.rFps = parseRate(v.r_frame_rate);
+    out.sar = (() => {
+      const m = /^(\d+)\:(\d+)$/.exec(String(v.sample_aspect_ratio || ""));
+      if (m && Number(m[2]) > 0) return Number(m[1]) / Number(m[2]);
+      return 0;
+    })();
+    out.bFrames = Math.max(0, Math.min(16, Math.round(Number(v.has_b_frames) || 0)));
+    const rotations = (Array.isArray(v.side_data_list) ? v.side_data_list : [])
+      .map((sd) => Number(sd && sd.rotation))
+      .filter((r) => Number.isFinite(r));
+    if (rotations.length > 0) {
+      const a = Math.abs(rotations[0]) % 360;
+      if (Math.abs(a - 90) < 0.01 || Math.abs(a - 270) < 0.01) {
+        const t = out.width; out.width = out.height; out.height = t;
+        out.rotated = true;
+      }
+    }
+  }
+  if (j.format && Number(j.format.duration) > 0) {
+    out.durationMs = Math.round(Number(j.format.duration) * 1000);
+  }
+  return out;
+}
+
+/** v1.1: the full probe shape — every field the export handler consults
+ * (stream-copy eligibility + overlay loop math + audio detection). */
+function emptyProbe() {
+  return {
+    hasAudio: false, width: 0, height: 0, durationMs: 0,
+    codec: "", pixFmt: "", fps: 0, rotated: false,
+    bFrames: 0,
+  };
+}
+
+async function fastProbeUncached(p) {
+  const bin = await ffprobeAvailable();
+  if (bin) {
+    const r = await captureExec(
+      bin,
+      ["-v", "quiet", "-print_format", "json", "-show_streams", "-show_format", "-i", p],
+      15000,
+    );
+    if (r && r.code === 0 && r.out) {
+      const info = parseFfprobeJson(r.out);
+      if (info) return info;
+    }
+  }
+  // Fallback: the async ffmpeg -i stderr parser (pre-v6 behavior).
+  try {
+    const r = await ffmpegCapture(["-hide_banner", "-i", p], 15000);
+    return G.videoProbeParser(r.out);
+  } catch (_) {
+    return emptyProbe(); // unreadable source → silent/unknown dims
+  }
+}
+
+/** v5.1-compatible entry point (same name, same promise-dedup semantics,
+ * same probe shape) — now backed by ffprobe + the persistent cache. */
+function probeMediaAsync(p) {
+  if (typeof p !== "string" || !p) {
+    return Promise.resolve(emptyProbe());
+  }
+  if (probeInFlight.has(p)) return probeInFlight.get(p);
+  const job = (async () => {
+    let key = p;
+    let statOk = false;
+    try {
+      const st = fs.statSync(p);
+      key = `${p}|${Math.round(st.mtimeMs)}|${st.size}`;
+      statOk = true;
+    } catch (_) { /* unreadable now — probe will report the empty shape */ }
+    if (probeCache.has(key)) return probeCache.get(key);
+    if (statOk) {
+      loadProbeDisk();
+      const e = probeDisk.entries[key];
+      if (e && Date.now() - e.t < PROBE_TTL_MS && e.info) {
+        probeCache.set(key, e.info);
+        return e.info;
+      }
+    }
+    const info = await fastProbeUncached(p);
+    probeCache.set(key, info);
+    if (statOk) {
+      probeDisk.entries[key] = { t: Date.now(), info };
+      probeDiskDirty = true;
+      scheduleProbeDiskSave();
+    }
+    return info;
+  })();
+  probeInFlight.set(p, job);
+  job.catch(() => {});
+  job.finally(() => { probeInFlight.delete(p); });
+  return job;
+}
+
+// ---------------------------------------------------------------------------
+// v6 PHASE 3 — SMART TURBO keyframe scan: ffprobe with -skip_frame nokey
+// over a -read_intervals window (decodes ONLY keyframes — a handful per
+// GOP, regardless of file length). Cached per path+window. Returns
+// [{ s: "<exact pts string>", ms }] or null (ffprobe unavailable / probe
+// failure → the caller falls back to the legacy ffmpeg showinfo scan or
+// plain re-encode).
+// ---------------------------------------------------------------------------
+const kfWindowCache = new Map();
+
+async function probeKeyframesNear(p, fromSec, durSec) {
+  const bin = await ffprobeAvailable();
+  if (!bin) return null;
+  const key = `${p}|${Math.max(0, fromSec).toFixed(3)}|${durSec.toFixed(3)}`;
+  if (kfWindowCache.has(key)) return kfWindowCache.get(key);
+  const job = (async () => {
+    try {
+      const r = await captureExec(
+        bin,
+        [
+          "-v", "quiet", "-print_format", "json",
+          "-select_streams", "v:0",
+          "-show_entries", "frame=pts_time",
+          "-skip_frame", "nokey",
+          "-read_intervals", `${Math.max(0, fromSec).toFixed(3)}%+${durSec.toFixed(3)}`,
+          "-i", p,
+        ],
+        20000,
+      );
+      if (!r || r.code !== 0 || !r.out) return null;
+      let j = null;
+      try { j = JSON.parse(r.out); } catch (_) { return null; }
+      const frames = Array.isArray(j.frames) ? j.frames : [];
+      const kfs = [];
+      for (const f of frames) {
+        const s = f && f.pts_time != null ? String(f.pts_time) : (f && f.pkt_pts_time != null ? String(f.pkt_pts_time) : null);
+        const ms = s != null ? parseFloat(s) * 1000 : NaN;
+        if (s != null && Number.isFinite(ms)) kfs.push({ s, ms });
+      }
+      kfs.sort((a, b) => a.ms - b.ms);
+      return kfs;
+    } catch (_) {
+      return null;
+    }
+  })();
+  kfWindowCache.set(key, job);
+  job.catch(() => {});
+  return job;
+}
+
+// ---------------------------------------------------------------------------
+// v1.4.1 KEYFRAME-ALIGNED STREAM-COPY TRIMS — the last big reason a
+// cuts-only clip still re-encoded was a head trim (`trimInMs > 0` forced
+// the encode path because `-c copy` can only cut ON keyframes). If the
+// requested cut point happens to have a source keyframe within ONE FRAME,
+// the copy path can start exactly at that keyframe and keep the fast path.
+// Probe = ffmpeg with `-skip_frame nokey` (decode ONLY keyframes — a few
+// frames per 5 s window, regardless of file length) + `showinfo` (prints
+// each decoded frame's pts_time) + `-copyts`/`-noaccurate_seek` so the
+// printed timestamps stay on the SOURCE clock and the read window starts
+// at the seek-landing keyframe. All flag placements verified against the
+// bundled ffmpeg 6.1.1: `-skip_frame nokey` MUST precede `-i` (a decoder
+// option placed after `-i` is applied to the encoder and rejected).
+// ---------------------------------------------------------------------------
+const kfAlignCache = new Map(); // `${path}|${trimMs}` → Promise<{ss,deltaMs}|null>
+
+/** Parse showinfo's `pts_time:<sec>` marks into {s: exactString, ms}. */
+function parseKeyframeSecs(out) {
+  const kfs = [];
+  const re = /pts_time:(\d+(?:\.\d+)?)/g;
+  const text = String(out || "");
+  let m;
+  while ((m = re.exec(text))) {
+    const v = parseFloat(m[1]);
+    if (Number.isFinite(v)) kfs.push({ s: m[1], ms: v * 1000 });
+  }
+  return kfs;
+}
+
+/**
+ * Nearest keyframe to `trimMs` within one frame duration (tolerance
+ * 1000/fps, clamped to 10–50 ms). Resolves { ss, deltaMs } — `ss` is the
+ * EXACT pts string, which buildStreamCopyArgs passes to `-ss` verbatim
+ * (µs precision — a rounded value 1 ms early makes the backward seek land
+ * on the previous GOP) — or null (not aligned / probe failure → the clip
+ * takes the re-encode path exactly as before).
+ */
+function findKeyframeAlignedStart(path, trimMs, fps) {
+  if (typeof path !== "string" || !path || !Number.isFinite(trimMs) || trimMs <= 0) {
+    return Promise.resolve(null);
+  }
+  const key = `${path}|${Math.round(trimMs)}`;
+  if (kfAlignCache.has(key)) return kfAlignCache.get(key);
+  const job = (async () => {
+    try {
+      const tolMs = Math.min(50, Math.max(10, Math.round(1000 / Math.max(1, Number(fps) || 30))));
+      // Window: [trim−2.5 s, trim+2.5 s] read from the seek-landing keyframe
+      // (−noaccurate_seek never discards pre-target packets, so the landing
+      // keyframe itself is included). A keyframe within tol ≤ 50 ms of trim
+      // is provably inside this window for ANY GOP size: the landing point
+      // is ≤ trim−2.5 s, and reading stops at original ts trim+2.5 s.
+      const ss = Math.max(0, (trimMs - 2500) / 1000).toFixed(3);
+      const r = await ffmpegCapture([
+        "-hide_banner", "-nostats",
+        "-copyts",
+        "-ss", ss, "-noaccurate_seek", "-t", "5",
+        "-skip_frame", "nokey",
+        "-i", path,
+        "-map", "0:v:0", "-vf", "showinfo",
+        "-f", "null", "-",
+      ], 20000);
+      const kfs = parseKeyframeSecs(r && r.out);
+      let best = null;
+      let bestD = Infinity;
+      for (const kf of kfs) {
+        const d = Math.abs(kf.ms - trimMs);
+        if (d < bestD) { bestD = d; best = kf; }
+      }
+      return best && bestD <= tolMs
+        ? { ss: best.s, deltaMs: Math.round(best.ms - trimMs) }
+        : null;
+    } catch (_) {
+      return null;
+    }
+  })();
+  kfAlignCache.set(key, job);
+  job.catch(() => {});
+  return job;
+}
+
+// ---------------------------------------------------------------------------
+// v9 TRUE SMART RENDER — video track timescale probe. The concat contract:
+// DIRTY pieces re-encode through the graph while CLEAN pieces stream-copy
+// source packets; for the concat demuxer's timestamp math to stay exact the
+// encoded pieces must write the SAME mp4 video track timescale the copied
+// pieces carry. ffprobe's stream time_base ("1/15360" etc.) IS the source
+// track's clock — its denominator feeds -video_track_timescale on the dirty
+// encodes. Cached per path; any failure → null (caller omits the flag and
+// ffmpeg's muxer default applies — the concat demuxer still rescales, this
+// is belt-and-braces exactness, not a correctness gate).
+// ---------------------------------------------------------------------------
+const videoTsCache = new Map(); // path → Promise<number|null>
+
+function probeVideoTimescale(p) {
+  if (typeof p !== "string" || !p) return Promise.resolve(null);
+  if (videoTsCache.has(p)) return videoTsCache.get(p);
+  const job = (async () => {
+    try {
+      const bin = await ffprobeAvailable();
+      if (!bin) return null;
+      const r = await captureExec(
+        bin,
+        [
+          "-v", "quiet", "-print_format", "json",
+          "-select_streams", "v:0",
+          "-show_entries", "stream=time_base",
+          "-i", p,
+        ],
+        15000,
+      );
+      if (!r || r.code !== 0 || !r.out) return null;
+      const j = JSON.parse(r.out);
+      const tb = j && j.streams && j.streams[0] && j.streams[0].time_base;
+      const m = /^(\d+)\/(\d+)$/.exec(String(tb || ""));
+      if (!m) return null;
+      const num = parseInt(m[1], 10);
+      const den = parseInt(m[2], 10);
+      if (!Number.isFinite(den) || den <= 0 || num !== 1) return null;
+      return den;
+    } catch (_) {
+      return null;
+    }
+  })();
+  videoTsCache.set(p, job);
+  job.catch(() => {});
+  return job;
+}
+
+// ---------------------------------------------------------------------------
+// v5.0 PARALLEL step-1 pool — clips encode in a worker pool of
+// min(4, max(1, cpus − 2)) concurrent ffmpeg children (spawn, not exec).
+// Any failure fails the whole export (with the clip index in the message)
+// and kills all siblings; cancellation surfaces as the v4.9
+// "Export cancelled" error verbatim.
+// ---------------------------------------------------------------------------
+
+/** v1.14.4: bounded-concurrency ordered map. The pre-encode source-fact
+ * gathering (ffprobe JSON + keyframe window scans + trim alignment) used to
+ * run as a SERIAL for-await — on HDD-class constrained machines each
+ * spawn-bound ffprobe costs 0.3–1 s, so a 20-clip timeline burned 20–60 s
+ * of pure serial "preparing…" before the first frame encoded. These probes
+ * are independent and I/O-bound (not timing measurements), so 4-wide
+ * concurrency is safe: probeMediaAsync has in-flight dedup and
+ * probeKeyframesNear caches the PROMISE under its window key, so parallel
+ * callers of the same key coalesce. Order is preserved by slot. */
+async function mapBoundedConcurrent(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const width = Math.max(1, Math.min(Number(limit) || 1, items.length));
+  await Promise.all(
+    Array.from({ length: width }, async () => {
+      while (true) {
+        const idx = next;
+        next += 1;
+        if (idx >= items.length) return;
+        out[idx] = await fn(items[idx], idx);
+      }
+    }),
+  );
+  return out;
+}
+
+async function runPool(jobs, workerCount, cbs) {
+  let next = 0;
+  let aborted = false;
+  const failures = [];
+  const killSiblings = () => {
+    if (!aborted) {
+      aborted = true;
+      killAllProcs();
+    }
+  };
+  const workers = Array.from({ length: Math.max(1, workerCount) }, () =>
+    (async () => {
+      while (!aborted) {
+        const idx = next;
+        next += 1;
+        if (idx >= jobs.length) return;
+        // v1.14.5 PROFILER: per-job wall (from launch to process exit).
+        const jobStart = Date.now();
+        try {
+          await runFfmpeg(jobs[idx].args, jobs[idx].durSec, (sec) => cbs.onTime(idx, sec));
+          if (cbs.onJobEnd) cbs.onJobEnd(idx, Date.now() - jobStart);
+          cbs.onDone(idx);
+        } catch (err) {
+          killSiblings();
+          failures.push({ idx, err });
+          return;
+        }
+      }
+    })(),
+  );
+  await Promise.all(workers);
+  if (failures.length > 0) {
+    const { idx, err } = failures[0];
+    if (err && err.message === "Export cancelled") throw err;
+    const seg = jobs[idx] && jobs[idx].segId ? ` (segment "${jobs[idx].segId}")` : "";
+    throw new Error(`Failed to encode clip ${idx + 1} of ${jobs.length}${seg}: ${(err && err.message) || err}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ASS builder — shared by the export burn-in AND the .ass sidecar export.
+// Mirrors src/lib/merger/captionAnimations.ts so preview == export.
+// ---------------------------------------------------------------------------
+
+const ANIM = {
+  POP_IN_MS: 220, SLIDE_UP_MS: 280, BOUNCE_IN_MS: 380, REVEAL_MS: 320,
+  SHAKE_MS: 280, TYPEWRITER_MS_PER_CHAR: 45, SLAM_MS: 180, GLITCH_MS: 220,
+  SPIN_IN_MS: 300, FLIP_IN_MS: 260, ELASTIC_MS: 450, ZOOM_WORDS_MS: 160,
+  SQUASH_MS: 340, TRACKING_IN_MS: 300, BLUR_IN_MS: 260, HEARTBEAT_MS: 640,
+};
+
+const COLOR_CYCLE_PALETTE = ["#FDE047", "#22D3EE", "#F472B6", "#A3E635"];
+
+function hexToAssColor(hex, alpha = 1) {
+  const h = (hex || "#FFFFFF").replace(/^#/, "");
+  const assAlpha = Math.round((1 - alpha) * 255).toString(16).padStart(2, "0").toUpperCase();
+  return `&H${assAlpha}${h.slice(4, 6)}${h.slice(2, 4)}${h.slice(0, 2)}`.toUpperCase();
+}
+
+function hexToAssBgr(hex) {
+  const h = (hex || "#FFFFFF").replace(/^#/, "");
+  return `&H${h.slice(4, 6)}${h.slice(2, 4)}${h.slice(0, 2)}`.toUpperCase();
+}
+
+/**
+ * ASS animation tags for one word. `karaoke: true` restricts to line-safe
+ * tags (\fscx/\fscy/\frz/\alpha/\1c/\2c/\t) because \move/\fad are
+ * once-per-line globals that would animate the WHOLE karaoke line.
+ * Mirrors assWordAnimationTags() in captionAnimations.ts.
+ */
+function assAnimTags(animation, wordDurMs, ch, karaoke, wordIndex, highlightColor) {
+  if (!animation || animation === "none") return "";
+  const chScale = ch / 1080;
+  const blocks = [];
+  const wIdx = wordIndex || 0;
+
+  switch (animation) {
+    case "pop-in": {
+      blocks.push(`{\\fscx40\\fscy40\\alpha&HFF&}`);
+      blocks.push(`{\\t(0,${Math.round(ANIM.POP_IN_MS * 0.7)},\\fscx115\\fscy115\\alpha&H00&)}`);
+      blocks.push(`{\\t(${Math.round(ANIM.POP_IN_MS * 0.7)},${ANIM.POP_IN_MS},\\fscx100\\fscy100)}`);
+      break;
+    }
+    case "slide-up": {
+      if (karaoke) {
+        blocks.push(`{\\alpha&HFF&\\fry-4}`);
+        blocks.push(`{\\t(0,${ANIM.SLIDE_UP_MS},\\alpha&H00&\\fry0)}`);
+      } else {
+        const dy = Math.round(30 * chScale);
+        blocks.push(`{\\move(0,${dy},0,0,0,${ANIM.SLIDE_UP_MS})\\fad(${Math.round(ANIM.SLIDE_UP_MS * 0.6)},0)}`);
+      }
+      break;
+    }
+    case "bounce-in": {
+      if (karaoke) {
+        blocks.push(`{\\fscx60\\fscy60\\alpha&HFF&}`);
+        blocks.push(`{\\t(0,${Math.round(ANIM.BOUNCE_IN_MS * 0.6)},\\fscx112\\fscy112\\alpha&H00&)}`);
+        blocks.push(`{\\t(${Math.round(ANIM.BOUNCE_IN_MS * 0.6)},${ANIM.BOUNCE_IN_MS},\\fscx100\\fscy100)}`);
+      } else {
+        const dy = Math.round(25 * chScale);
+        const t1 = Math.round(ANIM.BOUNCE_IN_MS * 0.6);
+        blocks.push(`{\\move(0,${-dy},0,0,0,${t1})\\fad(${Math.round(ANIM.BOUNCE_IN_MS * 0.4)},0)\\t(${t1},${ANIM.BOUNCE_IN_MS},\\fry1)}`);
+      }
+      break;
+    }
+    case "scale-pulse": {
+      const half = Math.max(1, Math.round(wordDurMs / 2));
+      blocks.push(`{\\t(0,${Math.round(half * 0.5)},\\fscx118\\fscy118)}`);
+      blocks.push(`{\\t(${Math.round(half * 0.5)},${half},\\fscx100\\fscy100)}`);
+      blocks.push(`{\\t(${half},${Math.round(half + (wordDurMs - half) * 0.5)},\\fscx118\\fscy118)}`);
+      blocks.push(`{\\t(${Math.round(half + (wordDurMs - half) * 0.5)},${wordDurMs},\\fscx100\\fscy100)}`);
+      break;
+    }
+    case "fade-through": {
+      if (karaoke) {
+        blocks.push(`{\\alpha&HFF&}`);
+        blocks.push(`{\\t(0,150,\\alpha&H00&)}`);
+      } else {
+        blocks.push(`{\\fad(150,150)}`);
+      }
+      break;
+    }
+    case "typewriter": {
+      blocks.push(karaoke
+        ? `{\\alpha&HFF&\\t(0,${ANIM.TYPEWRITER_MS_PER_CHAR * 6},\\alpha&H00&)}`
+        : `{\\fad(${ANIM.TYPEWRITER_MS_PER_CHAR * 6},0)}`);
+      break;
+    }
+    case "reveal": {
+      if (karaoke) {
+        blocks.push(`{\\alpha&HC0&}`);
+        blocks.push(`{\\t(0,${ANIM.REVEAL_MS},\\alpha&H00&)}`);
+      } else {
+        blocks.push(`{\\clip(0,0,0,${ch})\\fad(${Math.round(ANIM.REVEAL_MS * 0.5)},0)\\t(0,${ANIM.REVEAL_MS},\\clip(0,0,2000,${ch}))}`);
+      }
+      break;
+    }
+    case "wave": {
+      const amp = Math.max(1, Math.round(6 * chScale));
+      const q = Math.max(50, Math.round(wordDurMs / 4));
+      blocks.push(`{\\t(0,${q},\\fry${amp})}`);
+      blocks.push(`{\\t(${q},${q * 2},\\fry${-amp})}`);
+      blocks.push(`{\\t(${q * 2},${q * 3},\\fry${amp})}`);
+      blocks.push(`{\\t(${q * 3},${wordDurMs},\\fry0)}`);
+      break;
+    }
+    case "jitter": {
+      const amp = 2;
+      const steps = Math.min(6, Math.max(3, Math.round(wordDurMs / 80)));
+      const stepMs = Math.max(40, Math.round(wordDurMs / steps));
+      for (let i = 0; i < steps; i++) {
+        const t1 = i * stepMs;
+        const t2 = (i + 1) * stepMs;
+        const rx = i % 2 === 0 ? amp : -amp;
+        const ry = i % 3 === 0 ? amp : -amp;
+        blocks.push(`{\\t(${t1},${t2},\\frx${rx}\\fry${ry})}`);
+      }
+      blocks.push(`{\\t(${steps * stepMs},${wordDurMs},\\frx0\\fry0)}`);
+      break;
+    }
+    case "shake": {
+      const amp = 4;
+      const steps = 5;
+      const stepMs = Math.round(ANIM.SHAKE_MS / steps);
+      for (let i = 0; i < steps; i++) {
+        const t1 = i * stepMs;
+        const t2 = (i + 1) * stepMs;
+        const decay = 1 - i / steps;
+        const rx = (i % 2 === 0 ? 1 : -1) * Math.max(1, Math.round(amp * decay));
+        blocks.push(`{\\t(${t1},${t2},\\frx${rx})}`);
+      }
+      blocks.push(`{\\t(${ANIM.SHAKE_MS},${Math.max(ANIM.SHAKE_MS + 50, wordDurMs)},\\frx0)}`);
+      break;
+    }
+    case "drift": {
+      if (karaoke) {
+        blocks.push(`{\\t(0,${wordDurMs},\\fscx96\\fscy96\\alpha&H30&)}`);
+      } else {
+        const dy = Math.round(-8 * chScale);
+        blocks.push(`{\\move(0,0,0,${dy},0,${wordDurMs})}`);
+      }
+      break;
+    }
+    // ── v4.1 viral kinetic pack ──────────────────────────────────────
+    case "slam": {
+      blocks.push(`{\\fscx240\\fscy240\\alpha&HFF&}`);
+      blocks.push(`{\\t(0,${Math.round(ANIM.SLAM_MS * 0.5)},\\fscx115\\fscy115\\alpha&H00&)}`);
+      blocks.push(`{\\t(${Math.round(ANIM.SLAM_MS * 0.5)},${ANIM.SLAM_MS},\\fscx100\\fscy100)}`);
+      blocks.push(`{\\t(${ANIM.SLAM_MS},${ANIM.SLAM_MS + 80},\\frz2)}`);
+      blocks.push(`{\\t(${ANIM.SLAM_MS + 80},${ANIM.SLAM_MS + 140},\\frz0)}`);
+      break;
+    }
+    case "glitch": {
+      const hl = highlightColor ? hexToAssBgr(highlightColor) : null;
+      blocks.push(`{\\alpha&HA0&\\frz-3}`);
+      blocks.push(`{\\t(0,60,\\alpha&H40&\\frz3)}`);
+      if (hl) blocks.push(`{\\1c${hl}}`);
+      blocks.push(`{\\t(60,120,\\alpha&H00&\\frz-2)}`);
+      blocks.push(`{\\t(120,${ANIM.GLITCH_MS},\\alpha&H00&\\frz0)}`);
+      break;
+    }
+    case "spin-in": {
+      blocks.push(`{\\frz-14\\fscx60\\fscy60\\alpha&HFF&}`);
+      blocks.push(`{\\t(0,${ANIM.SPIN_IN_MS},\\frz0\\fscx100\\fscy100\\alpha&H00&)}`);
+      break;
+    }
+    case "flip-in": {
+      blocks.push(`{\\fscy5\\alpha&HFF&}`);
+      blocks.push(`{\\t(0,${Math.round(ANIM.FLIP_IN_MS * 0.8)},\\fscy108\\alpha&H00&)}`);
+      blocks.push(`{\\t(${Math.round(ANIM.FLIP_IN_MS * 0.8)},${ANIM.FLIP_IN_MS},\\fscy100)}`);
+      break;
+    }
+    case "elastic": {
+      blocks.push(`{\\fscx30\\fscy30\\alpha&HFF&}`);
+      blocks.push(`{\\t(0,${Math.round(ANIM.ELASTIC_MS * 0.55)},\\fscx106\\fscy106\\alpha&H00&)}`);
+      blocks.push(`{\\t(${Math.round(ANIM.ELASTIC_MS * 0.55)},${Math.round(ANIM.ELASTIC_MS * 0.8)},\\fscx97\\fscy97)}`);
+      blocks.push(`{\\t(${Math.round(ANIM.ELASTIC_MS * 0.8)},${ANIM.ELASTIC_MS},\\fscx100\\fscy100)}`);
+      break;
+    }
+    case "color-cycle": {
+      const color = COLOR_CYCLE_PALETTE[wIdx % COLOR_CYCLE_PALETTE.length];
+      const ass = hexToAssBgr(color);
+      if (karaoke) {
+        // Karaoke: pre-highlight color is Secondary → \2c per word.
+        blocks.push(`{\\2c${ass}\\fscx85\\fscy85\\alpha&HFF&}`);
+        blocks.push(`{\\t(0,160,\\fscx100\\fscy100\\alpha&H00&)}`);
+      } else {
+        blocks.push(`{\\1c${ass}\\fscx85\\fscy85\\alpha&HFF&}`);
+        blocks.push(`{\\t(0,160,\\fscx100\\fscy100\\alpha&H00&)}`);
+      }
+      break;
+    }
+    case "spotlight": {
+      blocks.push(`{\\fscx70\\fscy70\\alpha&HFF&}`);
+      blocks.push(`{\\t(0,140,\\fscx112\\fscy112\\alpha&H00&)}`);
+      blocks.push(`{\\t(140,200,\\fscx100\\fscy100)}`);
+      const half = Math.max(1, Math.round(wordDurMs / 2));
+      blocks.push(`{\\t(200,${Math.round(200 + half * 0.4)},\\fscx106\\fscy106)}`);
+      blocks.push(`{\\t(${Math.round(200 + half * 0.4)},${Math.max(200 + half, 201)},\\fscx100\\fscy100)}`);
+      break;
+    }
+    case "swing": {
+      const amp = 8;
+      const q = Math.max(50, Math.round(wordDurMs / 4));
+      blocks.push(`{\\frz${amp}}`);
+      blocks.push(`{\\t(0,${q},\\frz${-amp})}`);
+      blocks.push(`{\\t(${q},${q * 2},\\frz${amp})}`);
+      blocks.push(`{\\t(${q * 2},${q * 3},\\frz${-amp})}`);
+      blocks.push(`{\\t(${q * 3},${wordDurMs},\\frz0)}`);
+      break;
+    }
+    case "squash": {
+      blocks.push(`{\\fscy40\\fscx135\\alpha&HFF&}`);
+      blocks.push(`{\\t(0,${Math.round(ANIM.SQUASH_MS * 0.6)},\\fscy40\\fscx135\\alpha&H00&)}`);
+      blocks.push(`{\\t(${Math.round(ANIM.SQUASH_MS * 0.6)},${Math.round(ANIM.SQUASH_MS * 0.85)},\\fscy108\\fscx92)}`);
+      blocks.push(`{\\t(${Math.round(ANIM.SQUASH_MS * 0.85)},${ANIM.SQUASH_MS},\\fscy100\\fscx100)}`);
+      break;
+    }
+    case "zoom-words": {
+      blocks.push(`{\\fscx160\\fscy160\\alpha&HFF&}`);
+      blocks.push(`{\\t(0,${ANIM.ZOOM_WORDS_MS},\\fscx100\\fscy100\\alpha&H00&)}`);
+      break;
+    }
+    case "tracking-in": {
+      if (karaoke) {
+        // \fsp would leak across the line's word layout — approximate with
+        // a tight pop (mirrors captionAnimations.ts).
+        blocks.push(`{\\fscx92\\fscy92\\alpha&HFF&}`);
+        blocks.push(`{\\t(0,${ANIM.TRACKING_IN_MS},\\fscx100\\fscy100\\alpha&H00&)}`);
+      } else {
+        const sp = Math.max(1, Math.round(8 * chScale));
+        blocks.push(`{\\fsp${sp}\\alpha&HE6&}`);
+        blocks.push(`{\\t(0,${ANIM.TRACKING_IN_MS},\\fsp0\\alpha&H00&)}`);
+      }
+      break;
+    }
+    case "blur-in": {
+      blocks.push(`{\\fscx118\\fscy118\\alpha&HFF&}`);
+      blocks.push(`{\\t(0,${Math.round(ANIM.BLUR_IN_MS * 0.7)},\\fscx104\\fscy104\\alpha&H00&)}`);
+      blocks.push(`{\\t(${Math.round(ANIM.BLUR_IN_MS * 0.7)},${ANIM.BLUR_IN_MS},\\fscx100\\fscy100)}`);
+      break;
+    }
+    case "heartbeat": {
+      const b1 = Math.round(ANIM.HEARTBEAT_MS * 0.28);
+      const rest = Math.round(ANIM.HEARTBEAT_MS * 0.5);
+      const b2 = Math.round(ANIM.HEARTBEAT_MS * 0.78);
+      blocks.push(`{\\t(0,${Math.round(b1 / 2)},\\fscx114\\fscy114)}`);
+      blocks.push(`{\\t(${Math.round(b1 / 2)},${b1},\\fscx100\\fscy100)}`);
+      blocks.push(`{\\t(${rest},${Math.round(rest + (b2 - rest) / 2)},\\fscx108\\fscy108)}`);
+      blocks.push(`{\\t(${Math.round(rest + (b2 - rest) / 2)},${b2},\\fscx100\\fscy100)}`);
+      break;
+    }
+    default:
+      return "";
+  }
+  return blocks.length ? blocks.join("") : "";
+}
+
+function assFmtTime(sec) {
+  const clamped = Math.max(0, sec);
+  const h = Math.floor(clamped / 3600);
+  const m = Math.floor((clamped % 3600) / 60);
+  const s = Math.floor(clamped % 60);
+  const cs = Math.round((clamped % 1) * 100);
+  return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(cs).padStart(2, "0")}`;
+}
+
+/**
+ * Escape user text for ASS. Curly braces are REMOVED (libass renders "\{"
+ * literally as a backslash — stripping is the only safe transform).
+ * Newlines become \N.
+ */
+function escapeAssText(s) {
+  if (!s) return "";
+  return s
+    .replace(/\\/g, "\u2216") // rare — avoid tag injection
+    .replace(/[{}]/g, "")
+    .replace(/\n/g, "\\N");
+}
+
+// ---------------------------------------------------------------------------
+// HEADLINE PRESETS — mirror of src/lib/merger/headlinePresets.ts so the
+// exported ASS headline styles match the canvas preview exactly.
+// ---------------------------------------------------------------------------
+
+const HEADLINE_PRESETS = {
+  impact: {
+    ffmpegName: "Impact", fontSize: 0.085, fontWeight: 900, italic: false,
+    textColor: "#FFFFFF", accentColor: null, bgColor: null, bgAlpha: 1,
+    borderColor: "#000000", borderWidth: 6, shadow: true,
+    shadowColor: "#000000", shadowBlur: 12, textTransform: "uppercase",
+    letterSpacing: 2, positionY: 90, maxWidth: 0.86,
+  },
+  neon: {
+    ffmpegName: "Segoe UI", fontSize: 0.062, fontWeight: 800, italic: false,
+    textColor: "#67E8F9", accentColor: "#E879F9", bgColor: null, bgAlpha: 1,
+    borderColor: "#0E7490", borderWidth: 2, shadow: true,
+    shadowColor: "#D946EF", shadowBlur: 22, textTransform: "uppercase",
+    letterSpacing: 4, positionY: 100, maxWidth: 0.84,
+  },
+  sticker: {
+    ffmpegName: "Segoe UI", fontSize: 0.056, fontWeight: 900, italic: false,
+    textColor: "#1C1917", accentColor: "#F59E0B", bgColor: "#FBBF24", bgAlpha: 1,
+    borderColor: "#78350F", borderWidth: 3, shadow: true,
+    shadowColor: "#000000", shadowBlur: 10, textTransform: "uppercase",
+    letterSpacing: 1, positionY: 96, maxWidth: 0.8,
+  },
+  serif: {
+    ffmpegName: "Georgia", fontSize: 0.055, fontWeight: 400, italic: true,
+    textColor: "#F5F5F4", accentColor: null, bgColor: null, bgAlpha: 1,
+    borderColor: null, borderWidth: 0, shadow: true,
+    shadowColor: "#000000", shadowBlur: 8, textTransform: "none",
+    letterSpacing: 1, positionY: 110, maxWidth: 0.82,
+  },
+  banner: {
+    ffmpegName: "Segoe UI", fontSize: 0.05, fontWeight: 700, italic: false,
+    textColor: "#FFFFFF", accentColor: "#34D399", bgColor: "#0F0F12", bgAlpha: 0.72,
+    borderColor: null, borderWidth: 0, shadow: true,
+    shadowColor: "#000000", shadowBlur: 8, textTransform: "none",
+    letterSpacing: 2, positionY: 100, maxWidth: 0.86,
+  },
+};
+
+function getHeadlinePreset(id) {
+  return HEADLINE_PRESETS[id] || HEADLINE_PRESETS.impact;
+}
+
+/**
+ * Entrance tags for one headline item — mirror of headlineTransform() in
+ * native.ts so the burn-in matches the preview.
+ */
+function headlineAnimTags(animation, ch) {
+  const chScale = ch / 1080;
+  switch (animation) {
+    case "fade":
+      return `{\\fad(300,300)}`;
+    case "slide-up": {
+      const dy = Math.max(2, Math.round(34 * chScale));
+      return `{\\move(0,${dy},0,0,0,280)\\fad(180,0)}`;
+    }
+    case "pop":
+      return `{\\fscx60\\fscy60\\alpha&HFF&\\t(0,182,\\fscx112\\fscy112\\alpha&H00&)\\t(182,260,\\fscx100\\fscy100)}${""}\\fad(0,300)`;
+    case "zoom-punch":
+      return `{\\fscx200\\fscy200\\alpha&HFF&\\t(0,200,\\fscx100\\fscy100\\alpha&H00&)\\fad(0,300)}`;
+    default:
+      return `{\\fad(0,300)}`;
+  }
+}
+
+/**
+ * Build the Headline styles + Dialogue lines (clipped to the segment
+ * window, times relative to the window start). Returns
+ * { styleLines, eventLines } — the caller places the styles inside
+ * [V4+ Styles] and the events inside [Events]. Layer 1 so headlines
+ * render above caption lines.
+ *
+ * v1.17 Stack Text: items with a kinetic `stackStyle` AND a matching entry
+ * in `headlineGeometry` (renderer-measured line/word layout at the export
+ * resolution) ride the kinetic emitter in electron/stack-text-ass.js —
+ * per-style recipes from the preset library mirror, geometry-parity with
+ * the canvas painter. Kinetic items WITHOUT geometry (old callers/tests)
+ * and plain legacy items keep the v4.2 path below, byte-identical.
+ */
+function buildHeadlineEvents(headlines, width, height, winStart, winEnd, clampDur, headlineGeometry) {
+  const styleLines = [];
+  const eventLines = [];
+  const hScale = height / 1080;
+  const geos = Array.isArray(headlineGeometry) ? headlineGeometry : null;
+
+  for (const item of headlines) {
+    if (!item || !item.text) continue;
+    if (item.endMs <= winStart || item.startMs >= winEnd) continue;
+    const relStart = Math.max(0, item.startMs - winStart);
+    const relEnd = Math.min(clampDur, item.endMs - winStart);
+    if (relEnd <= relStart) continue;
+
+    // v1.17: kinetic Stack Text dispatch (geometry matched by the item's
+    // text + window + preset + size — the geometry array is the renderer's
+    // filtered copy, so duplicate-window items still match their own).
+    if (item.stackStyle && StackText.isKineticStyle(item.stackStyle)) {
+      const geo = geos
+        ? geos.find(
+            (g) =>
+              g &&
+              g.text === item.text &&
+              g.startMs === item.startMs &&
+              g.endMs === item.endMs &&
+              g.presetId === item.presetId &&
+              (g.sizeScale || 1) === (item.sizeScale || 1),
+          )
+        : null;
+      if (geo) {
+        const emitted = StackText.emitStackHeadlineItem(
+          item,
+          geo,
+          getHeadlinePreset(item.presetId),
+          width,
+          height,
+          winStart,
+          winEnd,
+          clampDur,
+          // Unique per-item style name (karaoke-fill needs its own
+          // Primary/Secondary color pair on the Style line).
+          `HeadlineK${headlines.indexOf(item)}`,
+        );
+        if (emitted) {
+          styleLines.push(...emitted.styleLines);
+          eventLines.push(...emitted.eventLines);
+          continue;
+        }
+      }
+      // No geometry / unmeasurable → fall through to the legacy emitter
+      // (the safe v4.2 path — never crash on old callers or tests).
+    }
+
+    const p = getHeadlinePreset(item.presetId);
+    const sizeScale = item.sizeScale || 1;
+    const fontSize = Math.max(10, Math.round(p.fontSize * height * sizeScale));
+    const positionY = Math.round(p.positionY * hScale);
+    const bold = p.fontWeight >= 600 ? -1 : 0;
+    const italic = p.italic ? -1 : 0;
+    // Alignment: 8=top-center, 5=middle-center, 2=bottom-center.
+    // v1.17: the effective position derives from the layout (round-trips
+    // legacyLayoutFor, so old items keep their exact v4.2 alignment; a
+    // stackLayout + SIMPLE style collapses onto it — mirror of the canvas
+    // painter's legacyPositionFor).
+    const effLayout =
+      item.stackLayout || StackText.legacyLayoutFor(item.position);
+    const effPosition =
+      effLayout === "top-banner" ? "top" : effLayout === "bottom-center" ? "bottom" : "center";
+    const alignment = effPosition === "top" ? 8 : effPosition === "center" ? 5 : 2;
+    // v1.14.6 preview parity (see buildAssDocument's BOX PARITY note):
+    // BorderStyle=3 box = OUTLINECOLOUR fill (verified) + Outline = padding
+    // extent; non-box outline/shadow scale with the output height exactly
+    // like the canvas painter (drawHeadline in native.ts).
+    const borderStyle = p.bgColor ? 3 : 1;
+    const outline = p.bgColor
+      ? Math.max(0, Math.round((p.bgPadding != null ? p.bgPadding : 10) * hScale))
+      : Math.max(0, Math.round((p.borderWidth || 0) * hScale));
+    const shadowVal = p.shadow ? Math.max(1, Math.round((p.shadowBlur || 3) / 2 * hScale)) : 0;
+    const outlineColour = p.bgColor
+      ? hexToAssColor(p.bgColor, p.bgAlpha != null ? p.bgAlpha : 1)
+      : hexToAssColor(p.borderColor || p.textColor);
+    const backColour = p.bgColor
+      ? (p.shadow ? hexToAssColor(p.accentColor || p.shadowColor || "#000000", 0.55) : hexToAssColor(p.bgColor, p.bgAlpha != null ? p.bgAlpha : 1))
+      : hexToAssColor(p.accentColor || p.shadowColor || "#000000", 0.55);
+    const marginLR = Math.round((width * (1 - p.maxWidth)) / 2);
+    const spacing = Math.round((p.letterSpacing || 0) * hScale * 10) / 10;
+
+    styleLines.push(
+      `Style: Headline,${p.ffmpegName},${fontSize},${hexToAssColor(p.textColor)},${hexToAssColor(p.textColor)},${outlineColour},${backColour},${bold},${italic},0,0,100,100,${spacing},0,${borderStyle},${outline},${shadowVal},${alignment},${marginLR},${marginLR},${positionY},1`,
+    );
+
+    let text = String(item.text);
+    if (p.textTransform === "uppercase") text = text.toUpperCase();
+    const tags = headlineAnimTags(item.animation, height);
+    eventLines.push(
+      `Dialogue: 1,${assFmtTime(relStart / 1000)},${assFmtTime(relEnd / 1000)},Headline,,0,0,0,,${tags}${escapeAssText(text)}`,
+    );
+  }
+  return { styleLines, eventLines, count: eventLines.length };
+}
+
+/**
+ * Build the full ASS document for a set of cues on the master timeline,
+ * with cue times SHIFTED to be relative to [segStartMs, segEndMs] and
+ * clamped to [0, segDurMs]. When segStartMs/segEndMs are omitted the
+ * cues are emitted with their absolute (master timeline) times — used
+ * for the .ass sidecar export.
+ *
+ * Headlines (v4.2): when `headlines` is a non-empty array, a Headline
+ * style + one Dialogue per item are appended (Layer 1, above captions).
+ * v1.17 Stack Text: `headlineGeometry` (renderer-measured) routes kinetic
+ * stackStyle items through electron/stack-text-ass.js; absent/null keeps
+ * the legacy emitter for every item (old callers/tests — safe fallback).
+ * v1.18 Kinetic Captions: `kineticCompositions` + `kineticGeometry`
+ * (renderer-planned + renderer-measured) emit per-word ASS events (Layer 0,
+ * after the headline events) through electron/kinetic-ass.js; cues covered
+ * by a GEOMETRY-MATCHED composition skip the legacy loop below (kinetic
+ * replaces captions for them), uncovered cues keep it (never crash on old
+ * payloads — missing geometry falls back).
+ *
+ * Word modes:
+ *   - "off": one Dialogue per cue (full text).
+ *   - "word": one Dialogue with \k karaoke tags (Primary=highlight,
+ *     Secondary=text). Karaoke-safe animation tags only.
+ *   - "word-only": one Dialogue per word (full tag set incl. \move/\fad).
+ *   - "stack": one Dialogue per stack-state — line i spans word i's
+ *     [start, next word's start), shows words 0..i stacked with \N,
+ *     previous words dim, active word highlighted + animated.
+ */
+function buildAssDocument(cues, cs, headlines, width, height, segStartMs, segEndMs, segDurMs, headlineGeometry, kineticCompositions, kineticGeometry) {
+  const hasHeadlines = Array.isArray(headlines) && headlines.some((h) => h && h.text);
+  if (!cs && !hasHeadlines) return null;
+
+  const fontName = (cs && cs.fontName) || "Arial";
+  const fontSize = Math.round(((cs && cs.fontSize) || 0.05) * height * ((cs && cs.fontSizeScale) || 1));
+  const textColor = (cs && cs.textColor) || "#FFFFFF";
+  const highlightColor = (cs && cs.highlightColor) || null;
+  const wordMode = (cs && cs.wordMode) || "off";
+  const animation = (cs && cs.animation) || "none";
+  const karaoke = wordMode === "word";
+
+  const position = (cs && (cs.customPosition || cs.position)) || "bottom";
+  // v1.14.6 PREVIEW PARITY (drawCaption in native.ts is the ground truth):
+  // every preset px unit is defined against a 1080p canvas and the preview
+  // scales it by ch/1080 — the ASS Style must scale the SAME way or
+  // captions sit at the wrong height/weight on 720p (fast mode) and any
+  // non-1080 export. positionY becomes marginV × hScale.
+  const hScale = height / 1080;
+  const positionYRaw = cs && cs.positionY != null ? cs.positionY : 50;
+  const marginV = Math.max(0, Math.round(positionYRaw * hScale));
+  const fontWeight = (cs && cs.fontWeight) || 600;
+  const bold = fontWeight >= 600 ? -1 : 0;
+  const italic = ((cs && cs.fontStyle) || "normal") === "italic" ? -1 : 0;
+  const bgColor = (cs && cs.bgColor) || null;
+  const bgAlpha = cs && cs.bgAlpha != null ? cs.bgAlpha : 1;
+  const bgPadding = cs && cs.bgPadding != null ? cs.bgPadding : 12;
+  const borderColor = (cs && cs.borderColor) || "#000000";
+  const borderWidth = cs && cs.borderWidth != null ? cs.borderWidth : 2;
+  const shadow = !!(cs && cs.shadow);
+  const shadowColor = (cs && cs.shadowColor) || "#000000";
+  const shadowBlur = cs && cs.shadowBlur != null ? cs.shadowBlur : 3;
+  const textTransform = (cs && cs.textTransform) || "none";
+  const spacing = (cs && cs.letterSpacing) || 0;
+  const alignment = (cs && cs.alignment) || "center";
+
+  // Alignment: 2=bottom-center, 5=middle-center, 8=top-center
+  let assAlignment = position === "top" ? 8 : position === "center" ? 5 : 2;
+  if (alignment === "left") assAlignment -= 1;
+  else if (alignment === "right") assAlignment += 1;
+
+  // v1.14.6 BOX PARITY — empirically verified libass semantics (see
+  // scripts/verify-caption-parity.js): BorderStyle=3 fills the box with
+  // OUTLINECOLOUR (with its alpha) and the box extends OUTLINE px beyond
+  // the glyphs — BackColour is the box SHADOW. Pre-v1.14.6 mapped the box
+  // color onto BackColour (invisible: the box rendered as borderColor at
+  // full opacity) and hard-set Outline=0 (bgPadding ignored → box flush
+  // against the text). Now: box fill = bgColor+bgAlpha on OutlineColour,
+  // padding = bgPadding×hScale on Outline (rounded corners have no ASS
+  // equivalent — bgRadius is dropped; text stroke over a box is not
+  // representable, matching the box presets that use borderColor=null).
+  const borderStyle = bgColor ? 3 : 1;
+  const outline = bgColor
+    ? Math.max(0, Math.round(bgPadding * hScale))
+    : Math.max(0, Math.round(borderWidth * hScale));
+  const shadowVal = shadow ? Math.max(1, Math.round(shadowBlur * hScale)) : 0;
+  const outlineColour = bgColor
+    ? hexToAssColor(bgColor, bgAlpha)
+    : hexToAssColor(borderColor);
+  const backColour = bgColor
+    ? (shadow ? hexToAssColor(shadowColor, 0.5) : hexToAssColor(bgColor, bgAlpha))
+    : hexToAssColor(shadow ? shadowColor : "#000000", 0.5);
+
+  // Karaoke \k mode: Primary = highlight (post-fill), Secondary = text.
+  const primary = karaoke && highlightColor ? highlightColor : textColor;
+  const secondary = karaoke ? textColor : textColor;
+
+  const transform = (s) => {
+    if (textTransform === "uppercase") return s.toUpperCase();
+    if (textTransform === "lowercase") return s.toLowerCase();
+    return s;
+  };
+
+  const assLines = [];
+  assLines.push("[Script Info]");
+  assLines.push("ScriptType: v4.00+");
+  assLines.push(`PlayResX: ${width}`);
+  assLines.push(`PlayResY: ${height}`);
+  assLines.push("WrapStyle: 1");
+  assLines.push("ScaledBorderAndShadow: yes");
+  assLines.push("");
+  assLines.push("[V4+ Styles]");
+  assLines.push("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding");
+
+  const useSegmentWindow = typeof segStartMs === "number" && typeof segDurMs === "number";
+  const winStart = useSegmentWindow ? segStartMs : 0;
+  const winEnd = useSegmentWindow ? segEndMs : Infinity;
+  const clampDur = useSegmentWindow ? segDurMs : Infinity;
+
+  // ── Headline overlay styles + events (v4.2, Layer 1) ──
+  const headline = hasHeadlines
+    ? buildHeadlineEvents(headlines, width, height, winStart, winEnd, clampDur, headlineGeometry)
+    : { styleLines: [], eventLines: [], count: 0 };
+
+  // ── v1.18 Kinetic Typography captions (Layer 0 — kinetic REPLACES the
+  // legacy caption loop for cues covered by an EMITTING composition).
+  // Compositions are renderer-planned (semantic phrase grouping,
+  // hierarchy, motion choreography — the main process never re-derives
+  // them, §36 determinism) and matched to renderer-measured geometry by
+  // cueStartMs; a composition without geometry emits NOTHING and covers
+  // nothing → its cues keep the legacy caption path (safe fallback).
+  const kineticActive = !!(
+    cs &&
+    cs.kinetic &&
+    cs.kinetic.enabled &&
+    Array.isArray(kineticCompositions) &&
+    kineticCompositions.length > 0
+  );
+  const kineticGeoList = kineticActive && Array.isArray(kineticGeometry) ? kineticGeometry : [];
+  const kinetic = kineticActive
+    ? KineticASS.emitKineticCompositions({
+        compositions: kineticCompositions,
+        geometry: kineticGeoList,
+        settings: cs.kinetic,
+        // v1.27.2 preview parity: the kinetic painter resolves its base color
+        // as customColor || "#FFFFFF" (kinetic/render.ts drawKineticComposition) —
+        // NOT the caption preset's textColor. cs.customColor ships the raw
+        // user override (native.ts payload); unset → white, exactly what the
+        // preview shows. The LEGACY caption loop below still uses cs.textColor
+        // (its own parity contract).
+        textColor: (cs && cs.customColor) || "#FFFFFF",
+        width,
+        height,
+        winStart,
+        winEnd,
+        clampDur,
+        // Font resolution is INTERNAL to kinetic-ass.js (FONT_ASS_NAMES
+        // mirrors the renderer's FONT_OPTIONS ffmpegName table) — no
+        // fontNameResolver needed from this side.
+      })
+    : { styleLines: [], eventLines: [], count: 0 };
+  // A cue is covered when a GEOMETRY-MATCHED composition overlaps it
+  // (kinetic requires word timing; the UI only offers it with word timing
+  // present — plain .srt cues stay legacy).
+  const kineticEmitting = kineticActive
+    ? kineticCompositions.filter((k) => k && kineticGeoList.some((g) => g && g.cueStartMs === k.startMs))
+    : [];
+  const kineticCovered = (cue) =>
+    kineticEmitting.some((k) => cue.endMs > k.startMs && cue.startMs < k.endMs);
+
+  // [V4+ Styles] — Default (captions) + Headline styles + Kinetic styles.
+  if (cs) {
+    assLines.push(`Style: Default,${fontName},${fontSize},${hexToAssColor(primary)},${hexToAssColor(secondary)},${outlineColour},${backColour},${bold},${italic},0,0,100,100,${spacing},0,${borderStyle},${outline},${shadowVal},${assAlignment},40,40,${marginV},1`);
+  }
+  assLines.push(...headline.styleLines);
+  assLines.push(...kinetic.styleLines);
+  assLines.push("");
+  assLines.push("[Events]");
+  assLines.push("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text");
+  assLines.push(...headline.eventLines);
+  assLines.push(...kinetic.eventLines);
+
+  let emitted = headline.count + kinetic.count;
+
+  if (!cs || !Array.isArray(cues) || cues.length === 0) {
+    return emitted > 0 ? assLines.join("\n") : null;
+  }
+
+  for (const cue of cues) {
+    if (cue.endMs <= winStart || cue.startMs >= winEnd) continue;
+    // v1.18: kinetic compositions replace the legacy caption emission for
+    // the cues they cover (geometry-matched only — see kineticEmitting).
+    if (kineticActive && kineticCovered(cue)) continue;
+
+    const relStartMs = Math.max(0, cue.startMs - winStart);
+    const relEndMs = Math.min(clampDur, cue.endMs - winStart);
+    if (relEndMs <= relStartMs) continue;
+
+    const hasWords = Array.isArray(cue.words) && cue.words.length > 0;
+
+    // Word-timing visibility helper: overlap with the segment window.
+    const wStart = (w) => Math.max(0, w.startMs - winStart);
+    const wEnd = (w) => Math.min(clampDur, w.endMs - winStart);
+
+    // ── Stack mode: one Dialogue per stack state ──
+    if (wordMode === "stack" && hasWords) {
+      const words = cue.words;
+      for (let i = 0; i < words.length; i++) {
+        const start = wStart(words[i]);
+        // Line i lives until the next word begins (or cue end).
+        const nextStart = i + 1 < words.length ? wStart(words[i + 1]) : relEndMs;
+        const end = Math.max(nextStart, start + 100);
+        if (end <= start) continue;
+
+        // Max 8 rows visible (matches the canvas window).
+        const from = Math.max(0, i - 7);
+        const parts = [];
+        for (let j = from; j <= i; j++) {
+          const wt = escapeAssText(transform(words[j].text || ""));
+          if (!wt) continue;
+          if (j === i) {
+            // Active word: highlight + full animation tags.
+            const tags = assAnimTags(animation, wEnd(words[i]) - start, height, false, i, highlightColor);
+            parts.push(`{\\alpha&H00&\\1c${hexToAssBgr(highlightColor || textColor)}}${tags}${wt}`);
+          } else {
+            // Spoken words above: dim.
+            parts.push(`{\\alpha&HA0&\\1c${hexToAssBgr(textColor)}}${wt}`);
+          }
+        }
+        if (parts.length === 0) continue;
+        assLines.push(`Dialogue: 0,${assFmtTime(start / 1000)},${assFmtTime(Math.min(end, relEndMs) / 1000)},Default,,0,0,0,,${parts.join("\\N")}`);
+        emitted++;
+      }
+      continue;
+    }
+
+    // ── Word-only mode: one Dialogue per word ──
+    if (wordMode === "word-only" && hasWords) {
+      // The active word renders in the preset's highlight color (matches
+      // drawWordOnly in native.ts).
+      const hlTag = highlightColor ? `{\\1c${hexToAssBgr(highlightColor)}}` : "";
+      for (const w of cue.words) {
+        if (w.endMs <= winStart || w.startMs >= winEnd) continue;
+        const ws = wStart(w);
+        const we = wEnd(w);
+        if (we <= ws) continue;
+        const wt = escapeAssText(transform(w.text || ""));
+        if (!wt) continue;
+        const tags = assAnimTags(animation, we - ws, height, false, cue.words.indexOf(w), highlightColor);
+        assLines.push(`Dialogue: 0,${assFmtTime(ws / 1000)},${assFmtTime(we / 1000)},Default,,0,0,0,,${hlTag}${tags}${wt}`);
+        emitted++;
+      }
+      continue;
+    }
+
+    // ── Word (karaoke highlight) mode: one Dialogue with \k tags ──
+    if (wordMode === "word" && hasWords) {
+      const parts = [];
+      let wIdx = 0;
+      for (const w of cue.words) {
+        if (w.endMs <= winStart || w.startMs >= winEnd) { wIdx++; continue; }
+        const ws = wStart(w);
+        const we = wEnd(w);
+        const wDurCs = Math.max(1, Math.round((we - ws) / 10));
+        const wt = escapeAssText(transform(w.text || ""));
+        if (!wt) { wIdx++; continue; }
+        const tags = assAnimTags(animation, we - ws, height, true, wIdx, highlightColor);
+        parts.push(`${tags}{\\k${wDurCs}}${wt}`);
+        wIdx++;
+      }
+      if (parts.length === 0) continue;
+      const karaokeText = parts.join(" ");
+      assLines.push(`Dialogue: 0,${assFmtTime(relStartMs / 1000)},${assFmtTime(relEndMs / 1000)},Default,,0,0,0,,${karaokeText}`);
+      emitted++;
+      continue;
+    }
+
+    // ── Standard mode (off) or no word timestamps: full text line ──
+    const text = escapeAssText(transform(cue.text || ""));
+    if (!text) continue;
+    const tags = assAnimTags(animation, relEndMs - relStartMs, height, false, 0, highlightColor);
+    assLines.push(`Dialogue: 0,${assFmtTime(relStartMs / 1000)},${assFmtTime(relEndMs / 1000)},Default,,0,0,0,,${tags}${text}`);
+    emitted++;
+  }
+
+  if (emitted === 0) return null;
+  return assLines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// IPC: export the full-timeline .ass sidecar (v4.1)
+// ---------------------------------------------------------------------------
+ipcMain.handle("export-ass-file", async (event, opts) => {
+  try {
+    // v1.27.2 KINETIC PARITY: the sidecar must carry the SAME kinetic
+    // choreography the burn-in exports carry (the user sees kinetic captions
+    // in the preview — a plain-caption .ass sidecar is the classic
+    // "export ≠ preview" drift). The renderer payload (page.tsx
+    // exportAssSidecar) needs to ship `kineticCompositions` +
+    // `kineticGeometry` + `captionSettings.kinetic`; when present they flow
+    // straight into buildAssDocument (kinetic events replace the legacy cue
+    // lines exactly like the burn-in path). Old payloads stay legacy.
+    const { cues, captionSettings, headlines, width, height, kineticCompositions, kineticGeometry } = opts || {};
+    const hasHl = Array.isArray(headlines) && headlines.length > 0;
+    if ((!cues || cues.length === 0) && !hasHl) return null;
+    const doc = buildAssDocument(cues || [], captionSettings, headlines, width, height, null, null, null, undefined, Array.isArray(kineticCompositions) ? kineticCompositions : undefined, Array.isArray(kineticGeometry) ? kineticGeometry : undefined);
+    if (!doc) return null;
+
+    const res = await dialog.showSaveDialog(mainWindow, {
+      title: "Export ASS Subtitles",
+      defaultPath: `framefuse_captions_${Date.now()}.ass`,
+      filters: [{ name: "ASS Subtitles", extensions: ["ass"] }],
+    });
+    if (res.canceled || !res.filePath) return null;
+    if (!res.filePath.toLowerCase().endsWith(".ass")) res.filePath += ".ass";
+    fs.writeFileSync(res.filePath, doc, "utf-8");
+    return { path: res.filePath, size: fs.statSync(res.filePath).size };
+  } catch (err) {
+    throw new Error(err.message || String(err));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// IPC: TWO-STEP EXPORT
+// Step 1: Encode each segment → MP4 clip with zoompan + ASS subtitles burn-in
+//         (+ v4.3 segment transitions: xfade head composites / dip fades;
+//          v5.0: VIDEO sources, overlay compositing, chroma key, per-clip
+//          audio tracks, PARALLEL encode pool)
+// Step 2: Concat all clips + mux audio using -f concat -c copy (INSTANT)
+//
+// v5.0 NOTE: the transition tables (XFADE_NAMES / DIP_COLORS / clampTrMs /
+// frozenZoompanExpr) and the full per-clip argv builder live in
+// ./export-graph.js (pure CommonJS — shared with the test harness).
+// ---------------------------------------------------------------------------
+
+// v1.13 Tier 3 (user directive): LOW-COST SUBTITLE RASTERIZATION — strip
+// libass's expensive per-glyph work from the BURN-IN documents only (the
+// .ass sidecar export keeps the user's original styling). Gaussian blur
+// (\blur) and box blur (\be) re-rasterize every blurred glyph on EVERY
+// frame it is alive — across a 34,200-frame timeline that eats 30 %+ of a
+// constrained CPU; \blur0 swaps the soft glow for a clean hard shadow, and
+// outline / border widths clamp to ≤ 2 px so the stroke rasterizer touches
+// fewer scanlines per glyph.
+function optimizeAssForConstrainedCpu(doc) {
+  if (typeof doc !== "string" || doc.length === 0) return doc;
+  return doc
+    // Dialogue override tags: \blur<n> → \blur0 (hard edges), drop \be
+    // entirely, clamp \bord to ≤ 2 px.
+    .replace(/\\blur-?[0-9]+(?:\.[0-9]+)?/g, "\\blur0")
+    .replace(/\\be[0-9]*/g, "")
+    .replace(/\\bord([0-9]+(?:\.[0-9]+)?)/g, (_m, n) => `\\bord${Math.min(2, parseFloat(n))}`)
+    // Style lines (ours are exactly the 23-field v4+ shape): clamp the
+    // Outline (field 16) and Shadow (field 17) widths to 2 px.
+    .replace(/^Style: .+$/gm, (line) => {
+      const f = line.split(",");
+      if (f.length !== 23) return line;
+      for (const idx of [16, 17]) {
+        const v = parseFloat(f[idx]);
+        if (Number.isFinite(v) && v > 2) f[idx] = "2";
+      }
+      return f.join(",");
+    });
+}
+
+ipcMain.handle("export-native", async (event, opts) => {
+  const { outputPath, fps: reqFps, width: reqWidth, height: reqHeight, bitrateMbps, quality, crf, audioKbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark, overlays, sfx, fastMode: fastModeWanted, slideshowFps24, textRemoval: textRemovalRaw, headlineGeometry, kineticCompositions, kineticGeometry, voiceovers, dubOriginalVolume, totalMs: payloadTotalMs } = opts;
+  // ── v1.25 MULTI-MUSIC payload normalization ───────────────────────────
+  // The renderer now ships `musicClips` (N placements, each with its resolved
+  // real path). OLD payloads (and any other call sites) still send the legacy
+  // `audioPath` + `audio.music*` scalars — normalize BOTH into one internal
+  // descriptor list; the graph builders take `musicTracks` (N clips) or the
+  // legacy single path, never both.
+  const musicClipList = Array.isArray(opts.musicClips)
+    ? opts.musicClips
+        .map((c) => c && typeof c.path === "string" && c.path
+          ? {
+              path: c.path,
+              startMs: Math.max(0, Math.round(Number(c.startMs) || 0)),
+              volume: Math.max(0, Math.min(2, Number(c.volume) || 1)),
+              loop: !!(c && c.loop),
+              // v1.33.5: the clip's duration rides along (the renderer ships
+              // it) — the mux builders use it for FINITE -stream_loop bounds
+              // so a looping track's input can EOF on its own instead of
+              // being infinite (-1). Probed at the call site when missing.
+              durationMs: Math.max(0, Math.round(Number(c.durationMs) || 0)),
+              // v1.29: "music" | "voice" — voice = full-length narration-style
+              // placement (loop is false there by contract). Informational for
+              // the graph builders (branches are volume/fades/adelay either
+              // way); sanitized to the two legal values, default "music".
+              role: c.role === "voice" ? "voice" : "music",
+            }
+          : null)
+        .filter(Boolean)
+    : [];
+  const hasMusicClips = musicClipList.length > 0;
+  const musicCount = hasMusicClips ? musicClipList.length : (typeof audioPath === "string" && audioPath ? 1 : 0);
+  if (hasMusicClips) {
+    console.log(`[Export] music: ${musicClipList.length} clip track(s) (multi-music v1.25 path)`);
+  }
+  // ── v1.15 BURN-IN TEXT REMOVAL (default OFF) ──────────────────────────
+  // sanitizeTextRemoval → null keeps every graph byte-identical when the
+  // feature is off (the only default). Region rects are SOURCE-normalized
+  // (0..1); the filters run BEFORE each video segment's cover-fit chain.
+  const textRemoval = require("./textremoval").sanitizeTextRemoval(textRemovalRaw);
+  if (textRemoval) {
+    const hasVideo = segments.some((s) => s && s.mediaType === "video");
+    console.log(
+      `[Export] text removal ON — mode=${textRemoval.mode}, regions=${textRemoval.regions.length}` +
+        (hasVideo ? "" : " (WARNING: no video segments — nothing to remove)"),
+    );
+    if (!hasVideo) {
+      // Still proceed (images ignore TR) but surface it in the log.
+    }
+  }
+  // v1.14.4 CONSTRAINED-CPU FAST MODE (see planSmartRenderingPipeline): the
+  // requested resolution can be DOWNSCALED mid-export on Tier-3 machines
+  // (mostly-dirty long timelines) — width/height stay mutable for that one
+  // re-assignment. Every consumer that must NOT see the fast-mode dims (the
+  // two-step fallback jobs, built before the smart pipeline runs) snapshots
+  // the values at build time.
+  let width = reqWidth;
+  let height = reqHeight;
+  // v1.14.5: fps is now `let` — the SLIDESHOW 24 FPS MODE (export-speed plan
+  // §2 — Phase 1) re-assigns it below for pure-image timelines. Every
+  // consumer (frame law, zoompan, ASS windows, chunk caps) reads this single
+  // binding, so one reassignment keeps the whole pipeline consistent.
+  let fps = Number(reqFps) || 30;
+
+  if (!outputPath) throw new Error("No output path");
+  // v1.33.6 AUDIO-ONLY EXPORT: zero visual segments is legal when the project
+  // carries audio (music/voice-over/SFX) — the video track renders as black
+  // over the audio's timeline (the tail-filler machinery in both pool
+  // paths). The hard error stays only for a genuinely empty project.
+  if (!segments || segments.length === 0) {
+    const hasAnyAudioInput =
+      musicClipList.length > 0 ||
+      (typeof audioPath === "string" && audioPath) ||
+      (Array.isArray(voiceovers) && voiceovers.some((v) => v && typeof v.wavPath === "string")) ||
+      (Array.isArray(sfx) && sfx.some((s) => s && typeof s.wavPath === "string"));
+    if (!hasAnyAudioInput) throw new Error("No segments");
+    console.log(
+      "[Export] audio-only timeline: 0 visual segment(s) — the video track renders as black over the audio's timeline",
+    );
+  }
+
+  if (!ffmpegPath || !fs.existsSync(ffmpegPath)) {
+    throw new Error("FFmpeg not found. The bundled FFmpeg binary is missing or corrupted. Please reinstall FrameFuse. Expected at: " + ffmpegPath);
+  }
+
+  // ── v1.16 RUST NATIVE ENGINE ROUTER ─────────────────────────────────
+  // wgpu compositor + runtime-FFI encode (no child processes, no IPC pipes,
+  // no Chromium GPU process). v0.1 handles the core fast path; anything it
+  // doesn't support yet, or ANY runtime failure, silently returns null and
+  // this handler continues into the v1.14.5 CLI pipeline below (Safe Mode).
+  if (opts.useRustEngine !== false) {
+    const rustResult = await RUST.runRustExport(opts, event, {
+      ffmpegPath,
+      cpuCount: os.cpus().length,
+    });
+    if (rustResult) {
+      console.log(
+        `[Export] Rust engine: ${rustResult.encoderName} (${rustResult.engineUsed})` +
+          rustResult.adapter ? ` on ${rustResult.adapter}` : "",
+        `— ${rustResult.totalWallMs}ms wall, ${rustResult.framesEncoded} frames`,
+      );
+      return rustResult;
+    }
+  }
+
+  // v1.20: WHY the CLI pipeline runs (kinetic-typography captions, stack
+  // text, geometric transitions, …) — threaded into every export-progress
+  // event so the Header badge can show the routing reason instead of a
+  // silent "FFmpeg CLI" (the #1 "why is the rust engine not working"
+  // support question).
+  const cliEngineReason = (() => {
+    try {
+      return RUST.rustGateReason ? RUST.rustGateReason(opts) : null;
+    } catch {
+      return null;
+    }
+  })();
+  if (cliEngineReason) {
+    console.log(`[Export] FFmpeg CLI pipeline — Rust engine bypassed: ${cliEngineReason}`);
+  }
+
+  // v4.4 watermark: { imagePath, x, y, w, h, opacity } — geometry computed
+  // ONCE in the renderer process (watermarkGeometry) so preview + export
+  // can never disagree. The chain (scale → setsar → rgba →
+  // colorchannelmixer=aa → overlay) lives in export-graph.buildClipArgs.
+  const wm =
+    watermark && watermark.imagePath && Number(watermark.w) > 0
+      ? {
+          imagePath: watermark.imagePath,
+          x: Math.round(Number(watermark.x) || 0),
+          y: Math.round(Number(watermark.y) || 0),
+          w: Math.round(Number(watermark.w)),
+          h: Math.round(Number(watermark.h) || watermark.w),
+          opacity: Math.max(0.05, Math.min(1, Number(watermark.opacity) || 1)).toFixed(3),
+        }
+      : null;
+
+  const intensity = Math.max(0, Math.min(100, Number(kenBurns?.intensity) || 0));
+  const zoomMax = 1.06 + (intensity / 100) * 0.18;
+  const enabled = !!kenBurns?.enabled;
+  const globalDir = kenBurns?.direction || "in";
+
+  const captionsEnabled = !!captionSettings?.enabled && subtitleCues && subtitleCues.length > 0;
+  const headlinesEnabled = Array.isArray(headlines) && headlines.some((h) => h && h.text && h.endMs > h.startMs);
+  // v1.27.2 KINETIC PARITY: the renderer measured the kinetic geometry at
+  // the REQUESTED export dims; CONSTRAINED-CPU fast mode can re-assign
+  // width/height below (the smart pipeline's pieces build ASS documents at
+  // the downscaled dims = PlayRes) — this binding is rescaled in lockstep
+  // (exactly like the watermark rects) so every \pos/\fs stays in the right
+  // coordinate space. The pre-fast-mode call sites (two-step + chunk jobs,
+  // built at the ORIGINAL dims) also read it before any reassignment.
+  let kineticGeoList = Array.isArray(kineticGeometry) ? kineticGeometry : undefined;
+  // v1.29 AUDIO-EXTENDED TIMELINE (user complaints 3/4 — the CRITICAL fix):
+  // totalMs used to be recomputed from the SEGMENTS alone, so a 1h9m audio
+  // over a 10s video trimmed every downstream -t/apad/fade clock to 10s.
+  // The renderer now ships the authoritative total (fillEndMs = max(last
+  // visual end, non-loop audio ends)); take max(segments, payload) so a
+  // stale/absent payload keeps the legacy value and an audio-driven timeline
+  // extends the export clocks (mix -t, apad whole_dur, fade-out alignment).
+  const segmentsTotalMs = segments.reduce((sum, s) => Math.max(sum, s.endMs ?? (s.startMs ?? 0) + s.durationMs), 0) || segments.reduce((sum, s) => sum + s.durationMs, 0);
+  const payloadTotal = Number.isFinite(Number(payloadTotalMs)) ? Math.max(0, Number(payloadTotalMs)) : 0;
+  const totalMs = Math.max(segmentsTotalMs, payloadTotal);
+  if (payloadTotal > segmentsTotalMs) {
+    console.log(
+      `[Export] audio-extended timeline: segments end at ${(segmentsTotalMs / 1000).toFixed(1)}s — payload totalMs ${(payloadTotal / 1000).toFixed(1)}s extends the export clocks (audio no longer trims to the visuals)`,
+    );
+  }
+  // v1.29 LOOP-TO-FILL: any base-lane video marked loop renders through the
+  // -stream_loop graph as ONE process (chunking/sub-windowing is disabled
+  // for it — see the chunk plan below and the smart-pipeline gate).
+  const hasBaseLoopSeg = segments.some((s) => s && s.mediaType === "video" && s.loop === true);
+  if (hasBaseLoopSeg) {
+    console.log(
+      `[Export] base-lane loop-to-fill: ${segments.filter((s) => s && s.mediaType === "video" && s.loop === true).length} looping video segment(s) — chunked encode + smart windowing disabled for them (single -stream_loop render per loop clip)`,
+    );
+  }
+  const totalSec = totalMs / 1000;
+
+  // ── v1.14.5 SLIDESHOW 24 FPS MODE (export-speed plan §2 — Phase 1) ──────
+  // A pure-image timeline (no base-lane VIDEO segments) renders 20 % fewer
+  // frames through EVERY downstream stage (zoompan, overlays, captions,
+  // encode) at 24 instead of 30 — the film rate, imperceptible on
+  // slideshows. Mixed video keeps the project rate, 60 fps projects keep 60,
+  // cinema is never touched, and the switch is NEVER silent: the result
+  // payload + toast say it, with the off switch in Export settings
+  // (`slideshowFps24`, default ON).
+  const allImages = segments.every((s) => s && s.mediaType !== "video");
+  let slideshowFpsApplied = null;
+  if (
+    allImages &&
+    slideshowFps24 !== false &&
+    fps > 24 && fps < 60 &&
+    quality !== "cinema" &&
+    totalMs >= 12000
+  ) {
+    slideshowFpsApplied = { from: fps, to: 24 };
+    fps = 24;
+    console.log(
+      `[Export] SLIDESHOW 24 FPS MODE: ${slideshowFpsApplied.from} → 24 fps ` +
+        `(pure-image ${(totalMs / 1000).toFixed(1)}-s timeline — 20 % fewer frames per filter; disable in Export settings)`,
+    );
+  }
+
+  // v1.14.5 EXPORT PROFILER (plan §1 — Phase 0): records stage/worker timing
+  // for THIS export; the payload + JSON file answer "where did the time go".
+  const prof = createExportProfiler({
+    requestedFps: Number(reqFps) || 30,
+    outputFps: fps,
+    width: reqWidth,
+    height: reqHeight,
+    quality,
+    segments: segments.length,
+    images: segments.reduce((n, s) => n + (s && s.mediaType !== "video" ? 1 : 0), 0),
+    slideshowFps: slideshowFpsApplied ? `${slideshowFpsApplied.from}->24` : null,
+  });
+
+  // v2.1: export audio bitrate — validated against the allowed ladder,
+  // 192 default (the v1.1 constant).
+  const abr = [96, 128, 192, 256, 320].includes(Number(audioKbps)) ? Number(audioKbps) : 192;
+  // v5.1: async warm-started GPU detection — the handler NEVER blocks the
+  // main process before the first frame (was: execSync up to 25 s).
+  prof.beginStage("encoder-detect");
+  const encoder = await detectGpuEncoderAsync();
+  prof.endStage("encoder-detect");
+
+  ensureTempDir();
+  const tempFiles = [];
+  const startTime = Date.now();
+
+  // v1.14.2 (user directive: "not getting exact time — how long will the
+  // export take"): the progress payload carries elapsed/total/phase/rate so
+  // the renderer can show an honest "@ 00:12 / 00:42 · ETA 18s · 2.3×"
+  // instead of a bare percent. phase: prepare → video → audio → mux → done.
+  let exportPhase = "prepare";
+
+  function sendProgress(percent, timemarkSec, etaSec) {
+    if (event.sender && !event.sender.isDestroyed()) {
+      const elapsedSec = (Date.now() - startTime) / 1000;
+      // v1.33.6 (stuck-at-100% report — full-handler repro): 100% is RESERVED
+      // for the actual completion event. The v1.33.4 finalize crawl topped at
+      // 99.96 (0.27 band), which a one-decimal display rounded to "100.0%"
+      // while the faststart rewrite was still running — and the old
+      // Math.min(100, …) clamp also flattened the (buggy, double-counted) pool
+      // fraction onto a pinned 100% half-way through the encode. Every
+      // in-flight value now clamps at 99.9; only a real 100 (the done event)
+      // can show 100.
+      const shownPct = Math.max(0, Math.min(percent >= 100 ? 100 : 99.9, percent));
+      // v1.33.6: ETA 0 is only honest at completion — the all-run model
+      // rounds to 0 near the band tops while minutes of mux/finalize remain
+      // (the "ETA shows 0s after 95%" report). An in-flight 0 reads as
+      // "estimating…" instead.
+      const shownEta =
+        etaSec === 0 && exportPhase !== "done" ? undefined : etaSec;
+      event.sender.send("export-progress", {
+        progress: shownPct,
+        fps: 0,
+        eta: shownEta,
+        // v1.14.1 (user directive: "NaN:NaN in the frontend"): the timemark
+        // is sent as a plain parseable "H:MM:SS.cc" string — the old
+        // `.replace(".", ",")` ASS-style comma decimal made the renderer's
+        // parseTimemark produce NaN and the chip render "@ NaN:NaN" on
+        // EVERY export since v1.2.
+        timemark: timemarkSec != null ? assFmtTime(timemarkSec) : undefined,
+        // v1.33.6: the honest wall-clock elapsed ships on every event (the
+        // UI now renders elapsed + ETA; the content timemark alone read as
+        // a "stopwatch that races then crawls").
+        // v1.14.2 additions (all optional — older shells ignore them):
+        elapsed: Math.round(elapsedSec * 10) / 10,
+        total: totalSec > 0 ? totalSec : undefined,
+        phase: exportPhase,
+        // v1.18: WHICH engine is running — the Header badge renders it
+        // ("FFmpeg CLI" vs the Rust router's engine: "rust" events).
+        engine: "cli",
+        // v1.20: WHY the CLI pipeline was chosen (kinetic-captions,
+        // stack-text, …) — null when the engine simply isn't installed.
+        engineReason: cliEngineReason || undefined,
+        // Overall ×-realtime: content-seconds processed per wall-second
+        // (the timemark is the aggregated content position; this is the
+        // same number ffmpeg prints as speed=, measured across the pool).
+        rate:
+          elapsedSec > 0.5 && timemarkSec > 0
+            ? Math.round((timemarkSec / elapsedSec) * 100) / 100
+            : undefined,
+      });
+    }
+  }
+
+  // Elapsed/ETA for the UI.
+  // v1.3: ETA requires a REAL sample before it is shown — the old ≥2% gate
+  // still extrapolated ffmpeg startup + filter warm-up into multi-hour
+  // estimates ("estimated 22445s" on a 19-minute video) that panicked
+  // users before the rate settled. 4% of content AND ≥ 5 s elapsed, and the
+  // same gate applies on re-estimates (the elapsed/fraction formula is an
+  // all-run average, so it only ever smooths).
+  // v1.14.2: the gate drops to 2% + 2 s (the user explicitly asked to see
+  // the time — an honest "estimating…" placeholder now covers the ramp
+  // instead of silence), and the estimate BLENDS the all-run average with
+  // the recent ~6 s slope so it tracks rate changes (clean-copy bursts,
+  // worker completions) instead of lagging behind them. A sanity clamp
+  // bounds startup-extrapolation spikes.
+  const etaSamples = [];
+  function etaFor(fraction) {
+    if (!(fraction > 0)) return undefined;
+    const now = Date.now();
+    etaSamples.push({ t: now, f: fraction });
+    if (etaSamples.length > 300) etaSamples.shift();
+    if (fraction <= 0.02) return undefined;
+    const elapsed = (now - startTime) / 1000;
+    if (elapsed < 2) return undefined;
+    const overall = fraction / elapsed;
+    let rate = overall;
+    // Recent slope: the oldest sample ≥6 s back vs the newest.
+    let oldIdx = -1;
+    for (let i = etaSamples.length - 1; i >= 0; i--) {
+      if (now - etaSamples[i].t >= 6000) { oldIdx = i; break; }
+    }
+    if (oldIdx >= 0 && oldIdx < etaSamples.length - 1) {
+      const a = etaSamples[oldIdx];
+      const b = etaSamples[etaSamples.length - 1];
+      const dt = (b.t - a.t) / 1000;
+      if (dt > 0.5) {
+        const recent = Math.max(0, (b.f - a.f) / dt);
+        rate = 0.35 * overall + 0.65 * recent;
+      }
+    }
+    if (!(rate > 1e-6)) return undefined;
+    const remaining = Math.max(0, 1 - fraction);
+    let eta = remaining / rate;
+    const cap = elapsed * 4 + 60;
+    if (eta > cap) eta = cap;
+    return Math.max(0, Math.round(eta));
+  }
+
+  try {
+    // ─── v5.0 media resolution: overlays + SFX + audio mode ─────────
+    // Overlays (track ≥ 1) are NOT concat clips — they composite on top of
+    // whichever base clip their window intersects, in track→startMs order
+    // (the preview draw order). SFX items arrive as already-rendered temp
+    // WAVs (native.ts uploads them via saveTempAudio).
+    const overlaySegs = (Array.isArray(overlays) ? overlays : [])
+      .filter((ov) => ov && (ov.imagePath || ov.videoPath))
+      .slice()
+      .sort(
+        (a, b) =>
+          (Number(a.track) || 0) - (Number(b.track) || 0) ||
+          (Number(a.startMs) || 0) - (Number(b.startMs) || 0),
+      );
+    const sfxList = (Array.isArray(sfx) ? sfx : []).filter(
+      (s) => s && typeof s.wavPath === "string" && s.wavPath,
+    );
+    // v1.17 VOICEOVER/DUB: narration MP3s + dub WAVs, already uploaded to temp
+    // by the renderer (same lifecycle as SFX WAVs). Mixed as extra amix
+    // branches — volume + absolute-timeline adelay, resampled to the 48 kHz
+    // stereo bus (MP3s arrive 24 kHz mono).
+    const voiceoverList = (Array.isArray(voiceovers) ? voiceovers : []).filter(
+      (v) => v && typeof v.wavPath === "string" && v.wavPath,
+    );
+    // DUB DUCK — the ORIGINAL clip audio sits under the dub track. The
+    // renderer sends RAW segment volumes + dubOriginalVolume (0..1, only
+    // when a dub track exists); the scale is applied HERE (single source of
+    // truth) so preview and export can never disagree. Music/SFX/VO are
+    // NOT ducked.
+    const dubDuck =
+      Number.isFinite(Number(dubOriginalVolume)) && voiceoverList.length > 0
+        ? Math.max(0, Math.min(1, Number(dubOriginalVolume)))
+        : 1;
+    if (voiceoverList.length > 0) {
+      console.log(
+        `[Export] voiceovers: ${voiceoverList.length} track(s)` +
+          (dubDuck < 1 ? ` · original audio ducked to ${(dubDuck * 100).toFixed(0)}%` : ""),
+      );
+    }
+    if (dubDuck < 1) {
+      for (const s of segments) {
+        if (s && s.mediaType === "video") {
+          s.volume = G.normalizeVolume(s.volume) * dubDuck;
+        }
+      }
+    }
+
+    // Base-lane validation: a VIDEO segment must carry its temp file.
+    for (let i = 0; i < segments.length; i++) {
+      const s = segments[i];
+      if (s && s.mediaType === "video" && !s.videoPath && !s.imagePath) {
+        throw new Error(`Segment ${i + 1} is a video but has no source file`);
+      }
+    }
+
+    // v5 AUDIO MODE: the new amix graph runs when CLIP audio actually
+    // participates — any BASE video with an audio stream (detected by
+    // probing the temp file's stderr) or any SFX placement. A music-only
+    // v4.9-shaped project keeps the EXACT v4.9 mux path; a project with no
+    // audio at all keeps the video-only concat (both byte-identical).
+    //
+    // v5.1 PERF: every needed media probe is warmed in PARALLEL here (async
+    // spawn) — the job loop below then reads everything from the cache. The
+    // v5.0 code probed sequentially with spawnSync, freezing the app.
+    const probePaths = new Set();
+    for (const s of segments) {
+      if (s && s.mediaType === "video" && s.videoPath) probePaths.add(s.videoPath);
+    }
+    for (const ov of overlaySegs) {
+      const p = ov.mediaType === "video" && ov.videoPath ? ov.videoPath : ov.imagePath;
+      if (p && !(Number(ov.sourceWidth) > 0 && Number(ov.sourceHeight) > 0)) {
+        probePaths.add(p);
+      }
+    }
+    await Promise.all(Array.from(probePaths).map((p) => probeMediaAsync(p)));
+
+    let anyVideoAudio = false;
+    for (const s of segments) {
+      if (s && s.mediaType === "video" && s.videoPath) {
+        if ((await probeMediaAsync(s.videoPath)).hasAudio) { anyVideoAudio = true; break; }
+      }
+    }
+    // v1.33.5: the legacy single music track's duration, probed ONCE (warm,
+    // 15 s-capped) — the mux + audio-bus builders use it for FINITE
+    // -stream_loop bounds so a looping track's input can EOF on its own
+    // instead of being infinite. Multi-music clips carry their own
+    // durationMs (probed per clip at the mux call site when missing).
+    const legacyMusicDurationSec = !hasMusicClips && typeof audioPath === "string" && audioPath
+      ? Math.max(0, (Number((await probeMediaAsync(audioPath)).durationMs) || 0) / 1000)
+      : 0;
+
+    prof.beginStage("build");
+
+    // ─── STEP 1 (build): probes → per-clip argv jobs ───────────────
+    // v4.3 transition planning + zoompan math + all three v4.9 branches
+    // (xfade head / watermark graph / plain -vf) live in
+    // G.buildClipArgs — byte-identical for v4.9-shaped payloads.
+    //
+    // v5.2 AUDIO PIPELINE: step-1 clips are now VIDEO-ONLY. Clip audio is
+    // extracted in parallel as 48 kHz stereo PCM WAVs and mixed ONCE in
+    // step 2 (volume + absolute-timeline adelay per clip + music + SFX →
+    // amix → a single AAC encode). This removes the v5.0/5.1 double AAC
+    // encode, the per-image-clip synthesized-silence tracks, and the
+    // AAC→AAC generational loss — the layout used by Shotcut-class editors.
+    const jobs = [];
+    const clipPaths = [];
+    const clipAudioJobs = [];
+    // v6: per-segment facts collected during the build loop — the single-pass
+    // route consumes them (audio branch list + probe-gated hw decode).
+    const segInfo = [];
+    let cumulativeMs = 0;
+    // v1.13 (user directive — Adaptive Hardware Matrix): the flat ≤4-core
+    // lowEnd flag is GONE. Every export resolves a 3-tier hardware profile
+    // (Tier 1 = a probe-verified GPU ASIC encoder · Tier 2 = ≥4 strong
+    // physical cores · Tier 3 = constrained/legacy CPUs, e.g. dual-module
+    // APUs) that decides the worker × thread shape, the x264 speed point,
+    // and whether libass gets the low-cost subtitle treatment.
+    const hwProfile = await getHardwareProfile();
+    // v1.14.1: logical threads from the MEASURED topology (one source of
+    // truth; identical to os.cpus().length but topology-aware consumers
+    // stay consistent).
+    const cpuCount = hwProfile.cpuLogical;
+    console.log(`[Export] Selected ${hwProfile.tier} (${encoder.name}) · ${hwProfile.cpuTopology} · encode pool ${hwProfile.workers}×${hwProfile.threadsPerWorker}${hwProfile.filterWorkers !== hwProfile.workers ? ` · filter pool ${hwProfile.filterWorkers}×1` : ""}`);
+
+    // ── v1.14.5 RENDER-COST STRATEGY (pre-plan, worst-case bound) ──────
+    // The encoder profile must be decided BEFORE any job argv exists, so
+    // this first estimate bounds dirtySec at the FULL timeline (the smart
+    // plan's ACTUAL dirty share only refines the LATER 720p decision —
+    // over-estimating here can only pick the faster encoder, never a lower
+    // resolution). Structure-only inputs: no probes needed.
+    const costEstimate = estimateRenderCost({
+      width,
+      height,
+      fps,
+      durationSec: totalSec,
+      dirtySec: totalSec,
+      captions: captionsEnabled,
+      headlines: headlinesEnabled,
+      overlayCount: overlaySegs.length,
+      chromaCount: overlaySegs.filter((ov) => ov && ov.chroma).length,
+      kenBurnsCount: enabled ? segments.reduce((n, s) => n + (s && s.mediaType !== "video" ? 1 : 0), 0) : 0,
+      transitionCount: Math.max(0, segments.length - 1),
+    });
+    const speedProfile = costEstimate.strategy === "HIGH" || costEstimate.strategy === "VERY_HIGH" ? "fast" : "balanced";
+    prof.cost = { ...costEstimate, speedProfile };
+    if (speedProfile === "fast") {
+      console.log(
+        `[Export] render-cost ${costEstimate.score} (${costEstimate.strategy}: ${costEstimate.pixelCost} G-frames × ${costEstimate.effectCost} effects) → FAST encoder profile`,
+      );
+    }
+
+    const encArgs = encoderArgs(encoder.name, bitrateMbps, width, height, quality, crf, hwProfile.tier, speedProfile);
+    // v1.13: the compact speed-point descriptor for the completion toast
+    // ("Tier 3 · constrained CPU · ultrafast").
+    const enginePreset = (() => {
+      const i = encArgs.indexOf("-preset");
+      return i >= 0 ? String(encArgs[i + 1]) : encoder.name;
+    })();
+    // v7 Step 1: QSV's d3d11va→qsv device-init globals ride at the head of
+    // every real encode argv (the probe validated the exact environment).
+    const encGlobalArgs = encoderGlobalArgs(encoder.name);
+    // v7 Step 4: per-segment TURBO plan recorded during the build loop — the
+    // HYBRID chunked single-pass replays the clean segments as stream
+    // copies (zero decode/filter/encode) while the dirty intervals render
+    // through the windowed graph.
+    const turboPlan = new Array(segments.length).fill(null);
+    // v5.2: thread budget — divide the cores across the parallel pool so N
+    // concurrent encoders never oversubscribe the CPU (the v5.1 scheme gave
+    // EVERY child `-threads 0` = all cores → 4× oversubscription thrash).
+    // v1.1 TURBO: the pool is now ENCODER-AWARE — hardware encoders are the
+    // shared resource (consumer GPUs serialize internally and allow few
+    // concurrent sessions), so a GPU export runs a TIGHTER pool with
+    // per-process threads freed for the CPU filter graphs; the CPU pool
+    // keeps the v5.2 core-division scheme.
+    // v6 PHASE 1: GPU pool 3 → 1 (one NVENC/QSV/AMF session saturates the
+    // GPU; 3 concurrent sessions mostly fought each other), CPU pool
+    // min(4,cpus−2) → min(2, floor(cpus/4)) (x264 scales with THREADS far
+    // better than with processes; >2 workers only added seek/GOP re-decode
+    // overhead). The thread-budget division below is unchanged — a single
+    // job still gets every core.
+    const isGpuEncoder = encoder.name !== "libx264";
+    // v1.14.1 (user directive: "export speed significantly reduced"): the
+    // FILTER-DOMINATED pool. Every ffmpeg's zoompan/scale/libass chain is
+    // single-threaded PER PROCESS, so process count — not x264 threads —
+    // is what fills the machine when the timeline is image/Ken Burns/
+    // caption-heavy. ≥half non-video segments → the pool widens to the
+    // profile's filterWorkers (Tier 3: min(4, logical) — the 4-thread
+    // dual-module APUs get their v1.12.1 shape back for exactly this
+    // workload; v1.13's 2×2 windows halved filter throughput there).
+    // Video-dominated timelines keep the v1.13 tier shape (x264 threads
+    // are the win on long encodes).
+    const nonVideoSegs = segments.reduce((n, s) => n + (s && s.mediaType !== "video" ? 1 : 0), 0);
+    const filterDominant = segments.length > 0 && nonVideoSegs >= Math.ceil(segments.length / 2);
+    const poolN = filterDominant ? hwProfile.filterWorkers : hwProfile.workers;
+    // v1.4.2 CHUNKED PARALLEL ENCODE: long re-encode clips split into
+    // frame-aligned ~60 s chunks (capped at the pool width — more chunks
+    // than workers only adds seek overhead, fewer wastes the pool). This is
+    // THE fix for the "one 19-minute video exports for hours" case: the
+    // per-clip filter graph (libass subtitles, scale, overlay) is
+    // single-threaded, so a single-process encode cannot use the machine —
+    // chunks turn it into the many-clips layout the pool already
+    // parallelizes, with the concat still riding `-c copy`.
+    const CHUNK_TARGET_SEC = 60;
+    const maxChunks = Math.max(2, poolN);
+    // v1.3 THREAD-STARVATION FIX: the v5.2 budget divided the cores by the
+    // POOL SIZE (min(4, cpus−2)) even when the project had FEWER clips than
+    // pool slots — a 1–2 long-clip project (the common "one 19-minute
+    // video" case) encoded with `-threads 1–2` on an 8-core machine, i.e.
+    // 25–50% CPU utilization and 2–4× slower than necessary. The budget now
+    // divides by the number of jobs that will ACTUALLY run concurrently,
+    // so a single long clip gets every core — the HandBrake/Shotcut
+    // single-job layout — while many-clip projects keep the v5.2
+    // oversubscription-free division.
+    // v1.4.2: the estimate is now CHUNK-AWARE — a chunkable long video
+    // counts as its chunk count (the pool will run that many encode jobs
+    // for it). Non-chunkable projects estimate exactly segments.length,
+    // keeping the legacy budget byte-for-byte.
+    const estVideoJobs = segments.reduce((n, s) => {
+      if (s && s.mediaType === "video" && s.videoPath) {
+        // v1.29: looping base videos NEVER chunk (the chunk offsets would
+        // seek past the finite SOURCE — the loop renders as one process).
+        const plan = s.loop === true
+          ? null
+          : G.planChunkFrames(Number(s.durationMs) || 0, fps, CHUNK_TARGET_SEC, maxChunks);
+        return n + (plan ? plan.length : 1);
+      }
+      return n + 1;
+    }, 0);
+    const activeJobs = Math.max(1, Math.min(poolN, estVideoJobs || segments.length));
+    const threadBudget = isGpuEncoder
+      ? Math.max(2, Math.min(6, Math.floor(cpuCount / activeJobs) || 2))
+      : hwProfile.tier === "TIER_3_CONSTRAINED_CPU"
+        // v7 Step 5 → v1.13 Tier 3: cap each pool worker at 2 threads —
+        // one worker per physical Piledriver module, W×threads stays
+        // within the core budget (no FPU/cache-thrashing oversubscription).
+        ? Math.max(1, Math.min(2, Math.floor(cpuCount / activeJobs)))
+        : Math.max(1, Math.floor(cpuCount / activeJobs));
+
+    // v1.1 TURBO: stream-copy counters for the result payload + a shared
+    // actual-duration accumulator (post-step-1 probe of each clip file —
+    // stream copies cut at packet granularity, so the real concat length
+    // can differ from the requested timeline by a frame per clip; the
+    // audio graph should pad/mix to the ACTUAL video length).
+    let copiedClips = 0;
+    let encodedClips = 0;
+    // v1.4.1: how many of the copied clips took the keyframe-aligned
+    // head-trim path (result telemetry — surfaced in the export toast).
+    let keyframeCuts = 0;
+    // v1.4.2 chunked-encode telemetry: chunkedClips = segments split into
+    // chunks, totalChunks = chunk encode jobs emitted, hwDecodeClips =
+    // sources riding the throughput-gated -hwaccel auto decode path.
+    let chunkedClips = 0;
+    let totalChunks = 0;
+    let hwDecodeClips = 0;
+
+    // v1.4.2: write an ASS document to a temp file → the subtitles= filter
+    // suffix. Shared by the segment path (tag = clip index) and the chunk
+    // path (tag = clip index _ chunk index).
+    const writeAssFile = (doc, tag) => {
+      const assPath = path.join(tempDir, `captions_${tag}_${Date.now()}.ass`);
+      // v1.14.6: the v1.13 Tier-3 caption raster downgrade is RETIRED for
+      // burn-in docs — it clamped Outline/Shadow to 2 px (and hard-killed
+      // blur), which visibly changed burned captions vs the preview on the
+      // constrained-CPU machines it fired on (the reported "export captions
+      // are not the same as the preview"). Our generated documents never
+      // emit \blur or \be (the actually-expensive per-glyph re-rasterization
+      // the v1.13 note feared), so the clamp bought ~nothing and cost parity.
+      // optimizeAssForConstrainedCpu stays exported for back-compat but is
+      // no longer applied to any burn-in document.
+      fs.writeFileSync(assPath, doc, "utf-8");
+      tempFiles.push(assPath);
+      const escapedAssPath = assPath
+        .replace(/\\/g, "/")
+        .replace(/:/g, "\\:")
+        .replace(/'/g, "\\'")
+        .replace(/,/g, "\\,");
+      // v1.21: fontsdir → the BUNDLED TTFs (resources/fonts in the packaged
+      // app, public/fonts in dev). Without it libass resolves only SYSTEM
+      // fonts — Montserrat/Inter/Bebas Neue/Playfair fell back to Arial and
+      // the burned captions lost their typographic identity (the "fonts
+      // don't match the reference/preview" bug).
+      let fontsSuffix = "";
+      const fontsDir = bundledFontsDirForAss();
+      if (fontsDir) {
+        const escapedFontsDir = fontsDir
+          .replace(/\\/g, "/")
+          .replace(/:/g, "\\:")
+          .replace(/'/g, "\\'")
+          .replace(/,/g, "\\,");
+        fontsSuffix = `:fontsdir='${escapedFontsDir}'`;
+      }
+      return `subtitles=filename='${escapedAssPath}'${fontsSuffix}`;
+    };
+
+    // v1.4.2: overlay specs for ANY window (segment OR chunk). The chunked
+    // encode path re-runs this per chunk with the chunk window so overlay
+    // playback position, motion clock, and enable=between() windows stay
+    // correct — identical semantics to the old inline segment loop.
+    const buildOverlaySpecsForWindow = async (winStartMs, winDurMs) => {
+      const specs = [];
+      for (const ov of overlaySegs) {
+        const win = G.overlayWindow(ov, winStartMs, winDurMs);
+        if (!win || win.overlapMs <= 0) continue;
+        const isVid = ov.mediaType === "video" && ov.videoPath;
+        const srcPath = isVid ? ov.videoPath : ov.imagePath;
+        let srcW = Number(ov.sourceWidth) > 0 ? Number(ov.sourceWidth) : 0;
+        let srcH = Number(ov.sourceHeight) > 0 ? Number(ov.sourceHeight) : 0;
+        if (!srcW || !srcH) {
+          const probe = await probeMediaAsync(srcPath);
+          srcW = probe.width;
+          srcH = probe.height;
+        }
+        const geo = G.overlayGeometryMirror(width, height, srcW, srcH, ov.overlay);
+        if (geo.dw <= 0 || geo.dh <= 0) continue;
+        // v5.6 MOTION PATHS: 1 keyframe = pinned position (resolved to a
+        // static rect through the geometry mirror with that kf as free-form
+        // x/y); ≥2 keyframes = the overlay filter's x/y become piecewise-
+        // linear TIME EXPRESSIONS (the exact preview curve). tOffsetSec
+        // shifts the window-local clock to the overlay's window-local clock.
+        const motion = G.sanitizeMotionMirror(
+          ov.overlay && ov.overlay.motion,
+        );
+        let x = geo.dx;
+        let y = geo.dy;
+        let xExpr = null;
+        let yExpr = null;
+        if (motion.length === 1) {
+          const pinned = G.overlayGeometryMirror(width, height, srcW, srcH, {
+            ...(ov.overlay || {}),
+            x: motion[0].x,
+            y: motion[0].y,
+          });
+          x = pinned.dx;
+          y = pinned.dy;
+        } else if (motion.length >= 2) {
+          const tOffsetSec = (winStartMs - Number(ov.startMs) || 0) / 1000;
+          const exprs = G.buildMotionOverlayExpr({
+            videoW: width,
+            videoH: height,
+            dw: geo.dw,
+            dh: geo.dh,
+            tOffsetSec,
+            motion,
+          });
+          if (exprs) {
+            xExpr = exprs.xExpr;
+            yExpr = exprs.yExpr;
+          }
+        }
+        // v5.2: overlayLoop — a short green-screen source repeats to span
+        // its whole timeline window (-stream_loop -1 on the input).
+        const ovLoop = ov.overlayLoop === true;
+        let srcDurMs = Number(ov.sourceDurationMs) > 0 ? Number(ov.sourceDurationMs) : 0;
+        if (!srcDurMs && isVid) {
+          const p = await probeMediaAsync(srcPath);
+          srcDurMs = Number(p.durationMs) > 0 ? Number(p.durationMs) : 0;
+        }
+        // v1.4.1 PER-OVERLAY FPS NORMALIZATION: a video overlay running
+        // FASTER than the project rate (e.g. 60 fps PiP over a 30 fps
+        // timeline) makes the whole composite graph evaluate at the
+        // overlay's rate — ~2× the scale/chroma/composite/encode work for
+        // zero visual gain (the base chain already normalizes the output
+        // to `fps`). `fps=<project>` at the head of the overlay chain
+        // drops the surplus frames before anything runs. Near-rate or
+        // slower overlays are left untouched (dup frames would only add
+        // work; the overlay filter's framesync already syncs by timestamp).
+        let normFps = null;
+        if (isVid) {
+          const ovProbe = await probeMediaAsync(srcPath);
+          const ovFps = Number(ovProbe.fps) || 0;
+          if (ovFps > fps + 0.5) normFps = fps;
+        }
+        specs.push({
+          inputArgs: isVid
+            ? G.buildOverlayVideoInputArgs({ ssMs: win.ssMs, durMs: win.overlapMs, path: srcPath, loop: ovLoop, srcDurMs })
+            : G.buildOverlayImageInputArgs({ durMs: win.overlapMs, path: srcPath }),
+          // v1.14.6 SINGLE-DECODE IMAGE OVERLAYS: EXTRA looped copies for
+          // the chain's `loop=` (one decoded frame → 25×overlap frames;
+          // imgLoop+1 ≥ ceil(25×overlapSec) covers the window the old
+          // `-loop 1 -t overlap` stream did — the 25 matches the image2
+          // default rate that input ran at).
+          imgLoop: isVid
+            ? undefined
+            : Math.max(1, Math.ceil(25 * (Math.max(0, Number(win.overlapMs) || 0) / 1000))),
+          fps: normFps,
+          x,
+          y,
+          xExpr,
+          yExpr,
+          dw: geo.dw,
+          dh: geo.dh,
+          chroma: ov.chroma || null,
+          a: win.a,
+          b: win.b,
+          // v6.5: the authoritative "overlay continues past this window" flag
+          // (padOverlayInputWindows pads exactly these inputs past a chunk
+          // end — framesync eof_action=pass would otherwise drop the overlay
+          // from the chunk's last frame).
+          clippedEnd: win.clippedEnd,
+        });
+      }
+      return specs;
+    };
+
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i];
+      const clipPath = path.join(tempDir, `clip_${String(i).padStart(4, "0")}.mp4`);
+
+      // v1.15 TEXT REMOVAL (two-step path): the removal filters need the
+      // SOURCE dims per video segment (regions are source-normalized).
+      // The smart pipeline probes its own srcFacts; this fallback probes
+      // here ONLY when text removal is active (probeMediaAsync is cached
+      // per path — the hasAudio probe below hits the cache).
+      let trSrcFacts = null;
+      if (textRemoval && seg.mediaType === "video" && seg.videoPath) {
+        try {
+          const tp = await probeMediaAsync(seg.videoPath);
+          if (Number(tp.width) > 0 && Number(tp.height) > 0) {
+            trSrcFacts = { srcW: Number(tp.width), srcH: Number(tp.height) };
+          }
+        } catch (_) { /* dims unknown → TR skipped for this clip */ }
+      }
+
+      const segStartMs = (typeof seg.startMs === "number") ? seg.startMs : cumulativeMs;
+      const segEndMs = (typeof seg.endMs === "number") ? seg.endMs : (cumulativeMs + seg.durationMs);
+
+      let assDoc = null;
+      if (captionsEnabled || headlinesEnabled) {
+        assDoc = buildAssDocument(
+          captionsEnabled ? subtitleCues : [],
+          captionsEnabled ? captionSettings : null,
+          headlinesEnabled ? headlines : null,
+          width, height, segStartMs, segEndMs, seg.durationMs,
+          headlinesEnabled ? headlineGeometry : undefined,
+          // v1.18 kinetic typography (rides captions — captionsEnabled gate):
+          captionsEnabled ? kineticCompositions : undefined,
+          captionsEnabled ? kineticGeoList : undefined,
+        );
+      }
+
+      const assSuffix = assDoc ? writeAssFile(assDoc, String(i).padStart(4, "0")) : null;
+
+      // v5 overlay specs for THIS clip window (segment-level — used by the
+      // copy gate + the whole-clip encode path; chunks re-window below).
+      const overlaySpecs = await buildOverlaySpecsForWindow(segStartMs, seg.durationMs);
+
+      const segHasAudio = !!(
+        seg.mediaType === "video" &&
+        seg.videoPath &&
+        (await probeMediaAsync(seg.videoPath)).hasAudio
+      );
+      // v6: collect for the single-pass route (hw decode is probed lazily
+      // there — probeHwDecode results are cached per path).
+      segInfo[i] = {
+        segStartMs,
+        segHasAudio,
+        speed: G.resolveSegSpeed(seg),
+        trimInMs: Number(seg.trimInMs) || 0,
+      };
+
+      // ── v1.1 TURBO: STREAM-COPY fast path ──────────────────────
+      // Cuts-only clips whose source already matches the output spec
+      // are remuxed with ZERO decode/filter/encode — this is the
+      // "simple cut exports in seconds" technique every fast editor
+      // uses. Eligibility has two halves:
+      //   (a) timeline-side (pure): G.clipNeedsReEncode — no speed, no
+      //       UNALIGNED head trim, no overlays in window, no captions/
+      //       headlines, no watermark, no transition fades at this
+      //       boundary;
+      //   (b) source-side (probe): h264 + yuv420p + output dims + fps
+      //       match + no rotation + the window covers the whole source
+      //       (tail-only trim ≤ 300 ms — packet-granularity cut).
+      // v1.4.1 KEYFRAME-ALIGNED TRIMS: a head trim no longer disqualifies
+      // the clip when a source keyframe sits within ONE FRAME of the
+      // requested cut (findKeyframeAlignedStart). The copy then starts
+      // at that keyframe (`-ss <exactPts> -noaccurate_seek`), keeping the
+      // timeline duration exact and the content boundary within one
+      // frame. Anything further than one frame stays re-encode — the
+      // frame-accuracy tradeoff is deliberately one frame, no more.
+      // Mixed projects are fine: copied and re-encoded parts share the
+      // exact output stream spec (h264 yuv420p WxH fps), so the concat
+      // demuxer + `-c copy` mux stay uniform.
+      const trimInMs = Number(seg.trimInMs) || 0;
+      let trimKeyAligned = false;
+      let trimSs = null;
+      let sandwichPlan = null;
+      if (trimInMs > 0) {
+        // Skip the keyframe probe when the clip is ALREADY re-encode-bound
+        // for other reasons (overlaps/captions/speed/fades/...) — patch
+        // trimInMs to 0 so clipNeedsReEncode reports those reasons alone.
+        // v1.15: text removal is also re-encode-bound — skip the probe too.
+        const otherwiseCopyEligible = !textRemoval && !G.clipNeedsReEncode({
+          i, seg: { ...seg, trimInMs: 0 }, segments, transition,
+          overlayCount: overlaySpecs.length,
+          assSuffix, wm,
+        });
+        if (otherwiseCopyEligible) {
+          const preProbe = await probeMediaAsync(seg.videoPath);
+          const preOk =
+            preProbe.codec === "h264" &&
+            preProbe.pixFmt === "yuv420p" &&
+            !preProbe.rotated &&
+            preProbe.width === width &&
+            preProbe.height === height &&
+            Math.abs((preProbe.fps || 0) - fps) < 0.06;
+          if (preOk) {
+            const kf = await findKeyframeAlignedStart(seg.videoPath, trimInMs, fps);
+            if (kf) {
+              trimKeyAligned = true;
+              trimSs = kf.ss;
+            } else {
+              // v6 PHASE 3 SMART TURBO: no keyframe within one frame — try
+              // the SANDWICH (re-encode the two ≤2s edges, stream-copy the
+              // ≥4s middle between keyframes). Frame-accurate at the trim
+              // boundaries AND mostly copy — the trimmed-clip TURBO hit
+              // rate jumps from the ~5% exact-alignment case to any clip
+              // whose GOPs straddle the trim.
+              const kfs = await probeKeyframesNear(
+                seg.videoPath,
+                Math.max(0, (trimInMs - 2500) / 1000),
+                (Number(seg.durationMs) || 0) / 1000 + 5,
+              );
+              if (kfs && kfs.length > 0) {
+                sandwichPlan = G.planSandwichCopy({
+                  trimMs: trimInMs,
+                  durMs: Number(seg.durationMs) || 0,
+                  keyframes: kfs,
+                });
+              }
+            }
+          }
+        }
+      }
+      // v1.15: text removal rewrites every frame — kill every copy fast
+      // path (keyframe-aligned trims, sandwich middles, legacy copies).
+      if (textRemoval) {
+        trimKeyAligned = false;
+        trimSs = null;
+        sandwichPlan = null;
+      }
+      if (!textRemoval && !G.clipNeedsReEncode({
+          i, seg, segments, transition,
+          overlayCount: overlaySpecs.length,
+          assSuffix, wm,
+          trimKeyAligned: trimKeyAligned || !!sandwichPlan,
+        })) {
+        const probe = await probeMediaAsync(seg.videoPath);
+        const srcDur = Number(probe.durationMs) || 0;
+        const specOk =
+          probe.codec === "h264" &&
+          probe.pixFmt === "yuv420p" &&
+          !probe.rotated &&
+          probe.width === width &&
+          probe.height === height &&
+          Math.abs((probe.fps || 0) - fps) < 0.06 &&
+          srcDur > 0;
+        // v1.1 legacy single-copy: untrimmed or keyframe-aligned head + the
+        // window covers the source tail (packet-granularity cut).
+        const formatOk = specOk &&
+          (trimInMs === 0 || trimKeyAligned) &&
+          (trimInMs + seg.durationMs) >= srcDur - 300;
+        // v6 sandwich: any trim depth — the edges re-encode to the exact
+        // boundaries, the middle copies between keyframes.
+        const sandwichOk = !!sandwichPlan && specOk;
+        if (formatOk) {
+          tempFiles.push(clipPath);
+          clipPaths.push(clipPath);
+          jobs.push({
+            idx: i,
+            args: G.buildStreamCopyArgs({
+              path: seg.videoPath,
+              durMs: seg.durationMs,
+              clipPath,
+              ss: trimSs,
+            }),
+            durSec: seg.durationMs / 1000,
+            durationMs: seg.durationMs,
+            segId: seg.id,
+            copy: true,
+          });
+          // v7 Step 4: record the TURBO plan so the HYBRID chunked single-pass
+          // can replay this segment as a stream-copy piece (with the same
+          // keyframe-aligned seek) instead of re-encoding it through the graph.
+          turboPlan[i] = { kind: "copy", ss: trimSs };
+          copiedClips += 1;
+          // v1.4.1: count only copies that actually rode the keyframe-aligned
+          // trim path (an aligned find that still re-encodes for a source-
+          // format reason must not inflate the number).
+          if (trimKeyAligned) keyframeCuts += 1;
+          cumulativeMs += seg.durationMs;
+          if (segHasAudio) {
+            // PCM extraction still rides the pool (audio is mixed in
+            // step 2 regardless of how the video got there).
+            // v6 FIX: the extraction now SEEKS to trimInMs — the v5.2 argv
+            // read from the file START, so a trimmed clip's audio came from
+            // the wrong window (the video rode -ss, the audio did not).
+            const wavPath = path.join(tempDir, `audio_${String(i).padStart(4, "0")}_${Date.now()}.wav`);
+            tempFiles.push(wavPath);
+            clipAudioJobs.push({
+              idx: jobs.length + clipAudioJobs.length,
+              args: [
+                ...(trimInMs > 0 ? ["-ss", G.fmt3(trimInMs)] : []),
+                "-i", seg.videoPath, "-vn", "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le", "-y", wavPath,
+              ],
+              wavPath,
+              startMs: segStartMs,
+              volume: G.normalizeVolume(seg.volume),
+              durSec: seg.durationMs / 1000,
+              durationMs: seg.durationMs,
+              segId: seg.id,
+            });
+          }
+          continue; // skip the encode path entirely
+        }
+        if (sandwichOk) {
+          // v6 SMART TURBO sandwich: head edge encode → middle stream copy
+          // → tail edge encode, all to the uniform output spec so the
+          // concat demuxer stays -c copy. Frame-accurate at BOTH trim
+          // boundaries; the ≥4s middle rides zero-decode copy.
+          // v7 Step 4: recorded for the HYBRID replay (edges re-encode + the
+          // middle copies — the plan is replayed with the hybrid's per-worker
+          // thread budget instead of the two-step pool's).
+          turboPlan[i] = { kind: "sandwich", plan: sandwichPlan };
+          const emitEdge = (edge, tag) => {
+            const edgePath = path.join(tempDir, `clip_${String(i).padStart(4, "0")}_${tag}.mp4`);
+            tempFiles.push(edgePath);
+            clipPaths.push(edgePath);
+            const built = G.buildClipArgs({
+              i,
+              seg: { ...seg, trimInMs: edge.trimMs, durationMs: edge.durMs },
+              segments,
+              fps,
+              width,
+              height,
+              kbEnabled: enabled,
+              zoomMax,
+              globalDir,
+              transition,
+              wm,
+              assSuffix,
+              clipPath: edgePath,
+              encArgs,
+              globalArgs: encGlobalArgs,
+              anyAudio: false,
+              segHasAudio: false,
+              overlaySpecs,
+              hwaccel: false,
+              threads: threadBudget,
+              // v1.15: text removal (source-normalized regions).
+              textRemoval,
+              ...(trSrcFacts ? { srcFacts: trSrcFacts } : {}),
+            });
+            jobs.push({
+              idx: i,
+              args: built.args,
+              durSec: edge.durMs / 1000,
+              durationMs: edge.durMs,
+              segId: seg.id,
+            });
+          };
+          if (sandwichPlan.head) emitEdge(sandwichPlan.head, "sh");
+          const midPath = path.join(tempDir, `clip_${String(i).padStart(4, "0")}_sm.mp4`);
+          tempFiles.push(midPath);
+          clipPaths.push(midPath);
+          jobs.push({
+            idx: i,
+            args: G.buildStreamCopyArgs({
+              path: seg.videoPath,
+              durMs: sandwichPlan.middle.durMs,
+              clipPath: midPath,
+              ss: sandwichPlan.middle.ss,
+            }),
+            durSec: sandwichPlan.middle.durMs / 1000,
+            durationMs: sandwichPlan.middle.durMs,
+            segId: seg.id,
+            copy: true,
+          });
+          if (sandwichPlan.tail) emitEdge(sandwichPlan.tail, "st");
+          copiedClips += 1; // the middle rode copy — the TURBO telemetry counts it
+          cumulativeMs += seg.durationMs;
+          if (segHasAudio) {
+            const wavPath = path.join(tempDir, `audio_${String(i).padStart(4, "0")}_${Date.now()}.wav`);
+            tempFiles.push(wavPath);
+            clipAudioJobs.push({
+              idx: jobs.length + clipAudioJobs.length,
+              args: [
+                ...(trimInMs > 0 ? ["-ss", G.fmt3(trimInMs)] : []),
+                "-i", seg.videoPath, "-vn", "-ar", "48000", "-ac", "2", "-c:a", "pcm_s16le", "-y", wavPath,
+              ],
+              wavPath,
+              startMs: segStartMs,
+              volume: G.normalizeVolume(seg.volume),
+              durSec: seg.durationMs / 1000,
+              durationMs: seg.durationMs,
+              segId: seg.id,
+            });
+          }
+          continue; // sandwiched — skip the whole-clip encode path
+        }
+      }
+      encodedClips += 1;
+
+      // ── v1.4.2 CHUNKED PARALLEL ENCODE + throughput-gated hw decode ──
+      // A long re-encode clip is ONE ffmpeg process whose filter graph
+      // (libass subtitles, scale, overlay) is single-threaded — the
+      // "19-minute video exports for 3.5 hours" pathology. Frame-aligned
+      // chunks (planChunkFrames) turn it into the many-clips layout the
+      // pool already parallelizes; the concat rides `-c copy` as always.
+      // Images are deliberately NOT chunked (zoompan frame indexing +
+      // slideshows are inherently many-clip).
+      const segIsVideo = seg.mediaType === "video" && seg.videoPath;
+      // v1.29 LOOP-TO-FILL: chunking is DISABLED for looping segments — the
+      // chunk plan's per-chunk seeks are offsets into the SOURCE window,
+      // which for a loop is only the first sourceDurationMs of a fill window
+      // that can be far longer (a 1h9m fill over a 10s source would emit
+      // chunks seeking to 30min of a 10s file). The loop renders as ONE
+      // -stream_loop process bounded by the output -t (= the fill window).
+      const chunkPlan = segIsVideo && seg.loop !== true
+        ? G.planChunkFrames(Number(seg.durationMs) || 0, fps, CHUNK_TARGET_SEC, maxChunks)
+        : null;
+      // v1.4.2→v1.12: hw decode is per-source, probe-gated tri-state
+      // (d3d11va | "auto" fallback | false) — ≥ 20 s sources pay the two
+      // probe arms; shorter video sources ride `-hwaccel auto` directly
+      // (the graceful fallback costs nothing when d3d11va is healthy).
+      const hw = segIsVideo
+        ? ((Number(seg.durationMs) || 0) >= 20000
+            ? await probeHwDecode(seg.videoPath)
+            : "auto")
+        : false;
+      if (hw) hwDecodeClips += 1;
+
+      if (chunkPlan) {
+        for (let k = 0; k < chunkPlan.length; k++) {
+          const ch = chunkPlan[k];
+          const chunkPath = path.join(
+            tempDir,
+            `clip_${String(i).padStart(4, "0")}_${String(k).padStart(2, "0")}.mp4`,
+          );
+          tempFiles.push(chunkPath);
+          clipPaths.push(chunkPath);
+          const chunkStartMs = segStartMs + ch.offsetMs;
+          // Per-chunk ASS window — a cue crossing a chunk boundary renders
+          // partially in each chunk, the EXACT semantics of cues crossing
+          // segment boundaries (buildAssDocument clamps to the window).
+          let chunkAssSuffix = null;
+          if (captionsEnabled || headlinesEnabled) {
+            const doc = buildAssDocument(
+              captionsEnabled ? subtitleCues : [],
+              captionsEnabled ? captionSettings : null,
+              headlinesEnabled ? headlines : null,
+              width, height, chunkStartMs, chunkStartMs + ch.durMs, ch.durMs,
+              headlinesEnabled ? headlineGeometry : undefined,
+              // v1.18 kinetic typography (rides captions — captionsEnabled gate):
+              captionsEnabled ? kineticCompositions : undefined,
+              captionsEnabled ? kineticGeoList : undefined,
+            );
+            chunkAssSuffix = doc
+              ? writeAssFile(doc, `${String(i).padStart(4, "0")}_${String(k).padStart(2, "0")}`)
+              : null;
+          }
+          const chunkOverlaySpecs = await buildOverlaySpecsForWindow(chunkStartMs, ch.durMs);
+          const built = G.buildClipArgs({
+            i,
+            seg,
+            segments,
+            fps,
+            width,
+            height,
+            kbEnabled: enabled,
+            zoomMax,
+            globalDir,
+            transition,
+            wm,
+            assSuffix: chunkAssSuffix,
+            clipPath: chunkPath,
+            encArgs,
+            globalArgs: encGlobalArgs,
+            anyAudio: false,
+            segHasAudio: false,
+            overlaySpecs: chunkOverlaySpecs,
+            hwaccel: hw,
+            threads: threadBudget,
+            chunk: { offsetMs: ch.offsetMs, durMs: ch.durMs, first: ch.first, last: ch.last },
+            // v1.15: text removal (source-normalized regions).
+            textRemoval,
+            ...(trSrcFacts ? { srcFacts: trSrcFacts } : {}),
+          });
+          jobs.push({
+            idx: i,
+            args: built.args,
+            durSec: ch.durMs / 1000,
+            durationMs: ch.durMs,
+            segId: seg.id,
+          });
+        }
+        chunkedClips += 1;
+        totalChunks += chunkPlan.length;
+      } else {
+        // Whole-clip encode (legacy path — argv byte-identical apart from
+        // the probed hwaccel flag, which is still false on CPU-only boxes).
+        tempFiles.push(clipPath);
+        clipPaths.push(clipPath);
+        // v5.2: video-only clip encode — audio never rides the concat demuxer.
+        const built = G.buildClipArgs({
+          i,
+          seg,
+          segments,
+          fps,
+          width,
+          height,
+          kbEnabled: enabled,
+          zoomMax,
+          globalDir,
+          transition,
+          wm,
+          assSuffix,
+          clipPath,
+          encArgs,
+          globalArgs: encGlobalArgs,
+          anyAudio: false,
+          segHasAudio: false,
+          overlaySpecs,
+          // v1.4.2: hardware decode is PER-SOURCE, PROBE-GATED (see
+          // probeHwDecode above) — no longer unconditionally disabled, but
+          // enabled only where it measured ≥ 1.3× faster than CPU decode.
+          hwaccel: hw,
+          // v5.2: thread budget (see the pool below).
+          threads: threadBudget,
+          // v1.15: text removal (source-normalized regions).
+          textRemoval,
+          ...(trSrcFacts ? { srcFacts: trSrcFacts } : {}),
+        });
+
+        jobs.push({
+          idx: i,
+          args: built.args,
+          durSec: seg.durationMs / 1000,
+          durationMs: seg.durationMs,
+          segId: seg.id,
+        });
+      }
+
+      // v5.2: parallel PCM extraction for the clip's own audio (speed
+      // applied here via atempo; volume stays in the step-2 mix graph).
+      // v6 FIX: -ss trimInMs — the extraction window now matches the video
+      // arm (the v5.2 argv read the audio from the file START).
+      // v1.29 LOOP-TO-FILL: a looping base video's OWN audio must loop with
+      // it — -stream_loop -1 on the input (BEFORE -ss, the overlay-input
+      // order), -ss taken modulo the source duration, NO input -t (the
+      // source is infinite), and the OUTPUT -t bounds the extraction at the
+      // segment's timeline window (the fill window). Speed retiming (atempo)
+      // applies to the looped stream exactly as it does to the video arm.
+      // (The copy/sandwich branches above can never see a loop segment —
+      // clipNeedsReEncode returns true for loop, so the re-encode path is
+      // the only reachable one for them.)
+      if (segHasAudio) {
+        const wavPath = path.join(tempDir, `audio_${String(i).padStart(4, "0")}_${Date.now()}.wav`);
+        tempFiles.push(wavPath);
+        const speed = Number(seg.speed) > 0 ? Number(seg.speed) : 1;
+        const sourceWinMs = speed !== 1 ? Math.max(0, Number(seg.durationMs) || 0) * speed : 0;
+        const tempo = speed !== 1 ? G.atempoFilters(speed) : [];
+        const segLoop = seg.loop === true;
+        const loopSrcDurMs = segLoop ? Number(seg.sourceDurationMs) || 0 : 0;
+        const loopSsMs = loopSrcDurMs > 0
+          ? Math.max(0, trimInMs % loopSrcDurMs)
+          : trimInMs;
+        clipAudioJobs.push({
+          idx: jobs.length + clipAudioJobs.length,
+          args: [
+            ...(segLoop ? ["-stream_loop", "-1"] : []),
+            ...((!segLoop && trimInMs > 0) || (segLoop && loopSsMs > 0)
+              ? ["-ss", G.fmt3(segLoop ? loopSsMs : trimInMs)]
+              : []),
+            ...(!segLoop && sourceWinMs > 0 ? ["-t", (sourceWinMs / 1000).toFixed(3)] : []),
+            "-i", seg.videoPath,
+            "-vn",
+            ...(tempo.length > 0 ? ["-af", tempo.join(",")] : []),
+            "-ar", "48000", "-ac", "2",
+            "-c:a", "pcm_s16le",
+            // v1.29: loop ⇒ OUTPUT -t = the timeline window (bounds the
+            // otherwise-infinite looped extraction at the fill window).
+            ...(segLoop
+              ? ["-t", (Math.max(0, Number(seg.durationMs) || 0) / 1000).toFixed(3)]
+              : []),
+            "-y", wavPath,
+          ],
+          wavPath,
+          startMs: segStartMs,
+          volume: G.normalizeVolume(seg.volume),
+          durSec: seg.durationMs / 1000,
+          durationMs: seg.durationMs,
+          segId: seg.id,
+        });
+      }
+      cumulativeMs += seg.durationMs;
+    }
+
+    // ─── v9 TRUE SMART RENDERING ─────────────────────────────────────────
+    // PHASE 1 of the smart-render refactor: the monolithic routing —
+    // "encodeWorkMs ≥ 8 s or ≥ 30 % of totalMs → re-encode the WHOLE
+    // timeline through one -filter_complex_script" — is DELETED. A timeline
+    // is never evaluated as a single block just because a percentage of it
+    // is dirty. Every export that has ANY dirty time now goes through
+    // planSmartRenderingPipeline() (below):
+    //   • PHASE 2 — SP.planSmartSegments slices [0, totalMs) into CLEAN
+    //     time-ranges (untouched video) and DIRTY ones (text, PIP, Ken
+    //     Burns, transitions, speed, unalignable trims), merges overlaps,
+    //     and keyframe-snaps every dirty↔clean boundary onto the SOURCE
+    //     keyframe grid (the Sandwich-copy lineage: probeKeyframesNear +
+    //     findKeyframeAlignedStart) so a copied piece never starts mid-GOP;
+    //   • PHASE 3 — ONE worker pool renders the pieces: CLEAN pieces ride
+    //     buildStreamCopyArgs (-c:v copy, zero decode/filter/encode —
+    //     seconds), DIRTY pieces ride the windowed single-pass graph
+    //     bounded to their exact [f0, f1) frames (sub-split across the
+    //     workers on multi-core boxes, fades kept whole), with the encoder
+    //     writing the SAME -video_track_timescale / resolution / SAR /
+    //     fps / yuv420p as the copied pieces (the concat contract) —
+    //     audio rides ONE full-timeline bus pass at -ar 48000;
+    //   • PHASE 4 — the finished chunks stitch through the concat demuxer
+    //     (-f concat -safe 0 -c copy -movflags +faststart) in timeline
+    //     order, then every temp chunk/graph/ASS file is deleted.
+    // A 19-minute timeline with 4 minutes of edits re-encodes exactly those
+    // 4 minutes (+ ≤1 GOP per boundary) — the 1.5 h monolithic export
+    // becomes minutes. Pure-copy projects keep the TURBO pool below (they
+    // have nothing to segment); any smart-plan failure (probe, eligibility,
+    // script budget, init-class error < 4 s) falls back to the
+    // battle-tested two-step pool with zero user impact.
+    prof.endStage("build");
+    const anyEncodeJob = jobs.length > 0 && jobs.some((j) => !j.copy);
+
+    const planSmartRenderingPipeline = async () => {
+      const smartStart = Date.now();
+      // Aggressive hygiene: sweep orphaned smart-chunk files a previous
+      // crashed/killed export may have left behind (this export's own temp
+      // files are tracked in tempFiles and cleaned by the outer handlers).
+      try {
+        for (const f of fs.readdirSync(tempDir)) {
+          if (/^chunk_\d{3,}\.mp4$/.test(f)) {
+            try { fs.unlinkSync(path.join(tempDir, f)); } catch (_) {}
+          }
+        }
+      } catch (_) {}
+      try {
+        // ── Source facts: per-segment copy capability + keyframe maps ──
+        // (format probes are warm from the build loop; the keyframe window
+        // scans ride the cached probeKeyframesNear).
+        // v1.14.4: this loop was a SERIAL for-await — each segment's
+        // probeMedia + trimAlign + keyframe scan is a spawn-bound ffprobe
+        // (0.3–1 s on HDD-class constrained machines), so a 20-clip
+        // timeline burned 20–60 s of "preparing" before the first frame
+        // encoded. The probes are independent and I/O-bound, so they now
+        // run 4-wide (mapBoundedConcurrent); same-key callers coalesce
+        // through the promise-level caches, and slot order is preserved.
+        // v1.14.5: every VIDEO branch now also carries the probe shape the
+        // satisfied-transform skips need (srcW/srcH/srcFps/rFps/sar/pixFmt/
+        // rotated — planSmartSegments ignores the extras).
+        prof.beginStage("srcFacts");
+        const srcFacts = await mapBoundedConcurrent(segments, 4, async (seg) => {
+          const isVideo = !!(seg && seg.mediaType === "video" && seg.videoPath);
+          if (!isVideo || G.resolveSegSpeed(seg) !== 1) {
+            return { copyCapable: false, keyframes: null, trimAligned: null, srcFps: 0, srcW: 0, srcH: 0, rFps: 0, sar: 0, pixFmt: "", rotated: false, mismatch: null };
+          }
+          const probe = await probeMediaAsync(seg.videoPath);
+          const probeFacts = {
+            srcFps: Number(probe.fps) || 0,
+            srcW: Number(probe.width) || 0,
+            srcH: Number(probe.height) || 0,
+            rFps: Number(probe.rFps) || 0,
+            sar: Number(probe.sar) || 0,
+            pixFmt: String(probe.pixFmt || ""),
+            rotated: !!probe.rotated,
+          };
+          const srcDurMs = Number(probe.durationMs) || 0;
+          const specOk =
+            probe.codec === "h264" &&
+            probe.pixFmt === "yuv420p" &&
+            !probe.rotated &&
+            probe.width === width &&
+            probe.height === height &&
+            Math.abs((probe.fps || 0) - fps) < 0.06 &&
+            srcDurMs > 0;
+          if (!specOk) {
+            // v1.10 (Task 2): the human-readable WHY this source cannot ride
+            // -c copy — planSmartSegments surfaces it in the export telemetry
+            // ("framerate resample 29.97 -> 30fps", "resolution …").
+            const fpsOff = Math.abs((probe.fps || 0) - fps) >= 0.06;
+            const resOff = probe.width !== width || probe.height !== height;
+            let mismatch;
+            if (fpsOff && !resOff && probe.codec === "h264" && probe.pixFmt === "yuv420p" && !probe.rotated) {
+              mismatch = `framerate resample ${(Number(probe.fps) || 0).toFixed(2)} -> ${fps}fps`;
+            } else if (resOff) {
+              mismatch = `resolution ${probe.width}x${probe.height} -> ${width}x${height}`;
+            } else if (probe.codec !== "h264") {
+              mismatch = `codec ${probe.codec || "unknown"} (needs re-encode)`;
+            } else if (probe.rotated) {
+              mismatch = "rotated source metadata";
+            } else if (srcDurMs <= 0) {
+              mismatch = "unreadable source duration";
+            } else {
+              mismatch = `pixel format ${probe.pixFmt || "unknown"} (needs re-encode)`;
+            }
+            return { copyCapable: false, keyframes: null, trimAligned: null, ...probeFacts, bFrames: 0, srcDurMs: 0, mismatch };
+          }
+          const trimInMs = Number(seg.trimInMs) || 0;
+          const trimAligned = trimInMs > 0
+            ? await findKeyframeAlignedStart(seg.videoPath, trimInMs, fps)
+            : null;
+          // One keyframe window covers the whole segment (+ slack for the
+          // planner's forward/backward snapping): [trimIn−3.5 s,
+          // trimIn+dur+12 s]. -skip_frame nokey decodes only keyframes —
+          // a handful per GOP regardless of file length.
+          const kfs = await probeKeyframesNear(
+            seg.videoPath,
+            Math.max(0, (trimInMs - 3500) / 1000),
+            (Number(seg.durationMs) || 0) / 1000 + 12,
+          );
+          return {
+            copyCapable: true,
+            keyframes: kfs,
+            trimAligned,
+            ...probeFacts,
+            // v9: the codec reorder depth (DTS lags PTS by b frames) + the
+            // source length — planSmartSegments subtracts b/g from a clean
+            // piece's -t so the copy tail lands on the exact display frame
+            // (uncorrected, mid-file copies drag b extra frames into the
+            // concat seam: duplicate content + DTS collisions).
+            bFrames: Math.max(0, Math.min(16, Math.round(Number(probe.bFrames) || 0))),
+            srcDurMs,
+          };
+        });
+        prof.endStage("srcFacts");
+
+        // ── Pool width + thread budgets ──────────────────────────────────
+        // v1.13 (user directive — Adaptive Hardware Matrix): the smart-path
+        // sub-split width is the TIER worker count. The v1.12/v1.12.1
+        // "≥4 cores → STRICTLY 4 × 1-thread workers" recipe proved to be the
+        // WRONG shape for 4-core dual-module APUs (AMD A8-class Piledriver:
+        // 2 modules sharing 2 FPUs + L2 — 4 processes thrashed the shared
+        // units; the field report's 46-min exports). Tier 3 runs 2 × 2-thread
+        // workers (one worker per physical module), Tier 2 (≥6 cores) runs
+        // min(4, cores/2) × 2, Tier 1 (GPU ASIC) runs 2.
+        // v1.14.4: filter-dominant timelines widen the SMART pool too —
+        // v1.14.1 widened only the parallel pass + the two-step fallback, so
+        // an image-heavy timeline with 30–70 % dirty coverage ran 2×2 while
+        // the SAME machine ran 4×1 the moment clean coverage dropped below
+        // 30 %. Any image segment is a dirty window by construction (images
+        // are never stream-copied), so ≥half images ⇒ the dirty windows are
+        // filter-bound (zoompan/scale/libass are single-threaded per
+        // PROCESS) — the v1.14.1 recipe applies verbatim. filterWorkers >
+        // workers only ever resolves on Tier 3.
+        const spWorkers = filterDominant && hwProfile.filterWorkers > hwProfile.workers
+          ? hwProfile.filterWorkers
+          : hwProfile.workers;
+
+        // ── The plan (pure) ──────────────────────────────────────────────
+        prof.beginStage("plan");
+        // v1.15.0 SCRIPT-BUDGET-AWARE WINDOW COUNT (decoupled from pool
+        // concurrency): the equal-window graph must fit
+        // SINGLEPASS_MAX_SCRIPT_BYTES (25 KB) per window AND a bounded
+        // number of INPUT STREAMS per window — a Ken Burns image chain is
+        // ~230-280 B of script and every image input costs ffmpeg a demux
+        // thread + decoder + queue (measured: 4 concurrent × 44-input
+        // graphs → pthread_create EAGAIN on a 2-core/4 GB box; the old
+        // W=2/130-input shape would have failed the same way had the 25 KB
+        // script check not bailed first — the budget bail accidentally
+        // protected the thread budget, and its absence at ≤200 images is
+        // ALSO why 85 vs 259 image exports both bottomed out badly). So:
+        //   • windowCount = max(script-budget windows, input-budget
+        //     windows at ≤48 image inputs each), clamped [2, 12];
+        //   • pool lanes stay the CPU/ENGINE-safe count (filterWorkers,
+        //     or 4 on GPU) — MORE windows than lanes run as a runPool QUEUE
+        //     (jobs drain as workers free up), never as more processes.
+        const imageSegCount = segments.reduce(
+          (n, s) => n + (s && s.imagePath && !s.videoPath ? 1 : 0),
+          0,
+        );
+        const estScriptBytes =
+          imageSegCount * 300 + (captionsEnabled ? subtitleCues.length * 64 : 0) + 2048;
+        const budgetWindows = Math.max(1, Math.ceil(estScriptBytes / 20000));
+        const inputWindows = Math.ceil(Math.max(1, imageSegCount) / 48);
+        const windowCount = Math.max(
+          2,
+          Math.min(12, Math.max(hwProfile.filterWorkers, budgetWindows, inputWindows)),
+        );
+        // Pool LANES (concurrent ffmpeg processes): GPU encoders cap at 4
+        // (NVENC/QSV/AMF session envelope); x264 rides the filter pool the
+        // tier already derived (Tier 2: 3-4, Tier 3: 2-4 by logical CPUs).
+        const parallelPoolLanes = isGpuEncoder
+          ? 4
+          : Math.max(2, Math.min(8, hwProfile.filterWorkers));
+        const plan = SP.planSmartSegments({
+          segments,
+          overlays: overlaySegs,
+          transition,
+          fps,
+          totalMs,
+          kbEnabled: enabled,
+          globalDir,
+          wm,
+          // v1.15: text removal dirties the whole timeline (see the
+          // planner's text-removal range).
+          textRemoval,
+          captionsEnabled,
+          subtitleCues,
+          headlinesEnabled,
+          headlines,
+          srcFacts,
+          workerCount: spWorkers,
+          // v1.10 (Task 3): the equal-window parallel budget + the clean-
+          // coverage ratio that triggers it (<30 % copied → mostly dirty).
+          // v1.14.1: the window budget rides the FILTER pool — parallel-pass
+          // timelines are by definition mostly-dirty (image/Ken Burns/
+          // caption-heavy), and their windowed graphs are single-threaded
+          // PER PROCESS, so Tier 3 widens to min(4, logical) processes (the
+          // v1.12.1 shape the dual-module APUs need HERE); Tier 2 keeps its
+          // worker shape (3-4 × 2 threads).
+          // v1.15.0: windowCount is the script/input-budget derivation
+          // above — windows beyond the pool LANES queue inside runPool.
+          parallelWorkers: windowCount,
+          maxParallelWindows: 12,
+          equalWindowRatio: 0.3,
+        });
+        if (!plan) {
+          console.log("[framefuse] smart render skipped: planner returned no plan → two-step pool");
+          return null;
+        }
+        prof.endStage("plan");
+
+        // ── v1.14.4 CONSTRAINED-CPU FAST RESOLUTION ─────────────────
+        // Field report: "after version 12 and 13 export speed became
+        // terrible." Beyond the regressions fixed above (hw-decode gate,
+        // pool shapes, serial probes), the remaining wall is physics: a
+        // 1080p full-dirty re-encode on a Piledriver-class APU runs ≈1×
+        // realtime at ultrafast — no thread topology changes that. This is
+        // the Draft-profile escape hatch, made AUTOMATIC and honest:
+        // ~2.2× less encode+filter work at the 720p-class resolution of the
+        // SAME aspect. Every consumer below (ASS docs, windowed graphs,
+        // overlay geometry via the width/height closure) reads the
+        // re-assigned dims; the two-step fallback jobs were built BEFORE this
+        // point and keep the original resolution; the watermark geometry
+        // (absolute px from the renderer) is scaled by the same factor. The
+        // result payload + toast SAY it — never a silent quality change —
+        // and the renderer's Export settings carry the off switch.
+        //
+        // v1.14.5: the TRIGGER is now the RENDER-COST SCORE (plan §11 —
+        // Phase 9) instead of "≥240 s AND ≥1080p": score ≥ 14 (VERY HIGH)
+        // computed from the plan's ACTUAL dirty seconds × the effect load —
+        // so a 3:59 and a 4:01 export of the same timeline behave the same,
+        // effect-heavy short timelines qualify, and effectless ones need
+        // duration to get there (the 240 s/1080p anchor case scores 14.93).
+        // The structural gates stay: Tier 3, no clean pieces (downscaling a
+        // mixed timeline would leave clean 1080p copies colliding with 720p
+        // chunks in the concat), never cinema, ≥60 s, short edge > 720,
+        // and the user's off switch.
+        const costPost = estimateRenderCost({
+          width,
+          height,
+          fps,
+          durationSec: totalSec,
+          dirtySec: (Number(plan.dirtyMs) || 0) / 1000,
+          captions: captionsEnabled,
+          headlines: headlinesEnabled,
+          overlayCount: overlaySegs.length,
+          chromaCount: overlaySegs.filter((ov) => ov && ov.chroma).length,
+          kenBurnsCount: enabled ? segments.reduce((n, s) => n + (s && s.mediaType !== "video" ? 1 : 0), 0) : 0,
+          transitionCount: Math.max(0, segments.length - 1),
+        });
+        prof.costPost = costPost;
+        // v1.15.0: the gate also admits Tier-1 (GPU) boxes with a weak CPU
+        // (≤4 strong cores) — a Tier-*string* check alone meant a Tier-3-
+        // class CPU with a working NVENC was filed Tier 1 and never got
+        // the ~2.2× pixel cut even at VERY_HIGH render cost. Encode is on
+        // the ASIC, but the filter wall (zoompan/libass) is CPU — that
+        // combination is exactly who this mode is for. The structural
+        // gates stay: mostly-dirty (no clean pieces — downscaling a mixed
+        // timeline would collide 1080p copies with 720p chunks in the
+        // concat), never cinema, ≥60 s, short edge > 720, off switch.
+        const weakCpuFastMode =
+          hwProfile.tier === "TIER_3_CONSTRAINED_CPU" ||
+          (hwProfile.tier === "TIER_1_GPU" && (hwProfile.cpuPhysical || 0) <= 4);
+        let fastModeApplied = null;
+        if (
+          weakCpuFastMode &&
+          fastModeWanted !== false &&
+          plan.parallelMode &&
+          quality !== "cinema" &&
+          totalMs >= 60000 &&
+          Math.min(width, height) > 720 &&
+          costPost.strategy === "VERY_HIGH"
+        ) {
+          const s = 720 / Math.min(width, height);
+          const even = (v) => Math.max(2, Math.round((v * s) / 2) * 2);
+          const fw = even(width);
+          const fh = even(height);
+          if (fw < width || fh < height) {
+            fastModeApplied = { from: `${width}x${height}`, to: `${fw}x${fh}` };
+            console.log(
+              `[Export] CONSTRAINED-CPU FAST MODE: ${fastModeApplied.from} → ${fastModeApplied.to} ` +
+                `(Tier 3 · render-cost ${costPost.score} ${costPost.strategy} — ${costPost.pixelCost} G-frames × ${costPost.effectCost} effects · ~2.2× fewer pixels to encode; disable in Export settings)`,
+            );
+            width = fw;
+            height = fh;
+            if (wm) {
+              // Absolute-px watermark geometry was computed by the renderer
+              // against the REQUESTED dims — carry it to the fast dims so it
+              // lands at the same relative position/size.
+              wm.x = Math.round(wm.x * s);
+              wm.y = Math.round(wm.y * s);
+              wm.w = Math.round(wm.w * s);
+              wm.h = Math.round(wm.h * s);
+            }
+            // v1.27.2 KINETIC PARITY: same rule for the renderer-measured
+            // kinetic geometry — every word rect/fontPx/block field was
+            // measured against the REQUESTED dims and the smart pipeline's
+            // ASS pieces are built at the fast dims (PlayRes = fw×fh); the
+            // native Rust path already ran (early return) on the ORIGINAL
+            // payload, so only this CLI-side copy is rescaled. Without it
+            // every \pos/\fs lands in the wrong coordinate space (kinetic
+            // captions misplaced + oversized on fast-mode exports).
+            if (kineticGeoList && kineticGeoList.length) {
+              const scaleKin = (v) => Math.round((Number(v) || 0) * s);
+              kineticGeoList = kineticGeoList.map((g) =>
+                g && typeof g === "object"
+                  ? {
+                      ...g,
+                      fontPx: scaleKin(g.fontPx),
+                      lineHeight: scaleKin(g.lineHeight),
+                      blockLeft: scaleKin(g.blockLeft),
+                      blockTop: scaleKin(g.blockTop),
+                      blockW: scaleKin(g.blockW),
+                      blockH: scaleKin(g.blockH),
+                      lines: Array.isArray(g.lines)
+                        ? g.lines.map((l) =>
+                            l && typeof l === "object"
+                              ? { ...l, fontPx: scaleKin(l.fontPx), y: scaleKin(l.y), h: scaleKin(l.h) }
+                              : l,
+                          )
+                        : g.lines,
+                      words: Array.isArray(g.words)
+                        ? g.words.map((w) =>
+                            w && typeof w === "object"
+                              ? { ...w, x: scaleKin(w.x), y: scaleKin(w.y), w: scaleKin(w.w), h: scaleKin(w.h), fontPx: scaleKin(w.fontPx) }
+                              : w,
+                          )
+                        : g.words,
+                    }
+                  : g,
+              );
+            }
+          }
+        }
+
+        // ── Mode-aware pool budget ───────────────────────────────────────
+        // v1.13 (Adaptive Hardware Matrix): parallel-pass workers ride the
+        // tier's threadsPerWorker (2 on Tier 2/3 — the v1.12 hard-pin of
+        // 1 thread existed to keep 4 workers inside 4 cores' caches; with
+        // tier-sized worker counts, 2 threads per worker is the recipe).
+        // Smart path keeps the v7 division + the Tier-3 caps.
+        // v1.14.1: when the parallel-pass window count WIDENED past the
+        // tier's worker count (Tier 3 filter pools), each window takes a
+        // single-thread encoder — W × 1 fills every logical core with
+        // filter work where W/2 × 2 could not. Unwidened pools (Tier 2)
+        // keep the tier's threadsPerWorker.
+        // v1.14.4: the WIDENED smart pool (filter-dominant, above) rides the
+        // same single-thread recipe — 4 workers × 2 filter threads on 4
+        // logical cores would oversubscribe 2× for zero filter gain
+        // (zoompan/libass stay single-threaded regardless).
+        const smartWidened = spWorkers > hwProfile.workers;
+        let poolWidth;
+        let threadsPer;
+        let filterThreadsPer;
+        if (plan.parallelMode) {
+          // v1.15.0: window count and pool LANES are decoupled — the plan
+          // may carry MORE windows than lanes (script/input budget) and the
+          // pool drains them as a QUEUE (runPool semantics, equal-duration
+          // windows = good load balance). Lanes stay the engine/CPU-safe
+          // count: GPU 4, x264 the tier's filter pool.
+          poolWidth = Math.max(1, Math.min(plan.workerCount, parallelPoolLanes));
+          threadsPer = poolWidth > hwProfile.workers
+            ? Math.max(1, Math.min(hwProfile.threadsPerWorker, Math.floor(cpuCount / poolWidth) || 1))
+            : hwProfile.threadsPerWorker;
+          filterThreadsPer = threadsPer;
+          if (plan.workerCount > poolWidth) {
+            console.log(
+              `[framefuse] parallel pass: ${plan.workerCount} windows over ${poolWidth} lane(s) (queue) — script/input budget ${estScriptBytes}B est, ≤48 image inputs per window`,
+            );
+          }
+        } else if (smartWidened) {
+          poolWidth = Math.max(1, spWorkers);
+          threadsPer = Math.max(1, Math.floor(cpuCount / poolWidth) || 1);
+          filterThreadsPer = threadsPer;
+        } else {
+          poolWidth = Math.max(1, spWorkers);
+          threadsPer = Math.max(1, Math.round(cpuCount / poolWidth));
+          filterThreadsPer = Math.max(2, Math.min(8, Math.floor(cpuCount / poolWidth)));
+          if (hwProfile.tier === "TIER_3_CONSTRAINED_CPU") {
+            threadsPer = Math.max(1, Math.min(2, threadsPer));
+            filterThreadsPer = Math.max(1, Math.min(2, filterThreadsPer));
+          }
+        }
+
+        // ── Audio branches + loudnorm (identical to the retired routes) ──
+        const clipAudioBranches = [];
+        for (let b = 0; b < segments.length; b++) {
+          const info = segInfo[b];
+          if (info && info.segHasAudio) {
+            clipAudioBranches.push({
+              inputIdx: b,
+              startMs: info.segStartMs,
+              volume: G.normalizeVolume(segments[b].volume),
+              atempo: G.atempoFilters(info.speed),
+              durationMs: Number(segments[b].durationMs) || 0,
+            });
+          }
+        }
+        let spLoudnorm = null;
+        let spMasterLoudnorm = null;
+        // v1.14.5 SIMPLE-AUDIO FAST PATH (plan §5): ≤3 branches AND every
+        // branch has a usable measurement → the graph applies STATIC gains
+        // (volume=dB) instead of the loudnorm filters, and the master-bus
+        // estimate becomes a static gain too. The disk cache (§4) already
+        // removed the re-measurement spawns for repeat sources; this removes
+        // the per-branch ebur128 analysis from the render itself.
+        let spAudioFastGain = false;
+        let spMasterGainDb = null;
+        if (audio && audio.normalize && (clipAudioBranches.length > 0 || musicCount > 0)) {
+          prof.beginStage("loudness");
+          // v1.33.4: the planning-stage measurements can take minutes on
+          // hour-long sources — the phase chip now says "measuring loudness"
+          // and the bar ticks 0 → 0.5% with the per-task decode fractions
+          // (previously this whole stage ran under the bare "prepare" label
+          // with a frozen 0% — indistinguishable from a hang).
+          exportPhase = "audio-measure";
+          sendProgress(0.2, 0, undefined);
+          const measures = { clip: new Array(clipAudioBranches.length).fill(null), music: null };
+          const tasks = clipAudioBranches.map((c, k) => ({
+            kind: "clip", k,
+            p: segments[c.inputIdx].videoPath,
+            dur: (Number(segments[c.inputIdx].durationMs) || 0) / 1000,
+            win: {
+              ssMs: segInfo[c.inputIdx].trimInMs,
+              durMs: (Number(segments[c.inputIdx].durationMs) || 0) * (segInfo[c.inputIdx].speed !== 1 ? segInfo[c.inputIdx].speed : 1),
+            },
+          }));
+          // v1.25: only the LEGACY single-music input is measured (the N-clip
+          // branches carry no loudnorm — SFX-style user-volume placements).
+          const legacyMusicPath = hasMusicClips ? null : audioPath;
+          if (legacyMusicPath) tasks.push({ kind: "music", p: legacyMusicPath, dur: totalSec, win: null });
+          const spFrac = new Array(tasks.length).fill(0);
+          // v1.33.5: denominators use the EFFECTIVE measured span (windowed
+          // measures tick 0→1 over their ≤ 90 s sample — the full duration
+          // would freeze the planning band).
+          for (const task of tasks) {
+            task.effDur = effectiveMeasureSec(
+              task.win && Number(task.win.durMs) > 0
+                ? Number(task.win.durMs) / 1000
+                : task.dur,
+            ) || task.dur;
+          }
+          for (let t = 0; t < tasks.length; t += 8) {
+            const chunkT = tasks.slice(t, t + 8);
+            const base = t;
+            const res = await Promise.all(chunkT.map((task, i) => measureLoudnessAsync(
+              task.p,
+              task.win,
+              // v1.33.4: the MUSIC branch (win=null — whole file) gets the
+              // duration-scaled budget; windowed clip branches keep the
+              // window-scaled default. (The old call passed NO timeout → a
+              // flat 60s cap for the music file — the v1.33.2 long-audio
+              // starvation bug, still live on the smart path until now.)
+              // v1.33.5: win=null is now sampled internally (90 s window)
+              // so the budget is comfortably above the real cost.
+              task.win ? undefined : Math.max(90000, Math.min(600000, 90000 + (task.dur || totalSec) * 40)),
+              task.effDur > 0
+                ? (sec) => {
+                    spFrac[base + i] = Math.min(1, sec / Math.max(0.01, task.effDur));
+                    let sum = 0;
+                    for (let q = 0; q < spFrac.length; q++) sum += spFrac[q];
+                    sendProgress(0.2 + 0.3 * (sum / spFrac.length), 0, undefined);
+                  }
+                : null,
+            )));
+            chunkT.forEach((task, r) => {
+              spFrac[base + r] = 1;
+              if (task.kind === "clip") measures.clip[task.k] = res[r];
+              else measures.music = res[r];
+            });
+          }
+          prof.endStage("loudness");
+          exportPhase = "video";
+          spLoudnorm = measures;
+          const branchCount = clipAudioBranches.length + musicCount;
+          const clipsUsable = measures.clip.every((m) => G.loudnessGainDb(m) != null);
+          const musicUsable = !legacyMusicPath || G.loudnessGainDb(measures.music) != null;
+          spAudioFastGain = branchCount > 0 && branchCount <= 3 && clipsUsable && musicUsable;
+          if (spAudioFastGain) {
+            // The estimated mix loudness as the master static gain (same
+            // energy-sum math estimateMixLoudnorm uses for its filter form).
+            const est = G.estimateMixLoudnessDb({
+              totalSec,
+              audio,
+              clipAudio: clipAudioBranches.map((c, k) => ({
+                measure: measures.clip[k],
+                volume: c.volume,
+                durationMs: c.durationMs,
+              })),
+              music: measures.music,
+            });
+            if (est) {
+              const db = -16 - est.i;
+              if (Number.isFinite(db) && Math.abs(db) <= 24) spMasterGainDb = Math.round(db * 100) / 100;
+            }
+            console.log(
+              `[Export] simple-audio fast path: ${branchCount} branch(es), static gains ` +
+                `(volume=dB, master ${spMasterGainDb != null ? `${spMasterGainDb}dB` : "—"}) — loudnorm filters skipped`,
+            );
+          }
+          if (!spAudioFastGain) {
+            spMasterLoudnorm = G.estimateMixLoudnorm({
+              totalSec,
+              audio,
+              clipAudio: clipAudioBranches.map((c, k) => ({
+                measure: measures.clip[k],
+                volume: c.volume,
+                durationMs: c.durationMs,
+              })),
+              music: measures.music,
+            });
+          }
+        } else if (musicCount > 0 || clipAudioBranches.length > 0) {
+          // v1.14.6 (user directive): normalize OFF → loudnorm is FULLY out
+          // of this export — no measurement spawns, no loudnorm filters, no
+          // master-mix render/remeasure. One explicit log line so the argv
+          // is provable (result.audioNormalize carries it to the UI toast).
+          console.log(
+            "[Export] audio: normalize OFF — loudnorm fully bypassed (0 measurement spawns, 0 loudnorm filters)",
+          );
+        }
+
+        // ── Hw decode per source (probe-gated, cached per path) ───────────
+        // v1.12 (user directive): EVERY worker video input rides hardware
+        // decode — d3d11va where the probe approves (the ≥1.3×-faster gate
+        // is gone; not-catastrophically-slower now qualifies because the
+        // parallel pool wins on freed CPU cycles), `-hwaccel auto` when the
+        // d3d11va arm init-fails (graceful fallback), `auto` WITHOUT a probe
+        // for short sources (< 20 s — the two probe arms cost more than the
+        // clip's whole decode). Images stay on the plain input.
+        const hwaccelPerSeg = [];
+        let spHwCount = 0;
+        for (let b = 0; b < segments.length; b++) {
+          const s = segments[b];
+          const isVid = !!(s && s.mediaType === "video" && s.videoPath);
+          const tok = !isVid
+            ? false
+            : (Number(s.durationMs) || 0) >= 20000
+              ? await probeHwDecode(s.videoPath)
+              : "auto";
+          hwaccelPerSeg.push(tok);
+          if (tok) spHwCount += 1;
+        }
+
+        // ── Full-timeline fades + per-segment source rates ───────────────
+        const fullFades = SP.buildGlobalFades({ segments, transition, totalMs });
+        const srcFpsPerSeg = await Promise.all(
+          segments.map(async (s) =>
+            s && s.mediaType === "video" && s.videoPath
+              ? Number((await probeMediaAsync(s.videoPath)).fps) || 0
+              : 0,
+          ),
+        );
+
+        // ── The CONCAT CONTRACT reference timescale: the first clean ──────
+        // piece's source track clock (dirty encodes write the same one).
+        // v1.10 (Task 3): the parallel-pass mode has NO clean pieces — every
+        // chunk is an encode, so they all pin the recipe's 90000 clock and
+        // the concat demuxer's offset math stays exact across all W workers.
+        let videoTimescale = null;
+        const firstClean = plan.pieces.find((p) => p.kind === "clean");
+        if (firstClean) {
+          videoTimescale = await probeVideoTimescale(segments[firstClean.segIdx].videoPath);
+        } else if (plan.parallelMode) {
+          videoTimescale = 90000;
+        }
+
+        // ── PHASE 3: build the pool jobs over the pieces ─────────────────
+        const poolJobs = [];
+        const chunkFiles = [];
+        let dirtyWindows = 0;
+        let cleanCopies = 0;
+        let overBudget = false;
+        const dirtyTotal = plan.pieces.filter((p) => p.kind === "dirty").length;
+        for (let pi = 0; pi < plan.pieces.length && !overBudget; pi++) {
+          const piece = plan.pieces[pi];
+          const chunkPath = path.join(tempDir, `chunk_${String(chunkFiles.length + 1).padStart(3, "0")}.mp4`);
+          tempFiles.push(chunkPath);
+          chunkFiles.push(chunkPath);
+          if (piece.kind === "clean") {
+            const seg = segments[piece.segIdx];
+            poolJobs.push({
+              args: G.buildStreamCopyArgs({
+                path: seg.videoPath,
+                // v9: copyDurMs carries the B-frame reorder correction —
+                // the demuxer bounds -t on DTS, which lag PTS by b frames.
+                durMs: piece.copyDurMs != null ? piece.copyDurMs : piece.durMs,
+                clipPath: chunkPath,
+                ss: piece.ss,
+              }),
+              durSec: piece.durMs / 1000,
+              durationMs: piece.durMs,
+              segId: seg.id,
+              copy: true,
+            });
+            cleanCopies += 1;
+            continue;
+          }
+          // DIRTY piece: the windowed single-pass graph bounded to the
+          // piece's exact [f0, f1) frames. windowSegmentsForChunk derives
+          // the per-segment sub-seeks from the SAME frame law the planner
+          // snapped boundaries with, so the encoded piece's first/last
+          // frames are the frames the full-timeline render would emit at
+          // those slots.
+          dirtyWindows += 1;
+          const winSegs = SP.windowSegmentsForChunk(segments, plan.spans, piece.f0, piece.f1, fps, srcFpsPerSeg);
+          const segMeta = winSegs.map((w) => ({
+            origIdx: w.origIdx, S: w.S, F: w.F, k0: w.k0, k1: w.k1, ssSec: w.ssSec,
+          }));
+          const ovSpecs = SP.padOverlayInputWindows(
+            await buildOverlaySpecsForWindow(piece.t0Ms, piece.durMs),
+            piece.durMs,
+          );
+          let pieceAssSuffix = null;
+          if (captionsEnabled || headlinesEnabled) {
+            const doc = buildAssDocument(
+              captionsEnabled ? subtitleCues : [],
+              captionsEnabled ? captionSettings : null,
+              headlinesEnabled ? headlines : null,
+              width, height, piece.t0Ms, piece.t0Ms + piece.durMs, piece.durMs,
+              headlinesEnabled ? headlineGeometry : undefined,
+              // v1.18 kinetic typography (rides captions — captionsEnabled gate):
+              captionsEnabled ? kineticCompositions : undefined,
+              captionsEnabled ? kineticGeoList : undefined,
+            );
+            pieceAssSuffix = doc ? writeAssFile(doc, `sm${String(pi).padStart(3, "0")}`) : null;
+          }
+          const cPlan = SP.buildSinglePassPlan({
+            segments: winSegs.map((w) => w.seg),
+            fullSegments: segments,
+            window: { t0Ms: piece.t0Ms, durMs: piece.durMs, segMeta },
+            videoOnly: true,
+            fades: fullFades,
+            fps,
+            width,
+            height,
+            totalMs,
+            kbEnabled: enabled,
+            zoomMax,
+            globalDir,
+            transition,
+            wm,
+            assSuffix: pieceAssSuffix,
+            overlaySpecs: ovSpecs,
+            audio,
+            audioPath: null,
+            sfx: [],
+            clipAudio: [],
+            loudnorm: null,
+            masterLoudnorm: null,
+            hwaccelPerSeg,
+            // v1.14.5: probed source facts for the satisfied-transform skips.
+            srcFacts,
+            // v1.15: burn-in text removal.
+            textRemoval,
+          });
+          if (cPlan.scriptBytes > SP.SINGLEPASS_MAX_SCRIPT_BYTES) {
+            console.warn(`[framefuse] smart render skipped: piece ${pi + 1}/${plan.pieces.length} graph ${cPlan.scriptBytes}B > ${SP.SINGLEPASS_MAX_SCRIPT_BYTES}B budget → two-step pool`);
+            overBudget = true;
+            break;
+          }
+          const scriptPath = path.join(tempDir, `graph_sm${pi}_${Date.now()}.txt`);
+          fs.writeFileSync(scriptPath, cPlan.script, "utf-8");
+          tempFiles.push(scriptPath);
+          // v1.14.5 PROFILER: classify the window's graph from the script it
+          // will actually run — the worker record reports where THIS piece's
+          // wall time went (zoompan/libass/overlay/chromakey/xfade).
+          const perfClasses = [];
+          if (/zoompan=/.test(cPlan.script)) perfClasses.push("zoompan");
+          if (/subtitles=/.test(cPlan.script)) perfClasses.push("captions");
+          if (/overlay=/.test(cPlan.script)) perfClasses.push("overlay");
+          if (/chromakey|lumakey/.test(cPlan.script)) perfClasses.push("chromakey");
+          if (/xfade=/.test(cPlan.script)) perfClasses.push("xfade");
+          poolJobs.push({
+            args: SP.buildSinglePassArgs({
+              plan: cPlan,
+              scriptPath,
+              encArgs,
+              abr: `${abr}k`,
+              fps,
+              outputPath: chunkPath,
+              threads: threadsPer,
+              filterThreads: filterThreadsPer,
+              globalArgs: encGlobalArgs,
+              videoTimescale,
+              // Exact slot count — the concat tiling depends on it.
+              frameCap: piece.frames,
+            }),
+            durSec: piece.durMs / 1000,
+            durationMs: piece.durMs,
+            segId: plan.parallelMode
+              ? `parallel window ${dirtyWindows}/${dirtyTotal}`
+              : `smart window ${dirtyWindows}/${dirtyTotal}`,
+            perfClasses,
+            frameCap: piece.frames,
+          });
+        }
+        if (overBudget) return null;
+
+        console.log(
+          `[framefuse] ${plan.parallelMode ? "PARALLEL PASS" : "SMART RENDER"}: ${cleanCopies} clean stream-copy piece(s) (${(plan.cleanMs / 1000).toFixed(1)}s) + ${dirtyWindows} dirty window(s) (${(plan.dirtyMs / 1000).toFixed(1)}s) over ${(totalMs / 1000).toFixed(1)}s — ${plan.zones.map((z) => z.why.join("+")).join(", ") || "no zones"}` +
+            (plan.reasons && plan.reasons.length
+              ? ` · reasons: ${plan.reasons.map((r) => `${r.label} (${Math.round(r.share * 100)}%)`).join("; ")}`
+              : ""),
+        );
+
+        // ── PHASE 3 (run): ONE pool over copies + dirty windows ───────────
+        // v1.14.2 (user directive: "export speed significantly reduced"):
+        // the audio bus used to run AFTER the pool completed — its whole
+        // runtime was ADDED to the wall clock even though it never touches
+        // the pool's outputs (its inputs are the SOURCE media). It now
+        // launches CONCURRENTLY with the video pool (the export blueprint's
+        // Phase 4: "process all timeline audio in a single pass WHILE the
+        // video workers are running"), and progress from both feeds ONE
+        // combined fraction: the pool owns 0–92 %, the concurrent audio
+        // pass 92–96 %, the concat mux 96.5–100 % (the same band layout as
+        // v1.14.1 — only the serialization changed).
+        const chunkFrac = poolJobs.map(() => 0);
+        let spAudioFrac = 0;
+        const poolStart = Date.now();
+        let lastEmit = 0;
+        prof.setPool({
+          width: poolWidth,
+          jobs: poolJobs.length,
+          copyJobs: cleanCopies,
+          dirtyJobs: dirtyWindows,
+          threadsPerWorker: threadsPer,
+        });
+        const emitSmartProgress = (force) => {
+          const now = Date.now();
+          if (!force && now - lastEmit < 100) return;
+          lastEmit = now;
+          let doneMs = 0;
+          for (let k = 0; k < poolJobs.length; k++) doneMs += chunkFrac[k] * poolJobs[k].durationMs;
+          const poolFrac = Math.min(1, doneMs / Math.max(1, totalMs));
+          const frac = Math.min(0.96, 0.92 * poolFrac + 0.04 * spAudioFrac);
+          sendProgress(frac * 100, frac * totalSec, etaFor(frac));
+        };
+
+        // ── Audio bus: ONE full-timeline pass (no per-chunk AAC boundary ──
+        // glitches, no windowed amix math), bounded by the VIDEO frame
+        // model; the final mux carries -shortest. v1.14.2: LAUNCHED BEFORE
+        // the pool and awaited after it (concurrent). Failures are recorded
+        // and re-raised with the exact v1.14.1 semantics (<4 s = filter-
+        // graph init failure → two-step fallback; later = hard error) once
+        // the pool settles, so the fallback decision point is unchanged.
+        let spAudioPath = null;
+        let spAudioErr = null;
+        const hasAudioBus =
+          clipAudioBranches.length > 0 || !!audioPath || hasMusicClips ||
+          sfxList.length > 0 || voiceoverList.length > 0;
+        const spAudioPromise = hasAudioBus
+          ? (async () => {
+              const aPlan = SP.buildSinglePassPlan({
+                segments,
+                audioOnly: true,
+                fps,
+                width,
+                height,
+                totalMs,
+                audio,
+                audioPath: hasMusicClips ? null : audioPath,
+                // v1.25 MULTI-MUSIC: the N-clip music inputs (SFX-style
+                // branches; each loop clip's input gets a FINITE
+                // -stream_loop count via its durationMs — v1.33.5).
+                musicTracks: hasMusicClips ? musicClipList : undefined,
+                // v1.33.5: the legacy track's duration (finite loop bound).
+                ...(!hasMusicClips && legacyMusicDurationSec > 0 ? { musicDurSec: legacyMusicDurationSec } : {}),
+                sfx: sfxList,
+                voiceovers: voiceoverList,
+                clipAudio: clipAudioBranches,
+                loudnorm: spLoudnorm,
+                masterLoudnorm: spMasterLoudnorm,
+                // v1.14.5: the simple-audio fast path (static gains).
+                audioFastGain: spAudioFastGain,
+                masterGainDb: spMasterGainDb,
+              });
+              if (!aPlan.hasAudioOut) return;
+              const aScriptPath = path.join(tempDir, `graph_sma_${Date.now()}.txt`);
+              fs.writeFileSync(aScriptPath, aPlan.script, "utf-8");
+              tempFiles.push(aScriptPath);
+              spAudioPath = path.join(tempDir, `spaudio_${Date.now()}.m4a`);
+              tempFiles.push(spAudioPath);
+              const aArgs = SP.buildAudioOnlyArgs({
+                plan: aPlan,
+                scriptPath: aScriptPath,
+                abr: `${abr}k`,
+                // v1.29 AUDIO-EXTENDED TIMELINE: the audio bus is bounded by
+                // the FULL export total (max(video frames, payload totalMs))
+                // — the video frame model alone would trim a voice/music
+                // track back to the visual length (the complaint-3/4 bug).
+                // The final mux's -shortest still ends the FILE at the video
+                // end when the visuals are shorter (verified behavior).
+                totalSec: Math.max(plan.totalFrames / fps, totalSec),
+                outputPath: spAudioPath,
+              });
+              const audioStart = Date.now();
+              try {
+                await runFfmpeg(aArgs, totalSec, (sec) => {
+                  spAudioFrac = Math.min(1, sec / Math.max(0.01, totalSec));
+                  emitSmartProgress(false);
+                });
+                prof.setStage("audio-bus", Date.now() - audioStart);
+                console.log(
+                  `[framefuse] audio bus pass finished in ${((Date.now() - audioStart) / 1000).toFixed(1)}s (ran concurrent with the video pool)`,
+                );
+              } catch (err) {
+                spAudioErr = { err, elapsed: Date.now() - audioStart };
+              }
+            })()
+          : null;
+
+        exportPhase = "video";
+        prof.beginStage("pool");
+        try {
+          await runPool(poolJobs, poolWidth, {
+            onTime: (idx, sec) => {
+              chunkFrac[idx] = Math.min(1, sec / Math.max(0.01, poolJobs[idx].durSec));
+              emitSmartProgress(false);
+            },
+            onDone: (idx) => {
+              chunkFrac[idx] = 1;
+              emitSmartProgress(true);
+            },
+            // v1.14.5 PROFILER: per-job wall + graph classes.
+            onJobEnd: (idx, wallMs) => {
+              const j = poolJobs[idx] || {};
+              prof.worker({
+                idx,
+                copy: !!j.copy,
+                segId: j.segId,
+                durMs: j.durationMs,
+                frames: j.frameCap || 0,
+                wallMs,
+                classes: j.perfClasses || [],
+              });
+            },
+          });
+        } catch (err) {
+          if (err && err.message === "Export cancelled") {
+            // The pool's kill-siblings already killed the concurrent audio
+            // ffmpeg (runFfmpeg registers every proc in activeProcs); its
+            // recorder swallowed the rejection, so just propagate.
+            throw err;
+          }
+          if (Date.now() - poolStart < 4000) {
+            console.warn("[framefuse] smart render pool failed at init — falling back to the two-step pool:", err.message);
+            return null;
+          }
+          throw err;
+        }
+        prof.endStage("pool");
+
+        // Audio bus join (usually already finished — it started with the
+        // pool and typically runs several × realtime).
+        if (spAudioPromise) {
+          exportPhase = "audio";
+          await spAudioPromise;
+        }
+        if (spAudioErr) {
+          const { err, elapsed } = spAudioErr;
+          if (err && err.message === "Export cancelled") throw err;
+          if (elapsed < 4000) {
+            console.warn("[framefuse] smart render audio pass failed at init — falling back to the two-step pool:", err.message);
+            return null;
+          }
+          throw err;
+        }
+
+        // ── v1.33.6 SMART-PATH TAIL FILLER (the no-loop audio-extended
+        // timeline): the plan's frame law models the FULL timeline (the
+        // parallel-pass planner slices [0, totalMs) even when the visuals end
+        // early), so the VISUAL extent comes from the SEGMENTS — max end of
+        // any base segment. The audio bus rendered to the audio-extended
+        // total; without a filler the mux's -shortest ends the FILE at the
+        // visual end (10s video + 69-min audio → a 10s file → the verify's
+        // bogus "disk filled up" error). A black tail (with the tail's
+        // caption window) now completes the video stream to the full
+        // timeline, same as the two-step path.
+        const segVisualEndSec = segments.reduce(
+          (m, s) => Math.max(m, ((Number(s && s.startMs) || 0) + (Number(s && s.durationMs) || 0)) / 1000),
+          0,
+        );
+        const spVisualSec = Math.max(
+          0,
+          Math.min(plan.totalFrames > 0 && fps > 0 ? plan.totalFrames / fps : totalSec, segVisualEndSec),
+        );
+        let spFillRan = false;
+        if (spAudioPath && totalSec > spVisualSec + 1.5) {
+          const spFillMs = Math.round((totalSec - spVisualSec) * 1000);
+          const spFillerPath = path.join(tempDir, `tailfill_${Date.now()}.mp4`);
+          tempFiles.push(spFillerPath);
+          chunkFiles.push(spFillerPath);
+          let spFillerAss = null;
+          if (captionsEnabled || headlinesEnabled) {
+            const doc = buildAssDocument(
+              captionsEnabled ? subtitleCues : [],
+              captionsEnabled ? captionSettings : null,
+              headlinesEnabled ? headlines : null,
+              width, height, Math.round(spVisualSec * 1000), Math.round(totalSec * 1000), spFillMs,
+              headlinesEnabled ? headlineGeometry : undefined,
+              captionsEnabled ? kineticCompositions : undefined,
+              captionsEnabled ? kineticGeoList : undefined,
+            );
+            spFillerAss = doc ? writeAssFile(doc, "sptail") : null;
+          }
+          exportPhase = "video";
+          console.log(
+            `[Export] tail filler (smart): visuals end at ${spVisualSec.toFixed(1)}s but the timeline is ${totalSec.toFixed(1)}s — rendering ${((totalSec - spVisualSec) / 60).toFixed(1)} min of black${spFillerAss ? " (captions continue)" : ""}`,
+          );
+          prof.beginStage("tail-fill");
+          const spFillEta = { lastSec: 0, lastAt: 0, rate: 0 };
+          await runFfmpeg(
+            [
+              "-f", "lavfi", "-i",
+              `color=c=black:s=${width}x${height}:r=${Math.round(fps)}:d=${(spFillMs / 1000).toFixed(3)}`,
+              "-vf", [...(spFillerAss ? [spFillerAss] : []), "setsar=1", "format=yuv420p"].join(","),
+              "-map", "0:v",
+              "-t", (spFillMs / 1000).toFixed(3),
+              ...encArgs,
+              "-r", String(Math.round(fps)),
+              "-an",
+              "-threads", String(threadsPer > 0 ? Math.round(threadsPer) : 0),
+              "-y", spFillerPath,
+            ],
+            spFillMs / 1000,
+            (sec) => {
+              const now = Date.now();
+              if (sec > spFillEta.lastSec + 0.5 && now > spFillEta.lastAt) {
+                const inst = (sec - spFillEta.lastSec) / ((now - spFillEta.lastAt) / 1000);
+                if (inst > 0) spFillEta.rate = spFillEta.rate > 0 ? 0.3 * spFillEta.rate + 0.7 * inst : inst;
+                spFillEta.lastSec = sec;
+                spFillEta.lastAt = now;
+              }
+              const etaSec = spFillEta.rate > 0.01
+                ? Math.min(3600, Math.round(Math.max(0, spFillMs / 1000 - sec) / spFillEta.rate))
+                : undefined;
+              sendProgress(96 + 0.7 * Math.min(1, sec / Math.max(0.01, spFillMs / 1000)), sec, etaSec);
+            },
+            { maxMs: Math.min(7200000, Math.max(600000, (spFillMs / 1000) * 750)) },
+          );
+          prof.endStage("tail-fill");
+          spFillRan = true;
+        }
+
+        // ── PHASE 4: concat demuxer stitch + mux (instant, -c copy) ───────
+        exportPhase = "mux";
+        sendProgress(96.9, totalSec, undefined); // v1.33.6: phase-local ETA only (smart path)
+        const spConcatPath = path.join(tempDir, `concat_${Date.now()}.txt`);
+        tempFiles.push(spConcatPath);
+        fs.writeFileSync(
+          spConcatPath,
+          chunkFiles.map((p) => `file '${p.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`).join("\n"),
+          "utf-8",
+        );
+        // v1.33.4: the faststart gate + the size-derived finalize budget are
+        // hoisted (both feed the progress mapping AND the argv) and the mux
+        // band is re-mapped 97 → 99.7 with the VIDEO length as the
+        // denominator (a -shortest audio-extended timeline caps out_time at
+        // the video end — the old audio-extended denominator could never
+        // reach 1 and the bar stalled below the band top). The finalize pass
+        // (faststart moov rewrite) fires from ffmpeg's own "Starting second
+        // pass" stderr line with a live crawl to 99.97 — 100% stays reserved
+        // for the actual exit.
+        let spChunkBytes = 0;
+        for (const p of chunkFiles) { try { spChunkBytes += fs.statSync(p).size; } catch (_) {} }
+        const spAudioBytes = spAudioPath ? (abr * 1000 / 8) * totalSec : 0;
+        const spExpectedOutBytes = spChunkBytes + spAudioBytes;
+        const spSkipFaststart = spExpectedOutBytes > 1.5 * 1024 * 1024 * 1024;
+        if (spSkipFaststart) {
+          console.log(
+            `[Export] faststart skipped: expected output ≈ ${(spExpectedOutBytes / 1024 / 1024 / 1024).toFixed(2)} GB > 1.5 GB ` +
+              `(-movflags +faststart would rewrite the whole file after 100% — moov stays at end; local playback unaffected)`,
+          );
+        }
+        const muxArgs = [
+          "-y",
+          "-f", "concat", "-safe", "0", "-i", spConcatPath,
+          ...(spAudioPath ? ["-i", spAudioPath] : []),
+          "-map", "0:v:0",
+          ...(spAudioPath ? ["-map", "1:a:0"] : []),
+          "-c", "copy",
+          ...(spAudioPath ? ["-shortest"] : []),
+          ...(spSkipFaststart ? [] : ["-movflags", "+faststart"]),
+          outputPath,
+        ];
+        const spVideoSec = spFillRan ? totalSec : spVisualSec;
+        const spMuxBandSec = Math.max(0.01, Math.min(spVideoSec, totalSec));
+        const muxStageStart = Date.now();
+        prof.beginStage("mux");
+        try {
+          await runFfmpeg(muxArgs, totalSec, (sec) => {
+            const frac = 0.97 + 0.027 * Math.min(1, sec / spMuxBandSec);
+            sendProgress(frac * 100, sec, etaFor(frac));
+          }, {
+            onFinalize: () => {
+              exportPhase = "finalize";
+              sendProgress(99.7, totalSec, undefined);
+              console.log("[Export] finalize: concat muxed — ffmpeg is rewriting the file header (faststart moov rewrite)");
+            },
+            onFinalizeProgress: (f) => {
+              sendProgress(99.7 + 0.2 * Math.min(0.95, Math.max(0, f)), totalSec, undefined); // v1.33.6: caps at 99.9 — "100.0" was a rounding lie
+            },
+            finalizeEstimateMs: Math.max(15000, Math.min(600000, (spExpectedOutBytes / (25 * 1024 * 1024)) * 2500)),
+            finalizeMs: spSkipFaststart
+              ? 90000
+              : Math.max(150000, Math.min(600000, 60000 + (spExpectedOutBytes / (25 * 1024 * 1024)) * 2500)),
+            noFinalizeOnTotal: spSkipFaststart,
+          });
+        } catch (err) {
+          prof.endStage("mux");
+          if (err && err.message === "Export cancelled") throw err;
+          if (Date.now() - muxStageStart < 4000) {
+            console.warn("[framefuse] smart render concat/mux failed at init — falling back to the two-step pool:", err.message);
+            return null;
+          }
+          throw err;
+        }
+        prof.endStage("mux");
+
+        // ── Aggressive cleanup + the result payload ──────────────────────
+        exportPhase = "done";
+        sendProgress(100, totalSec, 0);
+        for (const f of tempFiles) { try { fs.unlinkSync(f); } catch (_) {} }
+        // v1.33.3: verify the output exists + is complete before success
+        // (a truncated/missing file fails honestly instead of "success
+        // with no video").
+        const size = await verifyExportOutputAsync(outputPath, totalSec, "Export", segmentsTotalMs / 1000);
+        return {
+          path: outputPath,
+          size,
+          encoder: encoder.label,
+          elapsedSec: Math.round((Date.now() - startTime) / 1000),
+          // v9 telemetry: copiedClips = clean stream-copy pieces,
+          // encodedClips = dirty graph windows, keyframeCuts = clean pieces
+          // that entered via a keyframe-aligned start (trim or snapped).
+          copiedClips: cleanCopies,
+          encodedClips: dirtyWindows,
+          keyframeCuts: plan.keyframeCuts,
+          chunkedClips: 0,
+          totalChunks: dirtyWindows,
+          parallelChunks: dirtyWindows,
+          hwDecodeClips: spHwCount,
+          // v1.12.1: the ACTUAL max-concurrent ffmpeg processes during the
+          // encode stage — the Task-Manager-check number, surfaced so the
+          // toast/chip can never claim parallelism that did not run.
+          poolWorkers: poolWidth,
+          cpus: cpuCount,
+          // v1.14.1: the accurate topology (physical cores + threads) so a
+          // field report states exactly what the engine saw.
+          cpuPhysicalCores: hwProfile.cpuPhysical,
+          cpuLogicalCores: hwProfile.cpuLogical,
+          cpuTopology: hwProfile.cpuTopology,
+          filterPool: !!plan.parallelMode && poolWidth > hwProfile.workers,
+          // v1.13: the adaptive tier that ran this export + the speed point
+          // it chose (toast: "Tier 3 · constrained CPU · ultrafast").
+          tier: hwProfile.tier,
+          tierLabel: hwProfile.tierLabel,
+          enginePreset,
+          singlePass: false,
+          // v1.10: the parallel-pass mode (≥70 % dirty → W equal temporal
+          // windows, 1 encode thread each) reports as "parallel-pass" so the
+          // toast carries the multi-worker story; mixed timelines keep
+          // "smart-render".
+          mode: plan.parallelMode ? "parallel-pass" : "smart-render",
+          smartCleanSec: plan.cleanMs / 1000,
+          smartDirtySec: plan.dirtyMs / 1000,
+          // v1.14.4: the constrained-CPU fast resolution ran (never silent —
+          // the completion toast + Export tab surface it, with the off
+          // switch in Export settings).
+          fastMode: fastModeApplied ? true : undefined,
+          fastModeFrom: fastModeApplied ? fastModeApplied.from : undefined,
+          fastModeTo: fastModeApplied ? fastModeApplied.to : undefined,
+          outputWidth: width,
+          outputHeight: height,
+          // v1.14.5: the slideshow 24-fps mode + the render-cost story + the
+          // per-export performance profile (stage/worker telemetry JSON).
+          outputFps: fps,
+          slideshowFps: slideshowFpsApplied ? true : undefined,
+          slideshowFpsFrom: slideshowFpsApplied ? slideshowFpsApplied.from : undefined,
+          slideshowFpsTo: slideshowFpsApplied ? slideshowFpsApplied.to : undefined,
+          costStrategy: costPost.strategy,
+          renderCost: { score: costPost.score, pixelCost: costPost.pixelCost, effectCost: costPost.effectCost },
+          encoderSpeedProfile: speedProfile,
+          audioFastGain: spAudioFastGain || undefined,
+          // v1.14.6 (user directive): the audio-normalize state that actually
+          // ran — false = loudnorm fully bypassed (the toast proves it).
+          audioNormalize: !!(audio && audio.normalize),
+          hwCaps: hwProfile.hwCaps || undefined,
+          profile: prof.finish({ path: outputPath, size, contentSec: totalSec, mode: plan.parallelMode ? "parallel-pass" : "smart-render" }),
+          // v1.10 (Task 2): the primary human-readable dirty reason — the
+          // toast shows "Full re-encode required: [reason]" when 0 % was
+          // copied.
+          smartDirtyReason: plan.primaryReason || undefined,
+        };
+      } catch (err) {
+        if (err && err.message === "Export cancelled") throw err;
+        if (Date.now() - smartStart < 4000) {
+          console.warn("[framefuse] smart render failed at init — falling back to the two-step pool:", err.message);
+          return null;
+        }
+        throw err;
+      }
+    };
+
+    if (anyEncodeJob && !hasBaseLoopSeg) {
+      const smartResult = await planSmartRenderingPipeline();
+      if (smartResult) return smartResult;
+      // (the pipeline logged why it fell back — the two-step pool below
+      // takes over with its per-clip jobs + concat + amix)
+    } else if (anyEncodeJob && hasBaseLoopSeg) {
+      // v1.29: the smart pipeline's clean/dirty windowing + per-window
+      // sub-seeks (windowSegmentsForChunk ssSec, keyframe-snapped copies)
+      // assume the source window covers the timeline window — a loop
+      // segment's fill window can be far PAST its source length, so looping
+      // projects ride the two-step pool (per-clip -stream_loop renders).
+      console.log(
+        "[framefuse] smart render skipped: base-lane loop-to-fill segment(s) → two-step pool (per-clip -stream_loop renders)",
+      );
+    }
+
+    // ─── STEP 1 (run): PARALLEL encode + audio-extraction pool ────
+    // v1.12.1: this fallback only runs when the smart pipeline bailed —
+    // LOG the pool shape so the main-process log (and the result payload's
+    // poolWorkers) state exactly how many ffmpeg processes ran.
+    console.log(
+      `[framefuse] TWO-STEP POOL: ${jobs.length + clipAudioJobs.length} job(s) · ${poolN} concurrent ffmpeg process(es) · encoder ${encoder.name} · ${cpuCount} CPU core(s) · ${hwProfile.tier}`,
+    );
+    // N = min(4, max(1, os.cpus() − 2)) concurrent ffmpeg children
+    // (child_process.spawn). Per-clip "time=" marks aggregate into the
+    // SAME export-progress channel + payload shape the UI already
+    // consumes, weighted by clip duration on the master timeline.
+    // v5.2: the PCM extraction jobs ride the SAME pool — they are cheap
+    // (decode + WAV write) and fill idle slots while big encodes run.
+    const poolJobs = [...jobs, ...clipAudioJobs];
+    const clipFrac = poolJobs.map(() => 0);
+    let lastEmit = 0;
+    const emitProgress = (force) => {
+      const now = Date.now();
+      if (!force && now - lastEmit < 100) return; // ≤10 Hz progress IPC
+      lastEmit = now;
+      let doneMs = 0;
+      for (let k = 0; k < poolJobs.length; k++) doneMs += clipFrac[k] * poolJobs[k].durationMs;
+      // v1.33.6 (stuck-at-100% ROOT CAUSE — full-handler repro): the fraction
+      // is the pool's OWN completion, NOT doneMs / totalMs. A loop-to-fill
+      // export puts TWO full-timeline-sized jobs in the pool (the -stream_loop
+      // video encode AND the whole-timeline PCM audio extraction), so the old
+      // totalMs denominator double-counted the work: frac climbed to 2.0,
+      // sendProgress's clamp pinned the bar at 100% with ETA 0 HALF-WAY
+      // through the pool, and the timemark ran to 2× the timeline (the user's
+      // "smooth to 95%, then slow, stuck at 100%" + "time estimate moves too
+      // fast"). The timemark is also clamped to the timeline now.
+      const poolWorkMs =
+        poolJobs.reduce((n, j) => n + Math.max(1, Number(j.durationMs) || 1), 0) || 1;
+      const frac = Math.min(1, doneMs / poolWorkMs);
+      sendProgress(frac * 95, Math.min(totalSec, doneMs / 1000), etaFor(frac));
+    };
+    exportPhase = "video";
+    prof.setPool({
+      width: poolN,
+      jobs: poolJobs.length,
+      copyJobs: poolJobs.filter((j) => j.copy).length,
+      dirtyJobs: poolJobs.filter((j) => !j.copy).length,
+      threadsPerWorker: threadBudget,
+    });
+    prof.beginStage("pool");
+    await runPool(poolJobs, poolN, {
+      onTime: (idx, sec) => {
+        clipFrac[idx] = Math.min(1, sec / Math.max(0.01, poolJobs[idx].durSec));
+        emitProgress(false);
+      },
+      onDone: (idx) => {
+        clipFrac[idx] = 1;
+        emitProgress(true);
+      },
+      // v1.14.5 PROFILER: per-job wall (two-step pool).
+      onJobEnd: (idx, wallMs) => {
+        const j = poolJobs[idx] || {};
+        prof.worker({
+          idx,
+          copy: !!j.copy,
+          segId: j.segId,
+          durMs: j.durationMs,
+          frames: 0,
+          wallMs,
+          classes: j.idx != null ? ["clip-encode"] : (j.copy ? [] : ["encode"]),
+        });
+      },
+    });
+    prof.endStage("pool");
+
+    // ─── STEP 2: Concat all clips + mix audio ONCE (video: -c copy) ──
+    // v1.1 TURBO: stream copies cut at PACKET granularity and re-encodes
+    // round to whole frames, so the REAL concatenated video length can
+    // differ from the requested timeline by a frame per clip. The audio
+    // graph (apad/whole_dur + fade-out end + -shortest) should target the
+    // ACTUAL length — measure each clip file (parallel, cached probe) and
+    // sum. A failed probe falls back to the requested duration for that
+    // clip, and the whole total falls back when nothing is measurable.
+    exportPhase = "audio";
+    sendProgress(95.4, totalSec, undefined); // v1.33.6: etaFor is pool-fraction based — dishonest past the pool
+    // Probes run in bounded chunks (8 at a time) — a 100-clip project must
+    // not spawn 100 ffmpeg children simultaneously on a weak machine.
+    const clipDurProbe = [];
+    for (let c = 0; c < clipPaths.length; c += 8) {
+      const chunk = clipPaths.slice(c, c + 8);
+      const ds = await Promise.all(
+        chunk.map((p) => probeMediaAsync(p).then((info) => info.durationMs).catch(() => 0)),
+      );
+      clipDurProbe.push(...ds);
+    }
+    let actualTotalSec = totalSec;
+    let concatVideoSec = null; // v1.33.4: the ACCEPTED probed video length (the mux band denominator)
+    let tailFillerMs = 0;     // v1.33.6: visuals END EARLY (no loop, audio-extended) → black-tail fill
+    if (clipDurProbe.length > 0 && clipDurProbe.every((d) => d > 0)) {
+      const actualMs = clipDurProbe.reduce((a, b) => a + b, 0);
+      // Guard: a wildly-off measurement (bad probe) must never skew the
+      // mix — only accept when within 2% + 1s of the requested timeline.
+      if (Math.abs(actualMs - totalMs) <= totalMs * 0.02 + 1000) {
+        actualTotalSec = actualMs / 1000;
+        concatVideoSec = actualMs / 1000;
+      } else if (actualMs > 0 && actualMs < totalMs - 1500) {
+        // v1.33.6 (the "output is 10.0s long but the timeline is 4174.8s"
+        // report): the visuals are SHORTER than the audio-extended timeline
+        // and nothing loops to fill them. The old path let the mux's
+        // -shortest truncate the FILE at the visual end and the final verify
+        // then failed with a bogus "destination disk filled up" diagnosis.
+        // A BLACK TAIL segment now renders (captions still burn — its ASS
+        // window covers the tail) so the video stream covers the FULL
+        // timeline, exactly like a real NLE's empty-sequence black.
+        concatVideoSec = actualMs / 1000;
+        tailFillerMs = totalMs - actualMs;
+      }
+    } else if (clipPaths.length === 0 && totalMs > 0) {
+      // v1.33.6 AUDIO-ONLY timeline: no visual segments at all — the whole
+      // video track is the black filler over the audio.
+      concatVideoSec = 0;
+      tailFillerMs = totalMs;
+    }
+    if (tailFillerMs > 0) {
+      const tailDurSec = tailFillerMs / 1000;
+      const visualEndMs = Math.max(0, Math.round(totalMs - tailFillerMs));
+      const fillerPath = path.join(tempDir, `tailfill_${Date.now()}.mp4`);
+      tempFiles.push(fillerPath);
+      clipPaths.push(fillerPath);
+      // The tail's caption window (same builder + window semantics as any
+      // chunk — cues inside the tail still burn, locked to the audio).
+      let fillerAssSuffix = null;
+      if (captionsEnabled || headlinesEnabled) {
+        const doc = buildAssDocument(
+          captionsEnabled ? subtitleCues : [],
+          captionsEnabled ? captionSettings : null,
+          headlinesEnabled ? headlines : null,
+          width, height, visualEndMs, visualEndMs + tailFillerMs, tailFillerMs,
+          headlinesEnabled ? headlineGeometry : undefined,
+          captionsEnabled ? kineticCompositions : undefined,
+          captionsEnabled ? kineticGeoList : undefined,
+        );
+        fillerAssSuffix = doc ? writeAssFile(doc, "tailfill") : null;
+      }
+      // Same encode shape as any dirty chunk: recipe encoder args + fps +
+      // thread budget; the black lavfi source is already W×H at the project
+      // rate. -an keeps the concat clips video-only (the audio bus owns all
+      // audio); -t bounds the lavfi duration exactly.
+      const fillerVf = [
+        ...(fillerAssSuffix ? [fillerAssSuffix] : []),
+        "setsar=1",
+        "format=yuv420p",
+      ].join(",");
+      exportPhase = "video";
+      console.log(
+        `[Export] tail filler: visuals end at ${(visualEndMs / 1000).toFixed(1)}s but the timeline is ${(totalMs / 1000).toFixed(1)}s — rendering ${(tailDurSec / 60).toFixed(1)} min of black${fillerAssSuffix ? " (captions continue)" : ""} so the file covers the full timeline`,
+      );
+      prof.beginStage("tail-fill");
+      const fillEta = { lastSec: 0, lastAt: 0, rate: 0 };
+      try {
+        await runFfmpeg(
+          [
+            "-f", "lavfi", "-i",
+            `color=c=black:s=${width}x${height}:r=${Math.round(fps)}:d=${tailDurSec.toFixed(3)}`,
+            "-vf", fillerVf,
+            "-map", "0:v",
+            "-t", tailDurSec.toFixed(3),
+            ...encArgs,
+            "-r", String(Math.round(fps)),
+            "-an",
+            "-threads", String(threadBudget > 0 ? Math.round(threadBudget) : 0),
+            "-y", fillerPath,
+          ],
+          tailDurSec,
+          (sec) => {
+            const now = Date.now();
+            if (sec > fillEta.lastSec + 0.5 && now > fillEta.lastAt) {
+              const inst = (sec - fillEta.lastSec) / ((now - fillEta.lastAt) / 1000);
+              if (inst > 0) fillEta.rate = fillEta.rate > 0 ? 0.3 * fillEta.rate + 0.7 * inst : inst;
+              fillEta.lastSec = sec;
+              fillEta.lastAt = now;
+            }
+            const etaSec = fillEta.rate > 0.01
+              ? Math.min(3600, Math.round(Math.max(0, tailDurSec - sec) / fillEta.rate))
+              : undefined;
+            sendProgress(95 + 0.35 * Math.min(1, sec / Math.max(0.01, tailDurSec)), sec, etaSec);
+          },
+          { maxMs: Math.min(7200000, Math.max(600000, tailDurSec * 750)) },
+        );
+        // The filler is part of the concatenated video: the mux band now
+        // spans the FULL timeline (out_time reaches the end again).
+        concatVideoSec = totalSec;
+      } catch (err) {
+        if (err && err.message === "Export cancelled") throw err;
+        throw new Error(
+          `The tail-fill render (black segment after the last visual clip) failed: ${err.message}`,
+        );
+      }
+      prof.endStage("tail-fill");
+      exportPhase = "audio";
+    }
+
+    const concatListPath = path.join(tempDir, `concat_${Date.now()}.txt`);
+    tempFiles.push(concatListPath);
+
+    // ─── v1.2: 2-PASS LOUDNORM measurement (pass 1) ────────────────
+    // When normalize is ON, every audio SOURCE (each clip WAV + the music
+    // track) is measured now — audio-only ffmpeg passes, bounded 8-parallel,
+    // typically <1 s each — so the step-2 graph applies a STATIC linear gain
+    // per source (the ffmpeg 2-pass loudnorm recipe) instead of single-pass
+    // dynamic normalization, which pumps on variable material. SFX WAVs are
+    // deliberately NOT normalized: they are synthesized at designed levels.
+    // Measurement failure per file → null → that branch falls back to
+    // single-pass loudnorm (the v5.2 behavior); normalize OFF → argv
+    // unchanged (byte-identical to v1.1).
+    // v1.14.5: the clip WAVs are temp files (unique per export — not
+    // disk-cacheable), but the MUSIC measurement is (user source). The
+    // SIMPLE-AUDIO fast path applies here too: ≤3 branches + all measured →
+    // static gains + the estimated master gain, skipping the v1.3
+    // render-mix-to-WAV-remeasure round trip entirely.
+    let loudnormCtx = null;
+    let audioFastGain = false;
+    let masterGainDb = null;
+    const legacyMusicPath2 = hasMusicClips ? null : audioPath;
+    if (audio && audio.normalize && (clipAudioJobs.length > 0 || musicCount > 0)) {
+      prof.beginStage("loudness");
+      // v1.33.2 (stuck-at-100% report): the measurement pass can run MINUTES
+      // on hour-long audio — it used to sit frozen at a bare "96%" with the
+      // phase chip still saying "mixing audio". The phase now says exactly
+      // what is running and the bar moves to 95.5 while the (duration-scaled,
+      // v1.33.2) measurements decode each source.
+      // v1.33.4: the measure band 95.5 → 96.0 is now LIVE (each measurement
+      // child emits "time=" ticks — see measureLoudnormContext) so the bar
+      // visibly advances instead of freezing for the whole measurement.
+      exportPhase = "audio-measure";
+      sendProgress(95.5, totalSec, undefined); // v1.33.6: phase-local ETA only
+      loudnormCtx = await measureLoudnormContext(clipAudioJobs, legacyMusicPath2, actualTotalSec, (frac) => {
+        sendProgress(95.5 + 0.5 * Math.min(1, Math.max(0, frac)), totalSec, undefined); // v1.33.6: measure ticks carry no ETA
+      });
+      prof.endStage("loudness");
+      exportPhase = "audio";
+      sendProgress(96, totalSec, undefined); // v1.33.6: phase-local ETA only
+      const branchCount = clipAudioJobs.length + musicCount;
+      const clipsUsable = (loudnormCtx.clip || []).every((m) => G.loudnessGainDb(m) != null);
+      const musicUsable = !legacyMusicPath2 || G.loudnessGainDb(loudnormCtx.music) != null;
+      audioFastGain = branchCount > 0 && branchCount <= 3 && clipsUsable && musicUsable;
+      if (audioFastGain) {
+        const est = G.estimateMixLoudnessDb({
+          totalSec: actualTotalSec,
+          audio,
+          clipAudio: clipAudioJobs.map((j, k) => ({
+            measure: loudnormCtx.clip ? loudnormCtx.clip[k] : null,
+            volume: j.volume,
+            durationMs: j.durationMs,
+          })),
+          music: loudnormCtx.music,
+        });
+        if (est) {
+          const db = -16 - est.i;
+          if (Number.isFinite(db) && Math.abs(db) <= 24) masterGainDb = Math.round(db * 100) / 100;
+        }
+        console.log(
+          `[Export] simple-audio fast path: ${branchCount} branch(es), static gains ` +
+            `(volume=dB, master ${masterGainDb != null ? `${masterGainDb}dB` : "—"}) — loudnorm filters + master-mix render skipped`,
+        );
+      }
+    } else if (musicCount > 0 || clipAudioJobs.length > 0) {
+      // v1.14.6 (user directive): normalize OFF → loudnorm fully bypassed
+      // (mirrors the smart path's guarantee line).
+      console.log(
+        "[Export] audio: normalize OFF — loudnorm fully bypassed (0 measurement spawns, 0 loudnorm filters)",
+      );
+    }
+
+    // ─── v1.3: MASTER-BUS loudnorm (render → measure → mux) ────────
+    // Per-source normalize lands each SOURCE at −16 LUFS, but N overlapping
+    // sources SUM above it (2 sources ≈ −13). A mastering stage on the summed
+    // mix — exactly what a DAW master chain does — makes the exported file
+    // land at −16 regardless of overlap count. The mix is deterministic, so:
+    //   (a) render the post-volume mix to a temp WAV (audio-only, fast; the
+    //       rawMix graph stops before limiter/pad), output -t bounded (the
+    //       looped music input is infinite here — no video stream to stop it);
+    //   (b) MEASURE that WAV (measureLoudnessAsync);
+    //   (c) the final mux uses the WAV as its single audio input with the
+    //       measured master loudnorm + limiter + pad (buildConcatArgs'
+    //       masterMix mode).
+    // Only when normalize is ON and ≥2 branches actually overlap-sum; a
+    // single branch is already at −16 (the per-source pass), and normalize
+    // OFF keeps the byte-identical v1.2 argv. A failed render or measurement
+    // falls back to the v1.2 direct graph — never to a failed export.
+    let masterMix = null;
+    const audioBranchCount =
+      musicCount + clipAudioJobs.length + sfxList.length +
+      voiceoverList.length;
+    if (
+      audio && audio.normalize && audioBranchCount >= 2 && actualTotalSec > 0 &&
+      // v1.14.5: the simple-audio fast path replaces the render+remeasure
+      // round trip with the energy-sum master estimate (a static gain in the
+      // direct graph — see buildConcatArgs' masterGainDb).
+      !audioFastGain
+    ) {
+      try {
+        const mixWavPath = path.join(tempDir, `mixmaster_${Date.now()}.wav`);
+        tempFiles.push(mixWavPath);
+        const renderArgs = G.buildAudioMixRenderArgs({
+          audioPath: legacyMusicPath2,
+          // v1.25 MULTI-MUSIC: N-clip music inputs own the music side.
+          musicTracks: hasMusicClips ? musicClipList : undefined,
+          audio,
+          totalSec: actualTotalSec,
+          sfx: sfxList,
+          voiceovers: voiceoverList,
+          loudnorm: loudnormCtx,
+          clipAudio: clipAudioJobs.map((j) => ({
+            wavPath: j.wavPath,
+            startMs: j.startMs,
+            volume: j.volume,
+          })),
+          mixWavPath,
+        });
+        // v1.33.2 (stuck-at-100% report): the master-mix render of an
+        // hour-long timeline takes MINUTES on weak CPUs and previously ran
+        // with a NO-OP progress callback — the bar sat frozen at 96% with no
+        // phase change while ffmpeg decoded+mixed the full duration. The
+        // out_time now drives 96 → 96.5 with an explicit "mixing audio"
+        // phase so the bar visibly moves and the ETA is honest.
+        // v1.33.5: the ETA is now PHASE-LOCAL (a 1/s slope over the mix's own
+        // out_time) — the all-run etaFor() model said "seconds" at this
+        // point while the mix still needed minutes (the "time estimation is
+        // wrong" report). A hard duration cap also bounds the render.
+        exportPhase = "audio-mix";
+        let mixNotified = false;
+        const mixEta = { lastSec: 0, lastAt: 0, rate: 0 };
+        await runFfmpeg(renderArgs, actualTotalSec, (sec) => {
+          if (!mixNotified) {
+            mixNotified = true;
+            console.log(
+              `[Export] master-bus mix render: ${(actualTotalSec / 60).toFixed(1)} min of audio → temp WAV (progress 96→96.5%)`,
+            );
+          }
+          const now = Date.now();
+          if (sec > mixEta.lastSec + 0.5 && now > mixEta.lastAt) {
+            const inst = (sec - mixEta.lastSec) / ((now - mixEta.lastAt) / 1000);
+            if (inst > 0) mixEta.rate = mixEta.rate > 0 ? 0.3 * mixEta.rate + 0.7 * inst : inst;
+            mixEta.lastSec = sec;
+            mixEta.lastAt = now;
+          }
+          const mixEtaSec = mixEta.rate > 0.01
+            ? Math.min(3600, Math.round(Math.max(0, actualTotalSec - sec) / mixEta.rate))
+            : undefined;
+          sendProgress(96 + 0.5 * Math.min(1, sec / Math.max(0.01, actualTotalSec)), sec, mixEtaSec);
+        }, {
+          // v1.33.5: the mix render is whole-timeline audio work — bounded
+          // hard (never an infinite child): 0.75×-realtime-equivalent + a
+          // 600 s floor, 2 h cap. A healthy mix runs far faster; a wedged
+          // one now dies with an honest error instead of pinning the bar.
+          maxMs: Math.min(7200000, Math.max(600000, actualTotalSec * 750)),
+        });
+        exportPhase = "audio";
+        sendProgress(96.5, totalSec, undefined); // v1.33.6: phase-local ETA only
+        // v1.33.2: duration-scaled timeout (a 69-min mix WAV measures in
+        // 100-140s on weak CPUs — the flat 60s cap killed it and silently
+        // fell back to the slow dynamic loudnorm in the final mux).
+        // v1.33.4: 90s floor + 40ms/s (10 min cap) AND live progress — the
+        // master-mix measurement band 96.5 → 96.9 now ticks with the decode
+        // instead of freezing (the last frozen spot in the 95-100 band).
+        // v1.33.5: the mix WAV is measured through the SAME windowed policy
+        // (a 90 s representative sample) — constant cost, never times out,
+        // and the band denominator is the effective window so the ticks
+        // span the whole 96.5 → 96.9 band.
+        const masterEffSec = effectiveMeasureSec(actualTotalSec) || actualTotalSec;
+        const masterMeasure = await measureLoudnessAsync(
+          mixWavPath,
+          null,
+          Math.max(90000, Math.min(600000, 90000 + actualTotalSec * 40)),
+          (sec) => {
+            exportPhase = "audio-measure";
+            sendProgress(96.5 + 0.4 * Math.min(1, sec / Math.max(0.01, masterEffSec)), sec, undefined);
+          },
+        );
+        exportPhase = "audio";
+        sendProgress(96.9, totalSec, undefined); // v1.33.6: phase-local ETA only — the all-run model says "0s" here
+        if (fs.existsSync(mixWavPath) && fs.statSync(mixWavPath).size > 44) {
+          masterMix = { wavPath: mixWavPath, loudnorm: masterMeasure };
+        }
+      } catch (_) {
+        masterMix = null; // render failed → v1.2 direct graph
+      }
+    }
+
+    const concatContent = clipPaths.map(p => {
+      const safePath = p.replace(/\\/g, "/").replace(/'/g, "'\\''");
+      return `file '${safePath}'`;
+    }).join("\n");
+    fs.writeFileSync(concatListPath, concatContent, "utf-8");
+
+    // v5.2: G.buildConcatArgs muxes the concat video with the SINGLE-PASS
+    // audio mix (clip WAVs + music + SFX → amix → AAC once). Music-only /
+    // no-audio projects keep the exact v4.9 -af / copy paths.
+    // v1.1: totalSec = the ACTUAL concatenated video length (see above).
+    // v1.29 MUX DECISION (video SHORTER than audio, real-ffmpeg verified —
+    // /tmp smoke, ffmpeg 7.1.5): every audio-bearing mux branch already
+    // carries -shortest, so when the audio-extended totalSec (40s) exceeds
+    // the concat video length (10s) the file simply ENDS at the video end
+    // with the audio truncated at the file end — measured: 10.023s output,
+    // 0.3s wall (no stall on the longer amix/apad stream), both streams
+    // present, full decode clean. NO extra -t/-shortest added: the whole
+    // point of the audio-extended total is the audio rides the full clock
+    // (mix -t, apad whole_dur, fade alignment); the FILE end follows the
+    // visuals. Loop-to-fill projects never hit this case (the loop clip
+    // extends the video to the audio's end).
+    // v1.33.2 FASTSTART GATING (stuck-at-100% report): `-movflags
+    // +faststart` rewrites the ENTIRE output to move the moov atom to the
+    // front — an IO pass of 2× the file size that runs AFTER the last frame
+    // is muxed (progress already says 100%, nothing updates, and the export
+    // LOOKS hung). Measured on a real 2.07 GB / 69-min loop-fill export: the
+    // rewrite alone can take minutes on spinning disks. The flag only
+    // matters for progressive-download STREAMING (web players); local
+    // players (VLC/PotPlayer/WMP/editors) seek fine with moov-at-end, and
+    // uploaders re-encode anyway. Outputs expected to exceed 1.5 GB skip
+    // the rewrite — the result payload says so (faststartSkipped).
+    const expectedVideoBytes = clipPaths.reduce((n, p) => {
+      try { return n + fs.statSync(p).size; } catch (_) { return n; }
+    }, 0);
+    const expectedAudioBytes = (abr * 1000 / 8) * actualTotalSec;
+    const expectedOutBytes = expectedVideoBytes + expectedAudioBytes;
+    const skipFaststart = expectedOutBytes > 1.5 * 1024 * 1024 * 1024;
+    if (skipFaststart) {
+      console.log(
+        `[Export] faststart skipped: expected output ≈ ${(expectedOutBytes / 1024 / 1024 / 1024).toFixed(2)} GB > 1.5 GB ` +
+          `(-movflags +faststart would rewrite the whole file after 100% — moov stays at end; local playback unaffected)`,
+      );
+    }
+
+    // v1.33.5: music durations for the FINITE loop bounds — the renderer
+    // ships durationMs per music clip (probed per clip here when missing —
+    // cached, 15 s-capped); the legacy single track's duration was probed
+    // once at the top of the handler. Unknown durations keep -stream_loop -1
+    // (bounded by the mux's hard maxMs + out-time stall guards below).
+    const musicDurFor = async (mp) => {
+      try {
+        const pr = await probeMediaAsync(mp);
+        return (Number(pr && pr.durationMs) || 0) / 1000;
+      } catch (_) { return 0; }
+    };
+    const boundedMusicTracks = [];
+    for (const t of musicClipList) {
+      const durSec = (Number(t.durationMs) || 0) > 0
+        ? (Number(t.durationMs) / 1000)
+        : await musicDurFor(t.path);
+      boundedMusicTracks.push({ ...t, ...(durSec > 0 ? { durSec } : {}) });
+    }
+    const legacyMusicDurSec = legacyMusicDurationSec;
+
+    const concatArgs = G.buildConcatArgs({
+      concatListPath,
+      audioPath: legacyMusicPath2,
+      // v1.25 MULTI-MUSIC: N-clip music inputs (SFX-style graph branches; N
+      // inputs with per-clip -stream_loop, indexes 1..N before the WAVs).
+      musicTracks: hasMusicClips ? boundedMusicTracks : undefined,
+      // v1.33.5: the legacy single track's duration (finite loop bounds).
+      ...(legacyMusicDurSec > 0 ? { musicDurSec: legacyMusicDurSec } : {}),
+      audio,
+      outputPath,
+      totalSec: actualTotalSec,
+      sfx: sfxList,
+      voiceovers: voiceoverList,
+      loudnorm: loudnormCtx,
+      masterMix,
+      // v1.14.5: the simple-audio fast path (static gains).
+      audioFastGain,
+      masterGainDb,
+      audioKbps: abr,
+      clipAudio: clipAudioJobs.map((j) => ({
+        wavPath: j.wavPath,
+        startMs: j.startMs,
+        volume: j.volume,
+      })),
+      // v1.25: any multi-music stack forces the amix graph path (the legacy
+      // single -af chain can only filter ONE input).
+      newAudioGraph: anyVideoAudio || sfxList.length > 0 || voiceoverList.length > 0 || hasMusicClips,
+      // v1.33.2: >1.5 GB outputs drop the faststart rewrite (see above).
+      ...(skipFaststart ? { faststart: false } : {}),
+    });
+
+    exportPhase = "mux";
+    prof.beginStage("mux");
+    // v1.33.4 (stuck-at-100% root-cause release) — the mux band is
+    // RE-MAPPED and the finalize pass is now VISIBLE and bounded:
+    //   - the band runs 97 → 99.7 (0.027 width, above every audio-phase
+    //     band so progress never regresses); 100% is emitted ONLY by the
+    //     actual process exit (or the labeled finalize crawl below);
+    //   - the denominator is the CONCAT VIDEO length when the probes
+    //     accepted it: a -shortest audio-extended timeline caps out_time
+    //     at the video end, so the old audio-extended denominator could
+    //     never reach 1 and the bar stalled below the band top while the
+    //     mux worked;
+    //   - faststart's own "Starting second pass" stderr line fires the
+    //     finalize label EXACTLY when the moov rewrite begins (verified:
+    //     the rewrite is an in-place byte shift — no temp file, no size
+    //     change, no progress lines — so the crawl is time-based against
+    //     a size-derived IO estimate, capped at 99.97%);
+    //   - the finalize WATCHDOG is now size-scaled (60s + 2.5× the bytes
+    //     at ~25MB/s, clamped 2.5-10 min) instead of the flat 15 min, and
+    //     faststart-off muxes get a tight 90s tail bound (their post-total
+    //     tail is a sub-2s flush — the old 1.5s-heuristic "finalize" label
+    //     was noise for them and is now suppressed).
+    const muxBandSec = concatVideoSec || actualTotalSec;
+    // v1.33.5: PHASE-LOCAL ETA — etaFor()'s all-run fraction model is
+    // meaningless at 0.97+ ("seconds left" while a 69-min mux grinds for
+    // minutes — the "time estimation is wrong" report). The mux's own
+    // out_time slope drives the remaining-audio estimate.
+    const muxEta = { lastSec: 0, lastAt: 0, rate: 0 };
+    await runFfmpeg(concatArgs, actualTotalSec, (sec) => {
+      const frac = 0.97 + 0.027 * Math.min(1, sec / Math.max(0.01, muxBandSec));
+      const now = Date.now();
+      if (sec > muxEta.lastSec + 0.5 && now > muxEta.lastAt) {
+        const inst = (sec - muxEta.lastSec) / ((now - muxEta.lastAt) / 1000);
+        if (inst > 0) muxEta.rate = muxEta.rate > 0 ? 0.3 * muxEta.rate + 0.7 * inst : inst;
+        muxEta.lastSec = sec;
+        muxEta.lastAt = now;
+      }
+      const etaSec = muxEta.rate > 0.01
+        ? Math.min(3600, Math.round(Math.max(0, muxBandSec - sec) / muxEta.rate))
+        : undefined;
+      sendProgress(frac * 100, sec, etaSec);
+    }, {
+      // v1.33.5: the mux gets the same hard duration cap as the mix render
+      // — the LAST unbounded child in the pipeline. 0.75×-realtime-
+      // equivalent + 600 s floor (2 h cap): a healthy mux (stream-copy
+      // video + AAC audio) runs far faster; anything past the cap dies
+      // with an honest error instead of pinning the bar at 99.7+ forever.
+      maxMs: Math.min(7200000, Math.max(600000, actualTotalSec * 750)),
+      // v1.33.5: out-time stall guard — stats can keep flowing (watchdog
+      // sees "life") while the encode position is FROZEN (antivirus
+      // crawling the writes, an IO-level wedge). 120 s without out_time
+      // advancing while the timeline is not yet finished = wedged → kill.
+      outTimeStallMs: 120000,
+      onFinalize: () => {
+        exportPhase = "finalize";
+        sendProgress(99.7, actualTotalSec, undefined);
+        console.log(
+          `[Export] finalize: every frame muxed — ffmpeg is rewriting the file header (faststart${skipFaststart ? " (unexpected — gate said skip)" : "; can take a minute on large files"})`,
+        );
+      },
+      onFinalizeProgress: (f) => {
+        sendProgress(99.7 + 0.2 * Math.min(0.95, Math.max(0, f)), actualTotalSec, undefined); // v1.33.6: caps at 99.9 — "100.0" was a rounding lie
+      },
+      finalizeEstimateMs: Math.max(15000, Math.min(600000, (expectedOutBytes / (25 * 1024 * 1024)) * 2500)),
+      finalizeMs: skipFaststart
+        ? 90000
+        : Math.max(150000, Math.min(600000, 60000 + (expectedOutBytes / (25 * 1024 * 1024)) * 2500)),
+      noFinalizeOnTotal: skipFaststart,
+    });
+    prof.endStage("mux");
+
+    exportPhase = "done";
+    sendProgress(100, actualTotalSec, 0);
+
+    // Cleanup
+    for (const f of tempFiles) { try { fs.unlinkSync(f); } catch (_) {} }
+
+    // v1.33.3: verify the output exists + is complete before success (a
+    // truncated/missing file fails honestly instead of "success with no
+    // video" - the exact stuck-at-100% report shape).
+    const size = await verifyExportOutputAsync(outputPath, actualTotalSec, "Export", segmentsTotalMs / 1000);
+    // v1.1 TURBO: the result carries the performance story so the UI can
+    // show users WHY the export was fast (encoder + stream-copy counts).
+    // v1.4.1: keyframeCuts = copied clips that entered the fast path via a
+    // keyframe-aligned head trim (vs. trimIn=0 copies).
+    // v1.4.2: chunkedClips/totalChunks = the chunked parallel encode (long
+    // re-encode clips split across the pool), hwDecodeClips = sources
+    // riding the throughput-gated hardware decode path.
+    return {
+      path: outputPath,
+      size,
+      encoder: encoder.label,
+      elapsedSec: Math.round((Date.now() - startTime) / 1000),
+      copiedClips,
+      encodedClips,
+      keyframeCuts,
+      chunkedClips,
+      totalChunks,
+      hwDecodeClips,
+      // v1.12.1: the ACTUAL pool width (see the smart-path payload above).
+      poolWorkers: poolN,
+      cpus: cpuCount,
+      // v1.14.1: the accurate topology (see the smart-path payload).
+      cpuPhysicalCores: hwProfile.cpuPhysical,
+      cpuLogicalCores: hwProfile.cpuLogical,
+      cpuTopology: hwProfile.cpuTopology,
+      filterPool: filterDominant && poolN > hwProfile.workers,
+      // v1.13: the adaptive tier + speed point (see the smart payload).
+      tier: hwProfile.tier,
+      tierLabel: hwProfile.tierLabel,
+      enginePreset,
+      singlePass: false,
+      mode: "two-step",
+      // v1.14.5: the same payload story the smart path carries (slideshow
+      // fps, render-cost strategy, encoder profile, capability matrix,
+      // per-export performance profile).
+      outputFps: fps,
+      slideshowFps: slideshowFpsApplied ? true : undefined,
+      slideshowFpsFrom: slideshowFpsApplied ? slideshowFpsApplied.from : undefined,
+      slideshowFpsTo: slideshowFpsApplied ? slideshowFpsApplied.to : undefined,
+      outputWidth: width,
+      outputHeight: height,
+      costStrategy: costEstimate.strategy,
+      renderCost: { score: costEstimate.score, pixelCost: costEstimate.pixelCost, effectCost: costEstimate.effectCost },
+      encoderSpeedProfile: speedProfile,
+      audioFastGain: audioFastGain || undefined,
+      // v1.14.6 (user directive): the audio-normalize state that actually
+      // ran — false = loudnorm fully bypassed (the toast proves it).
+      audioNormalize: !!(audio && audio.normalize),
+      // v1.33.2: faststart was skipped for a >1.5 GB expected output (the
+      // whole-file moov rewrite runs after 100% with no progress and looks
+      // like a hang; local playback is unaffected by moov-at-end).
+      ...(skipFaststart ? { faststartSkipped: true } : {}),
+      hwCaps: hwProfile.hwCaps || undefined,
+      profile: prof.finish({ path: outputPath, size, contentSec: actualTotalSec, mode: "two-step" }),
+    };
+
+  } catch (err) {
+    for (const f of tempFiles) { try { fs.unlinkSync(f); } catch (_) {} }
+    throw err;
+  } finally {
+    // v1.14.5: the profiler's CPU sampler must never outlive the handler
+    // (success, failure, or cancellation).
+    try { prof.stopCpuSampler(); } catch (_) {}
+    // v5 leak guard: a finished (or failed/cancelled) export must never
+    // leave ffmpeg children behind — kill + warn if any survived.
+    leakGuard();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// v1.15.2 REAL-HARDWARE A/B EXPORT BENCH — the main-process arm.
+// See scripts/ab-export-bench.js (the driver) and
+// src/lib/merger/benchExport.ts (the renderer arm) for the full protocol.
+// ---------------------------------------------------------------------------
+let benchState = null; // { outPath, keepOpen, done }
+
+function writeBenchResults(payload) {
+  if (!benchState || benchState.done) return;
+  benchState.done = true;
+  try {
+    fs.mkdirSync(path.dirname(benchState.outPath), { recursive: true });
+    fs.writeFileSync(benchState.outPath, JSON.stringify(payload, null, 2));
+    console.log(`[BENCH] results written to ${benchState.outPath}`);
+  } catch (e) {
+    console.error(`[BENCH] results write failed: ${e.message}`);
+  }
+  if (!benchState.keepOpen) setTimeout(() => app.quit(), 250);
+}
+
+ipcMain.handle("bench:result", (_evt, payload) => {
+  writeBenchResults(payload);
+  return { ok: true };
+});
+
+function startExportBench() {
+  const planPath = process.env.FRAMEFUSE_BENCH_PLAN;
+  const outPath = process.env.FRAMEFUSE_BENCH_OUT;
+  if (!planPath || !outPath) {
+    console.error("[BENCH] FRAMEFUSE_BENCH needs FRAMEFUSE_BENCH_PLAN and FRAMEFUSE_BENCH_OUT");
+    app.quit();
+    return;
+  }
+  let plan;
+  try {
+    plan = JSON.parse(fs.readFileSync(planPath, "utf8"));
+  } catch (e) {
+    console.error(`[BENCH] plan read failed: ${e.message}`);
+    app.quit();
+    return;
+  }
+  benchState = {
+    outPath,
+    keepOpen: process.env.FRAMEFUSE_BENCH_KEEP_OPEN === "1",
+    done: false,
+  };
+
+  // Force the FFmpeg ladder to the plan's encoder (default nvenc) BEFORE
+  // any renderer export runs — the A/B's "FFmpeg NVENC path" arm.
+  const forceKey = plan.forceEncoder;
+  if (forceKey && Object.prototype.hasOwnProperty.call(FORCE_ENCODER_MAP, forceKey)) {
+    forcedEncoderKey = forceKey;
+    detectedEncoder = null; // invalidate the session cache
+    encoderDetecting = null;
+    console.log(`[BENCH] FFmpeg encoder forced to ${FORCE_ENCODER_MAP[forceKey].name}`);
+  }
+
+  const sendPlan = async () => {
+    const win = mainWindow;
+    if (!win || win.isDestroyed()) {
+      writeBenchResults({ ok: false, error: "bench window lost before the plan shipped", runs: [] });
+      return;
+    }
+    const media = [];
+    for (const item of plan.media || []) {
+      try {
+        const buf = await fs.promises.readFile(item.path);
+        media.push({
+          name: path.basename(item.path),
+          kind: item.kind,
+          // Buffer → exact-size ArrayBuffer (structured-clone payload).
+          bytes: buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
+        });
+      } catch (e) {
+        console.error(`[BENCH] media read failed (${item.path}): ${e.message}`);
+      }
+    }
+    if (media.length === 0) {
+      writeBenchResults({ ok: false, error: "no fixture media could be read", runs: [] });
+      return;
+    }
+    console.log(`[BENCH] shipping ${media.length} fixture files to the renderer`);
+    win.webContents.send("bench:run", {
+      media,
+      config: {
+        outputDir: plan.outputDir,
+        durationSec: plan.durationSec ?? 60,
+        fps: plan.fps ?? 30,
+        resolution: plan.resolution ?? "1080p",
+        aspect: plan.aspect ?? "16:9",
+        quality: plan.quality ?? "social",
+        forceEncoder: plan.forceEncoder ?? null,
+        captions: plan.captions === true,
+      },
+    });
+  };
+
+  // Fire when the page (and its React bench listener) is up. The window was
+  // just created, but cover the already-loaded case too.
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (mainWindow.webContents.isLoadingMainFrame()) {
+      mainWindow.webContents.once("did-finish-load", () => setTimeout(() => { void sendPlan(); }, 2500));
+    } else {
+      setTimeout(() => { void sendPlan(); }, 2500);
+    }
+  } else {
+    writeBenchResults({ ok: false, error: "bench window lost before the plan shipped", runs: [] });
+    return;
+  }
+
+  // Hard timeout: never leave a bench app hanging (the driver also enforces
+  // its own 20-minute limit).
+  setTimeout(() => {
+    if (benchState && !benchState.done) {
+      writeBenchResults({ ok: false, error: "bench timed out after 20 minutes", runs: [] });
+    }
+  }, 20 * 60 * 1000).unref();
+}
+
+// App lifecycle
+
+// ── v1.15.3 (user directive): force Chromium to expose the GPU video
+// encoders. Without these switches Electron can leave D3D11 video encode
+// (NVENC/QSV/AMF) disabled or blacklisted on Windows → the WebCodecs
+// engine's require-hardware probe is REJECTED → exports silently crawl on
+// the software encoder ("WebCodecs is slow as hell" trap). The engine's
+// watchdog + FFmpeg fallback still cover a genuinely broken driver; to
+// disable on a misbehaving machine, delete the three lines below.
+//   win32: D3D11VideoEncoder (hardware H.264 encode) + CanvasOopRasterization
+//          (canvas compositing in the GPU process)
+//   linux: VaapiVideoEncoder (VA-API — the dev-mode twin)
+if (process.platform === "win32") {
+  app.commandLine.appendSwitch("enable-features", "D3D11VideoEncoder,CanvasOopRasterization");
+} else if (process.platform === "linux") {
+  app.commandLine.appendSwitch("enable-features", "VaapiVideoEncoder");
+}
+app.commandLine.appendSwitch("ignore-gpu-blocklist");
+app.commandLine.appendSwitch("enable-gpu-rasterization");
+
+app.whenReady().then(() => {
+  ensureTempDir();
+  buildApplicationMenu();
+  createWindow();
+  // v1.15.3 lie detector: dump the GPU-process video-encode summary at
+  // startup — the console answer to "is a hardware H.264 encoder visible to
+  // Chromium on THIS machine" (renderer probes spec-side; this is
+  // driver-side). Visible in the app log + the A/B bench's [bench-app] pipe.
+  gpuVideoSummary().then((s) => console.log(`[gpu-info] ${s}`)).catch(() => {});
+  // v1.15.2 REAL-HARDWARE A/B EXPORT BENCH: scripts/ab-export-bench.js
+  // spawns the app with FRAMEFUSE_BENCH=1 + a plan JSON + a results JSON
+  // path. main reads the plan → ships the fixture media bytes to the
+  // renderer ("bench:run") → the renderer runs BOTH engines against fixed
+  // output paths (FFmpeg forced to the plan's encoder — default NVENC —
+  // then the WebCodecs GPU worker) → "bench:result" carries the timings →
+  // written to disk → quit. Headless/VM runs prove nothing about ASIC
+  // speed; this exists to gather REAL wall-clock + gpuFrameRenderMs field
+  // data on actual GPU hardware.
+  if (process.env.FRAMEFUSE_BENCH === "1") startExportBench();
+  // v5.1: warm the GPU-encoder probe at startup so the FIRST export starts
+  // encoding immediately instead of paying the detection latency up front.
+  detectGpuEncoderAsync();
+  // v1.14.5: warm the ffmpeg capability matrix alongside (one -hwaccels +
+  // one -filters listing — the first export's result payload gets it free).
+  detectHwCapsAsync();
+  // v1.14.3 ICON FIX (field report: "icon blank on desktop/shortcut after
+  // install; the installer showed it fine"): the installed exe keeps its
+  // path across upgrades, so the Windows shell icon cache can keep the
+  // STALE pre-v1.14.1 near-blank entry instead of re-extracting. The
+  // installer now notifies the shell (build/installer.nsh), and THIS
+  // covers users who upgrade in place (auto-update / overwrite install):
+  // on the first launch of each new version, best-effort rebuild the
+  // per-user icon caches (ie4uinit -show; Windows 10/11, harmless no-op
+  // elsewhere). One marker file per version in userData.
+  try {
+    const iconFixMarker = path.join(app.getPath("userData"), "icon-cache-refreshed-v" + app.getVersion());
+    if (!fs.existsSync(iconFixMarker)) {
+      fs.writeFileSync(iconFixMarker, String(Date.now()), "utf8");
+      if (process.platform === "win32") {
+        const sysDir = process.env.SystemRoot ? path.join(process.env.SystemRoot, "System32") : "C:\\Windows\\System32";
+        spawn(path.join(sysDir, "ie4uinit.exe"), ["-show"], { detached: true, stdio: "ignore" }).unref();
+      }
+    }
+  } catch (_) { /* best-effort — never block startup */ }
+  app.on("activate", () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+});
+
+app.on("window-all-closed", () => { if (process.platform !== "darwin") app.quit(); });
+
+// Test hook — exposes the ASS builder + the v1.4.2 hw-decode probe to the
+// dev verification harness (scripts/verify-chunked-encode.js stubs the
+// electron module so main.js loads in plain node).
+// Harmless in production: nothing requires the Electron main entry.
+// v1.13: also exports the pure tier resolver + the Tier-3 ASS optimizer so
+// the throwaway harnesses can unit-verify the Adaptive Hardware Matrix.
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    buildAssDocument, assAnimTags, buildHeadlineEvents, probeHwDecode, hwDecodeGate, resolveHardwareProfile, optimizeAssForConstrainedCpu, mapBoundedConcurrent,
+    // v1.14.5 Release-A hooks (verify-release-a.js): the cost score, the
+    // fast encoder profile, the profiler factory, the capability matrix,
+    // the cached loudness measurement, and the chain builder twin.
+    estimateRenderCost, encoderArgs, createExportProfiler, detectHwCapsAsync, measureLoudnessAsync, flushLoudnessDisk,
+  };
+}

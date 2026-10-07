@@ -3204,3 +3204,19 @@ Stage Summary:
 - The loop-export slowness the user measured was the parse error's silent CLI fallback; the engine's dedup fast paths (verified 17-21s per 10-min) now actually run.
 - Media-panel trash = timeline removal (media kept, restorable) — matching the keyboard Delete and the toolbar behaviors.
 - Engine 0.4.2 built + staged locally; next: commit → push → CI (Windows engine + suite) → release v1.33.9.
+---
+Task ID: 2 (continuation — v1.33.9 SHIPPED)
+Agent: main (Z.ai Code)
+Task: publish v1.33.9 (engine 0.4.2 lenient parse + router NaN sweep + media-keep UX).
+
+Work Log:
+- CI run 37649411075 (commit 3049c5d) GREEN: Windows engine 0.4.2 built, smoke PASS, color 4/4, v2 PASS, v3 20/20 (real GPU path), installer built, A/B bench completed.
+- Engine artifact 11496301831 verified (engineVersion 0.4.2, assertionsPassed true, sha256 04b83c80…). Installer artifact 11497172008 downloaded (244,111,000 bytes) → dist/ staged.
+- ASAR AUDIT (agent-ctx/release-1.33.9/verify-asar.js, via node_modules 7zip-bin 7za): ALL 29 CHECKS PASSED — v1.33.9 markers (sanitizeTimelineNumbers + TIMELINE_NUMERIC_DEFAULTS, numOr caption guards, chroma finite guards, cancel re-throw, rustDedup label, BUILD_VERSION package.json stamps, ETA latch, onRemoveFromTimeline in the packaged chunks), engine binary == EXACT CI smoke-tested 0.4.2, FFmpeg 7.1 DLLs + CLI + static export, and every retained v1.33.4–8 regression marker.
+- PUBLISHED: scripts/publish-release-1.33.9.js → release 405973277 tag v1.33.9 (commit 3049c5d), 3 assets (FrameFuse-Setup-1.33.9.exe 244,111,000 B / latest.yml / blockmap), three-way sha512 VERIFIED (HLiB/WXm+lmg…). releases/latest ⇒ v1.33.9.
+
+Stage Summary:
+- v1.33.9 LIVE: https://github.com/Ziruax/framefuse/releases/tag/v1.33.9
+- The user's three reports are closed: (1) "Timeline parse error: invalid type: null, expected f64" — the bug class is structurally dead (router NaN sweep + engine 0.4.2 lenient parse with self-diagnosing error excerpts); (2) looped exports "too much slow" — the parse error was silently routing to the slow CLI; the engine dedup fast paths now run (17-21 s per 10-min loop measured, ~39× realtime at 40-min); (3) ETA "estimating…" — latch + carry-forward verified live.
+- Speed research (x264 presets/threads/GOP/pipeline parallelism) validated the shipped design: veryfast social tier + ultrafast draft + threads=auto + packet dedup as THE lever for loop scenarios.
+- Bonus UX fix found by browser audit: the media-panel row/grid trash permanently deleted imported media (the keyboard Delete had been fixed but not the visible buttons) — now removes from the timeline and keeps the library entry (browser-verified with restore).
