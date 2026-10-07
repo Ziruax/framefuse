@@ -384,5 +384,7 @@ jobs:
           name: framefuse-windows-installer
           path: |
             dist/FrameFuse Setup *.exe
+            dist/latest.yml
+            dist/FrameFuse Setup *.exe.blockmap
           if-no-files-found: error
           retention-days: 14
