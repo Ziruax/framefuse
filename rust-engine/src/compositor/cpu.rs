@@ -36,6 +36,14 @@ pub struct CpuCompositor {
     lru: Vec<CacheKey>,
     /// Total bytes pinned by the cache (bounded by SCALE_CACHE_BUDGET).
     cached_bytes: usize,
+    /// v0.5 STATIC-PREFIX CACHE: the canvas state AFTER the layer pass
+    /// (background + images), BEFORE text. A static-image timeline re-blends
+    /// the same multi-megapixel layer stack every frame only to draw a
+    /// caption on top — when the layer signature repeats, restore the
+    /// snapshot (one memcpy) instead of clear + full-frame alpha blits
+    /// (the ~4-8 ms/frame the caption timeline was burning).
+    prefix_canvas: Vec<u8>,
+    prefix_sig: Option<Vec<u64>>,
 }
 
 impl CpuCompositor {
@@ -48,6 +56,8 @@ impl CpuCompositor {
             cache: HashMap::new(),
             lru: Vec::new(),
             cached_bytes: 0,
+            prefix_canvas: vec![0; (width as usize) * (height as usize) * 4],
+            prefix_sig: None,
         }
     }
 
@@ -235,29 +245,42 @@ impl Compositor for CpuCompositor {
         _width: u32,
         _height: u32,
     ) -> Result<(), String> {
-        // reset canvas to background
-        let bg = background;
-        for px in self.canvas.chunks_exact_mut(4) {
-            px.copy_from_slice(&bg);
-        }
-        for layer in layers {
-            let dw = ((layer.dest.2 * self.width as f32).round().max(1.0)) as u32;
-            let dh = ((layer.dest.3 * self.height as f32).round().max(1.0)) as u32;
-            let dx = (layer.dest.0 * self.width as f32).round() as i64;
-            let dy = (layer.dest.1 * self.height as f32).round() as i64;
-            let chroma = layer.chroma.as_ref().map(|c| {
-                let rgb = crate::compositor::parse_hex_color(&c.color);
-                let (r, g, b) = (rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0);
-                rgb_to_yuv601(r, g, b)
-            });
-            let (sim, smooth) = layer
-                .chroma
-                .as_ref()
-                .map(|c| (c.similarity.clamp(0.0, 1.0), c.smoothness.clamp(0.0, 1.0)))
-                .unwrap_or((0.0, 0.0));
-            let alpha = layer.alpha.clamp(0.0, 1.0);
-            let scaled = self.scale_layer(layer, dw, dh);
-            self.blit(&scaled, dw, dh, dx, dy, alpha, chroma, sim as f32, smooth as f32);
+        // v0.5 STATIC-PREFIX FAST PATH: identical layer stack + background
+        // ⇒ the post-layer canvas is byte-identical to the snapshot — one
+        // memcpy restores it (skip clear + scale-cache lookups + the
+        // full-frame alpha-blend blits) and only the text strips re-blend.
+        let sig = layer_stack_signature(layers, background);
+        let prefix_hit = self.prefix_sig.as_ref() == Some(&sig);
+        if prefix_hit {
+            self.canvas.copy_from_slice(&self.prefix_canvas);
+        } else {
+            // reset canvas to background
+            let bg = background;
+            for px in self.canvas.chunks_exact_mut(4) {
+                px.copy_from_slice(&bg);
+            }
+            for layer in layers {
+                let dw = ((layer.dest.2 * self.width as f32).round().max(1.0)) as u32;
+                let dh = ((layer.dest.3 * self.height as f32).round().max(1.0)) as u32;
+                let dx = (layer.dest.0 * self.width as f32).round() as i64;
+                let dy = (layer.dest.1 * self.height as f32).round() as i64;
+                let chroma = layer.chroma.as_ref().map(|c| {
+                    let rgb = crate::compositor::parse_hex_color(&c.color);
+                    let (r, g, b) = (rgb[0] as f32 / 255.0, rgb[1] as f32 / 255.0, rgb[2] as f32 / 255.0);
+                    rgb_to_yuv601(r, g, b)
+                });
+                let (sim, smooth) = layer
+                    .chroma
+                    .as_ref()
+                    .map(|c| (c.similarity.clamp(0.0, 1.0), c.smoothness.clamp(0.0, 1.0)))
+                    .unwrap_or((0.0, 0.0));
+                let alpha = layer.alpha.clamp(0.0, 1.0);
+                let scaled = self.scale_layer(layer, dw, dh);
+                self.blit(&scaled, dw, dh, dx, dy, alpha, chroma, sim as f32, smooth as f32);
+            }
+            // snapshot the post-layer state for the next identical frame
+            self.prefix_canvas.copy_from_slice(&self.canvas);
+            self.prefix_sig = Some(sig);
         }
         for t in texts {
             let (dx, dy, dw, dh) = (t.dest_px.0 as i64, t.dest_px.1 as i64, t.dest_px.2, t.dest_px.3);
@@ -281,6 +304,24 @@ impl Compositor for CpuCompositor {
     fn output(&self) -> &[u8] {
         &self.canvas
     }
+}
+
+/// v0.5: the layer stack's identity — (bitmap id, dest rect, alpha, crop
+/// window, chroma key, background color) per layer, in order. Equal
+/// signatures ⇒ equal post-layer canvas (the compositor is deterministic).
+fn layer_stack_signature(layers: &[Layer], background: [u8; 4]) -> Vec<u64> {
+    let mut sig = Vec::with_capacity(8 + layers.len() * 8);
+    sig.push(u64::from(background[0]) << 24 | u64::from(background[1]) << 16 | u64::from(background[2]) << 8 | u64::from(background[3]));
+    for l in layers {
+        sig.push(l.bitmap.id);
+        sig.push(((l.dest.0.to_bits() as u64) << 32) | l.dest.1.to_bits() as u64);
+        sig.push(((l.dest.2.to_bits() as u64) << 32) | l.dest.3.to_bits() as u64);
+        sig.push(((l.crop.0.to_bits() as u64) << 32) | l.crop.1.to_bits() as u64);
+        sig.push(((l.crop.2.to_bits() as u64) << 32) | l.crop.3.to_bits() as u64);
+        sig.push(l.alpha.to_bits() as u64);
+        sig.push(l.chroma.as_ref().map(Arc::as_ptr).map(|p| p as u64).unwrap_or(0));
+    }
+    sig
 }
 
 

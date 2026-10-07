@@ -134,6 +134,10 @@ pub struct FFSyms {
     pub avcodec_free_context: unsafe extern "C" fn(avctx: *mut *mut u8),
     pub avcodec_parameters_to_context: unsafe extern "C" fn(codec_ctx: *mut u8, par: *const u8) -> i32,
     pub avcodec_parameters_from_context: unsafe extern "C" fn(par: *mut u8, codec_ctx: *const u8) -> i32,
+    /// v0.5.1 (decode-back seed): parameter allocation for transferring the
+    /// encoder's extradata (SPS/PPS) into the H.264 decoder context.
+    pub avcodec_parameters_alloc: unsafe extern "C" fn() -> *mut u8,
+    pub avcodec_parameters_free: unsafe extern "C" fn(par: *mut *mut u8),
     pub avcodec_open2: unsafe extern "C" fn(avctx: *mut u8, codec: *const u8, options: *mut *mut u8) -> i32,
     pub avcodec_send_frame: unsafe extern "C" fn(avctx: *mut u8, frame: *const u8) -> i32,
     pub avcodec_receive_packet: unsafe extern "C" fn(avctx: *mut u8, avpkt: *mut u8) -> i32,
@@ -401,6 +405,8 @@ impl FFmpegLibs {
             avcodec_free_context: cast!(sym!(avcodec, b"avcodec_free_context"), _),
             avcodec_parameters_to_context: cast!(sym!(avcodec, b"avcodec_parameters_to_context"), _),
             avcodec_parameters_from_context: cast!(sym!(avcodec, b"avcodec_parameters_from_context"), _),
+            avcodec_parameters_alloc: cast!(sym!(avcodec, b"avcodec_parameters_alloc"), _),
+            avcodec_parameters_free: cast!(sym!(avcodec, b"avcodec_parameters_free"), _),
             avcodec_open2: cast!(sym!(avcodec, b"avcodec_open2"), _),
             avcodec_send_frame: cast!(sym!(avcodec, b"avcodec_send_frame"), _),
             avcodec_receive_packet: cast!(sym!(avcodec, b"avcodec_receive_packet"), _),
@@ -701,6 +707,31 @@ impl FFmpegLibs {
             wr_i32(cc, AVCC_THREAD_COUNT, 0); // 0 = auto
             wr_i32(cc, AVCC_THREAD_TYPE, FF_THREAD_FRAME | FF_THREAD_SLICE);
         }
+    }
+    /// v0.5.1: explicit threading config (count 0 = auto).
+    pub fn cc_set_threading(&self, cc: *mut u8, count: i32, thread_type: i32) {
+        unsafe {
+            wr_i32(cc, AVCC_THREAD_COUNT, count);
+            wr_i32(cc, AVCC_THREAD_TYPE, thread_type);
+        }
+    }
+    /// v0.5.1: fixed thread count (the decode-back decoder uses 1 — zero
+    /// frame-thread delay so the seed frame is decodable immediately).
+    pub fn cc_set_thread_count(&self, cc: *mut u8, n: i32) {
+        unsafe {
+            wr_i32(cc, AVCC_THREAD_COUNT, n);
+            wr_i32(cc, AVCC_THREAD_TYPE, 0);
+        }
+    }
+    /// v0.5.1: force the next sent frame to be an intra/key frame
+    /// (AVFrame.pict_type = AV_PICTURE_TYPE_I — the documented FFmpeg way;
+    /// libx264 honors it as a forced IDR). Used on caption-run start frames
+    /// so each run begins at a random-access point.
+    pub fn frame_force_intra(&self, f: *mut u8) {
+        unsafe { wr_i32(f, AVFRAME_PICT_TYPE, AV_PICTURE_TYPE_I) };
+    }
+    pub fn frame_clear_pict_type(&self, f: *mut u8) {
+        unsafe { wr_i32(f, AVFRAME_PICT_TYPE, AV_PICTURE_TYPE_NONE) };
     }
 
     // stream helpers

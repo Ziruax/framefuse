@@ -64,10 +64,14 @@ pub struct ExportOutcome {
     pub size_bytes: u64,
     pub adapter: Option<String>,
     /// v0.4.1: which packet-dedup fast path ran ("loop-cycle …" /
-    /// "static-tail …" / "static-image …"), or None when every frame was
+    /// "static-tail …" / "caption-runs …"), or None when every frame was
     /// encoded live. Surfaced to the completion report so a slow export is
-    /// diagnosable at a glance (dedup vetoed by captions/ken-burns/etc.).
+    /// diagnosable at a glance.
     pub dedup: Option<String>,
+    /// v0.5: why the compositor is GPU or CPU (the slow-GPU benchmark
+    /// verdict) — displayed on the engine health card so "why am I on the
+    /// CPU rasterizer" is answered in the UI.
+    pub compositor_note: Option<String>,
 }
 
 // ── v0.4 AUDIO MEMORY: the finished mix's backing store ────────────────────
@@ -133,9 +137,21 @@ struct CapturedPkt {
 ///   visual is the CONSTANT background; encode through the first tail
 ///   frame, then clone that single packet (a still-image P-frame chain,
 ///   exactly what a black-tail encode emits).
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum DedupKind {
     LoopCycle,
     StaticTail,
+    /// v0.5 (the "captions killed the fast path" fix): static background +
+    /// burned captions → run-level packet cloning. See the plan struct.
+    CaptionRuns,
+}
+
+/// v0.5: one span of identical composite output (frames [start,
+/// start+len)). len 1 = a genuinely unique frame (normal live encode).
+#[derive(Clone, Copy, Debug)]
+struct CaptionRun {
+    start: u64,
+    len: u64,
 }
 
 struct LoopDedupPlan {
@@ -148,6 +164,14 @@ struct LoopDedupPlan {
     /// wraps the decode position with THIS span so frame k and
     /// k+cycle_frames composite byte-identically.
     pub snap_span_sec: Option<f64>,
+    /// CaptionRuns only: the run table. The producer renders ONLY run
+    /// starts; the consumer emits each run's first frame live, then ONE
+    /// zero-delta "skip seed" (identical pixels → a pure-skip P-frame),
+    /// and the clone phase re-emits that seed for the rest of the run —
+    /// every clone re-applies a ZERO delta, so the decoded picture is
+    /// bit-identical by construction (strictly safer than StaticTail,
+    /// whose seed packet is a real content transition).
+    pub runs: Option<Vec<CaptionRun>>,
 }
 
 // ── sws guard (sws_freeContext takes the pointer directly) ────────────────
@@ -711,6 +735,20 @@ fn open_video_encoder(
     ff: &FFmpegLibs,
     timeline: &Timeline,
     global_header: bool,
+    // v0.5: the caption-run fast path clones packets — B-frames reference
+    // pictures by POC/frame_num and a cloned B slice would resolve its
+    // reference list against the WRONG pictures. P/I-only streams make
+    // cloning structurally safe (the verified StaticTail pattern).
+    suppress_bframes: bool,
+    // v0.5.1: caption-run mode needs SYNCHRONOUS packet emission — the
+    // decode-back seed consumes each run-start's packet IMMEDIATELY after
+    // its frame is sent. Frame threading AND rc-lookahead both buffer
+    // packets (10-32 deep), so this mode pins thread_count=1 and zeroes
+    // the lookahead via x264-params (both required: threads=1 alone still
+    // buffers rc-lookahead frames). The live set is ~2 frames per caption
+    // run, so single-threading the live prefix costs little against the
+    // clone-path win.
+    zero_delay: bool,
 ) -> Result<EncoderPick, String> {
     let ladder = [
         "h264_nvenc",
@@ -820,7 +858,23 @@ fn open_video_encoder(
             };
             let _ = ff.dict_set(&mut dict, "preset", preset);
             let _ = ff.dict_set(&mut dict, "crf", &crf.to_string());
-            ff.cc_set_threads_auto(ctx.raw);
+            if suppress_bframes {
+                // "bf" is the AVCodecContext max_b_frames option — libx264
+                // reads it (x264 i_bframe=0). P/I-only, clone-safe.
+                let _ = ff.dict_set(&mut dict, "bf", "0");
+            }
+            if zero_delay {
+                // v0.5.1 caption-run mode: synchronous packet emission (see
+                // the signature comment). tune=zerolatency is THE battle-
+                // tested zero-delay config (rc-lookahead=0 + sync-lookahead=0
+                // + sliced/frame-threads disabled buffering); plain
+                // thread_count=1 alone still buffers rc-lookahead frames
+                // (measured: packets only flowed ~10 sends in).
+                ff.cc_set_threading(ctx.raw, 1, 0);
+                let _ = ff.dict_set(&mut dict, "tune", "zerolatency");
+            } else {
+                ff.cc_set_threads_auto(ctx.raw);
+            }
         }
     }
     if bitrate > 0 && (name == "h264_amf" || timeline.crf.is_none()) {
@@ -844,10 +898,29 @@ fn open_video_encoder(
                     if global_header {
                         ff.cc_set_flags_or(g.raw, AV_CODEC_FLAG_GLOBAL_HEADER);
                     }
-                    ff.cc_set_threads_auto(g.raw);
+                    // v0.5.1: the hw-failure retry MUST carry the same
+                    // zero-delay/clone-safety settings as the primary
+                    // software branch — this retry is the path EVERY
+                    // "nvenc-registered-but-no-NVIDIA-GPU" machine takes
+                    // (the engine health card's `GPU compositor - libx264`
+                    // line IS this branch), and it silently dropped the
+                    // tune/threading here at v0.5.1-draft (packets lagged
+                    // rc-lookahead frames and the decode-back seed never
+                    // engaged — the exact 12-s bench symptom).
+                    if zero_delay {
+                        ff.cc_set_threading(g.raw, 1, 0);
+                    } else {
+                        ff.cc_set_threads_auto(g.raw);
+                    }
                     let mut d2: *mut u8 = std::ptr::null_mut();
                     let _ = ff.dict_set(&mut d2, "preset", "veryfast");
                     let _ = ff.dict_set(&mut d2, "crf", &crf.to_string());
+                    if suppress_bframes {
+                        let _ = ff.dict_set(&mut d2, "bf", "0");
+                    }
+                    if zero_delay {
+                        let _ = ff.dict_set(&mut d2, "tune", "zerolatency");
+                    }
                     let r2 = unsafe { (ff.syms.avcodec_open2)(g.raw, sw, &mut d2) };
                     ff.dict_free(&mut d2);
                     if r2 == 0 {
@@ -870,6 +943,11 @@ struct FrameJob {
     texts: Vec<TextLayer>,
     /// Per-frame background clear color (dip transitions / black).
     background: [u8; 4],
+    /// v0.5 caption-runs: the length of the identical-output run starting
+    /// at this frame (0 = dense mode, len 1 = unique frame). len ≥ 2 tells
+    /// the consumer to emit the zero-delta skip seed right after this
+    /// frame so the clone phase can re-emit it for the run's remainder.
+    run_len: u64,
 }
 
 enum ProducerMsg {
@@ -1043,6 +1121,63 @@ pub fn run_pipeline(
     }
     let watermark = Arc::new(watermark);
 
+    // ── v0.5 CAPTION-RUN DEDUP DETECTION (before the encoder opens) ──────
+    // Captions used to VETO every packet-dedup path, so "69-min audio + 1
+    // image + captions" rendered all 124k frames live — hours on the
+    // machines that need it most. The run table must be known BEFORE the
+    // encoder opens (P/I-only streams make packet cloning structurally
+    // safe; see open_video_encoder's suppress_bframes).
+    let caption_runs: Option<Vec<CaptionRun>> = detect_caption_runs(
+        &timeline,
+        &base,
+        &overlays,
+        &texts,
+        &prepared_captions,
+        &prepared_kinetic,
+        &watermark,
+        &image_bitmaps,
+        total_frames,
+        fps,
+        cw,
+        ch,
+    );
+    // v0.5.1: probe the LEGACY dedup paths PRE-OPEN as well — the
+    // single-packet clone paths (StaticTail kind: static-image +
+    // audio-extended tails) need a P/I-only stream to clone safely, which
+    // must be decided before the encoder opens (bf=0). LoopCycle clones
+    // whole GOP blocks (reference-safe as a block) and needs no dict.
+    // NOTE: this probe is deterministic — the later dedup decision reuses
+    // it verbatim instead of re-running the detection.
+    let quiet_visuals =
+        texts.is_empty() && prepared_captions.is_none() && prepared_kinetic.is_none() && watermark.is_none();
+    let legacy_dedup_probe: Option<LoopDedupPlan> = if caption_runs.is_none() {
+        detect_loop_dedup(&timeline, &base, &overlays, &ff, total_frames, quiet_visuals)
+            .map(|mut d| {
+                d.runs = None;
+                d
+            })
+    } else {
+        None
+    };
+    let legacy_static_clone = legacy_dedup_probe
+        .as_ref()
+        .map(|d| d.kind == DedupKind::StaticTail)
+        .unwrap_or(false);
+    // v0.5.1 FIX: `will_probe_encoder`/`software_encoder_expected` were
+    // dropped from this decision — avcodec_find_encoder_by_name only says
+    // the encoder is COMPILED IN, not that it can RUN (h264_nvenc is in
+    // every distro build; without libcuda it fails at open time). On such
+    // machines the probe predicted "hardware" → suppress_bframes stayed
+    // false → the ladder fell to libx264 → the caption-run plan was dropped
+    // at the post-open check → "69-min audio + 1 image + captions"
+    // rendered ALL 124k frames dense (7.6× realtime instead of the clone
+    // path's much higher rate; measured on the 62.8-min practical bench).
+    // The honest gate: set bf=0 whenever a clone plan exists; the software
+    // branch (and the hw-failure → libx264 retry) both honor it, and a
+    // hardware encoder that ACTUALLY opens ignores it (own B-frame config)
+    // and drops the plans post-open instead.
+    let suppress_bframes = caption_runs.is_some() || legacy_static_clone;
+
     // ── output context + streams ─────────────────────────────────────────
     let c_out = CString::new(output_path.clone()).map_err(|e| format!("bad output path: {}", e))?;
     let mut oc: *mut u8 = std::ptr::null_mut();
@@ -1061,14 +1196,164 @@ pub fn run_pipeline(
 
     // v2: open the video encoder FIRST — the actual encoder decides the
     // pixel format, which decides the compositor's GPU-YUV packing.
-    let venc = open_video_encoder(&ff, &timeline, global_header)?;
+    let venc = open_video_encoder(&ff, &timeline, global_header, suppress_bframes, caption_runs.is_some())?;
     log::info!("[rust-engine] encoder: {} (pix_fmt {})", venc.name, venc.pix_fmt);
+    // v0.5 safety: if the ladder's pick changed between probe and open
+    // (hardware open failure → libx264 retry without the bf=0 dict), or a
+    // hardware encoder engaged, the run plan is dropped — the dense
+    // per-frame path stays correct for every encoder.
+    let mut caption_runs = caption_runs;
+    if caption_runs.is_some() {
+        let opened_software = venc.name == "libx264" || venc.name == "h264_mf";
+        if !opened_software {
+            log::info!(
+                "[rust-engine] caption-run fast path disengaged (encoder {} — hardware keeps B-frames)",
+                venc.name
+            );
+            caption_runs = None;
+        }
+    }
+    // v0.5.1: same for the single-packet clone plans — a hardware encoder
+    // that actually opened keeps its own B-frame config, which makes the
+    // cloned chain structurally unsafe; the dense path runs instead (hw
+    // encoders are fast enough to afford it). LoopCycle survives: it
+    // clones whole GOP blocks, which stay reference-safe as a block.
+    let mut legacy_dedup_probe = legacy_dedup_probe;
+    if legacy_static_clone {
+        let opened_software = venc.name == "libx264" || venc.name == "h264_mf";
+        if !opened_software {
+            log::info!(
+                "[rust-engine] static-clone fast path disengaged (encoder {} — hardware keeps B-frames)",
+                venc.name
+            );
+            legacy_dedup_probe = None;
+        }
+    }
 
     // ── compositor (wgpu first, CPU fallback) — mode matched to encoder ──
     let yuv_mode = if venc.pix_fmt == AV_PIX_FMT_NV12 { YuvMode::Nv12 } else { YuvMode::Yuv420p };
     let mut compositor: Box<dyn Compositor> = compositor::create_compositor(cw, ch, yuv_mode);
     let mut engine_used = compositor.name().to_string();
     let adapter = compositor.adapter_name();
+    // v0.5 SLOW-GPU GUARD: an old driver/APU (or a WARP-adjacent adapter)
+    // can make the GPU composite path 10-50× SLOWER than the CPU raster —
+    // the user's "36 frames in 4523ms" health card (≈8 fps at 640×360) is
+    // exactly this. Benchmark BOTH compositors on a real frame BEFORE the
+    // encode loop and keep the faster one; the winner is reported in the
+    // result so the health card explains the choice. Env overrides:
+    // FRAMEFUSE_FORCE_COMPOSITOR=cpu|gpu skips the benchmark.
+    let mut compositor_note: Option<String> = None;
+    {
+        let forced = std::env::var("FRAMEFUSE_FORCE_COMPOSITOR").unwrap_or_default();
+        let gpu_active = compositor.name() == "rust-gpu";
+        if gpu_active && (forced == "cpu" || (forced.is_empty() && total_frames >= 24)) {
+            // a synthetic benchmark frame: one full-frame layer (the same
+            // render/submit/readback path a real frame takes). TWO
+            // alternating bitmaps so the CPU rasterizer's static-prefix
+            // cache MISSES every iteration — the benchmark must measure the
+            // worst case (a dynamic timeline), not the static fast path.
+            let bench_a = Bitmap::new(vec![40u8; 16 * 16 * 4], 16, 16);
+            let bench_b = Bitmap::new(vec![90u8; 16 * 16 * 4], 16, 16);
+            let mk_layer = |bmp: Bitmap| Layer {
+                bitmap: bmp,
+                crop: (0.0, 0.0, 1.0, 1.0),
+                dest: (0.0, 0.0, 1.0, 1.0),
+                alpha: 1.0,
+                chroma: None,
+                dynamic: false,
+            };
+            let bench_layers_a = [mk_layer(bench_a)];
+            let bench_layers_b = [mk_layer(bench_b)];
+            const BENCH_N: u32 = 4;
+            // GPU: 1 warmup (shader compile + texture alloc) + BENCH_N timed
+            let _ = compositor.render_frame(&bench_layers_a, &[], [12, 10, 9, 255], cw, ch);
+            let t_gpu = Instant::now();
+            for i in 0..BENCH_N {
+                let ls = if i % 2 == 0 { &bench_layers_a } else { &bench_layers_b };
+                let _ = compositor.render_frame(ls, &[], [12, 10, 9, 255], cw, ch);
+            }
+            let gpu_ms = t_gpu.elapsed().as_secs_f64() * 1000.0 / BENCH_N as f64;
+            // CPU: the full per-frame cost INCLUDING the RGBA→YUV sws pass
+            // the CPU path pays (the GPU path converts on-device).
+            let mut cpu = crate::compositor::cpu::CpuCompositor::new(cw, ch);
+            let sws = unsafe {
+                (ff.syms.sws_getContext)(
+                    cw as i32, ch as i32, AV_PIX_FMT_RGBA,
+                    cw as i32, ch as i32, venc.pix_fmt,
+                    SWS_BILINEAR, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(),
+                )
+            };
+            // a real scratch destination (YUV420P: 3 planes; NV12: Y + UV)
+            let w = cw as usize;
+            let h = ch as usize;
+            let h2 = (h + 1) / 2;
+            let is_nv12 = venc.pix_fmt == AV_PIX_FMT_NV12;
+            let mut scratch: Vec<u8> = if is_nv12 {
+                vec![0u8; w * (h + h2) + 64]
+            } else {
+                vec![0u8; w * h + 2 * w * h2 / 2 * 2 + 64]
+            };
+            let build_planes = |s: &mut [u8]| -> ([*mut u8; 8], [i32; 8]) {
+                let base = s.as_mut_ptr();
+                let y_stride = w as i32;
+                let mut planes: [*mut u8; 8] = [std::ptr::null_mut(); 8];
+                let mut strides: [i32; 8] = [0i32; 8];
+                planes[0] = base;
+                strides[0] = y_stride;
+                if is_nv12 {
+                    planes[1] = unsafe { base.add(w * h) };
+                    strides[1] = y_stride;
+                } else {
+                    planes[1] = unsafe { base.add(w * h) };
+                    strides[1] = ((w + 1) / 2) as i32;
+                    planes[2] = unsafe { base.add(w * h + ((w + 1) / 2) * h2) };
+                    strides[2] = ((w + 1) / 2) as i32;
+                }
+                (planes, strides)
+            };
+            let t_cpu = Instant::now();
+            for i in 0..BENCH_N {
+                let ls = if i % 2 == 0 { &bench_layers_a } else { &bench_layers_b };
+                let _ = cpu.render_frame(ls, &[], [12, 10, 9, 255], cw, ch);
+                if !sws.is_null() {
+                    let (mut dst_planes, dst_strides) = build_planes(&mut scratch);
+                    let src_planes: [*const u8; 1] = [cpu.output().as_ptr()];
+                    let src_strides: [i32; 1] = [cw as i32 * 4];
+                    unsafe {
+                        (ff.syms.sws_scale)(sws, src_planes.as_ptr(), src_strides.as_ptr(), 0, ch as i32, dst_planes.as_mut_ptr(), dst_strides.as_ptr());
+                    }
+                }
+            }
+            let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1000.0 / BENCH_N as f64;
+            if !sws.is_null() {
+                unsafe { (ff.syms.sws_freeContext)(sws) };
+            }
+            let gpu_fps = if gpu_ms > 0.001 { 1000.0 / gpu_ms } else { f64::INFINITY };
+            let cpu_fps = if cpu_ms > 0.001 { 1000.0 / cpu_ms } else { f64::INFINITY };
+            let use_cpu = forced == "cpu" || cpu_fps > gpu_fps * 1.15; // GPU keeps a grace margin (it also skips sws already counted)
+            compositor_note = Some(if use_cpu {
+                format!(
+                    "gpu composite {:.1} fps < cpu raster {:.1} fps → cpu rasterizer",
+                    gpu_fps, cpu_fps
+                )
+            } else {
+                format!(
+                    "gpu composite {:.1} fps ≥ cpu raster {:.1} fps → gpu compositor",
+                    gpu_fps, cpu_fps
+                )
+            });
+            log::info!(
+                "[rust-engine] compositor benchmark: gpu {:.1} fps vs cpu(+sws) {:.1} fps — {}",
+                gpu_fps,
+                cpu_fps,
+                if use_cpu { "CPU rasterizer wins" } else { "GPU compositor wins" }
+            );
+            if use_cpu {
+                compositor = Box::new(cpu);
+                engine_used = "rust-cpu".into();
+            }
+        }
+    }
 
     // video encoder stream
     let vstream = unsafe { (ff.syms.avformat_new_stream)(oc.raw, std::ptr::null()) };
@@ -1287,22 +1572,33 @@ pub fn run_pipeline(
         .map(|&oi| timeline.segments[oi].chroma.clone().map(Arc::new))
         .collect();
 
-    // ── v0.4 STATIC-LOOP DEDUP (the 60-min → 1-min export fix) ───────────
+    // ── v0.4/v0.5 DEDUP PLAN ─────────────────────────────────────────
     // A looped 10-s video under a 69-min audio renders 125,220 frames of
     // which exactly ~300 are unique. When NOTHING time-varying crosses the
     // loop (no captions/text/watermark/ken-burns/transitions/overlays), the
     // bitstream of every cycle after the first is byte-identical apart from
     // timestamps — so encode ONE cycle, then re-emit its packets with
-    // shifted pts/dts for each further cycle. This is exactly what
-    // `-stream_loop -c copy` produces; every player decodes it as a loop.
-    let dedup: Option<LoopDedupPlan> = detect_loop_dedup(
-        &timeline,
-        &base,
-        &overlays,
-        &ff,
-        total_frames,
-        texts.is_empty() && prepared_captions.is_none() && prepared_kinetic.is_none() && watermark.is_none(),
-    );
+    // shifted pts/dts for each further cycle (exactly `-stream_loop -c
+    // copy`). v0.5: with CAPTIONS the same idea applies at RUN granularity
+    // (the pre-open detection built the run table) — the caption-run plan
+    // takes priority over the legacy detections.
+    let dedup: Option<LoopDedupPlan> = if let Some(runs) = caption_runs {
+        // v0.5.1: two live frames per run ≥ 2 (the forced-IDR start + the
+        // decode-back zero-residual seed).
+        let live: u64 = runs.iter().map(|r| 1 + u64::from(r.len >= 2)).sum();
+        Some(LoopDedupPlan {
+            kind: DedupKind::CaptionRuns,
+            cycle_frames: 1,
+            encode_frames: live,
+            snap_span_sec: None,
+            runs: Some(runs),
+        })
+    } else {
+        // v0.5.1: reuse the PRE-OPEN probe (same function, same inputs —
+        // deterministic) instead of re-running the loop-cycle duration
+        // probe a second time.
+        legacy_dedup_probe
+    };
     // v0.4.1: the label rides to the ExportOutcome — the completion report
     // tells the user WHICH fast path ran (or that none did, and why that is
     // honest: time-varying content over the loop).
@@ -1312,6 +1608,15 @@ pub fn run_pipeline(
         }
         DedupKind::StaticTail => {
             format!("static-tail: {} live frames, the rest cloned from one packet", d.encode_frames)
+        }
+        DedupKind::CaptionRuns => {
+            let runs = d.runs.as_ref().map(|r| r.len()).unwrap_or(0);
+            format!(
+                "caption-runs: {} unique caption states ({} live frames, {} cloned)",
+                runs,
+                d.encode_frames,
+                total_frames.saturating_sub(d.encode_frames)
+            )
         }
     });
     if let Some(d) = &dedup {
@@ -1332,8 +1637,15 @@ pub fn run_pipeline(
                     total_frames
                 );
             }
+            DedupKind::CaptionRuns => {
+                trace(&format!("dedup: CaptionRuns runs={} live={}", d.runs.as_ref().map(|r| r.len()).unwrap_or(0), d.encode_frames));
+            }
         }
     }
+    // v0.5: the producer's frame schedule — Dense (0..limit) or the
+    // caption-run STARTS only (each job carries its run length so the
+    // consumer knows when to emit the zero-delta skip seed).
+    let producer_runs: Option<Vec<CaptionRun>> = dedup.as_ref().and_then(|d| d.runs.clone());
     let producer_frame_limit: u64 = dedup
         .as_ref()
         .map(|d| d.encode_frames)
@@ -1378,40 +1690,86 @@ pub fn run_pipeline(
                     }
                 }
 
-                for k in 0u64..producer_frame_limit {
-                    if cancelled.load(Ordering::Relaxed) {
-                        let _ = tx.send(ProducerMsg::Done { decode_ms });
-                        return;
-                    }
-                    let t = k as f64 / fps;
-                    let job = build_frame_job(
-                        k,
-                        &timeline,
-                        t,
-                        &base,
-                        &overlays,
-                        &overlay_chroma,
-                        &image_bitmaps,
-                        &mut video_sources,
-                        &texts,
-                        &prepared_captions,
-                        &prepared_kinetic,
-                        &watermark,
-                        &mut decode_ms,
-                        cw,
-                        ch,
-                        loop_snap,
-                    );
-                    let job = match job {
-                        Ok(j) => j,
-                        Err(e) => {
-                            let _ = tx.send(ProducerMsg::Failed(e));
+                // v0.5: the frame schedule — Dense (0..limit) or, for the
+                // caption-run fast path, ONLY the run starts (k =
+                // run.start; each job carries its run length so the
+                // consumer knows when to emit the zero-delta skip seed).
+                let run_schedule: Option<Vec<(u64, u64)>> =
+                    producer_runs.as_ref().map(|runs| runs.iter().map(|r| (r.start, r.len)).collect());
+                if let Some(schedule) = run_schedule {
+                    for (k, run_len) in schedule {
+                        if cancelled.load(Ordering::Relaxed) {
+                            let _ = tx.send(ProducerMsg::Done { decode_ms });
                             return;
                         }
-                    };
-                    if tx.send(ProducerMsg::Frame(job)).is_err() {
-                        // consumer dropped early (cancel / error) — stop
-                        return;
+                        let t = k as f64 / fps;
+                        let job = build_frame_job(
+                            k,
+                            &timeline,
+                            t,
+                            &base,
+                            &overlays,
+                            &overlay_chroma,
+                            &image_bitmaps,
+                            &mut video_sources,
+                            &texts,
+                            &prepared_captions,
+                            &prepared_kinetic,
+                            &watermark,
+                            &mut decode_ms,
+                            cw,
+                            ch,
+                            loop_snap,
+                        );
+                        let mut job = match job {
+                            Ok(j) => j,
+                            Err(e) => {
+                                let _ = tx.send(ProducerMsg::Failed(e));
+                                return;
+                            }
+                        };
+                        job.run_len = run_len;
+                        if tx.send(ProducerMsg::Frame(job)).is_err() {
+                            // consumer dropped early (cancel / error) — stop
+                            return;
+                        }
+                    }
+                } else {
+                    for k in 0u64..producer_frame_limit {
+                        if cancelled.load(Ordering::Relaxed) {
+                            let _ = tx.send(ProducerMsg::Done { decode_ms });
+                            return;
+                        }
+                        let t = k as f64 / fps;
+                        let job = build_frame_job(
+                            k,
+                            &timeline,
+                            t,
+                            &base,
+                            &overlays,
+                            &overlay_chroma,
+                            &image_bitmaps,
+                            &mut video_sources,
+                            &texts,
+                            &prepared_captions,
+                            &prepared_kinetic,
+                            &watermark,
+                            &mut decode_ms,
+                            cw,
+                            ch,
+                            loop_snap,
+                        );
+                        let job = match job {
+                            Ok(j) => j,
+                            Err(e) => {
+                                let _ = tx.send(ProducerMsg::Failed(e));
+                                return;
+                            }
+                        };
+                        if tx.send(ProducerMsg::Frame(job)).is_err() {
+                            // consumer dropped early (cancel / error) — stop
+                            return;
+                        }
                     }
                 }
                 let _ = tx.send(ProducerMsg::Done { decode_ms });
@@ -1431,6 +1789,35 @@ pub fn run_pipeline(
     // (muxer time base) and re-emitted with shifted timestamps for every
     // further loop cycle.
     let mut capture_store: Option<Vec<CapturedPkt>> = if dedup.is_some() { Some(Vec::new()) } else { None };
+    // v0.5.1: caption-run mode captures WITHOUT muxing — see
+    // drain_video_encoder. The loop-cycle/static-tail paths mux live and
+    // clone AFTER the live range (already monotonic).
+    let cap_only = dedup
+        .as_ref()
+        .map(|d| d.kind == DedupKind::CaptionRuns)
+        .unwrap_or(false);
+    // v0.5.1 DECODE-BACK DECODER: the seed frame's input must be the
+    // run-start IDR's DECODED pixels — feeding the original composite
+    // makes the seed's P residual = (A - A') ≠ 0, and a clone re-applies
+    // that residual on EVERY re-emission (measured +10 mean-abs-diff
+    // drift by mid-file). Feeding the decoded picture itself makes the
+    // seed an exact no-change frame (all-SKIP), so every clone decodes to
+    // the reference bit-exactly. Only the YUV420P software path (libx264)
+    // engages; NV12/hardware fall back to the original-frame seed.
+    let mut dec_back: Option<(PtrGuard, PtrGuard, PtrGuard)> = None; // (ctx, frame, pkt)
+    let mut dec_back_fallback = false;
+    if cap_only && frame_fmt == AV_PIX_FMT_YUV420P {
+        match init_decode_back(&ff, venc.ctx.raw) {
+            Ok(trio) => dec_back = Some(trio),
+            Err(e) => {
+                dec_back_fallback = true;
+                log::warn!(
+                    "[rust-engine] decode-back seed unavailable ({}) — seeds use the original frame (small drift)",
+                    e
+                );
+            }
+        }
+    }
     // v0.4 honest ETA: sliding rate window (frame mark + time) instead of
     // the whole-run (100-pct)/pct×elapsed extrapolation.
     let mut rate_mark: Option<(u64, Instant)> = None;
@@ -1453,8 +1840,13 @@ pub fn run_pipeline(
                 if cancelled.load(Ordering::Relaxed) {
                     return Err("cancelled".into());
                 }
-                let FrameJob { k, layers, texts: text_layers, background } = job;
+                let FrameJob { k, layers, texts: text_layers, background, run_len } = job;
                 let t = k as f64 / fps;
+                // v0.5 caption-runs: this job's full span counts toward
+                // progress the moment its start frame is encoded (the
+                // clone phase re-emits the span at packet speed).
+                let covered_now = if run_len > 0 { k + run_len } else { k + 1 };
+                let covered = covered_now.min(total_frames);
 
                 // composite (GPU → CPU mid-export fallback on device loss)
                 let t0 = Instant::now();
@@ -1568,12 +1960,23 @@ pub fn run_pipeline(
                         }
                     }
                     ff.frame_set_pts(avframe.raw, k as i64);
+                    // v0.5.1: caption-run starts are FORCED INTRA — each run
+                    // begins at a keyframe/random-access point (the clone
+                    // phase re-emits the start packet, and the seed's P
+                    // references it). Non-start frames CLEAR the field: ring
+                    // slots are reused and a stale forced-I would turn a
+                    // seed into a bulky IDR.
+                    if run_len > 0 {
+                        ff.frame_force_intra(avframe.raw);
+                    } else {
+                        ff.frame_clear_pict_type(avframe.raw);
+                    }
                     // send/drain contract: EAGAIN from send_frame means the
                     // frame was NOT consumed — drain packets, then retry.
                     loop {
                         let s = (ff.syms.avcodec_send_frame)(venc.ctx.raw, avframe.raw);
                         if s == AVERROR_EAGAIN {
-                            if drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets, &mut capture_store)? == 0 {
+                            if drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets, &mut capture_store, cap_only)? == 0 {
                                 return Err("video send_frame stuck on EAGAIN".into());
                             }
                             continue;
@@ -1583,10 +1986,112 @@ pub fn run_pipeline(
                         }
                         break;
                     }
+                    // v0.5.1: drain IMMEDIATELY after the start send — the
+                    // decode-back seed needs this frame's packet NOW (the
+                    // zero-delay encoder emits it synchronously; cap_only
+                    // keeps it captured without muxing).
+                    if cap_only {
+                        drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets, &mut capture_store, cap_only)?;
+                    }
+                    // ── v0.5.1 DECODE-BACK SEED ──────────────────────────
+                    // The v0.5 seed (same ORIGINAL pixels at pts k+1) had a
+                    // nonzero P residual — a clone re-applies its residual
+                    // on EVERY re-emission and the decode drifts (+10
+                    // mean-abs-diff by mid-file, measured). The seed here
+                    // feeds the IDR's DECODED pixels instead: the P-frame is
+                    // an exact no-change (all-SKIP) frame, so clones decode
+                    // to the reference bit-exactly. Falls back to the
+                    // original-frame seed only if the decoder is unusable.
+                    if run_len >= 2 {
+                        let seed_frame_data: Option<()> = (|| {
+                            let (dctx, dframe, dpkt) = dec_back.as_mut()?;
+                            let cap = capture_store.as_ref()?.last()?;
+                            if cap.data.is_empty() {
+                                return None;
+                            }
+                            // feed the start packet to the decoder
+                            if ff.packet_new(dpkt.raw, cap.data.len()).is_err() {
+                                return None;
+                            }
+                            unsafe {
+                                let dst = ff.packet_data(dpkt.raw);
+                                std::ptr::copy_nonoverlapping(cap.data.as_ptr(), dst, cap.data.len());
+                            }
+                            let sp = unsafe { (ff.syms.avcodec_send_packet)(dctx.raw, dpkt.raw) };
+                            if sp < 0 && sp != AVERROR_EAGAIN {
+                                return None;
+                            }
+                            ff.packet_unref(dpkt.raw);
+                            // receive the decoded picture (threads=1: zero
+                            // delay — exactly one frame per packet). The
+                            // frame is KEPT ref'd until the plane copy below.
+                            let rf = unsafe { (ff.syms.avcodec_receive_frame)(dctx.raw, dframe.raw) };
+                            if rf != 0 {
+                                return None; // no picture — unusable
+                            }
+                            Some(())
+                        })();
+                        let usable = seed_frame_data.is_some();
+                        let seed_avframe = if usable {
+                            // take the NEXT ring slot and copy the decoded
+                            // planes (YUV420P → YUV420P, per-row)
+                            let af = &frame_ring[ring_pos];
+                            ring_pos = (ring_pos + 1) % frame_ring_size;
+                            unsafe {
+                                let r = (ff.syms.av_frame_make_writable)(af.raw);
+                                if r < 0 {
+                                    return Err(format!("av_frame_make_writable(seed): {}", ff.err2str(r)));
+                                }
+                            }
+                            let (_, dframe, _) = dec_back.as_ref().unwrap();
+                            let w = cw as usize;
+                            let h = ch as usize;
+                            let h2 = (h + 1) / 2;
+                            let planes = [(0usize, h, w), (1, h2, w / 2), (2, h2, w / 2)];
+                            for (pi, rows, row_bytes) in planes {
+                                let src = ff.frame_data(dframe.raw, pi);
+                                let src_ls = ff.frame_linesize(dframe.raw, pi).max(1) as usize;
+                                let dst = ff.frame_data(af.raw, pi);
+                                let dst_ls = ff.frame_linesize(af.raw, pi).max(1) as usize;
+                                unsafe {
+                                    for row in 0..rows {
+                                        std::ptr::copy_nonoverlapping(src.add(row * src_ls), dst.add(row * dst_ls), row_bytes);
+                                    }
+                                }
+                            }
+                            unsafe { (ff.syms.av_frame_unref)(dframe.raw) };
+                            ff.frame_clear_pict_type(af.raw);
+                            af
+                        } else {
+                            // FALLBACK: the original composite (v0.5
+                            // semantics — small drift, still functional).
+                            // CLEAR the forced intra first — this slot was
+                            // just sent as the run's start keyframe.
+                            if !dec_back_fallback {
+                                log::warn!("[rust-engine] decode-back seed missed at frame {} — using the original frame (drift risk)", k);
+                            }
+                            ff.frame_clear_pict_type(avframe.raw);
+                            avframe
+                        };
+                        ff.frame_set_pts(seed_avframe.raw, (k + 1) as i64);
+                        loop {
+                            let s = (ff.syms.avcodec_send_frame)(venc.ctx.raw, seed_avframe.raw);
+                            if s == AVERROR_EAGAIN {
+                                if drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets, &mut capture_store, cap_only)? == 0 {
+                                    return Err("video send_frame (seed) stuck on EAGAIN".into());
+                                }
+                                continue;
+                            }
+                            if s < 0 {
+                                return Err(format!("video send_frame (seed): {}", ff.err2str(s)));
+                            }
+                            break;
+                        }
+                    }
                 }
                 // drain encoder → mux (EAGAIN-aware: NVENC async delay is
                 // INTACT now, packets arrive a few frames later)
-                drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets, &mut capture_store)?;
+                drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets, &mut capture_store, cap_only)?;
 
                 // v2.1: hand the frame's VIDEO-layer RGBA buffers back to the
                 // producer's pool. The compositor has fully consumed them
@@ -1605,10 +2110,10 @@ pub fn run_pipeline(
 
                 // progress (throttle to ~8/s, always first/last)
                 let el = v_loop_start.elapsed();
-                if k == 0 || k + 1 == total_frames || el - last_emit > std::time::Duration::from_millis(125) {
+                if k == 0 || covered >= total_frames || el - last_emit > std::time::Duration::from_millis(125) {
                     last_emit = el;
-                    let frac = (k + 1) as f64 / total_frames as f64;
-                    let encode_fps = (k + 1) as f64 / el.as_secs_f64().max(0.001);
+                    let frac = covered as f64 / total_frames as f64;
+                    let encode_fps = covered as f64 / el.as_secs_f64().max(0.001);
                     // v0.4: ETA from the sliding rate window (refreshed every
                     // ≥3 s) + a conservative audio-phase estimate (AAC runs at
                     // ≥80× realtime even on weak CPUs). In dedup mode the live
@@ -1622,13 +2127,13 @@ pub fn run_pipeline(
                         if let Some((mk, mt)) = rate_mark {
                             let dt = mt.elapsed().as_secs_f64();
                             if dt >= 3.0 {
-                                let f = (k + 1 - mk) as f64 / dt;
+                                let f = (covered - mk.min(covered)) as f64 / dt;
                                 if f > 0.5 {
-                                    let rem_v = (total_frames - (k + 1)) as f64 / f;
+                                    let rem_v = (total_frames - covered) as f64 / f;
                                     let rem_a = total_sec / 80.0;
                                     eta_ms = Some(((rem_v + rem_a) * 1000.0) as i64);
                                 }
-                                rate_mark = Some((k + 1, Instant::now()));
+                                rate_mark = Some((covered, Instant::now()));
                             }
                         }
                     }
@@ -1654,7 +2159,7 @@ pub fn run_pipeline(
             return Err(format!("video flush: {}", ff.err2str(s)));
         }
     }
-    drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets, &mut capture_store)?;
+    drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets, &mut capture_store, cap_only)?;
     trace(&format!("video flush done: captured={} packets", capture_store.as_ref().map(|c| c.len()).unwrap_or(0)));
     if let Some(plan) = dedup {
         trace("clone phase begin");
@@ -1759,6 +2264,117 @@ pub fn run_pipeline(
                 log::info!(
                     "[rust-engine] static-tail dedup: {} tail frames cloned from one packet in {} ms",
                     remaining,
+                    t_clone.elapsed().as_millis()
+                );
+            }
+            DedupKind::CaptionRuns => {
+                trace("clone: CaptionRuns begin");
+                // v0.5.1 ORDERED IDR EMISSION: the live phase captured the
+                // run-starts WITHOUT muxing (cap_only) — they are scattered
+                // across the whole timeline, so muxing them live would
+                // submit the video stream out of dts order and the muxer
+                // would reject the first clone ("non monotonically
+                // increasing dts"; reproduced on a 12-s bench at v0.5.0).
+                // Here EVERY packet is emitted in strict frame order, so
+                // the stream is monotonic by construction.
+                //
+                // GOP is normal; each run's START was forced intra
+                // (pict_type=I) and its seed (the start's DECODED pixels
+                // re-fed to the encoder) is an exact no-change P-frame.
+                // Emission per run, in strict frame order: the start
+                // verbatim, the seed verbatim, then the seed cloned for
+                // [start+2, start+len) — every clone decodes to the
+                // reference bit-exactly (zero residual), so the whole run
+                // shows the start's picture with ZERO drift, and the
+                // run-start keyframe keeps the file seekable.
+                let runs = plan.runs.clone().unwrap_or_default();
+                let n_runs = runs.len();
+                let mut cap_i = 0usize;
+                let mut written = 0u64;
+                let mut last_emit = std::time::Duration::from_secs(0);
+                let mut clones_done: u64 = 0;
+                let total_clones: u64 = total_frames.saturating_sub(plan.encode_frames);
+                for run in runs {
+                    if run.len < 1 {
+                        continue; // degenerate zero-length run
+                    }
+                    // the run's start packet (captured live, re-emitted now)
+                    let start = captured
+                        .get(cap_i)
+                        .ok_or_else(|| "caption-run dedup: packet stream ended before the run table".to_string())?;
+                    // sanity: the start's pts must match frame run.start
+                    // (±2 muxer-tb ticks — rescale rounding tolerance)
+                    let expected_start = off_tb(run.start);
+                    if (start.pts - expected_start).abs() > 2 {
+                        return Err(format!(
+                            "caption-run dedup: start pts {} ≠ expected {} at frame {} — encoder reordered packets",
+                            start.pts, expected_start, run.start
+                        ));
+                    }
+                    cap_i += 1;
+                    write_pkt_clone(&ff, pkt.raw, start, 0, v_idx, oc.raw, &mut wrote_packets)?;
+                    written += 1;
+                    // (when run.len ≥ 2) the zero-residual seed
+                    let seed: &CapturedPkt = if run.len >= 2 {
+                        let seed = captured
+                            .get(cap_i)
+                            .ok_or_else(|| "caption-run dedup: missing seed packet".to_string())?;
+                        // sanity: the seed's pts must match frame run.start+1
+                        let expected = off_tb(run.start + 1);
+                        if (seed.pts - expected).abs() > 2 {
+                            return Err(format!(
+                                "caption-run dedup: seed pts {} ≠ expected {} at frame {} — encoder reordered packets",
+                                seed.pts, expected, run.start
+                            ));
+                        }
+                        cap_i += 1;
+                        write_pkt_clone(&ff, pkt.raw, seed, 0, v_idx, oc.raw, &mut wrote_packets)?;
+                        written += 1;
+                        seed
+                    } else {
+                        start
+                    };
+                    // clone the seed for frames [run.start+2, run.start+len)
+                    for f in (run.start + 2)..(run.start + run.len) {
+                        if cancelled.load(Ordering::Relaxed) {
+                            return Err("cancelled".into());
+                        }
+                        let off = off_tb(f) - seed.pts;
+                        write_pkt_clone(&ff, pkt.raw, seed, off, v_idx, oc.raw, &mut wrote_packets)?;
+                        written += 1;
+                        clones_done += 1;
+                    }
+                    let el = t_clone.elapsed();
+                    if clones_done % 4096 == 0 || clones_done == total_clones || el - last_emit > std::time::Duration::from_millis(125) {
+                        last_emit = el;
+                        let frac = written as f64 / total_frames as f64;
+                        let el_s = el.as_secs_f64().max(0.001);
+                        let rate = clones_done as f64 / el_s;
+                        let eta_ms = Some(
+                            (((total_clones - clones_done) as f64 / rate.max(1e-6) + total_sec / 80.0) * 1000.0) as i64,
+                        );
+                        progress(ProgressEvent {
+                            phase: "video".into(),
+                            percent: 1.0 + 90.0 * frac,
+                            fps: 0.0,
+                            timemark_sec: (written as f64 / fps).max(0.0),
+                            eta_ms,
+                        });
+                    }
+                }
+                if cap_i != captured.len() {
+                    log::warn!(
+                        "[rust-engine] caption-run dedup: {} captured packets left unconsumed ({} walked) — encoder emitted more than the run table predicted",
+                        captured.len() - cap_i,
+                        cap_i
+                    );
+                }
+                log::info!(
+                    "[rust-engine] caption-run dedup: {} zero-drift seed packets cloned for {} runs ({} of {} frames live) in {} ms",
+                    clones_done,
+                    n_runs,
+                    plan.encode_frames,
+                    total_frames,
                     t_clone.elapsed().as_millis()
                 );
             }
@@ -1963,6 +2579,7 @@ pub fn run_pipeline(
         size_bytes: size,
         adapter,
         dedup: dedup_report,
+        compositor_note,
     })
 }
 
@@ -2433,11 +3050,20 @@ fn detect_static_image(
     if total_frames < 64 {
         return None;
     }
+    // v0.5.1: TWO live frames, not one. The captured "last" packet then is
+    // frame 1's P-frame (bf=0 on this path) — a chain of tiny P-clones,
+    // ~100 bytes each. The v0.5.0 plan (encode_frames=1) captured frame
+    // 0's IDR (~38 KB at 720p) and re-emitted it for EVERY remaining
+    // frame: a 10-min static export ballooned to 557 MB (14.4k keyframes),
+    // and 62.8-min would have been ~3.5 GB. P/I-only + clone-the-P is both
+    // valid (a still-frame P references the previous picture — same
+    // content) and ~2500× smaller per cloned frame.
     Some(LoopDedupPlan {
         kind: DedupKind::StaticTail,
         cycle_frames: 1,
-        encode_frames: 1,
+        encode_frames: 2,
         snap_span_sec: None,
+        runs: None,
     })
 }
 
@@ -2508,6 +3134,7 @@ fn detect_loop_cycle(
         cycle_frames,
         encode_frames: cycle_frames.min(total_frames),
         snap_span_sec: Some(cycle_frames as f64 / timeline.fps),
+        runs: None,
     })
 }
 
@@ -2534,12 +3161,61 @@ fn detect_static_tail(
     if tail_frames < 32 {
         return None; // a short tail isn't worth the machinery
     }
+    // v0.5.1: TWO frames past the visual end (when available) so the
+    // captured "last" packet is the tail's second frame — a P-frame on
+    // the bf=0 clone path — instead of the tail's first frame (which can
+    // land mid-GOP as a B-frame or a bulky intra). Same rationale as
+    // detect_static_image's encode_frames=2.
+    if total_frames < tail_from + 2 {
+        return None; // (unreachable given tail_frames ≥ 32, but explicit)
+    }
     Some(LoopDedupPlan {
         kind: DedupKind::StaticTail,
         cycle_frames: 1,
-        encode_frames: (tail_from + 1).min(total_frames),
+        encode_frames: tail_from + 2,
         snap_span_sec: None,
+        runs: None,
     })
+}
+
+/// v0.5.1: open an H.264 decoder for the decode-back seed — the decoder
+/// shares the ENCODER's extradata (SPS/PPS, via parameter transfer) so it
+/// can decode the just-encoded run-start IDR. Single-threaded: the decoded
+/// frame must be available immediately (zero frame-thread delay).
+/// Returns (decoder ctx, decoded AVFrame, feeding AVPacket).
+fn init_decode_back(ff: &FFmpegLibs, enc_ctx: *mut u8) -> Result<(PtrGuard, PtrGuard, PtrGuard), String> {
+    let dec = unsafe { (ff.syms.avcodec_find_decoder)(AV_CODEC_ID_H264) };
+    if dec.is_null() {
+        return Err("no H.264 decoder in the FFmpeg build".into());
+    }
+    let dctx_raw = unsafe { (ff.syms.avcodec_alloc_context3)(dec) };
+    if dctx_raw.is_null() {
+        return Err("avcodec_alloc_context3(decoder) failed".into());
+    }
+    let dctx = PtrGuard::new(dctx_raw, ff.syms.avcodec_free_context)?;
+    // extradata (SPS/PPS) from the encoder context via parameter transfer
+    let mut par = unsafe { (ff.syms.avcodec_parameters_alloc)() };
+    if par.is_null() {
+        return Err("avcodec_parameters_alloc failed".into());
+    }
+    let r1 = unsafe { (ff.syms.avcodec_parameters_from_context)(par, enc_ctx) };
+    let r2 = if r1 == 0 {
+        unsafe { (ff.syms.avcodec_parameters_to_context)(dctx.raw, par) }
+    } else {
+        r1
+    };
+    unsafe { (ff.syms.avcodec_parameters_free)(&mut par) };
+    if r2 != 0 {
+        return Err(format!("parameter transfer to decoder: {}", ff.err2str(r2)));
+    }
+    ff.cc_set_thread_count(dctx.raw, 1); // zero decode delay
+    let r = unsafe { (ff.syms.avcodec_open2)(dctx.raw, dec, std::ptr::null_mut()) };
+    if r != 0 {
+        return Err(format!("decoder open: {}", ff.err2str(r)));
+    }
+    let frame = ff.frame_alloc()?;
+    let pkt = ff.packet_alloc()?;
+    Ok((dctx, frame, pkt))
 }
 
 /// Emit one captured packet with timestamps shifted by `off` (muxer tb).
@@ -2572,6 +3248,168 @@ fn write_pkt_clone(
     }
     *wrote_packets += 1;
     Ok(())
+}
+
+// ── v0.5 CAPTION-RUN DEDUP (the "1 image + audio + captions" fast path) ────
+
+/// Structural gate: the composite is a STATIC BACKGROUND (any number of
+/// plain base-lane images, or none at all — audio-only timelines) plus
+/// CAPTIONS as the only time-varying element. No overlays, no headline
+/// texts, no kinetic engine, no watermark, no per-segment motion.
+fn static_background_gate(
+    timeline: &Timeline,
+    base: &[usize],
+    overlays: &[usize],
+    texts: &[(usize, TextLayer, f64, f64, f64)],
+    captions: &Option<Arc<PreparedCaptions>>,
+    kinetic: &Option<Arc<PreparedKinetic>>,
+    watermark: &Option<TextLayer>,
+) -> bool {
+    if overlays.is_empty() == false || texts.is_empty() == false {
+        return false;
+    }
+    if kinetic.is_some() || watermark.is_some() || captions.is_none() {
+        return false;
+    }
+    for &i in base {
+        let seg = &timeline.segments[i];
+        if seg.media_type != "image" {
+            return false; // video frames change every frame — not static
+        }
+        if (seg.speed - 1.0).abs() > 1e-6 {
+            return false; // speed rescales per frame
+        }
+        if let Some(kb) = &seg.ken_burns {
+            if kb.enabled {
+                return false; // zoom/pan animates every frame
+            }
+        }
+        if seg.trans_head_ms > 0.0 || seg.trans_tail_ms > 0.0 {
+            return false;
+        }
+        if seg.bookend_start_ms > 0.0 || seg.bookend_end_ms > 0.0 {
+            return false; // fade windows change alpha per frame
+        }
+        if seg.chroma.is_some() {
+            return false; // (static but keep the gate conservative)
+        }
+    }
+    true
+}
+
+/// One frame's visual signature as a flat u64 list: the active base image's
+/// bitmap id (multi-image slideshows change the background at boundaries)
+/// plus every caption text layer's (bitmap id, dest rect, alpha). Two equal
+/// signatures ⇒ the composited output is bit-identical (same inputs into a
+/// deterministic compositor).
+fn caption_frame_signature(
+    timeline: &Timeline,
+    base: &[usize],
+    image_bitmaps: &std::collections::HashMap<usize, Bitmap>,
+    pc: &PreparedCaptions,
+    now_ms: f64,
+    cw: u32,
+    ch: u32,
+) -> Vec<u64> {
+    let mut sig: Vec<u64> = Vec::with_capacity(12);
+    // active base image (mirrors build_frame_job's seg_at — first match)
+    for &i in base {
+        let s = &timeline.segments[i];
+        let end = if s.end_ms > s.start_ms { s.end_ms } else { s.start_ms + s.duration_ms };
+        if now_ms >= s.start_ms - 1e-6 && now_ms < end {
+            if let Some(b) = image_bitmaps.get(&i) {
+                sig.push(b.id);
+            }
+            break;
+        }
+    }
+    let layers = captions::layers_at(pc, now_ms, cw, ch);
+    for tl in &layers {
+        sig.push(tl.bitmap.id);
+        sig.push(((tl.dest_px.0 as u64) << 32) | (tl.dest_px.1 as u64));
+        sig.push(((tl.dest_px.2 as u64) << 32) | (tl.dest_px.3 as u64));
+        sig.push(tl.alpha.to_bits() as u64);
+    }
+    sig
+}
+
+/// v0.5 detection: walk every frame's caption signature, group identical
+/// frames into runs. Returns None when the gate fails or when the runs
+/// don't actually save meaningful encoder work (e.g. a continuously
+/// animated caption style like word-only+slam makes every frame unique —
+/// the dense path is then the honest choice and no B-frames are lost).
+fn detect_caption_runs(
+    timeline: &Timeline,
+    base: &[usize],
+    overlays: &[usize],
+    texts: &[(usize, TextLayer, f64, f64, f64)],
+    captions: &Option<Arc<PreparedCaptions>>,
+    kinetic: &Option<Arc<PreparedKinetic>>,
+    watermark: &Option<TextLayer>,
+    image_bitmaps: &std::collections::HashMap<usize, Bitmap>,
+    total_frames: u64,
+    fps: f64,
+    cw: u32,
+    ch: u32,
+) -> Option<Vec<CaptionRun>> {
+    if std::env::var("FRAMEFUSE_DISABLE_CAPTION_RUNS").map(|v| v == "1").unwrap_or(false) {
+        return None; // test/bisect kill switch
+    }
+    if total_frames < 64 {
+        return None;
+    }
+    if !static_background_gate(timeline, base, overlays, texts, captions, kinetic, watermark) {
+        return None;
+    }
+    let pc = captions.as_ref().unwrap();
+    let t_walk = Instant::now();
+    let mut runs: Vec<CaptionRun> = Vec::with_capacity(1024);
+    let mut prev_sig: Option<Vec<u64>> = None;
+    let mut cur_start: u64 = 0;
+    let mut cur_len: u64 = 0;
+    for k in 0..total_frames {
+        let now_ms = k as f64 / fps * 1000.0;
+        let sig = caption_frame_signature(timeline, base, image_bitmaps, pc, now_ms, cw, ch);
+        let same = prev_sig.as_ref().map(|p| p == &sig).unwrap_or(false);
+        if same {
+            cur_len += 1;
+        } else {
+            if cur_len > 0 {
+                runs.push(CaptionRun { start: cur_start, len: cur_len });
+            }
+            cur_start = k;
+            cur_len = 1;
+            prev_sig = Some(sig);
+        }
+    }
+    if cur_len > 0 {
+        runs.push(CaptionRun { start: cur_start, len: cur_len });
+    }
+    // worth-it check: live = the forced-IDR start (+ zero-residual seed per run ≥ 2)
+    let live: u64 = runs
+        .iter()
+        .map(|r| 1 + u64::from(r.len >= 2))
+        .sum();
+    let total = total_frames;
+    // engage only when we save ≥ 20% of the encoder work (below that the
+    // B-frame suppression trade + clone machinery aren't worth it)
+    if live > total.saturating_sub(1) / 5 * 4 {
+        trace(&format!(
+            "caption-runs: NOT engaging (live {} of {} frames — animated captions dominate)",
+            live, total
+        ));
+        return None;
+    }
+    let cloned = total.saturating_sub(live.min(total));
+    log::info!(
+        "[rust-engine] CAPTION-RUN FAST PATH: {} runs ({} live frames, {} cloned — {:.1}% of the timeline) — signature walk {} ms",
+        runs.len(),
+        live,
+        cloned,
+        100.0 * cloned as f64 / total as f64,
+        t_walk.elapsed().as_millis()
+    );
+    Some(runs)
 }
 
 // ── the frame builder (runs ON THE PRODUCER THREAD) ────────────────────────
@@ -2867,7 +3705,7 @@ fn build_frame_job(
                 .collect::<Vec<_>>()
         );
     }
-    Ok(FrameJob { k, layers, texts: text_layers, background })
+    Ok(FrameJob { k, layers, texts: text_layers, background, run_len: 0 })
 }
 
 /// Drain the video encoder into the muxer. Returns how many packets were
@@ -2876,6 +3714,13 @@ fn build_frame_job(
 /// v0.4: `capture` (Some during the dedup fast path) records each drained
 /// packet's post-rescale timestamps + bytes so later loop cycles can re-emit
 /// them with shifted pts/dts instead of re-encoding identical frames.
+///
+/// v0.5.1 `capture_only`: caption-run mode records WITHOUT muxing. The live
+/// run-starts are scattered across the whole timeline while the clones fill
+/// the gaps BETWEEN them — muxing the live packets as they drain submits the
+/// video stream out of dts order and the muxer rejects the first clone
+/// ("non monotonically increasing dts"; reproduced on a 12-s bench). The
+/// clone phase re-emits start + seed + clones in strict frame order instead.
 #[allow(clippy::too_many_arguments)]
 fn drain_video_encoder(
     ff: &FFmpegLibs,
@@ -2888,6 +3733,7 @@ fn drain_video_encoder(
     v_tb: &Rational,
     wrote_packets: &mut u64,
     capture: &mut Option<Vec<CapturedPkt>>,
+    capture_only: bool,
 ) -> Result<usize, String> {
     let _ = vstream; // retained for signature clarity; index is precomputed
     let mut n = 0usize;
@@ -2916,6 +3762,13 @@ fn drain_video_encoder(
                 flags: ff.packet_flags(pkt),
                 data: bytes,
             });
+        }
+        if capture_only {
+            // captured, not muxed — the clone phase re-emits it in stream
+            // order (wrote_packets is counted there, at the actual write)
+            ff.packet_unref(pkt);
+            n += 1;
+            continue;
         }
         let w = unsafe { (ff.syms.av_interleaved_write_frame)(oc, pkt) };
         ff.packet_unref(pkt);

@@ -7,6 +7,9 @@ pub const AVFRAME_WIDTH: usize = 104;
 pub const AVFRAME_HEIGHT: usize = 108;
 pub const AVFRAME_NB_SAMPLES: usize = 112;
 pub const AVFRAME_FORMAT: usize = 116;
+/// v0.5.1 (verified against the real n7.1 headers by gcc offsetof —
+/// pts=136 / sample_rate=192 / ch_layout=408 / sizeof=440 all re-confirmed):
+pub const AVFRAME_PICT_TYPE: usize = 124;
 pub const AVFRAME_PTS: usize = 136;
 pub const AVFRAME_CH_LAYOUT: usize = 408;
 pub const AVFRAME_SAMPLE_RATE: usize = 192;
@@ -100,3 +103,7 @@ pub const FF_THREAD_FRAME: i32 = 1;
 pub const FF_THREAD_SLICE: i32 = 2;
 pub const AV_CODEC_ID_AAC: i32 = 86018;
 pub const AV_CODEC_ID_H264: i32 = 27;
+// v0.5.1: pict_type forcing for the caption-run IDR starts (values from the
+// n7.1 headers: enum AVPictureType { NONE=0, I=1, P=2, B=3, ... }).
+pub const AV_PICTURE_TYPE_NONE: i32 = 0;
+pub const AV_PICTURE_TYPE_I: i32 = 1;

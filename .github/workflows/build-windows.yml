@@ -213,6 +213,26 @@ jobs:
             YUV_TEST_COLOR=$c node rust-engine/tools/yuv-color-test.js 2>&1 | tee -a rust-engine/color-test.log
           done
 
+      # v0.5.1 ORIENTATION regression: the v1.33.9 GPU compositor exported
+      # UPSIDE-DOWN video (composite.wgsl flipped the sample UV vertically
+      # on top of a transform that already maps y=0 → screen top) — and
+      # every CI color test used SPATIALLY UNIFORM frames, so a vertical
+      # flip was invisible. This locks the orientation: a top-red /
+      # bottom-blue image AND decoded video must export upright, and
+      # position:bottom captions must stay at the bottom — on BOTH
+      # compositor paths (CPU + forced GPU), each case in its own child
+      # process (FRAMEFUSE_FORCE_COMPOSITOR is process-global).
+      - name: Rust engine orientation test (180° flip regression)
+        shell: bash
+        env:
+          FF_TEST_FFMPEG: "resources/ffmpeg/win/ffmpeg.exe"
+          FF_ENGINE_FFMPEG_DIR: "resources/ffmpeg/win/dll"
+          FF_TEST_MEDIA_DIR: "${{ runner.temp }}/fftest-orient"
+          FRAMEFUSE_ENGINE_ALLOW_SOFTWARE_GPU: "1"
+        run: |
+          set -o pipefail
+          node rust-engine/tools/orientation-test.js 2>&1 | tee rust-engine/orientation-test.log
+
       # v2 engine feature test: native transitions (dissolve + dips +
       # bookends) + extra audio (voiceover/SFX on the native bus), with
       # luma-profile + volumedetect assertions. Runs after the smoke test.
@@ -263,6 +283,7 @@ jobs:
             rust-engine/feature-v2.log
             rust-engine/feature-v3.log
             rust-engine/color-test.log
+            rust-engine/orientation-test.log
           if-no-files-found: warn
           retention-days: 14
 

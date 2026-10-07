@@ -82,8 +82,13 @@ pub struct ExportResult {
     /// Loaded FFmpeg shared-library family (e.g. "61/61/59/8/5").
     pub ffmpeg_family: String,
     /// v0.4.1: which packet-dedup fast path ran ("loop-cycle …",
-    /// "static-tail …"), or None when every frame was encoded live.
+    /// "static-tail …", "caption-runs …"), or None when every frame was
+    /// encoded live.
     pub dedup: Option<String>,
+    /// v0.5: the compositor benchmark verdict ("gpu composite 7.9 fps <
+    /// cpu raster 61 fps → cpu rasterizer") — the engine health card shows
+    /// WHY the fast/slow compositor was chosen.
+    pub compositor_note: Option<String>,
 }
 
 #[napi]
@@ -243,6 +248,7 @@ pub fn export_video(
                             adapter: o.adapter,
                             ffmpeg_family,
                             dedup: o.dedup,
+                            compositor_note: o.compositor_note,
                         })
                     });
                 }
