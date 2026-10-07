@@ -3248,3 +3248,33 @@ Stage Summary:
 - The static-image no-caption case collapsed from 557 MB → 2.3 MB per 10 min (P-chain clones instead of repeated IDRs).
 - New FFI surface: avcodec_parameters_alloc/free, frame_force_intra/clear_pict_type (AVFRAME_PICT_TYPE=124, gcc-verified), cc_set_threading; decode-back decoder init helper.
 - Next: commit → push → CI (engine 0.5.1 + orientation test) → ASAR audit → release v1.34.0.
+
+---
+Task ID: 3 (cont. — release prep)
+Agent: main (Z.ai Code)
+
+Work Log:
+- Follow-up commit (6a76d34): the compositor benchmark verdict now surfaces end-to-end — engine 0.5.1's compositor_note → router `rustCompositorNote` → the export-success toast + LastExport ("gpu composite 7.9 fps < cpu raster 61 fps → cpu rasterizer" — the direct answer to the user's 8-fps health reading). Also fixed the stale dedup-off hint: captions NO LONGER veto the fast path (engine 0.5.1 caption-runs), the honest remaining vetoes are animated captions/ken-burns/text/overlays.
+- CI (run 37693784640, e84cd8a): engine job GREEN — smoke, GPU color (4 colors), NEW orientation test 6/6 PASS on real Windows WARP GPU path (`engine=rust-gpu` cases), v2, v3 20/20. Engine artifact 11514661392 downloaded: engineVersion 0.5.1, assertionsPassed, sha256 0de8d1d3…, orientation-test.log shows ALL PASS.
+- Release assets prepared: scripts/publish-release-1.34.0.js (release notes with the measured benchmark table + integrity-check instructions, dupe-aware CURL uploads, three-way sha512), agent-ctx/release-1.34.0/verify-asar.js (engine sha == CI-tested binary, 0.5.1 version stamp, FFmpeg DLLs, renderer 1.34.0 + rustCompositorNote markers, retained v1.33.4–9 regression markers).
+- Final CI run for the release: 37695967720 (6a76d34 — includes the router/UI bits; the release installer comes from THIS run).
+
+Stage Summary:
+- Everything staged for v1.34.0; waiting on CI → download installer → ASAR audit → publish → verify.
+
+---
+Task ID: 3 (final — v1.34.0 SHIPPED)
+Agent: main (Z.ai Code)
+Task: publish v1.34.0 (engine 0.5.1 — the 180° flip fix + the caption-run speed path that actually runs + the compositor verdict surfaced).
+
+Work Log:
+- Follow-up commit 6a76d34 (compositor verdict surfacing) → CI run 37695967720 GREEN end-to-end: engine job (smoke, GPU color 4 colors, ORIENTATION 6/6 PASS incl. rust-gpu on WARP, v2, v3 20/20) + installer job (the best-effort A/B bench timed out headless as on prior releases — non-blocking by design).
+- Installer artifact downloaded (FrameFuse Setup 1.34.0.exe, 244,134,169 bytes) → dist/ staged + latest.yml/blockmap normalized.
+- ASAR AUDIT (agent-ctx/release-1.34.0/verify-asar.js): ALL 31 CHECKS PASSED — the packaged engine binary is EXACTLY the release run's smoke+orientation-tested 0.5.1 (sha 16b6c61a…; first attempt compared against the older e84cd8a run's binary — re-staged from the same-run artifact 11515906040), engine 0.5.1 stamp, FFmpeg 7.1 DLLs + CLI, renderer 1.34.0 + rustCompositorNote markers, and every retained v1.33.4–9 regression marker.
+- PUBLISHED: scripts/publish-release-1.34.0.js → release 406233595 tag v1.34.0 (commit 6a76d34), 3 assets (FrameFuse-Setup-1.34.0.exe 244,134,169 B / latest.yml / blockmap), three-way sha512 VERIFIED (DOU1UCFa1gBU…). releases/latest ⇒ v1.34.0.
+- Final checks: dev server 200 (rebuilt after a cache clear), app loads at v1.34.0 with zero console errors, browser UX audit clean.
+
+Stage Summary:
+- v1.34.0 LIVE: https://github.com/Ziruax/framefuse/releases/tag/v1.34.0
+- The user's three reports are closed with MEASURED data: (1) "export is in opposite angle / 180 degree flip" — composite.wgsl UV flip fixed; orientation regression test (new, in CI) passes on both compositor paths on Windows WARP AND the real 62.8-min output verified upright pixel-level; (2) "export speed too much slow, contradiction with claimed numbers" — the caption fast path never ran on nvenc-registered-no-GPU machines (encoder-probe + dts-ordering + P-drift + retry-branch bugs, each reproduced on a 12-s bench and fixed); the user's exact scenario now measures 109.3 s for 62.8 min (34.5× realtime, 4.5× faster than v1.33.9, 150 MB, zero drift, seekable); (3) static-image exports collapsed 557 MB → 2.3 MB per 10 min.
+- The health card now also explains the compositor choice (the 8-fps APU case auto-selects the CPU rasterizer, verdict in the export toast).
