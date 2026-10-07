@@ -3166,3 +3166,21 @@ Stage Summary:
 - CRITICAL latent FFI bug found + fixed: AVFMTCTX_DURATION was reading heap garbage since the FFmpeg 7.x struct shift (filename[1024] removal) — harmless until v0.4 made it behavior-driving; this also explains both Windows CI failures.
 - Engine binaries are per-run (non-reproducible): each release ships ITS CI run's smoke-tested binary; verify per-release (engine.sha in agent-ctx/release-1.33.8/).
 - Playbook note: on the 4GB sandbox, ship the CI-built installer (workflow carries exe+yml+blockmap) instead of the local electron:build (OOMs).
+
+---
+Task ID: 1 (continuation — NSIS installer integrity report)
+Agent: main (Z.ai Code)
+Task: diagnose "NSIS Error: Installer integrity check has failed" reported by the user on the v1.33.8 installer.
+
+Work Log:
+- Computed sha512 of the local dist/FrameFuse-Setup-1.33.8.exe → EXACT match with latest.yml (b64 9oH1YyixZiR7…, hex f681f563…c5b0a). (agent-ctx/release-1.33.8/installer.sha is a stale sha256 from an earlier discarded local build — not the shipped file; the shipped file is the CI build, hash chain intact.)
+- Downloaded the FULL remote asset via the GitHub Releases API (asset id 618366208): status 200, content-length 244,035,423, full 244,035,423 bytes received, sha512 IDENTICAL to latest.yml. Asset state=uploaded, download_count=2 (the user's attempts).
+- Prior-session ASAR audit on this exact hash-extracted the whole payload 21/21 — a truncated file cannot pass that, so the shipped installer is structurally sound.
+- Checked recent releases: v1.33.8 is the live "latest" release; older releases all state=uploaded.
+- VERDICT: the published installer is byte-perfect end-to-end (local == remote == latest.yml). The corruption happened on the USER'S side during download — a truncated/partial file is the classic cause of the NSIS "Installer integrity check has failed" CRC error.
+- HARDENING: PATCHed release 405647587 notes with a "If you see 'Installer integrity check has failed'" section — exact expected size 244,035,423 bytes, the certutil SHA512 one-liner + expected hex hash, and re-download guidance (delete partial file, no pause/resume, no download accelerators, ~500 MB free disk).
+- Dev server verified healthy (GET / 200) during the session.
+
+Stage Summary:
+- No re-upload/re-release needed — the v1.33.8 asset on GitHub is verified perfect. User-facing fix: fresh full re-download, then confirm the file size is exactly 244,035,423 bytes before running.
+- Release notes now self-diagnose download corruption for any user (size + SHA512 + certutil command).
