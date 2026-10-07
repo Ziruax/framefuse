@@ -221,6 +221,20 @@ fn captions_debug_enabled() -> bool {
     *CAPTIONS_DEBUG.get_or_init(|| std::env::var("FF_DEBUG_CAPTIONS").is_ok())
 }
 
+// v0.4.1 (Windows CI crash bisect): env-gated pipeline trace — prints each
+// stage boundary to stderr so a native crash's location is unambiguous.
+static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+#[allow(dead_code)]
+fn trace_enabled() -> bool {
+    *TRACE.get_or_init(|| std::env::var("FF_TRACE").is_ok())
+}
+#[allow(dead_code)]
+fn trace(msg: &str) {
+    if trace_enabled() {
+        eprintln!("[ff-trace] {}", msg);
+    }
+}
+
 // ── video source decoder (LIVES ON THE PRODUCER THREAD) ───────────────────
 
 pub struct VideoSource {
@@ -1286,16 +1300,22 @@ pub fn run_pipeline(
     );
     if let Some(d) = &dedup {
         match d.kind {
-            DedupKind::LoopCycle => log::info!(
-                "[rust-engine] STATIC-LOOP FAST PATH: {} frame cycle × {} cycles — encoding ONCE, cloning the bitstream for the rest",
-                d.cycle_frames,
-                (total_frames as f64 / d.cycle_frames as f64).ceil()
-            ),
-            DedupKind::StaticTail => log::info!(
-                "[rust-engine] STATIC-TAIL FAST PATH: visuals end at frame {} of {} — the constant-background tail clones from ONE packet",
-                d.encode_frames - 1,
-                total_frames
-            ),
+            DedupKind::LoopCycle => {
+                trace(&format!("dedup: LoopCycle cycle_frames={} encode_frames={}", d.cycle_frames, d.encode_frames));
+                log::info!(
+                    "[rust-engine] STATIC-LOOP FAST PATH: {} frame cycle × {} cycles — encoding ONCE, cloning the bitstream for the rest",
+                    d.cycle_frames,
+                    (total_frames as f64 / d.cycle_frames as f64).ceil()
+                );
+            }
+            DedupKind::StaticTail => {
+                trace(&format!("dedup: StaticTail encode_frames={}", d.encode_frames));
+                log::info!(
+                    "[rust-engine] STATIC-TAIL FAST PATH: visuals end at frame {} of {} — the constant-background tail clones from ONE packet",
+                    d.encode_frames - 1,
+                    total_frames
+                );
+            }
         }
     }
     let producer_frame_limit: u64 = dedup
@@ -1609,9 +1629,9 @@ pub fn run_pipeline(
         }
     }
     drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets, &mut capture_store)?;
-
-    // ── v0.4 DEDUP: clone the repeatable part's packets ───────────────────
+    trace(&format!("video flush done: captured={} packets", capture_store.as_ref().map(|c| c.len()).unwrap_or(0)));
     if let Some(plan) = dedup {
+        trace("clone phase begin");
         let captured = capture_store.take().unwrap_or_default();
         if captured.is_empty() {
             return Err("loop dedup: the encoded prefix produced no packets".into());
@@ -1626,6 +1646,7 @@ pub fn run_pipeline(
         let t_clone = Instant::now();
         match plan.kind {
             DedupKind::LoopCycle => {
+                trace("clone: LoopCycle");
                 let cycles = total_frames / plan.cycle_frames;
                 let rem = total_frames % plan.cycle_frames;
                 let mut written = plan.encode_frames;
@@ -1676,6 +1697,7 @@ pub fn run_pipeline(
                 );
             }
             DedupKind::StaticTail => {
+                trace("clone: StaticTail begin");
                 // The LAST captured packet is the first tail frame (max dts at
                 // flush). Clone it for every remaining tail frame — a chain of
                 // identical P-frames, exactly what a still/black-tail encode
@@ -1719,6 +1741,7 @@ pub fn run_pipeline(
     }
 
     // ── AUDIO PHASE (mix ran in parallel — join it now) ──────────────────
+    trace("audio phase begin");
     let mut audio_ms: i64 = 0;
     if let Some(ref _ae) = aenc {
         let a0 = Instant::now();
@@ -1875,6 +1898,7 @@ pub fn run_pipeline(
     // path (success, error, cancel).
 
     // ── trailer + finish (movflags +faststart relocates moov here) ──────
+    trace("trailer begin");
     progress(ProgressEvent {
         phase: "mux".into(),
         percent: 98.5,
@@ -1886,6 +1910,7 @@ pub fn run_pipeline(
     if r < 0 {
         return Err(format!("av_write_trailer: {}", ff.err2str(r)));
     }
+    trace("trailer done");
 
     log::info!(
         "[rust-engine] export complete: {} packets, {} frames, engine={}, encoder={}",

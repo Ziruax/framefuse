@@ -244,6 +244,8 @@ jobs:
           FF_TEST_MEDIA_DIR: "${{ runner.temp }}/fftest-v3"
           FF_TEST_FONT: "C:/Windows/Fonts/arialbd.ttf"
           FRAMEFUSE_ENGINE_ALLOW_SOFTWARE_GPU: "1"
+          # v0.4.1 crash bisect: stage-boundary traces to stderr
+          FF_TRACE: "1"
         run: |
           set -o pipefail
           node rust-engine/tools/v3-feature-test.js 2>&1 | tee rust-engine/feature-v3.log

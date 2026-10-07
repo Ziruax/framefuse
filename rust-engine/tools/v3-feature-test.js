@@ -219,6 +219,7 @@ function check(label, ok) {
 }
 
 async function main() {
+  console.log("[v3] fixtures ready; starting scenario 1 (loop)");
   // ── 1. BASE-LANE LOOP-TO-FILL ───────────────────────────────────────────
   await exportTimeline("loop", {
     ...baseTimeline,
