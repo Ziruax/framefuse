@@ -3194,8 +3194,13 @@ function runFfmpeg(args, totalSec, onTime, opts) {
  * killed writer leaves a headerless husk. A missing/truncated output now
  * FAILS the export honestly (with the likely cause) instead of reporting
  * success with no video — the exact "stuck at 100%, no output" shape.
+ * v1.33.8: audio-extended timelines (audio longer than the visuals) are
+ * LEGAL and render full-length through the Rust engine; a short output
+ * that matches the VISUAL span is a video-track extension failure, NOT a
+ * disk-full — the error now says exactly that (the false "destination disk
+ * most likely filled up" report).
  * Returns the verified size; throws a plain-language error otherwise. */
-async function verifyExportOutputAsync(outputPath, expectedTotalSec, stageLabel) {
+async function verifyExportOutputAsync(outputPath, expectedTotalSec, stageLabel, visualTotalSec = 0) {
   let size = 0;
   try { size = fs.statSync(outputPath).size; } catch (_) { size = 0; }
   if (!(size > 1024)) {
@@ -3212,6 +3217,19 @@ async function verifyExportOutputAsync(outputPath, expectedTotalSec, stageLabel)
     const gotSec = vprobe && vprobe.durationMs ? vprobe.durationMs / 1000 : 0;
     if (gotSec > 0 && expectedTotalSec > 5 &&
         Math.abs(gotSec - expectedTotalSec) > Math.max(4, expectedTotalSec * 0.02)) {
+      // v1.33.8: did the output stop EXACTLY at the visual span instead? That
+      // is the video-track extension failing (the audio got cut with it) —
+      // a completely different diagnosis (and remedy) from a full disk.
+      const visualMatch =
+        visualTotalSec > 5 && Math.abs(gotSec - visualTotalSec) <= Math.max(4, visualTotalSec * 0.02);
+      if (visualMatch && visualTotalSec + 4 < expectedTotalSec) {
+        throw new Error(
+          `${stageLabel}: the output is ${gotSec.toFixed(1)}s — it stopped at the last VISUAL frame instead of the ` +
+            `${expectedTotalSec.toFixed(1)}s timeline (the audio is longer than the visuals). The audio was cut short. ` +
+            `Set the video/image to Loop on the timeline so it fills the whole timeline, then retry — the native engine ` +
+            `renders the full audio length either way.`
+        );
+      }
       throw new Error(
         `${stageLabel}: the output file is ${gotSec.toFixed(1)}s long but the timeline is ${expectedTotalSec.toFixed(1)}s — ` +
           `the write was cut short. The destination disk most likely filled up mid-export; free space and retry.`
@@ -6813,7 +6831,7 @@ ipcMain.handle("export-native", async (event, opts) => {
         // v1.33.3: verify the output exists + is complete before success
         // (a truncated/missing file fails honestly instead of "success
         // with no video").
-        const size = await verifyExportOutputAsync(outputPath, totalSec, "Export");
+        const size = await verifyExportOutputAsync(outputPath, totalSec, "Export", segmentsTotalMs / 1000);
         return {
           path: outputPath,
           size,
@@ -7467,7 +7485,7 @@ ipcMain.handle("export-native", async (event, opts) => {
     // v1.33.3: verify the output exists + is complete before success (a
     // truncated/missing file fails honestly instead of "success with no
     // video" - the exact stuck-at-100% report shape).
-    const size = await verifyExportOutputAsync(outputPath, actualTotalSec, "Export");
+    const size = await verifyExportOutputAsync(outputPath, actualTotalSec, "Export", segmentsTotalMs / 1000);
     // v1.1 TURBO: the result carries the performance story so the UI can
     // show users WHY the export was fast (encoder + stream-copy counts).
     // v1.4.1: keyframeCuts = copied clips that entered the fast path via a

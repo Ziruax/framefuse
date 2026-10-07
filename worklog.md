@@ -3119,3 +3119,29 @@ Stage Summary:
 - v1.33.7 IS LIVE: https://github.com/Ziruax/framefuse/releases/tag/v1.33.7 (installer FrameFuse-Setup-1.33.7.exe, 220.4MB).
 - THE COMPLETE ANSWER to the user's question shipped in code + measurements: the Rust engine (napi-rs + runtime-dlopened libav* — the user's blueprint, already) is THE export pipeline for every scenario; the CLI multi-phase path is demoted to the Safe-Mode fallback + 3 niche feature gates. Same encoders as the CLI, one native pass, no intermediates, GPU compositing + hardware-encoder probing, bounded memory, one honest progress model.
 - BONUS CRITICAL FIX: the GPU-path chroma corruption (green-tinted exports on every GPU/libx264 export since the GPU engine shipped) — found by the new full-frame chroma checks, fixed, verified on the Windows GPU runner.
+
+---
+Task ID: 1 (single-agent session)
+Agent: main (Z.ai Code)
+Task: v1.33.8 — fix the export OOM crash ("app closed itself at ~1.x GB"), the 60-80-min export speed on looped 10s video + 69-min voiceover, honest ETA, and the false "disk full" error on audio-extended timelines.
+
+Work Log:
+- Read the COMPLETE export pipeline: rust-engine/src/{lib,export,audio,ffmpeg_ffi,compositor/*,timeline,captions}.rs + electron/{main.js (export-native handler + verify), rust-engine-router.js}.
+- ROOT CAUSE 1 (crash): the audio thread allocated the whole timeline mix in RAM (69 min @ 48kHz stereo f32 = 1.6 GB anonymous Vec) AND the small/large decode gate keyed on COMPRESSED FILE SIZE — a 33 MB 69-min MP3 expands to 1.6 GB decoded f32 and was fully decoded (total ~3.2 GB anon → OOM kill of the Electron app mid-export; the slowdown before death = paging).
+- ROOT CAUSE 2 (speed): 125,220 frames each decoded→composited→encoded even though a 10-s loop has exactly 300 unique frames; eta 60-80 min on CPU-class machines.
+- ROOT CAUSE 3 (false disk-full): CLI verifyExportOutputAsync compared the 10-s output vs the 4174.8-s audio-extended timeline with a "disk most likely filled up" message.
+- ROOT CAUSE 4 (ETA): engine computed ETA = (100-pct)/pct × elapsed (whole-run extrapolation) — climbed while paging, hit 0 through the audio tail.
+- FIXES (rust-engine v0.4.0):
+  * Audio memory: mix > 192 MB spills to a FILE MAPPING (memmap2, evictable pages, flushed + MADV_DONTNEED before the AAC read); sources partition by ESTIMATED DECODED PCM size (audio_duration_sec now runs avformat_find_stream_info — MP3 durations were 0 without it, which re-broke the gate: measured 1665 MB → 240 MB peak on the 69-min VO + 90-s timeline repro); safety clamp folded into the AAC read; spill file auto-removed on every exit path (RemoveOnDrop).
+  * STATIC-LOOP PACKET DEDUP (LoopCycle): a looped base video with an exact whole-frame cycle and nothing time-varying crossing it (no captions/text/watermark/ken-burns/transitions/overlays, speed 1) encodes ONE cycle; the remaining cycles re-emit the captured packets with shifted pts/dts (av_new_packet FFI added) — exactly `-stream_loop -c copy` semantics. 125,244 packets cloned in 635 ms; frame@5s == frame@3005s bit-exact.
+  * STATIC-TAIL DEDUP: audio-extended timelines (visuals end early) clone ONE constant-background packet for the whole tail (also makes audio-only exports near-instant).
+  * ETA: phase-local (video sliding-rate window + conservative AAC estimate; audio from actual encode rate; done carries 0); lib.rs sink uses ev.etaMs; router passes etaMs as a NUMBER (done event no longer shows "estimating…").
+- FIXES (electron): verifyExportOutputAsync gains visualTotalSec — a short output that matches the VISUAL span now reports the real diagnosis ("stopped at the last visual frame; set Loop…") instead of "disk full".
+- Verified locally (Linux engine build, both --no-default-features and default/wgpu): v3 feature suite 20/20 (seam parity diff=0.00), v2 suite PASS, smoke PASS, scenario matrix ALL PASS (loop 69-min: 73.5 s wall, 4174.805 s output, spill removed, peak anon bounded; non-looped 69-min: duration 4174.805 s exact — disk-full case fixed; 40-min/20-min compact equivalents ALL PASS; no-dedup 10-s regression 1.1 s). bun run lint clean; 16 electron files parse clean.
+- NOTE: full 69-min local runs are flaky ON THIS SANDBOX ONLY (slow FUSE rootfs page-faulting the 1.6 GB spill mapping — thread stacks + /proc/meminfo proved no engine-side stall; Windows zero-fills in memory).
+
+Stage Summary:
+- rust-engine v0.4.0: OOM crash eliminated (peak RSS 1665→240 MB on the repro), loop exports 60-80 min → ~1-2 min of engine work + audio pass (56× realtime measured), audio-extended timelines produce full-length output, honest phase-local ETA.
+- One unified pipeline stays: the Rust native engine (the libav* blueprint) is THE export path; FFmpeg-CLI remains only the Safe-Mode fallback.
+- Artifacts: agent-ctx/export-repro-v04/ (v04-matrix.js, v04-compact.js, mem-diag2.js, repro logs).
+- Next: commit, push → CI (build-windows.yml rebuilds the engine + runs the full test suite), then publish v1.33.8 (publisher scripts/publish-release-1.33.8.js, three-way sha512).

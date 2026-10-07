@@ -146,11 +146,12 @@ pub fn export_video(
 
     let sink: ProgressSink = Arc::new(move |ev: ProgressEvent| {
         let elapsed = start.elapsed().as_secs_f64();
-        let eta_ms = if ev.percent > 0.5 && elapsed > 0.5 {
-            (((100.0 - ev.percent) / ev.percent) * elapsed * 1000.0) as i64
-        } else {
-            0
-        };
+        // v0.4: the pipeline owns the ETA math (phase-local, from the actual
+        // video-fps / audio-sample rates — see export.rs). The old
+        // (100-pct)/pct × elapsed whole-run extrapolation misread phase
+        // boundaries: ETA climbing while paging slowed the machine, then 0 s
+        // through the audio/mux tail. 0 = "estimating…" for the UI.
+        let eta_ms = ev.eta_ms.filter(|ms| *ms > 0).unwrap_or(0);
         let rate = if elapsed > 0.5 && ev.timemark_sec > 0.0 {
             Some((ev.timemark_sec / elapsed * 100.0).round() / 100.0)
         } else {

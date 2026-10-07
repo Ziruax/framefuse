@@ -1186,10 +1186,13 @@ async function runRustExport(opts, event, { ffmpegPath, cpuCount, sendCliProgres
         if (err || !p || !event.sender || event.sender.isDestroyed()) return;
         phasesSeen.add(p.phase);
         // → the EXACT export-progress payload shape the renderer renders
+        // v1.33.8: etaMs is a NUMBER (0 = "estimating…", only the done event
+        // carries a meaningful 0). The old truthiness check dropped the done
+        // event's 0 → "estimating…" at completion.
         event.sender.send("export-progress", {
           progress: Math.max(0, Math.min(100, p.percent)),
           fps: p.fps || 0,
-          eta: p.etaMs ? Math.round(p.etaMs / 100) / 10 : undefined,
+          eta: Number.isFinite(p.etaMs) ? Math.round(p.etaMs / 100) / 10 : undefined,
           timemark: p.timemarkSec != null ? assFmtTime(p.timemarkSec) : undefined,
           elapsed: p.elapsedSec,
           total: p.totalSec,

@@ -144,6 +144,10 @@ pub struct FFSyms {
     pub av_packet_free: unsafe extern "C" fn(pkt: *mut *mut u8),
     pub av_packet_unref: unsafe extern "C" fn(pkt: *mut u8),
     pub av_packet_rescale_ts: unsafe extern "C" fn(pkt: *mut u8, tb_src: Rational, tb_dst: Rational),
+    /// v0.4 (loop dedup): allocate a refcounted data buffer on a packet so
+    /// cloned bitstream packets can be handed to av_interleaved_write_frame
+    /// without aliasing encoder-owned memory.
+    pub av_new_packet: unsafe extern "C" fn(pkt: *mut u8, size: i32) -> i32,
     // avformat
     pub avformat_version: unsafe extern "C" fn() -> u32,
     pub avformat_open_input: unsafe extern "C" fn(ps: *mut *mut u8, url: *const c_char, fmt: *mut u8, options: *mut *mut u8) -> i32,
@@ -407,6 +411,7 @@ impl FFmpegLibs {
             av_packet_free: cast!(sym!(avcodec, b"av_packet_free"), _),
             av_packet_unref: cast!(sym!(avcodec, b"av_packet_unref"), _),
             av_packet_rescale_ts: cast!(sym!(avcodec, b"av_packet_rescale_ts"), _),
+            av_new_packet: cast!(sym!(avcodec, b"av_new_packet"), _),
             avformat_version: cast!(sym!(avformat, b"avformat_version"), _),
             avformat_open_input: cast!(sym!(avformat, b"avformat_open_input"), _),
             avformat_find_stream_info: cast!(sym!(avformat, b"avformat_find_stream_info"), _),
@@ -624,6 +629,25 @@ impl FFmpegLibs {
     }
     pub fn packet_flags(&self, p: *mut u8) -> i32 {
         unsafe { rd_i32(p, AVPACKET_FLAGS) }
+    }
+    pub fn packet_set_flags(&self, p: *mut u8, v: i32) {
+        unsafe { wr_i32(p, AVPACKET_FLAGS, v) };
+    }
+    pub fn packet_dts(&self, p: *mut u8) -> i64 {
+        unsafe { rd_i64(p, AVPACKET_DTS) }
+    }
+    pub fn packet_duration(&self, p: *mut u8) -> i64 {
+        unsafe { rd_i64(p, AVPACKET_DURATION) }
+    }
+    /// v0.4: allocate `size` bytes of refcounted storage on `p`
+    /// (av_new_packet — the write path then memcpy's clone bytes in and
+    /// av_interleaved_write_frame takes the reference cleanly).
+    pub fn packet_new(&self, p: *mut u8, size: usize) -> Result<(), String> {
+        let r = unsafe { (self.syms.av_new_packet)(p, size.min(i32::MAX as usize) as i32) };
+        if r < 0 {
+            return Err(format!("av_new_packet({} bytes) failed", size));
+        }
+        Ok(())
     }
     pub fn packet_rescale_ts(&self, p: *mut u8, src: Rational, dst: Rational) {
         unsafe { (self.syms.av_packet_rescale_ts)(p, src, dst) };

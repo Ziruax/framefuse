@@ -1,6 +1,6 @@
 [package]
 name = "framefuse-engine"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "FrameFuse native export engine: wgpu compositor + runtime-FFI FFmpeg encode, loaded by Electron via N-API"
 license = "MIT"
@@ -36,6 +36,7 @@ fontdue = "0.8"
 rayon = "1.8"
 log = "0.4"
 env_logger = "0.11"
+memmap2 = "0.9.11"
 
 [build-dependencies]
 napi-build = "2"

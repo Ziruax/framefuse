@@ -316,7 +316,9 @@ pub fn mix_into(out: &mut [f32], t: &Track, channels: usize) {
 
 /// v0.3: master-bus fades + safety clamp over a finished mix (the old
 /// mixdown tail, split so per-track `mix_into` passes can run first).
-pub fn finish_mix(
+/// v0.4: `fade_edges` carries just the fades — the spilled (file-mapped)
+/// mix clamps at AAC read time instead of dirtying the whole mapping.
+pub fn fade_edges(
     out: &mut [f32],
     total_samples: usize,
     channels: usize,
@@ -342,6 +344,16 @@ pub fn finish_mix(
             }
         }
     }
+}
+
+pub fn finish_mix(
+    out: &mut [f32],
+    total_samples: usize,
+    channels: usize,
+    fade_in_samples: usize,
+    fade_out_samples: usize,
+) {
+    fade_edges(out, total_samples, channels, fade_in_samples, fade_out_samples);
     for v in out.iter_mut() {
         *v = v.clamp(-1.0, 1.0);
     }
@@ -727,6 +739,12 @@ pub fn audio_duration_sec(ff: &FFmpegLibs, path: &str) -> f64 {
         Ok(g) => g,
         Err(_) => return 0.0,
     };
+    // v0.4: MP3/AAC raw streams only learn their duration during stream-info
+    // probing (Xing/Info header or bitrate scan) — without this the container
+    // duration reads 0, the decoded-size gate sees "0 bytes", and 69-minute
+    // voiceovers took the FULL-DECODE path (1.6 GB anonymous PCM — the
+    // residual OOM peak).
+    unsafe { (ff.syms.avformat_find_stream_info)(guard.raw, std::ptr::null_mut()) };
     let d_us = unsafe {
         let base = (guard.raw as *const u8).add(AVFMTCTX_DURATION) as *const i64;
         base.read_unaligned()
