@@ -1998,7 +1998,12 @@ fn source_gain(
     let mut gain = job.volume.clamp(0.0, 2.0) as f32;
     if timeline.normalize_audio && job.normalize {
         let target = timeline.audio_target_lufs.unwrap_or(-16.0);
-        if let Some(lufs) = audio::windowed_lufs(samples, src_chans.max(1), rate) {
+        let measured = audio::windowed_lufs(samples, src_chans.max(1), rate);
+        trace(&format!(
+            "source_gain `{}`: n={} src_ch={} measured={:?}",
+            job.tag, samples.len(), src_chans, measured
+        ));
+        if let Some(lufs) = measured {
             let db = target - lufs;
             if lufs > -70.0 && lufs < 0.0 && db.abs() <= 40.0 {
                 gain *= 10f64.powf(db / 20.0) as f32;
@@ -2083,6 +2088,19 @@ fn mix_timeline(
         const DECODE_RAM_LIMIT: f64 = 64.0 * 1024.0 * 1024.0;
         let (small, large): (Vec<usize>, Vec<usize>) = (0..jobs.len())
             .partition(|&ji| est_pcm_bytes(&jobs[ji].path) < DECODE_RAM_LIMIT);
+        if trace_enabled() {
+            for (ji, j) in jobs.iter().enumerate() {
+                let lane = if small.contains(&ji) { "small" } else { "large" };
+                eprintln!(
+                    "[ff-trace] audio job {} `{}`: est_pcm={:.1}MB lane={} dur_probe={:.2}s",
+                    ji,
+                    j.tag,
+                    est_pcm_bytes(&j.path) / 1048576.0,
+                    lane,
+                    audio::audio_duration_sec(ff, &j.path)
+                );
+            }
+        }
 
         // small sources: parallel decode, then mix (order-free)
         if !small.is_empty() {
@@ -2251,6 +2269,10 @@ fn mix_timeline(
         // v0.3 MASTER-BUS normalization: measure the ACTUAL mix (windowed,
         // constant cost) and apply one static gain toward the target. Only
         // when per-source gains ran (CLI parity).
+        trace(&format!(
+            "master-bus check: normalize={} any_normalized={} any_audio={}",
+            timeline.normalize_audio, st.any_normalized, st.any_audio
+        ));
         if timeline.normalize_audio && st.any_normalized {
             if let Some(mix_lufs) = audio::windowed_lufs(out, chans, rate) {
                 let target = timeline.audio_target_lufs.unwrap_or(-16.0);

@@ -51,11 +51,19 @@ pub const AVFMTCTX_STREAMS: usize = 48;
 pub const AVFMTCTX_NB_STREAMS: usize = 44;
 pub const AVFMTCTX_OFORMAT: usize = 16;
 pub const AVFMTCTX_PB: usize = 32;
-// int64_t duration in AV_TIME_BASE (µs): av_class(0) iformat(8) oformat(16)
-// priv_data(24) pb(32) ctx_flags(40) nb_streams(44) streams(48)
-// filename[1024](56) url(1080) start_time(1088) duration(1096) — the
-// PB/NB_STREAMS/STREAMS anchors above pin this prefix exactly.
-pub const AVFMTCTX_DURATION: usize = 1096;
+// v0.4.1 CRITICAL FIX: FFmpeg 7.0 REMOVED the deprecated `char filename[1024]`
+// field from AVFormatContext — every field after `streams` shifted DOWN by
+// 1032 bytes. The old offset (1096, generated from pre-7.0 headers that still
+// carried filename[1024]) read HEAP GARBAGE. v0.4's audio_duration_sec made
+// that read behavior-driving for the first time (the decoded-size gate +
+// loudnorm measurement seeks): garbage durations routed every source down the
+// streaming path with absurd seek targets — the Windows CI SEGFAULT (demuxer
+// seek overflow) and the loudnorm Δ=0dB failure (measurement seek missed).
+// Empirically pinned on the engine's ABI family (FFmpeg 7.1: Debian 7.1.5 +
+// upstream n7.1 = the BtbN Windows DLLs): duration sits at 104 with bit_rate
+// immediately after at 112 — the header's own field order (…, start_time,
+// duration, bit_rate) confirms the anchor.
+pub const AVFMTCTX_DURATION: usize = 104;
 pub const AVOFMT_FLAGS: usize = 44;
 pub const AVCHANNELLAYOUT_ORDER: usize = 0;
 pub const AVCHANNELLAYOUT_NB_CHANNELS: usize = 4;
