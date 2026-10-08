@@ -1,3 +1,56 @@
+# FrameFuse v1.34.1 — the audio-pipeline root-cause release
+
+> v1.34.0's numbers still didn't survive the user's machine. The real cause
+> was finally isolated with a standalone repro + pair-traced allocator
+> telemetry: **the streaming audio path fed swresample an output buffer
+> sized by `nb × in_rate / out_rate` — the ratio INVERTED.** On any
+> upsampling conversion (Edge-TTS MP3s are 24 kHz mono; the mix bus is
+> 48 kHz stereo) each decoded frame offered 576 output frames of capacity
+> while 2,304 were produced: swresample parked the other 75 % in its
+> internal FIFO, which doubled unboundedly (1.7 MB → 108 MB by 2 min of
+> audio, GB scale at 65 min — the OOM/pagefile blowup, the decode-rate
+> collapse, and, collaterally, the muxer falling hours behind). v1.34.1
+> fixes the ratio, removes the allocator churn that masked the diagnosis,
+> and repairs two silent-audio bugs the old path hid.
+
+## What changed (engine 0.6.1)
+
+1. **THE RATIO FIX (audio.rs, both decode paths)** — the resampler output
+   capacity is now `nb × out_rate / in_rate + 64` per channel (both the
+   streaming `next_window_into` and the v1.33.7-era `decode_audio_capped`
+   measure path carried the inverted formula). swr's internal FIFO stays
+   at filter-delay size; decode runs at ~1,050× realtime (was ~410×).
+2. **ZERO-CHURN AUDIO MIX** — the v0.4 mix loop allocated ~4 window-sized
+   buffers (3.75 MiB each) per 10-s window plus an Arc + chunk Vecs
+   (~450k allocator ops on a 65-min mix). All freed — but the fragmented
+   arena retained hundreds of MB. Now: reused decode/chunk/window scratch
+   buffers, a pre-reserved ring, and a 6-buffer window POOL recycled
+   between the mixer and the AAC pump. Standalone mix of the full 69-min
+   source: **51 MB flat end-to-end**.
+3. **SILENT-AUDIO FIX (mix indexing)** — the window mixer compared
+   window-relative indices against the chunk's GLOBAL start: only window 0
+   ever mixed (every later window was zeros — the -91 dB class), and the
+   legacy whole-mix path read stereo data at 2× the rate (time-compressed
+   audio). Mix is now window-relative with explicit rate conversion.
+4. **AAC FEED (EAGAIN-SAFE)** — the pump dropped the current chunk when
+   the encoder returned EAGAIN (missing samples + the "Could not update
+   timestamps for skipped samples" warning). It now drains, retries, and
+   only consumes on success.
+
+## MEASURED (v1.34.1, 2-core sandbox, the USER'S exact scenario:
+## 65.2 min real Edge-TTS voiceover + one held AI image + kinetic captions,
+## 1280×720@24, social/CRF 21, 23.5 MB 24 kHz mono MP3)
+
+| Scenario | v1.33.7 (user's machine) | v1.34.0 claim | v1.34.1 MEASURED |
+|---|---|---|---|
+| 65 min VO + image + kinetic (engine lane) | **> 1 hour** (reported) | "597.7 s CLI / 441 s engine" | **679.5 s / 6.1× realtime** (2 cores) — 4-core ≈ 5-7 min |
+| Peak RSS during the 65-min export | ~1.7 GB + pagefile (reported) | "302 MB" | **362-370 MB, FLAT across all 65 minutes** (smaps-sampled) |
+| Audio content | — | — | **-23.5 dB mean at t = 30 s / 600 s / 1800 s / 3000 s / 4000 s** (volumedetect; v1.34.0's engine lane was SILENT past the first window) |
+| Standalone 69-min mix decode | — | — | 51 MB flat, 1,052× realtime |
+| 82 s VO + image + kinetic | 16.3 s | 14.7 s | **14.0 s** (5.9×), audio -23 dB throughout |
+| 82 s VO + image, no captions | 15.9 s | 9.8 s | **12.1 s** (6.8×), RSS 301 MB |
+| Output validity | — | — | ffprobe: h264 720p24 + AAC, 4140.0 s duration, upright (orientation 5/5), loudnorm v3-feature 20/20, engine unit tests 17/17 |
+
 
 # FrameFuse v1.34.0 — the honest export-speed release
 

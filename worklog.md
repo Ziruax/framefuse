@@ -3322,3 +3322,22 @@ Work Log:
 Stage Summary:
 - The user's four complaints are now closed with reproducible evidence: (1) 180° flip — fixed + CI-locked; (2) 1hr+ kinetic export — routed to the measured-faster CLI lane + honest engine improvements; (3) 1.5GB+ temp/pagefile — streaming mix caps RSS ~300MB; (4) fake "15 min left" audio ETA — phase-local honest ETA + audio runs during video.
 - The prior session's "109.3s" claim is corrected in docs/EXPORT_PERF.md: measured 597.7s (2-core) / est. 3-5min (4-core) for the user's exact scenario — no unmeasured numbers.
+
+---
+Task ID: v1.34.1-audio-root-cause
+Agent: main (Z.ai Code)
+Task: The user's report — v1.34.0's claimed speeds again collapsed on their machine (69-min Edge-TTS + 1 image + kinetic captions > 1hr, temp/pagefile > 1.5GB, 90% frame phase ~1hr, then a lying 15-min audio ETA). Analyze, fix, remove leftover code, and make the fix provably real.
+
+Work Log:
+- Forensics: /proc smaps profiling of a live 65-min export → ONE contiguous [anon] VMA doubling 54→108→216→432→864MB; glibc malloc_stats on a standalone repro → the memory was IN-USE (live), not fragmentation; LD_PRELOAD pair-tracers (malloc/posix_memalign, node-safe via posix_memalign-only + ra0) → the doubling chain was av_malloc'd (FFmpeg-side).
+- Differential gates (noenc/nomux/noprod/nothreads/nonapi/nofaststart, all since removed) → the muxer, producer, threading, napi and compositor were all innocent; short runs were flat — the growth was TIMELINE-DURATION-scaled. The standalone audio repro (JobMixer loop, no node/video) reproduced it: 216MB/300s, ~2.16× the PCM rate.
+- ROOT CAUSE #1 (the memory blowup): `AudioStream` sized the swresample output buffer `est = nb × in_rate / out_rate` — the ratio INVERTED. 24kHz-mono Edge-TTS MP3s into 48kHz stereo offered 576 output frames of capacity while 2304 were produced; swr parked the other 75% in its internal FIFO, which doubled unboundedly (1.7MB→108MB by 2min; GB-scale at 65min → the OOM/pagefile, the decode-rate collapse, and the hours-behind muxer). Fixed at BOTH decode paths (streaming + decode_audio_capped).
+- ROOT CAUSE #2 (silent audio): the window mixer compared window-relative indices against the chunk's GLOBAL start — only window 0 ever mixed (-91dB beyond it; v0.4-era outputs confirm); the legacy whole-mix path indexed stereo data at 2× the rate (time-compressed audio). Rewrote mix_into_params with window-relative addressing + explicit rate conversion.
+- ROOT CAUSE #3 (dropped samples): pump_aac_samples consumed the chunk on encoder EAGAIN (the "Could not update timestamps for skipped samples" warning). Now drains + retries, consumes only on success.
+- ZERO-CHURN redesign: next_window_into/fill_to/consume_into with reused scratch buffers (swr_scratch, decode_scratch, chunk), pre-reserved VecDeque ring, pull_for → mix_window_into (no chunk Vecs, no Arc-per-chunk), mix_output_window_into with the caller's buffer, a 6-buffer window pool recycled between the mixer and the AAC pump. Removed the rebase-leftover duplicate preset block and 17 orphaned agent-ctx diagnostic scripts.
+- Verification (user's EXACT scenario: 65.2min real Edge-TTS VO + 1 held AI image + kinetic captions, 720p24, social): 679.5s wall = 6.1× realtime on 2 cores (4-core ≈ 5-7min vs their >1hr), RSS 362-370MB FLAT across all 65 minutes (smaps-sampled; was 1225MB→OOM), audio -23.5dB mean at t=30/600/1800/3000/4000s (volumedetect). Standalone 69-min mix: 51MB flat, 1052× realtime decode. 82s VO+image+kinetic 14.0s; 82s no-captions 12.1s RSS 301MB; engine unit tests 17/17 (incl. 2 new: mix-chain non-silence + stream window chaining); v3-feature loudnorm 20/20; orientation 5/5; lint clean; dev server + browser verified (studio interactive, zero console errors); layout title stamped v1.34.1.
+- Engine 0.6.1; all numbers in docs/EXPORT_PERF.md are from THIS session's runs (no claims).
+
+Stage Summary:
+- The "1hr export + 1.5GB temp + fake ETA" is closed at the root: an inverted resampler ratio (est), a window-indexing bug, an EAGAIN drop, and allocator churn — each verified fixed with standalone repros, pair-traced allocator telemetry, glibc malloc_stats, and end-to-end 65-min runs with flat-RSS sampling and volumedetect audio checks at five timestamps.
+- Release v1.34.1 staged: engine 0.6.1, package 1.34.1, docs corrected (v1.34.0's unmeasured 109.3s claim explicitly superseded).

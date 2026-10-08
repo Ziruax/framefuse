@@ -68,13 +68,13 @@ pub struct ExportOutcome {
 
 // ── sws guard (sws_freeContext takes the pointer directly) ────────────────
 
-struct SwsGuard {
-    raw: *mut u8,
-    free: unsafe extern "C" fn(*mut u8),
+pub(crate) struct SwsGuard {
+    pub(crate) raw: *mut u8,
+    pub(crate) free: unsafe extern "C" fn(*mut u8),
 }
 unsafe impl Send for SwsGuard {}
 impl SwsGuard {
-    fn ptr(&self) -> *mut u8 {
+    pub(crate) fn ptr(&self) -> *mut u8 {
         self.raw
     }
 }
@@ -729,32 +729,6 @@ fn open_video_encoder(
             // v0.4: pure-image (slideshow/static-hold) timelines ride the
             // stillimage tune — x264 trades a little lookahead/AQ for much
             // faster static-frame encoding, which is exactly this content.
-            // AND slice-only threading: frame threads add a multi-frame
-            // PACKET DELAY (the encoder still owes older packets while the
-            // clone path writes newer ones → non-monotonic DTS aborts the
-            // mux). Sliced threads emit packets synchronously — clone-safe —
-            // at a modest per-frame cost the clone path repays 100× on
-            // static holds.
-            let preset = match quality {
-                "cinema" => "slow",
-                "balanced" => "medium",
-                // v1.33.7: the CLI's speed tiers (draft/fastMode on
-                // constrained CPUs) drop to ultrafast — the engine honors
-                // the same ladder so a draft export is a DRAFT everywhere.
-                "draft" | "fast" => "ultrafast",
-                _ => "veryfast",
-            };
-            let _ = ff.dict_set(&mut dict, "preset", preset);
-            let _ = ff.dict_set(&mut dict, "crf", &crf.to_string());
-            // v0.4: pure-image (slideshow/static-hold) timelines ride the
-            // stillimage tune — x264 trades a little lookahead/AQ for much
-            // faster static-frame encoding, which is exactly this content.
-            // AND slice-only threading: frame threads add a multi-frame
-            // PACKET DELAY (the encoder still owes older packets while the
-            // clone path writes newer ones → non-monotonic DTS aborts the
-            // mux). Sliced threads emit packets synchronously — clone-safe —
-            // at a modest per-frame cost the clone path repays 100× on
-            // static holds.
         }
     }
     if bitrate > 0 && (name == "h264_amf" || timeline.crf.is_none()) {
@@ -909,9 +883,33 @@ fn pump_aac_samples(
                 }
             }
             ff.frame_set_pts(aframe, *fed_frames as i64);
-            let s = (ff.syms.avcodec_send_frame)(aenc, aframe);
+            // v0.6.1 EAGAIN-SAFE FEED: if the encoder's packet queue is
+            // full, drain packets and RETRY; if it stays full, leave
+            // `pending` untouched so the NEXT pump re-feeds the same
+            // samples. (The old code consumed the chunk on EAGAIN — the
+            // samples were silently dropped and the pts sequence skipped,
+            // which is exactly the "Could not update timestamps for
+            // skipped samples" warning + end-glitch class of bug.)
+            let mut s = (ff.syms.avcodec_send_frame)(aenc, aframe);
+            if s == AVERROR_EAGAIN {
+                let mut pr = (ff.syms.avcodec_receive_packet)(aenc, apkt);
+                while pr == 0 {
+                    ff.packet_rescale_ts(apkt, Rational::new(1, sr), a_tb);
+                    ff.packet_set_stream_index(apkt, a_idx);
+                    let w = (ff.syms.av_interleaved_write_frame)(oc, apkt);
+                    ff.packet_unref(apkt);
+                    if w < 0 {
+                        return Err(format!("write audio packet: {}", ff.err2str(w)));
+                    }
+                    pr = (ff.syms.avcodec_receive_packet)(aenc, apkt);
+                }
+                s = (ff.syms.avcodec_send_frame)(aenc, aframe);
+            }
             if s < 0 && s != AVERROR_EAGAIN {
                 return Err(format!("audio send_frame: {}", ff.err2str(s)));
+            }
+            if s == AVERROR_EAGAIN {
+                break; // samples stay in `pending`; retry on the next pump
             }
         }
         loop {
@@ -936,10 +934,19 @@ fn pump_aac_samples(
     Ok(())
 }
 
+/// v0.6.1: hand a spent mix-window buffer back to the pool (bounded — extra
+/// buffers beyond the in-flight window count are simply dropped/freed).
+fn recycle_window(pool: &std::sync::Mutex<Vec<Vec<f32>>>, w: Vec<f32>) {
+    let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.len() < 8 && !w.is_empty() {
+        pool.push(w);
+    }
+}
+
 /// Mix ONE output window [a, b) from every job's pull mixer (v0.4 streaming
 /// mix core). Returns (interleaved stereo window, any-job-contributed).
 #[allow(clippy::too_many_arguments)]
-fn mix_output_window(
+pub(crate) fn mix_output_window_into(
     specs: &[audio::JobSpec],
     mixers: &mut [Option<audio::JobMixer>],
     gains: &[f32],
@@ -947,31 +954,22 @@ fn mix_output_window(
     a: usize,
     b: usize,
     win_frames: usize,
-) -> Result<(Vec<f32>, bool), String> {
-    let mut buf = vec![0f32; (b - a) * chans];
+    buf: &mut Vec<f32>,
+) -> Result<bool, String> {
+    // v0.6.1 ZERO-CHURN: `buf` is the CALLER's reused window buffer — no
+    // per-window destination allocation (see JobMixer::mix_window_into).
+    buf.clear();
+    buf.resize((b - a) * chans, 0f32);
     let mut any = false;
     for (ji, _s) in specs.iter().enumerate() {
         if let Some(mx) = mixers[ji].as_mut() {
-            for (samples, out_start) in mx.pull_for(&specs[ji], a, b, win_frames)? {
-                if samples.is_empty() {
-                    continue;
-                }
-                let track = audio::Track {
-                    data: Arc::new(samples),
-                    start_sample: out_start,
-                    gain: gains[ji],
-                    speed: specs[ji].speed,
-                    loop_src: false, // JobMixer handles looping by wrapping
-                };
-                audio::mix_into(&mut buf, &track, chans);
-                any = true;
-            }
+            any |= mx.mix_window_into(&specs[ji], gains[ji], buf, a, b, win_frames, chans)?;
             if mx.finished() {
                 mixers[ji] = None;
             }
         }
     }
-    Ok((buf, any))
+    Ok(any)
 }
 
 // ── the pipeline ────────────────────────────────────────────────────────────
@@ -1311,10 +1309,18 @@ pub fn run_pipeline(
     let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<AudioMsg>(4);
     let mixed_frames = Arc::new(AtomicU64::new(0));
     let audio_thread_start = Instant::now();
+    // v0.6.1 WINDOW POOL: the 10-s mix windows cross threads through the
+    // channel (4 in flight + the consumer's current + measure transients).
+    // Recycling them keeps the steady-state at ~6 window buffers (~23 MB at
+    // 48 kHz stereo) instead of a fresh 3.75 MiB Vec per window — the
+    // allocator-churn class of bug that fragmented RSS into the GB scale.
+    let win_pool: Arc<std::sync::Mutex<Vec<Vec<f32>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    const WIN_POOL_CAP: usize = 8;
     {
         let ff = ff.clone();
         let timeline = timeline.clone();
         let mixed_frames = mixed_frames.clone();
+        let win_pool = win_pool.clone();
         std::thread::Builder::new()
             .name("framefuse-audio".into())
             .spawn(move || {
@@ -1460,19 +1466,20 @@ pub fn run_pipeline(
                             };
                             audio::JobMixer::open(ff.clone(), &measure_spec, rate, timeline.audio_channels)
                                 .and_then(|mut mm| {
-                                    let mut buf: Vec<f32> = Vec::new();
+                                    let mut acc: Vec<f32> = Vec::new();
+                                    let mut w: Vec<f32> = Vec::new();
                                     let want = measure_frames * chans.max(1);
                                     let mut pos = 0usize;
-                                    while buf.len() < want {
+                                    while acc.len() < want {
                                         let mspec = std::slice::from_ref(&measure_spec);
                                         let mut mixers = [Some(mm)];
-                                        let (w, _) = mix_output_window(&mspec, &mut mixers, &[1.0f32], chans, pos, pos + win_frames, win_frames)?;
+                                        let _ = mix_output_window_into(&mspec, &mut mixers, &[1.0f32], chans, pos, pos + win_frames, win_frames, &mut w)?;
                                         mm = mixers[0].take().unwrap();
                                         if w.is_empty() { break; }
-                                        buf.extend_from_slice(&w);
+                                        acc.extend_from_slice(&w);
                                         pos += win_frames;
                                     }
-                                    Ok(buf)
+                                    Ok(acc)
                                 })
                         };
         if let Ok(buf) = measure {
@@ -1507,11 +1514,12 @@ pub fn run_pipeline(
                             mmixers.push(audio::JobMixer::open(ff.clone(), s, rate, timeline.audio_channels).ok());
                         }
                         let mut acc: Vec<f32> = Vec::with_capacity((m_end - m_start) * chans);
+                        let mut w: Vec<f32> = Vec::new();
                         let mut m = m_start;
                         while m < m_end {
                             let e2 = (m + win_frames).min(m_end);
-                            match mix_output_window(&specs, &mut mmixers, &gains, chans, m, e2, win_frames) {
-                                Ok((buf, _)) => acc.extend_from_slice(&buf),
+                            match mix_output_window_into(&specs, &mut mmixers, &gains, chans, m, e2, win_frames, &mut w) {
+                                Ok(_) => acc.extend_from_slice(&w),
                                 Err(err) => {
                                     log::warn!("[rust-engine] master measure window: {}", err);
                                     break;
@@ -1562,7 +1570,15 @@ pub fn run_pipeline(
                         break Ok(());
                     }
                     let w_end = (w_start + win_frames).min(total_out);
-                    let (mut buf, _any) = match mix_output_window(&specs, &mut mixers, &gains, chans, w_start, w_end, win_frames) {
+                    // v0.6.1: pull a RECYCLED window buffer (the consumer
+                    // pushes them back after the AAC pump; the first few
+                    // windows allocate fresh).
+                    let mut buf: Vec<f32> = win_pool
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .pop()
+                        .unwrap_or_default();
+                    let _any = match mix_output_window_into(&specs, &mut mixers, &gains, chans, w_start, w_end, win_frames, &mut buf) {
                         Ok(v) => v,
                         Err(e) => break Err(e),
                     };
@@ -1597,6 +1613,8 @@ pub fn run_pipeline(
                     }
 
                     mixed_frames.store(w_end as u64, Ordering::Relaxed);
+                    // hand the pooled buffer to the consumer; the consumer
+                    // recycles it back after the AAC pump.
                     if audio_tx.send(AudioMsg::Win(buf)).is_err() {
                         break Ok(()); // consumer gone (cancel / error) — stop quietly
                     }
@@ -1939,6 +1957,7 @@ pub fn run_pipeline(
                         match audio_rx.try_recv() {
                             Ok(AudioMsg::Win(w)) => {
                                 pump_aac_samples(&ff, aenc_raw, apkt.raw, oc.raw, a_idx, a_tb, aframe_raw, a_frame_size, chn, sr, &mut a_pending, &w, &mut a_fed, false)?;
+                                recycle_window(&win_pool, w);
                             }
                             Ok(AudioMsg::Done { mix_ms }) => {
                                 audio_ms = mix_ms;
@@ -2006,6 +2025,7 @@ pub fn run_pipeline(
             match audio_rx.recv_timeout(std::time::Duration::from_millis(125)) {
                 Ok(AudioMsg::Win(w)) => {
                     pump_aac_samples(&ff, aenc_raw, apkt.raw, oc.raw, a_idx, a_tb, aframe_raw, a_frame_size, chn, sr, &mut a_pending, &w, &mut a_fed, false)?;
+                    recycle_window(&win_pool, w);
                 }
                 Ok(AudioMsg::Done { mix_ms }) => {
                     audio_ms = mix_ms;

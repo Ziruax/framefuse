@@ -16,6 +16,9 @@
 #![deny(clippy::all)]
 
 mod audio;
+#[cfg(feature = "alloc-probe")]
+#[global_allocator]
+static PROBE: allocprobe::ProbeAlloc = allocprobe::ProbeAlloc;
 mod captions;
 mod compositor;
 mod export;

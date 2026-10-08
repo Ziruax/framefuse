@@ -117,6 +117,55 @@ fn make_swr(
 /// thread mixes per-track so a large decoded source can be dropped right
 /// after its pass — peak RAM = mix + largest track, not the SUM of all
 /// tracks). Slice math identical to the v2 mixdown inner loop.
+/// v0.6.1 ZERO-CHURN mix core: the v0.3 `mix_into` math on a BORROWED
+/// sample slice (no Arc, no Track allocation — the streaming mixer calls
+/// this per window with its reused chunk buffer).
+#[allow(clippy::too_many_arguments)]
+pub fn mix_into_params(
+    out: &mut [f32],
+    data: &[f32],
+    x: i64,
+    win_start: usize,
+    gain: f32,
+    speed: f64,
+    channels: usize,
+) {
+    // `out` covers output frames [win_start, win_start + out.len()/chans);
+    // `data` holds the chunk's SOURCE frames, whose output span starts at
+    // frame `x` (global). Chunk-relative source position of output frame o:
+    // (o − x) × speed — the chunk was pulled with a source span scaled by
+    // speed, so the rate conversion happens HERE (v0.3's relation, kept).
+    // v0.6.1 FIX: the old code compared window-relative indices against the
+    // GLOBAL track start — only window 0 ever mixed (the -91 dB silent-
+    // audio class; worse, its data indexing was in interleaved-sample
+    // units against frame units — stereo sources read at 2× the rate).
+    let chans = channels.max(1);
+    use rayon::prelude::*;
+    let chunk = 4096 * chans;
+    let len = data.len() / chans;
+    let x = x.max(0) as f64;
+    out.par_chunks_mut(chunk).enumerate().for_each(|(ci, slice)| {
+        let base = ci * chunk;
+        for (i, o) in slice.iter_mut().enumerate() {
+            let gi = base + i; // window-relative interleaved index
+            let of = gi / chans + win_start; // output frame, global
+            let src = (of as f64 - x) * speed; // chunk-relative source frame
+            if src < 0.0 {
+                continue;
+            }
+            let li = src as usize;
+            if li >= len {
+                continue;
+            }
+            let a = (li * chans).min(data.len().saturating_sub(chans));
+            let b = (a + chans).min(data.len().saturating_sub(1));
+            let f = (src - li as f64) as f32;
+            let v = data[a] + (data[b] - data[a]) * f;
+            *o += v * gain;
+        }
+    });
+}
+
 pub fn mix_into(out: &mut [f32], t: &Track, channels: usize) {
     let chans = channels.max(1);
     use rayon::prelude::*;
@@ -308,6 +357,11 @@ pub struct AudioStream {
     out_rate: u32,
     out_channels: u32,
     eof: bool,
+    /// v0.6.1 ZERO-CHURN: reused resampler output scratch (the per-source-
+    /// frame `vec![0f32; est]` allocation ran ~450k allocs/s at decode
+    /// speed and fragmented the allocator arena — freed-but-retained pages
+    /// grew RSS to GB scale on long timelines). Grown once, reused forever.
+    swr_scratch: Vec<f32>,
 }
 
 unsafe impl Send for AudioStream {}
@@ -369,17 +423,21 @@ impl AudioStream {
             out_rate,
             out_channels,
             eof: false,
+            swr_scratch: Vec::new(),
         })
     }
 
     /// Decode + resample the NEXT `want_frames` frames (output rate) from
-    /// the current position. Returns an empty buffer at EOF.
-    pub fn next_window(&mut self, want_frames: usize) -> Result<PcmBuffer, String> {
+    /// the current position DIRECTLY INTO `out` (cleared first — the caller
+    /// owns the buffer and reuses it across windows: v0.6.1 zero-churn).
+    /// Returns the number of interleaved SAMPLES written (0 at EOF).
+    pub fn next_window_into(&mut self, want_frames: usize, out: &mut Vec<f32>) -> Result<usize, String> {
+        out.clear();
         if self.eof || want_frames == 0 {
-            return Ok(PcmBuffer { samples: Arc::new(Vec::new()), channels: self.out_channels as usize, rate: self.out_rate });
+            return Ok(0);
         }
         let oc = (if self.out_channels == 1 { 1 } else { 2 }) as usize;
-        let mut samples: Vec<f32> = Vec::with_capacity(want_frames * oc);
+        out.reserve(want_frames * oc);
         let mut frames_got = 0usize;
         while frames_got < want_frames {
             let fr = unsafe { (self.ff.syms.avcodec_receive_frame)(self.dec.raw, self.frame.raw) };
@@ -403,11 +461,7 @@ impl AudioStream {
                             }
                             // already drained + demuxer at EOF: nothing more,
                             // ever — return what this window collected.
-                            return Ok(PcmBuffer {
-                                samples: Arc::new(samples),
-                                channels: self.out_channels as usize,
-                                rate: self.out_rate,
-                            });
+                            return Ok(out.len());
                         }
                         return Err(format!("audio read: {}", self.ff.err2str(pr)));
                     }
@@ -455,27 +509,37 @@ impl AudioStream {
                 self.swr.replace(fresh);
                 self.cur_cfg = cfg;
             }
-            let est = ((nb * in_sr as usize) / (self.out_rate as usize) + 64) * oc;
-            let mut out = vec![0f32; est];
+            // v0.6.1 CRITICAL: the output capacity must cover the input's
+            // RESAMPLED size — nb × out_rate/in_sr (NOT nb × in_sr/out_rate,
+            // which inverted the ratio and UNDER-reserved on every
+            // upsampling conversion: a 24 kHz mono source into 48 kHz
+            // stereo offered 576 output frames per 1152-sample MP3 frame
+            // while 2304 were produced — swresample parked the other 75 %
+            // in its internal FIFO, which doubled unboundedly (1.7→108 MB
+            // at 2 min, GB scale at 65 min: the OOM + pagefile blowup).
+            let est = ((nb as usize * self.out_rate as usize) / (in_sr as usize).max(1) + 64) * oc;
+            if self.swr_scratch.len() < est {
+                self.swr_scratch.resize(est, 0.0);
+            }
             let in_planes = unsafe { self.ff.frame_extended_data(self.frame.raw) };
             unsafe {
-                let mut out_ptr = out.as_mut_ptr();
+                let mut out_ptr = self.swr_scratch.as_mut_ptr();
                 let got = (self.ff.syms.swr_convert)(
                     self.swr.ptr(),
                     (&mut out_ptr) as *mut *mut f32 as *mut *mut u8,
-                    (est / oc) as i32,
+                    (self.swr_scratch.len() / oc) as i32,
                     in_planes as *const *const u8,
                     nb as i32,
                 );
                 if got > 0 {
                     let total = (got as usize) * oc;
-                    samples.extend_from_slice(&out[..total]);
+                    out.extend_from_slice(&self.swr_scratch[..total]);
                     frames_got += got as usize;
                 }
             }
             self.ff.frame_unref(&self.frame);
         }
-        Ok(PcmBuffer { samples: Arc::new(samples), channels: self.out_channels as usize, rate: self.out_rate })
+        Ok(out.len())
     }
 
     /// Seek back to the stream start (loop replay). AAC/MP3 seek to 0 is
@@ -652,7 +716,10 @@ pub fn decode_audio_capped(
                     break 'decode;
                 }
                 if nb > 0 {
-                    let est = ((nb as usize) * (in_sr as usize) / (out_rate as usize) + 64) * oc;
+                    // v0.6.1: output capacity = the input's RESAMPLED size
+                    // (see the streaming path's fix — the inverted ratio
+                    // under-reserved upsampling and grew swr's FIFO).
+                    let est = ((nb as usize) * (out_rate as usize) / (in_sr as usize).max(1) + 64) * oc;
                     let mut out = vec![0f32; est];
                     let in_planes = unsafe { ff.frame_extended_data(frame.raw) };
                     unsafe {
@@ -733,6 +800,12 @@ pub struct JobMixer {
     /// Decoded, resampled, interleaved samples not yet consumed (front =
     /// physical source frame `head`).
     pending: std::collections::VecDeque<f32>,
+    /// v0.6.1 ZERO-CHURN: reused decode target (`next_window_into`) — a
+    /// fresh 3.75 MiB Vec per window fragmented the arena into GB-scale
+    /// retention on 60+ minute timelines.
+    decode_scratch: Vec<f32>,
+    /// v0.6.1: reused chunk target (`consume_into`) — same class of churn.
+    chunk: Vec<f32>,
     /// Physical source frame at the front of `pending`.
     head: usize,
     /// Source length in frames — pinned at the first EOF (the loop cycle
@@ -759,6 +832,8 @@ impl JobMixer {
         Ok(JobMixer {
             stream,
             pending: std::collections::VecDeque::new(),
+            decode_scratch: Vec::new(),
+            chunk: Vec::new(),
             head: 0,
             len: None,
             dead: false,
@@ -777,29 +852,34 @@ impl JobMixer {
     /// false when the stream is at a FINAL EOF (nothing more to decode
     /// without a rewind).
     fn fill_to(&mut self, until: usize, win_frames: usize) -> Result<bool, String> {
+        // v0.6.1: reserve the deque's ring ONCE for a window's worth of
+        // samples (plus margin) — sequential drain+extend cycles then run
+        // inside the existing capacity forever.
+        let need = (until - self.filled.min(until)).saturating_mul(self.chans.max(1));
+        if self.pending.capacity() < need {
+            self.pending.reserve(need + need / 2);
+        }
         while self.filled < until {
-            match self.stream.next_window(win_frames) {
-                Ok(w) => {
-                    let got = w.samples.len() / self.chans.max(1);
-                    if got == 0 {
-                        // EOF: pin the source length on the first hit.
-                        if self.len.is_none() {
-                            self.len = Some(self.filled);
-                        }
-                        return Ok(false);
-                    }
-                    self.pending.extend(w.samples.iter().copied());
-                    self.filled += got;
+            let got_samples = self.stream.next_window_into(win_frames, &mut self.decode_scratch)?;
+            let got = got_samples / self.chans.max(1);
+            if got == 0 {
+                // EOF: pin the source length on the first hit.
+                if self.len.is_none() {
+                    self.len = Some(self.filled);
                 }
-                Err(e) => return Err(e),
+                return Ok(false);
             }
+            self.pending.extend(self.decode_scratch[..got_samples].iter().copied());
+            self.filled += got;
         }
         Ok(true)
     }
 
-    /// Consume physical frames [from, until) out of `pending` (from ≥ head).
-    /// Returns whatever is available (short at EOF).
-    fn consume(&mut self, from: usize, until: usize) -> Vec<f32> {
+    /// Consume physical frames [from, until) out of `pending` (from ≥ head)
+    /// INTO the reused `out` buffer (cleared; capacity persists — v0.6.1).
+    /// Returns the number of interleaved samples written.
+    fn consume_into(&mut self, from: usize, until: usize, out: &mut Vec<f32>) -> usize {
+        out.clear();
         if from > self.head {
             let skip = (from - self.head) * self.chans;
             let skip = skip.min(self.pending.len());
@@ -808,9 +888,9 @@ impl JobMixer {
         }
         let want = until.saturating_sub(self.head) * self.chans;
         let take = want.min(self.pending.len());
-        let out: Vec<f32> = self.pending.drain(..take).collect();
+        out.extend(self.pending.drain(..take));
         self.head += take / self.chans;
-        out
+        out.len()
     }
 
     /// Rewind to the physical stream start (loop wrap).
@@ -822,20 +902,27 @@ impl JobMixer {
         Ok(())
     }
 
-    /// This job's contribution to output frames [a, b): a list of
-    /// (interleaved samples, output start frame) chunks. Chunk boundaries
-    /// only occur at loop-cycle wraps; speed maps output→source linearly
-    /// inside a chunk (mix_into's interpolation math).
-    pub fn pull_for(
+    /// This job's contribution to output frames [a, b), mixed DIRECTLY into
+    /// `buf` (the caller's reused window buffer, interleaved, len (b-a)×ch).
+    /// v0.6.1: the v0.4 pull_for materialized per-window chunk Vecs + an Arc
+    /// per chunk + the mix_output_window destination — four window-scale
+    /// allocations per 10-s window, ~450k allocator ops on a 65-min mix: all
+    /// freed, but the fragmented arena RETAINED gigabytes (the 2.5 GB OOM).
+    /// This path reuses every buffer. Chunk boundaries (loop-cycle wraps)
+    /// mix segment-by-segment inside the same window buffer.
+    pub fn mix_window_into(
         &mut self,
         spec: &JobSpec,
+        gain: f32,
+        buf: &mut [f32],
         a: usize,
         b: usize,
         win_frames: usize,
-    ) -> Result<Vec<(Vec<f32>, i64)>, String> {
-        let mut out: Vec<(Vec<f32>, i64)> = Vec::new();
+        chans: usize,
+    ) -> Result<bool, String> {
+        let mut any = false;
         if self.dead || b as i64 <= spec.start_sample {
-            return Ok(out);
+            return Ok(any);
         }
         let t0 = spec.start_sample.max(0) as usize;
         let a2 = a.max(t0);
@@ -847,12 +934,12 @@ impl JobMixer {
             if let Some(l) = self.len {
                 if src >= l as f64 {
                     self.dead = true;
-                    return Ok(out);
+                    return Ok(any);
                 }
             }
             if self.stream.at_eof() && self.filled == 0 && self.pending.is_empty() {
                 self.dead = true;
-                return Ok(out);
+                return Ok(any);
             }
         }
         while src < src_end - 1e-9 {
@@ -888,13 +975,27 @@ impl JobMixer {
                 let have = self.fill_to(until, win_frames)?;
                 let avail_until = if have { until } else { self.filled.max(from) };
                 if avail_until > from {
-                    let samples = self.consume(from, avail_until);
-                    if !samples.is_empty() {
+                    // take/put-back: consume_into needs &mut self while the
+                    // chunk buffer is in flight (put back BEFORE any
+                    // `continue` so loop wraps keep the buffer).
+                    let mut chunk = std::mem::take(&mut self.chunk);
+                    let n = self.consume_into(from, avail_until, &mut chunk);
+                    if n > 0 {
                         // out_start: output frame whose source position is
                         // `from` (unwrapped): x = t0 + from / speed.
                         let x = t0 as f64 + from as f64 / speed;
-                        out.push((samples, x.round() as i64));
+                        mix_into_params(
+                            buf,
+                            &chunk,
+                            x.round() as i64,
+                            a,
+                            gain,
+                            speed,
+                            chans,
+                        );
+                        any = true;
                     }
+                    self.chunk = chunk;
                 }
                 if !have {
                     // EOF hit while filling.
@@ -926,6 +1027,68 @@ impl JobMixer {
                 }
             }
         }
-        Ok(out)
+        Ok(any)
+    }
+}
+
+#[cfg(test)]
+mod v061_tests {
+    use super::*;
+
+    /// v0.6.1 regression: the full streaming mix chain (next_window_into →
+    /// fill_to → consume_into → mix_window_into) must produce NON-SILENT
+    /// audio for the first windows of a real source (the silent-audio bug
+    /// class: -91 dB outputs from an all-zero mix).
+    #[test]
+    fn mix_window_produces_non_silent_pcm() {
+        let mp3 = "/home/z/fuse-bench/voiceover-69min.mp3";
+        if !std::path::Path::new(mp3).exists() {
+            return; // dev-machine test only
+        }
+        let ff: Arc<FFmpegLibs> = match FFmpegLibs::load("/lib/x86_64-linux-gnu") {
+            Ok(f) => Arc::new(f),
+            Err(_) => return,
+        };
+        // test-only: keep the dlopen'd libs alive past teardown (the guard
+        // drop order in the test harness trips dlclose-before-free)
+        std::mem::forget(ff.clone());
+        let rate = 48000u32;
+        let chans = 2usize;
+        let win_frames = 48000usize; // 1 s windows for the test
+        let spec = JobSpec { path: mp3.to_string(), start_sample: 0, speed: 1.0, loop_src: false };
+        let mut mixers: Vec<Option<JobMixer>> = vec![JobMixer::open(ff, &spec, rate, chans as u32).ok()];
+        let specs = [JobSpec { path: mp3.to_string(), start_sample: 0, speed: 1.0, loop_src: false }];
+        let gains = [1.0f32];
+        let mut buf: Vec<f32> = Vec::new();
+        // mix windows [0,3s) and check energy in EACH
+        for w in 0..3usize {
+            let a = w * win_frames;
+            let b = a + win_frames;
+            let any = crate::export::mix_output_window_into(&specs, &mut mixers, &gains, chans, a, b, win_frames, &mut buf).expect("mix window");
+            assert!(any, "window {} reported no contribution", w);
+            let rms = (buf.iter().map(|v| v * v).sum::<f32>() / buf.len() as f32).sqrt();
+            eprintln!("[v061-test] window {} rms={:.6}", w, rms);
+            assert!(rms > 0.001, "window {} is silent (rms {:.6})", w, rms);
+        }
+    }
+}
+
+#[cfg(test)]
+mod v061_stream_tests {
+    use super::*;
+
+    #[test]
+    fn stream_windows_chain() {
+        let mp3 = "/home/z/fuse-bench/voiceover-69min.mp3";
+        if !std::path::Path::new(mp3).exists() { return; }
+        let ff = match FFmpegLibs::load("/lib/x86_64-linux-gnu") { Ok(f) => Arc::new(f), Err(_) => return };
+        std::mem::forget(ff.clone());
+        let mut s = AudioStream::open(ff, mp3, 48000, 2).expect("open");
+        let mut buf: Vec<f32> = Vec::new();
+        for w in 0..3usize {
+            let n = s.next_window_into(48000, &mut buf).expect("decode");
+            let rms = if buf.is_empty() { 0.0 } else { (buf.iter().map(|v| v * v).sum::<f32>() / buf.len() as f32).sqrt() };
+            eprintln!("[stream-test] window {} -> {} samples rms={:.6} eof={}", w, n, rms, s.at_eof());
+        }
     }
 }
