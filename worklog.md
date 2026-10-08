@@ -3341,3 +3341,17 @@ Work Log:
 Stage Summary:
 - The "1hr export + 1.5GB temp + fake ETA" is closed at the root: an inverted resampler ratio (est), a window-indexing bug, an EAGAIN drop, and allocator churn — each verified fixed with standalone repros, pair-traced allocator telemetry, glibc malloc_stats, and end-to-end 65-min runs with flat-RSS sampling and volumedetect audio checks at five timestamps.
 - Release v1.34.1 staged: engine 0.6.1, package 1.34.1, docs corrected (v1.34.0's unmeasured 109.3s claim explicitly superseded).
+
+---
+Task ID: v1.34.1-release
+Agent: main (Z.ai Code)
+Task: Ship v1.34.1 through the full release pipeline (push → CI → ASAR audit → three-way sha512 → release).
+
+Work Log:
+- Committed a1deb74 (engine 0.6.1 + fixes + docs + leftcode removal) and pushed; CI run 37819881095 PASSED both jobs: "Rust engine build + E2E smoke (MSVC)" (compiling framefuse-engine v0.6.1, probe ok: 0.6.1, smoke 15/15 assertions incl. rust-gpu compositor, libx264, FFmpeg family 61/61/59/8/5, 150 frames, 5s, AAC 48kHz stereo, sane luma) and "Electron installer + A/B bench".
+- ASAR audit of the packaged installer (7z payload carved at offset 309375, extracted with standalone 7zz + py7zr for listing): resources/app.asar (156 entries), app.asar.unpacked/rust-engine/framefuse-engine.win32-x64.node = the CI-built 0.6.1 binary (runtime-verified by the CI probe), packaged package.json version = 1.34.1, router kinetic-routing + null-scrub present, ffmpeg.exe/ffprobe.exe staged.
+- Release 407146620 (v1.34.1) created and published: FrameFuse-Setup-1.34.1.exe (244.1MB) + latest.yml + blockmap uploaded via curl; sha512 three-way verified: local file == re-downloaded asset == latest.yml digest (QRP4IAB5…BWQ==). Publisher: scripts/publish-release-1.34.1.js (committed).
+- Release notes carry ONLY measured numbers from this session (679.5s/6.1× on 2 cores for the user's exact 65-min scenario; flat 362-370MB; audio -23.5dB at 5 timestamps) and explicitly supersede v1.34.0's unmeasured 109.3s claim.
+
+Stage Summary:
+- v1.34.1 is live: https://github.com/Ziruax/framefuse/releases/tag/v1.34.1 — installer hash verified, CI green, engine 0.6.1 with the audio-pipeline root causes fixed (swr ratio inversion, window-indexing silence, EAGAIN drops, allocator churn).
