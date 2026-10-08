@@ -743,6 +743,8 @@ pub struct JobMixer {
     chans: usize,
     /// Physical frame index of the NEXT decode (head + pending frames).
     filled: usize,
+    /// The output bus rate (for jump-seek targets in seconds).
+    rate: u32,
 }
 
 impl JobMixer {
@@ -762,6 +764,7 @@ impl JobMixer {
             dead: false,
             chans,
             filled: 0,
+            rate,
         })
     }
 
@@ -853,6 +856,23 @@ impl JobMixer {
             }
         }
         while src < src_end - 1e-9 {
+            // v0.6 JUMP-SEEK: a pull starting far beyond the buffered
+            // position (the master pre-measure at 20 % of the timeline, a
+            // late-start measurement) must SEEK instead of decoding through
+            // everything in between — the pending deque held the whole span
+            // (minutes of PCM → GB-scale RAM → the OOM kill on long
+            // timelines). Sequential main-mix pulls never jump.
+            let from_probe = src.ceil().max(0.0) as usize;
+            if from_probe > self.head + win_frames + self.pending.len() / self.chans.max(1) {
+                let target_sec = from_probe as f64 / self.rate.max(1) as f64;
+                if let Err(e) = self.stream.seek_sec(target_sec) {
+                    log::warn!("[rust-engine] measure jump-seek: {}", e);
+                } else {
+                    self.pending.clear();
+                    self.head = from_probe;
+                    self.filled = from_probe;
+                }
+            }
             // Next cycle boundary (loop only, once L is pinned).
             let seg_end = match self.len {
                 Some(l) if spec.loop_src && l > 0 => {
