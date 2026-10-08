@@ -426,7 +426,7 @@ function main() {
           "-vf", "drawbox=y=90:h=90:c=0xE02020@1:t=fill",
           orientImg,
         ], "orient.png");
-        const orientOut = path.join(OUT_DIR, "orient.mp4");
+        const orientOut = path.join(MEDIA_DIR, "orient_out.mp4");
         const otl = {
           version: 1, width: 320, height: 180, fps: 12, totalMs: 800,
           segments: [{ id: "o1", mediaType: "image", path: orientImg, startMs: 0, endMs: 800, durationMs: 800, track: 0 }],
