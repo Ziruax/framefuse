@@ -1476,8 +1476,19 @@ pub fn run_pipeline(
                                 })
                         };
         if let Ok(buf) = measure {
-                                }
-                            }
+            if !buf.is_empty() {
+                if let Some(lufs) = audio::windowed_lufs(&buf, chans, rate) {
+                    let db = target_lufs - lufs;
+                    if lufs > -70.0 && lufs < 0.0 && db.abs() <= 40.0 {
+                        gains[ji] *= 10f64.powf(db / 20.0) as f32;
+                        any_normalized = true;
+                        log::info!(
+                            "[rust-engine] loudnorm `{}`: measured {:.1} LUFS → {:+.1} dB (target {:.0})",
+                            j.tag, lufs, db, target_lufs
+                        );
+                    }
+                }
+            }
                         }
                     }
                 }
@@ -1487,6 +1498,14 @@ pub fn run_pipeline(
                 //    the OUTPUT timeline. The v0.3 code measured the WHOLE mix —
                 //    which forced the full 1.6 GB mix buffer into RAM; this
                 //    samples the same span the per-source policy samples. ─────
+                let master_gain: f32 = if timeline.normalize_audio && any_normalized {
+                    let m_start = ((total_out as f64 * 0.20) as usize).min(total_out.saturating_sub(1));
+                    let m_end = (m_start + measure_frames).min(total_out);
+                    if m_end > m_start {
+                        let mut mmixers: Vec<Option<audio::JobMixer>> = Vec::with_capacity(specs.len());
+                        for s in specs.iter() {
+                            mmixers.push(audio::JobMixer::open(ff.clone(), s, rate, timeline.audio_channels).ok());
+                        }
                         let mut acc: Vec<f32> = Vec::with_capacity((m_end - m_start) * chans);
                         let mut m = m_start;
                         while m < m_end {
