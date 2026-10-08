@@ -543,6 +543,171 @@ pub fn audio_duration_sec(ff: &FFmpegLibs, path: &str) -> f64 {
     }
 }
 
+// ── v0.6 MEASURE DECODE (restored v1.33.7 path, capped) ─────────────────────
+// The streaming AudioStream measure hit a spurious early-EOF on interleaved
+// MP4s (video segment as audio source: ~4 packets then av_read_frame EOF,
+// zero samples decoded) while the v1.33.7 whole-file decode reads the same
+// files end-to-end. Short sources measure through THIS path again; long
+// ones keep the windowed mixer measure.
+/// Decode an audio stream (or the audio stream of a video) to interleaved
+/// f32 at `out_rate`/`out_channels`.
+pub fn decode_audio_capped(
+    ff: &FFmpegLibs,
+    path: &str,
+    out_rate: u32,
+    out_channels: u32,
+    max_frames: usize,
+) -> Result<PcmBuffer, String> {
+    let c_path = CString::new(path).map_err(|e| format!("bad path: {}", e))?;
+
+    let mut fc: *mut u8 = std::ptr::null_mut();
+    let r = unsafe {
+        (ff.syms.avformat_open_input)(&mut fc, c_path.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut())
+    };
+    if r < 0 || fc.is_null() {
+        return Err(format!("audio open failed for `{}`: {}", path, ff.err2str(r)));
+    }
+    let _in_guard = PtrGuard::new(fc, ff.syms.avformat_close_input).map_err(|e| e)?;
+
+    unsafe { (ff.syms.avformat_find_stream_info)(fc, std::ptr::null_mut()) };
+
+    let astream = unsafe {
+        (ff.syms.avformat_find_best_stream)(fc, AVMEDIA_TYPE_AUDIO, -1, -1, std::ptr::null_mut(), 0)
+    };
+    if astream < 0 {
+        return Err(format!("no audio stream in `{}`", path));
+    }
+    let st = ff.fmt_streams(fc, astream as usize);
+    if st.is_null() {
+        return Err("audio stream lookup failed".into());
+    }
+    let par = ff.stream_codecpar(st);
+    let codec_id = ff.par_codec_id(par);
+
+    let codec = unsafe { (ff.syms.avcodec_find_decoder)(codec_id) };
+    if codec.is_null() {
+        return Err(format!("no decoder for audio codec id {}", codec_id));
+    }
+    let dec = unsafe { (ff.syms.avcodec_alloc_context3)(codec) };
+    if dec.is_null() {
+        return Err("avcodec_alloc_context3(audio) failed".into());
+    }
+    let _dec_guard = PtrGuard::new(dec, ff.syms.avcodec_free_context).map_err(|e| e)?;
+    let r = unsafe { (ff.syms.avcodec_parameters_to_context)(dec, par) };
+    if r < 0 {
+        return Err(format!("audio parameters_to_context: {}", ff.err2str(r)));
+    }
+    ff.cc_set_threads_auto(dec);
+    let r = unsafe { (ff.syms.avcodec_open2)(dec, codec, std::ptr::null_mut()) };
+    if r < 0 {
+        return Err(format!("audio decoder open: {}", ff.err2str(r)));
+    }
+
+    let oc = (if out_channels == 1 { 1 } else { 2 }) as usize;
+
+    let frame = ff.frame_alloc()?;
+    let pkt = ff.packet_alloc()?;
+    let mut samples: Vec<f32> = Vec::new();
+    let mut swr = SwrCell::new(std::ptr::null_mut(), ff.syms.swr_free);
+    let mut cur_cfg: (i32, i32, i32) = (-1, -1, -1);
+
+    'decode: loop {
+        let pr = unsafe { (ff.syms.av_read_frame)(fc, pkt.raw) };
+        if pr < 0 {
+            if pr == AVERROR_EOF {
+                break 'decode;
+            }
+            return Err(format!("audio read: {}", ff.err2str(pr)));
+        }
+        let idx = unsafe { rd_i32(pkt.raw, AVPACKET_STREAM_INDEX) };
+        if idx == astream {
+            let sent = unsafe { (ff.syms.avcodec_send_packet)(dec, pkt.raw) };
+            ff.packet_unref(pkt.raw);
+            if sent < 0 && sent != AVERROR_EAGAIN && sent != AVERROR_EOF {
+                return Err(format!("audio send_packet: {}", ff.err2str(sent)));
+            }
+            loop {
+                let fr = unsafe { (ff.syms.avcodec_receive_frame)(dec, frame.raw) };
+                if fr == AVERROR_EAGAIN || fr == AVERROR_EOF {
+                    break;
+                }
+                if fr < 0 {
+                    return Err(format!("audio receive_frame: {}", ff.err2str(fr)));
+                }
+                let nb = ff.frame_nb_samples(frame.raw).max(0) as i32;
+                let in_fmt = ff.frame_format(frame.raw);
+                let in_ch = ff.frame_channels(frame.raw).max(1) as i32;
+                let in_sr = if ff.frame_sample_rate(frame.raw) > 0 {
+                    ff.frame_sample_rate(frame.raw)
+                } else {
+                    44100
+                };
+                let cfg = (in_fmt, in_ch, in_sr);
+                if cfg != cur_cfg {
+                    let fresh = make_swr(ff, in_fmt, in_ch, in_sr, out_rate, out_channels)?;
+                    swr.replace(fresh);
+                    cur_cfg = cfg;
+                }
+                if samples.len() / oc >= max_frames {
+                    break 'decode;
+                }
+                if nb > 0 {
+                    let est = ((nb as usize) * (in_sr as usize) / (out_rate as usize) + 64) * oc;
+                    let mut out = vec![0f32; est];
+                    let in_planes = unsafe { ff.frame_extended_data(frame.raw) };
+                    unsafe {
+                        let mut out_ptr = out.as_mut_ptr();
+                        let got = (ff.syms.swr_convert)(
+                            swr.ptr(),
+                            (&mut out_ptr) as *mut *mut f32 as *mut *mut u8,
+                            (est / oc) as i32,
+                            in_planes as *const *const u8,
+                            nb,
+                        );
+                        if got > 0 {
+                            let total = (got as usize) * oc;
+                            samples.extend_from_slice(&out[..total]);
+                        }
+                    }
+                }
+                ff.frame_unref(&frame);
+            }
+        } else {
+            ff.packet_unref(pkt.raw);
+        }
+    }
+
+    // flush the resampler tail
+    if !swr.ptr().is_null() {
+        loop {
+            let cap = 4096 * oc;
+            let mut out = vec![0f32; cap];
+            unsafe {
+                let mut out_ptr = out.as_mut_ptr();
+                let got = (ff.syms.swr_convert)(
+                    swr.ptr(),
+                    (&mut out_ptr) as *mut *mut f32 as *mut *mut u8,
+                    (cap / oc) as i32,
+                    std::ptr::null(),
+                    0,
+                );
+                if got <= 0 {
+                    break;
+                }
+                let total = (got as usize) * oc;
+                samples.extend_from_slice(&out[..total]);
+            }
+        }
+    }
+
+    Ok(PcmBuffer {
+        samples: Arc::new(samples),
+        channels: oc,
+        rate: out_rate,
+    })
+}
+
+
 // ── v0.4 WINDOWED JOB MIXER (bounded RAM for ANY timeline length) ───────────
 // The v0.3 audio thread materialized the FULL timeline mix in RAM next to
 // the decoded sources (a 69-min stereo f32 mix alone is ~1.6 GB — the

@@ -66,7 +66,7 @@ pub const AVFMTCTX_PB: usize = 32;
 // upstream n7.1 = the BtbN Windows DLLs): duration sits at 104 with bit_rate
 // immediately after at 112 — the header's own field order (…, start_time,
 // duration, bit_rate) confirms the anchor.
-pub const AVFMTCTX_DURATION: usize = 1096;
+pub const AVFMTCTX_DURATION: usize = 104;
 pub const AVOFMT_FLAGS: usize = 44;
 pub const AVCHANNELLAYOUT_ORDER: usize = 0;
 pub const AVCHANNELLAYOUT_NB_CHANNELS: usize = 4;

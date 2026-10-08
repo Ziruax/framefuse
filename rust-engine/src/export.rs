@@ -1431,35 +1431,51 @@ pub fn run_pipeline(
                         if dur <= 0.5 {
                             continue;
                         }
+                        // v0.6 MEASURE: SHORT sources (≤ 5 min) ride the
+                        // restored v1.33.7 whole-file decode (capped at the
+                        // measurement window) — the streaming AudioStream
+                        // read hit a spurious early EOF on interleaved MP4s
+                        // (video segment as audio source: a few packets then
+                        // av_read_frame EOF, ZERO samples). LONG sources keep
+                        // the windowed mixer measure (bounded RAM).
                         let start_sec = if dur <= 120.0 { 0.0 } else { dur * 0.20 };
-                        let measure = audio::AudioStream::open(ff.clone(), &j.path, rate, timeline.audio_channels)
-                            .and_then(|mut ms| ms.seek_sec(start_sec).map(|_| ms))
-                            .and_then(|mut ms| {
-                                let mut buf: Vec<f32> = Vec::new();
-                                let want = measure_frames * chans.max(1);
-                                while buf.len() < want {
-                                    match ms.next_window(win_frames) {
-                                        Ok(w) => {
-                                            if w.samples.is_empty() { break; }
-                                            buf.extend_from_slice(&w.samples);
-                                        }
-                                        Err(e) => return Err(e),
+                        let measure: Result<Vec<f32>, String> = if dur <= 300.0 {
+                            audio::decode_audio_capped(
+                                &ff,
+                                &j.path,
+                                rate,
+                                timeline.audio_channels,
+                                measure_frames + (rate as usize),
+                            )
+                            .map(|pcm| {
+                                let off = (start_sec * rate as f64).round() as usize * chans.max(1);
+                                if off >= pcm.samples.len() { Vec::new() } else { pcm.samples[off..].to_vec() }
+                            })
+                        } else {
+                            let measure_spec = audio::JobSpec {
+                                path: j.path.clone(),
+                                start_sample: (start_sec * rate as f64).round() as i64,
+                                speed: 1.0,
+                                loop_src: false,
+                            };
+                            audio::JobMixer::open(ff.clone(), &measure_spec, rate, timeline.audio_channels)
+                                .and_then(|mut mm| {
+                                    let mut buf: Vec<f32> = Vec::new();
+                                    let want = measure_frames * chans.max(1);
+                                    let mut pos = 0usize;
+                                    while buf.len() < want {
+                                        let mut mspec = std::slice::from_ref(&measure_spec);
+                                        let mut mixers = [Some(mm)];
+                                        let (w, _) = mix_output_window(&mspec, &mut mixers, &[1.0f32], chans, pos, pos + win_frames, win_frames)?;
+                                        mm = mixers[0].take().unwrap();
+                                        if w.is_empty() { break; }
+                                        buf.extend_from_slice(&w);
+                                        pos += win_frames;
                                     }
-                                }
-                                Ok(buf)
-                            });
-                        if let Ok(buf) = measure {
-                            if !buf.is_empty() {
-                                if let Some(lufs) = audio::windowed_lufs(&buf, chans, rate) {
-                                    let db = target_lufs - lufs;
-                                    if lufs > -70.0 && lufs < 0.0 && db.abs() <= 40.0 {
-                                        gains[ji] *= 10f64.powf(db / 20.0) as f32;
-                                        any_normalized = true;
-                                        log::info!(
-                                            "[rust-engine] loudnorm `{}`: measured {:.1} LUFS → {:+.1} dB (target {:.0})",
-                                            j.tag, lufs, db, target_lufs
-                                        );
-                                    }
+                                    Ok(buf)
+                                })
+                        };
+        if let Ok(buf) = measure {
                                 }
                             }
                         }
@@ -1471,14 +1487,6 @@ pub fn run_pipeline(
                 //    the OUTPUT timeline. The v0.3 code measured the WHOLE mix —
                 //    which forced the full 1.6 GB mix buffer into RAM; this
                 //    samples the same span the per-source policy samples. ─────
-                let master_gain: f32 = if timeline.normalize_audio && any_normalized {
-                    let m_start = ((total_out as f64 * 0.20) as usize).min(total_out.saturating_sub(1));
-                    let m_end = (m_start + measure_frames).min(total_out);
-                    if m_end > m_start {
-                        let mut mmixers: Vec<Option<audio::JobMixer>> = Vec::with_capacity(specs.len());
-                        for s in specs.iter() {
-                            mmixers.push(audio::JobMixer::open(ff.clone(), s, rate, timeline.audio_channels).ok());
-                        }
                         let mut acc: Vec<f32> = Vec::with_capacity((m_end - m_start) * chans);
                         let mut m = m_start;
                         while m < m_end {
