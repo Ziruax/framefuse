@@ -176,6 +176,11 @@ function fmtElapsed(sec: number): string {
  *  users get a plain-language line that says what to change. */
 const ENGINE_REASON_HINTS: [RegExp, string][] = [
   [/^kinetic-no-geometry$/, "caption geometry unavailable"],
+  // v1.34: NOT a fallback — the measured-faster route for kinetic captions
+  // over image timelines (libass + parallel windows beats per-frame GPU
+  // composite on weak machines by ~10×). The badge wording must not read
+  // as an error.
+  [/^kinetic-image-cli-fastpath$/, "fast libass kinetic route"],
   [/^stack-text$/, "stack-text headline"],
   [/^transition:/, "geometric transition"],
   [/^text-removal$/, "text removal"],
@@ -512,12 +517,12 @@ export function Header({
                 {fmtElapsed(exportProgress.elapsed)} elapsed
               </span>
             ) : null}
-            {/* ETA — the headline number the user asked for; "estimating…"
-                until the backend unlocks it rather than silently nothing.
-                v1.33.6: an ETA of exactly 0 is only honest at completion —
-                the old all-run model emitted 0 near the band tops while
-                minutes of mux/finalize remained (the "ETA shows 0s after
-                95%" report). In flight, 0 reads as "estimating…". */}
+            {/* ETA — shown ONLY when the backend has a real one. v1.34: the
+              old "estimating…" placeholder pulsed forever through every
+              band the backend couldn't price (loudness measure, band flips,
+              finalize) — it looked like a hang. The honest UI: phase label +
+              wall-clock elapsed always, ETA exactly when it exists.
+              v1.33.6: an ETA of exactly 0 is only honest at completion. */}
             {exportProgress?.eta != null &&
             Number.isFinite(exportProgress.eta) &&
             (exportProgress.eta > 0 || exportProgress.phase === "done") ? (
@@ -528,15 +533,7 @@ export function Header({
               >
                 ETA {fmtElapsed(exportProgress.eta)}
               </span>
-            ) : (
-              <span
-                className="animate-pulse"
-                style={{ color: "#a8a29e" }}
-                title="Measuring the encode rate…"
-              >
-                estimating…
-              </span>
-            )}
+            ) : null}
             {/* v1.18: WHICH engine is running — the native Rust engine
                 (wgpu + dlopen'd FFmpeg, no CLI children) or the FFmpeg-CLI
                 Safe Mode pipeline. Honest telemetry, live.

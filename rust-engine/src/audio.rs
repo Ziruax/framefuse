@@ -113,160 +113,6 @@ fn make_swr(
     Ok(swr)
 }
 
-/// Decode an audio stream (or the audio stream of a video) to interleaved
-/// f32 at `out_rate`/`out_channels`.
-pub fn decode_audio(
-    ff: &FFmpegLibs,
-    path: &str,
-    out_rate: u32,
-    out_channels: u32,
-) -> Result<PcmBuffer, String> {
-    let c_path = CString::new(path).map_err(|e| format!("bad path: {}", e))?;
-
-    let mut fc: *mut u8 = std::ptr::null_mut();
-    let r = unsafe {
-        (ff.syms.avformat_open_input)(&mut fc, c_path.as_ptr(), std::ptr::null_mut(), std::ptr::null_mut())
-    };
-    if r < 0 || fc.is_null() {
-        return Err(format!("audio open failed for `{}`: {}", path, ff.err2str(r)));
-    }
-    let _in_guard = PtrGuard::new(fc, ff.syms.avformat_close_input).map_err(|e| e)?;
-
-    unsafe { (ff.syms.avformat_find_stream_info)(fc, std::ptr::null_mut()) };
-
-    let astream = unsafe {
-        (ff.syms.avformat_find_best_stream)(fc, AVMEDIA_TYPE_AUDIO, -1, -1, std::ptr::null_mut(), 0)
-    };
-    if astream < 0 {
-        return Err(format!("no audio stream in `{}`", path));
-    }
-    let st = ff.fmt_streams(fc, astream as usize);
-    if st.is_null() {
-        return Err("audio stream lookup failed".into());
-    }
-    let par = ff.stream_codecpar(st);
-    let codec_id = ff.par_codec_id(par);
-
-    let codec = unsafe { (ff.syms.avcodec_find_decoder)(codec_id) };
-    if codec.is_null() {
-        return Err(format!("no decoder for audio codec id {}", codec_id));
-    }
-    let dec = unsafe { (ff.syms.avcodec_alloc_context3)(codec) };
-    if dec.is_null() {
-        return Err("avcodec_alloc_context3(audio) failed".into());
-    }
-    let _dec_guard = PtrGuard::new(dec, ff.syms.avcodec_free_context).map_err(|e| e)?;
-    let r = unsafe { (ff.syms.avcodec_parameters_to_context)(dec, par) };
-    if r < 0 {
-        return Err(format!("audio parameters_to_context: {}", ff.err2str(r)));
-    }
-    ff.cc_set_threads_auto(dec);
-    let r = unsafe { (ff.syms.avcodec_open2)(dec, codec, std::ptr::null_mut()) };
-    if r < 0 {
-        return Err(format!("audio decoder open: {}", ff.err2str(r)));
-    }
-
-    let oc = (if out_channels == 1 { 1 } else { 2 }) as usize;
-
-    let frame = ff.frame_alloc()?;
-    let pkt = ff.packet_alloc()?;
-    let mut samples: Vec<f32> = Vec::new();
-    let mut swr = SwrCell::new(std::ptr::null_mut(), ff.syms.swr_free);
-    let mut cur_cfg: (i32, i32, i32) = (-1, -1, -1);
-
-    'decode: loop {
-        let pr = unsafe { (ff.syms.av_read_frame)(fc, pkt.raw) };
-        if pr < 0 {
-            if pr == AVERROR_EOF {
-                break 'decode;
-            }
-            return Err(format!("audio read: {}", ff.err2str(pr)));
-        }
-        let idx = unsafe { rd_i32(pkt.raw, AVPACKET_STREAM_INDEX) };
-        if idx == astream {
-            let sent = unsafe { (ff.syms.avcodec_send_packet)(dec, pkt.raw) };
-            ff.packet_unref(pkt.raw);
-            if sent < 0 && sent != AVERROR_EAGAIN && sent != AVERROR_EOF {
-                return Err(format!("audio send_packet: {}", ff.err2str(sent)));
-            }
-            loop {
-                let fr = unsafe { (ff.syms.avcodec_receive_frame)(dec, frame.raw) };
-                if fr == AVERROR_EAGAIN || fr == AVERROR_EOF {
-                    break;
-                }
-                if fr < 0 {
-                    return Err(format!("audio receive_frame: {}", ff.err2str(fr)));
-                }
-                let nb = ff.frame_nb_samples(frame.raw).max(0) as i32;
-                let in_fmt = ff.frame_format(frame.raw);
-                let in_ch = ff.frame_channels(frame.raw).max(1) as i32;
-                let in_sr = if ff.frame_sample_rate(frame.raw) > 0 {
-                    ff.frame_sample_rate(frame.raw)
-                } else {
-                    44100
-                };
-                let cfg = (in_fmt, in_ch, in_sr);
-                if cfg != cur_cfg {
-                    let fresh = make_swr(ff, in_fmt, in_ch, in_sr, out_rate, out_channels)?;
-                    swr.replace(fresh);
-                    cur_cfg = cfg;
-                }
-                if nb > 0 {
-                    let est = ((nb as usize) * (in_sr as usize) / (out_rate as usize) + 64) * oc;
-                    let mut out = vec![0f32; est];
-                    let in_planes = unsafe { ff.frame_extended_data(frame.raw) };
-                    unsafe {
-                        let mut out_ptr = out.as_mut_ptr();
-                        let got = (ff.syms.swr_convert)(
-                            swr.ptr(),
-                            (&mut out_ptr) as *mut *mut f32 as *mut *mut u8,
-                            (est / oc) as i32,
-                            in_planes as *const *const u8,
-                            nb,
-                        );
-                        if got > 0 {
-                            let total = (got as usize) * oc;
-                            samples.extend_from_slice(&out[..total]);
-                        }
-                    }
-                }
-                ff.frame_unref(&frame);
-            }
-        } else {
-            ff.packet_unref(pkt.raw);
-        }
-    }
-
-    // flush the resampler tail
-    if !swr.ptr().is_null() {
-        loop {
-            let cap = 4096 * oc;
-            let mut out = vec![0f32; cap];
-            unsafe {
-                let mut out_ptr = out.as_mut_ptr();
-                let got = (ff.syms.swr_convert)(
-                    swr.ptr(),
-                    (&mut out_ptr) as *mut *mut f32 as *mut *mut u8,
-                    (cap / oc) as i32,
-                    std::ptr::null(),
-                    0,
-                );
-                if got <= 0 {
-                    break;
-                }
-                let total = (got as usize) * oc;
-                samples.extend_from_slice(&out[..total]);
-            }
-        }
-    }
-
-    Ok(PcmBuffer {
-        samples: Arc::new(samples),
-        channels: oc,
-        rate: out_rate,
-    })
-}
-
 /// v0.3: add ONE track into an existing interleaved mix buffer (the audio
 /// thread mixes per-track so a large decoded source can be dropped right
 /// after its pass — peak RAM = mix + largest track, not the SUM of all
@@ -312,51 +158,6 @@ pub fn mix_into(out: &mut [f32], t: &Track, channels: usize) {
             *o += v * t.gain;
         }
     });
-}
-
-/// v0.3: master-bus fades + safety clamp over a finished mix (the old
-/// mixdown tail, split so per-track `mix_into` passes can run first).
-/// v0.4: `fade_edges` carries just the fades — the spilled (file-mapped)
-/// mix clamps at AAC read time instead of dirtying the whole mapping.
-pub fn fade_edges(
-    out: &mut [f32],
-    total_samples: usize,
-    channels: usize,
-    fade_in_samples: usize,
-    fade_out_samples: usize,
-) {
-    let chans = channels.max(1);
-    // master-bus fades
-    if fade_in_samples > 0 {
-        for i in 0..total_samples.min(fade_in_samples) {
-            let g = i as f32 / fade_in_samples as f32;
-            for c in 0..chans {
-                out[i * chans + c] *= g;
-            }
-        }
-    }
-    if fade_out_samples > 0 && total_samples > 0 {
-        let start = total_samples.saturating_sub(fade_out_samples);
-        for i in start..total_samples {
-            let g = (total_samples - i) as f32 / fade_out_samples as f32;
-            for c in 0..chans {
-                out[i * chans + c] *= g;
-            }
-        }
-    }
-}
-
-pub fn finish_mix(
-    out: &mut [f32],
-    total_samples: usize,
-    channels: usize,
-    fade_in_samples: usize,
-    fade_out_samples: usize,
-) {
-    fade_edges(out, total_samples, channels, fade_in_samples, fade_out_samples);
-    for v in out.iter_mut() {
-        *v = v.clamp(-1.0, 1.0);
-    }
 }
 
 // ── v0.3 EBU R128 K-WEIGHTED LOUDNESS (the loudnorm measurement parity,
@@ -507,9 +308,6 @@ pub struct AudioStream {
     out_rate: u32,
     out_channels: u32,
     eof: bool,
-    /// Resampled frames decoded in the CURRENT pass (resets on seek_start;
-    /// after EOF of the first pass this is the source length L).
-    pass_frames: usize,
 }
 
 unsafe impl Send for AudioStream {}
@@ -571,7 +369,6 @@ impl AudioStream {
             out_rate,
             out_channels,
             eof: false,
-            pass_frames: 0,
         })
     }
 
@@ -606,7 +403,6 @@ impl AudioStream {
                             }
                             // already drained + demuxer at EOF: nothing more,
                             // ever — return what this window collected.
-                            self.pass_frames += frames_got;
                             return Ok(PcmBuffer {
                                 samples: Arc::new(samples),
                                 channels: self.out_channels as usize,
@@ -679,7 +475,6 @@ impl AudioStream {
             }
             self.ff.frame_unref(&self.frame);
         }
-        self.pass_frames += frames_got;
         Ok(PcmBuffer { samples: Arc::new(samples), channels: self.out_channels as usize, rate: self.out_rate })
     }
 
@@ -706,14 +501,7 @@ impl AudioStream {
             (self.ff.syms.avcodec_flush_buffers)(self.dec.raw);
         }
         self.eof = false;
-        self.pass_frames = 0;
         Ok(())
-    }
-
-    /// Resampled frames decoded in the current pass (the source length L
-    /// after the first pass reaches EOF).
-    pub fn pass_frames(&self) -> usize {
-        self.pass_frames
     }
 
     pub fn at_eof(&self) -> bool {
@@ -739,19 +527,220 @@ pub fn audio_duration_sec(ff: &FFmpegLibs, path: &str) -> f64 {
         Ok(g) => g,
         Err(_) => return 0.0,
     };
-    // v0.4: MP3/AAC raw streams only learn their duration during stream-info
-    // probing (Xing/Info header or bitrate scan) — without this the container
-    // duration reads 0, the decoded-size gate sees "0 bytes", and 69-minute
-    // voiceovers took the FULL-DECODE path (1.6 GB anonymous PCM — the
-    // residual OOM peak).
+    // v0.6: find_stream_info FIRST — MP3s (and several containers) leave
+    // duration = AV_NOPTS after a bare open_input; the estimate lands during
+    // stream-info probing. AV_NOPTS (i64::MIN) reads as 0 (not measured).
     unsafe { (ff.syms.avformat_find_stream_info)(guard.raw, std::ptr::null_mut()) };
     let d_us = unsafe {
         let base = (guard.raw as *const u8).add(AVFMTCTX_DURATION) as *const i64;
-        base.read_unaligned()
+        let v = base.read_unaligned();
+        if v == i64::MIN { 0 } else { v }
     };
     if d_us > 0 {
         d_us as f64 / 1_000_000.0
     } else {
         0.0
+    }
+}
+
+// ── v0.4 WINDOWED JOB MIXER (bounded RAM for ANY timeline length) ───────────
+// The v0.3 audio thread materialized the FULL timeline mix in RAM next to
+// the decoded sources (a 69-min stereo f32 mix alone is ~1.6 GB — the
+// pagefile blowup users saw on low-RAM machines). The JobMixer is the
+// pull-based counterpart: the caller drives OUTPUT windows [a, b) and each
+// mixer returns just that window's contribution, decoding sequentially and
+// re-seeking only on loop wraps. Peak RAM = pending window + one decode
+// window, regardless of timeline or source length.
+
+/// One placed audio job, in mixer terms (output-sample units).
+pub struct JobSpec {
+    pub path: String,
+    /// Output frame where this job begins (from start_ms).
+    pub start_sample: i64,
+    /// Playback speed (base-lane video speed; 1 for music/VO/SFX).
+    pub speed: f64,
+    /// Loop the source across the remaining timeline.
+    pub loop_src: bool,
+}
+
+pub struct JobMixer {
+    stream: AudioStream,
+    /// Decoded, resampled, interleaved samples not yet consumed (front =
+    /// physical source frame `head`).
+    pending: std::collections::VecDeque<f32>,
+    /// Physical source frame at the front of `pending`.
+    head: usize,
+    /// Source length in frames — pinned at the first EOF (the loop cycle
+    /// length; also the non-loop end).
+    len: Option<usize>,
+    /// This job can no longer contribute (non-loop, past EOF/end).
+    dead: bool,
+    chans: usize,
+    /// Physical frame index of the NEXT decode (head + pending frames).
+    filled: usize,
+}
+
+impl JobMixer {
+    pub fn open(
+        ff: Arc<FFmpegLibs>,
+        spec: &JobSpec,
+        rate: u32,
+        chans: u32,
+    ) -> Result<Self, String> {
+        let stream = AudioStream::open(ff, &spec.path, rate, chans)?;
+        let chans = (if chans == 1 { 1 } else { 2 }) as usize;
+        Ok(JobMixer {
+            stream,
+            pending: std::collections::VecDeque::new(),
+            head: 0,
+            len: None,
+            dead: false,
+            chans,
+            filled: 0,
+        })
+    }
+
+    /// True when this job will never contribute again.
+    pub fn finished(&self) -> bool {
+        self.dead
+    }
+
+    /// Decode until the physical buffer covers `until` (or EOF). Returns
+    /// false when the stream is at a FINAL EOF (nothing more to decode
+    /// without a rewind).
+    fn fill_to(&mut self, until: usize, win_frames: usize) -> Result<bool, String> {
+        while self.filled < until {
+            match self.stream.next_window(win_frames) {
+                Ok(w) => {
+                    let got = w.samples.len() / self.chans.max(1);
+                    if got == 0 {
+                        // EOF: pin the source length on the first hit.
+                        if self.len.is_none() {
+                            self.len = Some(self.filled);
+                        }
+                        return Ok(false);
+                    }
+                    self.pending.extend(w.samples.iter().copied());
+                    self.filled += got;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Consume physical frames [from, until) out of `pending` (from ≥ head).
+    /// Returns whatever is available (short at EOF).
+    fn consume(&mut self, from: usize, until: usize) -> Vec<f32> {
+        if from > self.head {
+            let skip = (from - self.head) * self.chans;
+            let skip = skip.min(self.pending.len());
+            self.pending.drain(..skip);
+            self.head += skip / self.chans;
+        }
+        let want = until.saturating_sub(self.head) * self.chans;
+        let take = want.min(self.pending.len());
+        let out: Vec<f32> = self.pending.drain(..take).collect();
+        self.head += take / self.chans;
+        out
+    }
+
+    /// Rewind to the physical stream start (loop wrap).
+    fn rewind(&mut self) -> Result<(), String> {
+        self.stream.seek_start()?;
+        self.pending.clear();
+        self.head = 0;
+        self.filled = 0;
+        Ok(())
+    }
+
+    /// This job's contribution to output frames [a, b): a list of
+    /// (interleaved samples, output start frame) chunks. Chunk boundaries
+    /// only occur at loop-cycle wraps; speed maps output→source linearly
+    /// inside a chunk (mix_into's interpolation math).
+    pub fn pull_for(
+        &mut self,
+        spec: &JobSpec,
+        a: usize,
+        b: usize,
+        win_frames: usize,
+    ) -> Result<Vec<(Vec<f32>, i64)>, String> {
+        let mut out: Vec<(Vec<f32>, i64)> = Vec::new();
+        if self.dead || b as i64 <= spec.start_sample {
+            return Ok(out);
+        }
+        let t0 = spec.start_sample.max(0) as usize;
+        let a2 = a.max(t0);
+        let speed = spec.speed.max(0.01);
+        // UNWRAPPED source position (fractional frames) for output a2 / b.
+        let mut src = (a2 - t0) as f64 * speed;
+        let src_end = (b - t0) as f64 * speed;
+        if !spec.loop_src {
+            if let Some(l) = self.len {
+                if src >= l as f64 {
+                    self.dead = true;
+                    return Ok(out);
+                }
+            }
+            if self.stream.at_eof() && self.filled == 0 && self.pending.is_empty() {
+                self.dead = true;
+                return Ok(out);
+            }
+        }
+        while src < src_end - 1e-9 {
+            // Next cycle boundary (loop only, once L is pinned).
+            let seg_end = match self.len {
+                Some(l) if spec.loop_src && l > 0 => {
+                    let l = l as f64;
+                    let cyc = (src / l).floor() * l + l;
+                    cyc.min(src_end)
+                }
+                _ => src_end,
+            };
+            let from = src.ceil().max(0.0) as usize; // physical = unwrapped mod L after rewind
+            let until = seg_end.ceil().max(0.0) as usize;
+            if until > from {
+                let have = self.fill_to(until, win_frames)?;
+                let avail_until = if have { until } else { self.filled.max(from) };
+                if avail_until > from {
+                    let samples = self.consume(from, avail_until);
+                    if !samples.is_empty() {
+                        // out_start: output frame whose source position is
+                        // `from` (unwrapped): x = t0 + from / speed.
+                        let x = t0 as f64 + from as f64 / speed;
+                        out.push((samples, x.round() as i64));
+                    }
+                }
+                if !have {
+                    // EOF hit while filling.
+                    if let Some(l) = self.len {
+                        if !spec.loop_src || l == 0 {
+                            self.dead = true;
+                            break;
+                        }
+                        // loop wrap: rewind and continue the next cycle.
+                        self.rewind()?;
+                        src = ((src / l as f64).floor() + 1.0) * l as f64;
+                        continue;
+                    } else {
+                        self.dead = true;
+                        break;
+                    }
+                }
+                src = until as f64;
+            } else {
+                src = seg_end;
+            }
+            // non-loop past the end
+            if !spec.loop_src {
+                if let Some(l) = self.len {
+                    if src >= l as f64 {
+                        self.dead = true;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 }

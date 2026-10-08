@@ -32,15 +32,14 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
   let clip = u.transform * vec3<f32>(p, 1.0);
   var out: VsOut;
   out.pos = vec4<f32>(clip.xy, 0.0, 1.0);
-  // v0.5.1 ORIENTATION FIX: the transform (gpu.rs layer_transform) already
-  // maps quad-local y=0 to clip +1 = the TOP of the screen (-2dh, 1-2dy —
-  // a y-down screen-space convention, matching the CPU blit's dy-from-top).
-  // WebGPU's texture v=0 is the FIRST uploaded row = the bitmap's TOP row
-  // (write_texture receives top-row-first RGBA, same as the CPU path).
-  // The old `1.0 - p.y` flipped the sample vertically — every GPU-path
-  // export since v1.20 rendered upside-down (the CPU path stayed upright,
-  // and CI color tests used spatially-uniform frames, so it slipped through).
-  // uv.y must be p.y: screen top (p.y=0) samples texture row 0 (image top).
+  // v0.4 ORIENTATION FIX (the user-reported upside-down GPU export):
+  // WebGPU's texture coordinate origin is the TOP-LEFT texel with v
+  // increasing DOWNWARD, and the layer_transform maps quad y=0 to the TOP
+  // of the dest rect (NDC +y is up = top edge). The old `1.0 - p.y` flipped
+  // the V axis on top of that — every GPU-path export rendered VERTICALLY
+  // MIRRORED (sky at the bottom) since v1.16, while the CPU rasterizer
+  // (which blits rows top-down) stayed upright. Sampling v = p.y keeps the
+  // quad's top edge on the bitmap's top row: upright, CPU-parity.
   out.uv = vec2<f32>(p.x, p.y);
   return out;
 }

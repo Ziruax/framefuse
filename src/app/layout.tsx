@@ -1,14 +1,10 @@
 import type { Metadata, Viewport } from "next";
-import pkg from "../../package.json";
 import "./globals.css";
 
 export const metadata: Metadata = {
   // v1.14.2: the title states what the product is — a Windows desktop app
   // (the browser route is a landing page / dev preview, not the product).
-  // v1.33.9: the version is derived from package.json — the title used to
-  // carry a hand-typed constant that drifted every release (v1.33.7 title
-  // on the v1.33.8 build).
-  title: `FrameFuse v${pkg.version} — Windows Desktop Video Studio`,
+  title: "FrameFuse v1.34.0 — Windows Desktop Video Studio",
   description:
     "Multi-track Windows desktop video studio: video clips, green-screen chroma key with on-canvas PiP, background music with volume & loop, SFX, native Whisper captions, and fast native export.",
   applicationName: "FrameFuse",

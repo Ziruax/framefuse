@@ -147,11 +147,10 @@ pub struct FFSyms {
     pub av_packet_alloc: unsafe extern "C" fn() -> *mut u8,
     pub av_packet_free: unsafe extern "C" fn(pkt: *mut *mut u8),
     pub av_packet_unref: unsafe extern "C" fn(pkt: *mut u8),
-    pub av_packet_rescale_ts: unsafe extern "C" fn(pkt: *mut u8, tb_src: Rational, tb_dst: Rational),
-    /// v0.4 (loop dedup): allocate a refcounted data buffer on a packet so
-    /// cloned bitstream packets can be handed to av_interleaved_write_frame
-    /// without aliasing encoder-owned memory.
+    // v0.4 FRAME-CLONE PATH: allocates a packet with a fresh data buffer
+    // (the cloned-frame writer copies the cached packet's bytes in).
     pub av_new_packet: unsafe extern "C" fn(pkt: *mut u8, size: i32) -> i32,
+    pub av_packet_rescale_ts: unsafe extern "C" fn(pkt: *mut u8, tb_src: Rational, tb_dst: Rational),
     // avformat
     pub avformat_version: unsafe extern "C" fn() -> u32,
     pub avformat_open_input: unsafe extern "C" fn(ps: *mut *mut u8, url: *const c_char, fmt: *mut u8, options: *mut *mut u8) -> i32,
@@ -416,8 +415,8 @@ impl FFmpegLibs {
             av_packet_alloc: cast!(sym!(avcodec, b"av_packet_alloc"), _),
             av_packet_free: cast!(sym!(avcodec, b"av_packet_free"), _),
             av_packet_unref: cast!(sym!(avcodec, b"av_packet_unref"), _),
-            av_packet_rescale_ts: cast!(sym!(avcodec, b"av_packet_rescale_ts"), _),
             av_new_packet: cast!(sym!(avcodec, b"av_new_packet"), _),
+            av_packet_rescale_ts: cast!(sym!(avcodec, b"av_packet_rescale_ts"), _),
             avformat_version: cast!(sym!(avformat, b"avformat_version"), _),
             avformat_open_input: cast!(sym!(avformat, b"avformat_open_input"), _),
             avformat_find_stream_info: cast!(sym!(avformat, b"avformat_find_stream_info"), _),

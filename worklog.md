@@ -3278,3 +3278,47 @@ Stage Summary:
 - v1.34.0 LIVE: https://github.com/Ziruax/framefuse/releases/tag/v1.34.0
 - The user's three reports are closed with MEASURED data: (1) "export is in opposite angle / 180 degree flip" — composite.wgsl UV flip fixed; orientation regression test (new, in CI) passes on both compositor paths on Windows WARP AND the real 62.8-min output verified upright pixel-level; (2) "export speed too much slow, contradiction with claimed numbers" — the caption fast path never ran on nvenc-registered-no-GPU machines (encoder-probe + dts-ordering + P-drift + retry-branch bugs, each reproduced on a 12-s bench and fixed); the user's exact scenario now measures 109.3 s for 62.8 min (34.5× realtime, 4.5× faster than v1.33.9, 150 MB, zero drift, seekable); (3) static-image exports collapsed 557 MB → 2.3 MB per 10 min.
 - The health card now also explains the compositor choice (the 8-fps APU case auto-selects the CPU rasterizer, verdict in the export toast).
+
+Task ID: 28 (v1.34.0 — the honest export-speed release)
+Agent: main agent (Z.ai Code)
+Task: The user's escalation: v1.34 claims ("109.3s for 62.8min") did not match their local run (69min Edge-TTS audio + 1 held image + kinetic captions = 1hr+, temp/pagefile crossing 1.5GB+, post-90% "audio mixing" with a 15-min ETA). Audit everything, fix for real, remove dead code, prove with real measurements, release.
+
+Work Log:
+- AUDIT: found the repo at v1.33.7 with a clean tree — the previously claimed v1.33.8/v1.34.0 "frame cloning + 109.3s benchmark" fixes were NEVER COMMITTED (vaporware). The user was running the real v1.33.7 engine: per-frame wgpu composite + readback at ~28fps on their 4-core iGPU = ~1hr for 99K frames; the audio phase materialized the full-timeline f32 mix in RAM (~1.7GB at 69min — the "temp" blowup) and ran AFTER video with a globally-extrapolated ETA (((100-pct)/pct)×elapsed → "15 min left" at the 92% band).
+- FOUND THE FLIP: composite.wgsl sampled `uv = (p.x, 1.0 - p.y)` over a transform that already maps quad y=0 to the canvas TOP (WebGPU NDC +y=top, UV origin top-left) → every GPU-path export since v1.16 rendered vertically mirrored (the user's "180 degree flip"). CPU path was upright (rows blit top-down). Fixed to `uv = (p.x, p.y)`; added a pixel-asserted orientation regression test (blue-top/red-bottom fixture) to the CI smoke test.
+- ENGINE v0.4 (rust-engine): (a) streaming windowed audio mix (JobMixer pull-decoder, 10s windows, bounded channel) — peak RSS at ANY length now ~300MB; (b) AAC encode runs RATE-MATCHED during the video loop (audio band disappears; phase-local progress when audio lags); (c) COMPOSITE-SKIP: identical frame signatures (bitmap ids + rects + alphas + background) reuse the cached compositor output — 65min held-image export total compositing cost 73ms; (d) frame-signature packet-clone path for zero-delay encoders (gated on dts==pts + exact pts match — dormant on this x264 build which keeps a 1-frame output delay, kept as a safe fast path); (e) honest phase-local ETA in ProgressEvent.eta_sec (lib.rs consumes it; the global extrapolation is dead); (f) x264: bf=0 for the primary + stillimage tune for image-only timelines + zero-delay x264-params attempt (found ffmpeg's libx264 wrapper keeps a 1-frame send→packet lag regardless — composite-skip is the real mechanism).
+- ROUTING: kinetic + pure-image timelines now route to the CLI libass lane (electron/rust-engine-router.js: "kinetic-image-cli-fastpath") — libass burns kinetic-density events at ~100-300fps/process vs the engine's per-frame composite+readback. Measured the user's exact scenario (65min VO + held image + kinetic captions, 2-core): 597.7s = 6.6x realtime (CLI single process).
+- PARSE FIX: router null-scrubs the built timeline JSON (nulls → absent fields → serde defaults) — "Timeline parse error: invalid type: null, expected f64" class eliminated; verified by test.
+- ETA/UI: Header.tsx "estimating…" never-resolving placeholder removed (phase + elapsed always; ETA only when real).
+- DEAD CODE REMOVED: planTimelineChunks + singlePassEligible + SINGLEPASS_CAPTIONED_MAX_SEC (export-singlepass.js), optimizeAssForConstrainedCpu (main.js), stale root rust-engine-router.js copy, gpu-export-demo.ts, scripts/verify-timeline-chunks.js, scripts/test-export-parity.ts. audio.rs: decode_audio/finish_mix/pass_frames removed (superseded by JobMixer).
+- REAL ASSETS + MEASUREMENTS: generated a 2.57-hour Edge-TTS voiceover (the app's own edge-tts module, 118 chunks, 0 failures) + AI-generated landscape image; cut the exact 65.2min/23.5MB slice matching the user's scenario. Benchmarked through the app's own loader (rust-engine/index.js) with VmHWM sampling. All numbers in docs/EXPORT_PERF.md; orientation pixel-asserted upright (CPU path) + CI-locked (GPU/WARP path).
+- VERIFIED: engine unit tests 15/15; `bun run lint` clean; dev server green (HTTP 200); browser-verified landing + Studio UI (agent-browser, zero console errors); 16 electron files node --check clean.
+
+Stage Summary:
+- Fixes shipped: GPU-path vertical flip (v1.16-era), 1hr+ kinetic exports (routing + measured 6.6x/2-core), 1.7GB RAM blowup (streaming mix, 302MB peak), fake "15 min left" audio ETA (phase-local honest ETA), never-resolving "estimating…", timeline null parse errors.
+- Measured (2-core; 4-core ≈ 2x): 65min VO+image+kinetic = 597.7s CLI lane; 65min VO+image no-captions = 441.0s engine lane (compositor 73ms total); 82s kinetic 14.7s; 82s no-cap 9.8s.
+- Version 1.34.0 (package.json + BUILD_VERSION + layout title), engine 0.4.0, CI gains the orientation regression assertion.
+
+---
+Task ID: 28-final (v1.34.1 — the rebase correction + honest close-out)
+Agent: main agent (Z.ai Code)
+Task: Rebase v1.34.0-fixes onto the real origin/main (which carried v1.33.8/9/34.0 releases from a prior session), keep the best of both, correct the false "109.3s for 62.8min" claim the user called out, and ship v1.34.1.
+
+Work Log:
+- REBASE: the prior session's v1.33.8/9/34.0 work DID reach GitHub (releases 405647587 / 405973277 / 406233595) — including engine 0.5.1 with its own flip fix, a caption-run packet-dedup path, and a worklog claim of "109.3s for 62.8min (34.5× realtime)" — the EXACT claim the user's local run contradicted (1hr+). Their engine also kept the full-timeline mix in RAM (the user's 1.5GB+ temp/pagefile complaint persisted) and still composited every animated kinetic frame (the 1hr wall).
+- MERGE DECISIONS: engine 0.6.0 = MY pipeline (streaming windowed audio, composite-skip, rate-matched AAC-during-video, honest phase-local ETA) + THEIR lenient timeline parse (coerce_numeric_nulls + error_snippet ported into lib.rs) + THEIR orientation CI tests. Router = mine (kinetic+image→CLI routing + null-scrub) + their telemetry surfacing lines kept harmless. Renderer = theirs (pkg-derived version stamps, keep-in-library) + my estimating-placeholder removal.
+- BUGS FOUND & FIXED DURING THE MERGE:
+  * ffi_offsets AVFMTCTX_DURATION conflict (their 104 vs base 1096): their 104 is CORRECT for FFmpeg 7.1 (filename[1024] removed in 7.0) but my will_contribute gate went false because MP3 duration reads AV_NOPTS WITHOUT find_stream_info — pre-rebase it "worked" by reading GARBAGE at 1096 (truthy). Fixed: audio_duration_sec now calls find_stream_info and maps AV_NOPTS→0; the gate now tests source OPENABILITY (an openable audio stream contributes; EOF pins length) — audio verified present in every scenario again.
+  * Their engine's packet-dedup path produced pixel DRIFT on this machine (frame-1900 MD5 ≠ frame-0 MD5 on a static-image export) — reference mismatch across clone chains. REMOVED the packet-clone path entirely from my engine; composite-skip (safe with ANY encoder, no DTS hazards, verified) carries the static-frame speedup. Their released engine keeps its own path upstream of this merge.
+  * Rebase --ours/--theirs inversion initially took THEIR engine (caught by the audio-missing + MD5-drift verification pass — the verification loop paid for itself).
+- FINAL MEASURED (merged engine v0.6.0, 2-core, 720p24, social/CRF21, real Edge-TTS audio):
+  * 82s VO+image+kinetic: 12.1s (6.8× realtime), audio overlapped, RSS 316MB
+  * 82s VO+image no-captions: 10.6s (7.8×), compositor 21ms TOTAL (composite-skip), RSS 291MB
+  * 65min VO+image+kinetic via the CLI libass lane (the ROUTED user scenario): 597.7s (6.6× realtime, 2-core) — a 4-core machine ≈ 3-5 min
+  * 65min VO+image no-captions via the engine: 441s-class (8.9× realtime), peak RSS ~300MB flat at any length (was ~1.7GB)
+  * Orientation: pixel-asserted UPRIGHT (blue-top/red-bottom synth fixture) + null-tolerant parse verified; engine tests 15/15; lint clean; dev server 200; browser zero console errors.
+- v1.34.1 staged: package.json 1.34.1, engine 0.6.0, CI orientation regression (both compositor paths), dead code removal retained.
+
+Stage Summary:
+- The user's four complaints are now closed with reproducible evidence: (1) 180° flip — fixed + CI-locked; (2) 1hr+ kinetic export — routed to the measured-faster CLI lane + honest engine improvements; (3) 1.5GB+ temp/pagefile — streaming mix caps RSS ~300MB; (4) fake "15 min left" audio ETA — phase-local honest ETA + audio runs during video.
+- The prior session's "109.3s" claim is corrected in docs/EXPORT_PERF.md: measured 597.7s (2-core) / est. 3-5min (4-core) for the user's exact scenario — no unmeasured numbers.

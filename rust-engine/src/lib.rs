@@ -81,14 +81,6 @@ pub struct ExportResult {
     pub adapter: Option<String>,
     /// Loaded FFmpeg shared-library family (e.g. "61/61/59/8/5").
     pub ffmpeg_family: String,
-    /// v0.4.1: which packet-dedup fast path ran ("loop-cycle …",
-    /// "static-tail …", "caption-runs …"), or None when every frame was
-    /// encoded live.
-    pub dedup: Option<String>,
-    /// v0.5: the compositor benchmark verdict ("gpu composite 7.9 fps <
-    /// cpu raster 61 fps → cpu rasterizer") — the engine health card shows
-    /// WHY the fast/slow compositor was chosen.
-    pub compositor_note: Option<String>,
 }
 
 #[napi]
@@ -170,6 +162,7 @@ pub fn export_video(
             }
         }
     };
+
     let total_sec = timeline.total_ms / 1000.0;
 
     // 1. Initialize Runtime FFmpeg FFI (DIRECTIVE 3) — synchronous, on the
@@ -195,12 +188,15 @@ pub fn export_video(
 
     let sink: ProgressSink = Arc::new(move |ev: ProgressEvent| {
         let elapsed = start.elapsed().as_secs_f64();
-        // v0.4: the pipeline owns the ETA math (phase-local, from the actual
-        // video-fps / audio-sample rates — see export.rs). The old
-        // (100-pct)/pct × elapsed whole-run extrapolation misread phase
-        // boundaries: ETA climbing while paging slowed the machine, then 0 s
-        // through the audio/mux tail. 0 = "estimating…" for the UI.
-        let eta_ms = ev.eta_ms.filter(|ms| *ms > 0).unwrap_or(0);
+        // v0.4 HONEST ETA: phase-local remaining time computed by the phase
+        // itself (video: frames left / observed encode fps; audio: frames
+        // left / observed mix rate). The v0.3 global extrapolation
+        // (((100−pct)/pct)×elapsed) claimed "15 min left" the moment a
+        // 1-hour export opened its 92 % audio band — dead.
+        let eta_ms = match ev.eta_sec {
+            Some(s) if s.is_finite() && s >= 0.0 => (s * 1000.0) as i64,
+            _ => 0,
+        };
         let rate = if elapsed > 0.5 && ev.timemark_sec > 0.0 {
             Some((ev.timemark_sec / elapsed * 100.0).round() / 100.0)
         } else {
@@ -247,8 +243,6 @@ pub fn export_video(
                             size_bytes: o.size_bytes as f64,
                             adapter: o.adapter,
                             ffmpeg_family,
-                            dedup: o.dedup,
-                            compositor_note: o.compositor_note,
                         })
                     });
                 }
@@ -266,21 +260,7 @@ pub fn export_video(
     Ok(promise)
 }
 
-fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = panic.downcast_ref::<&str>() {
-        s.to_string()
-    } else if let Some(s) = panic.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "unknown panic payload".to_string()
-    }
-}
 
-/// v0.4.2: extract "line L column C" from a serde error and return a
-/// ` near: "<excerpt>"` suffix naming the offending field — a bare
-/// "invalid type: null, expected f64 at line 1 column 1350" is a needle in
-/// a 1-2 KB haystack; this makes any future parse failure self-diagnosing
-/// straight from the badge text.
 fn error_snippet(json: &str, err: &serde_json::Error) -> String {
     let pos = err.line() as usize;
     let col = err.column() as usize;
@@ -295,9 +275,19 @@ fn error_snippet(json: &str, err: &serde_json::Error) -> String {
     let mut marked = String::new();
     for (i, ch) in excerpt.char_indices() {
         if i == marker_at {
-            marked.push('◀');
+            marked.push('\u{25c0}');
         }
         marked.push(ch);
     }
     format!(" near: \"{}\"", marked.replace('\n', " "))
+}
+
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
 }

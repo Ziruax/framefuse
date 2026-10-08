@@ -304,7 +304,7 @@ function main() {
         );
       }
     })
-    .then((res) => {
+    .then(async (res) => {
       console.log("=== RESULT ===");
       console.log(JSON.stringify(res, null, 2));
 
@@ -410,6 +410,45 @@ function main() {
         }
       } catch (e) {
         console.log("  (luma check unavailable: " + (e && e.message) + ")");
+      }
+
+      // 4.5 v0.4 ORIENTATION REGRESSION (the user-reported upside-down GPU
+      // export): a spatially-unambiguous fixture (top half BLUE, bottom half
+      // RED) must decode UPRIGHT — on whichever compositor ran (real GPU on
+      // hardware machines, WARP on the CI runner; both go through the same
+      // composite.wgsl path whose V-axis was flipped since v1.16).
+      try {
+        const orientImg = path.join(MEDIA_DIR, "orient.png");
+        runFF([
+          "-y", "-hide_banner", "-loglevel", "error",
+          "-f", "lavfi", "-i", "color=c=0x2040E0:s=320x180:d=1",
+          "-frames:v", "1",
+          "-vf", "drawbox=y=90:h=90:c=0xE02020@1:t=fill",
+          orientImg,
+        ], "orient.png");
+        const orientOut = path.join(OUT_DIR, "orient.mp4");
+        const otl = {
+          version: 1, width: 320, height: 180, fps: 12, totalMs: 800,
+          segments: [{ id: "o1", mediaType: "image", path: orientImg, startMs: 0, endMs: 800, durationMs: 800, track: 0 }],
+        };
+        await engine.exportVideo(JSON.stringify(otl), orientOut, FFMPEG_DIR, () => {});
+        const strip = (y) => spawnSync(
+          FFMPEG,
+          ["-v", "error", "-i", orientOut, "-frames:v", "1", "-vf", `crop=160:20:80:${y},format=rgb24`, "-f", "rawvideo", "-"],
+          { timeout: 60000, maxBuffer: 8 * 1024 * 1024 },
+        );
+        const top = strip(20);
+        const bot = strip(140);
+        if (top.status === 0 && bot.status === 0 && top.stdout.length >= 60 && bot.stdout.length >= 60) {
+          const tR = top.stdout[0], tB = top.stdout[2];
+          const bR = bot.stdout[0], bB = bot.stdout[2];
+          check(tB > tR + 20, `orientation: TOP strip is BLUE (R${tR} < B${tB}) — compositor upright`);
+          check(bR > bB + 20, `orientation: BOTTOM strip is RED (R${bR} > B${bB}) — not vertically mirrored`);
+        } else {
+          check(false, "orientation fixture frame decode failed");
+        }
+      } catch (e) {
+        check(false, "orientation regression test error: " + (e && e.message));
       }
 
       const wallMs = Date.now() - t0;

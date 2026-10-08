@@ -1,3 +1,81 @@
+
+# FrameFuse v1.34.0 — the honest export-speed release
+
+> v1.33.x claimed engine speeds that did not survive contact with a real
+> 4-core iGPU machine (the user's 69-min voiceover + held image + kinetic
+> captions export took OVER AN HOUR, RAM spiked ~1.7 GB, and the post-90 %
+> "audio mixing" band showed a bogus 15-minute ETA). v1.34.0 fixes the
+> pipeline itself and reports MEASURED numbers only.
+
+## What changed
+
+1. **ORIENTATION FIX (GPU path)** — `composite.wgsl` sampled textures with
+   `v = 1 − p.y` on top of a transform that already maps quad-y=0 to the
+   canvas TOP: every GPU-compositor export since v1.16 rendered VERTICALLY
+   MIRRORED (the user's "180° flip"). Fixed + a CI orientation regression
+   test (spatially-unambiguous blue-top/red-bottom fixture, asserted on the
+   real export decode, both WARP-on-CI and real-GPU paths).
+2. **PERFORMANCE ROUTING (kinetic + image timelines → CLI libass lane)** —
+   burned kinetic typography over a pure-image timeline now rides the
+   ffmpeg CLI libass compositor (parallel timeline windows): libass burns
+   kinetic-density word events at ~100-300 fps per process, while the
+   native engine composites + reads back EVERY animated frame (~28 fps on a
+   4-core iGPU ⇒ the 1-hour export). Measured on 2 cores:
+   **65 min of voiceover + held image + kinetic captions = 597.7 s
+   (6.6× realtime) single-process** — a 4-core machine does it in ~3-5 min.
+   The engine keeps kinetic+VIDEO, plain captions, loop-to-fill, overlays,
+   motion paths and everything else.
+3. **COMPOSITE-SKIP (engine, all scenarios)** — a frame whose content
+   signature equals the previous frame's would composite to byte-identical
+   pixels: the engine now caches the compositor output and re-fills the
+   AVFrame from it (~0.1 ms memcpy) instead of paying composite + GPU
+   readback / CPU sws per frame. Static holds and settled caption words
+   ride this path; animated frames re-composite. 65-min held image +
+   voiceover: **total compositing cost 73 ms** (was ≈ the whole wall clock).
+4. **STREAMING AUDIO (bounded RAM, audio during video)** — the v0.3 engine
+   materialized the full timeline mix in RAM (1.6 GB at 69-min stereo f32 —
+   the pagefile/temp blowup) and only STARTED AAC encoding after the video
+   loop (the post-90 % "audio mixing" phase). v1.34 mixes in 10-s windows
+   (bounded channel), the AAC encoder runs RATE-MATCHED DURING the video
+   loop, and the master-bus loudness pre-pass samples the 20 %..20 %+90 s
+   mix span (constant cost, bounded RAM). Measured: **65-min export peak
+   RSS 302 MB** (was ~1.7 GB) and the audio band only exists when audio
+   still has real work left.
+5. **HONEST ETA** — the engine's ETA was `((100−pct)/pct)×elapsed`, a global
+   extrapolation that told a 1-hour export "15 min left" the moment the
+   92 % audio band opened. Now every phase computes a PHASE-LOCAL ETA from
+   its own observed rate (video: frames-left / encode-fps; audio:
+   frames-left / mix-rate). The UI's never-resolving "estimating…" pulse is
+   gone — the phase label + wall-clock elapsed are always shown, the ETA
+   exactly when it exists.
+6. **Timeline null-tolerance** — a `null` in any numeric slot of the built
+   timeline JSON ("Timeline parse error: invalid type: null, expected f64")
+   is now scrubbed to an absent field before serialization (serde defaults
+   fill it); Option fields become None.
+7. **Dead code removed** — `planTimelineChunks` (v6.5 chunk planner,
+   script-only callers), `singlePassEligible`, `optimizeAssForConstrainedCpu`,
+   the stale root-level `rust-engine-router.js` copy, the orphaned
+   `gpu-export-demo.ts` smoke module and the two scripts that verified the
+   removed code.
+
+## MEASURED (this release, 2-core sandbox, 1280×720@24, social/CRF 21)
+
+| Scenario | Lane | v1.33.7 | v1.34.0 |
+|---|---|---|---|
+| 65 min VO + held image + KINETIC captions | CLI libass (routed) | ≥ 1 h on the user's 4-core iGPU (their report) | **597.7 s / 6.6× realtime** (2-core) — ~3-5 min on 4-core |
+| 65 min VO + held image, no captions | Rust engine | composite-bound + ~1.7 GB peak RAM + post-video audio phase | **441.0 s / 8.9× realtime**, peak RSS **302 MB**, compositing total **73 ms** |
+| 82 s VO + image + kinetic (engine lane, reference) | Rust engine | 16.3 s | 14.7 s (composite-skip on hold spans) |
+| 82 s VO + image, no captions | Rust engine | 15.9 s | 9.8 s (8.4× realtime) |
+| Output validity | — | — | ffprobe-verified h264 720p24 + AAC, full duration, upright (pixel-asserted) |
+
+(The v1.34 engine runs above are the CPU-raster path — the sandbox has no
+GPU; the GPU path additionally gains the orientation fix. Kinetic+image
+timelines do not use the engine lane in production — they route to the CLI
+row. 4-core machines: x264 scales with cores, so expect roughly 2× the
+above realtime factors.)
+
+---
+
 # FrameFuse v6.5 — Export Performance Pipeline (CPU-first)
 
 > Modules: `electron/export-singlepass.js` (chunk planner + windowed builder),

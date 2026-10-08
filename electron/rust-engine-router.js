@@ -286,6 +286,24 @@ function rustEligible(opts) {
     if (geo.length === 0) reasons.push("kinetic-no-geometry");
   }
 
+  // v1.34.0 PERFORMANCE ROUTING (the 1-hour kinetic export fix): burned
+  // kinetic typography over a PURE-IMAGE timeline rides the CLI libass
+  // compositor. libass burns kinetic-density word events at 100-300 fps
+  // per process (and the smart pipeline renders timeline windows in
+  // parallel), while the native engine composites + readbacks EVERY
+  // animated frame — ~28 fps on a 4-core iGPU, i.e. ~1 hour for a
+  // 69-min voiceover video. The engine keeps kinetic+VIDEO, plain
+  // captions, loop-to-fill, overlays, motion paths and everything else;
+  // this route is strictly the measured-faster path for this scenario
+  // (bench: docs/EXPORT_PERF.md).
+  if (
+    kineticOn &&
+    segList.length > 0 &&
+    segList.every((s) => s && s.mediaType !== "video")
+  ) {
+    reasons.push("kinetic-image-cli-fastpath");
+  }
+
   // v0.3: overlay motion paths (≥2 keyframes) are NATIVE — the engine
   // interpolates the overlay center piecewise-linearly. No gate.
   const overlays = Array.isArray(opts.overlays) ? opts.overlays : [];
@@ -1234,8 +1252,16 @@ async function runRustExport(opts, event, { ffmpegPath, cpuCount, sendCliProgres
   const startedAt = Date.now();
   const phasesSeen = new Set();
   try {
+    // v1.34: null-scrub — a `null` in any numeric slot of the built
+    // timeline ("Timeline parse error: invalid type: null, expected f64",
+    // the 10-min-audio repro) becomes an ABSENT field, which serde's
+    // container-level default fills with the documented default. Option
+    // fields likewise become None instead of a parse failure.
+    const timelineJson = JSON.stringify(built.timeline, (_k, v) =>
+      v === null || v === undefined ? undefined : v,
+    );
     const res = await rustEngine.exportVideo(
-      JSON.stringify(built.timeline),
+      timelineJson,
       opts.outputPath,
       dllDir,
       (err, p) => {

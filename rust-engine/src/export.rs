@@ -22,7 +22,7 @@
 //!
 //! Muxer: movflags +faststart (moov at the front, instant seeking).
 
-use crate::audio::{self, PcmBuffer, Track};
+use crate::audio;
 use crate::compositor::{self, Bitmap, Compositor, Layer, OutputFormat, TextLayer, YuvMode};
 use crate::captions::{self, PreparedCaptions};
 use crate::ffmpeg_ffi::*;
@@ -32,7 +32,7 @@ use crate::text::TextRenderer;
 use crate::timeline::{ChromaKey, Segment, Timeline};
 use rayon::prelude::*;
 use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -44,11 +44,12 @@ pub struct ProgressEvent {
     pub percent: f64,      // 0..100
     pub fps: f64,          // encode fps (informational)
     pub timemark_sec: f64, // content position
-    /// v0.4: phase-local ETA in ms, computed by the pipeline from the ACTUAL
-    /// current-phase rate (video fps, audio sample rate). The old
-    /// whole-run (100-pct)/pct×t extrapolation misread phase boundaries —
-    /// the "ETA climbs while the export slows / shows 0s after 95%" reports.
-    pub eta_ms: Option<i64>,
+    /// v0.4 HONEST ETA: phase-local remaining seconds, computed from the
+    /// ACTUAL phase progress rate (frames encoded / wall-sec; frames mixed /
+    /// wall-sec). The v0.3 global `((100-pct)/pct)*elapsed` extrapolation
+    /// told a 1-hour export "15 min left" the moment the 92 % audio band
+    /// opened — this field replaces it wholesale.
+    pub eta_sec: Option<f64>,
 }
 pub type ProgressSink = Arc<dyn Fn(ProgressEvent) + Send + Sync>;
 
@@ -63,115 +64,6 @@ pub struct ExportOutcome {
     pub audio_ms: i64,
     pub size_bytes: u64,
     pub adapter: Option<String>,
-    /// v0.4.1: which packet-dedup fast path ran ("loop-cycle …" /
-    /// "static-tail …" / "caption-runs …"), or None when every frame was
-    /// encoded live. Surfaced to the completion report so a slow export is
-    /// diagnosable at a glance.
-    pub dedup: Option<String>,
-    /// v0.5: why the compositor is GPU or CPU (the slow-GPU benchmark
-    /// verdict) — displayed on the engine health card so "why am I on the
-    /// CPU rasterizer" is answered in the UI.
-    pub compositor_note: Option<String>,
-}
-
-// ── v0.4 AUDIO MEMORY: the finished mix's backing store ────────────────────
-// A 69-min timeline mixes to 400M f32 samples = 1.6 GB. Keeping that in a
-// plain Vec COMMITS the whole pagefile reservation for the export's life;
-// combined with a fully-decoded long voiceover it OOM-killed the host app
-// mid-export (the "app closed itself at ~1.x GB" crash). Long mixes now
-// spill to a file mapping — dirty pages flush under memory pressure instead
-// of pinning RAM — and the AAC encode pass reads the same mapping.
-#[allow(clippy::large_enum_variant)]
-pub enum AudioMix {
-    Ram(Vec<f32>),
-    Spill { path: std::path::PathBuf, samples: usize, chans: usize },
-}
-
-impl AudioMix {
-    #[allow(dead_code)] // diagnostics/selftest may read the backing
-    pub fn len(&self) -> usize {
-        match self {
-            AudioMix::Ram(v) => v.len(),
-            AudioMix::Spill { samples, .. } => *samples,
-        }
-    }
-}
-
-/// Removes the spill file when dropped (armed until the consumer takes
-/// ownership; every early `?` return path stays clean).
-struct RemoveOnDrop(Option<std::path::PathBuf>);
-impl RemoveOnDrop {
-    fn disarm(&mut self) -> Option<std::path::PathBuf> {
-        self.0.take()
-    }
-}
-impl Drop for RemoveOnDrop {
-    fn drop(&mut self) {
-        if let Some(p) = &self.0 {
-            let _ = std::fs::remove_file(p);
-        }
-    }
-}
-
-// ── v0.4 STATIC-LOOP PACKET DEDUP ──────────────────────────────────────
-// A 10-s video looped to a 69-min audio renders 125,220 frames of which
-// exactly 300 are unique. Encoding each one anyway was the 60-80-min ETA.
-// The dedup path encodes ONE cycle, captures its bitstream packets, and
-// re-emits them with shifted timestamps for every further cycle (exactly
-// what `-stream_loop -c copy` produces) — the muxer and every player see
-// a byte-identical loop at encode-once cost.
-struct CapturedPkt {
-    pts: i64,
-    dts: i64,
-    duration: i64,
-    flags: i32,
-    data: Vec<u8>,
-}
-
-/// v0.4 dedup modes — both encode the REPEATABLE part once and re-emit its
-/// packets with shifted timestamps:
-/// · LoopCycle: a looped base video with an exact whole-frame cycle
-///   (10-s clip × 418 cycles) — encode cycle 0, clone it per cycle.
-/// · StaticTail: the base lane ends before the timeline (audio-extended
-///   timelines — the false "disk full" case) — every frame past the last
-///   visual is the CONSTANT background; encode through the first tail
-///   frame, then clone that single packet (a still-image P-frame chain,
-///   exactly what a black-tail encode emits).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DedupKind {
-    LoopCycle,
-    StaticTail,
-    /// v0.5 (the "captions killed the fast path" fix): static background +
-    /// burned captions → run-level packet cloning. See the plan struct.
-    CaptionRuns,
-}
-
-/// v0.5: one span of identical composite output (frames [start,
-/// start+len)). len 1 = a genuinely unique frame (normal live encode).
-#[derive(Clone, Copy, Debug)]
-struct CaptionRun {
-    start: u64,
-    len: u64,
-}
-
-struct LoopDedupPlan {
-    kind: DedupKind,
-    /// frames per repeated unit (LoopCycle: the cycle; StaticTail: 1)
-    pub cycle_frames: u64,
-    /// frames the producer actually renders (the non-repeatable prefix)
-    pub encode_frames: u64,
-    /// LoopCycle only: the SNAPPED cycle span in seconds — build_frame_job
-    /// wraps the decode position with THIS span so frame k and
-    /// k+cycle_frames composite byte-identically.
-    pub snap_span_sec: Option<f64>,
-    /// CaptionRuns only: the run table. The producer renders ONLY run
-    /// starts; the consumer emits each run's first frame live, then ONE
-    /// zero-delta "skip seed" (identical pixels → a pure-skip P-frame),
-    /// and the clone phase re-emits that seed for the rest of the run —
-    /// every clone re-applies a ZERO delta, so the decoded picture is
-    /// bit-identical by construction (strictly safer than StaticTail,
-    /// whose seed packet is a real content transition).
-    pub runs: Option<Vec<CaptionRun>>,
 }
 
 // ── sws guard (sws_freeContext takes the pointer directly) ────────────────
@@ -248,20 +140,6 @@ impl RgbaPool {
 static CAPTIONS_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 fn captions_debug_enabled() -> bool {
     *CAPTIONS_DEBUG.get_or_init(|| std::env::var("FF_DEBUG_CAPTIONS").is_ok())
-}
-
-// v0.4.1 (Windows CI crash bisect): env-gated pipeline trace — prints each
-// stage boundary to stderr so a native crash's location is unambiguous.
-static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-#[allow(dead_code)]
-fn trace_enabled() -> bool {
-    *TRACE.get_or_init(|| std::env::var("FF_TRACE").is_ok())
-}
-#[allow(dead_code)]
-fn trace(msg: &str) {
-    if trace_enabled() {
-        eprintln!("[ff-trace] {}", msg);
-    }
 }
 
 // ── video source decoder (LIVES ON THE PRODUCER THREAD) ───────────────────
@@ -484,7 +362,7 @@ impl VideoSource {
             // seek backwards (or first use): land slightly before the target
             let target = (t - 0.5).max(0.0);
             let ts = (target / self.stream_tb.as_f64()).round() as i64;
-            let sr = unsafe {
+            let _sr = unsafe {
                 let r = (self.ff.syms.av_seek_frame)(self.fc.raw, self.vstream, ts, AVSEEK_FLAG_BACKWARD);
                 (self.ff.syms.avcodec_flush_buffers)(self.dec.raw);
                 r
@@ -731,24 +609,12 @@ fn encoder_pix_fmt(name: &str) -> i32 {
     }
 }
 
+
+/// v0.4: zero-delay, clone-friendly x264 settings (see open_video_encoder).
 fn open_video_encoder(
     ff: &FFmpegLibs,
     timeline: &Timeline,
     global_header: bool,
-    // v0.5: the caption-run fast path clones packets — B-frames reference
-    // pictures by POC/frame_num and a cloned B slice would resolve its
-    // reference list against the WRONG pictures. P/I-only streams make
-    // cloning structurally safe (the verified StaticTail pattern).
-    suppress_bframes: bool,
-    // v0.5.1: caption-run mode needs SYNCHRONOUS packet emission — the
-    // decode-back seed consumes each run-start's packet IMMEDIATELY after
-    // its frame is sent. Frame threading AND rc-lookahead both buffer
-    // packets (10-32 deep), so this mode pins thread_count=1 and zeroes
-    // the lookahead via x264-params (both required: threads=1 alone still
-    // buffers rc-lookahead frames). The live set is ~2 frames per caption
-    // run, so single-threading the live prefix costs little against the
-    // clone-path win.
-    zero_delay: bool,
 ) -> Result<EncoderPick, String> {
     let ladder = [
         "h264_nvenc",
@@ -770,6 +636,8 @@ fn open_video_encoder(
 
     let ctx = unsafe { (ff.syms.avcodec_alloc_context3)(codec) };
     let ctx = PtrGuard::new(ctx, ff.syms.avcodec_free_context).map_err(|e| e)?;
+
+    unsafe { wr_i32(ctx.raw, AVCC_MAX_B_FRAMES, 0) };
 
     let fps1000 = (timeline.fps * 1000.0).round().max(1.0) as i32;
     let pix_fmt = encoder_pix_fmt(name);
@@ -858,23 +726,35 @@ fn open_video_encoder(
             };
             let _ = ff.dict_set(&mut dict, "preset", preset);
             let _ = ff.dict_set(&mut dict, "crf", &crf.to_string());
-            if suppress_bframes {
-                // "bf" is the AVCodecContext max_b_frames option — libx264
-                // reads it (x264 i_bframe=0). P/I-only, clone-safe.
-                let _ = ff.dict_set(&mut dict, "bf", "0");
-            }
-            if zero_delay {
-                // v0.5.1 caption-run mode: synchronous packet emission (see
-                // the signature comment). tune=zerolatency is THE battle-
-                // tested zero-delay config (rc-lookahead=0 + sync-lookahead=0
-                // + sliced/frame-threads disabled buffering); plain
-                // thread_count=1 alone still buffers rc-lookahead frames
-                // (measured: packets only flowed ~10 sends in).
-                ff.cc_set_threading(ctx.raw, 1, 0);
-                let _ = ff.dict_set(&mut dict, "tune", "zerolatency");
-            } else {
-                ff.cc_set_threads_auto(ctx.raw);
-            }
+            // v0.4: pure-image (slideshow/static-hold) timelines ride the
+            // stillimage tune — x264 trades a little lookahead/AQ for much
+            // faster static-frame encoding, which is exactly this content.
+            // AND slice-only threading: frame threads add a multi-frame
+            // PACKET DELAY (the encoder still owes older packets while the
+            // clone path writes newer ones → non-monotonic DTS aborts the
+            // mux). Sliced threads emit packets synchronously — clone-safe —
+            // at a modest per-frame cost the clone path repays 100× on
+            // static holds.
+            let preset = match quality {
+                "cinema" => "slow",
+                "balanced" => "medium",
+                // v1.33.7: the CLI's speed tiers (draft/fastMode on
+                // constrained CPUs) drop to ultrafast — the engine honors
+                // the same ladder so a draft export is a DRAFT everywhere.
+                "draft" | "fast" => "ultrafast",
+                _ => "veryfast",
+            };
+            let _ = ff.dict_set(&mut dict, "preset", preset);
+            let _ = ff.dict_set(&mut dict, "crf", &crf.to_string());
+            // v0.4: pure-image (slideshow/static-hold) timelines ride the
+            // stillimage tune — x264 trades a little lookahead/AQ for much
+            // faster static-frame encoding, which is exactly this content.
+            // AND slice-only threading: frame threads add a multi-frame
+            // PACKET DELAY (the encoder still owes older packets while the
+            // clone path writes newer ones → non-monotonic DTS aborts the
+            // mux). Sliced threads emit packets synchronously — clone-safe —
+            // at a modest per-frame cost the clone path repays 100× on
+            // static holds.
         }
     }
     if bitrate > 0 && (name == "h264_amf" || timeline.crf.is_none()) {
@@ -890,6 +770,7 @@ fn open_video_encoder(
             if !sw.is_null() {
                 let ctx2 = unsafe { (ff.syms.avcodec_alloc_context3)(sw) };
                 if let Ok(g) = PtrGuard::new(ctx2, ff.syms.avcodec_free_context) {
+                    unsafe { wr_i32(g.raw, AVCC_MAX_B_FRAMES, 0) };
                     ff.cc_set_dimensions(g.raw, timeline.width as i32, timeline.height as i32);
                     ff.cc_set_pix_fmt(g.raw, AV_PIX_FMT_YUV420P);
                     ff.cc_set_time_base(g.raw, Rational::new(1000, fps1000));
@@ -898,29 +779,13 @@ fn open_video_encoder(
                     if global_header {
                         ff.cc_set_flags_or(g.raw, AV_CODEC_FLAG_GLOBAL_HEADER);
                     }
-                    // v0.5.1: the hw-failure retry MUST carry the same
-                    // zero-delay/clone-safety settings as the primary
-                    // software branch — this retry is the path EVERY
-                    // "nvenc-registered-but-no-NVIDIA-GPU" machine takes
-                    // (the engine health card's `GPU compositor - libx264`
-                    // line IS this branch), and it silently dropped the
-                    // tune/threading here at v0.5.1-draft (packets lagged
-                    // rc-lookahead frames and the decode-back seed never
-                    // engaged — the exact 12-s bench symptom).
-                    if zero_delay {
-                        ff.cc_set_threading(g.raw, 1, 0);
-                    } else {
-                        ff.cc_set_threads_auto(g.raw);
-                    }
+                    ff.cc_set_threads_auto(g.raw);
                     let mut d2: *mut u8 = std::ptr::null_mut();
                     let _ = ff.dict_set(&mut d2, "preset", "veryfast");
+                    if timeline.segments.iter().all(|s| s.media_type != "video") {
+                        let _ = ff.dict_set(&mut d2, "tune", "stillimage");
+                    }
                     let _ = ff.dict_set(&mut d2, "crf", &crf.to_string());
-                    if suppress_bframes {
-                        let _ = ff.dict_set(&mut d2, "bf", "0");
-                    }
-                    if zero_delay {
-                        let _ = ff.dict_set(&mut d2, "tune", "zerolatency");
-                    }
                     let r2 = unsafe { (ff.syms.avcodec_open2)(g.raw, sw, &mut d2) };
                     ff.dict_free(&mut d2);
                     if r2 == 0 {
@@ -943,17 +808,170 @@ struct FrameJob {
     texts: Vec<TextLayer>,
     /// Per-frame background clear color (dip transitions / black).
     background: [u8; 4],
-    /// v0.5 caption-runs: the length of the identical-output run starting
-    /// at this frame (0 = dense mode, len 1 = unique frame). len ≥ 2 tells
-    /// the consumer to emit the zero-delta skip seed right after this
-    /// frame so the clone phase can re-emit it for the run's remainder.
-    run_len: u64,
 }
 
 enum ProducerMsg {
     Frame(FrameJob),
     Failed(String),
     Done { decode_ms: i64 },
+}
+
+/// Content identity of one frame job: everything the compositor reads.
+/// Equal signatures ⇒ byte-identical composited output (the pipeline is
+/// deterministic — same inputs, same GPU/CPU raster).
+fn frame_signature(layers: &[Layer], texts: &[TextLayer], background: &[u8; 4]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write(background);
+    for l in layers {
+        h.write_u64(l.bitmap.id);
+        h.write_u32(l.crop.0.to_bits());
+        h.write_u32(l.crop.1.to_bits());
+        h.write_u32(l.crop.2.to_bits());
+        h.write_u32(l.crop.3.to_bits());
+        h.write_u32(l.dest.0.to_bits());
+        h.write_u32(l.dest.1.to_bits());
+        h.write_u32(l.dest.2.to_bits());
+        h.write_u32(l.dest.3.to_bits());
+        h.write_u32(l.alpha.to_bits());
+        h.write_usize(l.chroma.as_ref().map(Arc::as_ptr).map(|p| p as *const () as usize).unwrap_or(0));
+        h.write_u8(l.dynamic as u8);
+    }
+    for tx in texts {
+        h.write_u64(tx.bitmap.id);
+        h.write_u32(tx.dest_px.0);
+        h.write_u32(tx.dest_px.1);
+        h.write_u32(tx.dest_px.2);
+        h.write_u32(tx.dest_px.3);
+        h.write_u32(tx.alpha.to_bits());
+    }
+    h.finish()
+}
+
+// ── v0.4 AUDIO INTERLEAVE: AAC encode during the video loop ──────────────
+// Mix windows stream producer→consumer through a bounded channel; the
+// consumer feeds the AAC encoder between video frames so audio cost
+// overlaps video instead of running as a separate post-video phase.
+
+enum AudioMsg {
+    Win(Vec<f32>),
+    Done { mix_ms: i64 },
+    Fail(String),
+}
+
+/// Feed interleaved f32 mix samples into the AAC encoder + muxer. Buffers
+/// short tails in `pending`; `allow_short` encodes the final partial frame
+/// (the original code sent a full-length NB_SAMPLES frame with a partially
+/// stale buffer — a <21 ms garbage blip at the very end of every export).
+#[allow(clippy::too_many_arguments)]
+fn pump_aac_samples(
+    ff: &FFmpegLibs,
+    aenc: *mut u8,
+    apkt: *mut u8,
+    oc: *mut u8,
+    a_idx: i32,
+    a_tb: Rational,
+    aframe: *mut u8,
+    frame_size: usize,
+    chans: usize,
+    sr: i32,
+    pending: &mut Vec<f32>,
+    samples: &[f32],
+    fed_frames: &mut usize,
+    allow_short: bool,
+) -> Result<(), String> {
+    pending.extend_from_slice(samples);
+    if aenc.is_null() || aframe.is_null() {
+        pending.clear(); // no AAC stream — drain silently
+        return Ok(());
+    }
+    let frame_size = frame_size.max(64);
+    let chans = chans.max(1);
+    loop {
+        let avail = pending.len() / chans;
+        if avail == 0 || (avail < frame_size && !allow_short) {
+            break;
+        }
+        let take = avail.min(frame_size);
+        unsafe {
+            let r = (ff.syms.av_frame_make_writable)(aframe);
+            if r < 0 {
+                return Err(format!("audio make_writable: {}", ff.err2str(r)));
+            }
+            wr_i32(aframe, AVFRAME_NB_SAMPLES, take as i32);
+            let lp = ff.frame_data(aframe, 0);
+            let rp = if chans > 1 { ff.frame_data(aframe, 1) } else { lp };
+            let src = pending.as_ptr();
+            for i in 0..take {
+                (lp as *mut f32).add(i).write_unaligned(*src.add(i * chans));
+                if chans > 1 {
+                    (rp as *mut f32).add(i).write_unaligned(*src.add(i * chans + 1));
+                }
+            }
+            ff.frame_set_pts(aframe, *fed_frames as i64);
+            let s = (ff.syms.avcodec_send_frame)(aenc, aframe);
+            if s < 0 && s != AVERROR_EAGAIN {
+                return Err(format!("audio send_frame: {}", ff.err2str(s)));
+            }
+        }
+        loop {
+            let pr = unsafe { (ff.syms.avcodec_receive_packet)(aenc, apkt) };
+            if pr == AVERROR_EAGAIN || pr == AVERROR_EOF {
+                break;
+            }
+            if pr < 0 {
+                return Err(format!("audio receive_packet: {}", ff.err2str(pr)));
+            }
+            ff.packet_rescale_ts(apkt, Rational::new(1, sr), a_tb);
+            ff.packet_set_stream_index(apkt, a_idx);
+            let w = unsafe { (ff.syms.av_interleaved_write_frame)(oc, apkt) };
+            ff.packet_unref(apkt);
+            if w < 0 {
+                return Err(format!("write audio packet: {}", ff.err2str(w)));
+            }
+        }
+        pending.drain(..take * chans);
+        *fed_frames += take;
+    }
+    Ok(())
+}
+
+/// Mix ONE output window [a, b) from every job's pull mixer (v0.4 streaming
+/// mix core). Returns (interleaved stereo window, any-job-contributed).
+#[allow(clippy::too_many_arguments)]
+fn mix_output_window(
+    specs: &[audio::JobSpec],
+    mixers: &mut [Option<audio::JobMixer>],
+    gains: &[f32],
+    chans: usize,
+    a: usize,
+    b: usize,
+    win_frames: usize,
+) -> Result<(Vec<f32>, bool), String> {
+    let mut buf = vec![0f32; (b - a) * chans];
+    let mut any = false;
+    for (ji, _s) in specs.iter().enumerate() {
+        if let Some(mx) = mixers[ji].as_mut() {
+            for (samples, out_start) in mx.pull_for(&specs[ji], a, b, win_frames)? {
+                if samples.is_empty() {
+                    continue;
+                }
+                let track = audio::Track {
+                    data: Arc::new(samples),
+                    start_sample: out_start,
+                    gain: gains[ji],
+                    speed: specs[ji].speed,
+                    loop_src: false, // JobMixer handles looping by wrapping
+                };
+                audio::mix_into(&mut buf, &track, chans);
+                any = true;
+            }
+            if mx.finished() {
+                mixers[ji] = None;
+            }
+        }
+    }
+    Ok((buf, any))
 }
 
 // ── the pipeline ────────────────────────────────────────────────────────────
@@ -981,7 +999,7 @@ pub fn run_pipeline(
         percent: 0.5,
         fps: 0.0,
         timemark_sec: 0.0,
-        eta_ms: None,
+        eta_sec: None,
     });
 
     // ── split segments: base lane (sequential) + overlay lanes ──────────
@@ -1121,63 +1139,6 @@ pub fn run_pipeline(
     }
     let watermark = Arc::new(watermark);
 
-    // ── v0.5 CAPTION-RUN DEDUP DETECTION (before the encoder opens) ──────
-    // Captions used to VETO every packet-dedup path, so "69-min audio + 1
-    // image + captions" rendered all 124k frames live — hours on the
-    // machines that need it most. The run table must be known BEFORE the
-    // encoder opens (P/I-only streams make packet cloning structurally
-    // safe; see open_video_encoder's suppress_bframes).
-    let caption_runs: Option<Vec<CaptionRun>> = detect_caption_runs(
-        &timeline,
-        &base,
-        &overlays,
-        &texts,
-        &prepared_captions,
-        &prepared_kinetic,
-        &watermark,
-        &image_bitmaps,
-        total_frames,
-        fps,
-        cw,
-        ch,
-    );
-    // v0.5.1: probe the LEGACY dedup paths PRE-OPEN as well — the
-    // single-packet clone paths (StaticTail kind: static-image +
-    // audio-extended tails) need a P/I-only stream to clone safely, which
-    // must be decided before the encoder opens (bf=0). LoopCycle clones
-    // whole GOP blocks (reference-safe as a block) and needs no dict.
-    // NOTE: this probe is deterministic — the later dedup decision reuses
-    // it verbatim instead of re-running the detection.
-    let quiet_visuals =
-        texts.is_empty() && prepared_captions.is_none() && prepared_kinetic.is_none() && watermark.is_none();
-    let legacy_dedup_probe: Option<LoopDedupPlan> = if caption_runs.is_none() {
-        detect_loop_dedup(&timeline, &base, &overlays, &ff, total_frames, quiet_visuals)
-            .map(|mut d| {
-                d.runs = None;
-                d
-            })
-    } else {
-        None
-    };
-    let legacy_static_clone = legacy_dedup_probe
-        .as_ref()
-        .map(|d| d.kind == DedupKind::StaticTail)
-        .unwrap_or(false);
-    // v0.5.1 FIX: `will_probe_encoder`/`software_encoder_expected` were
-    // dropped from this decision — avcodec_find_encoder_by_name only says
-    // the encoder is COMPILED IN, not that it can RUN (h264_nvenc is in
-    // every distro build; without libcuda it fails at open time). On such
-    // machines the probe predicted "hardware" → suppress_bframes stayed
-    // false → the ladder fell to libx264 → the caption-run plan was dropped
-    // at the post-open check → "69-min audio + 1 image + captions"
-    // rendered ALL 124k frames dense (7.6× realtime instead of the clone
-    // path's much higher rate; measured on the 62.8-min practical bench).
-    // The honest gate: set bf=0 whenever a clone plan exists; the software
-    // branch (and the hw-failure → libx264 retry) both honor it, and a
-    // hardware encoder that ACTUALLY opens ignores it (own B-frame config)
-    // and drops the plans post-open instead.
-    let suppress_bframes = caption_runs.is_some() || legacy_static_clone;
-
     // ── output context + streams ─────────────────────────────────────────
     let c_out = CString::new(output_path.clone()).map_err(|e| format!("bad output path: {}", e))?;
     let mut oc: *mut u8 = std::ptr::null_mut();
@@ -1196,164 +1157,14 @@ pub fn run_pipeline(
 
     // v2: open the video encoder FIRST — the actual encoder decides the
     // pixel format, which decides the compositor's GPU-YUV packing.
-    let venc = open_video_encoder(&ff, &timeline, global_header, suppress_bframes, caption_runs.is_some())?;
+    let venc = open_video_encoder(&ff, &timeline, global_header)?;
     log::info!("[rust-engine] encoder: {} (pix_fmt {})", venc.name, venc.pix_fmt);
-    // v0.5 safety: if the ladder's pick changed between probe and open
-    // (hardware open failure → libx264 retry without the bf=0 dict), or a
-    // hardware encoder engaged, the run plan is dropped — the dense
-    // per-frame path stays correct for every encoder.
-    let mut caption_runs = caption_runs;
-    if caption_runs.is_some() {
-        let opened_software = venc.name == "libx264" || venc.name == "h264_mf";
-        if !opened_software {
-            log::info!(
-                "[rust-engine] caption-run fast path disengaged (encoder {} — hardware keeps B-frames)",
-                venc.name
-            );
-            caption_runs = None;
-        }
-    }
-    // v0.5.1: same for the single-packet clone plans — a hardware encoder
-    // that actually opened keeps its own B-frame config, which makes the
-    // cloned chain structurally unsafe; the dense path runs instead (hw
-    // encoders are fast enough to afford it). LoopCycle survives: it
-    // clones whole GOP blocks, which stay reference-safe as a block.
-    let mut legacy_dedup_probe = legacy_dedup_probe;
-    if legacy_static_clone {
-        let opened_software = venc.name == "libx264" || venc.name == "h264_mf";
-        if !opened_software {
-            log::info!(
-                "[rust-engine] static-clone fast path disengaged (encoder {} — hardware keeps B-frames)",
-                venc.name
-            );
-            legacy_dedup_probe = None;
-        }
-    }
 
     // ── compositor (wgpu first, CPU fallback) — mode matched to encoder ──
     let yuv_mode = if venc.pix_fmt == AV_PIX_FMT_NV12 { YuvMode::Nv12 } else { YuvMode::Yuv420p };
     let mut compositor: Box<dyn Compositor> = compositor::create_compositor(cw, ch, yuv_mode);
     let mut engine_used = compositor.name().to_string();
     let adapter = compositor.adapter_name();
-    // v0.5 SLOW-GPU GUARD: an old driver/APU (or a WARP-adjacent adapter)
-    // can make the GPU composite path 10-50× SLOWER than the CPU raster —
-    // the user's "36 frames in 4523ms" health card (≈8 fps at 640×360) is
-    // exactly this. Benchmark BOTH compositors on a real frame BEFORE the
-    // encode loop and keep the faster one; the winner is reported in the
-    // result so the health card explains the choice. Env overrides:
-    // FRAMEFUSE_FORCE_COMPOSITOR=cpu|gpu skips the benchmark.
-    let mut compositor_note: Option<String> = None;
-    {
-        let forced = std::env::var("FRAMEFUSE_FORCE_COMPOSITOR").unwrap_or_default();
-        let gpu_active = compositor.name() == "rust-gpu";
-        if gpu_active && (forced == "cpu" || (forced.is_empty() && total_frames >= 24)) {
-            // a synthetic benchmark frame: one full-frame layer (the same
-            // render/submit/readback path a real frame takes). TWO
-            // alternating bitmaps so the CPU rasterizer's static-prefix
-            // cache MISSES every iteration — the benchmark must measure the
-            // worst case (a dynamic timeline), not the static fast path.
-            let bench_a = Bitmap::new(vec![40u8; 16 * 16 * 4], 16, 16);
-            let bench_b = Bitmap::new(vec![90u8; 16 * 16 * 4], 16, 16);
-            let mk_layer = |bmp: Bitmap| Layer {
-                bitmap: bmp,
-                crop: (0.0, 0.0, 1.0, 1.0),
-                dest: (0.0, 0.0, 1.0, 1.0),
-                alpha: 1.0,
-                chroma: None,
-                dynamic: false,
-            };
-            let bench_layers_a = [mk_layer(bench_a)];
-            let bench_layers_b = [mk_layer(bench_b)];
-            const BENCH_N: u32 = 4;
-            // GPU: 1 warmup (shader compile + texture alloc) + BENCH_N timed
-            let _ = compositor.render_frame(&bench_layers_a, &[], [12, 10, 9, 255], cw, ch);
-            let t_gpu = Instant::now();
-            for i in 0..BENCH_N {
-                let ls = if i % 2 == 0 { &bench_layers_a } else { &bench_layers_b };
-                let _ = compositor.render_frame(ls, &[], [12, 10, 9, 255], cw, ch);
-            }
-            let gpu_ms = t_gpu.elapsed().as_secs_f64() * 1000.0 / BENCH_N as f64;
-            // CPU: the full per-frame cost INCLUDING the RGBA→YUV sws pass
-            // the CPU path pays (the GPU path converts on-device).
-            let mut cpu = crate::compositor::cpu::CpuCompositor::new(cw, ch);
-            let sws = unsafe {
-                (ff.syms.sws_getContext)(
-                    cw as i32, ch as i32, AV_PIX_FMT_RGBA,
-                    cw as i32, ch as i32, venc.pix_fmt,
-                    SWS_BILINEAR, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(),
-                )
-            };
-            // a real scratch destination (YUV420P: 3 planes; NV12: Y + UV)
-            let w = cw as usize;
-            let h = ch as usize;
-            let h2 = (h + 1) / 2;
-            let is_nv12 = venc.pix_fmt == AV_PIX_FMT_NV12;
-            let mut scratch: Vec<u8> = if is_nv12 {
-                vec![0u8; w * (h + h2) + 64]
-            } else {
-                vec![0u8; w * h + 2 * w * h2 / 2 * 2 + 64]
-            };
-            let build_planes = |s: &mut [u8]| -> ([*mut u8; 8], [i32; 8]) {
-                let base = s.as_mut_ptr();
-                let y_stride = w as i32;
-                let mut planes: [*mut u8; 8] = [std::ptr::null_mut(); 8];
-                let mut strides: [i32; 8] = [0i32; 8];
-                planes[0] = base;
-                strides[0] = y_stride;
-                if is_nv12 {
-                    planes[1] = unsafe { base.add(w * h) };
-                    strides[1] = y_stride;
-                } else {
-                    planes[1] = unsafe { base.add(w * h) };
-                    strides[1] = ((w + 1) / 2) as i32;
-                    planes[2] = unsafe { base.add(w * h + ((w + 1) / 2) * h2) };
-                    strides[2] = ((w + 1) / 2) as i32;
-                }
-                (planes, strides)
-            };
-            let t_cpu = Instant::now();
-            for i in 0..BENCH_N {
-                let ls = if i % 2 == 0 { &bench_layers_a } else { &bench_layers_b };
-                let _ = cpu.render_frame(ls, &[], [12, 10, 9, 255], cw, ch);
-                if !sws.is_null() {
-                    let (mut dst_planes, dst_strides) = build_planes(&mut scratch);
-                    let src_planes: [*const u8; 1] = [cpu.output().as_ptr()];
-                    let src_strides: [i32; 1] = [cw as i32 * 4];
-                    unsafe {
-                        (ff.syms.sws_scale)(sws, src_planes.as_ptr(), src_strides.as_ptr(), 0, ch as i32, dst_planes.as_mut_ptr(), dst_strides.as_ptr());
-                    }
-                }
-            }
-            let cpu_ms = t_cpu.elapsed().as_secs_f64() * 1000.0 / BENCH_N as f64;
-            if !sws.is_null() {
-                unsafe { (ff.syms.sws_freeContext)(sws) };
-            }
-            let gpu_fps = if gpu_ms > 0.001 { 1000.0 / gpu_ms } else { f64::INFINITY };
-            let cpu_fps = if cpu_ms > 0.001 { 1000.0 / cpu_ms } else { f64::INFINITY };
-            let use_cpu = forced == "cpu" || cpu_fps > gpu_fps * 1.15; // GPU keeps a grace margin (it also skips sws already counted)
-            compositor_note = Some(if use_cpu {
-                format!(
-                    "gpu composite {:.1} fps < cpu raster {:.1} fps → cpu rasterizer",
-                    gpu_fps, cpu_fps
-                )
-            } else {
-                format!(
-                    "gpu composite {:.1} fps ≥ cpu raster {:.1} fps → gpu compositor",
-                    gpu_fps, cpu_fps
-                )
-            });
-            log::info!(
-                "[rust-engine] compositor benchmark: gpu {:.1} fps vs cpu(+sws) {:.1} fps — {}",
-                gpu_fps,
-                cpu_fps,
-                if use_cpu { "CPU rasterizer wins" } else { "GPU compositor wins" }
-            );
-            if use_cpu {
-                compositor = Box::new(cpu);
-                engine_used = "rust-cpu".into();
-            }
-        }
-    }
 
     // video encoder stream
     let vstream = unsafe { (ff.syms.avformat_new_stream)(oc.raw, std::ptr::null()) };
@@ -1484,29 +1295,40 @@ pub fn run_pipeline(
 
     let pkt = ff.packet_alloc()?;
 
-    // ── AUDIO THREAD (decode + mix runs DURING the video loop) ──────────
-    // v0.3 REWORK: (1) base-lane LOOP-TO-FILL segments loop their own audio
-    //   across the timeline (the CLI `-stream_loop` parity); (2) per-source
-    //   loudness normalization when `timeline.normalize_audio` — the EBU R128
-    //   K-weighted gated measurement runs IN-PROCESS (audio::windowed_lufs,
-    //   ≤90 s sample — constant cost) and applies a STATIC linear gain toward
-    //   the target (−16 LUFS default), CLI clip/legacy-music semantics:
-    //   extra-audio (voiceover/SFX/music-clip) placements are NEVER measured.
-    // v0.4 MEMORY HARDENING (the "app closed itself mid-export" crash):
-    //   (3) sources are partitioned by DECODED PCM size, not compressed file
-    //   bytes — a 33 MB 69-min MP3 expands to 1.6 GB of f32 at bus rate and
-    //   the old file-size gate fully decoded it into RAM; (4) mixes above the
-    //   RAM budget spill to a FILE MAPPING — dirty pages flush under memory
-    //   pressure instead of committing 1.6 GB of pagefile for the whole
-    //   export. Peak RSS: mix window + ~23 MB decode window either way.
-    let (audio_tx, audio_rx) = std::sync::mpsc::channel::<Result<AudioMix, String>>();
+    // ── AUDIO THREAD (v0.4 STREAMING windowed mix, bounded RAM) ──────────
+    // The v0.3 design materialized the FULL timeline mix in RAM (1.6 GB at
+    // 69-min stereo f32 — the pagefile/temp blowup users reported on
+    // low-RAM machines) and only started AAC encoding AFTER the video loop
+    // (the post-90 % “audio mixing” phase). v0.4:
+    //   * the mix is produced in 10-s windows (peak RAM ≈ a few windows);
+    //   * windows stream to the consumer DURING the video loop, which feeds
+    //     the AAC encoder between video frames — audio cost overlaps video;
+    //   * per-source gains keep the ≤90-s windowed LUFS policy (constant
+    //     cost); the master-bus measurement samples the 20 %..20 %+90 s mix
+    //     span via a short measurement-only pre-pass (bounded RAM);
+    //   * the post-video audio phase only appears when the audio thread
+    //     still has windows left, with REAL phase-local progress + ETA.
+    let (audio_tx, audio_rx) = std::sync::mpsc::sync_channel::<AudioMsg>(4);
+    let mixed_frames = Arc::new(AtomicU64::new(0));
+    let audio_thread_start = Instant::now();
     {
         let ff = ff.clone();
         let timeline = timeline.clone();
-        let spill_base = output_path.clone();
+        let mixed_frames = mixed_frames.clone();
         std::thread::Builder::new()
             .name("framefuse-audio".into())
             .spawn(move || {
+                struct AudioJob {
+                    path: String,
+                    start_ms: f64,
+                    volume: f64,
+                    speed: f64,
+                    loop_src: bool,
+                    /// CLI parity: clip audio + LEGACY music normalize;
+                    /// voiceover/SFX/music-clip placements never.
+                    normalize: bool,
+                    tag: String,
+                }
                 let mut jobs: Vec<AudioJob> = Vec::new();
                 for s in timeline.segments.iter() {
                     if s.has_audio && s.volume > 0.001 && !s.path.is_empty() {
@@ -1549,12 +1371,214 @@ pub fn run_pipeline(
                     });
                 }
 
-                let result = if jobs.is_empty() {
-                    Ok(AudioMix::Ram(Vec::new()))
+                let t_mix = Instant::now();
+                if jobs.is_empty() {
+                    let _ = audio_tx.send(AudioMsg::Done { mix_ms: 0 });
+                    return;
+                }
+                let rate = timeline.sample_rate;
+                let chans = timeline.audio_channels as usize;
+                let total_out = (timeline.total_ms / 1000.0 * rate as f64).ceil() as usize;
+                let target_lufs = timeline.audio_target_lufs.unwrap_or(-16.0);
+                const MIX_WIN_SEC: f64 = 10.0;
+                let win_frames = (MIX_WIN_SEC * rate as f64).max(1.0) as usize;
+                const MEASURE_SEC: f64 = 90.0;
+                let measure_frames = (MEASURE_SEC * rate as f64).max(1.0) as usize;
+
+                // jobs → mixer specs (output-sample placement) + unity gains
+                let specs: Vec<audio::JobSpec> = jobs
+                    .iter()
+                    .map(|j| audio::JobSpec {
+                        path: j.path.clone(),
+                        start_sample: ((j.start_ms.max(0.0) / 1000.0) * rate as f64).round() as i64,
+                        speed: j.speed,
+                        loop_src: j.loop_src,
+                    })
+                    .collect();
+                let mut gains: Vec<f32> = jobs.iter().map(|j| j.volume.clamp(0.0, 2.0) as f32).collect();
+
+                // Will ANY job contribute? (placed before the end and either
+                // looped or a decodable source — v0.3's "no audio at all ⇒ no
+                // audio track content" parity, decided up front.)
+                // v0.6: openability, not container duration — MP3s often
+                // carry AV_NOPTS until deep probing; a source that OPENS
+                // with an audio stream contributes (EOF pins the length).
+                let will_contribute = specs.iter().any(|s| {
+                    s.start_sample < total_out as i64
+                        && (s.loop_src
+                            || audio::AudioStream::open(
+                                ff.clone(),
+                                &s.path,
+                                timeline.sample_rate,
+                                timeline.audio_channels,
+                            )
+                            .is_ok())
+                });
+                if !will_contribute {
+                    let _ = audio_tx.send(AudioMsg::Done { mix_ms: 0 });
+                    return;
+                }
+
+                // ── per-source loudness gains (≤90 s windowed LUFS at 20 % in,
+                //    constant cost — the v0.3.1 policy, kept verbatim) ────────
+                let mut any_normalized = false;
+                if timeline.normalize_audio {
+                    for (ji, j) in jobs.iter().enumerate() {
+                        if !j.normalize {
+                            continue;
+                        }
+                        let dur = audio::audio_duration_sec(&ff, &j.path);
+                        if dur <= 0.5 {
+                            continue;
+                        }
+                        let start_sec = if dur <= 120.0 { 0.0 } else { dur * 0.20 };
+                        let measure = audio::AudioStream::open(ff.clone(), &j.path, rate, timeline.audio_channels)
+                            .and_then(|mut ms| ms.seek_sec(start_sec).map(|_| ms))
+                            .and_then(|mut ms| {
+                                let mut buf: Vec<f32> = Vec::new();
+                                let want = measure_frames * chans.max(1);
+                                while buf.len() < want {
+                                    match ms.next_window(win_frames) {
+                                        Ok(w) => {
+                                            if w.samples.is_empty() { break; }
+                                            buf.extend_from_slice(&w.samples);
+                                        }
+                                        Err(e) => return Err(e),
+                                    }
+                                }
+                                Ok(buf)
+                            });
+                        if let Ok(buf) = measure {
+                            if !buf.is_empty() {
+                                if let Some(lufs) = audio::windowed_lufs(&buf, chans, rate) {
+                                    let db = target_lufs - lufs;
+                                    if lufs > -70.0 && lufs < 0.0 && db.abs() <= 40.0 {
+                                        gains[ji] *= 10f64.powf(db / 20.0) as f32;
+                                        any_normalized = true;
+                                        log::info!(
+                                            "[rust-engine] loudnorm `{}`: measured {:.1} LUFS → {:+.1} dB (target {:.0})",
+                                            j.tag, lufs, db, target_lufs
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── MASTER-BUS pre-measure (v0.4: constant cost + bounded RAM).
+                //    A measurement-only windowed mix over [20 %, 20 % + 90 s) of
+                //    the OUTPUT timeline. The v0.3 code measured the WHOLE mix —
+                //    which forced the full 1.6 GB mix buffer into RAM; this
+                //    samples the same span the per-source policy samples. ─────
+                let master_gain: f32 = if timeline.normalize_audio && any_normalized {
+                    let m_start = ((total_out as f64 * 0.20) as usize).min(total_out.saturating_sub(1));
+                    let m_end = (m_start + measure_frames).min(total_out);
+                    if m_end > m_start {
+                        let mut mmixers: Vec<Option<audio::JobMixer>> = Vec::with_capacity(specs.len());
+                        for s in specs.iter() {
+                            mmixers.push(audio::JobMixer::open(ff.clone(), s, rate, timeline.audio_channels).ok());
+                        }
+                        let mut acc: Vec<f32> = Vec::with_capacity((m_end - m_start) * chans);
+                        let mut m = m_start;
+                        while m < m_end {
+                            let e2 = (m + win_frames).min(m_end);
+                            match mix_output_window(&specs, &mut mmixers, &gains, chans, m, e2, win_frames) {
+                                Ok((buf, _)) => acc.extend_from_slice(&buf),
+                                Err(err) => {
+                                    log::warn!("[rust-engine] master measure window: {}", err);
+                                    break;
+                                }
+                            }
+                            m = e2;
+                        }
+                        if let Some(mix_lufs) = audio::windowed_lufs(&acc, chans, rate) {
+                            let db = target_lufs - mix_lufs;
+                            if mix_lufs > -70.0 && mix_lufs < 0.0 && db.abs() <= 40.0 {
+                                log::info!(
+                                    "[rust-engine] loudnorm master: mix measured {:.1} LUFS → {:+.1} dB",
+                                    mix_lufs, db
+                                );
+                                10f64.powf(db / 20.0) as f32
+                            } else {
+                                1.0
+                            }
+                        } else {
+                            1.0
+                        }
+                    } else {
+                        1.0
+                    }
                 } else {
-                    mix_timeline(&ff, &timeline, &jobs, &spill_base)
+                    1.0
                 };
-                let _ = audio_tx.send(result);
+
+                // ── the STREAMING windowed mix (v0.4) ─────────────────────────
+                let mut mixers: Vec<Option<audio::JobMixer>> = Vec::with_capacity(specs.len());
+                for s in specs.iter() {
+                    match audio::JobMixer::open(ff.clone(), s, rate, timeline.audio_channels) {
+                        Ok(mx) => mixers.push(Some(mx)),
+                        Err(e) => {
+                            if !e.contains("no audio stream") {
+                                log::warn!("[rust-engine] audio decode `{}`: {}", s.path, e);
+                            }
+                            mixers.push(None);
+                        }
+                    }
+                }
+                let fade_in_f = ((timeline.fade_in_ms / 1000.0) * rate as f64).round() as usize;
+                let fade_out_f = ((timeline.fade_out_ms / 1000.0) * rate as f64).round() as usize;
+
+                let mut w_start = 0usize;
+                let result: Result<(), String> = loop {
+                    if w_start >= total_out {
+                        break Ok(());
+                    }
+                    let w_end = (w_start + win_frames).min(total_out);
+                    let (mut buf, _any) = match mix_output_window(&specs, &mut mixers, &gains, chans, w_start, w_end, win_frames) {
+                        Ok(v) => v,
+                        Err(e) => break Err(e),
+                    };
+                    // master gain + fades (global ends) + clamp — the v0.3
+                    // finish_mix math, windowed
+                    if master_gain != 1.0 {
+                        for v in buf.iter_mut() {
+                            *v *= master_gain;
+                        }
+                    }
+                    if fade_in_f > 0 && w_start == 0 {
+                        let n = (buf.len() / chans).min(fade_in_f);
+                        for i in 0..n {
+                            let g = i as f32 / fade_in_f as f32;
+                            for c in 0..chans {
+                                buf[i * chans + c] *= g;
+                            }
+                        }
+                    }
+                    if fade_out_f > 0 && w_end >= total_out {
+                        let start_f = total_out.saturating_sub(fade_out_f).max(w_start);
+                        for i in start_f..total_out {
+                            let g = (total_out - i) as f32 / fade_out_f as f32;
+                            let li = (i - w_start) * chans;
+                            for c in 0..chans {
+                                buf[li + c] *= g;
+                            }
+                        }
+                    }
+                    for v in buf.iter_mut() {
+                        *v = v.clamp(-1.0, 1.0);
+                    }
+
+                    mixed_frames.store(w_end as u64, Ordering::Relaxed);
+                    if audio_tx.send(AudioMsg::Win(buf)).is_err() {
+                        break Ok(()); // consumer gone (cancel / error) — stop quietly
+                    }
+                    w_start = w_end;
+                };
+                let _ = audio_tx.send(match result {
+                    Ok(()) => AudioMsg::Done { mix_ms: t_mix.elapsed().as_millis() as i64 },
+                    Err(e) => AudioMsg::Fail(e),
+                });
             })
             .map_err(|e| format!("audio thread spawn failed: {}", e))?;
     }
@@ -1571,87 +1595,6 @@ pub fn run_pipeline(
         .iter()
         .map(|&oi| timeline.segments[oi].chroma.clone().map(Arc::new))
         .collect();
-
-    // ── v0.4/v0.5 DEDUP PLAN ─────────────────────────────────────────
-    // A looped 10-s video under a 69-min audio renders 125,220 frames of
-    // which exactly ~300 are unique. When NOTHING time-varying crosses the
-    // loop (no captions/text/watermark/ken-burns/transitions/overlays), the
-    // bitstream of every cycle after the first is byte-identical apart from
-    // timestamps — so encode ONE cycle, then re-emit its packets with
-    // shifted pts/dts for each further cycle (exactly `-stream_loop -c
-    // copy`). v0.5: with CAPTIONS the same idea applies at RUN granularity
-    // (the pre-open detection built the run table) — the caption-run plan
-    // takes priority over the legacy detections.
-    let dedup: Option<LoopDedupPlan> = if let Some(runs) = caption_runs {
-        // v0.5.1: two live frames per run ≥ 2 (the forced-IDR start + the
-        // decode-back zero-residual seed).
-        let live: u64 = runs.iter().map(|r| 1 + u64::from(r.len >= 2)).sum();
-        Some(LoopDedupPlan {
-            kind: DedupKind::CaptionRuns,
-            cycle_frames: 1,
-            encode_frames: live,
-            snap_span_sec: None,
-            runs: Some(runs),
-        })
-    } else {
-        // v0.5.1: reuse the PRE-OPEN probe (same function, same inputs —
-        // deterministic) instead of re-running the loop-cycle duration
-        // probe a second time.
-        legacy_dedup_probe
-    };
-    // v0.4.1: the label rides to the ExportOutcome — the completion report
-    // tells the user WHICH fast path ran (or that none did, and why that is
-    // honest: time-varying content over the loop).
-    let dedup_report: Option<String> = dedup.as_ref().map(|d| match d.kind {
-        DedupKind::LoopCycle => {
-            format!("loop-cycle: {} unique frames cloned across the timeline", d.cycle_frames)
-        }
-        DedupKind::StaticTail => {
-            format!("static-tail: {} live frames, the rest cloned from one packet", d.encode_frames)
-        }
-        DedupKind::CaptionRuns => {
-            let runs = d.runs.as_ref().map(|r| r.len()).unwrap_or(0);
-            format!(
-                "caption-runs: {} unique caption states ({} live frames, {} cloned)",
-                runs,
-                d.encode_frames,
-                total_frames.saturating_sub(d.encode_frames)
-            )
-        }
-    });
-    if let Some(d) = &dedup {
-        match d.kind {
-            DedupKind::LoopCycle => {
-                trace(&format!("dedup: LoopCycle cycle_frames={} encode_frames={}", d.cycle_frames, d.encode_frames));
-                log::info!(
-                    "[rust-engine] STATIC-LOOP FAST PATH: {} frame cycle × {} cycles — encoding ONCE, cloning the bitstream for the rest",
-                    d.cycle_frames,
-                    (total_frames as f64 / d.cycle_frames as f64).ceil()
-                );
-            }
-            DedupKind::StaticTail => {
-                trace(&format!("dedup: StaticTail encode_frames={}", d.encode_frames));
-                log::info!(
-                    "[rust-engine] STATIC-TAIL FAST PATH: visuals end at frame {} of {} — the constant-background tail clones from ONE packet",
-                    d.encode_frames - 1,
-                    total_frames
-                );
-            }
-            DedupKind::CaptionRuns => {
-                trace(&format!("dedup: CaptionRuns runs={} live={}", d.runs.as_ref().map(|r| r.len()).unwrap_or(0), d.encode_frames));
-            }
-        }
-    }
-    // v0.5: the producer's frame schedule — Dense (0..limit) or the
-    // caption-run STARTS only (each job carries its run length so the
-    // consumer knows when to emit the zero-delta skip seed).
-    let producer_runs: Option<Vec<CaptionRun>> = dedup.as_ref().and_then(|d| d.runs.clone());
-    let producer_frame_limit: u64 = dedup
-        .as_ref()
-        .map(|d| d.encode_frames)
-        .unwrap_or(total_frames);
-    let loop_snap: Option<f64> = dedup.as_ref().and_then(|d| d.snap_span_sec);
-
     let (tx, rx) = sync_channel::<ProducerMsg>(8);
     {
         let ff = ff.clone();
@@ -1690,86 +1633,39 @@ pub fn run_pipeline(
                     }
                 }
 
-                // v0.5: the frame schedule — Dense (0..limit) or, for the
-                // caption-run fast path, ONLY the run starts (k =
-                // run.start; each job carries its run length so the
-                // consumer knows when to emit the zero-delta skip seed).
-                let run_schedule: Option<Vec<(u64, u64)>> =
-                    producer_runs.as_ref().map(|runs| runs.iter().map(|r| (r.start, r.len)).collect());
-                if let Some(schedule) = run_schedule {
-                    for (k, run_len) in schedule {
-                        if cancelled.load(Ordering::Relaxed) {
-                            let _ = tx.send(ProducerMsg::Done { decode_ms });
-                            return;
-                        }
-                        let t = k as f64 / fps;
-                        let job = build_frame_job(
-                            k,
-                            &timeline,
-                            t,
-                            &base,
-                            &overlays,
-                            &overlay_chroma,
-                            &image_bitmaps,
-                            &mut video_sources,
-                            &texts,
-                            &prepared_captions,
-                            &prepared_kinetic,
-                            &watermark,
-                            &mut decode_ms,
-                            cw,
-                            ch,
-                            loop_snap,
-                        );
-                        let mut job = match job {
-                            Ok(j) => j,
-                            Err(e) => {
-                                let _ = tx.send(ProducerMsg::Failed(e));
-                                return;
-                            }
-                        };
-                        job.run_len = run_len;
-                        if tx.send(ProducerMsg::Frame(job)).is_err() {
-                            // consumer dropped early (cancel / error) — stop
-                            return;
-                        }
+                for k in 0u64..total_frames {
+                    if cancelled.load(Ordering::Relaxed) {
+                        let _ = tx.send(ProducerMsg::Done { decode_ms });
+                        return;
                     }
-                } else {
-                    for k in 0u64..producer_frame_limit {
-                        if cancelled.load(Ordering::Relaxed) {
-                            let _ = tx.send(ProducerMsg::Done { decode_ms });
+                    let t = k as f64 / fps;
+                    let job = build_frame_job(
+                        k,
+                        &timeline,
+                        t,
+                        &base,
+                        &overlays,
+                        &overlay_chroma,
+                        &image_bitmaps,
+                        &mut video_sources,
+                        &texts,
+                        &prepared_captions,
+                        &prepared_kinetic,
+                        &watermark,
+                        &mut decode_ms,
+                        cw,
+                        ch,
+                    );
+                    let job = match job {
+                        Ok(j) => j,
+                        Err(e) => {
+                            let _ = tx.send(ProducerMsg::Failed(e));
                             return;
                         }
-                        let t = k as f64 / fps;
-                        let job = build_frame_job(
-                            k,
-                            &timeline,
-                            t,
-                            &base,
-                            &overlays,
-                            &overlay_chroma,
-                            &image_bitmaps,
-                            &mut video_sources,
-                            &texts,
-                            &prepared_captions,
-                            &prepared_kinetic,
-                            &watermark,
-                            &mut decode_ms,
-                            cw,
-                            ch,
-                            loop_snap,
-                        );
-                        let job = match job {
-                            Ok(j) => j,
-                            Err(e) => {
-                                let _ = tx.send(ProducerMsg::Failed(e));
-                                return;
-                            }
-                        };
-                        if tx.send(ProducerMsg::Frame(job)).is_err() {
-                            // consumer dropped early (cancel / error) — stop
-                            return;
-                        }
+                    };
+                    if tx.send(ProducerMsg::Frame(job)).is_err() {
+                        // consumer dropped early (cancel / error) — stop
+                        return;
                     }
                 }
                 let _ = tx.send(ProducerMsg::Done { decode_ms });
@@ -1778,56 +1674,60 @@ pub fn run_pipeline(
     }
 
     // ── CONSUMER LOOP (composite + encode + mux) ─────────────────────────
-    let mut compositor_ms: i64 = 0;
-    let mut encode_ms: i64 = 0;
+    let mut compositor_dur = std::time::Duration::ZERO;
+    let mut encode_dur = std::time::Duration::ZERO;
     let v_loop_start = Instant::now();
     let mut last_emit: std::time::Duration = std::time::Duration::from_secs(0);
     let mut wrote_packets: u64 = 0;
     let mut producer_decode_ms: i64 = 0;
     let mut ring_pos: usize = 0;
-    // v0.4 dedup: the first cycle's encoded packets, captured post-rescale
-    // (muxer time base) and re-emitted with shifted timestamps for every
-    // further loop cycle.
-    let mut capture_store: Option<Vec<CapturedPkt>> = if dedup.is_some() { Some(Vec::new()) } else { None };
-    // v0.5.1: caption-run mode captures WITHOUT muxing — see
-    // drain_video_encoder. The loop-cycle/static-tail paths mux live and
-    // clone AFTER the live range (already monotonic).
-    let cap_only = dedup
-        .as_ref()
-        .map(|d| d.kind == DedupKind::CaptionRuns)
-        .unwrap_or(false);
-    // v0.5.1 DECODE-BACK DECODER: the seed frame's input must be the
-    // run-start IDR's DECODED pixels — feeding the original composite
-    // makes the seed's P residual = (A - A') ≠ 0, and a clone re-applies
-    // that residual on EVERY re-emission (measured +10 mean-abs-diff
-    // drift by mid-file). Feeding the decoded picture itself makes the
-    // seed an exact no-change frame (all-SKIP), so every clone decodes to
-    // the reference bit-exactly. Only the YUV420P software path (libx264)
-    // engages; NV12/hardware fall back to the original-frame seed.
-    let mut dec_back: Option<(PtrGuard, PtrGuard, PtrGuard)> = None; // (ctx, frame, pkt)
-    let mut dec_back_fallback = false;
-    if cap_only && frame_fmt == AV_PIX_FMT_YUV420P {
-        match init_decode_back(&ff, venc.ctx.raw) {
-            Ok(trio) => dec_back = Some(trio),
-            Err(e) => {
-                dec_back_fallback = true;
-                log::warn!(
-                    "[rust-engine] decode-back seed unavailable ({}) — seeds use the original frame (small drift)",
-                    e
-                );
+
+    // v0.4 COMPOSITE-SKIP state: the previous frame's content signature.
+    let mut prev_sig: Option<u64> = None;
+
+    // v0.4 COMPOSITE-SKIP cache: an identical frame signature means the
+    // compositor would emit BYTE-IDENTICAL pixels — cache the last output
+    // and re-fill the AVFrame from it (a ~0.1 ms memcpy) instead of paying
+    // composite + GPU readback / CPU sws (~8-25 ms per frame). Works with
+    // ANY encoder (unlike packet cloning, which requires zero output
+    // delay): the encoder still sees every frame, so DTS ordering is
+    // untouched. Static holds, settled caption words and tail filler ride
+    // this path; animated frames re-composite.
+    let mut cached_frame: Option<Vec<u8>> = None;
+    let mut skipped_composites: u64 = 0;
+
+    // v0.4 AUDIO INTERLEAVE state: mix windows stream in DURING the video
+    // loop and feed the AAC encoder between frames — audio cost overlaps
+    // video instead of running as a separate post-video phase.
+    let aenc_raw: *mut u8 = aenc.as_ref().map(|g| g.raw).unwrap_or(std::ptr::null_mut());
+    let chn = timeline.audio_channels as usize;
+    let a_frame_size = if !aenc_raw.is_null() { ff.cc_frame_size(aenc_raw).max(64) as usize } else { 0 };
+    let aframe_guard: Option<PtrGuard> = if !aenc_raw.is_null() {
+        let aframe = ff.frame_alloc()?;
+        unsafe {
+            wr_i32(aframe.raw, AVFRAME_FORMAT, AV_SAMPLE_FMT_FLTP);
+            wr_i32(aframe.raw, AVFRAME_NB_SAMPLES, a_frame_size as i32);
+            wr_i32(aframe.raw, AVFRAME_SAMPLE_RATE, sr);
+            ff.frame_set_layout(aframe.raw, chn as i32, if chn == 1 { 0x4 } else { 0x3 });
+            let r = (ff.syms.av_frame_get_buffer)(aframe.raw, 0);
+            if r < 0 {
+                return Err(format!("audio frame buffer: {}", ff.err2str(r)));
             }
         }
-    }
-    // v0.4 honest ETA: sliding rate window (frame mark + time) instead of
-    // the whole-run (100-pct)/pct×elapsed extrapolation.
-    let mut rate_mark: Option<(u64, Instant)> = None;
-    // v0.4.1: the last computed video-phase ETA, carried forward onto
-    // EVERY progress event. The engine used to emit eta only on the
-    // ~3-second rate-window events (≈1 in 24 events) — the UI's
-    // "estimating…" placeholder dominated and the number flashed for
-    // 125 ms every 3 s, unreadable (the "eta not getting an exact number"
-    // report). A slightly stale estimate beats a hidden one.
-    let mut last_eta_ms: Option<i64> = None;
+        Some(aframe)
+    } else {
+        None
+    };
+    let aframe_raw: *mut u8 = aframe_guard.as_ref().map(|g| g.raw).unwrap_or(std::ptr::null_mut());
+    let apkt = ff.packet_alloc()?;
+    let mut audio_done = false;
+    let mut audio_ms: i64 = 0;
+    let mut a_pending: Vec<f32> = Vec::new();
+    let mut a_fed: usize = 0;
+    let total_out_frames = ((timeline.total_ms / 1000.0) * timeline.sample_rate as f64).ceil() as usize;
+    // v0.4 RATE-MATCH lead: the AAC pump stays ~one mix-window ahead of the
+    // video's content position (see the pump below).
+    let a_lead_frames = 10.0 * sr as f64;
 
     while let Ok(msg) = rx.recv() {
         match msg {
@@ -1840,16 +1740,19 @@ pub fn run_pipeline(
                 if cancelled.load(Ordering::Relaxed) {
                     return Err("cancelled".into());
                 }
-                let FrameJob { k, layers, texts: text_layers, background, run_len } = job;
+                let FrameJob { k, layers, texts: text_layers, background } = job;
                 let t = k as f64 / fps;
-                // v0.5 caption-runs: this job's full span counts toward
-                // progress the moment its start frame is encoded (the
-                // clone phase re-emits the span at packet speed).
-                let covered_now = if run_len > 0 { k + run_len } else { k + 1 };
-                let covered = covered_now.min(total_frames);
+                // v0.4 COMPOSITE-SKIP: identical signature ⇒ identical pixels.
+                let sig = frame_signature(&layers, &text_layers, &background);
+                let reuse = prev_sig == Some(sig) && cached_frame.is_some();
+                prev_sig = Some(sig);
 
                 // composite (GPU → CPU mid-export fallback on device loss)
                 let t0 = Instant::now();
+                if reuse {
+                    skipped_composites += 1;
+                }
+                if !reuse {
                 if let Err(e) = compositor.render_frame(&layers, &text_layers, background, cw, ch) {
                     log::warn!("[rust-engine] compositor failed at frame {} ({}); switching to CPU rasterizer", k, e);
                     compositor = Box::new(crate::compositor::cpu::CpuCompositor::new(cw, ch));
@@ -1869,8 +1772,10 @@ pub fn run_pipeline(
                     }
                     compositor.render_frame(&layers, &text_layers, background, cw, ch)?;
                 }
+                cached_frame = Some(compositor.output().to_vec());
+                }
                 let out_fmt = compositor.output_format();
-                let frame_bytes: &[u8] = compositor.output();
+                let frame_bytes: &[u8] = cached_frame.as_deref().unwrap_or(&[]);
 
                 // ── fill the AVFrame ──
                 let t1 = Instant::now();
@@ -1960,23 +1865,12 @@ pub fn run_pipeline(
                         }
                     }
                     ff.frame_set_pts(avframe.raw, k as i64);
-                    // v0.5.1: caption-run starts are FORCED INTRA — each run
-                    // begins at a keyframe/random-access point (the clone
-                    // phase re-emits the start packet, and the seed's P
-                    // references it). Non-start frames CLEAR the field: ring
-                    // slots are reused and a stale forced-I would turn a
-                    // seed into a bulky IDR.
-                    if run_len > 0 {
-                        ff.frame_force_intra(avframe.raw);
-                    } else {
-                        ff.frame_clear_pict_type(avframe.raw);
-                    }
                     // send/drain contract: EAGAIN from send_frame means the
                     // frame was NOT consumed — drain packets, then retry.
                     loop {
                         let s = (ff.syms.avcodec_send_frame)(venc.ctx.raw, avframe.raw);
                         if s == AVERROR_EAGAIN {
-                            if drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets, &mut capture_store, cap_only)? == 0 {
+                            if drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets)? == 0 {
                                 return Err("video send_frame stuck on EAGAIN".into());
                             }
                             continue;
@@ -1986,112 +1880,12 @@ pub fn run_pipeline(
                         }
                         break;
                     }
-                    // v0.5.1: drain IMMEDIATELY after the start send — the
-                    // decode-back seed needs this frame's packet NOW (the
-                    // zero-delay encoder emits it synchronously; cap_only
-                    // keeps it captured without muxing).
-                    if cap_only {
-                        drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets, &mut capture_store, cap_only)?;
-                    }
-                    // ── v0.5.1 DECODE-BACK SEED ──────────────────────────
-                    // The v0.5 seed (same ORIGINAL pixels at pts k+1) had a
-                    // nonzero P residual — a clone re-applies its residual
-                    // on EVERY re-emission and the decode drifts (+10
-                    // mean-abs-diff by mid-file, measured). The seed here
-                    // feeds the IDR's DECODED pixels instead: the P-frame is
-                    // an exact no-change (all-SKIP) frame, so clones decode
-                    // to the reference bit-exactly. Falls back to the
-                    // original-frame seed only if the decoder is unusable.
-                    if run_len >= 2 {
-                        let seed_frame_data: Option<()> = (|| {
-                            let (dctx, dframe, dpkt) = dec_back.as_mut()?;
-                            let cap = capture_store.as_ref()?.last()?;
-                            if cap.data.is_empty() {
-                                return None;
-                            }
-                            // feed the start packet to the decoder
-                            if ff.packet_new(dpkt.raw, cap.data.len()).is_err() {
-                                return None;
-                            }
-                            unsafe {
-                                let dst = ff.packet_data(dpkt.raw);
-                                std::ptr::copy_nonoverlapping(cap.data.as_ptr(), dst, cap.data.len());
-                            }
-                            let sp = unsafe { (ff.syms.avcodec_send_packet)(dctx.raw, dpkt.raw) };
-                            if sp < 0 && sp != AVERROR_EAGAIN {
-                                return None;
-                            }
-                            ff.packet_unref(dpkt.raw);
-                            // receive the decoded picture (threads=1: zero
-                            // delay — exactly one frame per packet). The
-                            // frame is KEPT ref'd until the plane copy below.
-                            let rf = unsafe { (ff.syms.avcodec_receive_frame)(dctx.raw, dframe.raw) };
-                            if rf != 0 {
-                                return None; // no picture — unusable
-                            }
-                            Some(())
-                        })();
-                        let usable = seed_frame_data.is_some();
-                        let seed_avframe = if usable {
-                            // take the NEXT ring slot and copy the decoded
-                            // planes (YUV420P → YUV420P, per-row)
-                            let af = &frame_ring[ring_pos];
-                            ring_pos = (ring_pos + 1) % frame_ring_size;
-                            unsafe {
-                                let r = (ff.syms.av_frame_make_writable)(af.raw);
-                                if r < 0 {
-                                    return Err(format!("av_frame_make_writable(seed): {}", ff.err2str(r)));
-                                }
-                            }
-                            let (_, dframe, _) = dec_back.as_ref().unwrap();
-                            let w = cw as usize;
-                            let h = ch as usize;
-                            let h2 = (h + 1) / 2;
-                            let planes = [(0usize, h, w), (1, h2, w / 2), (2, h2, w / 2)];
-                            for (pi, rows, row_bytes) in planes {
-                                let src = ff.frame_data(dframe.raw, pi);
-                                let src_ls = ff.frame_linesize(dframe.raw, pi).max(1) as usize;
-                                let dst = ff.frame_data(af.raw, pi);
-                                let dst_ls = ff.frame_linesize(af.raw, pi).max(1) as usize;
-                                unsafe {
-                                    for row in 0..rows {
-                                        std::ptr::copy_nonoverlapping(src.add(row * src_ls), dst.add(row * dst_ls), row_bytes);
-                                    }
-                                }
-                            }
-                            unsafe { (ff.syms.av_frame_unref)(dframe.raw) };
-                            ff.frame_clear_pict_type(af.raw);
-                            af
-                        } else {
-                            // FALLBACK: the original composite (v0.5
-                            // semantics — small drift, still functional).
-                            // CLEAR the forced intra first — this slot was
-                            // just sent as the run's start keyframe.
-                            if !dec_back_fallback {
-                                log::warn!("[rust-engine] decode-back seed missed at frame {} — using the original frame (drift risk)", k);
-                            }
-                            ff.frame_clear_pict_type(avframe.raw);
-                            avframe
-                        };
-                        ff.frame_set_pts(seed_avframe.raw, (k + 1) as i64);
-                        loop {
-                            let s = (ff.syms.avcodec_send_frame)(venc.ctx.raw, seed_avframe.raw);
-                            if s == AVERROR_EAGAIN {
-                                if drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets, &mut capture_store, cap_only)? == 0 {
-                                    return Err("video send_frame (seed) stuck on EAGAIN".into());
-                                }
-                                continue;
-                            }
-                            if s < 0 {
-                                return Err(format!("video send_frame (seed): {}", ff.err2str(s)));
-                            }
-                            break;
-                        }
-                    }
                 }
                 // drain encoder → mux (EAGAIN-aware: NVENC async delay is
                 // INTACT now, packets arrive a few frames later)
-                drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets, &mut capture_store, cap_only)?;
+                drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets)?;
+                encode_dur += t1.elapsed();
+                compositor_dur += t1.duration_since(t0);
 
                 // v2.1: hand the frame's VIDEO-layer RGBA buffers back to the
                 // producer's pool. The compositor has fully consumed them
@@ -2105,47 +1899,50 @@ pub fn run_pipeline(
                     }
                 }
 
-                compositor_ms += t0.elapsed().as_millis() as i64;
-                encode_ms += t1.elapsed().as_millis() as i64;
+                // ── v0.4 AUDIO INTERLEAVE (RATE-MATCHED): encode just enough
+                // audio to stay one mix-window ahead of the video's content
+                // position. The AAC cost overlaps the video encode (a 69-min
+                // timeline's ~1-3 min of audio work disappears into the video
+                // wall clock) — and an UNbounded pump would let a 10-s window
+                // (~20-40 ms of AAC) throttle the video loop to the audio
+                // rate; matching content paces keeps both ends busy.
+                if !audio_done {
+                    let want = (t * sr as f64) as usize + a_lead_frames as usize;
+                    while a_fed < want {
+                        match audio_rx.try_recv() {
+                            Ok(AudioMsg::Win(w)) => {
+                                pump_aac_samples(&ff, aenc_raw, apkt.raw, oc.raw, a_idx, a_tb, aframe_raw, a_frame_size, chn, sr, &mut a_pending, &w, &mut a_fed, false)?;
+                            }
+                            Ok(AudioMsg::Done { mix_ms }) => {
+                                audio_ms = mix_ms;
+                                audio_done = true;
+                                break;
+                            }
+                            Ok(AudioMsg::Fail(e)) => return Err(format!("audio mix failed: {}", e)),
+                            Err(_) => break,
+                        }
+                    }
+                }
 
                 // progress (throttle to ~8/s, always first/last)
                 let el = v_loop_start.elapsed();
-                if k == 0 || covered >= total_frames || el - last_emit > std::time::Duration::from_millis(125) {
+                if k == 0 || k + 1 == total_frames || el - last_emit > std::time::Duration::from_millis(125) {
                     last_emit = el;
-                    let frac = covered as f64 / total_frames as f64;
-                    let encode_fps = covered as f64 / el.as_secs_f64().max(0.001);
-                    // v0.4: ETA from the sliding rate window (refreshed every
-                    // ≥3 s) + a conservative audio-phase estimate (AAC runs at
-                    // ≥80× realtime even on weak CPUs). In dedup mode the live
-                    // loop is only the first cycle — the clone phase emits the
-                    // honest cycle-rate ETA instead.
-                    let mut eta_ms: Option<i64> = None;
-                    if dedup.is_none() {
-                        if rate_mark.is_none() {
-                            rate_mark = Some((0, Instant::now()));
-                        }
-                        if let Some((mk, mt)) = rate_mark {
-                            let dt = mt.elapsed().as_secs_f64();
-                            if dt >= 3.0 {
-                                let f = (covered - mk.min(covered)) as f64 / dt;
-                                if f > 0.5 {
-                                    let rem_v = (total_frames - covered) as f64 / f;
-                                    let rem_a = total_sec / 80.0;
-                                    eta_ms = Some(((rem_v + rem_a) * 1000.0) as i64);
-                                }
-                                rate_mark = Some((covered, Instant::now()));
-                            }
-                        }
-                    }
-                    // v0.4.1: carry the last computed estimate forward
-                    eta_ms = eta_ms.or(last_eta_ms);
-                    last_eta_ms = eta_ms;
+                    let frac = (k + 1) as f64 / total_frames as f64;
+                    let encode_fps = (k + 1) as f64 / el.as_secs_f64().max(0.001);
                     progress(ProgressEvent {
                         phase: "video".into(),
                         percent: 1.0 + 90.0 * frac,
                         fps: if encode_fps.is_finite() { encode_fps } else { 0.0 },
                         timemark_sec: t.max(0.0),
-                        eta_ms,
+                        // v0.4 HONEST ETA: the real remaining time at the
+                        // observed frame rate (NOT a global percent
+                        // extrapolation).
+                        eta_sec: if encode_fps.is_finite() && encode_fps > 0.5 && k + 1 < total_frames {
+                            Some((total_frames - (k + 1)) as f64 / encode_fps)
+                        } else {
+                            None
+                        },
                     });
                 }
             }
@@ -2159,374 +1956,85 @@ pub fn run_pipeline(
             return Err(format!("video flush: {}", ff.err2str(s)));
         }
     }
-    drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets, &mut capture_store, cap_only)?;
-    trace(&format!("video flush done: captured={} packets", capture_store.as_ref().map(|c| c.len()).unwrap_or(0)));
-    if let Some(plan) = dedup {
-        trace("clone phase begin");
-        let captured = capture_store.take().unwrap_or_default();
-        if captured.is_empty() {
-            return Err("loop dedup: the encoded prefix produced no packets".into());
+    drain_video_encoder(&ff, venc.ctx.raw, pkt.raw, oc.raw, vstream, v_idx, &v_tb_enc, &v_tb, &mut wrote_packets)?;
+    // ── AUDIO JOIN (v0.4) ─────────────────────────────────────────────────
+    // The mix streamed and AAC-encoded DURING the video loop; this phase only
+    // exists when the audio thread still has windows left (slow decode/mix,
+    // fast video) — and then it reports REAL phase-local progress (frames
+    // mixed / total) and a phase-local ETA from the observed mix rate. The
+    // v0.3 "15 min left" global extrapolation is gone.
+    {
+        let mut last_emit_a = std::time::Duration::from_secs(0);
+        if !audio_done {
+            progress(ProgressEvent {
+                phase: "audio".into(),
+                percent: 92.0,
+                fps: 0.0,
+                timemark_sec: total_sec,
+                eta_sec: None,
+            });
         }
-        // pts/dts offsets in the MUXER's time base: n frames of the encoder
-        // time base rescaled to v_tb (rounded like av_packet_rescale_ts).
-        let off_tb = |n: u64| -> i64 {
-            let num = n as i128 * v_tb_enc.num as i128 * v_tb.den as i128;
-            let den = v_tb_enc.den as i128 * v_tb.num as i128;
-            ((num + den / 2) / den) as i64
-        };
-        let t_clone = Instant::now();
-        match plan.kind {
-            DedupKind::LoopCycle => {
-                trace("clone: LoopCycle");
-                let cycles = total_frames / plan.cycle_frames;
-                let rem = total_frames % plan.cycle_frames;
-                let mut written = plan.encode_frames;
-                let total_cycles = cycles + if rem > 0 { 1 } else { 0 };
-                let mut cycles_done: u64 = 1; // cycle 0 was encoded live
-                // full clone cycles 1..cycles-1
-                for n in 1u64..cycles {
-                    let off = off_tb(n * plan.cycle_frames);
-                    for cap in captured.iter() {
-                        if cancelled.load(Ordering::Relaxed) {
-                            return Err("cancelled".into());
-                        }
-                        write_pkt_clone(&ff, pkt.raw, cap, off, v_idx, oc.raw, &mut wrote_packets)?;
-                        written += 1;
-                    }
-                    cycles_done += 1;
-                    let el = t_clone.elapsed().as_secs_f64().max(0.001);
-                    let rate = cycles_done as f64 / el;
-                    let eta_ms = Some(
-                        (((total_cycles - cycles_done) as f64 / rate.max(1e-6) + total_sec / 80.0) * 1000.0) as i64,
-                    );
-                    progress(ProgressEvent {
-                        phase: "video".into(),
-                        percent: 1.0 + 90.0 * (written as f64 / total_frames as f64),
-                        fps: 0.0,
-                        timemark_sec: (written as f64 / fps).max(0.0),
-                        eta_ms,
-                    });
+        let t_a = Instant::now();
+        while !audio_done {
+            match audio_rx.recv_timeout(std::time::Duration::from_millis(125)) {
+                Ok(AudioMsg::Win(w)) => {
+                    pump_aac_samples(&ff, aenc_raw, apkt.raw, oc.raw, a_idx, a_tb, aframe_raw, a_frame_size, chn, sr, &mut a_pending, &w, &mut a_fed, false)?;
                 }
-                // partial tail cycle (the timeline's total is not a whole multiple)
-                if rem > 0 {
-                    let off = off_tb(cycles * plan.cycle_frames);
-                    for cap in captured.iter().take(rem as usize) {
-                        if cancelled.load(Ordering::Relaxed) {
-                            return Err("cancelled".into());
-                        }
-                        write_pkt_clone(&ff, pkt.raw, cap, off, v_idx, oc.raw, &mut wrote_packets)?;
-                        written += 1;
-                    }
+                Ok(AudioMsg::Done { mix_ms }) => {
+                    audio_ms = mix_ms;
+                    audio_done = true;
                 }
-                log::info!(
-                    "[rust-engine] loop dedup: {} packets cloned for {} cycles ({}/{} frames) in {} ms",
-                    wrote_packets,
-                    total_cycles,
-                    written,
-                    total_frames,
-                    t_clone.elapsed().as_millis()
-                );
-            }
-            DedupKind::StaticTail => {
-                trace("clone: StaticTail begin");
-                // The LAST captured packet is the first tail frame (max dts at
-                // flush). Clone it for every remaining tail frame — a chain of
-                // identical P-frames, exactly what a still/black-tail encode
-                // emits, at one memcpy + mux per frame.
-                let last = captured.last().expect("captured non-empty");
-                let remaining = total_frames - plan.encode_frames;
-                let mut written = plan.encode_frames;
-                let mut last_emit = std::time::Duration::from_secs(0);
-                for i in 1u64..=remaining {
-                    if cancelled.load(Ordering::Relaxed) {
-                        return Err("cancelled".into());
-                    }
-                    write_pkt_clone(&ff, pkt.raw, last, off_tb(i), v_idx, oc.raw, &mut wrote_packets)?;
-                    written += 1;
-                    let el = t_clone.elapsed();
-                    if i % 4096 == 0 || i == remaining || el - last_emit > std::time::Duration::from_millis(125) {
-                        last_emit = el;
-                        let frac = written as f64 / total_frames as f64;
-                        let el_s = el.as_secs_f64().max(0.001);
-                        let rate = i as f64 / el_s;
-                        let eta_ms = Some(
-                            (((remaining - i) as f64 / rate.max(1e-6) + total_sec / 80.0) * 1000.0) as i64,
-                        );
+                Ok(AudioMsg::Fail(e)) => return Err(format!("audio mix failed: {}", e)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let el = t_a.elapsed();
+                    if el - last_emit_a > std::time::Duration::from_millis(125) {
+                        last_emit_a = el;
+                        let mixed = mixed_frames.load(Ordering::Relaxed) as f64;
+                        let total = total_out_frames.max(1) as f64;
+                        let frac = (mixed / total).min(1.0);
+                        let elapsed_audio = audio_thread_start.elapsed().as_secs_f64().max(0.001);
+                        let rate = mixed / elapsed_audio;
+                        let eta = if rate > 1.0 && mixed < total {
+                            Some((total - mixed) / rate)
+                        } else {
+                            None
+                        };
                         progress(ProgressEvent {
-                            phase: "video".into(),
-                            percent: 1.0 + 90.0 * frac,
+                            phase: "audio".into(),
+                            percent: 92.0 + 6.0 * frac,
                             fps: 0.0,
-                            timemark_sec: (written as f64 / fps).max(0.0),
-                            eta_ms,
+                            timemark_sec: total_sec,
+                            eta_sec: eta,
                         });
                     }
                 }
-                log::info!(
-                    "[rust-engine] static-tail dedup: {} tail frames cloned from one packet in {} ms",
-                    remaining,
-                    t_clone.elapsed().as_millis()
-                );
-            }
-            DedupKind::CaptionRuns => {
-                trace("clone: CaptionRuns begin");
-                // v0.5.1 ORDERED IDR EMISSION: the live phase captured the
-                // run-starts WITHOUT muxing (cap_only) — they are scattered
-                // across the whole timeline, so muxing them live would
-                // submit the video stream out of dts order and the muxer
-                // would reject the first clone ("non monotonically
-                // increasing dts"; reproduced on a 12-s bench at v0.5.0).
-                // Here EVERY packet is emitted in strict frame order, so
-                // the stream is monotonic by construction.
-                //
-                // GOP is normal; each run's START was forced intra
-                // (pict_type=I) and its seed (the start's DECODED pixels
-                // re-fed to the encoder) is an exact no-change P-frame.
-                // Emission per run, in strict frame order: the start
-                // verbatim, the seed verbatim, then the seed cloned for
-                // [start+2, start+len) — every clone decodes to the
-                // reference bit-exactly (zero residual), so the whole run
-                // shows the start's picture with ZERO drift, and the
-                // run-start keyframe keeps the file seekable.
-                let runs = plan.runs.clone().unwrap_or_default();
-                let n_runs = runs.len();
-                let mut cap_i = 0usize;
-                let mut written = 0u64;
-                let mut last_emit = std::time::Duration::from_secs(0);
-                let mut clones_done: u64 = 0;
-                let total_clones: u64 = total_frames.saturating_sub(plan.encode_frames);
-                for run in runs {
-                    if run.len < 1 {
-                        continue; // degenerate zero-length run
-                    }
-                    // the run's start packet (captured live, re-emitted now)
-                    let start = captured
-                        .get(cap_i)
-                        .ok_or_else(|| "caption-run dedup: packet stream ended before the run table".to_string())?;
-                    // sanity: the start's pts must match frame run.start
-                    // (±2 muxer-tb ticks — rescale rounding tolerance)
-                    let expected_start = off_tb(run.start);
-                    if (start.pts - expected_start).abs() > 2 {
-                        return Err(format!(
-                            "caption-run dedup: start pts {} ≠ expected {} at frame {} — encoder reordered packets",
-                            start.pts, expected_start, run.start
-                        ));
-                    }
-                    cap_i += 1;
-                    write_pkt_clone(&ff, pkt.raw, start, 0, v_idx, oc.raw, &mut wrote_packets)?;
-                    written += 1;
-                    // (when run.len ≥ 2) the zero-residual seed
-                    let seed: &CapturedPkt = if run.len >= 2 {
-                        let seed = captured
-                            .get(cap_i)
-                            .ok_or_else(|| "caption-run dedup: missing seed packet".to_string())?;
-                        // sanity: the seed's pts must match frame run.start+1
-                        let expected = off_tb(run.start + 1);
-                        if (seed.pts - expected).abs() > 2 {
-                            return Err(format!(
-                                "caption-run dedup: seed pts {} ≠ expected {} at frame {} — encoder reordered packets",
-                                seed.pts, expected, run.start
-                            ));
-                        }
-                        cap_i += 1;
-                        write_pkt_clone(&ff, pkt.raw, seed, 0, v_idx, oc.raw, &mut wrote_packets)?;
-                        written += 1;
-                        seed
-                    } else {
-                        start
-                    };
-                    // clone the seed for frames [run.start+2, run.start+len)
-                    for f in (run.start + 2)..(run.start + run.len) {
-                        if cancelled.load(Ordering::Relaxed) {
-                            return Err("cancelled".into());
-                        }
-                        let off = off_tb(f) - seed.pts;
-                        write_pkt_clone(&ff, pkt.raw, seed, off, v_idx, oc.raw, &mut wrote_packets)?;
-                        written += 1;
-                        clones_done += 1;
-                    }
-                    let el = t_clone.elapsed();
-                    if clones_done % 4096 == 0 || clones_done == total_clones || el - last_emit > std::time::Duration::from_millis(125) {
-                        last_emit = el;
-                        let frac = written as f64 / total_frames as f64;
-                        let el_s = el.as_secs_f64().max(0.001);
-                        let rate = clones_done as f64 / el_s;
-                        let eta_ms = Some(
-                            (((total_clones - clones_done) as f64 / rate.max(1e-6) + total_sec / 80.0) * 1000.0) as i64,
-                        );
-                        progress(ProgressEvent {
-                            phase: "video".into(),
-                            percent: 1.0 + 90.0 * frac,
-                            fps: 0.0,
-                            timemark_sec: (written as f64 / fps).max(0.0),
-                            eta_ms,
-                        });
-                    }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    audio_done = true;
                 }
-                if cap_i != captured.len() {
-                    log::warn!(
-                        "[rust-engine] caption-run dedup: {} captured packets left unconsumed ({} walked) — encoder emitted more than the run table predicted",
-                        captured.len() - cap_i,
-                        cap_i
-                    );
-                }
-                log::info!(
-                    "[rust-engine] caption-run dedup: {} zero-drift seed packets cloned for {} runs ({} of {} frames live) in {} ms",
-                    clones_done,
-                    n_runs,
-                    plan.encode_frames,
-                    total_frames,
-                    t_clone.elapsed().as_millis()
-                );
             }
         }
-        encode_ms += t_clone.elapsed().as_millis() as i64;
-    }
-
-    // ── AUDIO PHASE (mix ran in parallel — join it now) ──────────────────
-    trace("audio phase begin");
-    let mut audio_ms: i64 = 0;
-    if let Some(ref _ae) = aenc {
-        let a0 = Instant::now();
-        progress(ProgressEvent {
-            phase: "audio".into(),
-            percent: 92.0,
-            fps: 0.0,
-            timemark_sec: total_sec,
-            eta_ms: None,
-        });
-        let mixed = match audio_rx.recv() {
-            Ok(Ok(m)) => m,
-            Ok(Err(e)) => return Err(format!("audio mix failed: {}", e)),
-            Err(_) => return Err("audio thread died".into()),
-        };
-
-        // v0.4: RAM mix → direct slice; spilled mix → a read-only mapping of
-        // the same file the audio thread wrote (file-backed pages stream from
-        // disk under memory pressure — the 1.6 GB mix never pins RAM). The
-        // guard removes the spill file on every path out of this export.
-        let (spill_path, view) = match mixed {
-            AudioMix::Ram(v) => (None, MixView::Ram(v)),
-            AudioMix::Spill { path, .. } => {
-                let f = std::fs::File::open(&path)
-                    .map_err(|e| format!("mix spill open: {}", e))?;
-                let map = unsafe { memmap2::Mmap::map(&f) }
-                    .map_err(|e| format!("mix spill map: {}", e))?;
-                (Some(path), MixView::Map(map))
-            }
-        };
-        let _spill_guard = RemoveOnDrop(spill_path);
-        let mixed: &[f32] = match &view {
-            MixView::Ram(v) => &v[..],
-            MixView::Map(m) => {
-                let n = m.len() / 4;
-                unsafe { std::slice::from_raw_parts(m.as_ptr() as *const f32, n) }
-            }
-        };
-
-        if !mixed.is_empty() {
-            let frame_size = ff.cc_frame_size(_ae.raw).max(64) as usize;
-            let chn = timeline.audio_channels as usize;
-            let aframe = ff.frame_alloc()?;
+        // final partial AAC frame (the v0.4 pump keeps the short tail instead
+        // of encoding a full stale-buffer frame)
+        if !a_pending.is_empty() {
+            pump_aac_samples(&ff, aenc_raw, apkt.raw, oc.raw, a_idx, a_tb, aframe_raw, a_frame_size, chn, sr, &mut a_pending, &[], &mut a_fed, true)?;
+        }
+        // flush audio encoder
+        if !aenc_raw.is_null() {
             unsafe {
-                wr_i32(aframe.raw, AVFRAME_FORMAT, AV_SAMPLE_FMT_FLTP);
-                wr_i32(aframe.raw, AVFRAME_NB_SAMPLES, frame_size as i32);
-                wr_i32(aframe.raw, AVFRAME_SAMPLE_RATE, sr);
-                ff.frame_set_layout(aframe.raw, chn as i32, if chn == 1 { 0x4 } else { 0x3 });
-                let r = (ff.syms.av_frame_get_buffer)(aframe.raw, 0);
-                if r < 0 {
-                    return Err(format!("audio frame buffer: {}", ff.err2str(r)));
-                }
-            }
-            let mut sample_pos = 0usize;
-            // v2.1: audio-phase progress throttled to ~8/s like the video
-            // loop — one event per 1024-sample AAC frame was ~47 TSFN calls
-            // per second of audio (thousands per export), all crossing the
-            // napi boundary for purely informational updates.
-            let mut last_emit_a = std::time::Duration::from_secs(0);
-            while sample_pos < mixed.len() {
-                let take = frame_size.min((mixed.len() - sample_pos) / chn);
-                if take == 0 {
-                    break;
-                }
-                unsafe {
-                    let r = (ff.syms.av_frame_make_writable)(aframe.raw);
-                    if r < 0 {
-                        return Err(format!("audio make_writable: {}", ff.err2str(r)));
-                    }
-                    let lp = ff.frame_data(aframe.raw, 0);
-                    let rp = if chn > 1 { ff.frame_data(aframe.raw, 1) } else { lp };
-                    for i in 0..take {
-                        // v0.4: the clamp that finish_mix applies to RAM mixes
-                        // is folded into the read here so spilled mixes get it
-                        // too (per-window cost, never a full 1.6 GB pass).
-                        let l = mixed[sample_pos + i * chn].clamp(-1.0, 1.0);
-                        let rr = if chn > 1 { mixed[sample_pos + i * chn + 1].clamp(-1.0, 1.0) } else { l };
-                        (lp as *mut f32).add(i).write_unaligned(l);
-                        if chn > 1 {
-                            (rp as *mut f32).add(i).write_unaligned(rr);
-                        }
-                    }
-                    ff.frame_set_pts(aframe.raw, (sample_pos / chn) as i64);
-                    let s = (ff.syms.avcodec_send_frame)(_ae.raw, aframe.raw);
-                    if s < 0 && s != AVERROR_EAGAIN {
-                        return Err(format!("audio send_frame: {}", ff.err2str(s)));
-                    }
-                }
-                loop {
-                    let pr = unsafe { (ff.syms.avcodec_receive_packet)(_ae.raw, pkt.raw) };
-                    if pr == AVERROR_EAGAIN || pr == AVERROR_EOF {
-                        break;
-                    }
-                    if pr < 0 {
-                        return Err(format!("audio receive_packet: {}", ff.err2str(pr)));
-                    }
-                    ff.packet_rescale_ts(pkt.raw, Rational::new(1, sr), a_tb);
-                    ff.packet_set_stream_index(pkt.raw, a_idx);
-                    let w = unsafe { (ff.syms.av_interleaved_write_frame)(oc.raw, pkt.raw) };
-                    ff.packet_unref(pkt.raw);
-                    if w < 0 {
-                        return Err(format!("write audio packet: {}", ff.err2str(w)));
-                    }
-                }
-                sample_pos += take * chn;
-                let el = a0.elapsed();
-                let last_chunk = sample_pos >= mixed.len();
-                if sample_pos == take * chn || last_chunk || el - last_emit_a > std::time::Duration::from_millis(125) {
-                    last_emit_a = el;
-                    let frac = (sample_pos as f64 / mixed.len().max(1) as f64).min(1.0);
-                    // v0.4: phase-local ETA from the ACTUAL AAC encode rate
-                    // (the old whole-run model showed 0s through this phase).
-                    let el_s = el.as_secs_f64();
-                    let eta_ms = if frac > 0.02 && el_s > 0.5 {
-                        Some(((1.0 - frac) / frac * el_s * 1000.0) as i64)
-                    } else {
-                        None
-                    };
-                    progress(ProgressEvent {
-                        phase: "audio".into(),
-                        percent: 92.0 + 6.0 * frac,
-                        fps: 0.0,
-                        timemark_sec: total_sec,
-                        eta_ms,
-                    });
-                }
-            }
-            // flush audio encoder
-            unsafe {
-                let s = (ff.syms.avcodec_send_frame)(_ae.raw, std::ptr::null());
+                let s = (ff.syms.avcodec_send_frame)(aenc_raw, std::ptr::null());
                 if s >= 0 || s == AVERROR_EOF {
                     loop {
-                        let pr = (ff.syms.avcodec_receive_packet)(_ae.raw, pkt.raw);
+                        let pr = (ff.syms.avcodec_receive_packet)(aenc_raw, apkt.raw);
                         if pr == AVERROR_EAGAIN || pr == AVERROR_EOF {
                             break;
                         }
                         if pr < 0 {
                             break;
                         }
-                        ff.packet_rescale_ts(pkt.raw, Rational::new(1, sr), a_tb);
-                        ff.packet_set_stream_index(pkt.raw, a_idx);
-                        let w = (ff.syms.av_interleaved_write_frame)(oc.raw, pkt.raw);
-                        ff.packet_unref(pkt.raw);
+                        ff.packet_rescale_ts(apkt.raw, Rational::new(1, sr), a_tb);
+                        ff.packet_set_stream_index(apkt.raw, a_idx);
+                        let w = (ff.syms.av_interleaved_write_frame)(oc.raw, apkt.raw);
+                        ff.packet_unref(apkt.raw);
                         if w < 0 {
                             return Err(format!("write audio flush: {}", ff.err2str(w)));
                         }
@@ -2534,29 +2042,28 @@ pub fn run_pipeline(
                 }
             }
         }
-        audio_ms = a0.elapsed().as_millis() as i64;
     }
-    // v0.4: the spill file is cleaned by `spill_guard`'s Drop on every exit
-    // path (success, error, cancel).
 
     // ── trailer + finish (movflags +faststart relocates moov here) ──────
-    trace("trailer begin");
     progress(ProgressEvent {
         phase: "mux".into(),
         percent: 98.5,
         fps: 0.0,
         timemark_sec: total_sec,
-        eta_ms: None,
+        eta_sec: None,
     });
     let r = unsafe { (ff.syms.av_write_trailer)(oc.raw) };
     if r < 0 {
         return Err(format!("av_write_trailer: {}", ff.err2str(r)));
     }
-    trace("trailer done");
 
     log::info!(
-        "[rust-engine] export complete: {} packets, {} frames, engine={}, encoder={}",
-        wrote_packets, total_frames, engine_used, venc.name
+        "[rust-engine] export complete: {} packets, {} frames ({} composite-skipped), engine={}, encoder={}",
+        wrote_packets,
+        total_frames,
+        skipped_composites,
+        engine_used,
+        venc.name
     );
     let size = std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
     progress(ProgressEvent {
@@ -2564,7 +2071,7 @@ pub fn run_pipeline(
         percent: 100.0,
         fps: 0.0,
         timemark_sec: total_sec,
-        eta_ms: Some(0),
+        eta_sec: None,
     });
 
     Ok(ExportOutcome {
@@ -2572,844 +2079,13 @@ pub fn run_pipeline(
         encoder_name: venc.name,
         frames: total_frames,
         duration_ms: t_start.elapsed().as_millis() as i64,
-        compositor_ms,
-        encode_ms,
+        compositor_ms: compositor_dur.as_millis() as i64,
+        encode_ms: encode_dur.as_millis() as i64,
         decode_ms: decode_ms + producer_decode_ms,
         audio_ms,
         size_bytes: size,
         adapter,
-        dedup: dedup_report,
-        compositor_note,
     })
-}
-
-// ── v0.4 audio mixdown (file scope; runs on the audio thread) ──────────────
-
-/// The consumer-side view of a finished mix.
-enum MixView {
-    Ram(Vec<f32>),
-    Map(memmap2::Mmap),
-}
-
-/// One placed audio source on the output timeline (thread-side job shape).
-struct AudioJob {
-    path: String,
-    start_ms: f64,
-    volume: f64,
-    speed: f64,
-    loop_src: bool,
-    /// CLI parity: clip audio + LEGACY music normalize; voiceover/SFX/
-    /// music-clip placements never.
-    normalize: bool,
-    tag: String,
-}
-
-#[derive(Default)]
-struct MixState {
-    any_audio: bool,
-    any_normalized: bool,
-}
-
-/// The mix's write backing: a plain Vec under the RAM budget, or a file
-/// mapping above it (file-backed pages flush under memory pressure).
-enum MixBacking {
-    Ram(Vec<f32>),
-    Map(memmap2::MmapMut),
-}
-
-impl MixBacking {
-    fn slice(&mut self, len: usize) -> &mut [f32] {
-        match self {
-            MixBacking::Ram(v) => v.as_mut_slice(),
-            MixBacking::Map(m) => unsafe {
-                std::slice::from_raw_parts_mut(m.as_mut_ptr() as *mut f32, len)
-            },
-        }
-    }
-}
-
-/// Per-source normalization measurement (windowed, constant cost) + gain,
-/// shared by the small (full-decode) and streaming mix paths.
-fn source_gain(
-    st: &mut MixState,
-    timeline: &Timeline,
-    rate: u32,
-    chans: usize,
-    job: &AudioJob,
-    samples: &[f32],
-    src_chans: usize,
-) -> f32 {
-    let mut gain = job.volume.clamp(0.0, 2.0) as f32;
-    if timeline.normalize_audio && job.normalize {
-        let target = timeline.audio_target_lufs.unwrap_or(-16.0);
-        let measured = audio::windowed_lufs(samples, src_chans.max(1), rate);
-        trace(&format!(
-            "source_gain `{}`: n={} src_ch={} measured={:?}",
-            job.tag, samples.len(), src_chans, measured
-        ));
-        if let Some(lufs) = measured {
-            let db = target - lufs;
-            if lufs > -70.0 && lufs < 0.0 && db.abs() <= 40.0 {
-                gain *= 10f64.powf(db / 20.0) as f32;
-                st.any_normalized = true;
-                let _ = chans;
-                log::info!(
-                    "[rust-engine] loudnorm `{}`: measured {:.1} LUFS → {:+.1} dB (target {:.0})",
-                    job.tag, lufs, db, target
-                );
-            }
-        }
-    }
-    gain
-}
-
-/// The full timeline mixdown. Returns the RAM mix or a spilled f32 file.
-#[allow(clippy::too_many_lines)]
-fn mix_timeline(
-    ff: &Arc<FFmpegLibs>,
-    timeline: &Timeline,
-    jobs: &[AudioJob],
-    output_path: &str,
-) -> Result<AudioMix, String> {
-    use rayon::prelude::*;
-    let rate = timeline.sample_rate;
-    let chans = timeline.audio_channels as usize;
-    let total_samples = (timeline.total_ms / 1000.0 * rate as f64).ceil() as usize;
-    let total_f32 = total_samples.saturating_mul(chans.max(1));
-    let mix_bytes = total_f32.saturating_mul(4);
-
-    // v0.4 backing selection: RAM under the budget, a file mapping above
-    // (69 min @ 48 kHz stereo f32 = 1.6 GB — the OOM that closed the app).
-    const MIX_RAM_BUDGET: usize = 192 * 1024 * 1024;
-    let use_spill = mix_bytes > MIX_RAM_BUDGET;
-    let spill_path = std::path::PathBuf::from(format!("{}.ffmix.tmp", output_path));
-    let mut guard = RemoveOnDrop(None);
-    let mut backing = if use_spill {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&spill_path)
-            .map_err(|e| format!("mix spill create `{}`: {}", spill_path.display(), e))?;
-        file.set_len(mix_bytes as u64)
-            .map_err(|e| format!("mix spill set_len: {}", e))?;
-        match unsafe { memmap2::MmapMut::map_mut(&file) } {
-            Ok(m) => {
-                log::info!(
-                    "[rust-engine] audio mix: {} bytes over the {}-MB RAM budget — spilling to `{}` (file-backed pages, never pinned)",
-                    mix_bytes,
-                    MIX_RAM_BUDGET >> 20,
-                    spill_path.display()
-                );
-                guard.0 = Some(spill_path.clone());
-                MixBacking::Map(m)
-            }
-            Err(e) => {
-                log::warn!(
-                    "[rust-engine] mix spill mmap failed ({}) — falling back to a {}-byte RAM mix",
-                    e,
-                    mix_bytes
-                );
-                MixBacking::Ram(vec![0f32; total_f32])
-            }
-        }
-    } else {
-        MixBacking::Ram(vec![0f32; total_f32])
-    };
-    let spilled = matches!(backing, MixBacking::Map(_));
-
-    let mut st = MixState::default();
-    {
-        let out: &mut [f32] = backing.slice(total_f32);
-
-        // v0.4 partition by DECODED PCM size, not compressed file bytes —
-        // a 33 MB 69-min MP3 expands to 1.6 GB of f32 at bus rate; the old
-        // file-size gate fully decoded sources like that into RAM.
-        let est_pcm_bytes = |p: &str| -> f64 {
-            audio::audio_duration_sec(ff, p) * rate as f64 * chans.max(1) as f64 * 4.0
-        };
-        const DECODE_RAM_LIMIT: f64 = 64.0 * 1024.0 * 1024.0;
-        let (small, large): (Vec<usize>, Vec<usize>) = (0..jobs.len())
-            .partition(|&ji| est_pcm_bytes(&jobs[ji].path) < DECODE_RAM_LIMIT);
-        if trace_enabled() {
-            for (ji, j) in jobs.iter().enumerate() {
-                let lane = if small.contains(&ji) { "small" } else { "large" };
-                eprintln!(
-                    "[ff-trace] audio job {} `{}`: est_pcm={:.1}MB lane={} dur_probe={:.2}s",
-                    ji,
-                    j.tag,
-                    est_pcm_bytes(&j.path) / 1048576.0,
-                    lane,
-                    audio::audio_duration_sec(ff, &j.path)
-                );
-            }
-        }
-
-        // small sources: parallel decode, then mix (order-free)
-        if !small.is_empty() {
-            let decoded: Vec<Result<PcmBuffer, String>> = small
-                .par_iter()
-                .map(|&ji| {
-                    let j = &jobs[ji];
-                    audio::decode_audio(ff, &j.path, rate, timeline.audio_channels)
-                })
-                .collect();
-            for (k, res) in decoded.into_iter().enumerate() {
-                match res {
-                    Ok(pcm) => {
-                        let job = &jobs[small[k]];
-                        if !pcm.samples.is_empty() {
-                            let gain = source_gain(&mut st, timeline, rate, chans, job, &pcm.samples, pcm.channels);
-                            st.any_audio = true;
-                            let track = Track {
-                                data: pcm.samples,
-                                start_sample: (job.start_ms / 1000.0 * rate as f64).round() as i64,
-                                gain,
-                                speed: job.speed,
-                                loop_src: job.loop_src,
-                            };
-                            audio::mix_into(out, &track, chans);
-                        }
-                    }
-                    Err(e) => {
-                        if !e.contains("no audio stream") {
-                            log::warn!("[rust-engine] audio decode `{}`: {}", jobs[small[k]].path, e);
-                        }
-                    }
-                }
-            }
-        }
-
-        // large sources: STREAMING decode + mix — peak RAM = ONE window
-        // (~23 MB at 60 s). The decoder stays open across windows
-        // (sample-accurate stitching); loop sources replay from the start
-        // each cycle.
-        const AUDIO_WINDOW_SEC: f64 = 60.0;
-        for &ji in large.iter() {
-            let j = &jobs[ji];
-            let window_frames = (AUDIO_WINDOW_SEC * rate as f64) as usize;
-
-            // (a) loudness measurement FIRST — a dedicated 90 s window at
-            // 20 % in (constant cost, never the whole file), on its own
-            // stream instance.
-            let mut gain = j.volume.clamp(0.0, 2.0) as f32;
-            if timeline.normalize_audio && j.normalize {
-                let dur = audio::audio_duration_sec(ff, &j.path);
-                if dur > 0.5 {
-                    let start_sec = if dur <= 120.0 { 0.0 } else { dur * 0.20 };
-                    let measure = audio::AudioStream::open(ff.clone(), &j.path, rate, timeline.audio_channels)
-                        .and_then(|mut ms| ms.seek_sec(start_sec).map(|_| ms))
-                        .and_then(|mut ms| {
-                            let mut buf: Vec<f32> = Vec::new();
-                            let want = (90.0 * rate as f64) as usize * chans.max(1);
-                            while buf.len() < want {
-                                match ms.next_window(window_frames) {
-                                    Ok(w) => {
-                                        if w.samples.is_empty() { break; }
-                                        buf.extend_from_slice(&w.samples);
-                                    }
-                                    Err(e) => return Err(e),
-                                }
-                            }
-                            Ok(buf)
-                        });
-                    if let Ok(buf) = measure {
-                        if !buf.is_empty() {
-                            let mut probe = MixState::default();
-                            gain = source_gain(&mut probe, timeline, rate, chans, j, &buf, chans);
-                            if probe.any_normalized {
-                                st.any_normalized = true;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // (b) the streaming mix
-            match audio::AudioStream::open(ff.clone(), &j.path, rate, timeline.audio_channels) {
-                Ok(mut stream) => {
-                    let t_start = (j.start_ms / 1000.0 * rate as f64).round() as i64;
-                    let out_frames = out.len() / chans.max(1);
-                    let mut mixed_any = false;
-                    // loop cycles map source frame f of cycle k to
-                    // out_sample = t_start + (k*L + f)/speed. `loop_off`
-                    // accumulates k*L.
-                    let mut loop_off: usize = 0;
-                    'cycles: loop {
-                        let mut cycle_frames: usize = 0; // frames this cycle
-                        loop {
-                            let before = stream.pass_frames();
-                            match stream.next_window(window_frames) {
-                                Ok(w) => {
-                                    let wf = w.samples.len() / chans.max(1);
-                                    if wf == 0 {
-                                        break; // EOF — cycle done
-                                    }
-                                    let base = loop_off + before;
-                                    let out_start = t_start
-                                        + ((base as f64 / j.speed.max(0.01)).round() as i64);
-                                    if out_start < out_frames as i64 {
-                                        let track = Track {
-                                            data: w.samples,
-                                            start_sample: out_start,
-                                            gain,
-                                            speed: j.speed,
-                                            loop_src: false, // cycles handle looping
-                                        };
-                                        audio::mix_into(out, &track, chans);
-                                        mixed_any = true;
-                                    } else {
-                                        // this job can no longer contribute
-                                        break 'cycles;
-                                    }
-                                    cycle_frames += wf;
-                                }
-                                Err(e) => {
-                                    log::warn!("[rust-engine] audio stream window `{}`: {}", j.path, e);
-                                    break 'cycles;
-                                }
-                            }
-                        }
-                        if !j.loop_src {
-                            break 'cycles;
-                        }
-                        // loop: replay while the timeline has room
-                        if cycle_frames == 0 {
-                            break 'cycles; // zero-length source — nothing to loop
-                        }
-                        if t_start + (((loop_off + cycle_frames) as f64 / j.speed.max(0.01)).round() as i64) >= out_frames as i64 {
-                            break 'cycles; // a full replay would start past the end
-                        }
-                        loop_off += cycle_frames;
-                        match stream.seek_start() {
-                            Ok(()) => continue 'cycles,
-                            Err(e) => {
-                                log::warn!("[rust-engine] audio loop seek `{}`: {}", j.path, e);
-                                break 'cycles;
-                            }
-                        }
-                    }
-                    if mixed_any {
-                        st.any_audio = true;
-                    }
-                }
-                Err(e) => {
-                    if !e.contains("no audio stream") {
-                        log::warn!("[rust-engine] audio decode `{}`: {}", j.path, e);
-                    }
-                }
-            }
-        }
-    }
-
-    if !st.any_audio {
-        // silence — the guard (if any) removes the spill file on drop
-        return Ok(AudioMix::Ram(Vec::new()));
-    }
-
-    {
-        let out: &mut [f32] = backing.slice(total_f32);
-        // v0.3 MASTER-BUS normalization: measure the ACTUAL mix (windowed,
-        // constant cost) and apply one static gain toward the target. Only
-        // when per-source gains ran (CLI parity).
-        trace(&format!(
-            "master-bus check: normalize={} any_normalized={} any_audio={}",
-            timeline.normalize_audio, st.any_normalized, st.any_audio
-        ));
-        if timeline.normalize_audio && st.any_normalized {
-            if let Some(mix_lufs) = audio::windowed_lufs(out, chans, rate) {
-                let target = timeline.audio_target_lufs.unwrap_or(-16.0);
-                let db = target - mix_lufs;
-                if mix_lufs > -70.0 && mix_lufs < 0.0 && db.abs() <= 40.0 {
-                    let g = 10f64.powf(db / 20.0) as f32;
-                    for v in out.iter_mut() {
-                        *v *= g;
-                    }
-                    log::info!(
-                        "[rust-engine] loudnorm master: mix measured {:.1} LUFS → {:+.1} dB",
-                        mix_lufs,
-                        db
-                    );
-                }
-            }
-        }
-        let fade_in = ((timeline.fade_in_ms / 1000.0) * rate as f64).round() as usize;
-        let fade_out = ((timeline.fade_out_ms / 1000.0) * rate as f64).round() as usize;
-        if spilled {
-            // fades only — the safety clamp is folded into the AAC read so
-            // the mapping never takes a second full-content dirty pass
-            audio::fade_edges(out, total_samples, chans, fade_in, fade_out);
-        } else {
-            audio::finish_mix(out, total_samples, chans, fade_in, fade_out);
-        }
-    }
-
-    if spilled {
-        if let MixBacking::Map(m) = &mut backing {
-            // flush dirty pages to the file, then drop them from RSS: the
-            // consumer's read-only mapping re-faults them STREAMING, so the
-            // 1.6 GB mix costs ~one window of resident memory instead of
-            // the whole mapping. (Unix: MADV_DONTNEED after msync. Windows:
-            // the file-backed mapping's dirty pages are trimmed by the
-            // memory manager under pressure — same guarantee.)
-            m.flush().map_err(|e| format!("mix spill flush: {}", e))?;
-            #[cfg(target_os = "linux")]
-            unsafe {
-                let _ = m.unchecked_advise(memmap2::UncheckedAdvice::DontNeed);
-            }
-        }
-        drop(backing); // unmap before the consumer re-maps read-only
-        let path = guard.disarm().expect("spill guard armed when spilled");
-        Ok(AudioMix::Spill { path, samples: total_f32, chans })
-    } else {
-        match backing {
-            MixBacking::Ram(v) => Ok(AudioMix::Ram(v)),
-            _ => unreachable!("spilled checked above"),
-        }
-    }
-}
-
-// ── v0.4 dedup detection ───────────────────────────────────────────────────
-
-/// v0.4 entry point: LoopCycle when a single looped base video spans the
-/// timeline with an exact whole-frame cycle; StaticTail when the base lane
-/// ends early (audio-extended) and the remaining frames are all constant
-/// background. Conservative gates — any richer timeline takes the normal
-/// per-frame path.
-fn detect_loop_dedup(
-    timeline: &Timeline,
-    base: &[usize],
-    overlays: &[usize],
-    ff: &Arc<FFmpegLibs>,
-    total_frames: u64,
-    quiet_visuals: bool,
-) -> Option<LoopDedupPlan> {
-    if total_frames < 64 || !quiet_visuals || !overlays.is_empty() {
-        return None;
-    }
-    // ── mode 0 (v0.4.1): STATIC IMAGE — one composite frame repeated ──
-    // A single image held across the whole timeline (no ken-burns, no
-    // text, no chroma, speed 1) is ONE unique frame: encode frame 0 and
-    // clone its packet for the rest. The "1 image + 69-min voiceover"
-    // case drops from hours of per-frame compositing to one frame +
-    // memcpy clones (the StaticTail machinery already does exactly this).
-    if let Some(plan) = detect_static_image(timeline, base, total_frames) {
-        return Some(plan);
-    }
-    // ── mode 1: LOOP-CYCLE (the user's looped-video scenario) ──────────
-    if let Some(plan) = detect_loop_cycle(timeline, base, ff, total_frames) {
-        return Some(plan);
-    }
-    // ── mode 2: STATIC-TAIL (audio-extended timelines) ──────────────
-    detect_static_tail(timeline, base, total_frames)
-}
-
-/// v0.4.1 STATIC-IMAGE plan: a single base-lane IMAGE spanning the whole
-/// timeline with nothing time-varying over it. Frame 0 is the only unique
-/// composite — encode it, clone its packet for the remaining frames
-/// (the StaticTail clone loop, with encode_frames = 1).
-fn detect_static_image(
-    timeline: &Timeline,
-    base: &[usize],
-    total_frames: u64,
-) -> Option<LoopDedupPlan> {
-    if base.len() != 1 {
-        return None;
-    }
-    let seg = &timeline.segments[base[0]];
-    if seg.media_type != "image" {
-        return None;
-    }
-    // speed ≠ 1 rescales the (static) source each frame — not repeatable
-    if (seg.speed - 1.0).abs() > 1e-6 {
-        return None;
-    }
-    if seg.start_ms > 1.0 {
-        return None;
-    }
-    let seg_end = if seg.end_ms > seg.start_ms { seg.end_ms } else { seg.start_ms + seg.duration_ms };
-    if seg_end + 2.0 < timeline.total_ms {
-        return None; // the image must span the whole timeline
-    }
-    // ken-burns zoom/pan makes every frame unique
-    if let Some(kb) = &seg.ken_burns {
-        if kb.enabled {
-            return None;
-        }
-    }
-    if seg.trans_head_ms > 0.0 || seg.trans_tail_ms > 0.0 {
-        return None;
-    }
-    if seg.bookend_start_ms > 0.0 || seg.bookend_end_ms > 0.0 {
-        return None;
-    }
-    if seg.chroma.is_some() {
-        return None;
-    }
-    if total_frames < 64 {
-        return None;
-    }
-    // v0.5.1: TWO live frames, not one. The captured "last" packet then is
-    // frame 1's P-frame (bf=0 on this path) — a chain of tiny P-clones,
-    // ~100 bytes each. The v0.5.0 plan (encode_frames=1) captured frame
-    // 0's IDR (~38 KB at 720p) and re-emitted it for EVERY remaining
-    // frame: a 10-min static export ballooned to 557 MB (14.4k keyframes),
-    // and 62.8-min would have been ~3.5 GB. P/I-only + clone-the-P is both
-    // valid (a still-frame P references the previous picture — same
-    // content) and ~2500× smaller per cloned frame.
-    Some(LoopDedupPlan {
-        kind: DedupKind::StaticTail,
-        cycle_frames: 1,
-        encode_frames: 2,
-        snap_span_sec: None,
-        runs: None,
-    })
-}
-
-fn detect_loop_cycle(
-    timeline: &Timeline,
-    base: &[usize],
-    ff: &Arc<FFmpegLibs>,
-    total_frames: u64,
-) -> Option<LoopDedupPlan> {
-    if base.len() != 1 {
-        return None;
-    }
-    let seg = &timeline.segments[base[0]];
-    if seg.media_type != "video" || !seg.loop_src {
-        return None;
-    }
-    // speed ≠ 1 shifts the cycle mapping each wrap — not exactly repeatable
-    if (seg.speed - 1.0).abs() > 1e-6 {
-        return None;
-    }
-    if seg.start_ms > 1.0 {
-        return None;
-    }
-    let seg_end = if seg.end_ms > seg.start_ms { seg.end_ms } else { seg.start_ms + seg.duration_ms };
-    if seg_end + 2.0 < timeline.total_ms {
-        return None; // the base segment must span the whole timeline
-    }
-    if let Some(kb) = &seg.ken_burns {
-        if kb.enabled {
-            return None;
-        }
-    }
-    if seg.trans_head_ms > 0.0 || seg.trans_tail_ms > 0.0 {
-        return None;
-    }
-    if seg.bookend_start_ms > 0.0 || seg.bookend_end_ms > 0.0 {
-        return None;
-    }
-    if seg.chroma.is_some() {
-        return None;
-    }
-    // source span: the payload's probed duration, or a throwaway decode probe
-    let span_sec = match seg.source_duration_ms {
-        Some(d) if d > 50.0 => d / 1000.0,
-        _ => {
-            let vs = VideoSource::new(ff.clone(), &seg.path, None).ok()?;
-            let d = vs.duration();
-            if d <= 0.05 {
-                return None;
-            }
-            d
-        }
-    };
-    let trimmed = (span_sec - seg.trim_in_ms / 1000.0).max(0.05);
-    // SNAP the cycle to a whole number of frames: frame k and
-    // k + cycle_frames then decode/composite byte-identically. The sub-frame
-    // remainder (< 1 frame per cycle) is invisible.
-    let cf = (trimmed * timeline.fps).floor();
-    if cf < 8.0 {
-        return None;
-    }
-    let cycle_frames = cf as u64;
-    if total_frames < cycle_frames * 2 {
-        return None; // not worth it — encode normally
-    }
-    Some(LoopDedupPlan {
-        kind: DedupKind::LoopCycle,
-        cycle_frames,
-        encode_frames: cycle_frames.min(total_frames),
-        snap_span_sec: Some(cycle_frames as f64 / timeline.fps),
-        runs: None,
-    })
-}
-
-fn detect_static_tail(
-    timeline: &Timeline,
-    base: &[usize],
-    total_frames: u64,
-) -> Option<LoopDedupPlan> {
-    // the last visual frame's index (0 when the timeline is audio-only)
-    let visual_end_ms: f64 = base
-        .iter()
-        .map(|&i| {
-            let s = &timeline.segments[i];
-            if s.end_ms > s.start_ms {
-                s.end_ms
-            } else {
-                s.start_ms + s.duration_ms
-            }
-        })
-        .fold(0.0, f64::max);
-    // first frame index at/after the visual end → the tail starts there
-    let tail_from = ((visual_end_ms / 1000.0) * timeline.fps).ceil() as u64;
-    let tail_frames = total_frames.saturating_sub(tail_from);
-    if tail_frames < 32 {
-        return None; // a short tail isn't worth the machinery
-    }
-    // v0.5.1: TWO frames past the visual end (when available) so the
-    // captured "last" packet is the tail's second frame — a P-frame on
-    // the bf=0 clone path — instead of the tail's first frame (which can
-    // land mid-GOP as a B-frame or a bulky intra). Same rationale as
-    // detect_static_image's encode_frames=2.
-    if total_frames < tail_from + 2 {
-        return None; // (unreachable given tail_frames ≥ 32, but explicit)
-    }
-    Some(LoopDedupPlan {
-        kind: DedupKind::StaticTail,
-        cycle_frames: 1,
-        encode_frames: tail_from + 2,
-        snap_span_sec: None,
-        runs: None,
-    })
-}
-
-/// v0.5.1: open an H.264 decoder for the decode-back seed — the decoder
-/// shares the ENCODER's extradata (SPS/PPS, via parameter transfer) so it
-/// can decode the just-encoded run-start IDR. Single-threaded: the decoded
-/// frame must be available immediately (zero frame-thread delay).
-/// Returns (decoder ctx, decoded AVFrame, feeding AVPacket).
-fn init_decode_back(ff: &FFmpegLibs, enc_ctx: *mut u8) -> Result<(PtrGuard, PtrGuard, PtrGuard), String> {
-    let dec = unsafe { (ff.syms.avcodec_find_decoder)(AV_CODEC_ID_H264) };
-    if dec.is_null() {
-        return Err("no H.264 decoder in the FFmpeg build".into());
-    }
-    let dctx_raw = unsafe { (ff.syms.avcodec_alloc_context3)(dec) };
-    if dctx_raw.is_null() {
-        return Err("avcodec_alloc_context3(decoder) failed".into());
-    }
-    let dctx = PtrGuard::new(dctx_raw, ff.syms.avcodec_free_context)?;
-    // extradata (SPS/PPS) from the encoder context via parameter transfer
-    let mut par = unsafe { (ff.syms.avcodec_parameters_alloc)() };
-    if par.is_null() {
-        return Err("avcodec_parameters_alloc failed".into());
-    }
-    let r1 = unsafe { (ff.syms.avcodec_parameters_from_context)(par, enc_ctx) };
-    let r2 = if r1 == 0 {
-        unsafe { (ff.syms.avcodec_parameters_to_context)(dctx.raw, par) }
-    } else {
-        r1
-    };
-    unsafe { (ff.syms.avcodec_parameters_free)(&mut par) };
-    if r2 != 0 {
-        return Err(format!("parameter transfer to decoder: {}", ff.err2str(r2)));
-    }
-    ff.cc_set_thread_count(dctx.raw, 1); // zero decode delay
-    let r = unsafe { (ff.syms.avcodec_open2)(dctx.raw, dec, std::ptr::null_mut()) };
-    if r != 0 {
-        return Err(format!("decoder open: {}", ff.err2str(r)));
-    }
-    let frame = ff.frame_alloc()?;
-    let pkt = ff.packet_alloc()?;
-    Ok((dctx, frame, pkt))
-}
-
-/// Emit one captured packet with timestamps shifted by `off` (muxer tb).
-fn write_pkt_clone(
-    ff: &FFmpegLibs,
-    pkt: *mut u8,
-    cap: &CapturedPkt,
-    off: i64,
-    v_idx: i32,
-    oc: *mut u8,
-    wrote_packets: &mut u64,
-) -> Result<(), String> {
-    if cap.data.is_empty() {
-        return Ok(()); // zero-size packets carry no samples
-    }
-    ff.packet_new(pkt, cap.data.len())?;
-    unsafe {
-        let dst = ff.packet_data(pkt);
-        std::ptr::copy_nonoverlapping(cap.data.as_ptr(), dst, cap.data.len());
-    }
-    ff.packet_set_pts(pkt, cap.pts + off);
-    ff.packet_set_dts(pkt, cap.dts + off);
-    ff.packet_set_duration(pkt, cap.duration);
-    ff.packet_set_flags(pkt, cap.flags);
-    ff.packet_set_stream_index(pkt, v_idx);
-    let w = unsafe { (ff.syms.av_interleaved_write_frame)(oc, pkt) };
-    ff.packet_unref(pkt);
-    if w < 0 {
-        return Err(format!("write cloned packet: {}", ff.err2str(w)));
-    }
-    *wrote_packets += 1;
-    Ok(())
-}
-
-// ── v0.5 CAPTION-RUN DEDUP (the "1 image + audio + captions" fast path) ────
-
-/// Structural gate: the composite is a STATIC BACKGROUND (any number of
-/// plain base-lane images, or none at all — audio-only timelines) plus
-/// CAPTIONS as the only time-varying element. No overlays, no headline
-/// texts, no kinetic engine, no watermark, no per-segment motion.
-fn static_background_gate(
-    timeline: &Timeline,
-    base: &[usize],
-    overlays: &[usize],
-    texts: &[(usize, TextLayer, f64, f64, f64)],
-    captions: &Option<Arc<PreparedCaptions>>,
-    kinetic: &Option<Arc<PreparedKinetic>>,
-    watermark: &Option<TextLayer>,
-) -> bool {
-    if overlays.is_empty() == false || texts.is_empty() == false {
-        return false;
-    }
-    if kinetic.is_some() || watermark.is_some() || captions.is_none() {
-        return false;
-    }
-    for &i in base {
-        let seg = &timeline.segments[i];
-        if seg.media_type != "image" {
-            return false; // video frames change every frame — not static
-        }
-        if (seg.speed - 1.0).abs() > 1e-6 {
-            return false; // speed rescales per frame
-        }
-        if let Some(kb) = &seg.ken_burns {
-            if kb.enabled {
-                return false; // zoom/pan animates every frame
-            }
-        }
-        if seg.trans_head_ms > 0.0 || seg.trans_tail_ms > 0.0 {
-            return false;
-        }
-        if seg.bookend_start_ms > 0.0 || seg.bookend_end_ms > 0.0 {
-            return false; // fade windows change alpha per frame
-        }
-        if seg.chroma.is_some() {
-            return false; // (static but keep the gate conservative)
-        }
-    }
-    true
-}
-
-/// One frame's visual signature as a flat u64 list: the active base image's
-/// bitmap id (multi-image slideshows change the background at boundaries)
-/// plus every caption text layer's (bitmap id, dest rect, alpha). Two equal
-/// signatures ⇒ the composited output is bit-identical (same inputs into a
-/// deterministic compositor).
-fn caption_frame_signature(
-    timeline: &Timeline,
-    base: &[usize],
-    image_bitmaps: &std::collections::HashMap<usize, Bitmap>,
-    pc: &PreparedCaptions,
-    now_ms: f64,
-    cw: u32,
-    ch: u32,
-) -> Vec<u64> {
-    let mut sig: Vec<u64> = Vec::with_capacity(12);
-    // active base image (mirrors build_frame_job's seg_at — first match)
-    for &i in base {
-        let s = &timeline.segments[i];
-        let end = if s.end_ms > s.start_ms { s.end_ms } else { s.start_ms + s.duration_ms };
-        if now_ms >= s.start_ms - 1e-6 && now_ms < end {
-            if let Some(b) = image_bitmaps.get(&i) {
-                sig.push(b.id);
-            }
-            break;
-        }
-    }
-    let layers = captions::layers_at(pc, now_ms, cw, ch);
-    for tl in &layers {
-        sig.push(tl.bitmap.id);
-        sig.push(((tl.dest_px.0 as u64) << 32) | (tl.dest_px.1 as u64));
-        sig.push(((tl.dest_px.2 as u64) << 32) | (tl.dest_px.3 as u64));
-        sig.push(tl.alpha.to_bits() as u64);
-    }
-    sig
-}
-
-/// v0.5 detection: walk every frame's caption signature, group identical
-/// frames into runs. Returns None when the gate fails or when the runs
-/// don't actually save meaningful encoder work (e.g. a continuously
-/// animated caption style like word-only+slam makes every frame unique —
-/// the dense path is then the honest choice and no B-frames are lost).
-fn detect_caption_runs(
-    timeline: &Timeline,
-    base: &[usize],
-    overlays: &[usize],
-    texts: &[(usize, TextLayer, f64, f64, f64)],
-    captions: &Option<Arc<PreparedCaptions>>,
-    kinetic: &Option<Arc<PreparedKinetic>>,
-    watermark: &Option<TextLayer>,
-    image_bitmaps: &std::collections::HashMap<usize, Bitmap>,
-    total_frames: u64,
-    fps: f64,
-    cw: u32,
-    ch: u32,
-) -> Option<Vec<CaptionRun>> {
-    if std::env::var("FRAMEFUSE_DISABLE_CAPTION_RUNS").map(|v| v == "1").unwrap_or(false) {
-        return None; // test/bisect kill switch
-    }
-    if total_frames < 64 {
-        return None;
-    }
-    if !static_background_gate(timeline, base, overlays, texts, captions, kinetic, watermark) {
-        return None;
-    }
-    let pc = captions.as_ref().unwrap();
-    let t_walk = Instant::now();
-    let mut runs: Vec<CaptionRun> = Vec::with_capacity(1024);
-    let mut prev_sig: Option<Vec<u64>> = None;
-    let mut cur_start: u64 = 0;
-    let mut cur_len: u64 = 0;
-    for k in 0..total_frames {
-        let now_ms = k as f64 / fps * 1000.0;
-        let sig = caption_frame_signature(timeline, base, image_bitmaps, pc, now_ms, cw, ch);
-        let same = prev_sig.as_ref().map(|p| p == &sig).unwrap_or(false);
-        if same {
-            cur_len += 1;
-        } else {
-            if cur_len > 0 {
-                runs.push(CaptionRun { start: cur_start, len: cur_len });
-            }
-            cur_start = k;
-            cur_len = 1;
-            prev_sig = Some(sig);
-        }
-    }
-    if cur_len > 0 {
-        runs.push(CaptionRun { start: cur_start, len: cur_len });
-    }
-    // worth-it check: live = the forced-IDR start (+ zero-residual seed per run ≥ 2)
-    let live: u64 = runs
-        .iter()
-        .map(|r| 1 + u64::from(r.len >= 2))
-        .sum();
-    let total = total_frames;
-    // engage only when we save ≥ 20% of the encoder work (below that the
-    // B-frame suppression trade + clone machinery aren't worth it)
-    if live > total.saturating_sub(1) / 5 * 4 {
-        trace(&format!(
-            "caption-runs: NOT engaging (live {} of {} frames — animated captions dominate)",
-            live, total
-        ));
-        return None;
-    }
-    let cloned = total.saturating_sub(live.min(total));
-    log::info!(
-        "[rust-engine] CAPTION-RUN FAST PATH: {} runs ({} live frames, {} cloned — {:.1}% of the timeline) — signature walk {} ms",
-        runs.len(),
-        live,
-        cloned,
-        100.0 * cloned as f64 / total as f64,
-        t_walk.elapsed().as_millis()
-    );
-    Some(runs)
 }
 
 // ── the frame builder (runs ON THE PRODUCER THREAD) ────────────────────────
@@ -3461,9 +2137,6 @@ fn build_frame_job(
     decode_ms: &mut i64,
     cw: u32,
     ch: u32,
-    // v0.4: Some(span) in dedup mode — the loop wrap uses the SNAPPED span
-    // so frame k and k+cycle_frames are byte-identical (clone-able packets).
-    loop_snap: Option<f64>,
 ) -> Result<FrameJob, String> {
     let mut layers: Vec<Layer> = Vec::with_capacity(2 + overlays.len());
     let mut fade_gain = 1.0f32;
@@ -3558,8 +2231,6 @@ fn build_frame_job(
             // source span (the CLI `-stream_loop` parity; the overlay lane's
             // `overlay_loop` mirror). Span = sourceDurationMs (payload) with
             // the decoder's EOF-pinned duration as the fallback.
-            // v0.4: dedup mode overrides the span with the SNAPPED cycle so
-            // each cycle's frame sequence is exactly repeatable.
             let payload_dur = seg.source_duration_ms.unwrap_or(0.0) / 1000.0;
             let src_dur = if payload_dur > 0.05 {
                 payload_dur
@@ -3569,10 +2240,7 @@ fn build_frame_job(
             let trim = seg.trim_in_ms / 1000.0;
             let mut src_t = trim + local_t * seg.speed;
             if seg.loop_src && src_dur > 0.05 {
-                let span = match loop_snap {
-                    Some(s) => s,
-                    None => (src_dur - trim).max(0.05),
-                };
+                let span = (src_dur - trim).max(0.05);
                 src_t = trim + ((local_t * seg.speed) % span);
             }
             let t0 = Instant::now();
@@ -3705,22 +2373,14 @@ fn build_frame_job(
                 .collect::<Vec<_>>()
         );
     }
-    Ok(FrameJob { k, layers, texts: text_layers, background, run_len: 0 })
+    Ok(FrameJob { k, layers, texts: text_layers, background })
 }
 
 /// Drain the video encoder into the muxer. Returns how many packets were
 /// written (0 when the encoder has none yet — EAGAIN). `v_idx` is the
 /// pre-resolved muxer stream index (fixed after write_header).
-/// v0.4: `capture` (Some during the dedup fast path) records each drained
-/// packet's post-rescale timestamps + bytes so later loop cycles can re-emit
-/// them with shifted pts/dts instead of re-encoding identical frames.
-///
-/// v0.5.1 `capture_only`: caption-run mode records WITHOUT muxing. The live
-/// run-starts are scattered across the whole timeline while the clones fill
-/// the gaps BETWEEN them — muxing the live packets as they drain submits the
-/// video stream out of dts order and the muxer rejects the first clone
-/// ("non monotonically increasing dts"; reproduced on a 12-s bench). The
-/// clone phase re-emits start + seed + clones in strict frame order instead.
+/// v0.4: `cache` — when Some, the LAST written packet is copied (bytes +
+/// timestamps) for the FRAME-CLONE fast path; pass None at flush time.
 #[allow(clippy::too_many_arguments)]
 fn drain_video_encoder(
     ff: &FFmpegLibs,
@@ -3732,8 +2392,6 @@ fn drain_video_encoder(
     v_tb_enc: &Rational,
     v_tb: &Rational,
     wrote_packets: &mut u64,
-    capture: &mut Option<Vec<CapturedPkt>>,
-    capture_only: bool,
 ) -> Result<usize, String> {
     let _ = vstream; // retained for signature clarity; index is precomputed
     let mut n = 0usize;
@@ -3747,29 +2405,6 @@ fn drain_video_encoder(
         }
         ff.packet_rescale_ts(pkt, *v_tb_enc, *v_tb);
         ff.packet_set_stream_index(pkt, v_idx);
-        if let Some(store) = capture.as_mut() {
-            let len = ff.packet_size(pkt).max(0) as usize;
-            let bytes = if len > 0 {
-                let src = ff.packet_data(pkt);
-                unsafe { std::slice::from_raw_parts(src, len) }.to_vec()
-            } else {
-                Vec::new()
-            };
-            store.push(CapturedPkt {
-                pts: ff.packet_pts(pkt),
-                dts: ff.packet_dts(pkt),
-                duration: ff.packet_duration(pkt),
-                flags: ff.packet_flags(pkt),
-                data: bytes,
-            });
-        }
-        if capture_only {
-            // captured, not muxed — the clone phase re-emits it in stream
-            // order (wrote_packets is counted there, at the actual write)
-            ff.packet_unref(pkt);
-            n += 1;
-            continue;
-        }
         let w = unsafe { (ff.syms.av_interleaved_write_frame)(oc, pkt) };
         ff.packet_unref(pkt);
         if w < 0 {

@@ -4525,35 +4525,6 @@ ipcMain.handle("export-ass-file", async (event, opts) => {
 // ./export-graph.js (pure CommonJS — shared with the test harness).
 // ---------------------------------------------------------------------------
 
-// v1.13 Tier 3 (user directive): LOW-COST SUBTITLE RASTERIZATION — strip
-// libass's expensive per-glyph work from the BURN-IN documents only (the
-// .ass sidecar export keeps the user's original styling). Gaussian blur
-// (\blur) and box blur (\be) re-rasterize every blurred glyph on EVERY
-// frame it is alive — across a 34,200-frame timeline that eats 30 %+ of a
-// constrained CPU; \blur0 swaps the soft glow for a clean hard shadow, and
-// outline / border widths clamp to ≤ 2 px so the stroke rasterizer touches
-// fewer scanlines per glyph.
-function optimizeAssForConstrainedCpu(doc) {
-  if (typeof doc !== "string" || doc.length === 0) return doc;
-  return doc
-    // Dialogue override tags: \blur<n> → \blur0 (hard edges), drop \be
-    // entirely, clamp \bord to ≤ 2 px.
-    .replace(/\\blur-?[0-9]+(?:\.[0-9]+)?/g, "\\blur0")
-    .replace(/\\be[0-9]*/g, "")
-    .replace(/\\bord([0-9]+(?:\.[0-9]+)?)/g, (_m, n) => `\\bord${Math.min(2, parseFloat(n))}`)
-    // Style lines (ours are exactly the 23-field v4+ shape): clamp the
-    // Outline (field 16) and Shadow (field 17) widths to 2 px.
-    .replace(/^Style: .+$/gm, (line) => {
-      const f = line.split(",");
-      if (f.length !== 23) return line;
-      for (const idx of [16, 17]) {
-        const v = parseFloat(f[idx]);
-        if (Number.isFinite(v) && v > 2) f[idx] = "2";
-      }
-      return f.join(",");
-    });
-}
-
 ipcMain.handle("export-native", async (event, opts) => {
   const { outputPath, fps: reqFps, width: reqWidth, height: reqHeight, bitrateMbps, quality, crf, audioKbps, kenBurns, segments, audioPath, audio, captionSettings, subtitleCues, headlines, transition, watermark, overlays, sfx, fastMode: fastModeWanted, slideshowFps24, textRemoval: textRemovalRaw, headlineGeometry, kineticCompositions, kineticGeometry, voiceovers, dubOriginalVolume, totalMs: payloadTotalMs } = opts;
   // ── v1.25 MULTI-MUSIC payload normalization ───────────────────────────
@@ -7751,7 +7722,7 @@ app.on("window-all-closed", () => { if (process.platform !== "darwin") app.quit(
 // the throwaway harnesses can unit-verify the Adaptive Hardware Matrix.
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    buildAssDocument, assAnimTags, buildHeadlineEvents, probeHwDecode, hwDecodeGate, resolveHardwareProfile, optimizeAssForConstrainedCpu, mapBoundedConcurrent,
+    buildAssDocument, assAnimTags, buildHeadlineEvents, probeHwDecode, hwDecodeGate, resolveHardwareProfile, mapBoundedConcurrent,
     // v1.14.5 Release-A hooks (verify-release-a.js): the cost score, the
     // fast encoder profile, the profiler factory, the capability matrix,
     // the cached loudness measurement, and the chain builder twin.
