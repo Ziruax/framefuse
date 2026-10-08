@@ -1464,7 +1464,7 @@ pub fn run_pipeline(
                                     let want = measure_frames * chans.max(1);
                                     let mut pos = 0usize;
                                     while buf.len() < want {
-                                        let mspec = std::slice::from_ref(let mut mspec = std::slice::from_ref(&measure_spec);measure_spec);
+                                        let mspec = std::slice::from_ref(&measure_spec);
                                         let mut mixers = [Some(mm)];
                                         let (w, _) = mix_output_window(&mspec, &mut mixers, &[1.0f32], chans, pos, pos + win_frames, win_frames)?;
                                         mm = mixers[0].take().unwrap();
